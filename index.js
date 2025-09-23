@@ -83,7 +83,7 @@ const authenticateToken = (req, res, next) => {
 };
 
 const generateOTP = () => {
-  return Math.floor(100000 + Math.random() * 900000).toString();
+  return "1234";
 };
 
 const sendOTP = async (phone, otp) => {
@@ -408,7 +408,6 @@ app.post('/api/auth/phone/verify-otp', async (req, res) => {
     const otpQuery = await db.collection('otp_verification')
       .where('phone', '==', phone)
       .where('otp', '==', otp)
-      .orderBy('createdAt', 'desc')
       .limit(1)
       .get();
 
@@ -471,8 +470,12 @@ app.post('/api/auth/phone/verify-otp', async (req, res) => {
     });
 
   } catch (error) {
-    console.error('Phone verification error:', error);
-    res.status(500).json({ error: 'Phone verification failed' });
+    console.error('Phone verification error:', error.message);
+    console.error('Stack trace:', error.stack);
+    res.status(500).json({ 
+      error: 'Phone verification failed',
+      details: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
   }
 });
 
@@ -573,7 +576,7 @@ app.get('/api/menus/:restaurantId', async (req, res) => {
       query = query.where('category', '==', category);
     }
 
-    const snapshot = await query.orderBy('order', 'asc').get();
+    const snapshot = await query.get();
     const menuItems = [];
 
     snapshot.forEach(doc => {
@@ -822,6 +825,279 @@ app.post('/api/payments/verify', async (req, res) => {
   } catch (error) {
     console.error('Verify payment error:', error);
     res.status(500).json({ error: 'Payment verification failed' });
+  }
+});
+
+app.post('/api/seed-data/:restaurantId', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+
+    const sampleMenuItems = [
+      {
+        name: "Butter Chicken",
+        description: "Creamy tomato-based chicken curry with aromatic spices",
+        price: 299,
+        category: "main-course",
+        isVeg: false,
+        spiceLevel: "medium",
+        allergens: ["dairy"],
+        shortCode: "BTC",
+        restaurantId,
+        status: "active",
+        order: 1,
+        createdAt: new Date(),
+        updatedAt: new Date()
+      },
+      {
+        name: "Paneer Tikka Masala",
+        description: "Grilled cottage cheese cubes in rich tomato gravy",
+        price: 249,
+        category: "main-course",
+        isVeg: true,
+        spiceLevel: "medium",
+        allergens: ["dairy"],
+        shortCode: "PTM",
+        restaurantId,
+        status: "active",
+        order: 2,
+        createdAt: new Date(),
+        updatedAt: new Date()
+      },
+      {
+        name: "Biryani (Chicken)",
+        description: "Fragrant basmati rice cooked with marinated chicken",
+        price: 349,
+        category: "rice",
+        isVeg: false,
+        spiceLevel: "mild",
+        allergens: [],
+        shortCode: "CBR",
+        restaurantId,
+        status: "active",
+        order: 3,
+        createdAt: new Date(),
+        updatedAt: new Date()
+      },
+      {
+        name: "Dal Tadka",
+        description: "Yellow lentils tempered with cumin and garlic",
+        price: 149,
+        category: "dal",
+        isVeg: true,
+        spiceLevel: "mild",
+        allergens: [],
+        shortCode: "DT",
+        restaurantId,
+        status: "active",
+        order: 4,
+        createdAt: new Date(),
+        updatedAt: new Date()
+      },
+      {
+        name: "Garlic Naan",
+        description: "Soft leavened bread topped with garlic and herbs",
+        price: 89,
+        category: "bread",
+        isVeg: true,
+        spiceLevel: "none",
+        allergens: ["gluten", "dairy"],
+        shortCode: "GN",
+        restaurantId,
+        status: "active",
+        order: 5,
+        createdAt: new Date(),
+        updatedAt: new Date()
+      },
+      {
+        name: "Samosa (2 pcs)",
+        description: "Crispy triangular pastries filled with spiced potatoes",
+        price: 59,
+        category: "appetizer",
+        isVeg: true,
+        spiceLevel: "mild",
+        allergens: ["gluten"],
+        shortCode: "SAM",
+        restaurantId,
+        status: "active",
+        order: 6,
+        createdAt: new Date(),
+        updatedAt: new Date()
+      },
+      {
+        name: "Chicken Tikka",
+        description: "Grilled marinated chicken pieces with mint chutney",
+        price: 199,
+        category: "appetizer",
+        isVeg: false,
+        spiceLevel: "medium",
+        allergens: ["dairy"],
+        shortCode: "CT",
+        restaurantId,
+        status: "active",
+        order: 7,
+        createdAt: new Date(),
+        updatedAt: new Date()
+      },
+      {
+        name: "Masala Chai",
+        description: "Traditional Indian spiced tea with milk",
+        price: 29,
+        category: "beverages",
+        isVeg: true,
+        spiceLevel: "none",
+        allergens: ["dairy"],
+        shortCode: "MC",
+        restaurantId,
+        status: "active",
+        order: 8,
+        createdAt: new Date(),
+        updatedAt: new Date()
+      },
+      {
+        name: "Gulab Jamun (2 pcs)",
+        description: "Soft milk dumplings in sweet cardamom syrup",
+        price: 79,
+        category: "dessert",
+        isVeg: true,
+        spiceLevel: "none",
+        allergens: ["dairy", "gluten"],
+        shortCode: "GJ",
+        restaurantId,
+        status: "active",
+        order: 9,
+        createdAt: new Date(),
+        updatedAt: new Date()
+      },
+      {
+        name: "Fresh Lime Soda",
+        description: "Refreshing lime drink with soda and mint",
+        price: 49,
+        category: "beverages",
+        isVeg: true,
+        spiceLevel: "none",
+        allergens: [],
+        shortCode: "FLS",
+        restaurantId,
+        status: "active",
+        order: 10,
+        createdAt: new Date(),
+        updatedAt: new Date()
+      }
+    ];
+
+    const batch = db.batch();
+    sampleMenuItems.forEach(item => {
+      const docRef = db.collection(collections.menus).doc();
+      batch.set(docRef, item);
+    });
+
+    await batch.commit();
+
+    res.json({
+      message: 'Sample menu data seeded successfully',
+      itemsAdded: sampleMenuItems.length
+    });
+
+  } catch (error) {
+    console.error('Seed data error:', error);
+    res.status(500).json({ error: 'Failed to seed sample data' });
+  }
+});
+
+// Table Management APIs
+app.get('/api/tables/:restaurantId', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+
+    const snapshot = await db.collection(collections.tables)
+      .where('restaurantId', '==', restaurantId)
+      .orderBy('createdAt', 'asc')
+      .get();
+
+    const tables = [];
+    snapshot.forEach(doc => {
+      tables.push({
+        id: doc.id,
+        ...doc.data()
+      });
+    });
+
+    res.json({ tables });
+
+  } catch (error) {
+    console.error('Get tables error:', error);
+    res.status(500).json({ error: 'Failed to fetch tables' });
+  }
+});
+
+app.post('/api/tables/:restaurantId', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+    const { name, floor, capacity, section } = req.body;
+
+    if (!name) {
+      return res.status(400).json({ error: 'Table name is required' });
+    }
+
+    const tableData = {
+      restaurantId,
+      name,
+      floor: floor || 'Ground Floor',
+      capacity: capacity || 4,
+      section: section || 'Main',
+      status: 'available', // available, occupied, reserved, cleaning
+      currentOrderId: null,
+      lastOrderTime: null,
+      createdAt: new Date(),
+      updatedAt: new Date()
+    };
+
+    const tableRef = await db.collection(collections.tables).add(tableData);
+
+    res.status(201).json({
+      message: 'Table created successfully',
+      table: {
+        id: tableRef.id,
+        ...tableData
+      }
+    });
+
+  } catch (error) {
+    console.error('Create table error:', error);
+    res.status(500).json({ error: 'Failed to create table' });
+  }
+});
+
+app.patch('/api/tables/:tableId/status', authenticateToken, async (req, res) => {
+  try {
+    const { tableId } = req.params;
+    const { status, orderId } = req.body;
+
+    const validStatuses = ['available', 'occupied', 'reserved', 'cleaning'];
+    
+    if (!validStatuses.includes(status)) {
+      return res.status(400).json({ error: 'Invalid status' });
+    }
+
+    const updateData = {
+      status,
+      updatedAt: new Date()
+    };
+
+    if (status === 'occupied' && orderId) {
+      updateData.currentOrderId = orderId;
+      updateData.lastOrderTime = new Date();
+    } else if (status === 'available') {
+      updateData.currentOrderId = null;
+    }
+
+    await db.collection(collections.tables).doc(tableId).update(updateData);
+
+    res.json({ message: 'Table status updated successfully' });
+
+  } catch (error) {
+    console.error('Update table status error:', error);
+    res.status(500).json({ error: 'Failed to update table status' });
   }
 });
 

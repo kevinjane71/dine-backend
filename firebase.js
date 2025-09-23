@@ -37,7 +37,8 @@ try {
     inventory: 'inventory',
     analytics: 'analytics',
     feedback: 'feedback',
-    loyalty: 'loyalty'
+    loyalty: 'loyalty',
+    tables: 'tables'
   };
 
   module.exports = {
