@@ -1147,6 +1147,222 @@ app.get('/api/analytics/:restaurantId', authenticateToken, async (req, res) => {
   }
 });
 
+// Staff Management APIs
+const requireOwnerRole = (req, res, next) => {
+  if (req.user.role !== 'owner') {
+    return res.status(403).json({ error: 'Access denied. Owner role required.' });
+  }
+  next();
+};
+
+// Get all staff for a restaurant
+app.get('/api/staff/:restaurantId', authenticateToken, requireOwnerRole, async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+
+    const snapshot = await db.collection(collections.users)
+      .where('restaurantId', '==', restaurantId)
+      .where('role', 'in', ['waiter', 'manager'])
+      .get();
+
+    const staff = [];
+    snapshot.forEach(doc => {
+      const userData = doc.data();
+      staff.push({
+        id: doc.id,
+        name: userData.name,
+        phone: userData.phone,
+        email: userData.email,
+        role: userData.role,
+        status: userData.status || 'active',
+        startDate: userData.startDate,
+        lastLogin: userData.lastLogin,
+        createdAt: userData.createdAt,
+        updatedAt: userData.updatedAt
+      });
+    });
+
+    res.json({ staff });
+
+  } catch (error) {
+    console.error('Get staff error:', error);
+    res.status(500).json({ error: 'Failed to fetch staff' });
+  }
+});
+
+// Add new staff member
+app.post('/api/staff/:restaurantId', authenticateToken, requireOwnerRole, async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+    const { name, phone, email, role = 'waiter', startDate } = req.body;
+
+    if (!name || !phone) {
+      return res.status(400).json({ error: 'Name and phone are required' });
+    }
+
+    // Check if phone already exists
+    const existingUser = await db.collection(collections.users)
+      .where('phone', '==', phone)
+      .get();
+
+    if (!existingUser.empty) {
+      return res.status(400).json({ error: 'Phone number already registered' });
+    }
+
+    const staffData = {
+      name,
+      phone,
+      email: email || null,
+      role,
+      restaurantId,
+      status: 'active',
+      startDate: startDate ? new Date(startDate) : new Date(),
+      phoneVerified: false,
+      emailVerified: false,
+      provider: 'staff',
+      createdAt: new Date(),
+      updatedAt: new Date(),
+      lastLogin: null
+    };
+
+    const staffRef = await db.collection(collections.users).add(staffData);
+
+    res.status(201).json({
+      message: 'Staff member added successfully',
+      staff: {
+        id: staffRef.id,
+        ...staffData
+      }
+    });
+
+  } catch (error) {
+    console.error('Add staff error:', error);
+    res.status(500).json({ error: 'Failed to add staff member' });
+  }
+});
+
+// Update staff member
+app.patch('/api/staff/:staffId', authenticateToken, requireOwnerRole, async (req, res) => {
+  try {
+    const { staffId } = req.params;
+    const { name, phone, email, role, status } = req.body;
+
+    const updateData = {
+      updatedAt: new Date()
+    };
+
+    if (name) updateData.name = name;
+    if (phone) updateData.phone = phone;
+    if (email !== undefined) updateData.email = email;
+    if (role) updateData.role = role;
+    if (status) updateData.status = status;
+
+    await db.collection(collections.users).doc(staffId).update(updateData);
+
+    res.json({ message: 'Staff member updated successfully' });
+
+  } catch (error) {
+    console.error('Update staff error:', error);
+    res.status(500).json({ error: 'Failed to update staff member' });
+  }
+});
+
+// Delete staff member
+app.delete('/api/staff/:staffId', authenticateToken, requireOwnerRole, async (req, res) => {
+  try {
+    const { staffId } = req.params;
+
+    await db.collection(collections.users).doc(staffId).delete();
+
+    res.json({ message: 'Staff member deleted successfully' });
+
+  } catch (error) {
+    console.error('Delete staff error:', error);
+    res.status(500).json({ error: 'Failed to delete staff member' });
+  }
+});
+
+// Staff login with phone OTP (separate from customer login)
+app.post('/api/auth/staff/verify-otp', async (req, res) => {
+  try {
+    const { phone, otp, restaurantId } = req.body;
+
+    if (!phone || !otp || !restaurantId) {
+      return res.status(400).json({ error: 'Phone, OTP, and restaurant ID are required' });
+    }
+
+    // Verify OTP
+    const otpQuery = await db.collection('otp_verification')
+      .where('phone', '==', phone)
+      .where('otp', '==', otp)
+      .limit(1)
+      .get();
+
+    if (otpQuery.empty) {
+      return res.status(400).json({ error: 'Invalid OTP' });
+    }
+
+    const otpDoc = otpQuery.docs[0];
+    const otpData = otpDoc.data();
+
+    if (new Date() > otpData.otpExpiry.toDate()) {
+      return res.status(400).json({ error: 'OTP expired' });
+    }
+
+    // Find staff member
+    const staffQuery = await db.collection(collections.users)
+      .where('phone', '==', phone)
+      .where('restaurantId', '==', restaurantId)
+      .where('role', 'in', ['waiter', 'manager'])
+      .where('status', '==', 'active')
+      .get();
+
+    if (staffQuery.empty) {
+      return res.status(404).json({ error: 'Staff member not found or inactive' });
+    }
+
+    const staffDoc = staffQuery.docs[0];
+    const staffData = staffDoc.data();
+
+    // Update last login
+    await staffDoc.ref.update({
+      lastLogin: new Date(),
+      phoneVerified: true,
+      updatedAt: new Date()
+    });
+
+    // Delete OTP
+    await otpDoc.ref.delete();
+
+    const token = jwt.sign(
+      { 
+        userId: staffDoc.id, 
+        phone: staffData.phone, 
+        role: staffData.role,
+        restaurantId: staffData.restaurantId
+      },
+      process.env.JWT_SECRET,
+      { expiresIn: '7d' }
+    );
+
+    res.json({
+      message: 'Staff login successful',
+      token,
+      user: {
+        id: staffDoc.id,
+        phone: staffData.phone,
+        name: staffData.name,
+        role: staffData.role,
+        restaurantId: staffData.restaurantId
+      }
+    });
+
+  } catch (error) {
+    console.error('Staff login error:', error);
+    res.status(500).json({ error: 'Staff login failed' });
+  }
+});
+
 app.use((err, req, res, next) => {
   console.error(`[${req.id}] Error:`, err);
   
