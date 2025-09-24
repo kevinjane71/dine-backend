@@ -31,6 +31,7 @@ const corsOptions = {
       'http://localhost:3002',
       'http://localhost:3003',
       'https://dine-frontend.vercel.app',
+      'https://dine-backend-lake.vercel.app',
       process.env.FRONTEND_URL
     ].filter(Boolean);
     
@@ -1001,6 +1002,117 @@ app.post('/api/seed-data/:restaurantId', authenticateToken, async (req, res) => 
   } catch (error) {
     console.error('Seed data error:', error);
     res.status(500).json({ error: 'Failed to seed sample data' });
+  }
+});
+
+// Seed sample orders
+app.post('/api/seed-orders/:restaurantId', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+
+    const sampleOrders = [
+      {
+        id: `ORD-${Date.now()}-001`,
+        restaurantId,
+        orderType: 'dine-in',
+        tableNumber: 5,
+        status: 'preparing',
+        customerInfo: {
+          name: 'Rahul Kumar',
+          phone: '+91-9876543210'
+        },
+        items: [
+          { name: 'Butter Chicken', quantity: 2, price: 299 },
+          { name: 'Garlic Naan', quantity: 3, price: 89 },
+          { name: 'Basmati Rice', quantity: 1, price: 149 }
+        ],
+        totalAmount: 925,
+        notes: 'Extra spicy',
+        createdAt: new Date(Date.now() - 15 * 60 * 1000), // 15 minutes ago
+        updatedAt: new Date()
+      },
+      {
+        id: `ORD-${Date.now()}-002`,
+        restaurantId,
+        orderType: 'delivery',
+        tableNumber: null,
+        status: 'delivered',
+        customerInfo: {
+          name: 'Priya Sharma',
+          phone: '+91-9123456789',
+          address: '123 MG Road, Bangalore'
+        },
+        items: [
+          { name: 'Chicken Tikka', quantity: 1, price: 199 },
+          { name: 'Fresh Lime Soda', quantity: 2, price: 49 }
+        ],
+        totalAmount: 297,
+        notes: null,
+        createdAt: new Date(Date.now() - 45 * 60 * 1000), // 45 minutes ago
+        updatedAt: new Date()
+      },
+      {
+        id: `ORD-${Date.now()}-003`,
+        restaurantId,
+        orderType: 'pickup',
+        tableNumber: null,
+        status: 'ready',
+        customerInfo: {
+          name: 'Amit Patel',
+          phone: '+91-9988776655'
+        },
+        items: [
+          { name: 'Dal Tadka', quantity: 1, price: 149 },
+          { name: 'Paneer Tikka Masala', quantity: 1, price: 249 },
+          { name: 'Roti', quantity: 4, price: 79 }
+        ],
+        totalAmount: 794,
+        notes: 'Less oil please',
+        createdAt: new Date(Date.now() - 25 * 60 * 1000), // 25 minutes ago
+        updatedAt: new Date()
+      },
+      {
+        id: `ORD-${Date.now()}-004`,
+        restaurantId,
+        orderType: 'dine-in',
+        tableNumber: 12,
+        status: 'confirmed',
+        customerInfo: {
+          name: 'Sunita Reddy',
+          phone: '+91-8765432109'
+        },
+        items: [
+          { name: 'Biryani (Chicken)', quantity: 1, price: 349 },
+          { name: 'Samosa', quantity: 2, price: 59 },
+          { name: 'Masala Chai', quantity: 1, price: 29 }
+        ],
+        totalAmount: 496,
+        notes: null,
+        createdAt: new Date(Date.now() - 5 * 60 * 1000), // 5 minutes ago
+        updatedAt: new Date()
+      }
+    ];
+
+    // Add each order to Firestore
+    const batch = db.batch();
+    sampleOrders.forEach(order => {
+      const orderRef = db.collection(collections.orders).doc();
+      batch.set(orderRef, {
+        ...order,
+        id: orderRef.id // Use Firestore generated ID
+      });
+    });
+
+    await batch.commit();
+
+    res.json({
+      message: 'Sample orders seeded successfully',
+      ordersAdded: sampleOrders.length
+    });
+
+  } catch (error) {
+    console.error('Seed orders error:', error);
+    res.status(500).json({ error: 'Failed to seed sample orders' });
   }
 });
 
