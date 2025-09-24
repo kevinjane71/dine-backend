@@ -399,6 +399,7 @@ app.post('/api/auth/phone/send-otp', async (req, res) => {
   }
 });
 
+// Owner phone-based registration/login
 app.post('/api/auth/phone/verify-otp', async (req, res) => {
   try {
     const { phone, otp, name } = req.body;
@@ -428,34 +429,48 @@ app.post('/api/auth/phone/verify-otp', async (req, res) => {
       .where('phone', '==', phone)
       .get();
 
-    let userId;
+    let userId, isNewUser = false, hasRestaurants = false;
 
     if (userDoc.empty) {
+      // New owner registration
       const newUser = {
         phone,
-        name: name || 'User',
-        role: 'customer',
+        name: name || 'Restaurant Owner',
+        role: 'owner',
         emailVerified: false,
         phoneVerified: true,
         provider: 'phone',
+        setupComplete: false,
         createdAt: new Date(),
         updatedAt: new Date()
       };
 
       const userRef = await db.collection(collections.users).add(newUser);
       userId = userRef.id;
+      isNewUser = true;
     } else {
+      // Existing owner login
+      const userData = userDoc.docs[0].data();
       userId = userDoc.docs[0].id;
+      
       await userDoc.docs[0].ref.update({
         phoneVerified: true,
         updatedAt: new Date()
       });
+
+      // Check if owner has restaurants
+      const restaurantsQuery = await db.collection(collections.restaurants)
+        .where('ownerId', '==', userId)
+        .limit(1)
+        .get();
+      
+      hasRestaurants = !restaurantsQuery.empty;
     }
 
     await otpDoc.ref.delete();
 
     const token = jwt.sign(
-      { userId, phone, role: userDoc.empty ? 'customer' : userDoc.docs[0].data().role },
+      { userId, phone, role: 'owner' },
       process.env.JWT_SECRET,
       { expiresIn: '7d' }
     );
@@ -466,9 +481,12 @@ app.post('/api/auth/phone/verify-otp', async (req, res) => {
       user: {
         id: userId,
         phone,
-        name: name || userDoc.docs[0]?.data()?.name || 'User',
-        role: userDoc.empty ? 'customer' : userDoc.docs[0].data().role
-      }
+        name: name || userDoc.docs[0]?.data()?.name || 'Restaurant Owner',
+        role: 'owner'
+      },
+      isNewUser,
+      hasRestaurants,
+      redirectTo: isNewUser || !hasRestaurants ? '/admin' : '/admin'
     });
 
   } catch (error) {
@@ -523,13 +541,14 @@ app.post('/api/restaurants', authenticateToken, async (req, res) => {
       features 
     } = req.body;
 
-    if (!name || !address) {
-      return res.status(400).json({ error: 'Restaurant name and address are required' });
+    if (!name) {
+      return res.status(400).json({ error: 'Restaurant name is required' });
     }
 
     const restaurantData = {
       name,
-      address,
+      address: address || null,
+      city: req.body.city || null,
       phone: phone || null,
       email: email || null,
       cuisine: cuisine || [],
@@ -562,6 +581,66 @@ app.post('/api/restaurants', authenticateToken, async (req, res) => {
   } catch (error) {
     console.error('Create restaurant error:', error);
     res.status(500).json({ error: 'Failed to create restaurant' });
+  }
+});
+
+// Update restaurant
+app.patch('/api/restaurants/:restaurantId', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+    const { userId } = req.user;
+    const updateData = {};
+
+    // Only allow owner to update their own restaurants
+    const restaurant = await db.collection(collections.restaurants).doc(restaurantId).get();
+    if (!restaurant.exists || restaurant.data().ownerId !== userId) {
+      return res.status(403).json({ error: 'Access denied' });
+    }
+
+    // Update allowed fields
+    const allowedFields = ['name', 'address', 'city', 'phone', 'email', 'cuisine', 'description'];
+    allowedFields.forEach(field => {
+      if (req.body[field] !== undefined) {
+        updateData[field] = req.body[field];
+      }
+    });
+
+    if (Object.keys(updateData).length === 0) {
+      return res.status(400).json({ error: 'No valid fields to update' });
+    }
+
+    updateData.updatedAt = new Date();
+
+    await db.collection(collections.restaurants).doc(restaurantId).update(updateData);
+
+    res.json({ message: 'Restaurant updated successfully' });
+
+  } catch (error) {
+    console.error('Update restaurant error:', error);
+    res.status(500).json({ error: 'Failed to update restaurant' });
+  }
+});
+
+// Delete restaurant
+app.delete('/api/restaurants/:restaurantId', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+    const { userId } = req.user;
+
+    // Only allow owner to delete their own restaurants
+    const restaurant = await db.collection(collections.restaurants).doc(restaurantId).get();
+    if (!restaurant.exists || restaurant.data().ownerId !== userId) {
+      return res.status(403).json({ error: 'Access denied' });
+    }
+
+    // TODO: Also delete associated staff, menus, orders etc.
+    await db.collection(collections.restaurants).doc(restaurantId).delete();
+
+    res.json({ message: 'Restaurant deleted successfully' });
+
+  } catch (error) {
+    console.error('Delete restaurant error:', error);
+    res.status(500).json({ error: 'Failed to delete restaurant' });
   }
 });
 
@@ -656,6 +735,8 @@ app.post('/api/orders', async (req, res) => {
       items, 
       customerInfo, 
       orderType = 'dine-in',
+      paymentMethod = 'cash',
+      staffInfo,
       notes 
     } = req.body;
 
@@ -694,6 +775,8 @@ app.post('/api/orders', async (req, res) => {
       items: orderItems,
       totalAmount,
       customerInfo: customerInfo || {},
+      paymentMethod: paymentMethod || 'cash',
+      staffInfo: staffInfo || null,
       notes: notes || '',
       status: 'pending',
       kotSent: false,
@@ -1307,27 +1390,33 @@ app.get('/api/staff/:restaurantId', authenticateToken, requireOwnerRole, async (
 app.post('/api/staff/:restaurantId', authenticateToken, requireOwnerRole, async (req, res) => {
   try {
     const { restaurantId } = req.params;
-    const { name, phone, email, role = 'waiter', startDate } = req.body;
+    const { name, phone, email, role = 'waiter', startDate, address } = req.body;
 
-    if (!name || !phone) {
-      return res.status(400).json({ error: 'Name and phone are required' });
+    if (!name || !phone || !email) {
+      return res.status(400).json({ error: 'Name, phone, and email are required' });
     }
 
-    // Check if phone already exists
+    // Check if email already exists
     const existingUser = await db.collection(collections.users)
-      .where('phone', '==', phone)
+      .where('email', '==', email)
       .get();
 
     if (!existingUser.empty) {
-      return res.status(400).json({ error: 'Phone number already registered' });
+      return res.status(400).json({ error: 'Email already registered' });
     }
+
+    // Generate random password for staff
+    const temporaryPassword = Math.random().toString(36).slice(-8);
+    const hashedPassword = await bcrypt.hash(temporaryPassword, 10);
 
     const staffData = {
       name,
       phone,
-      email: email || null,
+      email,
+      password: hashedPassword,
       role,
       restaurantId,
+      address: address || null,
       status: 'active',
       startDate: startDate ? new Date(startDate) : new Date(),
       phoneVerified: false,
@@ -1335,16 +1424,36 @@ app.post('/api/staff/:restaurantId', authenticateToken, requireOwnerRole, async 
       provider: 'staff',
       createdAt: new Date(),
       updatedAt: new Date(),
-      lastLogin: null
+      lastLogin: null,
+      temporaryPassword: true // Flag to indicate password needs to be changed
     };
 
     const staffRef = await db.collection(collections.users).add(staffData);
 
+    // TODO: Send email with login credentials
+    console.log(`📧 Staff Login Credentials for ${name}:`);
+    console.log(`   Login ID: ${email}`);
+    console.log(`   Password: ${temporaryPassword}`);
+    console.log(`   Restaurant: ${restaurantId}`);
+
     res.status(201).json({
-      message: 'Staff member added successfully',
+      message: 'Staff member added successfully. Login credentials sent to email.',
       staff: {
         id: staffRef.id,
-        ...staffData
+        name,
+        phone,
+        email,
+        role,
+        restaurantId,
+        address,
+        status: 'active',
+        startDate: staffData.startDate,
+        createdAt: staffData.createdAt
+      },
+      // For demo purposes, return credentials (remove in production)
+      credentials: {
+        loginId: email,
+        password: temporaryPassword
       }
     });
 
@@ -1395,37 +1504,18 @@ app.delete('/api/staff/:staffId', authenticateToken, requireOwnerRole, async (re
   }
 });
 
-// Staff login with phone OTP (separate from customer login)
-app.post('/api/auth/staff/verify-otp', async (req, res) => {
+// Staff login with email and password
+app.post('/api/auth/staff/login', async (req, res) => {
   try {
-    const { phone, otp, restaurantId } = req.body;
+    const { loginId, password } = req.body;
 
-    if (!phone || !otp || !restaurantId) {
-      return res.status(400).json({ error: 'Phone, OTP, and restaurant ID are required' });
+    if (!loginId || !password) {
+      return res.status(400).json({ error: 'Login ID and password are required' });
     }
 
-    // Verify OTP
-    const otpQuery = await db.collection('otp_verification')
-      .where('phone', '==', phone)
-      .where('otp', '==', otp)
-      .limit(1)
-      .get();
-
-    if (otpQuery.empty) {
-      return res.status(400).json({ error: 'Invalid OTP' });
-    }
-
-    const otpDoc = otpQuery.docs[0];
-    const otpData = otpDoc.data();
-
-    if (new Date() > otpData.otpExpiry.toDate()) {
-      return res.status(400).json({ error: 'OTP expired' });
-    }
-
-    // Find staff member
+    // Find staff member by loginId (email)
     const staffQuery = await db.collection(collections.users)
-      .where('phone', '==', phone)
-      .where('restaurantId', '==', restaurantId)
+      .where('email', '==', loginId)
       .where('role', 'in', ['waiter', 'manager'])
       .where('status', '==', 'active')
       .get();
@@ -1437,20 +1527,22 @@ app.post('/api/auth/staff/verify-otp', async (req, res) => {
     const staffDoc = staffQuery.docs[0];
     const staffData = staffDoc.data();
 
+    // Check password
+    const isValidPassword = await bcrypt.compare(password, staffData.password);
+    if (!isValidPassword) {
+      return res.status(401).json({ error: 'Invalid credentials' });
+    }
+
     // Update last login
     await staffDoc.ref.update({
       lastLogin: new Date(),
-      phoneVerified: true,
       updatedAt: new Date()
     });
-
-    // Delete OTP
-    await otpDoc.ref.delete();
 
     const token = jwt.sign(
       { 
         userId: staffDoc.id, 
-        phone: staffData.phone, 
+        email: staffData.email, 
         role: staffData.role,
         restaurantId: staffData.restaurantId
       },
@@ -1463,10 +1555,11 @@ app.post('/api/auth/staff/verify-otp', async (req, res) => {
       token,
       user: {
         id: staffDoc.id,
-        phone: staffData.phone,
+        email: staffData.email,
         name: staffData.name,
         role: staffData.role,
-        restaurantId: staffData.restaurantId
+        restaurantId: staffData.restaurantId,
+        phone: staffData.phone
       }
     });
 
