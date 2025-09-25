@@ -133,7 +133,9 @@ app.get('/', (req, res) => {
       menus: '/api/menus/* (includes PATCH /api/menus/item/:id, DELETE /api/menus/item/:id)',
       orders: '/api/orders/*',
       payments: '/api/payments/*',
-      tables: '/api/tables/*',
+      tables: '/api/tables/* (includes PATCH /api/tables/:id, DELETE /api/tables/:id)',
+      floors: '/api/floors/*',
+      bookings: '/api/bookings/*',
       analytics: '/api/analytics/*',
       staff: '/api/staff/*'
     }
@@ -1436,7 +1438,7 @@ app.patch('/api/tables/:tableId/status', authenticateToken, async (req, res) => 
     const { tableId } = req.params;
     const { status, orderId } = req.body;
 
-    const validStatuses = ['available', 'occupied', 'reserved', 'cleaning'];
+    const validStatuses = ['available', 'occupied', 'reserved', 'cleaning', 'out-of-service'];
     
     if (!validStatuses.includes(status)) {
       return res.status(400).json({ error: 'Invalid status' });
@@ -1461,6 +1463,450 @@ app.patch('/api/tables/:tableId/status', authenticateToken, async (req, res) => 
   } catch (error) {
     console.error('Update table status error:', error);
     res.status(500).json({ error: 'Failed to update table status' });
+  }
+});
+
+// Update table details
+app.patch('/api/tables/:tableId', authenticateToken, async (req, res) => {
+  try {
+    const { tableId } = req.params;
+    const { name, floor, capacity, section } = req.body;
+
+    const updateData = {
+      updatedAt: new Date()
+    };
+
+    if (name) updateData.name = name;
+    if (floor) updateData.floor = floor;
+    if (capacity) updateData.capacity = capacity;
+    if (section) updateData.section = section;
+
+    if (Object.keys(updateData).length === 1) { // Only updatedAt
+      return res.status(400).json({ error: 'No valid fields to update' });
+    }
+
+    await db.collection(collections.tables).doc(tableId).update(updateData);
+
+    res.json({ message: 'Table updated successfully' });
+
+  } catch (error) {
+    console.error('Update table error:', error);
+    res.status(500).json({ error: 'Failed to update table' });
+  }
+});
+
+// Delete table
+app.delete('/api/tables/:tableId', authenticateToken, async (req, res) => {
+  try {
+    const { tableId } = req.params;
+
+    await db.collection(collections.tables).doc(tableId).delete();
+
+    res.json({ message: 'Table deleted successfully' });
+
+  } catch (error) {
+    console.error('Delete table error:', error);
+    res.status(500).json({ error: 'Failed to delete table' });
+  }
+});
+
+// Floor Management APIs
+app.get('/api/floors/:restaurantId', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+
+    // Get all tables for this restaurant
+    const tablesSnapshot = await db.collection(collections.tables)
+      .where('restaurantId', '==', restaurantId)
+      .orderBy('createdAt', 'asc')
+      .get();
+
+    const tables = [];
+    tablesSnapshot.forEach(doc => {
+      tables.push({
+        id: doc.id,
+        ...doc.data()
+      });
+    });
+
+    // Group tables by floor
+    const floorsMap = {};
+    tables.forEach(table => {
+      const floorName = table.floor || 'Ground Floor';
+      if (!floorsMap[floorName]) {
+        floorsMap[floorName] = {
+          id: `floor_${floorName.toLowerCase().replace(/\s+/g, '_')}`,
+          name: floorName,
+          restaurantId,
+          tables: []
+        };
+      }
+      floorsMap[floorName].tables.push(table);
+    });
+
+    const floors = Object.values(floorsMap);
+    
+    // If no floors exist, create default floor structure
+    if (floors.length === 0) {
+      floors.push({
+        id: 'floor_ground_floor',
+        name: 'Ground Floor',
+        restaurantId,
+        tables: []
+      });
+    }
+
+    res.json({ floors });
+
+  } catch (error) {
+    console.error('Get floors error:', error);
+    res.status(500).json({ error: 'Failed to fetch floors' });
+  }
+});
+
+// Create new floor (creates floor implicitly when adding tables)
+app.post('/api/floors/:restaurantId', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+    const { name } = req.body;
+
+    if (!name) {
+      return res.status(400).json({ error: 'Floor name is required' });
+    }
+
+    // Create a sample table for this floor to establish the floor
+    const tableData = {
+      restaurantId,
+      name: 'Table 1',
+      floor: name,
+      capacity: 4,
+      section: 'Main',
+      status: 'available',
+      currentOrderId: null,
+      lastOrderTime: null,
+      createdAt: new Date(),
+      updatedAt: new Date()
+    };
+
+    const tableRef = await db.collection(collections.tables).add(tableData);
+
+    res.status(201).json({
+      message: 'Floor created successfully with initial table',
+      floor: {
+        id: `floor_${name.toLowerCase().replace(/\s+/g, '_')}`,
+        name,
+        restaurantId,
+        tables: [{
+          id: tableRef.id,
+          ...tableData
+        }]
+      }
+    });
+
+  } catch (error) {
+    console.error('Create floor error:', error);
+    res.status(500).json({ error: 'Failed to create floor' });
+  }
+});
+
+// Update floor (rename all tables on this floor)
+app.patch('/api/floors/:floorId', authenticateToken, async (req, res) => {
+  try {
+    const { floorId } = req.params;
+    const { name, restaurantId } = req.body;
+
+    if (!name || !restaurantId) {
+      return res.status(400).json({ error: 'Floor name and restaurant ID are required' });
+    }
+
+    // Extract original floor name from floorId
+    const originalFloorName = floorId.replace('floor_', '').replace(/_/g, ' ');
+    const originalFloorNameCapitalized = originalFloorName.split(' ').map(word => 
+      word.charAt(0).toUpperCase() + word.slice(1).toLowerCase()
+    ).join(' ');
+
+    // Update all tables on this floor
+    const tablesSnapshot = await db.collection(collections.tables)
+      .where('restaurantId', '==', restaurantId)
+      .where('floor', '==', originalFloorNameCapitalized)
+      .get();
+
+    const batch = db.batch();
+    tablesSnapshot.forEach(doc => {
+      batch.update(doc.ref, {
+        floor: name,
+        updatedAt: new Date()
+      });
+    });
+
+    await batch.commit();
+
+    res.json({ message: 'Floor updated successfully' });
+
+  } catch (error) {
+    console.error('Update floor error:', error);
+    res.status(500).json({ error: 'Failed to update floor' });
+  }
+});
+
+// Delete floor (delete all tables on this floor)
+app.delete('/api/floors/:floorId', authenticateToken, async (req, res) => {
+  try {
+    const { floorId } = req.params;
+    const { restaurantId } = req.query;
+
+    if (!restaurantId) {
+      return res.status(400).json({ error: 'Restaurant ID is required' });
+    }
+
+    // Extract floor name from floorId
+    const floorName = floorId.replace('floor_', '').replace(/_/g, ' ');
+    const floorNameCapitalized = floorName.split(' ').map(word => 
+      word.charAt(0).toUpperCase() + word.slice(1).toLowerCase()
+    ).join(' ');
+
+    // Delete all tables on this floor
+    const tablesSnapshot = await db.collection(collections.tables)
+      .where('restaurantId', '==', restaurantId)
+      .where('floor', '==', floorNameCapitalized)
+      .get();
+
+    const batch = db.batch();
+    tablesSnapshot.forEach(doc => {
+      batch.delete(doc.ref);
+    });
+
+    await batch.commit();
+
+    res.json({ message: 'Floor and all its tables deleted successfully' });
+
+  } catch (error) {
+    console.error('Delete floor error:', error);
+    res.status(500).json({ error: 'Failed to delete floor' });
+  }
+});
+
+// Booking Management APIs
+app.get('/api/bookings/:restaurantId', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+    const { date, status } = req.query;
+
+    let query = db.collection(collections.bookings || 'bookings')
+      .where('restaurantId', '==', restaurantId);
+
+    if (status) {
+      query = query.where('status', '==', status);
+    }
+
+    if (date) {
+      const startDate = new Date(date);
+      const endDate = new Date(date);
+      endDate.setDate(endDate.getDate() + 1);
+      
+      query = query.where('bookingDate', '>=', startDate)
+                   .where('bookingDate', '<', endDate);
+    }
+
+    const snapshot = await query.orderBy('bookingDate', 'desc').get();
+    const bookings = [];
+
+    snapshot.forEach(doc => {
+      bookings.push({
+        id: doc.id,
+        ...doc.data()
+      });
+    });
+
+    res.json({ bookings });
+
+  } catch (error) {
+    console.error('Get bookings error:', error);
+    res.status(500).json({ error: 'Failed to fetch bookings' });
+  }
+});
+
+// Create new booking
+app.post('/api/bookings/:restaurantId', async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+    const { 
+      tableId,
+      customerName, 
+      customerPhone, 
+      customerEmail,
+      partySize, 
+      bookingDate, 
+      bookingTime,
+      duration = 120, // default 2 hours
+      specialRequests,
+      occasionType
+    } = req.body;
+
+    if (!tableId || !customerName || !customerPhone || !bookingDate || !bookingTime || !partySize) {
+      return res.status(400).json({ 
+        error: 'Table ID, customer name, phone, booking date, time, and party size are required' 
+      });
+    }
+
+    // Check if table exists and is available
+    const tableDoc = await db.collection(collections.tables).doc(tableId).get();
+    if (!tableDoc.exists) {
+      return res.status(404).json({ error: 'Table not found' });
+    }
+
+    const tableData = tableDoc.data();
+    if (tableData.status === 'out-of-service') {
+      return res.status(400).json({ error: 'Table is out of service' });
+    }
+
+    // Create booking date-time
+    const bookingDateTime = new Date(`${bookingDate}T${bookingTime}:00`);
+    const endDateTime = new Date(bookingDateTime.getTime() + duration * 60 * 1000);
+
+    // Check for overlapping bookings
+    const overlappingBookings = await db.collection(collections.bookings || 'bookings')
+      .where('tableId', '==', tableId)
+      .where('status', '==', 'confirmed')
+      .where('bookingDate', '>=', new Date(bookingDateTime.getTime() - duration * 60 * 1000))
+      .where('bookingDate', '<=', endDateTime)
+      .get();
+
+    if (!overlappingBookings.empty) {
+      return res.status(400).json({ error: 'Table is already booked for this time slot' });
+    }
+
+    const bookingData = {
+      restaurantId,
+      tableId,
+      tableName: tableData.name,
+      floor: tableData.floor,
+      customerName,
+      customerPhone,
+      customerEmail: customerEmail || null,
+      partySize,
+      bookingDate: bookingDateTime,
+      bookingTime,
+      duration,
+      endTime: endDateTime,
+      status: 'confirmed', // confirmed, arrived, completed, cancelled, no-show
+      specialRequests: specialRequests || null,
+      occasionType: occasionType || null,
+      createdAt: new Date(),
+      updatedAt: new Date()
+    };
+
+    const bookingRef = await db.collection(collections.bookings || 'bookings').add(bookingData);
+
+    // Update table status to reserved if booking is within 30 minutes
+    const now = new Date();
+    const timeDiff = bookingDateTime.getTime() - now.getTime();
+    const minutesDiff = Math.floor(timeDiff / (1000 * 60));
+
+    if (minutesDiff <= 30 && minutesDiff >= -15) { // 30 min before to 15 min after
+      await db.collection(collections.tables).doc(tableId).update({
+        status: 'reserved',
+        currentBookingId: bookingRef.id,
+        updatedAt: new Date()
+      });
+    }
+
+    res.status(201).json({
+      message: 'Booking created successfully',
+      booking: {
+        id: bookingRef.id,
+        ...bookingData
+      }
+    });
+
+  } catch (error) {
+    console.error('Create booking error:', error);
+    res.status(500).json({ error: 'Failed to create booking' });
+  }
+});
+
+// Update booking
+app.patch('/api/bookings/:bookingId', authenticateToken, async (req, res) => {
+  try {
+    const { bookingId } = req.params;
+    const { status, customerName, customerPhone, partySize, specialRequests } = req.body;
+
+    const updateData = {
+      updatedAt: new Date()
+    };
+
+    const validStatuses = ['confirmed', 'arrived', 'completed', 'cancelled', 'no-show'];
+
+    if (status) {
+      if (!validStatuses.includes(status)) {
+        return res.status(400).json({ error: 'Invalid status' });
+      }
+      updateData.status = status;
+    }
+
+    if (customerName) updateData.customerName = customerName;
+    if (customerPhone) updateData.customerPhone = customerPhone;
+    if (partySize) updateData.partySize = partySize;
+    if (specialRequests !== undefined) updateData.specialRequests = specialRequests;
+
+    if (Object.keys(updateData).length === 1) { // Only updatedAt
+      return res.status(400).json({ error: 'No valid fields to update' });
+    }
+
+    await db.collection(collections.bookings || 'bookings').doc(bookingId).update(updateData);
+
+    // If booking status changed to completed or cancelled, update table status
+    if (status && ['completed', 'cancelled', 'no-show'].includes(status)) {
+      const bookingDoc = await db.collection(collections.bookings || 'bookings').doc(bookingId).get();
+      if (bookingDoc.exists) {
+        const bookingData = bookingDoc.data();
+        const tableDoc = await db.collection(collections.tables).doc(bookingData.tableId).get();
+        if (tableDoc.exists && tableDoc.data().currentBookingId === bookingId) {
+          await db.collection(collections.tables).doc(bookingData.tableId).update({
+            status: 'available',
+            currentBookingId: null,
+            updatedAt: new Date()
+          });
+        }
+      }
+    }
+
+    res.json({ message: 'Booking updated successfully' });
+
+  } catch (error) {
+    console.error('Update booking error:', error);
+    res.status(500).json({ error: 'Failed to update booking' });
+  }
+});
+
+// Delete booking
+app.delete('/api/bookings/:bookingId', authenticateToken, async (req, res) => {
+  try {
+    const { bookingId } = req.params;
+
+    // Get booking data first to update table status
+    const bookingDoc = await db.collection(collections.bookings || 'bookings').doc(bookingId).get();
+    if (bookingDoc.exists) {
+      const bookingData = bookingDoc.data();
+      
+      // Update table status if it's currently reserved for this booking
+      const tableDoc = await db.collection(collections.tables).doc(bookingData.tableId).get();
+      if (tableDoc.exists && tableDoc.data().currentBookingId === bookingId) {
+        await db.collection(collections.tables).doc(bookingData.tableId).update({
+          status: 'available',
+          currentBookingId: null,
+          updatedAt: new Date()
+        });
+      }
+    }
+
+    await db.collection(collections.bookings || 'bookings').doc(bookingId).delete();
+
+    res.json({ message: 'Booking deleted successfully' });
+
+  } catch (error) {
+    console.error('Delete booking error:', error);
+    res.status(500).json({ error: 'Failed to delete booking' });
   }
 });
 
