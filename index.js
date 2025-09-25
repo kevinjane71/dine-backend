@@ -130,9 +130,12 @@ app.get('/', (req, res) => {
       health: '/health',
       auth: '/api/auth/*',
       restaurants: '/api/restaurants/*',
-      menus: '/api/menus/*',
+      menus: '/api/menus/* (includes PATCH /api/menus/item/:id, DELETE /api/menus/item/:id)',
       orders: '/api/orders/*',
-      payments: '/api/payments/*'
+      payments: '/api/payments/*',
+      tables: '/api/tables/*',
+      analytics: '/api/analytics/*',
+      staff: '/api/staff/*'
     }
   });
 });
@@ -707,6 +710,13 @@ app.post('/api/menus/:restaurantId', authenticateToken, async (req, res) => {
       shortCode: shortCode || name.substring(0, 3).toUpperCase(),
       status: 'active',
       order: 0,
+      // Availability/Stock management fields
+      isAvailable: req.body.isAvailable !== undefined ? req.body.isAvailable : true,
+      stockQuantity: req.body.stockQuantity || null, // null means unlimited
+      lowStockThreshold: req.body.lowStockThreshold || 5,
+      isStockManaged: req.body.isStockManaged || false,
+      availableFrom: req.body.availableFrom || null, // time-based availability
+      availableUntil: req.body.availableUntil || null,
       createdAt: new Date(),
       updatedAt: new Date()
     };
@@ -724,6 +734,103 @@ app.post('/api/menus/:restaurantId', authenticateToken, async (req, res) => {
   } catch (error) {
     console.error('Create menu item error:', error);
     res.status(500).json({ error: 'Failed to create menu item' });
+  }
+});
+
+// Update menu item
+app.patch('/api/menus/item/:id', authenticateToken, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { userId } = req.user;
+    
+    // Get the menu item first to check ownership
+    const menuItemDoc = await db.collection(collections.menus).doc(id).get();
+    
+    if (!menuItemDoc.exists) {
+      return res.status(404).json({ error: 'Menu item not found' });
+    }
+    
+    const menuItemData = menuItemDoc.data();
+    
+    // Check if user owns the restaurant this menu item belongs to
+    const restaurantDoc = await db.collection(collections.restaurants).doc(menuItemData.restaurantId).get();
+    if (!restaurantDoc.exists || restaurantDoc.data().ownerId !== userId) {
+      return res.status(403).json({ error: 'Access denied' });
+    }
+    
+    const updateData = { updatedAt: new Date() };
+    
+    // Update allowed fields
+    const allowedFields = [
+      'name', 'description', 'price', 'category', 'isVeg', 'spiceLevel', 
+      'allergens', 'image', 'shortCode', 'status', 'order',
+      'isAvailable', 'stockQuantity', 'lowStockThreshold', 'isStockManaged',
+      'availableFrom', 'availableUntil'
+    ];
+    
+    allowedFields.forEach(field => {
+      if (req.body[field] !== undefined) {
+        if (field === 'price') {
+          updateData[field] = parseFloat(req.body[field]);
+        } else {
+          updateData[field] = req.body[field];
+        }
+      }
+    });
+    
+    if (Object.keys(updateData).length === 1) { // Only updatedAt
+      return res.status(400).json({ error: 'No valid fields to update' });
+    }
+    
+    await db.collection(collections.menus).doc(id).update(updateData);
+    
+    res.json({ 
+      message: 'Menu item updated successfully',
+      updatedFields: Object.keys(updateData).filter(key => key !== 'updatedAt')
+    });
+    
+  } catch (error) {
+    console.error('Update menu item error:', error);
+    res.status(500).json({ error: 'Failed to update menu item' });
+  }
+});
+
+// Delete menu item (soft delete)
+app.delete('/api/menus/item/:id', authenticateToken, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { userId } = req.user;
+    
+    // Get the menu item first to check ownership
+    const menuItemDoc = await db.collection(collections.menus).doc(id).get();
+    
+    if (!menuItemDoc.exists) {
+      return res.status(404).json({ error: 'Menu item not found' });
+    }
+    
+    const menuItemData = menuItemDoc.data();
+    
+    // Check if user owns the restaurant this menu item belongs to
+    const restaurantDoc = await db.collection(collections.restaurants).doc(menuItemData.restaurantId).get();
+    if (!restaurantDoc.exists || restaurantDoc.data().ownerId !== userId) {
+      return res.status(403).json({ error: 'Access denied' });
+    }
+    
+    // Soft delete by setting status to 'deleted'
+    await db.collection(collections.menus).doc(id).update({
+      status: 'deleted',
+      deletedAt: new Date(),
+      updatedAt: new Date()
+    });
+    
+    res.json({ 
+      message: 'Menu item deleted successfully',
+      note: 'Item has been soft deleted and can be restored if needed'
+    });
+    
+  } catch (error) {
+    console.error('Delete menu item error:', error);
+    res.status(500).json({ error: 'Failed to delete menu item' });
   }
 });
 
@@ -930,6 +1037,12 @@ app.post('/api/seed-data/:restaurantId', authenticateToken, async (req, res) => 
         restaurantId,
         status: "active",
         order: 1,
+        isAvailable: true,
+        stockQuantity: null, // unlimited
+        lowStockThreshold: 5,
+        isStockManaged: false,
+        availableFrom: null,
+        availableUntil: null,
         createdAt: new Date(),
         updatedAt: new Date()
       },
@@ -945,6 +1058,12 @@ app.post('/api/seed-data/:restaurantId', authenticateToken, async (req, res) => 
         restaurantId,
         status: "active",
         order: 2,
+        isAvailable: true,
+        stockQuantity: null,
+        lowStockThreshold: 5,
+        isStockManaged: false,
+        availableFrom: null,
+        availableUntil: null,
         createdAt: new Date(),
         updatedAt: new Date()
       },
@@ -960,6 +1079,12 @@ app.post('/api/seed-data/:restaurantId', authenticateToken, async (req, res) => 
         restaurantId,
         status: "active",
         order: 3,
+        isAvailable: true,
+        stockQuantity: 15, // limited stock example
+        lowStockThreshold: 3,
+        isStockManaged: true,
+        availableFrom: null,
+        availableUntil: null,
         createdAt: new Date(),
         updatedAt: new Date()
       },
@@ -975,6 +1100,12 @@ app.post('/api/seed-data/:restaurantId', authenticateToken, async (req, res) => 
         restaurantId,
         status: "active",
         order: 4,
+        isAvailable: true,
+        stockQuantity: null,
+        lowStockThreshold: 5,
+        isStockManaged: false,
+        availableFrom: null,
+        availableUntil: null,
         createdAt: new Date(),
         updatedAt: new Date()
       },
@@ -990,6 +1121,12 @@ app.post('/api/seed-data/:restaurantId', authenticateToken, async (req, res) => 
         restaurantId,
         status: "active",
         order: 5,
+        isAvailable: true,
+        stockQuantity: 25,
+        lowStockThreshold: 5,
+        isStockManaged: true,
+        availableFrom: null,
+        availableUntil: null,
         createdAt: new Date(),
         updatedAt: new Date()
       },
@@ -1005,6 +1142,12 @@ app.post('/api/seed-data/:restaurantId', authenticateToken, async (req, res) => 
         restaurantId,
         status: "active",
         order: 6,
+        isAvailable: true,
+        stockQuantity: 20,
+        lowStockThreshold: 3,
+        isStockManaged: true,
+        availableFrom: null,
+        availableUntil: null,
         createdAt: new Date(),
         updatedAt: new Date()
       },
@@ -1020,6 +1163,12 @@ app.post('/api/seed-data/:restaurantId', authenticateToken, async (req, res) => 
         restaurantId,
         status: "active",
         order: 7,
+        isAvailable: true,
+        stockQuantity: null,
+        lowStockThreshold: 5,
+        isStockManaged: false,
+        availableFrom: null,
+        availableUntil: null,
         createdAt: new Date(),
         updatedAt: new Date()
       },
@@ -1035,6 +1184,12 @@ app.post('/api/seed-data/:restaurantId', authenticateToken, async (req, res) => 
         restaurantId,
         status: "active",
         order: 8,
+        isAvailable: true,
+        stockQuantity: null,
+        lowStockThreshold: 5,
+        isStockManaged: false,
+        availableFrom: null,
+        availableUntil: null,
         createdAt: new Date(),
         updatedAt: new Date()
       },
@@ -1050,6 +1205,12 @@ app.post('/api/seed-data/:restaurantId', authenticateToken, async (req, res) => 
         restaurantId,
         status: "active",
         order: 9,
+        isAvailable: true,
+        stockQuantity: 12,
+        lowStockThreshold: 2,
+        isStockManaged: true,
+        availableFrom: null,
+        availableUntil: null,
         createdAt: new Date(),
         updatedAt: new Date()
       },
@@ -1065,6 +1226,12 @@ app.post('/api/seed-data/:restaurantId', authenticateToken, async (req, res) => 
         restaurantId,
         status: "active",
         order: 10,
+        isAvailable: true,
+        stockQuantity: null,
+        lowStockThreshold: 5,
+        isStockManaged: false,
+        availableFrom: null,
+        availableUntil: null,
         createdAt: new Date(),
         updatedAt: new Date()
       }
@@ -1566,6 +1733,51 @@ app.post('/api/auth/staff/login', async (req, res) => {
   } catch (error) {
     console.error('Staff login error:', error);
     res.status(500).json({ error: 'Staff login failed' });
+  }
+});
+
+// Fix user roles - temporary endpoint for fixing customer->owner roles
+app.post('/api/auth/fix-user-roles', async (req, res) => {
+  try {
+    const { phone } = req.body;
+    if (!phone) {
+      return res.status(400).json({ error: 'Phone number required' });
+    }
+    
+    // Find user by phone
+    const userQuery = await db.collection(collections.users)
+      .where('phone', '==', phone)
+      .get();
+      
+    if (userQuery.empty) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+    
+    const userDoc = userQuery.docs[0];
+    const userData = userDoc.data();
+    
+    // Update role to owner if it's customer
+    if (userData.role === 'customer') {
+      await userDoc.ref.update({
+        role: 'owner',
+        updatedAt: new Date()
+      });
+      
+      console.log(`✅ Fixed user role for phone ${phone}: customer -> owner`);
+      res.json({ 
+        message: 'User role updated successfully',
+        oldRole: 'customer',
+        newRole: 'owner'
+      });
+    } else {
+      res.json({ 
+        message: 'User role is already correct',
+        currentRole: userData.role
+      });
+    }
+  } catch (error) {
+    console.error('Fix user roles error:', error);
+    res.status(500).json({ error: 'Failed to fix user roles' });
   }
 });
 
