@@ -1370,13 +1370,12 @@ app.post('/api/seed-orders/:restaurantId', authenticateToken, async (req, res) =
 });
 
 // Table Management APIs
-app.get('/api/tables/:restaurantId', authenticateToken, async (req, res) => {
+app.get('/api/tables/:restaurantId', async (req, res) => {
   try {
     const { restaurantId } = req.params;
 
     const snapshot = await db.collection(collections.tables)
       .where('restaurantId', '==', restaurantId)
-      .orderBy('createdAt', 'asc')
       .get();
 
     const tables = [];
@@ -1511,14 +1510,13 @@ app.delete('/api/tables/:tableId', authenticateToken, async (req, res) => {
 });
 
 // Floor Management APIs
-app.get('/api/floors/:restaurantId', authenticateToken, async (req, res) => {
+app.get('/api/floors/:restaurantId', async (req, res) => {
   try {
     const { restaurantId } = req.params;
 
     // Get all tables for this restaurant
     const tablesSnapshot = await db.collection(collections.tables)
       .where('restaurantId', '==', restaurantId)
-      .orderBy('createdAt', 'asc')
       .get();
 
     const tables = [];
