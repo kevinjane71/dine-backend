@@ -2233,23 +2233,26 @@ app.get('/api/kot/:restaurantId', authenticateToken, async (req, res) => {
     const { restaurantId } = req.params;
     const { status } = req.query;
 
+    // Use a simpler query to avoid Firestore composite index requirements
     let query = db.collection(collections.orders).where('restaurantId', '==', restaurantId);
     
-    // Only show orders that need kitchen attention (confirmed status and above)
-    const validKotStatuses = ['confirmed', 'preparing', 'ready', 'served'];
-    
-    if (status && validKotStatuses.includes(status)) {
+    // If specific status requested, filter by that
+    if (status && ['confirmed', 'preparing', 'ready', 'served'].includes(status)) {
       query = query.where('status', '==', status);
-    } else {
-      // Get all orders that need kitchen attention
-      query = query.where('status', 'in', validKotStatuses);
     }
 
-    const ordersSnapshot = await query.orderBy('createdAt', 'desc').limit(50).get();
+    // Get all orders and filter in memory to avoid complex indexing
+    const ordersSnapshot = await query.limit(100).get();
     const orders = [];
+    const validKotStatuses = ['confirmed', 'preparing', 'ready', 'served'];
 
     for (const doc of ordersSnapshot.docs) {
       const orderData = { id: doc.id, ...doc.data() };
+      
+      // Filter in memory if no specific status was requested
+      if (!status && !validKotStatuses.includes(orderData.status)) {
+        continue; // Skip orders that don't need kitchen attention
+      }
       
       // Get table information if tableNumber exists
       let tableInfo = null;
