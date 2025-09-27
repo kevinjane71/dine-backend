@@ -7,6 +7,9 @@ const jwt = require('jsonwebtoken');
 const bcrypt = require('bcryptjs');
 const QRCode = require('qrcode');
 const { OAuth2Client } = require('google-auth-library');
+const multer = require('multer');
+const { Storage } = require('@google-cloud/storage');
+const OpenAI = require('openai');
 // const twilio = require('twilio');
 // const Razorpay = require('razorpay');
 require('dotenv').config();
@@ -22,6 +25,47 @@ const googleClient = new OAuth2Client(process.env.GOOGLE_CLIENT_ID);
 //   key_id: process.env.RAZORPAY_KEY_ID,
 //   key_secret: process.env.RAZORPAY_KEY_SECRET
 // });
+
+// Initialize Firebase Storage
+let storage;
+if (process.env.NODE_ENV === 'production') {
+  // For production
+  const serviceAccount = JSON.parse(process.env.GOOGLE_APPLICATION_CREDENTIALS_JSON);
+  storage = new Storage({
+    projectId: serviceAccount.project_id,
+    credentials: {
+      client_email: serviceAccount.client_email,
+      private_key: serviceAccount.private_key
+    }
+  });
+} else {
+  // For local development
+  storage = new Storage();
+}
+const bucket = storage.bucket(process.env.FIREBASE_STORAGE_BUCKET || 'dine-menu-uploads');
+
+// Initialize OpenAI
+const openai = new OpenAI({
+  apiKey: process.env.OPENAI_API_KEY,
+});
+
+// Configure multer for file uploads
+const upload = multer({ 
+  storage: multer.memoryStorage(),
+  limits: {
+    fileSize: 300 * 1024 * 1024, // 300MB max file size
+    files: 10 // Max 10 files
+  },
+  fileFilter: (req, file, cb) => {
+    // Allow images and PDFs
+    const allowedTypes = ['image/jpeg', 'image/png', 'image/jpg', 'image/webp', 'application/pdf'];
+    if (allowedTypes.includes(file.mimetype)) {
+      cb(null, true);
+    } else {
+      cb(new Error('Invalid file type. Only images and PDFs are allowed.'), false);
+    }
+  }
+});
 
 const corsOptions = {
   origin: function (origin, callback) {
@@ -71,14 +115,22 @@ const authenticateToken = (req, res, next) => {
   const authHeader = req.headers['authorization'];
   const token = authHeader && authHeader.split(' ')[1];
 
+  console.log('Auth header:', authHeader);
+  console.log('Token:', token ? 'Present' : 'Missing');
+  console.log('Request URL:', req.url);
+  console.log('Request method:', req.method);
+
   if (!token) {
+    console.log('No token found, returning 401');
     return res.status(401).json({ error: 'Access token required' });
   }
 
   jwt.verify(token, process.env.JWT_SECRET, (err, user) => {
     if (err) {
+      console.log('Token verification failed:', err.message);
       return res.status(403).json({ error: 'Invalid or expired token' });
     }
+    console.log('Token verified successfully for user:', user.userId);
     req.user = user;
     next();
   });
@@ -100,6 +152,106 @@ const sendOTP = async (phone, otp) => {
   } catch (error) {
     console.error('SMS Error:', error);
     return false;
+  }
+};
+
+// Helper function to upload file to Firebase Storage
+const uploadToFirebase = async (file, restaurantId) => {
+  console.log(`\n=== UPLOADING FILE TO FIREBASE ===`);
+  console.log('File details:', {
+    originalname: file.originalname,
+    mimetype: file.mimetype,
+    size: file.size,
+    bufferLength: file.buffer ? file.buffer.length : 'No buffer'
+  });
+  console.log('Restaurant ID:', restaurantId);
+  
+  const filename = `menu-uploads/${restaurantId}/${Date.now()}-${file.originalname}`;
+  console.log('Firebase filename:', filename);
+  console.log('Bucket name:', bucket.name);
+  
+  const blob = bucket.file(filename);
+  
+  try {
+    console.log('Starting Firebase upload...');
+    await blob.save(file.buffer, {
+      contentType: file.mimetype,
+      metadata: {
+        restaurantId: restaurantId,
+        uploadedAt: new Date().toISOString()
+      }
+    });
+    
+    const fileUrl = `https://storage.googleapis.com/${bucket.name}/${filename}`;
+    console.log('✅ Firebase upload successful!');
+    console.log('File URL:', fileUrl);
+    
+    return fileUrl;
+  } catch (error) {
+    console.error('❌ Firebase upload failed:', error);
+    throw error;
+  }
+};
+
+// Helper function to extract menu from image using OpenAI Vision
+const extractMenuFromImage = async (imageUrl) => {
+  try {
+    const response = await openai.chat.completions.create({
+      model: "gpt-4-turbo",
+      messages: [
+        {
+          role: "user",
+          content: [
+            {
+              type: "text",
+              text: `Analyze this menu image and extract all menu items. Return the data in the following JSON format:
+              {
+                "menuItems": [
+                  {
+                    "name": "Item Name",
+                    "description": "Item description",
+                    "price": 100,
+                    "category": "appetizer|main-course|dessert|beverages|bread|rice|dal",
+                    "isVeg": true,
+                    "spiceLevel": "mild|medium|hot",
+                    "allergens": ["dairy", "gluten", "nuts"],
+                    "shortCode": "ABC"
+                  }
+                ]
+              }
+              
+              Rules:
+              - Extract ALL visible menu items
+              - Convert prices to numbers (remove currency symbols)
+              - Categorize items appropriately
+              - Set isVeg based on item content (true for vegetarian, false for non-vegetarian)
+              - Generate shortCode as first 3 letters of item name
+              - Include allergens if mentioned
+              - If description is not available, leave empty string
+              - Ensure all prices are numeric values`
+            },
+            {
+              type: "image_url",
+              image_url: {
+                url: imageUrl
+              }
+            }
+          ]
+        }
+      ],
+      max_tokens: 4000
+    });
+
+    const content = response.choices[0].message.content;
+    // Extract JSON from the response
+    const jsonMatch = content.match(/\{[\s\S]*\}/);
+    if (jsonMatch) {
+      return JSON.parse(jsonMatch[0]);
+    }
+    throw new Error('No valid JSON found in response');
+  } catch (error) {
+    console.error('Error extracting menu from image:', error);
+    throw error;
   }
 };
 
@@ -1019,6 +1171,289 @@ app.post('/api/payments/verify', async (req, res) => {
   } catch (error) {
     console.error('Verify payment error:', error);
     res.status(500).json({ error: 'Payment verification failed' });
+  }
+});
+
+// Bulk menu upload API
+app.post('/api/menus/bulk-upload/:restaurantId', authenticateToken, upload.array('menuFiles', 10), async (req, res) => {
+  try {
+    console.log(`\n=== BULK UPLOAD REQUEST RECEIVED ===`);
+    const { restaurantId } = req.params;
+    const { userId } = req.user;
+    const files = req.files;
+
+    console.log('Restaurant ID:', restaurantId);
+    console.log('User ID:', userId);
+    console.log('Files received:', files ? files.length : 'No files');
+    
+    if (files && files.length > 0) {
+      files.forEach((file, index) => {
+        console.log(`File ${index + 1}:`, {
+          originalname: file.originalname,
+          mimetype: file.mimetype,
+          size: file.size,
+          fieldname: file.fieldname,
+          hasBuffer: !!file.buffer
+        });
+      });
+    }
+
+    if (!files || files.length === 0) {
+      console.log('❌ No files uploaded');
+      return res.status(400).json({ error: 'No files uploaded' });
+    }
+
+    if (files.length > 10) {
+      console.log('❌ Too many files:', files.length);
+      return res.status(400).json({ error: 'Maximum 10 files allowed' });
+    }
+
+    // Check if user owns the restaurant
+    const restaurant = await db.collection(collections.restaurants).doc(restaurantId).get();
+    if (!restaurant.exists || restaurant.data().ownerId !== userId) {
+      return res.status(403).json({ error: 'Access denied' });
+    }
+
+    const uploadedFiles = [];
+    const extractedMenus = [];
+    const errors = [];
+
+    // Upload files to Firebase Storage
+    console.log(`\n=== STARTING FIREBASE UPLOADS ===`);
+    for (let i = 0; i < files.length; i++) {
+      const file = files[i];
+      console.log(`\n--- Uploading file ${i + 1}/${files.length}: ${file.originalname} ---`);
+      
+      try {
+        const fileUrl = await uploadToFirebase(file, restaurantId);
+        uploadedFiles.push({
+          originalName: file.originalname,
+          url: fileUrl,
+          size: file.size,
+          mimetype: file.mimetype
+        });
+        console.log(`✅ File ${i + 1} uploaded successfully`);
+      } catch (error) {
+        console.error(`❌ Error uploading file ${i + 1} (${file.originalname}):`, error);
+        errors.push(`Failed to upload ${file.originalname}: ${error.message}`);
+      }
+    }
+    
+    console.log(`\n=== UPLOAD SUMMARY ===`);
+    console.log('Successfully uploaded:', uploadedFiles.length);
+    console.log('Upload errors:', errors.length);
+    if (errors.length > 0) {
+      console.log('Error details:', errors);
+    }
+
+    // Extract menu data from uploaded images
+    console.log(`\n=== STARTING AI EXTRACTION ===`);
+    for (let i = 0; i < uploadedFiles.length; i++) {
+      const uploadedFile = uploadedFiles[i];
+      console.log(`\n--- Processing file ${i + 1}/${uploadedFiles.length}: ${uploadedFile.originalName} ---`);
+      console.log('File URL:', uploadedFile.url);
+      console.log('File type:', uploadedFile.mimetype);
+      
+      try {
+        if (uploadedFile.mimetype.startsWith('image/')) {
+          console.log('Starting AI extraction for image...');
+          const menuData = await extractMenuFromImage(uploadedFile.url);
+          console.log('✅ AI extraction successful!');
+          console.log('Extracted items:', menuData.menuItems ? menuData.menuItems.length : 0);
+          
+          // Add original file info to each menu item
+          const menuItemsWithFile = (menuData.menuItems || []).map(item => ({
+            ...item,
+            originalFile: uploadedFile.originalName
+          }));
+          
+          extractedMenus.push({
+            file: uploadedFile.originalName,
+            menuItems: menuItemsWithFile
+          });
+        } else {
+          console.log('⚠️ Skipping non-image file (PDF processing not implemented)');
+          errors.push(`PDF processing not implemented yet: ${uploadedFile.originalName}`);
+        }
+      } catch (error) {
+        console.error(`❌ Error extracting menu from ${uploadedFile.originalName}:`, error);
+        errors.push(`Failed to extract menu from ${uploadedFile.originalName}: ${error.message}`);
+      }
+    }
+    
+    console.log(`\n=== EXTRACTION SUMMARY ===`);
+    console.log('Files processed:', uploadedFiles.length);
+    console.log('Menus extracted:', extractedMenus.length);
+    console.log('Extraction errors:', errors.length);
+
+    // Prepare response with detailed status
+    const response = {
+      success: errors.length === 0,
+      message: errors.length === 0 
+        ? 'Files uploaded and processed successfully' 
+        : 'Files uploaded with some issues',
+      uploadedFiles: uploadedFiles.length,
+      extractedMenus: extractedMenus.length,
+      errors: errors,
+      data: extractedMenus,
+      summary: {
+        totalFiles: files.length,
+        uploadedSuccessfully: uploadedFiles.length,
+        uploadErrors: errors.filter(e => e.includes('Failed to upload')).length,
+        extractionErrors: errors.filter(e => e.includes('Failed to extract')).length,
+        pdfErrors: errors.filter(e => e.includes('PDF processing not implemented')).length
+      }
+    };
+
+    // Return appropriate status code based on success
+    if (errors.length === 0) {
+      res.status(200).json(response);
+    } else if (uploadedFiles.length > 0) {
+      res.status(207).json(response); // Multi-status (partial success)
+    } else {
+      res.status(400).json(response);
+    }
+
+  } catch (error) {
+    console.error('Bulk upload error:', error);
+    
+    // Categorize different types of errors
+    let errorType = 'UNKNOWN_ERROR';
+    let userMessage = 'An unexpected error occurred';
+    
+    if (error.message.includes('Firebase')) {
+      errorType = 'STORAGE_ERROR';
+      userMessage = 'Failed to upload files to storage. Please check your Firebase configuration.';
+    } else if (error.message.includes('OpenAI') || error.message.includes('AuthenticationError')) {
+      errorType = 'AI_SERVICE_ERROR';
+      userMessage = 'AI service is currently unavailable. Please try again later or contact support.';
+    } else if (error.message.includes('permissions')) {
+      errorType = 'PERMISSION_ERROR';
+      userMessage = 'Insufficient permissions to process the request. Please check your account settings.';
+    } else if (error.message.includes('network') || error.message.includes('timeout')) {
+      errorType = 'NETWORK_ERROR';
+      userMessage = 'Network error occurred. Please check your connection and try again.';
+    }
+    
+    res.status(500).json({ 
+      success: false,
+      error: userMessage,
+      errorType: errorType,
+      details: process.env.NODE_ENV === 'development' ? error.message : 'Internal server error',
+      timestamp: new Date().toISOString()
+    });
+  }
+});
+
+// Save extracted menu items to database
+app.post('/api/menus/bulk-save/:restaurantId', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+    const { userId } = req.user;
+    const { menuItems } = req.body;
+
+    if (!menuItems || !Array.isArray(menuItems)) {
+      return res.status(400).json({ error: 'Menu items array is required' });
+    }
+
+    // Check if user owns the restaurant
+    const restaurant = await db.collection(collections.restaurants).doc(restaurantId).get();
+    if (!restaurant.exists || restaurant.data().ownerId !== userId) {
+      return res.status(403).json({ error: 'Access denied' });
+    }
+
+    const savedItems = [];
+    const errors = [];
+
+    // Save each menu item
+    for (const item of menuItems) {
+      try {
+        // Convert AI extracted data to match manual menu item format
+        const menuItem = {
+          restaurantId,
+          name: item.name || 'Unnamed Item',
+          description: item.description || '',
+          price: parseFloat(item.price) || 0,
+          category: item.category || 'main-course',
+          isVeg: Boolean(item.isVeg),
+          spiceLevel: item.spiceLevel || 'medium',
+          allergens: Array.isArray(item.allergens) ? item.allergens : [],
+          shortCode: item.shortCode || item.name.substring(0, 3).toUpperCase(),
+          status: 'active',
+          order: 0,
+          isAvailable: true,
+          stockQuantity: null,
+          lowStockThreshold: 5,
+          isStockManaged: false,
+          availableFrom: null,
+          availableUntil: null,
+          createdAt: new Date(),
+          updatedAt: new Date(),
+          // Add source tracking
+          source: 'ai_upload',
+          originalFile: item.originalFile || null
+        };
+
+        const menuRef = await db.collection(collections.menus).add(menuItem);
+        savedItems.push({
+          id: menuRef.id,
+          ...menuItem
+        });
+      } catch (error) {
+        console.error(`Error saving menu item ${item.name}:`, error);
+        errors.push(`Failed to save ${item.name}: ${error.message}`);
+      }
+    }
+
+    res.json({
+      message: 'Menu items saved successfully',
+      savedCount: savedItems.length,
+      errorCount: errors.length,
+      savedItems: savedItems,
+      errors: errors
+    });
+
+  } catch (error) {
+    console.error('Bulk save error:', error);
+    res.status(500).json({ error: 'Bulk save failed', details: error.message });
+  }
+});
+
+// Get upload status and extracted menu preview
+app.get('/api/menus/upload-status/:restaurantId', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+    const { userId } = req.user;
+
+    // Check if user owns the restaurant
+    const restaurant = await db.collection(collections.restaurants).doc(restaurantId).get();
+    if (!restaurant.exists || restaurant.data().ownerId !== userId) {
+      return res.status(403).json({ error: 'Access denied' });
+    }
+
+    // Get recent menu items for this restaurant
+    const menuSnapshot = await db.collection(collections.menus)
+      .where('restaurantId', '==', restaurantId)
+      .orderBy('createdAt', 'desc')
+      .limit(50)
+      .get();
+
+    const recentItems = [];
+    menuSnapshot.forEach(doc => {
+      recentItems.push({
+        id: doc.id,
+        ...doc.data()
+      });
+    });
+
+    res.json({
+      totalItems: recentItems.length,
+      recentItems: recentItems
+    });
+
+  } catch (error) {
+    console.error('Upload status error:', error);
+    res.status(500).json({ error: 'Failed to get upload status' });
   }
 });
 
