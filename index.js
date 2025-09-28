@@ -211,7 +211,7 @@ const extractMenuFromImage = async (imageUrl) => {
                     "name": "Item Name",
                     "description": "Item description",
                     "price": 100,
-                    "category": "appetizer|main-course|dessert|beverages|bread|rice|dal",
+                    "category": "appetizer|main-course|dessert|beverages|bread|rice|dal|fast-food|chinese|pizza|south-indian|north-indian",
                     "isVeg": true,
                     "spiceLevel": "mild|medium|hot",
                     "allergens": ["dairy", "gluten", "nuts"],
@@ -219,6 +219,22 @@ const extractMenuFromImage = async (imageUrl) => {
                   }
                 ]
               }
+              
+              Category mapping guidelines:
+              - appetizer: Starters, snacks, small plates, finger foods
+              - main-course: Main dishes, entrees, substantial meals
+              - dessert: Sweet dishes, ice cream, cakes, sweets
+              - beverages: Drinks, juices, soft drinks, tea, coffee
+              - rice: Rice dishes, biryani, pulao, fried rice
+              - bread: Roti, naan, paratha, bread items
+              - dal: Dal, curry, gravy dishes, lentil preparations
+              - fast-food: Burgers, sandwiches, quick bites
+              - chinese: Chinese cuisine items
+              - pizza: Pizza varieties
+              - south-indian: Dosa, idli, sambar, rasam, South Indian dishes
+              - north-indian: North Indian curries, tandoor items
+              
+              Important: Choose the most appropriate category based on the dish type and cuisine style.
               
               Rules:
               - Extract ALL visible menu items
@@ -1368,13 +1384,55 @@ app.post('/api/menus/bulk-save/:restaurantId', authenticateToken, async (req, re
     // Save each menu item
     for (const item of menuItems) {
       try {
+        // Map AI category to our category system
+        const mapAICategory = (aiCategory) => {
+          if (!aiCategory) return 'main-course';
+          
+          const categoryMap = {
+            'appetizer': 'appetizer',
+            'appetizers': 'appetizer',
+            'starter': 'appetizer',
+            'starters': 'appetizer',
+            'main course': 'main-course',
+            'main': 'main-course',
+            'mains': 'main-course',
+            'entree': 'main-course',
+            'entrees': 'main-course',
+            'dessert': 'dessert',
+            'desserts': 'dessert',
+            'sweet': 'dessert',
+            'beverage': 'beverages',
+            'beverages': 'beverages',
+            'drink': 'beverages',
+            'drinks': 'beverages',
+            'rice': 'rice',
+            'biryani': 'rice',
+            'bread': 'bread',
+            'roti': 'bread',
+            'naan': 'bread',
+            'dal': 'dal',
+            'curry': 'dal',
+            'curries': 'dal',
+            'fast food': 'fast-food',
+            'fastfood': 'fast-food',
+            'burger': 'fast-food',
+            'pizza': 'pizza',
+            'chinese': 'chinese',
+            'south indian': 'south-indian',
+            'north indian': 'north-indian'
+          };
+          
+          const normalizedCategory = aiCategory.toLowerCase().trim();
+          return categoryMap[normalizedCategory] || 'main-course';
+        };
+
         // Convert AI extracted data to match manual menu item format
         const menuItem = {
           restaurantId,
           name: item.name || 'Unnamed Item',
           description: item.description || '',
           price: parseFloat(item.price) || 0,
-          category: item.category || 'main-course',
+          category: mapAICategory(item.category),
           isVeg: Boolean(item.isVeg),
           spiceLevel: item.spiceLevel || 'medium',
           allergens: Array.isArray(item.allergens) ? item.allergens : [],
