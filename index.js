@@ -1063,6 +1063,10 @@ app.post('/api/orders', async (req, res) => {
     };
 
     const orderRef = await db.collection(collections.orders).add(orderData);
+    
+    console.log(`🛒 Order created successfully: ${orderRef.id} with status: ${orderData.status}`);
+    console.log(`📋 Order items: ${orderData.items.length} items`);
+    console.log(`🏪 Restaurant: ${orderData.restaurantId}`);
 
     res.status(201).json({
       message: 'Order created successfully',
@@ -1081,7 +1085,9 @@ app.post('/api/orders', async (req, res) => {
 app.get('/api/orders/:restaurantId', authenticateToken, async (req, res) => {
   try {
     const { restaurantId } = req.params;
-    const { status, date } = req.query;
+    const { status, date, search } = req.query;
+
+    console.log(`🔍 Orders API - Restaurant: ${restaurantId}, Status: ${status || 'all'}, Search: ${search || 'none'}`);
 
     let query = db.collection(collections.orders)
       .where('restaurantId', '==', restaurantId);
@@ -1100,7 +1106,7 @@ app.get('/api/orders/:restaurantId', authenticateToken, async (req, res) => {
     }
 
     const snapshot = await query.orderBy('createdAt', 'desc').get();
-    const orders = [];
+    let orders = [];
 
     snapshot.forEach(doc => {
       orders.push({
@@ -1108,6 +1114,38 @@ app.get('/api/orders/:restaurantId', authenticateToken, async (req, res) => {
         ...doc.data()
       });
     });
+
+    // Apply search filter if provided
+    if (search) {
+      const searchValue = search.toLowerCase().trim();
+      console.log(`🔎 Searching orders for: "${searchValue}"`);
+      
+      orders = orders.filter(order => {
+        // Search by order ID (case insensitive) - Order IDs are unique, return regardless of status
+        if (order.id.toLowerCase().includes(searchValue)) {
+          console.log(`✅ Found match by order ID: ${order.id} (status: ${order.status})`);
+          return true;
+        }
+        
+        // Search by table number (if exists) - Only return non-completed for table searches
+        if (order.tableNumber && order.tableNumber.toString().toLowerCase().includes(searchValue)) {
+          if (order.status !== 'completed' && order.status !== 'cancelled') {
+            console.log(`✅ Found match by table number: ${order.tableNumber} (status: ${order.status})`);
+            return true;
+          } else {
+            console.log(`❌ Found order by table ${order.tableNumber} but it's ${order.status}`);
+          }
+        }
+        
+        return false;
+      });
+      
+      console.log(`📊 Search results: ${orders.length} orders found`);
+    } else {
+      // If no search, filter out completed orders by default
+      orders = orders.filter(order => order.status !== 'completed' && order.status !== 'cancelled');
+      console.log(`📊 All active orders: ${orders.length} orders found`);
+    }
 
     res.json({ orders });
 
@@ -1140,6 +1178,110 @@ app.patch('/api/orders/:orderId/status', authenticateToken, async (req, res) => 
     res.status(500).json({ error: 'Failed to update order status' });
   }
 });
+
+// Update order (items, table number, etc.)
+app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
+  try {
+    const { orderId } = req.params;
+    const { items, tableNumber, orderType, paymentMethod, updatedAt, lastUpdatedBy } = req.body;
+
+    // Validate items if provided
+    if (items && (!Array.isArray(items) || items.length === 0)) {
+      return res.status(400).json({ error: 'Items must be a non-empty array' });
+    }
+
+    // Get current order to validate it exists
+    const orderDoc = await db.collection(collections.orders).doc(orderId).get();
+    if (!orderDoc.exists) {
+      return res.status(404).json({ error: 'Order not found' });
+    }
+
+    const currentOrder = orderDoc.data();
+    
+    // Don't allow updates to completed or cancelled orders
+    if (currentOrder.status === 'completed' || currentOrder.status === 'cancelled') {
+      return res.status(400).json({ error: 'Cannot update completed or cancelled orders' });
+    }
+
+    // Prepare update data
+    const updateData = {
+      updatedAt: updatedAt ? new Date(updatedAt) : new Date()
+    };
+
+    if (items) {
+      // Compare with existing items to mark new/updated items
+      const existingItems = currentOrder.items || [];
+      const processedItems = items.map(newItem => {
+        const existingItem = existingItems.find(existing => existing.menuItemId === newItem.menuItemId);
+        
+        if (!existingItem) {
+          // This is a completely new item
+          return { ...newItem, isNew: true, addedAt: new Date().toISOString() };
+        } else if (existingItem.quantity !== newItem.quantity) {
+          // This item's quantity was updated
+          return { ...newItem, isUpdated: true, updatedAt: new Date().toISOString() };
+        } else {
+          // This item was not changed
+          return { ...newItem };
+        }
+      });
+      
+      updateData.items = processedItems;
+      updateData.itemCount = processedItems.reduce((sum, item) => sum + item.quantity, 0);
+      updateData.totalAmount = await calculateOrderTotal(processedItems);
+    }
+
+    if (tableNumber !== undefined) updateData.tableNumber = tableNumber;
+    if (orderType) updateData.orderType = orderType;
+    if (paymentMethod) updateData.paymentMethod = paymentMethod;
+    if (lastUpdatedBy) updateData.lastUpdatedBy = lastUpdatedBy;
+
+    // Add update history
+    const updateHistory = currentOrder.updateHistory || [];
+    updateHistory.push({
+      timestamp: updateData.updatedAt,
+      updatedBy: lastUpdatedBy || { name: 'System', id: 'system' },
+      changes: {
+        items: items ? `Updated to ${items.length} items` : null,
+        tableNumber: tableNumber !== undefined ? `Changed to ${tableNumber}` : null,
+        orderType: orderType ? `Changed to ${orderType}` : null,
+        paymentMethod: paymentMethod ? `Changed to ${paymentMethod}` : null
+      }
+    });
+    updateData.updateHistory = updateHistory;
+
+    await db.collection(collections.orders).doc(orderId).update(updateData);
+
+    res.json({ 
+      message: 'Order updated successfully',
+      data: { orderId }
+    });
+
+  } catch (error) {
+    console.error('Update order error:', error);
+    res.status(500).json({ error: 'Failed to update order' });
+  }
+});
+
+// Helper function to calculate order total
+async function calculateOrderTotal(items) {
+  let total = 0;
+  
+  for (const item of items) {
+    try {
+      const menuItemDoc = await db.collection(collections.menuItems).doc(item.menuItemId).get();
+      if (menuItemDoc.exists) {
+        const menuItem = menuItemDoc.data();
+        total += menuItem.price * item.quantity;
+      }
+    } catch (error) {
+      console.error('Error calculating item total:', error);
+      // Continue with other items if one fails
+    }
+  }
+  
+  return total;
+}
 
 app.post('/api/payments/create', async (req, res) => {
   try {
@@ -2726,35 +2868,48 @@ app.get('/api/kot/:restaurantId', async (req, res) => {
     const { restaurantId } = req.params;
     const { status } = req.query;
 
-    // Get orders from today onwards to avoid loading too much historical data
-    const todayStart = new Date();
-    todayStart.setHours(0, 0, 0, 0);
+    console.log(`🔍 KOT API - Getting orders for restaurant: ${restaurantId}, status filter: ${status || 'all'}`);
+
+    // Get orders from yesterday onwards to avoid loading too much historical data
+    const yesterdayStart = new Date();
+    yesterdayStart.setDate(yesterdayStart.getDate() - 1);
+    yesterdayStart.setHours(0, 0, 0, 0);
+
+    console.log(`📅 Filtering orders from: ${yesterdayStart.toISOString()}`);
 
     // Use a simpler query to avoid Firestore composite index requirements
     let query = db.collection(collections.orders)
       .where('restaurantId', '==', restaurantId)
-      .where('createdAt', '>=', todayStart)
+      .where('createdAt', '>=', yesterdayStart)
       .orderBy('createdAt', 'desc');
     
     // Get all orders and filter in memory to avoid complex indexing
     const ordersSnapshot = await query.limit(100).get();
+    console.log(`📊 Total orders found in DB: ${ordersSnapshot.docs.length}`);
+    
     const orders = [];
-    const validKotStatuses = ['confirmed', 'preparing', 'ready', 'served'];
+    const validKotStatuses = ['confirmed', 'preparing', 'ready'];
+    console.log(`✅ Valid KOT statuses: ${validKotStatuses.join(', ')}`);
 
     for (const doc of ordersSnapshot.docs) {
       const orderData = { id: doc.id, ...doc.data() };
+      console.log(`📋 Order ${doc.id}: status="${orderData.status}", created="${orderData.createdAt?.toDate()?.toISOString()}"`);
       
       // If specific status requested, filter by that
       if (status && status !== 'all') {
         if (orderData.status !== status) {
+          console.log(`❌ Skipping order ${doc.id} - status "${orderData.status}" doesn't match filter "${status}"`);
           continue;
         }
       } else {
         // For 'all' or no status filter, show only kitchen-relevant orders
         if (!validKotStatuses.includes(orderData.status)) {
+          console.log(`❌ Skipping order ${doc.id} - status "${orderData.status}" not in valid KOT statuses`);
           continue; // Skip orders that don't need kitchen attention
         }
       }
+      
+      console.log(`✅ Including order ${doc.id} in KOT list`);
       
       // Get table information if tableNumber exists
       let tableInfo = null;
@@ -2806,6 +2961,11 @@ app.get('/api/kot/:restaurantId', async (req, res) => {
         updatedAt: orderData.updatedAt?.toDate()?.toISOString() || new Date().toISOString()
       });
     }
+
+    console.log(`🍽️ Final KOT result: ${orders.length} orders`);
+    orders.forEach(order => {
+      console.log(`   - Order ${order.id}: ${order.status} (${order.items?.length || 0} items)`);
+    });
 
     res.json({
       orders,
