@@ -1055,7 +1055,7 @@ app.post('/api/orders', async (req, res) => {
       paymentMethod: paymentMethod || 'cash',
       staffInfo: staffInfo || null,
       notes: notes || '',
-      status: 'pending',
+      status: req.body.status || 'pending',
       kotSent: false,
       paymentStatus: 'pending',
       createdAt: new Date(),
@@ -1122,7 +1122,7 @@ app.patch('/api/orders/:orderId/status', authenticateToken, async (req, res) => 
     const { orderId } = req.params;
     const { status } = req.body;
 
-    const validStatuses = ['pending', 'confirmed', 'preparing', 'ready', 'served', 'cancelled'];
+    const validStatuses = ['pending', 'confirmed', 'preparing', 'ready', 'served', 'completed', 'cancelled'];
     
     if (!validStatuses.includes(status)) {
       return res.status(400).json({ error: 'Invalid status' });
@@ -2721,19 +2721,21 @@ app.post('/api/auth/fix-user-roles', async (req, res) => {
 // KOT (Kitchen Order Ticket) Management APIs
 
 // Get KOT orders for kitchen - only orders with status 'confirmed' or later, not 'cancelled'
-app.get('/api/kot/:restaurantId', authenticateToken, async (req, res) => {
+app.get('/api/kot/:restaurantId', async (req, res) => {
   try {
     const { restaurantId } = req.params;
     const { status } = req.query;
 
-    // Use a simpler query to avoid Firestore composite index requirements
-    let query = db.collection(collections.orders).where('restaurantId', '==', restaurantId);
-    
-    // If specific status requested, filter by that
-    if (status && ['confirmed', 'preparing', 'ready', 'served'].includes(status)) {
-      query = query.where('status', '==', status);
-    }
+    // Get orders from today onwards to avoid loading too much historical data
+    const todayStart = new Date();
+    todayStart.setHours(0, 0, 0, 0);
 
+    // Use a simpler query to avoid Firestore composite index requirements
+    let query = db.collection(collections.orders)
+      .where('restaurantId', '==', restaurantId)
+      .where('createdAt', '>=', todayStart)
+      .orderBy('createdAt', 'desc');
+    
     // Get all orders and filter in memory to avoid complex indexing
     const ordersSnapshot = await query.limit(100).get();
     const orders = [];
@@ -2742,9 +2744,16 @@ app.get('/api/kot/:restaurantId', authenticateToken, async (req, res) => {
     for (const doc of ordersSnapshot.docs) {
       const orderData = { id: doc.id, ...doc.data() };
       
-      // Filter in memory if no specific status was requested
-      if (!status && !validKotStatuses.includes(orderData.status)) {
-        continue; // Skip orders that don't need kitchen attention
+      // If specific status requested, filter by that
+      if (status && status !== 'all') {
+        if (orderData.status !== status) {
+          continue;
+        }
+      } else {
+        // For 'all' or no status filter, show only kitchen-relevant orders
+        if (!validKotStatuses.includes(orderData.status)) {
+          continue; // Skip orders that don't need kitchen attention
+        }
       }
       
       // Get table information if tableNumber exists
@@ -2811,12 +2820,12 @@ app.get('/api/kot/:restaurantId', authenticateToken, async (req, res) => {
 });
 
 // Update KOT cooking status and timer
-app.patch('/api/kot/:orderId/status', authenticateToken, async (req, res) => {
+app.patch('/api/kot/:orderId/status', async (req, res) => {
   try {
     const { orderId } = req.params;
     const { status, cookingStartTime, cookingEndTime, notes } = req.body;
 
-    const validStatuses = ['confirmed', 'preparing', 'ready', 'served'];
+    const validStatuses = ['confirmed', 'preparing', 'ready', 'served', 'completed'];
     if (!validStatuses.includes(status)) {
       return res.status(400).json({ error: 'Invalid status' });
     }
@@ -2876,7 +2885,7 @@ app.patch('/api/kot/:orderId/status', authenticateToken, async (req, res) => {
 });
 
 // Get single KOT details
-app.get('/api/kot/:restaurantId/:orderId', authenticateToken, async (req, res) => {
+app.get('/api/kot/:restaurantId/:orderId', async (req, res) => {
   try {
     const { restaurantId, orderId } = req.params;
 
