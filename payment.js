@@ -45,20 +45,24 @@ const initializePaymentRoutes = (db, razorpay) => {
         }
       });
 
-      // Store order in database
-      await db.collection('dine_orders').doc(order.id).set({
+      // Store order in database (filter out undefined values)
+      const orderData = {
         orderId: order.id,
         amount: amountInPaise,
         currency,
         planId,
         email,
         userId,
-        phone,
-        shopId,
         app: 'Dine', // Also store app name in database
         status: 'created',
         createdAt: new Date()
-      });
+      };
+      
+      // Only add optional fields if they have values
+      if (phone) orderData.phone = phone;
+      if (shopId) orderData.shopId = shopId;
+      
+      await db.collection('dine_orders').doc(order.id).set(orderData);
 
       res.json({ 
         success: true, 
@@ -114,7 +118,7 @@ const initializePaymentRoutes = (db, razorpay) => {
 
       const orderData = orderDoc.data();
 
-      // Create payment record
+      // Create payment record (filter out undefined values)
       const paymentRef = db.collection('dine_payments').doc(razorpay_payment_id);
       const paymentDoc = {
         orderId: razorpay_order_id,
@@ -123,14 +127,16 @@ const initializePaymentRoutes = (db, razorpay) => {
         planId: planId || orderData.planId,
         email: orderData.email,
         userId: userId || orderData.userId,
-        phone: orderData.phone,
-        shopId: orderData.shopId,
         amount: orderData.amount,
         currency: orderData.currency,
         app: 'Dine', // Add app name
         status: 'verified',
         verifiedAt: new Date()
       };
+      
+      // Only add optional fields if they have values
+      if (orderData.phone) paymentDoc.phone = orderData.phone;
+      if (orderData.shopId) paymentDoc.shopId = orderData.shopId;
 
       await paymentRef.set(paymentDoc);
 
@@ -250,20 +256,24 @@ const initializePaymentRoutes = (db, razorpay) => {
               const paymentDoc = await paymentRef.get();
               
               if (!paymentDoc.exists) {
-                await paymentRef.set({
+                const webhookPaymentDoc = {
                   orderId: payment.order_id,
                   paymentId: payment.id,
                   planId: orderData.planId,
                   email: orderData.email,
                   userId: orderData.userId,
-                  phone: orderData.phone,
-                  shopId: orderData.shopId,
                   amount: payment.amount,
                   currency: payment.currency,
                   status: payment.status,
                   app: 'Dine',
                   webhookAt: new Date()
-                });
+                };
+                
+                // Only add optional fields if they have values
+                if (orderData.phone) webhookPaymentDoc.phone = orderData.phone;
+                if (orderData.shopId) webhookPaymentDoc.shopId = orderData.shopId;
+                
+                await paymentRef.set(webhookPaymentDoc);
               }
 
               // Update user subscription
