@@ -2072,7 +2072,7 @@ app.patch('/api/tables/:tableId/status', authenticateToken, async (req, res) => 
     const { tableId } = req.params;
     const { status, orderId } = req.body;
 
-    const validStatuses = ['available', 'occupied', 'reserved', 'cleaning', 'out-of-service'];
+    const validStatuses = ['available', 'occupied', 'serving', 'reserved', 'cleaning', 'out-of-service'];
     
     if (!validStatuses.includes(status)) {
       return res.status(400).json({ error: 'Invalid status' });
