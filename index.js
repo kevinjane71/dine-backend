@@ -11,20 +11,21 @@ const multer = require('multer');
 const { Storage } = require('@google-cloud/storage');
 const OpenAI = require('openai');
 // const twilio = require('twilio');
-// const Razorpay = require('razorpay');
+const Razorpay = require('razorpay');
 require('dotenv').config();
 
 const { db, collections } = require('./firebase');
+const initializePaymentRoutes = require('./payment');
 
 const app = express();
 const PORT = process.env.PORT || 3003;
 
 const googleClient = new OAuth2Client(process.env.GOOGLE_CLIENT_ID);
 // const twilioClient = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
-// const razorpay = new Razorpay({
-//   key_id: process.env.RAZORPAY_KEY_ID,
-//   key_secret: process.env.RAZORPAY_KEY_SECRET
-// });
+const razorpay = new Razorpay({
+  key_id: process.env.RAZORPAY_KEY_ID,
+  key_secret: process.env.RAZORPAY_KEY_SECRET
+});
 
 // Initialize Firebase Storage
 let storage;
@@ -1325,54 +1326,10 @@ async function calculateOrderTotal(items) {
   return total;
 }
 
-app.post('/api/payments/create', async (req, res) => {
-  try {
-    const { orderId, amount, currency = 'INR' } = req.body;
+// Initialize payment routes
+const paymentRoutes = initializePaymentRoutes(db, razorpay);
+app.use('/api/payments', paymentRoutes);
 
-    if (!orderId || !amount) {
-      return res.status(400).json({ error: 'Order ID and amount are required' });
-    }
-
-    // Mock payment creation for demo (Razorpay disabled)
-    const mockOrder = {
-      id: `mock_order_${orderId}_${Date.now()}`,
-      amount: Math.round(amount * 100),
-      currency,
-      key: 'demo_key'
-    };
-
-    console.log(`💳 Mock payment created for order ${orderId}: ₹${amount}`);
-
-    res.json(mockOrder);
-
-  } catch (error) {
-    console.error('Create payment error:', error);
-    res.status(500).json({ error: 'Failed to create payment' });
-  }
-});
-
-app.post('/api/payments/verify', async (req, res) => {
-  try {
-    const { razorpay_order_id, razorpay_payment_id, razorpay_signature, orderId } = req.body;
-
-    // Mock payment verification for demo (Razorpay disabled)
-    console.log(`💳 Mock payment verification for order ${orderId}`);
-    
-    if (db && orderId) {
-      await db.collection(collections.orders).doc(orderId).update({
-        paymentStatus: 'completed',
-        paymentId: razorpay_payment_id || `mock_payment_${Date.now()}`,
-        updatedAt: new Date()
-      });
-    }
-
-    res.json({ message: 'Payment verified successfully (mock)' });
-
-  } catch (error) {
-    console.error('Verify payment error:', error);
-    res.status(500).json({ error: 'Payment verification failed' });
-  }
-});
 
 // Bulk menu upload API
 app.post('/api/menus/bulk-upload/:restaurantId', authenticateToken, upload.array('menuFiles', 10), async (req, res) => {
