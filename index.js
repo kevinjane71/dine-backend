@@ -85,11 +85,6 @@ app.use(morgan(process.env.NODE_ENV === 'production' ? 'combined' : 'dev'));
 app.use(bodyParser.json({ limit: '10mb' }));
 app.use(bodyParser.urlencoded({ extended: true, limit: '10mb' }));
 
-// Global OPTIONS handler for all API routes
-app.options('/api/*', (req, res) => {
-  res.status(200).end();
-});
-
 app.use((req, res, next) => {
   req.id = Math.random().toString(36).substring(2, 15);
   res.setHeader('X-Request-ID', req.id);
@@ -2595,7 +2590,7 @@ app.get('/api/staff/:restaurantId', authenticateToken, requireOwnerRole, async (
 
     const snapshot = await db.collection(collections.users)
       .where('restaurantId', '==', restaurantId)
-      .where('role', 'in', ['waiter', 'manager'])
+      .where('role', 'in', ['waiter', 'manager', 'employee'])
       .get();
 
     const staff = [];
@@ -2629,17 +2624,30 @@ app.post('/api/staff/:restaurantId', authenticateToken, requireOwnerRole, async 
     const { restaurantId } = req.params;
     const { name, phone, email, role = 'waiter', startDate, address } = req.body;
 
-    if (!name || !phone || !email) {
-      return res.status(400).json({ error: 'Name, phone, and email are required' });
+    if (!name || !phone) {
+      return res.status(400).json({ error: 'Name and phone are required' });
     }
 
-    // Check if email already exists
+    // Check if email already exists (only if email is provided)
+    if (email) {
     const existingUser = await db.collection(collections.users)
       .where('email', '==', email)
       .get();
 
     if (!existingUser.empty) {
       return res.status(400).json({ error: 'Email already registered' });
+      }
+    }
+
+    // Generate unique 5-digit numeric User ID
+    let userId;
+    let isUnique = false;
+    while (!isUnique) {
+      userId = Math.floor(10000 + Math.random() * 90000).toString(); // 5-digit number
+      const existingUserId = await db.collection(collections.users)
+        .where('loginId', '==', userId)
+        .get();
+      isUnique = existingUserId.empty;
     }
 
     // Generate random password for staff
@@ -2649,7 +2657,7 @@ app.post('/api/staff/:restaurantId', authenticateToken, requireOwnerRole, async 
     const staffData = {
       name,
       phone,
-      email,
+      email: email || null,
       password: hashedPassword,
       role,
       restaurantId,
@@ -2662,24 +2670,35 @@ app.post('/api/staff/:restaurantId', authenticateToken, requireOwnerRole, async 
       createdAt: new Date(),
       updatedAt: new Date(),
       lastLogin: null,
-      temporaryPassword: true // Flag to indicate password needs to be changed
+      temporaryPassword: true, // Flag to indicate password needs to be changed
+      loginId: userId, // Use the generated 5-digit numeric ID
+      pageAccess: {
+        dashboard: true,
+        history: true,
+        tables: true,
+        menu: true,
+        analytics: false,
+        inventory: false,
+        kot: false,
+        admin: false
+      }
     };
 
     const staffRef = await db.collection(collections.users).add(staffData);
 
     // TODO: Send email with login credentials
     console.log(`📧 Staff Login Credentials for ${name}:`);
-    console.log(`   Login ID: ${email}`);
+    console.log(`   User ID: ${userId}`);
     console.log(`   Password: ${temporaryPassword}`);
     console.log(`   Restaurant: ${restaurantId}`);
 
     res.status(201).json({
-      message: 'Staff member added successfully. Login credentials sent to email.',
+      message: 'Staff member added successfully. Login credentials generated.',
       staff: {
         id: staffRef.id,
         name,
         phone,
-        email,
+        email: email || null,
         role,
         restaurantId,
         address,
@@ -2689,7 +2708,7 @@ app.post('/api/staff/:restaurantId', authenticateToken, requireOwnerRole, async 
       },
       // For demo purposes, return credentials (remove in production)
       credentials: {
-        loginId: email,
+        loginId: userId,
         password: temporaryPassword
       }
     });
@@ -2704,7 +2723,7 @@ app.post('/api/staff/:restaurantId', authenticateToken, requireOwnerRole, async 
 app.patch('/api/staff/:staffId', authenticateToken, requireOwnerRole, async (req, res) => {
   try {
     const { staffId } = req.params;
-    const { name, phone, email, role, status } = req.body;
+    const { name, phone, email, role, status, pageAccess } = req.body;
 
     const updateData = {
       updatedAt: new Date()
@@ -2715,6 +2734,7 @@ app.patch('/api/staff/:staffId', authenticateToken, requireOwnerRole, async (req
     if (email !== undefined) updateData.email = email;
     if (role) updateData.role = role;
     if (status) updateData.status = status;
+    if (pageAccess) updateData.pageAccess = pageAccess;
 
     await db.collection(collections.users).doc(staffId).update(updateData);
 
@@ -2741,7 +2761,111 @@ app.delete('/api/staff/:staffId', authenticateToken, requireOwnerRole, async (re
   }
 });
 
-// Staff login with email and password
+// Get user page access
+app.get('/api/user/page-access', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    
+    const userDoc = await db.collection(collections.users).doc(userId).get();
+    
+    if (!userDoc.exists) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+    
+    const userData = userDoc.data();
+    
+    res.json({
+      pageAccess: userData.pageAccess || {
+        dashboard: true,
+        history: true,
+        tables: true,
+        menu: true,
+        analytics: false,
+        inventory: false,
+        kot: false,
+        admin: false
+      },
+      role: userData.role,
+      restaurantId: userData.restaurantId
+    });
+  } catch (error) {
+    console.error('Get page access error:', error);
+    res.status(500).json({ error: 'Failed to get page access' });
+  }
+});
+
+// Get user profile with restaurant and owner details
+app.get('/api/user/profile', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    
+    const userDoc = await db.collection(collections.users).doc(userId).get();
+    
+    if (!userDoc.exists) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+    
+    const userData = userDoc.data();
+    
+    // Get restaurant details if user has restaurantId
+    let restaurantData = null;
+    let ownerData = null;
+    
+    if (userData.restaurantId) {
+      const restaurantDoc = await db.collection(collections.restaurants).doc(userData.restaurantId).get();
+      if (restaurantDoc.exists) {
+        restaurantData = restaurantDoc.data();
+        
+        // Get owner details
+        if (restaurantData.ownerId) {
+          const ownerDoc = await db.collection(collections.users).doc(restaurantData.ownerId).get();
+          if (ownerDoc.exists) {
+            ownerData = ownerDoc.data();
+          }
+        }
+      }
+    }
+    
+    res.json({
+      user: {
+        id: userDoc.id,
+        name: userData.name,
+        email: userData.email,
+        phone: userData.phone,
+        role: userData.role,
+        restaurantId: userData.restaurantId,
+        pageAccess: userData.pageAccess,
+        status: userData.status,
+        createdAt: userData.createdAt,
+        lastLogin: userData.lastLogin
+      },
+      restaurant: restaurantData ? {
+        id: restaurantData.id,
+        name: restaurantData.name,
+        address: restaurantData.address,
+        phone: restaurantData.phone,
+        email: restaurantData.email,
+        cuisine: restaurantData.cuisine,
+        description: restaurantData.description,
+        ownerId: restaurantData.ownerId,
+        status: restaurantData.status,
+        createdAt: restaurantData.createdAt
+      } : null,
+      owner: ownerData ? {
+        id: restaurantData.ownerId,
+        name: ownerData.name,
+        email: ownerData.email,
+        phone: ownerData.phone,
+        role: ownerData.role
+      } : null
+    });
+  } catch (error) {
+    console.error('Get user profile error:', error);
+    res.status(500).json({ error: 'Failed to get user profile' });
+  }
+});
+
+// Staff login with User ID and password
 app.post('/api/auth/staff/login', async (req, res) => {
   try {
     const { loginId, password } = req.body;
@@ -2750,10 +2874,10 @@ app.post('/api/auth/staff/login', async (req, res) => {
       return res.status(400).json({ error: 'Login ID and password are required' });
     }
 
-    // Find staff member by loginId (email)
+    // Find staff member by loginId (User ID)
     const staffQuery = await db.collection(collections.users)
-      .where('email', '==', loginId)
-      .where('role', 'in', ['waiter', 'manager'])
+      .where('loginId', '==', loginId)
+      .where('role', 'in', ['waiter', 'manager', 'employee'])
       .where('status', '==', 'active')
       .get();
 
@@ -2770,6 +2894,17 @@ app.post('/api/auth/staff/login', async (req, res) => {
       return res.status(401).json({ error: 'Invalid credentials' });
     }
 
+    // Get restaurant details
+    const restaurantDoc = await db.collection(collections.restaurants).doc(staffData.restaurantId).get();
+    const restaurantData = restaurantDoc.exists ? restaurantDoc.data() : null;
+
+    // Get owner details from restaurant
+    let ownerData = null;
+    if (restaurantData && restaurantData.ownerId) {
+      const ownerDoc = await db.collection(collections.users).doc(restaurantData.ownerId).get();
+      ownerData = ownerDoc.exists ? ownerDoc.data() : null;
+    }
+
     // Update last login
     await staffDoc.ref.update({
       lastLogin: new Date(),
@@ -2781,7 +2916,8 @@ app.post('/api/auth/staff/login', async (req, res) => {
         userId: staffDoc.id, 
         email: staffData.email, 
         role: staffData.role,
-        restaurantId: staffData.restaurantId
+        restaurantId: staffData.restaurantId,
+        ownerId: restaurantData?.ownerId
       },
       process.env.JWT_SECRET,
       { expiresIn: '7d' }
@@ -2796,8 +2932,25 @@ app.post('/api/auth/staff/login', async (req, res) => {
         name: staffData.name,
         role: staffData.role,
         restaurantId: staffData.restaurantId,
-        phone: staffData.phone
-      }
+        phone: staffData.phone,
+        pageAccess: staffData.pageAccess
+      },
+      restaurant: restaurantData ? {
+        id: restaurantData.id,
+        name: restaurantData.name,
+        address: restaurantData.address,
+        phone: restaurantData.phone,
+        email: restaurantData.email,
+        cuisine: restaurantData.cuisine,
+        description: restaurantData.description,
+        ownerId: restaurantData.ownerId
+      } : null,
+      owner: ownerData ? {
+        id: restaurantData.ownerId,
+        name: ownerData.name,
+        email: ownerData.email,
+        phone: ownerData.phone
+      } : null
     });
 
   } catch (error) {
