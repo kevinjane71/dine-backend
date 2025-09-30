@@ -69,52 +69,26 @@ const upload = multer({
 });
 
 const corsOptions = {
-  origin: true, // Allow all origins for debugging
+  origin: process.env.NODE_ENV === 'production' 
+    ? 'https://dine-frontend-ecru.vercel.app'
+    : ['http://localhost:3002', 'http://localhost:3003'],
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS', 'PATCH'],
-  allowedHeaders: [
-    'Content-Type', 
-    'Authorization', 
-    'X-Requested-With', 
-    'Accept', 
-    'Origin',
-    'Access-Control-Request-Method',
-    'Access-Control-Request-Headers'
-  ],
-  exposedHeaders: ['Content-Length', 'X-Foo', 'X-Bar'],
-  optionsSuccessStatus: 200,
-  preflightContinue: false
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'Accept', 'Origin'],
+  optionsSuccessStatus: 200
 };
 
 app.use(helmet({ crossOriginResourcePolicy: { policy: "cross-origin" } }));
 app.use(cors(corsOptions));
 
-// Aggressive CORS middleware for Vercel deployment
-app.use((req, res, next) => {
-  console.log('🌐 CORS middleware - Origin:', req.headers.origin);
-  console.log('🌐 CORS middleware - Method:', req.method);
-  console.log('🌐 CORS middleware - Headers:', req.headers);
-  
-  // Set CORS headers for all requests
-  res.header('Access-Control-Allow-Origin', req.headers.origin || '*');
-  res.header('Access-Control-Allow-Credentials', 'true');
-  res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS, PATCH');
-  res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With, Accept, Origin, Access-Control-Request-Method, Access-Control-Request-Headers, X-Requested-With');
-  res.header('Access-Control-Max-Age', '86400'); // 24 hours
-  
-  // Handle preflight requests
-  if (req.method === 'OPTIONS') {
-    console.log('🌐 Handling OPTIONS preflight request');
-    res.status(200).end();
-    return;
-  }
-  
-  next();
-});
-
 app.use(morgan(process.env.NODE_ENV === 'production' ? 'combined' : 'dev'));
 app.use(bodyParser.json({ limit: '10mb' }));
 app.use(bodyParser.urlencoded({ extended: true, limit: '10mb' }));
+
+// Global OPTIONS handler for all API routes
+app.options('/api/*', (req, res) => {
+  res.status(200).end();
+});
 
 app.use((req, res, next) => {
   req.id = Math.random().toString(36).substring(2, 15);
@@ -546,13 +520,8 @@ app.post('/api/auth/google', async (req, res) => {
   }
 });
 
-// Handle OPTIONS request for auth endpoint
+// Handle OPTIONS requests for CORS preflight
 app.options('/api/auth/phone/send-otp', (req, res) => {
-  console.log('🔧 OPTIONS request for /api/auth/phone/send-otp');
-  res.header('Access-Control-Allow-Origin', req.headers.origin || '*');
-  res.header('Access-Control-Allow-Methods', 'POST, OPTIONS');
-  res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With, Accept, Origin');
-  res.header('Access-Control-Allow-Credentials', 'true');
   res.status(200).end();
 });
 
