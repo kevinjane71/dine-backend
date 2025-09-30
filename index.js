@@ -1073,9 +1073,9 @@ app.post('/api/orders', async (req, res) => {
 app.get('/api/orders/:restaurantId', authenticateToken, async (req, res) => {
   try {
     const { restaurantId } = req.params;
-    const { status, date, search } = req.query;
+    const { status, date, search, waiterId } = req.query;
 
-    console.log(`🔍 Orders API - Restaurant: ${restaurantId}, Status: ${status || 'all'}, Search: ${search || 'none'}`);
+    console.log(`🔍 Orders API - Restaurant: ${restaurantId}, Status: ${status || 'all'}, Search: ${search || 'none'}, Waiter: ${waiterId || 'all'}`);
 
     let query = db.collection(collections.orders)
       .where('restaurantId', '==', restaurantId);
@@ -1103,6 +1103,14 @@ app.get('/api/orders/:restaurantId', authenticateToken, async (req, res) => {
       });
     });
 
+    // Apply waiter filter if provided
+    if (waiterId) {
+      orders = orders.filter(order => {
+        return order.staffInfo && order.staffInfo.userId === waiterId;
+      });
+      console.log(`👤 Filtered by waiter ${waiterId}: ${orders.length} orders found`);
+    }
+
     // Apply search filter if provided
     if (search) {
       const searchValue = search.toLowerCase().trim();
@@ -1123,6 +1131,18 @@ app.get('/api/orders/:restaurantId', authenticateToken, async (req, res) => {
           } else {
             console.log(`❌ Found order by table ${order.tableNumber} but it's ${order.status}`);
           }
+        }
+        
+        // Search by waiter name (if exists)
+        if (order.staffInfo && order.staffInfo.name && order.staffInfo.name.toLowerCase().includes(searchValue)) {
+          console.log(`✅ Found match by waiter name: ${order.staffInfo.name} (status: ${order.status})`);
+          return true;
+        }
+        
+        // Search by waiter login ID (if exists)
+        if (order.staffInfo && order.staffInfo.loginId && order.staffInfo.loginId.toLowerCase().includes(searchValue)) {
+          console.log(`✅ Found match by waiter login ID: ${order.staffInfo.loginId} (status: ${order.status})`);
+          return true;
         }
         
         return false;
@@ -2582,6 +2602,38 @@ const requireOwnerRole = (req, res, next) => {
   }
   next();
 };
+
+// Get all waiters for a restaurant (for filtering purposes)
+app.get('/api/waiters/:restaurantId', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+
+    const snapshot = await db.collection(collections.users)
+      .where('restaurantId', '==', restaurantId)
+      .where('role', 'in', ['waiter', 'manager', 'employee'])
+      .where('status', '==', 'active')
+      .get();
+
+    const waiters = [];
+    snapshot.forEach(doc => {
+      const userData = doc.data();
+      waiters.push({
+        id: doc.id,
+        name: userData.name,
+        loginId: userData.loginId,
+        role: userData.role,
+        phone: userData.phone,
+        email: userData.email
+      });
+    });
+
+    res.json({ waiters });
+
+  } catch (error) {
+    console.error('Get waiters error:', error);
+    res.status(500).json({ error: 'Failed to fetch waiters' });
+  }
+});
 
 // Get all staff for a restaurant
 app.get('/api/staff/:restaurantId', authenticateToken, requireOwnerRole, async (req, res) => {
