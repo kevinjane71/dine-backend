@@ -69,36 +69,7 @@ const upload = multer({
 });
 
 const corsOptions = {
-  origin: function (origin, callback) {
-    // Allow requests with no origin (like mobile apps or curl requests)
-    if (!origin) return callback(null, true);
-    
-    const allowedOrigins = [
-      'http://localhost:3002',
-      'http://localhost:3003',
-      'https://dine-frontend.vercel.app',
-      'https://dine-frontend-ecru.vercel.app',
-      'https://dine-backend-lake.vercel.app',
-      'https://dine-frontend-ecru.vercel.app/',
-      process.env.FRONTEND_URL
-    ].filter(Boolean);
-    
-    // Allow localhost in development
-    if (process.env.NODE_ENV !== 'production') {
-      if (origin.startsWith('http://localhost:') || origin.startsWith('http://192.168.')) {
-        return callback(null, true);
-      }
-    }
-    
-    // Check if origin is in allowed list
-    if (allowedOrigins.indexOf(origin) !== -1) {
-      callback(null, true);
-    } else {
-      console.log('CORS blocked origin:', origin);
-      console.log('Allowed origins:', allowedOrigins);
-      callback(new Error('Not allowed by CORS'));
-    }
-  },
+  origin: true, // Allow all origins for debugging
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS', 'PATCH'],
   allowedHeaders: [
@@ -118,28 +89,22 @@ const corsOptions = {
 app.use(helmet({ crossOriginResourcePolicy: { policy: "cross-origin" } }));
 app.use(cors(corsOptions));
 
-// Additional CORS headers middleware for Vercel
+// Aggressive CORS middleware for Vercel deployment
 app.use((req, res, next) => {
-  const origin = req.headers.origin;
-  const allowedOrigins = [
-    'http://localhost:3002',
-    'http://localhost:3003',
-    'https://dine-frontend.vercel.app',
-    'https://dine-frontend-ecru.vercel.app',
-    'https://dine-backend-lake.vercel.app',
-    'https://dine-frontend-ecru.vercel.app/',
-    process.env.FRONTEND_URL
-  ].filter(Boolean);
-
-  if (!origin || allowedOrigins.includes(origin) || process.env.NODE_ENV !== 'production') {
-    res.header('Access-Control-Allow-Origin', origin || '*');
-  }
+  console.log('🌐 CORS middleware - Origin:', req.headers.origin);
+  console.log('🌐 CORS middleware - Method:', req.method);
+  console.log('🌐 CORS middleware - Headers:', req.headers);
   
+  // Set CORS headers for all requests
+  res.header('Access-Control-Allow-Origin', req.headers.origin || '*');
   res.header('Access-Control-Allow-Credentials', 'true');
   res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS, PATCH');
-  res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With, Accept, Origin, Access-Control-Request-Method, Access-Control-Request-Headers');
+  res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With, Accept, Origin, Access-Control-Request-Method, Access-Control-Request-Headers, X-Requested-With');
+  res.header('Access-Control-Max-Age', '86400'); // 24 hours
   
+  // Handle preflight requests
   if (req.method === 'OPTIONS') {
+    console.log('🌐 Handling OPTIONS preflight request');
     res.status(200).end();
     return;
   }
@@ -579,6 +544,16 @@ app.post('/api/auth/google', async (req, res) => {
     console.error('Google auth error:', error);
     res.status(500).json({ error: 'Google authentication failed' });
   }
+});
+
+// Handle OPTIONS request for auth endpoint
+app.options('/api/auth/phone/send-otp', (req, res) => {
+  console.log('🔧 OPTIONS request for /api/auth/phone/send-otp');
+  res.header('Access-Control-Allow-Origin', req.headers.origin || '*');
+  res.header('Access-Control-Allow-Methods', 'POST, OPTIONS');
+  res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With, Accept, Origin');
+  res.header('Access-Control-Allow-Credentials', 'true');
+  res.status(200).end();
 });
 
 app.post('/api/auth/phone/send-otp', async (req, res) => {
