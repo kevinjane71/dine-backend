@@ -70,6 +70,7 @@ const upload = multer({
 
 const corsOptions = {
   origin: function (origin, callback) {
+    // Allow requests with no origin (like mobile apps or curl requests)
     if (!origin) return callback(null, true);
     
     const allowedOrigins = [
@@ -78,30 +79,74 @@ const corsOptions = {
       'https://dine-frontend.vercel.app',
       'https://dine-frontend-ecru.vercel.app',
       'https://dine-backend-lake.vercel.app',
+      'https://dine-frontend-ecru.vercel.app/',
       process.env.FRONTEND_URL
     ].filter(Boolean);
     
+    // Allow localhost in development
     if (process.env.NODE_ENV !== 'production') {
       if (origin.startsWith('http://localhost:') || origin.startsWith('http://192.168.')) {
         return callback(null, true);
       }
     }
     
+    // Check if origin is in allowed list
     if (allowedOrigins.indexOf(origin) !== -1) {
       callback(null, true);
     } else {
       console.log('CORS blocked origin:', origin);
+      console.log('Allowed origins:', allowedOrigins);
       callback(new Error('Not allowed by CORS'));
     }
   },
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS', 'PATCH'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'Accept', 'Origin'],
-  optionsSuccessStatus: 200
+  allowedHeaders: [
+    'Content-Type', 
+    'Authorization', 
+    'X-Requested-With', 
+    'Accept', 
+    'Origin',
+    'Access-Control-Request-Method',
+    'Access-Control-Request-Headers'
+  ],
+  exposedHeaders: ['Content-Length', 'X-Foo', 'X-Bar'],
+  optionsSuccessStatus: 200,
+  preflightContinue: false
 };
 
 app.use(helmet({ crossOriginResourcePolicy: { policy: "cross-origin" } }));
 app.use(cors(corsOptions));
+
+// Additional CORS headers middleware for Vercel
+app.use((req, res, next) => {
+  const origin = req.headers.origin;
+  const allowedOrigins = [
+    'http://localhost:3002',
+    'http://localhost:3003',
+    'https://dine-frontend.vercel.app',
+    'https://dine-frontend-ecru.vercel.app',
+    'https://dine-backend-lake.vercel.app',
+    'https://dine-frontend-ecru.vercel.app/',
+    process.env.FRONTEND_URL
+  ].filter(Boolean);
+
+  if (!origin || allowedOrigins.includes(origin) || process.env.NODE_ENV !== 'production') {
+    res.header('Access-Control-Allow-Origin', origin || '*');
+  }
+  
+  res.header('Access-Control-Allow-Credentials', 'true');
+  res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS, PATCH');
+  res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With, Accept, Origin, Access-Control-Request-Method, Access-Control-Request-Headers');
+  
+  if (req.method === 'OPTIONS') {
+    res.status(200).end();
+    return;
+  }
+  
+  next();
+});
+
 app.use(morgan(process.env.NODE_ENV === 'production' ? 'combined' : 'dev'));
 app.use(bodyParser.json({ limit: '10mb' }));
 app.use(bodyParser.urlencoded({ extended: true, limit: '10mb' }));
@@ -538,6 +583,9 @@ app.post('/api/auth/google', async (req, res) => {
 
 app.post('/api/auth/phone/send-otp', async (req, res) => {
   try {
+    console.log('📱 OTP request received from origin:', req.headers.origin);
+    console.log('📱 Request headers:', req.headers);
+    
     const { phone } = req.body;
 
     if (!phone) {
@@ -1390,7 +1438,7 @@ app.post('/api/menus/bulk-upload/:restaurantId', authenticateToken, upload.array
           mimetype: file.mimetype
         });
         console.log(`✅ File ${i + 1} uploaded successfully`);
-      } catch (error) {
+  } catch (error) {
         console.error(`❌ Error uploading file ${i + 1} (${file.originalname}):`, error);
         errors.push(`Failed to upload ${file.originalname}: ${error.message}`);
       }
@@ -2881,7 +2929,7 @@ app.get('/api/kot/:restaurantId', async (req, res) => {
       .where('restaurantId', '==', restaurantId)
       .where('createdAt', '>=', yesterdayStart)
       .orderBy('createdAt', 'desc');
-    
+
     // Get all orders and filter in memory to avoid complex indexing
     const ordersSnapshot = await query.limit(100).get();
     console.log(`📊 Total orders found in DB: ${ordersSnapshot.docs.length}`);
@@ -2904,7 +2952,7 @@ app.get('/api/kot/:restaurantId', async (req, res) => {
         // For 'all' or no status filter, show only kitchen-relevant orders
         if (!validKotStatuses.includes(orderData.status)) {
           console.log(`❌ Skipping order ${doc.id} - status "${orderData.status}" not in valid KOT statuses`);
-          continue; // Skip orders that don't need kitchen attention
+        continue; // Skip orders that don't need kitchen attention
         }
       }
       
@@ -3100,6 +3148,434 @@ app.get('/api/kot/:restaurantId/:orderId', async (req, res) => {
   } catch (error) {
     console.error('Get KOT details error:', error);
     res.status(500).json({ error: 'Failed to fetch KOT details' });
+  }
+});
+
+// ========================================
+// INVENTORY MANAGEMENT APIs
+// ========================================
+
+// Get all inventory items for a restaurant
+app.get('/api/inventory/:restaurantId', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+    const { category, status, search } = req.query;
+
+    console.log(`📦 Inventory API - Restaurant: ${restaurantId}, Category: ${category || 'all'}, Status: ${status || 'all'}, Search: ${search || 'none'}`);
+
+    let query = db.collection(collections.inventory).where('restaurantId', '==', restaurantId);
+    
+    // Apply category filter if provided
+    if (category && category !== 'all') {
+      query = query.where('category', '==', category);
+    }
+
+    const snapshot = await query.orderBy('name', 'asc').get();
+    let items = [];
+
+    snapshot.forEach(doc => {
+      const itemData = { id: doc.id, ...doc.data() };
+      
+      // Apply status filter
+      if (status && status !== 'all') {
+        if (status === 'low' && itemData.currentStock > itemData.minStock) return;
+        if (status === 'good' && itemData.currentStock <= itemData.minStock) return;
+        if (status === 'expired' && new Date(itemData.expiryDate) > new Date()) return;
+      }
+      
+      // Apply search filter
+      if (search) {
+        const searchValue = search.toLowerCase().trim();
+        if (!itemData.name.toLowerCase().includes(searchValue) &&
+            !itemData.category.toLowerCase().includes(searchValue) &&
+            !itemData.supplier.toLowerCase().includes(searchValue)) {
+          return;
+        }
+      }
+      
+      items.push(itemData);
+    });
+
+    console.log(`📊 Inventory results: ${items.length} items found`);
+
+    res.json({ 
+      items,
+      total: items.length,
+      timestamp: new Date().toISOString()
+    });
+
+  } catch (error) {
+    console.error('Get inventory error:', error);
+    res.status(500).json({ error: 'Failed to fetch inventory items' });
+  }
+});
+
+// Get single inventory item
+app.get('/api/inventory/:restaurantId/:itemId', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId, itemId } = req.params;
+
+    const itemDoc = await db.collection(collections.inventory).doc(itemId).get();
+    
+    if (!itemDoc.exists) {
+      return res.status(404).json({ error: 'Inventory item not found' });
+    }
+
+    const itemData = itemDoc.data();
+    
+    if (itemData.restaurantId !== restaurantId) {
+      return res.status(403).json({ error: 'Access denied' });
+    }
+
+    res.json({ item: { id: itemDoc.id, ...itemData } });
+
+  } catch (error) {
+    console.error('Get inventory item error:', error);
+    res.status(500).json({ error: 'Failed to fetch inventory item' });
+  }
+});
+
+// Create new inventory item
+app.post('/api/inventory/:restaurantId', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+    const { userId, role } = req.user;
+    
+    // Check permissions
+    if (role !== 'owner' && role !== 'manager') {
+      return res.status(403).json({ error: 'Access denied. Owner or manager privileges required.' });
+    }
+
+    const {
+      name,
+      category,
+      unit,
+      currentStock,
+      minStock,
+      maxStock,
+      costPerUnit,
+      supplier,
+      description,
+      barcode,
+      expiryDate,
+      location
+    } = req.body;
+
+    // Validate required fields
+    if (!name || !category || !unit) {
+      return res.status(400).json({ error: 'Name, category, and unit are required' });
+    }
+
+    // Check if item with same name already exists
+    const existingItemsSnapshot = await db.collection(collections.inventory)
+      .where('restaurantId', '==', restaurantId)
+      .where('name', '==', name)
+      .limit(1)
+      .get();
+
+    if (!existingItemsSnapshot.empty) {
+      return res.status(400).json({ error: 'Item with this name already exists' });
+    }
+
+    // Determine status based on stock levels
+    let status = 'good';
+    if (currentStock <= minStock) {
+      status = 'low';
+    }
+    if (expiryDate && new Date(expiryDate) < new Date()) {
+      status = 'expired';
+    }
+
+    const itemData = {
+      restaurantId,
+      name: name.trim(),
+      category: category.trim(),
+      unit: unit.trim(),
+      currentStock: parseFloat(currentStock) || 0,
+      minStock: parseFloat(minStock) || 0,
+      maxStock: parseFloat(maxStock) || 0,
+      costPerUnit: parseFloat(costPerUnit) || 0,
+      supplier: supplier?.trim() || '',
+      description: description?.trim() || '',
+      barcode: barcode?.trim() || '',
+      expiryDate: expiryDate || null,
+      location: location?.trim() || '',
+      status,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+      createdBy: userId,
+      updatedBy: userId
+    };
+
+    const itemRef = await db.collection(collections.inventory).add(itemData);
+
+    console.log(`📦 Inventory item created: ${itemRef.id} - ${itemData.name}`);
+
+    res.status(201).json({
+      message: 'Inventory item created successfully',
+      item: { id: itemRef.id, ...itemData }
+    });
+
+  } catch (error) {
+    console.error('Create inventory item error:', error);
+    res.status(500).json({ error: 'Failed to create inventory item' });
+  }
+});
+
+// Update inventory item
+app.patch('/api/inventory/:restaurantId/:itemId', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId, itemId } = req.params;
+    const { userId, role } = req.user;
+    
+    // Check permissions
+    if (role !== 'owner' && role !== 'manager') {
+      return res.status(403).json({ error: 'Access denied. Owner or manager privileges required.' });
+    }
+
+    // Get current item
+    const itemDoc = await db.collection(collections.inventory).doc(itemId).get();
+    
+    if (!itemDoc.exists) {
+      return res.status(404).json({ error: 'Inventory item not found' });
+    }
+
+    const currentItem = itemDoc.data();
+    
+    if (currentItem.restaurantId !== restaurantId) {
+      return res.status(403).json({ error: 'Access denied' });
+    }
+
+    const updateData = {
+      updatedAt: new Date(),
+      updatedBy: userId
+    };
+
+    // Update fields if provided
+    const fieldsToUpdate = [
+      'name', 'category', 'unit', 'currentStock', 'minStock', 'maxStock',
+      'costPerUnit', 'supplier', 'description', 'barcode', 'expiryDate', 'location'
+    ];
+
+    fieldsToUpdate.forEach(field => {
+      if (req.body[field] !== undefined) {
+        if (field === 'name' || field === 'category' || field === 'unit' || 
+            field === 'supplier' || field === 'description' || field === 'barcode' || field === 'location') {
+          updateData[field] = req.body[field]?.trim() || '';
+        } else if (field === 'currentStock' || field === 'minStock' || field === 'maxStock' || field === 'costPerUnit') {
+          updateData[field] = parseFloat(req.body[field]) || 0;
+        } else if (field === 'expiryDate') {
+          updateData[field] = req.body[field] || null;
+        }
+      }
+    });
+
+    // Recalculate status
+    const newCurrentStock = updateData.currentStock !== undefined ? updateData.currentStock : currentItem.currentStock;
+    const newMinStock = updateData.minStock !== undefined ? updateData.minStock : currentItem.minStock;
+    const newExpiryDate = updateData.expiryDate !== undefined ? updateData.expiryDate : currentItem.expiryDate;
+
+    let status = 'good';
+    if (newCurrentStock <= newMinStock) {
+      status = 'low';
+    }
+    if (newExpiryDate && new Date(newExpiryDate) < new Date()) {
+      status = 'expired';
+    }
+    updateData.status = status;
+
+    await db.collection(collections.inventory).doc(itemId).update(updateData);
+
+    console.log(`📦 Inventory item updated: ${itemId}`);
+
+    res.json({
+      message: 'Inventory item updated successfully',
+      item: { id: itemId, ...currentItem, ...updateData }
+    });
+
+  } catch (error) {
+    console.error('Update inventory item error:', error);
+    res.status(500).json({ error: 'Failed to update inventory item' });
+  }
+});
+
+// Delete inventory item
+app.delete('/api/inventory/:restaurantId/:itemId', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId, itemId } = req.params;
+    const { userId, role } = req.user;
+    
+    // Check permissions
+    if (role !== 'owner' && role !== 'manager') {
+      return res.status(403).json({ error: 'Access denied. Owner or manager privileges required.' });
+    }
+
+    // Get item to verify ownership
+    const itemDoc = await db.collection(collections.inventory).doc(itemId).get();
+    
+    if (!itemDoc.exists) {
+      return res.status(404).json({ error: 'Inventory item not found' });
+    }
+
+    const itemData = itemDoc.data();
+    
+    if (itemData.restaurantId !== restaurantId) {
+      return res.status(403).json({ error: 'Access denied' });
+    }
+
+    await db.collection(collections.inventory).doc(itemId).delete();
+
+    console.log(`📦 Inventory item deleted: ${itemId} - ${itemData.name}`);
+
+    res.json({ message: 'Inventory item deleted successfully' });
+
+  } catch (error) {
+    console.error('Delete inventory item error:', error);
+    res.status(500).json({ error: 'Failed to delete inventory item' });
+  }
+});
+
+// Get inventory categories
+app.get('/api/inventory/:restaurantId/categories', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+
+    const snapshot = await db.collection(collections.inventory)
+      .where('restaurantId', '==', restaurantId)
+      .get();
+
+    const categories = new Set();
+    snapshot.forEach(doc => {
+      const itemData = doc.data();
+      if (itemData.category) {
+        categories.add(itemData.category);
+      }
+    });
+
+    res.json({ 
+      categories: Array.from(categories).sort(),
+      timestamp: new Date().toISOString()
+    });
+
+  } catch (error) {
+    console.error('Get inventory categories error:', error);
+    res.status(500).json({ error: 'Failed to fetch categories' });
+  }
+});
+
+// Get inventory dashboard stats
+app.get('/api/inventory/:restaurantId/dashboard', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+
+    const snapshot = await db.collection(collections.inventory)
+      .where('restaurantId', '==', restaurantId)
+      .get();
+
+    let totalItems = 0;
+    let lowStockItems = 0;
+    let expiredItems = 0;
+    let totalValue = 0;
+    let categories = new Set();
+
+    snapshot.forEach(doc => {
+      const itemData = doc.data();
+      totalItems++;
+      
+      if (itemData.status === 'low') lowStockItems++;
+      if (itemData.status === 'expired') expiredItems++;
+      
+      totalValue += itemData.currentStock * itemData.costPerUnit;
+      
+      if (itemData.category) {
+        categories.add(itemData.category);
+      }
+    });
+
+    res.json({
+      stats: {
+        totalItems,
+        lowStockItems,
+        expiredItems,
+        totalValue,
+        totalCategories: categories.size
+      },
+      timestamp: new Date().toISOString()
+    });
+
+  } catch (error) {
+    console.error('Get inventory dashboard error:', error);
+    res.status(500).json({ error: 'Failed to fetch dashboard stats' });
+  }
+});
+
+// ========================================
+// SUPPLIER MANAGEMENT APIs
+// ========================================
+
+// Get all suppliers for a restaurant
+app.get('/api/suppliers/:restaurantId', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+
+    const snapshot = await db.collection(collections.suppliers)
+      .where('restaurantId', '==', restaurantId)
+      .orderBy('name', 'asc')
+      .get();
+
+    const suppliers = [];
+    snapshot.forEach(doc => {
+      suppliers.push({ id: doc.id, ...doc.data() });
+    });
+
+    res.json({ suppliers, total: suppliers.length });
+
+  } catch (error) {
+    console.error('Get suppliers error:', error);
+    res.status(500).json({ error: 'Failed to fetch suppliers' });
+  }
+});
+
+// Create new supplier
+app.post('/api/suppliers/:restaurantId', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+    const { userId, role } = req.user;
+    
+    if (role !== 'owner' && role !== 'manager') {
+      return res.status(403).json({ error: 'Access denied. Owner or manager privileges required.' });
+    }
+
+    const { name, contact, email, address, paymentTerms, notes } = req.body;
+
+    if (!name || !contact) {
+      return res.status(400).json({ error: 'Name and contact are required' });
+    }
+
+    const supplierData = {
+      restaurantId,
+      name: name.trim(),
+      contact: contact.trim(),
+      email: email?.trim() || '',
+      address: address?.trim() || '',
+      paymentTerms: paymentTerms?.trim() || '',
+      notes: notes?.trim() || '',
+      isActive: true,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+      createdBy: userId
+    };
+
+    const supplierRef = await db.collection(collections.suppliers).add(supplierData);
+
+    res.status(201).json({
+      message: 'Supplier created successfully',
+      supplier: { id: supplierRef.id, ...supplierData }
+    });
+
+  } catch (error) {
+    console.error('Create supplier error:', error);
+    res.status(500).json({ error: 'Failed to create supplier' });
   }
 });
 

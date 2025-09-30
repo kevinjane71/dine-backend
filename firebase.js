@@ -35,6 +35,7 @@ try {
     orders: 'orders',
     payments: 'payments',
     inventory: 'inventory',
+    suppliers: 'suppliers',
     analytics: 'analytics',
     feedback: 'feedback',
     loyalty: 'loyalty',
