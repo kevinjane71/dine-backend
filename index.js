@@ -68,18 +68,30 @@ const upload = multer({
   }
 });
 
+const allowedOrigins = [
+  'http://localhost:3002',
+  'http://localhost:3003',
+  'https://dine-frontend-ecru.vercel.app'
+];
+
 const corsOptions = {
-  origin: process.env.NODE_ENV === 'production' 
-    ? 'https://dine-frontend-ecru.vercel.app'
-    : ['http://localhost:3002', 'http://localhost:3003'],
+  origin: (origin, callback) => {
+    if (!origin || allowedOrigins.includes(origin)) {
+      callback(null, true);
+    } else {
+      callback(new Error("CORS not allowed"));
+    }
+  },
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS', 'PATCH'],
   allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'Accept', 'Origin'],
   optionsSuccessStatus: 200
 };
 
+app.use(cors(corsOptions)); 
+app.options('*', cors(corsOptions)); // important for preflight
 app.use(helmet({ crossOriginResourcePolicy: { policy: "cross-origin" } }));
-app.use(cors(corsOptions));
+
 
 app.use(morgan(process.env.NODE_ENV === 'production' ? 'combined' : 'dev'));
 app.use(bodyParser.json({ limit: '10mb' }));
