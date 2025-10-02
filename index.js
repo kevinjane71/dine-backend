@@ -3773,12 +3773,11 @@ app.use((req, res) => {
   });
 });
 
-if (process.env.NODE_ENV !== 'production') {
-  app.listen(PORT, '0.0.0.0', () => {
-    console.log(`🚀 Dine Backend server running on port ${PORT}`);
-    console.log(`🌐 Local URL: http://localhost:${PORT}`);
-    console.log(`🍽️ Ready to serve your restaurant management app!`);
-  });
-}
+// Start server for both local development and production
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`🚀 Dine Backend server running on port ${PORT}`);
+  console.log(`🌐 Environment: ${process.env.NODE_ENV || 'development'}`);
+  console.log(`🍽️ Ready to serve your restaurant management app!`);
+});
 
 module.exports = app;
