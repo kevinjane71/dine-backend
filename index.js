@@ -31,17 +31,31 @@ const razorpay = new Razorpay({
 let storage;
 if (process.env.NODE_ENV === 'production') {
   // For production
-  const serviceAccount = JSON.parse(process.env.GOOGLE_APPLICATION_CREDENTIALS_JSON);
-  storage = new Storage({
-    projectId: serviceAccount.project_id,
-    credentials: {
-      client_email: serviceAccount.client_email,
-      private_key: serviceAccount.private_key
+  try {
+    const credentialsJson = process.env.GOOGLE_APPLICATION_CREDENTIALS_JSON;
+    if (!credentialsJson || credentialsJson === 'undefined') {
+      console.warn('⚠️ GOOGLE_APPLICATION_CREDENTIALS_JSON not set, using default Firebase initialization');
+      storage = new Storage();
+    } else {
+      const serviceAccount = JSON.parse(credentialsJson);
+      storage = new Storage({
+        projectId: serviceAccount.project_id,
+        credentials: {
+          client_email: serviceAccount.client_email,
+          private_key: serviceAccount.private_key
+        }
+      });
+      console.log('✅ Firebase Storage initialized with service account');
     }
-  });
+  } catch (error) {
+    console.error('❌ Error parsing Firebase credentials:', error.message);
+    console.warn('⚠️ Falling back to default Firebase initialization');
+    storage = new Storage();
+  }
 } else {
   // For local development
   storage = new Storage();
+  console.log('✅ Firebase Storage initialized for development');
 }
 const bucket = storage.bucket(process.env.FIREBASE_STORAGE_BUCKET || 'dine-menu-uploads');
 
@@ -68,9 +82,9 @@ const upload = multer({
   }
 });
 //hello ddd
-const allowedOrigins = [
-  'http://localhost:3002',
-  'http://localhost:3003',
+    const allowedOrigins = [
+      'http://localhost:3002',
+      'http://localhost:3003',
   'https://dine-frontend-ecru.vercel.app'
 ];
 
@@ -88,7 +102,7 @@ const corsOptions = {
   optionsSuccessStatus: 200
 };
 
-app.use(cors(corsOptions)); 
+app.use(cors(corsOptions));
 app.options('*', cors(corsOptions)); // important for preflight
 app.use(helmet({ crossOriginResourcePolicy: { policy: "cross-origin" } }));
 
@@ -527,9 +541,24 @@ app.post('/api/auth/google', async (req, res) => {
   }
 });
 
-// Handle OPTIONS requests for CORS preflight
-app.options('/api/auth/phone/send-otp', (req, res) => {
-  res.status(200).end();
+// Health check endpoint
+app.get('/api/health', (req, res) => {
+  res.json({ 
+    status: 'OK', 
+    timestamp: new Date().toISOString(),
+    environment: process.env.NODE_ENV || 'development',
+    uptime: process.uptime()
+  });
+});
+
+// Handle OPTIONS requests for CORS preflight - Middleware approach
+app.use((req, res, next) => {
+  if (req.method === 'OPTIONS') {
+    console.log('🔄 OPTIONS request received for:', req.path);
+    res.status(200).end();
+    return;
+  }
+  next();
 });
 
 app.post('/api/auth/phone/send-otp', async (req, res) => {
@@ -3774,10 +3803,18 @@ app.use((req, res) => {
 });
 
 // Start server for both local development and production
-app.listen(PORT, '0.0.0.0', () => {
-  console.log(`🚀 Dine Backend server running on port ${PORT}`);
+const server = app.listen(PORT, '0.0.0.0', () => {
+    console.log(`🚀 Dine Backend server running on port ${PORT}`);
   console.log(`🌐 Environment: ${process.env.NODE_ENV || 'development'}`);
-  console.log(`🍽️ Ready to serve your restaurant management app!`);
+    console.log(`🍽️ Ready to serve your restaurant management app!`);
+  });
+
+// Handle server errors
+server.on('error', (error) => {
+  console.error('❌ Server error:', error);
+  if (error.code === 'EADDRINUSE') {
+    console.error(`Port ${PORT} is already in use`);
+  }
 });
 
 module.exports = app;
