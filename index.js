@@ -1703,6 +1703,8 @@ app.get('/api/menus/upload-status/:restaurantId', authenticateToken, async (req,
   }
 });
 
+// COMMENTED OUT - Auto seed data functionality removed
+/*
 app.post('/api/seed-data/:restaurantId', authenticateToken, async (req, res) => {
   try {
     const { restaurantId } = req.params;
@@ -1938,7 +1940,10 @@ app.post('/api/seed-data/:restaurantId', authenticateToken, async (req, res) => 
     res.status(500).json({ error: 'Failed to seed sample data' });
   }
 });
+*/
 
+// COMMENTED OUT - Auto seed orders functionality removed
+/*
 // Seed sample orders
 app.post('/api/seed-orders/:restaurantId', authenticateToken, async (req, res) => {
   try {
@@ -2049,6 +2054,7 @@ app.post('/api/seed-orders/:restaurantId', authenticateToken, async (req, res) =
     res.status(500).json({ error: 'Failed to seed sample orders' });
   }
 });
+*/
 
 // Table Management APIs
 app.get('/api/tables/:restaurantId', async (req, res) => {
