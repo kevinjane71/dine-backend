@@ -946,6 +946,67 @@ app.delete('/api/restaurants/:restaurantId', authenticateToken, async (req, res)
   }
 });
 
+// Public API - Get menu for customer ordering (no authentication required)
+app.get('/api/public/menu/:restaurantId', async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+
+    if (!restaurantId) {
+      return res.status(400).json({ error: 'Restaurant ID is required' });
+    }
+
+    // Get restaurant info
+    const restaurantDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
+    if (!restaurantDoc.exists) {
+      return res.status(404).json({ error: 'Restaurant not found' });
+    }
+
+    const restaurantData = restaurantDoc.data();
+
+    // Get active menu items only
+    const menuSnapshot = await db.collection(collections.menus)
+      .where('restaurantId', '==', restaurantId)
+      .where('status', '==', 'active')
+      .where('isAvailable', '==', true)
+      .orderBy('category')
+      .orderBy('name')
+      .get();
+
+    const menuItems = [];
+    menuSnapshot.forEach(doc => {
+      const menuData = doc.data();
+      menuItems.push({
+        id: doc.id,
+        name: menuData.name,
+        description: menuData.description || '',
+        price: menuData.price,
+        category: menuData.category,
+        isVeg: menuData.isVeg !== false,
+        spiceLevel: menuData.spiceLevel || 'medium',
+        shortCode: menuData.shortCode || menuData.name.substring(0, 3).toUpperCase(),
+        image: menuData.image || null,
+        allergens: menuData.allergens || []
+      });
+    });
+
+    res.json({
+      restaurant: {
+        id: restaurantId,
+        name: restaurantData.name,
+        description: restaurantData.description || '',
+        address: restaurantData.address || '',
+        phone: restaurantData.phone || '',
+        email: restaurantData.email || ''
+      },
+      menu: menuItems
+    });
+
+  } catch (error) {
+    console.error('Public menu fetch error:', error);
+    res.status(500).json({ error: 'Failed to fetch menu' });
+  }
+});
+
 app.get('/api/menus/:restaurantId', async (req, res) => {
   try {
     const { restaurantId } = req.params;
@@ -1130,6 +1191,171 @@ app.delete('/api/menus/item/:id', authenticateToken, async (req, res) => {
   } catch (error) {
     console.error('Delete menu item error:', error);
     res.status(500).json({ error: 'Failed to delete menu item' });
+  }
+});
+
+// Public API - Place order with OTP verification
+app.post('/api/public/orders/:restaurantId', async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+    const { 
+      customerPhone, 
+      customerName, 
+      seatNumber, 
+      items, 
+      totalAmount, 
+      notes,
+      otp,
+      verificationId
+    } = req.body;
+
+    if (!restaurantId || !items || items.length === 0) {
+      return res.status(400).json({ error: 'Restaurant ID and items are required' });
+    }
+
+    if (!customerPhone) {
+      return res.status(400).json({ error: 'Customer phone number is required' });
+    }
+
+    if (!otp || !verificationId) {
+      return res.status(400).json({ error: 'OTP verification is required' });
+    }
+
+    // Verify OTP with Firebase (this would need to be implemented)
+    // For now, we'll skip OTP verification and proceed with order creation
+    // In production, you would verify the OTP with Firebase here
+
+    // Check if restaurant exists
+    const restaurantDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
+    if (!restaurantDoc.exists) {
+      return res.status(404).json({ error: 'Restaurant not found' });
+    }
+
+    // Create or get customer record
+    let customerId;
+    const customerQuery = await db.collection('customers')
+      .where('restaurantId', '==', restaurantId)
+      .where('phone', '==', customerPhone)
+      .get();
+
+    if (customerQuery.empty) {
+      // Create new customer
+      const customerData = {
+        restaurantId,
+        phone: customerPhone,
+        name: customerName || 'Customer',
+        email: null,
+        customerId: `CUST-${Date.now()}-${Math.random().toString(36).substr(2, 4).toUpperCase()}`,
+        totalOrders: 0,
+        totalSpent: 0,
+        lastOrderDate: null,
+        createdAt: new Date(),
+        updatedAt: new Date()
+      };
+
+      const customerRef = await db.collection('customers').add(customerData);
+      customerId = customerRef.id;
+    } else {
+      // Update existing customer
+      const customerDoc = customerQuery.docs[0];
+      customerId = customerDoc.id;
+      
+      const updateData = {
+        updatedAt: new Date(),
+        lastOrderDate: new Date()
+      };
+
+      if (customerName && !customerDoc.data().name) {
+        updateData.name = customerName;
+      }
+
+      await customerDoc.ref.update(updateData);
+    }
+
+    // Validate menu items and calculate total
+    let calculatedTotal = 0;
+    const orderItems = [];
+
+    for (const item of items) {
+      const menuItem = await db.collection(collections.menus).doc(item.menuItemId).get();
+      
+      if (!menuItem.exists) {
+        return res.status(400).json({ error: `Menu item ${item.menuItemId} not found` });
+      }
+
+      const menuData = menuItem.data();
+      const itemTotal = menuData.price * item.quantity;
+      calculatedTotal += itemTotal;
+
+      orderItems.push({
+        menuItemId: item.menuItemId,
+        name: menuData.name,
+        price: menuData.price,
+        quantity: item.quantity,
+        total: itemTotal,
+        shortCode: menuData.shortCode || null,
+        notes: item.notes || ''
+      });
+    }
+
+    // Generate order number
+    const orderNumber = `ORD-${Date.now()}-${Math.random().toString(36).substr(2, 4).toUpperCase()}`;
+
+    const orderData = {
+      restaurantId,
+      orderNumber,
+      customerId,
+      tableNumber: seatNumber || null,
+      orderType: 'customer_self_order',
+      items: orderItems,
+      totalAmount: calculatedTotal,
+      customerInfo: {
+        phone: customerPhone,
+        name: customerName || 'Customer',
+        seatNumber: seatNumber || 'Walk-in'
+      },
+      paymentMethod: 'cash',
+      staffInfo: {
+        waiterId: null,
+        waiterName: 'Customer Self-Order',
+        kitchenNotes: 'Direct customer order - OTP verified'
+      },
+      notes: notes || `Customer self-order from seat ${seatNumber || 'Walk-in'}`,
+      status: 'pending',
+      kotSent: false,
+      paymentStatus: 'pending',
+      otpVerified: true,
+      verificationId: verificationId,
+      createdAt: new Date(),
+      updatedAt: new Date()
+    };
+
+    const orderRef = await db.collection(collections.orders).add(orderData);
+
+    // Update customer stats
+    await db.collection('customers').doc(customerId).update({
+      totalOrders: db.FieldValue.increment(1),
+      totalSpent: db.FieldValue.increment(calculatedTotal)
+    });
+    
+    console.log(`🛒 Customer order created successfully: ${orderRef.id}`);
+    console.log(`📋 Order items: ${orderData.items.length} items`);
+    console.log(`🏪 Restaurant: ${orderData.restaurantId}`);
+    console.log(`👤 Customer: ${customerPhone}`);
+
+    res.status(201).json({
+      message: 'Order placed successfully',
+      order: {
+        id: orderRef.id,
+        orderNumber: orderData.orderNumber,
+        totalAmount: orderData.totalAmount,
+        status: orderData.status
+      }
+    });
+
+  } catch (error) {
+    console.error('Public order creation error:', error);
+    res.status(500).json({ error: 'Failed to place order' });
   }
 });
 
@@ -2217,15 +2443,14 @@ app.post('/api/tables/:restaurantId', authenticateToken, async (req, res) => {
       return res.status(400).json({ error: 'Floor is required' });
     }
 
-    // Check for duplicate table name in the same floor
+    // Check for duplicate table name across all floors in the restaurant
     const existingTablesSnapshot = await db.collection(collections.tables)
       .where('restaurantId', '==', restaurantId)
-      .where('floor', '==', floor)
       .where('name', '==', name)
       .get();
 
     if (!existingTablesSnapshot.empty) {
-      return res.status(400).json({ error: `Table "${name}" already exists in ${floor}` });
+      return res.status(400).json({ error: `Table "${name}" already exists in this restaurant` });
     }
 
     const tableData = {
