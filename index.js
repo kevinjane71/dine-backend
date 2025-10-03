@@ -2354,7 +2354,7 @@ app.get('/api/floors/:restaurantId', async (req, res) => {
 app.post('/api/floors/:restaurantId', authenticateToken, async (req, res) => {
   try {
     const { restaurantId } = req.params;
-    const { name } = req.body;
+    const { name, description } = req.body;
 
     if (!name) {
       return res.status(400).json({ error: 'Floor name is required' });
@@ -2381,6 +2381,7 @@ app.post('/api/floors/:restaurantId', authenticateToken, async (req, res) => {
       floor: {
         id: `floor_${name.toLowerCase().replace(/\s+/g, '_')}`,
         name,
+        description: description || null,
         restaurantId,
         tables: [{
           id: tableRef.id,
