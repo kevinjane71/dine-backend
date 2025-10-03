@@ -85,7 +85,9 @@ const upload = multer({
     const allowedOrigins = [
       'http://localhost:3002',
       'http://localhost:3003',
-  'https://dine-frontend-ecru.vercel.app'
+      'https://dine-frontend-ecru.vercel.app',
+      'https://www.dineopen.com',
+      'https://dineopen.com'
 ];
 
 const corsOptions = {
