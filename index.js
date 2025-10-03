@@ -1143,11 +1143,19 @@ app.post('/api/orders', async (req, res) => {
       orderType = 'dine-in',
       paymentMethod = 'cash',
       staffInfo,
-      notes 
+      notes,
+      customerPhone,
+      customerName,
+      seatNumber
     } = req.body;
 
     if (!restaurantId || !items || items.length === 0) {
       return res.status(400).json({ error: 'Restaurant ID and items are required' });
+    }
+
+    // For customer self-orders, require phone number
+    if (orderType === 'customer_self_order' && !customerPhone) {
+      return res.status(400).json({ error: 'Customer phone number is required for self-orders' });
     }
 
     let totalAmount = 0;
@@ -1170,20 +1178,33 @@ app.post('/api/orders', async (req, res) => {
         price: menuData.price,
         quantity: item.quantity,
         total: itemTotal,
+        shortCode: menuData.shortCode || null,
         notes: item.notes || ''
       });
     }
 
+    // Generate order number
+    const orderNumber = `ORD-${Date.now()}-${Math.random().toString(36).substr(2, 4).toUpperCase()}`;
+
     const orderData = {
       restaurantId,
-      tableNumber: tableNumber || null,
+      orderNumber,
+      tableNumber: tableNumber || seatNumber || null,
       orderType,
       items: orderItems,
       totalAmount,
-      customerInfo: customerInfo || {},
+      customerInfo: customerInfo || {
+        phone: customerPhone,
+        name: customerName || 'Customer',
+        seatNumber: seatNumber || 'Walk-in'
+      },
       paymentMethod: paymentMethod || 'cash',
-      staffInfo: staffInfo || null,
-      notes: notes || '',
+      staffInfo: orderType === 'customer_self_order' ? {
+        waiterId: null,
+        waiterName: 'Customer Self-Order',
+        kitchenNotes: 'Direct customer order'
+      } : (staffInfo || null),
+      notes: notes || (orderType === 'customer_self_order' ? `Customer self-order from seat ${seatNumber || 'Walk-in'}` : ''),
       status: req.body.status || 'pending',
       kotSent: false,
       paymentStatus: 'pending',
@@ -1196,6 +1217,7 @@ app.post('/api/orders', async (req, res) => {
     console.log(`🛒 Order created successfully: ${orderRef.id} with status: ${orderData.status}`);
     console.log(`📋 Order items: ${orderData.items.length} items`);
     console.log(`🏪 Restaurant: ${orderData.restaurantId}`);
+    console.log(`👤 Order type: ${orderData.orderType}`);
 
     res.status(201).json({
       message: 'Order created successfully',
@@ -2191,10 +2213,25 @@ app.post('/api/tables/:restaurantId', authenticateToken, async (req, res) => {
       return res.status(400).json({ error: 'Table name is required' });
     }
 
+    if (!floor) {
+      return res.status(400).json({ error: 'Floor is required' });
+    }
+
+    // Check for duplicate table name in the same floor
+    const existingTablesSnapshot = await db.collection(collections.tables)
+      .where('restaurantId', '==', restaurantId)
+      .where('floor', '==', floor)
+      .where('name', '==', name)
+      .get();
+
+    if (!existingTablesSnapshot.empty) {
+      return res.status(400).json({ error: `Table "${name}" already exists in ${floor}` });
+    }
+
     const tableData = {
       restaurantId,
       name,
-      floor: floor || 'Ground Floor',
+      floor: floor,
       capacity: capacity || 4,
       section: section || 'Main',
       status: 'available', // available, occupied, reserved, cleaning
