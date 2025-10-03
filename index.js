@@ -607,6 +607,100 @@ app.post('/api/auth/phone/send-otp', async (req, res) => {
   }
 });
 
+// Firebase OTP verification endpoint
+app.post('/api/auth/firebase/verify', async (req, res) => {
+  try {
+    const { uid, phoneNumber, email, displayName, photoURL } = req.body;
+
+    if (!uid) {
+      return res.status(400).json({ error: 'Firebase UID is required' });
+    }
+
+    // Check if user exists in our database
+    let userDoc = await db.collection(collections.users)
+      .where('firebaseUid', '==', uid)
+      .get();
+
+    let userId, isNewUser = false, hasRestaurants = false;
+
+    if (userDoc.empty) {
+      // New user registration via Firebase
+      const newUser = {
+        firebaseUid: uid,
+        phone: phoneNumber || null,
+        email: email || null,
+        name: displayName || 'Restaurant Owner',
+        role: 'owner',
+        emailVerified: !!email,
+        phoneVerified: !!phoneNumber,
+        provider: 'firebase',
+        setupComplete: false,
+        createdAt: new Date(),
+        updatedAt: new Date()
+      };
+
+      const userRef = await db.collection(collections.users).add(newUser);
+      userId = userRef.id;
+      isNewUser = true;
+    } else {
+      // Existing user login
+      const userData = userDoc.docs[0].data();
+      userId = userDoc.docs[0].id;
+      
+      // Update user info if needed
+      const updateData = {
+        updatedAt: new Date(),
+        phoneVerified: !!phoneNumber,
+        emailVerified: !!email
+      };
+
+      if (email && !userData.email) updateData.email = email;
+      if (displayName && !userData.name) updateData.name = displayName;
+      if (photoURL && !userData.photoURL) updateData.photoURL = photoURL;
+
+      await userDoc.docs[0].ref.update(updateData);
+
+      // Check if owner has restaurants
+      const restaurantsQuery = await db.collection(collections.restaurants)
+        .where('ownerId', '==', userId)
+        .limit(1)
+        .get();
+      
+      hasRestaurants = !restaurantsQuery.empty;
+    }
+
+    // Generate JWT token
+    const token = jwt.sign(
+      { userId, phone: phoneNumber, email, role: 'owner' },
+      process.env.JWT_SECRET,
+      { expiresIn: '7d' }
+    );
+
+    res.json({
+      message: 'Firebase verification successful',
+      token,
+      user: {
+        id: userId,
+        phone: phoneNumber,
+        email,
+        name: displayName || 'Restaurant Owner',
+        role: 'owner',
+        photoURL
+      },
+      isNewUser,
+      hasRestaurants,
+      redirectTo: isNewUser || !hasRestaurants ? '/admin' : '/admin'
+    });
+
+  } catch (error) {
+    console.error('Firebase verification error:', error);
+    res.status(500).json({ 
+      error: 'Firebase verification failed',
+      details: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
+  }
+});
+
 // Owner phone-based registration/login
 app.post('/api/auth/phone/verify-otp', async (req, res) => {
   try {
