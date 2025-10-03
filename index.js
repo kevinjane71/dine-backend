@@ -143,8 +143,13 @@ const authenticateToken = (req, res, next) => {
   });
 };
 
-const generateOTP = () => {
+const generateOTP = (phone) => {
+  // Only use hardcoded OTP for dummy account
+  if (phone === '+919000000000' || phone === '9000000000') {
   return "1234";
+  }
+  // For real numbers, generate random OTP (this won't be used since we're using Firebase)
+  return Math.floor(100000 + Math.random() * 900000).toString();
 };
 
 const sendOTP = async (phone, otp) => {
@@ -334,7 +339,7 @@ app.post('/api/auth/register', async (req, res) => {
     }
 
     const hashedPassword = await bcrypt.hash(password, 10);
-    const emailOTP = generateOTP();
+    const emailOTP = generateOTP(phone || 'email');
 
     const userData = {
       email,
@@ -573,7 +578,7 @@ app.post('/api/auth/phone/send-otp', async (req, res) => {
       return res.status(400).json({ error: 'Phone number is required' });
     }
 
-    const otp = generateOTP();
+    const otp = generateOTP(phone);
     const otpExpiry = new Date(Date.now() + 10 * 60 * 1000);
 
     const otpRecord = {
