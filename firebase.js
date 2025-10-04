@@ -40,7 +40,11 @@ try {
     feedback: 'feedback',
     loyalty: 'loyalty',
     tables: 'tables',
-    bookings: 'bookings'
+    bookings: 'bookings',
+    userRestaurants: 'userRestaurants',
+    restaurantSettings: 'restaurantSettings',
+    discountSettings: 'discountSettings',
+    customers: 'customers'
   };
 
   module.exports = {

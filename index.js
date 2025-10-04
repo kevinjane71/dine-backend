@@ -1431,7 +1431,7 @@ app.post('/api/orders', async (req, res) => {
         kitchenNotes: 'Direct customer order'
       } : (staffInfo || null),
       notes: notes || (orderType === 'customer_self_order' ? `Customer self-order from seat ${seatNumber || 'Walk-in'}` : ''),
-      status: req.body.status || 'pending',
+      status: req.body.status || (orderType === 'customer_self_order' ? 'confirmed' : 'confirmed'),
       kotSent: false,
       paymentStatus: 'pending',
       createdAt: new Date(),
@@ -3494,7 +3494,7 @@ app.get('/api/kot/:restaurantId', async (req, res) => {
     console.log(`📊 Total orders found in DB: ${ordersSnapshot.docs.length}`);
     
     const orders = [];
-    const validKotStatuses = ['confirmed', 'preparing', 'ready'];
+    const validKotStatuses = ['pending', 'confirmed', 'preparing', 'ready'];
     console.log(`✅ Valid KOT statuses: ${validKotStatuses.join(', ')}`);
 
     for (const doc of ordersSnapshot.docs) {
@@ -4151,6 +4151,371 @@ app.use((err, req, res, next) => {
   });
 });
 
+// ==================== ADMIN SETTINGS APIs ====================
+
+// Get all admin settings for a restaurant
+app.get('/api/admin/settings/:restaurantId', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+    const userId = req.user.userId;
+
+    // Verify user has admin access to this restaurant
+    const userRestaurantSnapshot = await db.collection(collections.userRestaurants)
+      .where('userId', '==', userId)
+      .where('restaurantId', '==', restaurantId)
+      .where('role', 'in', ['owner', 'manager'])
+      .get();
+
+    if (userRestaurantSnapshot.empty) {
+      return res.status(403).json({ error: 'Access denied. Admin role required.' });
+    }
+
+    // Get restaurant settings
+    const settingsSnapshot = await db.collection(collections.restaurantSettings)
+      .where('restaurantId', '==', restaurantId)
+      .get();
+
+    let settings = {};
+    if (!settingsSnapshot.empty) {
+      settingsSnapshot.forEach(doc => {
+        settings = { ...settings, ...doc.data() };
+      });
+    }
+
+    // Get default settings if none exist
+    if (Object.keys(settings).length === 0) {
+      settings = {
+        restaurantId,
+        // Restaurant Info
+        restaurantName: '',
+        description: '',
+        address: '',
+        phone: '',
+        email: '',
+        
+        // Operating Hours
+        operatingHours: {
+          monday: { open: '09:00', close: '22:00', isOpen: true },
+          tuesday: { open: '09:00', close: '22:00', isOpen: true },
+          wednesday: { open: '09:00', close: '22:00', isOpen: true },
+          thursday: { open: '09:00', close: '22:00', isOpen: true },
+          friday: { open: '09:00', close: '22:00', isOpen: true },
+          saturday: { open: '09:00', close: '22:00', isOpen: true },
+          sunday: { open: '09:00', close: '22:00', isOpen: true }
+        },
+        
+        // Order Settings
+        orderSettings: {
+          lastOrderTime: '21:30',
+          preparationTime: 15,
+          maxOrderValue: 5000,
+          minOrderValue: 100,
+          allowPreOrders: true,
+          preOrderAdvanceHours: 2
+        },
+        
+        // Discount Settings
+        discountSettings: {
+          globalDiscount: {
+            enabled: false,
+            type: 'percentage', // percentage or fixed
+            value: 0,
+            minOrderValue: 0,
+            maxDiscountAmount: 0,
+            validFrom: null,
+            validTo: null
+          },
+          categoryDiscounts: [],
+          itemDiscounts: []
+        },
+        
+        // Payment Settings
+        paymentSettings: {
+          acceptCash: true,
+          acceptCard: true,
+          acceptUPI: true,
+          acceptWallet: true,
+          serviceCharge: 0,
+          taxRate: 18
+        },
+        
+        // Notification Settings
+        notificationSettings: {
+          orderNotifications: true,
+          paymentNotifications: true,
+          lowStockNotifications: true,
+          emailNotifications: true,
+          smsNotifications: false
+        },
+        
+        // System Settings
+        systemSettings: {
+          autoAcceptOrders: false,
+          requireCustomerConfirmation: true,
+          showPreparationTime: true,
+          allowOrderModifications: true,
+          maxModificationTime: 5 // minutes
+        },
+        
+        createdAt: new Date(),
+        updatedAt: new Date()
+      };
+    }
+
+    res.json({ settings });
+  } catch (error) {
+    console.error('Get admin settings error:', error);
+    res.status(500).json({ error: 'Failed to fetch settings' });
+  }
+});
+
+// Update admin settings
+app.put('/api/admin/settings/:restaurantId', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+    const userId = req.user.userId;
+    const settingsData = req.body;
+
+    // Verify user has admin access to this restaurant
+    const userRestaurantSnapshot = await db.collection(collections.userRestaurants)
+      .where('userId', '==', userId)
+      .where('restaurantId', '==', restaurantId)
+      .where('role', 'in', ['owner', 'manager'])
+      .get();
+
+    if (userRestaurantSnapshot.empty) {
+      return res.status(403).json({ error: 'Access denied. Admin role required.' });
+    }
+
+    // Validate settings data
+    if (!settingsData) {
+      return res.status(400).json({ error: 'Settings data is required' });
+    }
+
+    // Update settings with timestamp
+    const updatedSettings = {
+      ...settingsData,
+      restaurantId,
+      updatedAt: new Date()
+    };
+
+    // Check if settings document exists
+    const existingSettingsSnapshot = await db.collection(collections.restaurantSettings)
+      .where('restaurantId', '==', restaurantId)
+      .get();
+
+    if (existingSettingsSnapshot.empty) {
+      // Create new settings document
+      updatedSettings.createdAt = new Date();
+      await db.collection(collections.restaurantSettings).add(updatedSettings);
+    } else {
+      // Update existing settings
+      const settingsDoc = existingSettingsSnapshot.docs[0];
+      await settingsDoc.ref.update(updatedSettings);
+    }
+
+    // Update restaurant basic info if provided
+    if (settingsData.restaurantName || settingsData.description || settingsData.address || settingsData.phone || settingsData.email) {
+      const restaurantUpdate = {};
+      if (settingsData.restaurantName) restaurantUpdate.name = settingsData.restaurantName;
+      if (settingsData.description) restaurantUpdate.description = settingsData.description;
+      if (settingsData.address) restaurantUpdate.address = settingsData.address;
+      if (settingsData.phone) restaurantUpdate.phone = settingsData.phone;
+      if (settingsData.email) restaurantUpdate.email = settingsData.email;
+      restaurantUpdate.updatedAt = new Date();
+
+      const restaurantSnapshot = await db.collection(collections.restaurants)
+        .where('id', '==', restaurantId)
+        .get();
+
+      if (!restaurantSnapshot.empty) {
+        await restaurantSnapshot.docs[0].ref.update(restaurantUpdate);
+      }
+    }
+
+    res.json({ 
+      message: 'Settings updated successfully',
+      settings: updatedSettings
+    });
+  } catch (error) {
+    console.error('Update admin settings error:', error);
+    res.status(500).json({ error: 'Failed to update settings' });
+  }
+});
+
+// Apply discount to orders
+app.post('/api/admin/settings/:restaurantId/apply-discount', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+    const userId = req.user.userId;
+    const { discountType, targetType, targetId, discountData } = req.body;
+
+    // Verify user has admin access to this restaurant
+    const userRestaurantSnapshot = await db.collection(collections.userRestaurants)
+      .where('userId', '==', userId)
+      .where('restaurantId', '==', restaurantId)
+      .where('role', 'in', ['owner', 'manager'])
+      .get();
+
+    if (userRestaurantSnapshot.empty) {
+      return res.status(403).json({ error: 'Access denied. Admin role required.' });
+    }
+
+    // Validate discount data
+    if (!discountType || !targetType || !discountData) {
+      return res.status(400).json({ error: 'Invalid discount parameters' });
+    }
+
+    const discountSettings = {
+      restaurantId,
+      discountType, // 'global', 'category', 'item'
+      targetType, // 'all', 'specific'
+      targetId: targetId || null,
+      discountData,
+      appliedBy: userId,
+      appliedAt: new Date(),
+      isActive: true
+    };
+
+    // Save discount setting
+    await db.collection(collections.discountSettings).add(discountSettings);
+
+    res.json({ 
+      message: 'Discount applied successfully',
+      discount: discountSettings
+    });
+  } catch (error) {
+    console.error('Apply discount error:', error);
+    res.status(500).json({ error: 'Failed to apply discount' });
+  }
+});
+
+// Get restaurant operating status
+app.get('/api/admin/settings/:restaurantId/status', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+    const userId = req.user.userId;
+
+    // Verify user has admin access to this restaurant
+    const userRestaurantSnapshot = await db.collection(collections.userRestaurants)
+      .where('userId', '==', userId)
+      .where('restaurantId', '==', restaurantId)
+      .where('role', 'in', ['owner', 'manager'])
+      .get();
+
+    if (userRestaurantSnapshot.empty) {
+      return res.status(403).json({ error: 'Access denied. Admin role required.' });
+    }
+
+    // Get current settings
+    const settingsSnapshot = await db.collection(collections.restaurantSettings)
+      .where('restaurantId', '==', restaurantId)
+      .get();
+
+    let operatingHours = {};
+    let orderSettings = {};
+    
+    if (!settingsSnapshot.empty) {
+      const settings = settingsSnapshot.docs[0].data();
+      operatingHours = settings.operatingHours || {};
+      orderSettings = settings.orderSettings || {};
+    }
+
+    // Check if restaurant is currently open
+    const now = new Date();
+    const currentDay = now.toLocaleLowerCase().substring(0, 3); // mon, tue, etc.
+    const currentTime = now.toTimeString().substring(0, 5); // HH:MM format
+
+    const todayHours = operatingHours[currentDay];
+    const isOpen = todayHours && todayHours.isOpen && 
+                   currentTime >= todayHours.open && 
+                   currentTime <= todayHours.close;
+
+    // Check if orders are still being accepted
+    const lastOrderTime = orderSettings.lastOrderTime || '21:30';
+    const acceptingOrders = isOpen && currentTime <= lastOrderTime;
+
+    res.json({
+      isOpen,
+      acceptingOrders,
+      currentTime,
+      todayHours,
+      lastOrderTime,
+      nextOpenTime: getNextOpenTime(operatingHours, now)
+    });
+  } catch (error) {
+    console.error('Get restaurant status error:', error);
+    res.status(500).json({ error: 'Failed to get restaurant status' });
+  }
+});
+
+// Update restaurant operating status
+app.put('/api/admin/settings/:restaurantId/status', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+    const userId = req.user.userId;
+    const { isOpen, reason } = req.body;
+
+    // Verify user has admin access to this restaurant
+    const userRestaurantSnapshot = await db.collection(collections.userRestaurants)
+      .where('userId', '==', userId)
+      .where('restaurantId', '==', restaurantId)
+      .where('role', 'in', ['owner', 'manager'])
+      .get();
+
+    if (userRestaurantSnapshot.empty) {
+      return res.status(403).json({ error: 'Access denied. Admin role required.' });
+    }
+
+    // Update restaurant status
+    const statusUpdate = {
+      isOpen: isOpen !== undefined ? isOpen : true,
+      statusChangeReason: reason || 'Manual status update',
+      statusChangedBy: userId,
+      statusChangedAt: new Date(),
+      updatedAt: new Date()
+    };
+
+    // Update restaurant document
+    const restaurantSnapshot = await db.collection(collections.restaurants)
+      .where('id', '==', restaurantId)
+      .get();
+
+    if (!restaurantSnapshot.empty) {
+      await restaurantSnapshot.docs[0].ref.update(statusUpdate);
+    }
+
+    res.json({ 
+      message: 'Restaurant status updated successfully',
+      status: statusUpdate
+    });
+  } catch (error) {
+    console.error('Update restaurant status error:', error);
+    res.status(500).json({ error: 'Failed to update restaurant status' });
+  }
+});
+
+// Helper function to get next open time
+function getNextOpenTime(operatingHours, currentTime) {
+  const days = ['sunday', 'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday'];
+  const currentDayIndex = currentTime.getDay();
+  
+  for (let i = 1; i <= 7; i++) {
+    const nextDayIndex = (currentDayIndex + i) % 7;
+    const nextDay = days[nextDayIndex];
+    const nextDayHours = operatingHours[nextDay];
+    
+    if (nextDayHours && nextDayHours.isOpen) {
+      return {
+        day: nextDay,
+        time: nextDayHours.open
+      };
+    }
+  }
+  
+  return null;
+}
+
 // 404 handler - must be last
 app.use((req, res) => {
   res.status(404).json({ 
@@ -4166,7 +4531,8 @@ app.use((req, res) => {
       '/api/orders/*',
       '/api/payments/*',
       '/api/analytics/*',
-      '/api/kot/*'
+      '/api/kot/*',
+      '/api/admin/settings/*'
     ]
   });
 });
