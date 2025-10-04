@@ -978,31 +978,24 @@ app.get('/api/public/menu/:restaurantId', async (req, res) => {
 
     const restaurantData = restaurantDoc.data();
 
-    // Get active menu items only
-    const menuSnapshot = await db.collection(collections.menus)
-      .where('restaurantId', '==', restaurantId)
-      .where('status', '==', 'active')
-      .where('isAvailable', '==', true)
-      .orderBy('category')
-      .orderBy('name')
-      .get();
-
-    const menuItems = [];
-    menuSnapshot.forEach(doc => {
-      const menuData = doc.data();
-      menuItems.push({
-        id: doc.id,
-        name: menuData.name,
-        description: menuData.description || '',
-        price: menuData.price,
-        category: menuData.category,
-        isVeg: menuData.isVeg !== false,
-        spiceLevel: menuData.spiceLevel || 'medium',
-        shortCode: menuData.shortCode || menuData.name.substring(0, 3).toUpperCase(),
-        image: menuData.image || null,
-        allergens: menuData.allergens || []
-      });
-    });
+    // Get menu items from embedded menu structure
+    const embeddedMenuItems = restaurantData.menu?.items || [];
+    
+    // Filter active and available menu items
+    const menuItems = embeddedMenuItems
+      .filter(item => item.status === 'active' && item.isAvailable === true)
+      .map(item => ({
+        id: item.id,
+        name: item.name,
+        description: item.description || '',
+        price: item.price,
+        category: item.category,
+        isVeg: item.isVeg !== false,
+        spiceLevel: item.spiceLevel || 'medium',
+        shortCode: item.shortCode || item.name.substring(0, 3).toUpperCase(),
+        image: item.image || null,
+        allergens: item.allergens || []
+      }));
 
     res.json({
       restaurant: {
@@ -1407,24 +1400,28 @@ app.post('/api/public/orders/:restaurantId', async (req, res) => {
     let calculatedTotal = 0;
     const orderItems = [];
 
+    // Get restaurant menu items from embedded structure
+    const restaurantData = restaurantDoc.data();
+    const menuItems = restaurantData.menu?.items || [];
+
     for (const item of items) {
-      const menuItem = await db.collection(collections.menus).doc(item.menuItemId).get();
+      // Find menu item in the embedded menu structure
+      const menuItem = menuItems.find(menuItem => menuItem.id === item.menuItemId);
       
-      if (!menuItem.exists) {
+      if (!menuItem) {
         return res.status(400).json({ error: `Menu item ${item.menuItemId} not found` });
       }
 
-      const menuData = menuItem.data();
-      const itemTotal = menuData.price * item.quantity;
+      const itemTotal = menuItem.price * item.quantity;
       calculatedTotal += itemTotal;
 
       orderItems.push({
         menuItemId: item.menuItemId,
-        name: menuData.name,
-        price: menuData.price,
+        name: menuItem.name,
+        price: menuItem.price,
         quantity: item.quantity,
         total: itemTotal,
-        shortCode: menuData.shortCode || null,
+        shortCode: menuItem.shortCode || null,
         notes: item.notes || ''
       });
     }
@@ -1518,24 +1515,33 @@ app.post('/api/orders', async (req, res) => {
     let totalAmount = 0;
     const orderItems = [];
 
+    // Get restaurant document to access embedded menu items
+    const restaurantDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
+    if (!restaurantDoc.exists) {
+      return res.status(404).json({ error: 'Restaurant not found' });
+    }
+
+    const restaurantData = restaurantDoc.data();
+    const menuItems = restaurantData.menu?.items || [];
+
     for (const item of items) {
-      const menuItem = await db.collection(collections.menus).doc(item.menuItemId).get();
+      // Find menu item in the embedded menu structure
+      const menuItem = menuItems.find(menuItem => menuItem.id === item.menuItemId);
       
-      if (!menuItem.exists) {
+      if (!menuItem) {
         return res.status(400).json({ error: `Menu item ${item.menuItemId} not found` });
       }
 
-      const menuData = menuItem.data();
-      const itemTotal = menuData.price * item.quantity;
+      const itemTotal = menuItem.price * item.quantity;
       totalAmount += itemTotal;
 
       orderItems.push({
         menuItemId: item.menuItemId,
-        name: menuData.name,
-        price: menuData.price,
+        name: menuItem.name,
+        price: menuItem.price,
         quantity: item.quantity,
         total: itemTotal,
-        shortCode: menuData.shortCode || null,
+        shortCode: menuItem.shortCode || null,
         notes: item.notes || ''
       });
     }
@@ -2276,20 +2282,18 @@ app.get('/api/menus/upload-status/:restaurantId', authenticateToken, async (req,
       return res.status(403).json({ error: 'Access denied' });
     }
 
-    // Get recent menu items for this restaurant
-    const menuSnapshot = await db.collection(collections.menus)
-      .where('restaurantId', '==', restaurantId)
-      .orderBy('createdAt', 'desc')
-      .limit(50)
-      .get();
-
-    const recentItems = [];
-    menuSnapshot.forEach(doc => {
-      recentItems.push({
-        id: doc.id,
-        ...doc.data()
-      });
-    });
+    // Get recent menu items from embedded menu structure
+    const restaurantData = restaurant.data();
+    const embeddedMenuItems = restaurantData.menu?.items || [];
+    
+    // Sort by creation date and limit to 50 most recent
+    const recentItems = embeddedMenuItems
+      .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt))
+      .slice(0, 50)
+      .map(item => ({
+        id: item.id,
+        ...item
+      }));
 
     res.json({
       totalItems: recentItems.length,
