@@ -1563,6 +1563,31 @@ app.patch('/api/orders/:orderId/status', authenticateToken, async (req, res) => 
       return res.status(400).json({ error: 'Invalid status' });
     }
 
+    // Get the order first to validate it exists and belongs to user's restaurant
+    const orderDoc = await db.collection(collections.orders).doc(orderId).get();
+    if (!orderDoc.exists) {
+      return res.status(404).json({ error: 'Order not found' });
+    }
+
+    const orderData = orderDoc.data();
+    
+    // Get user's restaurant context
+    const user = req.user;
+    let userRestaurantId = null;
+    
+    if (user.restaurantId) {
+      // Staff user - use their assigned restaurant
+      userRestaurantId = user.restaurantId;
+    } else if (user.role === 'owner' || user.role === 'admin') {
+      // Owner/Admin - get selected restaurant from request or use order's restaurant
+      userRestaurantId = req.body.restaurantId || orderData.restaurantId;
+    }
+    
+    // Validate that the order belongs to the user's restaurant
+    if (orderData.restaurantId !== userRestaurantId) {
+      return res.status(403).json({ error: 'Access denied: Order does not belong to your restaurant' });
+    }
+
     await db.collection(collections.orders).doc(orderId).update({
       status,
       updatedAt: new Date()
@@ -1594,6 +1619,23 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
     }
 
     const currentOrder = orderDoc.data();
+    
+    // Get user's restaurant context
+    const user = req.user;
+    let userRestaurantId = null;
+    
+    if (user.restaurantId) {
+      // Staff user - use their assigned restaurant
+      userRestaurantId = user.restaurantId;
+    } else if (user.role === 'owner' || user.role === 'admin') {
+      // Owner/Admin - get selected restaurant from request or use order's restaurant
+      userRestaurantId = req.body.restaurantId || currentOrder.restaurantId;
+    }
+    
+    // Validate that the order belongs to the user's restaurant
+    if (currentOrder.restaurantId !== userRestaurantId) {
+      return res.status(403).json({ error: 'Access denied: Order does not belong to your restaurant' });
+    }
     
     // Don't allow updates to completed or cancelled orders
     if (currentOrder.status === 'completed' || currentOrder.status === 'cancelled') {
