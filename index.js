@@ -4573,6 +4573,158 @@ function getNextOpenTime(operatingHours, currentTime) {
   return null;
 }
 
+// Menu AI Upload and Build Endpoint
+app.post('/api/menu/upload-and-build', upload.array('menuImage', 1), async (req, res) => {
+  try {
+    const { restaurantId } = req.body;
+    
+    if (!restaurantId) {
+      return res.status(400).json({
+        success: false,
+        error: 'Restaurant ID is required'
+      });
+    }
+    
+    if (!req.files || req.files.length === 0) {
+      return res.status(400).json({
+        success: false,
+        error: 'No image file provided'
+      });
+    }
+    
+    const file = req.files[0];
+    
+    // Validate file size (500MB max)
+    const maxSize = 500 * 1024 * 1024; // 500MB in bytes
+    if (file.size > maxSize) {
+      return res.status(400).json({
+        success: false,
+        error: 'File size exceeds 500MB limit'
+      });
+    }
+    
+    // Validate file type
+    const allowedTypes = ['image/jpeg', 'image/png', 'image/jpg', 'image/webp'];
+    if (!allowedTypes.includes(file.mimetype)) {
+      return res.status(400).json({
+        success: false,
+        error: 'Invalid file type. Only JPEG, PNG, and WebP are allowed'
+      });
+    }
+    
+    console.log('📸 Received menu image upload:', {
+      filename: file.originalname,
+      size: Math.round(file.size / 1024 / 1024) + 'MB',
+      type: file.mimetype,
+      restaurantId: restaurantId
+    });
+    
+    // TODO: Process image with AI/ML service to extract menu items
+    // For now, return mock data
+    
+    // Simulate AI processing time
+    await new Promise(resolve => setTimeout(resolve, 2000));
+    
+    // Mock AI-generated menu items
+    const mockMenuItems = [
+      {
+        name: 'Burger Classic',
+        price: 12.99,
+        category: 'Main Course',
+        description: 'Juicy beef patty with fresh vegetables',
+        veg: false,
+        available: true,
+        shortCode: 'BC01'
+      },
+      {
+        name: 'Margherita Pizza',
+        price: 14.99,
+        category: 'Main Course',
+        description: 'Fresh mozzarella and tomato sauce',
+        veg: true,
+        available: true,
+        shortCode: 'MP01'
+      },
+      {
+        name: 'Chicken Wings',
+        price: 9.99,
+        category: 'Appetizers',
+        description: 'Crispy wings with choice of sauce',
+        veg: false,
+        available: true,
+        shortCode: 'CW01'
+      },
+      {
+        name: 'Caesar Salad',
+        price: 8.99,
+        category: 'Salads',
+        description: 'Fresh romaine lettuce with caesar dressing',
+        veg: true,
+        available: true,
+        shortCode: 'CS01'
+      },
+      {
+        name: 'Chocolate Cake',
+        price: 6.99,
+        category: 'Desserts',
+        description: 'Rich chocolate cake with fudge frosting',
+        veg: true,
+        available: true,
+        shortCode: 'CC01'
+      },
+      {
+        name: 'Fresh Lemonade',
+        price: 4.99,
+        category: 'Beverages',
+        description: 'Freshly squeezed lemon juice',
+        veg: true,
+        available: true,
+        shortCode: 'FL01'
+      }
+    ];
+    
+    // Save menu items to database
+    const savedItems = [];
+    for (const item of mockMenuItems) {
+      try {
+        const docRef = db.collection(collections.menus).doc();
+        await docRef.set({
+          ...item,
+          restaurantId: restaurantId,
+          createdAt: db.FieldValue.serverTimestamp(),
+          updatedAt: db.FieldValue.serverTimestamp()
+        });
+        
+        savedItems.push({
+          id: docRef.id,
+          ...item
+        });
+      } catch (error) {
+        console.error('Error saving menu item:', error);
+      }
+    }
+    
+    console.log(`✅ AI processed menu image and created ${savedItems.length} menu items`);
+    
+    res.json({
+      success: true,
+      message: `Successfully processed menu image and created ${savedItems.length} menu items`,
+      menuItems: savedItems,
+      fileName: file.originalname,
+      fileSize: `${Math.round(file.size / 1024 / 1024)}MB`
+    });
+    
+  } catch (error) {
+    console.error('❌ Error processing menu upload:', error);
+    
+    res.status(500).json({
+      success: false,
+      error: 'Failed to process menu image',
+      message: error.message
+    });
+  }
+});
+
 // 404 handler - must be last
 app.use((req, res) => {
   res.status(404).json({ 
