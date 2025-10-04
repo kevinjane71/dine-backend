@@ -26,7 +26,8 @@ try {
     console.log('✅ Firebase Admin initialized successfully');
   }
 
-  db = admin.firestore();
+  db = admin.firestore('dine'); // Use the "dine" database instead of default
+  console.log('🎯 Using Firestore database: "dine"');
   
   const collections = {
     users: 'users',
