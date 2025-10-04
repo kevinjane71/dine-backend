@@ -2078,6 +2078,15 @@ app.post('/api/menus/bulk-save/:restaurantId', authenticateToken, async (req, re
     const { userId } = req.user;
     const { menuItems } = req.body;
 
+    console.log(`\n=== BULK SAVE REQUEST ===`);
+    console.log('Restaurant ID:', restaurantId);
+    console.log('User ID:', userId);
+    console.log('Menu items received:', menuItems ? menuItems.length : 'No items');
+    
+    if (menuItems && menuItems.length > 0) {
+      console.log('First item sample:', JSON.stringify(menuItems[0], null, 2));
+    }
+
     if (!menuItems || !Array.isArray(menuItems)) {
       return res.status(400).json({ error: 'Menu items array is required' });
     }
@@ -2091,7 +2100,25 @@ app.post('/api/menus/bulk-save/:restaurantId', authenticateToken, async (req, re
     const savedItems = [];
     const errors = [];
 
-    // Save each menu item
+    // Get the restaurant document to update its menu
+    const restaurantDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
+    if (!restaurantDoc.exists) {
+      return res.status(404).json({ error: 'Restaurant not found' });
+    }
+
+    const restaurantData = restaurantDoc.data();
+    const existingMenu = restaurantData.menu || { categories: [], items: [] };
+    const existingItems = existingMenu.items || [];
+    const existingCategories = existingMenu.categories || [];
+
+    console.log('📋 Existing menu structure:', {
+      hasMenu: !!restaurantData.menu,
+      existingItemsCount: existingItems.length,
+      existingCategoriesCount: existingCategories.length,
+      firstExistingItem: existingItems[0] ? existingItems[0].name : 'No items'
+    });
+
+    // Process each menu item
     for (const item of menuItems) {
       try {
         // Map AI category to our category system
@@ -2138,6 +2165,7 @@ app.post('/api/menus/bulk-save/:restaurantId', authenticateToken, async (req, re
 
         // Convert AI extracted data to match manual menu item format
         const menuItem = {
+          id: `item_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`, // Generate unique ID
           restaurantId,
           name: item.name || 'Unnamed Item',
           description: item.description || '',
@@ -2148,7 +2176,7 @@ app.post('/api/menus/bulk-save/:restaurantId', authenticateToken, async (req, re
           allergens: Array.isArray(item.allergens) ? item.allergens : [],
           shortCode: item.shortCode || item.name.substring(0, 3).toUpperCase(),
           status: 'active',
-          order: 0,
+          order: existingItems.length, // Set order based on existing items
           isAvailable: true,
           stockQuantity: null,
           lowStockThreshold: 5,
@@ -2162,15 +2190,64 @@ app.post('/api/menus/bulk-save/:restaurantId', authenticateToken, async (req, re
           originalFile: item.originalFile || null
         };
 
-        const menuRef = await db.collection(collections.menus).add(menuItem);
-        savedItems.push({
-          id: menuRef.id,
-          ...menuItem
-        });
+        // Add to existing items
+        existingItems.push(menuItem);
+        savedItems.push(menuItem);
+
+        console.log(`✅ Processed item: ${menuItem.name} (${menuItem.category})`);
+        console.log(`📊 Current items count: ${existingItems.length}`);
+
+        // Add category if it doesn't exist
+        const categoryExists = existingCategories.some(cat => cat.id === menuItem.category);
+        if (!categoryExists) {
+          existingCategories.push({
+            id: menuItem.category,
+            name: menuItem.category.charAt(0).toUpperCase() + menuItem.category.slice(1).replace('-', ' '),
+            order: existingCategories.length,
+            createdAt: new Date(),
+            updatedAt: new Date()
+          });
+          console.log(`📂 Added new category: ${menuItem.category}`);
+        }
       } catch (error) {
-        console.error(`Error saving menu item ${item.name}:`, error);
-        errors.push(`Failed to save ${item.name}: ${error.message}`);
+        console.error(`Error processing menu item ${item.name}:`, error);
+        errors.push(`Failed to process ${item.name}: ${error.message}`);
       }
+    }
+
+    // Update the restaurant document with the new menu items
+    if (savedItems.length > 0) {
+      console.log(`\n=== UPDATING RESTAURANT DOCUMENT ===`);
+      console.log('Restaurant ID:', restaurantId);
+      console.log('Total items to save:', savedItems.length);
+      console.log('Total categories:', existingCategories.length);
+      console.log('Existing items before update:', existingItems.length);
+      
+      const updateData = {
+        menu: {
+          categories: existingCategories,
+          items: existingItems,
+          lastUpdated: new Date()
+        },
+        updatedAt: new Date()
+      };
+      
+      console.log('Update data structure:', {
+        categoriesCount: updateData.menu.categories.length,
+        itemsCount: updateData.menu.items.length,
+        lastUpdated: updateData.menu.lastUpdated
+      });
+      
+      await db.collection(collections.restaurants).doc(restaurantId).update(updateData);
+      console.log('✅ Restaurant document updated successfully');
+      
+      // Verify the update by reading the document back
+      const verifyDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
+      const verifyData = verifyDoc.data();
+      console.log('🔍 Verification - Menu items after update:', verifyData.menu?.items?.length || 0);
+      console.log('🔍 Verification - Menu categories after update:', verifyData.menu?.categories?.length || 0);
+    } else {
+      console.log('❌ No items to save, skipping database update');
     }
 
     res.json({
