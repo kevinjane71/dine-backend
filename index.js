@@ -1027,23 +1027,25 @@ app.get('/api/menus/:restaurantId', async (req, res) => {
     const { restaurantId } = req.params;
     const { category } = req.query;
 
-    let query = db.collection(collections.menus)
-      .where('restaurantId', '==', restaurantId)
-      .where('status', '==', 'active');
-
-    if (category) {
-      query = query.where('category', '==', category);
+    // Get restaurant document which now contains the menu
+    const restaurantDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
+    
+    if (!restaurantDoc.exists) {
+      return res.status(404).json({ error: 'Restaurant not found' });
     }
 
-    const snapshot = await query.get();
-    const menuItems = [];
+    const restaurantData = restaurantDoc.data();
+    const menuData = restaurantData.menu || { categories: [], items: [] };
 
-    snapshot.forEach(doc => {
-      menuItems.push({
-        id: doc.id,
-        ...doc.data()
-      });
-    });
+    let menuItems = menuData.items || [];
+
+    // Filter by category if specified
+    if (category) {
+      menuItems = menuItems.filter(item => item.category === category);
+    }
+
+    // Filter only active items
+    menuItems = menuItems.filter(item => item.status === 'active');
 
     res.json({ menuItems });
 
@@ -1072,8 +1074,19 @@ app.post('/api/menus/:restaurantId', authenticateToken, async (req, res) => {
       return res.status(400).json({ error: 'Name, price, and category are required' });
     }
 
-    const menuItem = {
-      restaurantId,
+    // Get current restaurant data
+    const restaurantDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
+    
+    if (!restaurantDoc.exists) {
+      return res.status(404).json({ error: 'Restaurant not found' });
+    }
+
+    const restaurantData = restaurantDoc.data();
+    const currentMenu = restaurantData.menu || { categories: [], items: [] };
+
+    // Create new menu item
+    const newMenuItem = {
+      id: `item_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`, // Generate unique ID
       name,
       description: description || '',
       price: parseFloat(price),
@@ -1087,23 +1100,43 @@ app.post('/api/menus/:restaurantId', authenticateToken, async (req, res) => {
       order: 0,
       // Availability/Stock management fields
       isAvailable: req.body.isAvailable !== undefined ? req.body.isAvailable : true,
-      stockQuantity: req.body.stockQuantity || null, // null means unlimited
+      stockQuantity: req.body.stockQuantity || null,
       lowStockThreshold: req.body.lowStockThreshold || 5,
       isStockManaged: req.body.isStockManaged || false,
-      availableFrom: req.body.availableFrom || null, // time-based availability
+      availableFrom: req.body.availableFrom || null,
       availableUntil: req.body.availableUntil || null,
       createdAt: new Date(),
       updatedAt: new Date()
     };
 
-    const menuRef = await db.collection(collections.menus).add(menuItem);
+    // Add to menu items array
+    const updatedItems = [...(currentMenu.items || []), newMenuItem];
+
+    // Update categories if new category
+    const categories = [...(currentMenu.categories || [])];
+    if (!categories.find(cat => cat.name === category)) {
+      categories.push({
+        name: category,
+        items: [newMenuItem]
+      });
+    } else {
+      // Add to existing category
+      const categoryIndex = categories.findIndex(cat => cat.name === category);
+      categories[categoryIndex].items.push(newMenuItem);
+    }
+
+    // Update restaurant document with new menu structure
+    await db.collection(collections.restaurants).doc(restaurantId).update({
+      menu: {
+        categories,
+        items: updatedItems,
+        lastUpdated: new Date()
+      }
+    });
 
     res.status(201).json({
       message: 'Menu item created successfully',
-      menuItem: {
-        id: menuRef.id,
-        ...menuItem
-      }
+      menuItem: newMenuItem
     });
 
   } catch (error) {
@@ -1118,18 +1151,31 @@ app.patch('/api/menus/item/:id', authenticateToken, async (req, res) => {
     const { id } = req.params;
     const { userId } = req.user;
     
-    // Get the menu item first to check ownership
-    const menuItemDoc = await db.collection(collections.menus).doc(id).get();
+    // Find the restaurant that contains this menu item
+    const restaurantsSnapshot = await db.collection(collections.restaurants).get();
+    let foundRestaurant = null;
+    let foundItem = null;
     
-    if (!menuItemDoc.exists) {
+    for (const restaurantDoc of restaurantsSnapshot.docs) {
+      const restaurantData = restaurantDoc.data();
+      const menuData = restaurantData.menu || { items: [] };
+      
+      const item = menuData.items.find(item => item.id === id);
+      if (item) {
+        foundRestaurant = restaurantDoc;
+        foundItem = item;
+        break;
+      }
+    }
+    
+    if (!foundRestaurant || !foundItem) {
       return res.status(404).json({ error: 'Menu item not found' });
     }
     
-    const menuItemData = menuItemDoc.data();
+    const restaurantData = foundRestaurant.data();
     
-    // Check if user owns the restaurant this menu item belongs to
-    const restaurantDoc = await db.collection(collections.restaurants).doc(menuItemData.restaurantId).get();
-    if (!restaurantDoc.exists || restaurantDoc.data().ownerId !== userId) {
+    // Check if user owns the restaurant
+    if (restaurantData.ownerId !== userId) {
       return res.status(403).json({ error: 'Access denied' });
     }
     
@@ -1157,13 +1203,39 @@ app.patch('/api/menus/item/:id', authenticateToken, async (req, res) => {
       return res.status(400).json({ error: 'No valid fields to update' });
     }
     
-    await db.collection(collections.menus).doc(id).update(updateData);
+    // Update the menu item in the restaurant document
+    const currentMenu = restaurantData.menu || { categories: [], items: [] };
+    const updatedItems = currentMenu.items.map(item => {
+      if (item.id === id) {
+        return { ...item, ...updateData };
+      }
+      return item;
+    });
+    
+    // Update categories as well
+    const updatedCategories = currentMenu.categories.map(category => ({
+      ...category,
+      items: category.items.map(item => {
+        if (item.id === id) {
+          return { ...item, ...updateData };
+        }
+        return item;
+      })
+    }));
+    
+    await db.collection(collections.restaurants).doc(foundRestaurant.id).update({
+      menu: {
+        categories: updatedCategories,
+        items: updatedItems,
+        lastUpdated: new Date()
+      }
+    });
     
     res.json({ 
       message: 'Menu item updated successfully',
       updatedFields: Object.keys(updateData).filter(key => key !== 'updatedAt')
     });
-    
+
   } catch (error) {
     console.error('Update menu item error:', error);
     res.status(500).json({ error: 'Failed to update menu item' });
@@ -1176,26 +1248,70 @@ app.delete('/api/menus/item/:id', authenticateToken, async (req, res) => {
     const { id } = req.params;
     const { userId } = req.user;
     
-    // Get the menu item first to check ownership
-    const menuItemDoc = await db.collection(collections.menus).doc(id).get();
+    // Find the restaurant that contains this menu item
+    const restaurantsSnapshot = await db.collection(collections.restaurants).get();
+    let foundRestaurant = null;
+    let foundItem = null;
     
-    if (!menuItemDoc.exists) {
+    for (const restaurantDoc of restaurantsSnapshot.docs) {
+      const restaurantData = restaurantDoc.data();
+      const menuData = restaurantData.menu || { items: [] };
+      
+      const item = menuData.items.find(item => item.id === id);
+      if (item) {
+        foundRestaurant = restaurantDoc;
+        foundItem = item;
+        break;
+      }
+    }
+    
+    if (!foundRestaurant || !foundItem) {
       return res.status(404).json({ error: 'Menu item not found' });
     }
     
-    const menuItemData = menuItemDoc.data();
+    const restaurantData = foundRestaurant.data();
     
-    // Check if user owns the restaurant this menu item belongs to
-    const restaurantDoc = await db.collection(collections.restaurants).doc(menuItemData.restaurantId).get();
-    if (!restaurantDoc.exists || restaurantDoc.data().ownerId !== userId) {
+    // Check if user owns the restaurant
+    if (restaurantData.ownerId !== userId) {
       return res.status(403).json({ error: 'Access denied' });
     }
     
     // Soft delete by setting status to 'deleted'
-    await db.collection(collections.menus).doc(id).update({
-      status: 'deleted',
-      deletedAt: new Date(),
-      updatedAt: new Date()
+    const currentMenu = restaurantData.menu || { categories: [], items: [] };
+    const updatedItems = currentMenu.items.map(item => {
+      if (item.id === id) {
+        return { 
+          ...item, 
+          status: 'deleted',
+          deletedAt: new Date(),
+          updatedAt: new Date()
+        };
+      }
+      return item;
+    });
+    
+    // Update categories as well
+    const updatedCategories = currentMenu.categories.map(category => ({
+      ...category,
+      items: category.items.map(item => {
+        if (item.id === id) {
+          return { 
+            ...item, 
+            status: 'deleted',
+            deletedAt: new Date(),
+            updatedAt: new Date()
+          };
+        }
+        return item;
+      })
+    }));
+    
+    await db.collection(collections.restaurants).doc(foundRestaurant.id).update({
+      menu: {
+        categories: updatedCategories,
+        items: updatedItems,
+        lastUpdated: new Date()
+      }
     });
     
     res.json({ 
@@ -4572,158 +4688,6 @@ function getNextOpenTime(operatingHours, currentTime) {
   
   return null;
 }
-
-// Menu AI Upload and Build Endpoint
-app.post('/api/menu/upload-and-build', upload.array('menuImage', 1), async (req, res) => {
-  try {
-    const { restaurantId } = req.body;
-    
-    if (!restaurantId) {
-      return res.status(400).json({
-        success: false,
-        error: 'Restaurant ID is required'
-      });
-    }
-    
-    if (!req.files || req.files.length === 0) {
-      return res.status(400).json({
-        success: false,
-        error: 'No image file provided'
-      });
-    }
-    
-    const file = req.files[0];
-    
-    // Validate file size (500MB max)
-    const maxSize = 500 * 1024 * 1024; // 500MB in bytes
-    if (file.size > maxSize) {
-      return res.status(400).json({
-        success: false,
-        error: 'File size exceeds 500MB limit'
-      });
-    }
-    
-    // Validate file type
-    const allowedTypes = ['image/jpeg', 'image/png', 'image/jpg', 'image/webp'];
-    if (!allowedTypes.includes(file.mimetype)) {
-      return res.status(400).json({
-        success: false,
-        error: 'Invalid file type. Only JPEG, PNG, and WebP are allowed'
-      });
-    }
-    
-    console.log('📸 Received menu image upload:', {
-      filename: file.originalname,
-      size: Math.round(file.size / 1024 / 1024) + 'MB',
-      type: file.mimetype,
-      restaurantId: restaurantId
-    });
-    
-    // TODO: Process image with AI/ML service to extract menu items
-    // For now, return mock data
-    
-    // Simulate AI processing time
-    await new Promise(resolve => setTimeout(resolve, 2000));
-    
-    // Mock AI-generated menu items
-    const mockMenuItems = [
-      {
-        name: 'Burger Classic',
-        price: 12.99,
-        category: 'Main Course',
-        description: 'Juicy beef patty with fresh vegetables',
-        veg: false,
-        available: true,
-        shortCode: 'BC01'
-      },
-      {
-        name: 'Margherita Pizza',
-        price: 14.99,
-        category: 'Main Course',
-        description: 'Fresh mozzarella and tomato sauce',
-        veg: true,
-        available: true,
-        shortCode: 'MP01'
-      },
-      {
-        name: 'Chicken Wings',
-        price: 9.99,
-        category: 'Appetizers',
-        description: 'Crispy wings with choice of sauce',
-        veg: false,
-        available: true,
-        shortCode: 'CW01'
-      },
-      {
-        name: 'Caesar Salad',
-        price: 8.99,
-        category: 'Salads',
-        description: 'Fresh romaine lettuce with caesar dressing',
-        veg: true,
-        available: true,
-        shortCode: 'CS01'
-      },
-      {
-        name: 'Chocolate Cake',
-        price: 6.99,
-        category: 'Desserts',
-        description: 'Rich chocolate cake with fudge frosting',
-        veg: true,
-        available: true,
-        shortCode: 'CC01'
-      },
-      {
-        name: 'Fresh Lemonade',
-        price: 4.99,
-        category: 'Beverages',
-        description: 'Freshly squeezed lemon juice',
-        veg: true,
-        available: true,
-        shortCode: 'FL01'
-      }
-    ];
-    
-    // Save menu items to database
-    const savedItems = [];
-    for (const item of mockMenuItems) {
-      try {
-        const docRef = db.collection(collections.menus).doc();
-        await docRef.set({
-          ...item,
-          restaurantId: restaurantId,
-          createdAt: db.FieldValue.serverTimestamp(),
-          updatedAt: db.FieldValue.serverTimestamp()
-        });
-        
-        savedItems.push({
-          id: docRef.id,
-          ...item
-        });
-      } catch (error) {
-        console.error('Error saving menu item:', error);
-      }
-    }
-    
-    console.log(`✅ AI processed menu image and created ${savedItems.length} menu items`);
-    
-    res.json({
-      success: true,
-      message: `Successfully processed menu image and created ${savedItems.length} menu items`,
-      menuItems: savedItems,
-      fileName: file.originalname,
-      fileSize: `${Math.round(file.size / 1024 / 1024)}MB`
-    });
-    
-  } catch (error) {
-    console.error('❌ Error processing menu upload:', error);
-    
-    res.status(500).json({
-      success: false,
-      error: 'Failed to process menu image',
-      message: error.message
-    });
-  }
-});
 
 // 404 handler - must be last
 app.use((req, res) => {
