@@ -8,6 +8,13 @@ const initializePaymentRoutes = (db, razorpay) => {
   // 1. Create Order API
   router.post('/create-order', async (req, res) => {
     try {
+      if (!razorpay) {
+        return res.status(503).json({
+          success: false,
+          error: 'Payment service unavailable - Razorpay not configured'
+        });
+      }
+      
       const { amount, currency = 'INR', planId, email, userId, phone, shopId } = req.body;
       
       // Validate required fields

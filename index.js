@@ -22,10 +22,25 @@ const PORT = process.env.PORT || 3003;
 
 const googleClient = new OAuth2Client(process.env.GOOGLE_CLIENT_ID);
 // const twilioClient = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
-const razorpay = new Razorpay({
-  key_id: process.env.RAZORPAY_KEY_ID,
-  key_secret: process.env.RAZORPAY_KEY_SECRET
-});
+
+// Initialize Razorpay with validation
+let razorpay;
+try {
+  if (!process.env.RAZORPAY_KEY_ID || !process.env.RAZORPAY_KEY_SECRET) {
+    console.warn('⚠️ Razorpay environment variables not set - payment features will be disabled');
+    razorpay = null;
+  } else {
+    razorpay = new Razorpay({
+      key_id: process.env.RAZORPAY_KEY_ID,
+      key_secret: process.env.RAZORPAY_KEY_SECRET
+    });
+    console.log('✅ Razorpay initialized successfully');
+  }
+} catch (error) {
+  console.error('❌ Razorpay initialization error:', error.message);
+  console.error('Please check your RAZORPAY_KEY_ID and RAZORPAY_KEY_SECRET environment variables');
+  razorpay = null;
+}
 
 // Initialize Firebase Storage
 let storage;

@@ -5,6 +5,23 @@ let db;
 
 try {
   if (!admin.apps.length) {
+    // Validate required environment variables
+    const requiredEnvVars = [
+      'FIREBASE_PROJECT_ID',
+      'FIREBASE_PRIVATE_KEY_ID', 
+      'FIREBASE_PRIVATE_KEY',
+      'FIREBASE_CLIENT_EMAIL',
+      'FIREBASE_CLIENT_ID'
+    ];
+    
+    const missingVars = requiredEnvVars.filter(varName => !process.env[varName] || process.env[varName] === 'undefined');
+    
+    if (missingVars.length > 0) {
+      console.error('❌ Missing Firebase environment variables:', missingVars.join(', '));
+      console.error('Please set these variables in your Vercel deployment settings');
+      throw new Error(`Missing Firebase environment variables: ${missingVars.join(', ')}`);
+    }
+
     const serviceAccount = {
       type: "service_account",
       project_id: process.env.FIREBASE_PROJECT_ID,
