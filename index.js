@@ -1228,7 +1228,7 @@ app.patch('/api/menus/item/:id', authenticateToken, async (req, res) => {
       message: 'Menu item updated successfully',
       updatedFields: Object.keys(updateData).filter(key => key !== 'updatedAt')
     });
-
+    
   } catch (error) {
     console.error('Update menu item error:', error);
     res.status(500).json({ error: 'Failed to update menu item' });
@@ -1275,9 +1275,9 @@ app.delete('/api/menus/item/:id', authenticateToken, async (req, res) => {
       if (item.id === id) {
         return { 
           ...item, 
-          status: 'deleted',
-          deletedAt: new Date(),
-          updatedAt: new Date()
+      status: 'deleted',
+      deletedAt: new Date(),
+      updatedAt: new Date()
         };
       }
       return item;
@@ -1556,11 +1556,14 @@ app.post('/api/orders', async (req, res) => {
       orderType,
       items: orderItems,
       totalAmount,
-      customerInfo: customerInfo || {
-        phone: customerPhone,
-        name: customerName || 'Customer',
-        seatNumber: seatNumber || 'Walk-in'
-      },
+          customerInfo: customerInfo || {
+            phone: customerPhone,
+            name: customerName || 'Customer',
+            email: customerInfo?.email || null,
+            city: customerInfo?.city || null,
+            dob: customerInfo?.dob || null,
+            seatNumber: seatNumber || 'Walk-in'
+          },
       paymentMethod: paymentMethod || 'cash',
       staffInfo: orderType === 'customer_self_order' ? {
         waiterId: null,
@@ -1577,10 +1580,51 @@ app.post('/api/orders', async (req, res) => {
 
     const orderRef = await db.collection(collections.orders).add(orderData);
     
+    // Create/update customer if customer info is provided
+    let customerId = null;
+    if (customerInfo && (customerInfo.name || customerInfo.phone)) {
+      try {
+        const customerResponse = await fetch(`${req.protocol}://${req.get('host')}/api/customers`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': req.headers.authorization || ''
+          },
+          body: JSON.stringify({
+            name: customerInfo.name,
+            phone: customerInfo.phone,
+            email: customerInfo.email,
+            city: customerInfo.city,
+            dob: customerInfo.dob,
+            restaurantId: restaurantId,
+            orderHistory: [{
+              orderId: orderRef.id,
+              orderNumber: orderNumber,
+              totalAmount: totalAmount,
+              orderDate: new Date(),
+              tableNumber: tableNumber || seatNumber || null
+            }]
+          })
+        });
+
+        if (customerResponse.ok) {
+          const customerData = await customerResponse.json();
+          customerId = customerData.customer.id;
+          console.log(`👤 Customer created/updated: ${customerId}`);
+        }
+      } catch (error) {
+        console.error('Customer creation error:', error);
+        // Don't fail the order if customer creation fails
+      }
+    }
+    
     console.log(`🛒 Order created successfully: ${orderRef.id} with status: ${orderData.status}`);
     console.log(`📋 Order items: ${orderData.items.length} items`);
     console.log(`🏪 Restaurant: ${orderData.restaurantId}`);
     console.log(`👤 Order type: ${orderData.orderType}`);
+    if (customerId) {
+      console.log(`👤 Customer ID: ${customerId}`);
+    }
 
     res.status(201).json({
       message: 'Order created successfully',
@@ -2172,7 +2216,7 @@ app.post('/api/menus/bulk-save/:restaurantId', authenticateToken, async (req, re
         // Convert AI extracted data to match manual menu item format
         const menuItem = {
           id: `item_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`, // Generate unique ID
-          restaurantId,
+        restaurantId,
           name: item.name || 'Unnamed Item',
           description: item.description || '',
           price: parseFloat(item.price) || 0,
@@ -2183,13 +2227,13 @@ app.post('/api/menus/bulk-save/:restaurantId', authenticateToken, async (req, re
           shortCode: item.shortCode || item.name.substring(0, 3).toUpperCase(),
           status: 'active',
           order: existingItems.length, // Set order based on existing items
-          isAvailable: true,
-          stockQuantity: null,
-          lowStockThreshold: 5,
-          isStockManaged: false,
-          availableFrom: null,
-          availableUntil: null,
-          createdAt: new Date(),
+        isAvailable: true,
+        stockQuantity: null,
+        lowStockThreshold: 5,
+        isStockManaged: false,
+        availableFrom: null,
+        availableUntil: null,
+        createdAt: new Date(),
           updatedAt: new Date(),
           // Add source tracking
           source: 'ai_upload',
@@ -2210,8 +2254,8 @@ app.post('/api/menus/bulk-save/:restaurantId', authenticateToken, async (req, re
             id: menuItem.category,
             name: menuItem.category.charAt(0).toUpperCase() + menuItem.category.slice(1).replace('-', ' '),
             order: existingCategories.length,
-            createdAt: new Date(),
-            updatedAt: new Date()
+        createdAt: new Date(),
+        updatedAt: new Date()
           });
           console.log(`📂 Added new category: ${menuItem.category}`);
         }
@@ -4398,6 +4442,216 @@ app.put('/api/admin/settings/:restaurantId/status', authenticateToken, async (re
   }
 });
 
+// Customer Management APIs
+app.post('/api/customers', authenticateToken, async (req, res) => {
+  try {
+    const { userId } = req.user;
+    const { name, phone, email, city, dob, restaurantId, orderHistory = [] } = req.body;
+
+    if (!name && !phone && !email) {
+      return res.status(400).json({ error: 'At least one of name, phone, or email is required' });
+    }
+
+    if (!restaurantId) {
+      return res.status(400).json({ error: 'Restaurant ID is required' });
+    }
+
+    // Check if customer already exists with same phone number or email
+    let existingCustomer = null;
+    if (phone || email) {
+      let customerQuery;
+      
+      if (phone && email) {
+        // Check both phone and email
+        customerQuery = await db.collection(collections.customers)
+          .where('restaurantId', '==', restaurantId)
+          .where('phone', '==', phone)
+          .limit(1)
+          .get();
+        
+        if (customerQuery.empty) {
+          customerQuery = await db.collection(collections.customers)
+            .where('restaurantId', '==', restaurantId)
+            .where('email', '==', email)
+            .limit(1)
+            .get();
+        }
+      } else if (phone) {
+        customerQuery = await db.collection(collections.customers)
+          .where('phone', '==', phone)
+          .where('restaurantId', '==', restaurantId)
+          .limit(1)
+          .get();
+      } else if (email) {
+        customerQuery = await db.collection(collections.customers)
+          .where('email', '==', email)
+          .where('restaurantId', '==', restaurantId)
+          .limit(1)
+          .get();
+      }
+
+      if (!customerQuery.empty) {
+        existingCustomer = customerQuery.docs[0];
+      }
+    }
+
+    if (existingCustomer) {
+      // Update existing customer
+      const customerData = existingCustomer.data();
+      const updatedData = {
+        ...customerData,
+        name: name || customerData.name,
+        phone: phone || customerData.phone,
+        email: email || customerData.email,
+        city: city || customerData.city,
+        dob: dob || customerData.dob,
+        orderHistory: [...customerData.orderHistory, ...orderHistory],
+        lastOrderDate: orderHistory.length > 0 ? new Date() : customerData.lastOrderDate,
+        updatedAt: new Date()
+      };
+
+      await existingCustomer.ref.update(updatedData);
+
+      res.json({
+        message: 'Customer updated successfully',
+        customer: {
+          id: existingCustomer.id,
+          ...updatedData
+        }
+      });
+    } else {
+      // Create new customer
+      const customerData = {
+        name: name || null,
+        phone: phone || null,
+        email: email || null,
+        city: city || null,
+        dob: dob || null,
+        restaurantId,
+        orderHistory: orderHistory || [],
+        totalOrders: orderHistory.length,
+        totalSpent: orderHistory.reduce((sum, order) => sum + (order.totalAmount || 0), 0),
+        lastOrderDate: orderHistory.length > 0 ? new Date() : null,
+        createdAt: new Date(),
+        updatedAt: new Date()
+      };
+
+      const customerRef = await db.collection(collections.customers).add(customerData);
+
+      res.status(201).json({
+        message: 'Customer created successfully',
+        customer: {
+          id: customerRef.id,
+          ...customerData
+        }
+      });
+    }
+  } catch (error) {
+    console.error('Customer creation error:', error);
+    res.status(500).json({ error: 'Failed to create/update customer' });
+  }
+});
+
+app.get('/api/customers/:restaurantId', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+    const { userId } = req.user;
+
+    // Verify user has access to this restaurant
+    const restaurant = await db.collection(collections.restaurants).doc(restaurantId).get();
+    if (!restaurant.exists || restaurant.data().ownerId !== userId) {
+      return res.status(403).json({ error: 'Access denied' });
+    }
+
+    const customersSnapshot = await db.collection(collections.customers)
+      .where('restaurantId', '==', restaurantId)
+      .orderBy('lastOrderDate', 'desc')
+      .limit(100)
+      .get();
+
+    const customers = [];
+    customersSnapshot.forEach(doc => {
+      customers.push({
+        id: doc.id,
+        ...doc.data()
+      });
+    });
+
+    res.json({ customers });
+  } catch (error) {
+    console.error('Get customers error:', error);
+    res.status(500).json({ error: 'Failed to fetch customers' });
+  }
+});
+
+app.patch('/api/customers/:customerId', authenticateToken, async (req, res) => {
+  try {
+    const { customerId } = req.params;
+    const { userId } = req.user;
+    const updateData = req.body;
+
+    // Get customer and verify access
+    const customerDoc = await db.collection(collections.customers).doc(customerId).get();
+    if (!customerDoc.exists) {
+      return res.status(404).json({ error: 'Customer not found' });
+    }
+
+    const customerData = customerDoc.data();
+    const restaurant = await db.collection(collections.restaurants).doc(customerData.restaurantId).get();
+    if (!restaurant.exists || restaurant.data().ownerId !== userId) {
+      return res.status(403).json({ error: 'Access denied' });
+    }
+
+    const updatedData = {
+      ...updateData,
+      updatedAt: new Date()
+    };
+
+    await customerDoc.ref.update(updatedData);
+
+    res.json({
+      message: 'Customer updated successfully',
+      customer: {
+        id: customerId,
+        ...customerData,
+        ...updatedData
+      }
+    });
+  } catch (error) {
+    console.error('Update customer error:', error);
+    res.status(500).json({ error: 'Failed to update customer' });
+  }
+});
+
+app.delete('/api/customers/:customerId', authenticateToken, async (req, res) => {
+  try {
+    const { customerId } = req.params;
+    const { userId } = req.user;
+
+    // Get customer and verify access
+    const customerDoc = await db.collection(collections.customers).doc(customerId).get();
+    if (!customerDoc.exists) {
+      return res.status(404).json({ error: 'Customer not found' });
+    }
+
+    const customerData = customerDoc.data();
+    const restaurant = await db.collection(collections.restaurants).doc(customerData.restaurantId).get();
+    if (!restaurant.exists || restaurant.data().ownerId !== userId) {
+      return res.status(403).json({ error: 'Access denied' });
+    }
+
+    // Delete customer
+    await customerDoc.ref.delete();
+
+    res.json({
+      message: 'Customer deleted successfully'
+    });
+  } catch (error) {
+    console.error('Delete customer error:', error);
+    res.status(500).json({ error: 'Failed to delete customer' });
+  }
+});
+
 // Helper function to get next open time
 function getNextOpenTime(operatingHours, currentTime) {
   const days = ['sunday', 'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday'];
@@ -4418,6 +4672,10 @@ function getNextOpenTime(operatingHours, currentTime) {
   
   return null;
 }
+
+// Mount payment routes
+const paymentRouter = initializePaymentRoutes(db, razorpay);
+app.use('/api/payments', paymentRouter);
 
 // 404 handler - must be last
 app.use((req, res) => {

@@ -90,86 +90,181 @@ const initializePaymentRoutes = (db, razorpay) => {
     }
   });
 
-  // 2. Verify Payment API
+  // 2. Verify Payment API - Updated for Offline/Manual Payments
   router.post('/verify', async (req, res) => {
     try {
       const {
+        orderId,
+        paymentMethod = 'cash',
+        amount,
+        userId,
+        restaurantId,
+        // Legacy Razorpay fields (for backward compatibility)
         razorpay_order_id,
         razorpay_payment_id,
-        razorpay_signature,
-        planId,
-        userId
+        razorpay_signature
       } = req.body;
 
-      // Verify signature
-      const shasum = crypto.createHmac('sha256', process.env.RAZORPAY_KEY_SECRET);
-      shasum.update(`${razorpay_order_id}|${razorpay_payment_id}`);
-      const digest = shasum.digest('hex');
-
-      if (digest !== razorpay_signature) {
-        return res.status(400).json({ 
-          success: false, 
-          error: 'Invalid signature' 
-        });
-      }
-
-      // Get order details from database
-      const orderDoc = await db.collection('dine_orders').doc(razorpay_order_id).get();
-
-      if (!orderDoc.exists) {
-        return res.status(404).json({ 
-          success: false, 
-          error: 'Order not found' 
-        });
-      }
-
-      const orderData = orderDoc.data();
-
-      // Create payment record (filter out undefined values)
-      const paymentRef = db.collection('dine_payments').doc(razorpay_payment_id);
-      const paymentDoc = {
-        orderId: razorpay_order_id,
-        paymentId: razorpay_payment_id,
-        signature: razorpay_signature,
-        planId: planId || orderData.planId,
-        email: orderData.email,
-        userId: userId || orderData.userId,
-        amount: orderData.amount,
-        currency: orderData.currency,
-        app: 'Dine', // Add app name
-        status: 'verified',
-        verifiedAt: new Date()
-      };
-      
-      // Only add optional fields if they have values
-      if (orderData.phone) paymentDoc.phone = orderData.phone;
-      if (orderData.shopId) paymentDoc.shopId = orderData.shopId;
-
-      await paymentRef.set(paymentDoc);
-
-      // Update order status
-      await db.collection('dine_orders').doc(razorpay_order_id).update({
-        status: 'paid',
-        paymentId: razorpay_payment_id,
-        updatedAt: new Date()
+      console.log('[PAYMENT] Payment verification request:', {
+        orderId,
+        paymentMethod,
+        amount,
+        userId,
+        restaurantId,
+        hasRazorpayData: !!(razorpay_order_id && razorpay_payment_id)
       });
 
-      // Update user subscription
-      await updateUserSubscription(db, orderData.userId, orderData.email, orderData.planId || planId);
+      // Handle offline/manual payments
+      if (paymentMethod === 'cash' || paymentMethod === 'card' || paymentMethod === 'upi') {
+        if (!orderId) {
+          return res.status(400).json({ 
+            success: false, 
+            error: 'Order ID is required for offline payments' 
+          });
+        }
 
-      res.json({ 
-        success: true, 
-        message: 'Payment verified successfully',
-        data: {
-          planId: orderData.planId || planId,
+        // Get order details from the main orders collection
+        const orderDoc = await db.collection('orders').doc(orderId).get();
+
+        if (!orderDoc.exists) {
+          return res.status(404).json({ 
+            success: false, 
+            error: 'Order not found' 
+          });
+        }
+
+        const orderData = orderDoc.data();
+
+        // Generate payment ID for offline payments
+        const paymentId = `offline_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+
+        // Create payment record for offline payment
+        const paymentRef = db.collection('payments').doc(paymentId);
+        const paymentDoc = {
+          orderId: orderId,
+          paymentId: paymentId,
+          paymentMethod: paymentMethod,
+          amount: orderData.totalAmount || amount,
+          currency: 'INR',
+          status: 'completed',
+          completedAt: new Date(),
+          userId: userId,
+          restaurantId: restaurantId,
+          type: 'offline',
+          app: 'Dine'
+        };
+
+        await paymentRef.set(paymentDoc);
+
+        // Update order status to completed
+        await db.collection('orders').doc(orderId).update({
+          status: 'completed',
+          paymentStatus: 'paid',
+          paymentMethod: paymentMethod,
+          paymentId: paymentId,
+          completedAt: new Date(),
+          updatedAt: new Date()
+        });
+
+        console.log('[PAYMENT] Offline payment completed successfully:', {
+          orderId,
+          paymentId,
+          paymentMethod,
+          amount: orderData.totalAmount
+        });
+
+        res.json({ 
+          success: true, 
+          message: 'Payment completed successfully',
+          data: {
+            orderId: orderId,
+            paymentId: paymentId,
+            paymentMethod: paymentMethod,
+            amount: orderData.totalAmount,
+            status: 'completed'
+          }
+        });
+
+        return;
+      }
+
+      // Handle Razorpay payments (legacy support)
+      if (razorpay_order_id && razorpay_payment_id && razorpay_signature) {
+        // Verify signature
+        const shasum = crypto.createHmac('sha256', process.env.RAZORPAY_KEY_SECRET);
+        shasum.update(`${razorpay_order_id}|${razorpay_payment_id}`);
+        const digest = shasum.digest('hex');
+
+        if (digest !== razorpay_signature) {
+          return res.status(400).json({ 
+            success: false, 
+            error: 'Invalid signature' 
+          });
+        }
+
+        // Get order details from database
+        const orderDoc = await db.collection('dine_orders').doc(razorpay_order_id).get();
+
+        if (!orderDoc.exists) {
+          return res.status(404).json({ 
+            success: false, 
+            error: 'Order not found' 
+          });
+        }
+
+        const orderData = orderDoc.data();
+
+        // Create payment record (filter out undefined values)
+        const paymentRef = db.collection('dine_payments').doc(razorpay_payment_id);
+        const paymentDoc = {
+          orderId: razorpay_order_id,
           paymentId: razorpay_payment_id,
+          signature: razorpay_signature,
+          planId: orderData.planId,
           email: orderData.email,
           userId: orderData.userId,
-          phone: orderData.phone,
-          shopId: orderData.shopId,
-          orderId: razorpay_order_id,
-          app: 'Dine' // Include app name in response
-        }
+          amount: orderData.amount,
+          currency: orderData.currency,
+          app: 'Dine',
+          status: 'verified',
+          verifiedAt: new Date()
+        };
+        
+        // Only add optional fields if they have values
+        if (orderData.phone) paymentDoc.phone = orderData.phone;
+        if (orderData.shopId) paymentDoc.shopId = orderData.shopId;
+
+        await paymentRef.set(paymentDoc);
+
+        // Update order status
+        await db.collection('dine_orders').doc(razorpay_order_id).update({
+          status: 'paid',
+          paymentId: razorpay_payment_id,
+          updatedAt: new Date()
+        });
+
+        res.json({ 
+          success: true, 
+          message: 'Payment verified successfully',
+          data: {
+            planId: orderData.planId,
+            paymentId: razorpay_payment_id,
+            email: orderData.email,
+            userId: orderData.userId,
+            phone: orderData.phone,
+            shopId: orderData.shopId,
+            orderId: razorpay_order_id,
+            app: 'Dine'
+          }
+        });
+
+        return;
+      }
+
+      // If neither offline nor Razorpay data is provided
+      return res.status(400).json({ 
+        success: false, 
+        error: 'Invalid payment data. Provide either offline payment details or Razorpay payment details.' 
       });
 
     } catch (error) {
