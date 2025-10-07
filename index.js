@@ -4684,6 +4684,174 @@ function getNextOpenTime(operatingHours, currentTime) {
 const paymentRouter = initializePaymentRoutes(db, razorpay);
 app.use('/api/payments', paymentRouter);
 
+// ==================== CATEGORY MANAGEMENT APIs ====================
+
+// Get categories for a restaurant
+app.get('/api/categories/:restaurantId', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+    
+    // Get restaurant document to access embedded categories
+    const restaurantDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
+    if (!restaurantDoc.exists) {
+      return res.status(404).json({ error: 'Restaurant not found' });
+    }
+
+    const restaurantData = restaurantDoc.data();
+    const categories = restaurantData.categories || [];
+
+    res.json({ categories });
+  } catch (error) {
+    console.error('Get categories error:', error);
+    res.status(500).json({ error: 'Failed to fetch categories' });
+  }
+});
+
+// Create new category
+app.post('/api/categories/:restaurantId', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+    const { name, emoji = '🍽️', description = '' } = req.body;
+
+    if (!name) {
+      return res.status(400).json({ error: 'Category name is required' });
+    }
+
+    // Get restaurant document
+    const restaurantDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
+    if (!restaurantDoc.exists) {
+      return res.status(404).json({ error: 'Restaurant not found' });
+    }
+
+    const restaurantData = restaurantDoc.data();
+    const existingCategories = restaurantData.categories || [];
+
+    // Check if category already exists
+    const categoryId = name.toLowerCase().replace(/\s+/g, '-');
+    if (existingCategories.find(cat => cat.id === categoryId)) {
+      return res.status(400).json({ error: 'Category already exists' });
+    }
+
+    const newCategory = {
+      id: categoryId,
+      name: name.trim(),
+      emoji: emoji.trim(),
+      description: description.trim(),
+      createdAt: new Date(),
+      updatedAt: new Date()
+    };
+
+    // Add category to restaurant document
+    const updatedCategories = [...existingCategories, newCategory];
+    await db.collection(collections.restaurants).doc(restaurantId).update({
+      categories: updatedCategories,
+      updatedAt: new Date()
+    });
+
+    res.status(201).json({
+      message: 'Category created successfully',
+      category: newCategory
+    });
+  } catch (error) {
+    console.error('Create category error:', error);
+    res.status(500).json({ error: 'Failed to create category' });
+  }
+});
+
+// Update category
+app.patch('/api/categories/:restaurantId/:categoryId', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId, categoryId } = req.params;
+    const { name, emoji, description } = req.body;
+
+    // Get restaurant document
+    const restaurantDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
+    if (!restaurantDoc.exists) {
+      return res.status(404).json({ error: 'Restaurant not found' });
+    }
+
+    const restaurantData = restaurantDoc.data();
+    const categories = restaurantData.categories || [];
+
+    // Find category to update
+    const categoryIndex = categories.findIndex(cat => cat.id === categoryId);
+    if (categoryIndex === -1) {
+      return res.status(404).json({ error: 'Category not found' });
+    }
+
+    // Update category
+    const updatedCategory = {
+      ...categories[categoryIndex],
+      ...(name && { name: name.trim() }),
+      ...(emoji && { emoji: emoji.trim() }),
+      ...(description !== undefined && { description: description.trim() }),
+      updatedAt: new Date()
+    };
+
+    categories[categoryIndex] = updatedCategory;
+
+    // Update restaurant document
+    await db.collection(collections.restaurants).doc(restaurantId).update({
+      categories: categories,
+      updatedAt: new Date()
+    });
+
+    res.json({
+      message: 'Category updated successfully',
+      category: updatedCategory
+    });
+  } catch (error) {
+    console.error('Update category error:', error);
+    res.status(500).json({ error: 'Failed to update category' });
+  }
+});
+
+// Delete category
+app.delete('/api/categories/:restaurantId/:categoryId', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId, categoryId } = req.params;
+
+    // Get restaurant document
+    const restaurantDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
+    if (!restaurantDoc.exists) {
+      return res.status(404).json({ error: 'Restaurant not found' });
+    }
+
+    const restaurantData = restaurantDoc.data();
+    const categories = restaurantData.categories || [];
+
+    // Check if category exists
+    const categoryIndex = categories.findIndex(cat => cat.id === categoryId);
+    if (categoryIndex === -1) {
+      return res.status(404).json({ error: 'Category not found' });
+    }
+
+    // Check if any menu items use this category
+    const menuItems = restaurantData.menu?.items || [];
+    const itemsUsingCategory = menuItems.filter(item => item.category === categoryId);
+    
+    if (itemsUsingCategory.length > 0) {
+      return res.status(400).json({ 
+        error: `Cannot delete category. ${itemsUsingCategory.length} menu items are using this category. Please reassign or delete those items first.` 
+      });
+    }
+
+    // Remove category
+    categories.splice(categoryIndex, 1);
+
+    // Update restaurant document
+    await db.collection(collections.restaurants).doc(restaurantId).update({
+      categories: categories,
+      updatedAt: new Date()
+    });
+
+    res.json({ message: 'Category deleted successfully' });
+  } catch (error) {
+    console.error('Delete category error:', error);
+    res.status(500).json({ error: 'Failed to delete category' });
+  }
+});
+
 // 404 handler - must be last
 app.use((req, res) => {
   res.status(404).json({ 
@@ -4700,7 +4868,8 @@ app.use((req, res) => {
       '/api/payments/*',
       '/api/analytics/*',
       '/api/kot/*',
-      '/api/admin/settings/*'
+      '/api/admin/settings/*',
+      '/api/categories/*'
     ]
   });
 });
