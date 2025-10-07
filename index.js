@@ -658,6 +658,71 @@ app.post('/api/auth/firebase/verify', async (req, res) => {
       const userRef = await db.collection(collections.users).add(newUser);
       userId = userRef.id;
       isNewUser = true;
+
+      // Create default restaurant for new users
+      try {
+        const defaultRestaurant = {
+          name: 'My Restaurant',
+          description: 'Welcome to your restaurant! You can customize this information later.',
+          address: '',
+          phone: phoneNumber || '',
+          email: email || '',
+          cuisine: ['Indian'],
+          timings: {
+            openTime: '09:00',
+            closeTime: '22:00',
+            lastOrderTime: '21:30'
+          },
+          ownerId: userId,
+          menu: {
+            items: []
+          },
+          categories: [
+            {
+              id: 'appetizer',
+              name: 'Appetizers',
+              emoji: '🥗',
+              description: 'Starters and appetizers'
+            },
+            {
+              id: 'main-course',
+              name: 'Main Course',
+              emoji: '🍽️',
+              description: 'Main dishes'
+            },
+            {
+              id: 'dessert',
+              name: 'Desserts',
+              emoji: '🍰',
+              description: 'Sweet treats'
+            },
+            {
+              id: 'beverages',
+              name: 'Beverages',
+              emoji: '🥤',
+              description: 'Drinks and beverages'
+            }
+          ],
+          isActive: true,
+          createdAt: new Date(),
+          updatedAt: new Date()
+        };
+
+        const restaurantRef = await db.collection(collections.restaurants).add(defaultRestaurant);
+        console.log(`✅ Default restaurant created for new user ${userId}: ${restaurantRef.id}`);
+        
+        // Update user to mark setup as complete
+        await userRef.update({
+          setupComplete: true,
+          updatedAt: new Date()
+        });
+        
+        hasRestaurants = true;
+      } catch (restaurantError) {
+        console.error('❌ Error creating default restaurant:', restaurantError);
+        // Don't fail the login if restaurant creation fails
+        hasRestaurants = false;
+      }
     } else {
       // Existing user login
       const userData = userDoc.docs[0].data();
@@ -711,7 +776,7 @@ app.post('/api/auth/firebase/verify', async (req, res) => {
       },
       isNewUser,
       hasRestaurants,
-      redirectTo: isNewUser || !hasRestaurants ? '/admin' : '/admin'
+      redirectTo: hasRestaurants ? '/dashboard' : '/admin'
     });
 
   } catch (error) {
@@ -772,6 +837,71 @@ app.post('/api/auth/phone/verify-otp', async (req, res) => {
       const userRef = await db.collection(collections.users).add(newUser);
       userId = userRef.id;
       isNewUser = true;
+
+      // Create default restaurant for new users
+      try {
+        const defaultRestaurant = {
+          name: 'My Restaurant',
+          description: 'Welcome to your restaurant! You can customize this information later.',
+          address: '',
+          phone: phone,
+          email: '',
+          cuisine: ['Indian'],
+          timings: {
+            openTime: '09:00',
+            closeTime: '22:00',
+            lastOrderTime: '21:30'
+          },
+          ownerId: userId,
+          menu: {
+            items: []
+          },
+          categories: [
+            {
+              id: 'appetizer',
+              name: 'Appetizers',
+              emoji: '🥗',
+              description: 'Starters and appetizers'
+            },
+            {
+              id: 'main-course',
+              name: 'Main Course',
+              emoji: '🍽️',
+              description: 'Main dishes'
+            },
+            {
+              id: 'dessert',
+              name: 'Desserts',
+              emoji: '🍰',
+              description: 'Sweet treats'
+            },
+            {
+              id: 'beverages',
+              name: 'Beverages',
+              emoji: '🥤',
+              description: 'Drinks and beverages'
+            }
+          ],
+          isActive: true,
+          createdAt: new Date(),
+          updatedAt: new Date()
+        };
+
+        const restaurantRef = await db.collection(collections.restaurants).add(defaultRestaurant);
+        console.log(`✅ Default restaurant created for new phone user ${userId}: ${restaurantRef.id}`);
+        
+        // Update user to mark setup as complete
+        await userRef.update({
+          setupComplete: true,
+          updatedAt: new Date()
+        });
+        
+        hasRestaurants = true;
+      } catch (restaurantError) {
+        console.error('❌ Error creating default restaurant:', restaurantError);
+        // Don't fail the login if restaurant creation fails
+        hasRestaurants = false;
+      }
     } else {
       // Existing owner login
       const userData = userDoc.docs[0].data();
@@ -810,7 +940,7 @@ app.post('/api/auth/phone/verify-otp', async (req, res) => {
       },
       isNewUser,
       hasRestaurants,
-      redirectTo: isNewUser || !hasRestaurants ? '/admin' : '/admin'
+      redirectTo: hasRestaurants ? '/dashboard' : '/admin'
     });
 
   } catch (error) {
