@@ -645,10 +645,11 @@ app.post('/api/auth/firebase/verify', async (req, res) => {
         phone: phoneNumber || null,
         email: email || null,
         name: displayName || 'Restaurant Owner',
+        photoURL: photoURL || null,
         role: 'owner',
         emailVerified: !!email,
         phoneVerified: !!phoneNumber,
-        provider: 'firebase',
+        provider: email ? 'google' : 'firebase',
         setupComplete: false,
         createdAt: new Date(),
         updatedAt: new Date()
@@ -672,6 +673,11 @@ app.post('/api/auth/firebase/verify', async (req, res) => {
       if (email && !userData.email) updateData.email = email;
       if (displayName && !userData.name) updateData.name = displayName;
       if (photoURL && !userData.photoURL) updateData.photoURL = photoURL;
+      
+      // Update provider if logging in with Google
+      if (email && userData.provider !== 'google') {
+        updateData.provider = 'google';
+      }
 
       await userDoc.docs[0].ref.update(updateData);
 
@@ -700,7 +706,8 @@ app.post('/api/auth/firebase/verify', async (req, res) => {
         email,
         name: displayName || 'Restaurant Owner',
         role: 'owner',
-        photoURL
+        photoURL,
+        provider: email ? 'google' : 'firebase'
       },
       isNewUser,
       hasRestaurants,
