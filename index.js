@@ -1492,15 +1492,73 @@ app.post('/api/public/orders/:restaurantId', async (req, res) => {
       return res.status(404).json({ error: 'Restaurant not found' });
     }
 
-    // Create or get customer record
+    // Helper function to normalize phone number
+    const normalizePhone = (phone) => {
+      if (!phone) return null;
+      // Remove all non-digit characters
+      const digits = phone.replace(/\D/g, '');
+      
+      // Handle Indian phone numbers
+      if (digits.length === 12 && digits.startsWith('91')) {
+        // Remove country code for Indian numbers
+        return digits.substring(2);
+      } else if (digits.length === 10) {
+        // Already a 10-digit number
+        return digits;
+      } else if (digits.length === 11 && digits.startsWith('0')) {
+        // Remove leading zero
+        return digits.substring(1);
+      }
+      
+      // Return as-is for other formats
+      return digits;
+    };
+
+    // Create or get customer record with phone normalization
     let customerId;
+    let existingCustomer = null;
+    
+    // First try exact match
     const customerQuery = await db.collection('customers')
       .where('restaurantId', '==', restaurantId)
       .where('phone', '==', customerPhone)
       .get();
 
-    if (customerQuery.empty) {
+    if (!customerQuery.empty) {
+      existingCustomer = customerQuery.docs[0];
+    } else {
+      // Try normalized phone match
+      const normalizedPhone = normalizePhone(customerPhone);
+      if (normalizedPhone) {
+        const allCustomers = await db.collection('customers')
+          .where('restaurantId', '==', restaurantId)
+          .get();
+        
+        existingCustomer = allCustomers.docs.find(doc => {
+          const customerPhone = normalizePhone(doc.data().phone);
+          return customerPhone === normalizedPhone;
+        });
+      }
+    }
+
+    if (existingCustomer) {
+      // Update existing customer
+      console.log(`🔄 Found existing customer for public order: ${existingCustomer.id} with phone: ${existingCustomer.data().phone}`);
+      customerId = existingCustomer.id;
+      
+      const updateData = {
+        updatedAt: new Date(),
+        lastOrderDate: new Date()
+      };
+
+      if (customerName && !existingCustomer.data().name) {
+        updateData.name = customerName;
+      }
+
+      await existingCustomer.ref.update(updateData);
+    } else {
       // Create new customer
+      console.log(`🆕 Creating new customer for public order with phone: ${customerPhone}, name: ${customerName}`);
       const customerData = {
         restaurantId,
         phone: customerPhone,
@@ -1516,21 +1574,7 @@ app.post('/api/public/orders/:restaurantId', async (req, res) => {
 
       const customerRef = await db.collection('customers').add(customerData);
       customerId = customerRef.id;
-    } else {
-      // Update existing customer
-      const customerDoc = customerQuery.docs[0];
-      customerId = customerDoc.id;
-      
-      const updateData = {
-        updatedAt: new Date(),
-        lastOrderDate: new Date()
-      };
-
-      if (customerName && !customerDoc.data().name) {
-        updateData.name = customerName;
-      }
-
-      await customerDoc.ref.update(updateData);
+      console.log(`✅ New customer created for public order: ${customerRef.id} with phone: ${customerPhone}`);
     }
 
     // Validate menu items and calculate total
@@ -1720,6 +1764,13 @@ app.post('/api/orders', async (req, res) => {
     // Create/update customer if customer info is provided
     let customerId = null;
     if (customerInfo && (customerInfo.name || customerInfo.phone)) {
+      console.log(`📞 Processing customer info for order:`, {
+        name: customerInfo.name,
+        phone: customerInfo.phone,
+        email: customerInfo.email,
+        restaurantId: restaurantId
+      });
+      
       try {
         const customerResponse = await fetch(`${req.protocol}://${req.get('host')}/api/customers`, {
           method: 'POST',
@@ -1747,7 +1798,10 @@ app.post('/api/orders', async (req, res) => {
         if (customerResponse.ok) {
           const customerData = await customerResponse.json();
           customerId = customerData.customer.id;
-          console.log(`👤 Customer created/updated: ${customerId}`);
+          console.log(`👤 Customer processed successfully: ${customerId} - ${customerData.message}`);
+        } else {
+          const errorData = await customerResponse.json();
+          console.log(`❌ Customer processing failed:`, errorData);
         }
       } catch (error) {
         console.error('Customer creation error:', error);
@@ -4585,6 +4639,10 @@ app.post('/api/customers', authenticateToken, async (req, res) => {
     const { userId } = req.user;
     const { name, phone, email, city, dob, restaurantId, orderHistory = [] } = req.body;
 
+    console.log(`📞 Customer API called with:`, {
+      name, phone, email, restaurantId, orderHistoryLength: orderHistory.length
+    });
+
     if (!name && !phone && !email) {
       return res.status(400).json({ error: 'At least one of name, phone, or email is required' });
     }
@@ -4593,20 +4651,56 @@ app.post('/api/customers', authenticateToken, async (req, res) => {
       return res.status(400).json({ error: 'Restaurant ID is required' });
     }
 
+    // Helper function to normalize phone number
+    const normalizePhone = (phone) => {
+      if (!phone) return null;
+      // Remove all non-digit characters
+      const digits = phone.replace(/\D/g, '');
+      
+      // Handle Indian phone numbers
+      if (digits.length === 12 && digits.startsWith('91')) {
+        // Remove country code for Indian numbers
+        return digits.substring(2);
+      } else if (digits.length === 10) {
+        // Already a 10-digit number
+        return digits;
+      } else if (digits.length === 11 && digits.startsWith('0')) {
+        // Remove leading zero
+        return digits.substring(1);
+      }
+      
+      // Return as-is for other formats
+      return digits;
+    };
+
     // Check if customer already exists with same phone number or email
     let existingCustomer = null;
     if (phone || email) {
+      console.log(`🔍 Looking for existing customer with phone: ${phone}, email: ${email}`);
       let customerQuery;
       
       if (phone && email) {
         // Check both phone and email
+        const normalizedPhone = normalizePhone(phone);
         customerQuery = await db.collection(collections.customers)
           .where('restaurantId', '==', restaurantId)
           .where('phone', '==', phone)
           .limit(1)
           .get();
         
-        if (customerQuery.empty) {
+        // If exact match not found, try normalized phone
+        if (customerQuery.empty && normalizedPhone) {
+          const allCustomers = await db.collection(collections.customers)
+            .where('restaurantId', '==', restaurantId)
+            .get();
+          
+          existingCustomer = allCustomers.docs.find(doc => {
+            const customerPhone = normalizePhone(doc.data().phone);
+            return customerPhone === normalizedPhone;
+          });
+        }
+        
+        if (!existingCustomer && customerQuery.empty) {
           customerQuery = await db.collection(collections.customers)
             .where('restaurantId', '==', restaurantId)
             .where('email', '==', email)
@@ -4614,26 +4708,45 @@ app.post('/api/customers', authenticateToken, async (req, res) => {
             .get();
         }
       } else if (phone) {
+        const normalizedPhone = normalizePhone(phone);
         customerQuery = await db.collection(collections.customers)
-          .where('phone', '==', phone)
           .where('restaurantId', '==', restaurantId)
+          .where('phone', '==', phone)
           .limit(1)
           .get();
+        
+        // If exact match not found, try normalized phone
+        if (customerQuery.empty && normalizedPhone) {
+          const allCustomers = await db.collection(collections.customers)
+            .where('restaurantId', '==', restaurantId)
+            .get();
+          
+          existingCustomer = allCustomers.docs.find(doc => {
+            const customerPhone = normalizePhone(doc.data().phone);
+            return customerPhone === normalizedPhone;
+          });
+        }
       } else if (email) {
         customerQuery = await db.collection(collections.customers)
-          .where('email', '==', email)
           .where('restaurantId', '==', restaurantId)
+          .where('email', '==', email)
           .limit(1)
           .get();
       }
 
-      if (!customerQuery.empty) {
+      if (!existingCustomer && !customerQuery.empty) {
         existingCustomer = customerQuery.docs[0];
+        console.log(`✅ Found existing customer via exact match: ${existingCustomer.id}`);
+      }
+      
+      if (!existingCustomer) {
+        console.log(`❌ No existing customer found for phone: ${phone}, email: ${email}`);
       }
     }
 
     if (existingCustomer) {
       // Update existing customer
+      console.log(`🔄 Found existing customer: ${existingCustomer.id} with phone: ${existingCustomer.data().phone}`);
       const customerData = existingCustomer.data();
       const updatedData = {
         ...customerData,
@@ -4658,6 +4771,7 @@ app.post('/api/customers', authenticateToken, async (req, res) => {
       });
     } else {
       // Create new customer
+      console.log(`🆕 Creating new customer with phone: ${phone}, name: ${name}`);
       const customerData = {
         name: name || null,
         phone: phone || null,
@@ -4674,6 +4788,7 @@ app.post('/api/customers', authenticateToken, async (req, res) => {
       };
 
       const customerRef = await db.collection(collections.customers).add(customerData);
+      console.log(`✅ New customer created: ${customerRef.id} with phone: ${phone}`);
 
       res.status(201).json({
         message: 'Customer created successfully',
