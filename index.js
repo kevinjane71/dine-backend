@@ -1017,6 +1017,15 @@ app.post('/api/restaurants', authenticateToken, async (req, res) => {
 
     const restaurantRef = await db.collection(collections.restaurants).add(restaurantData);
 
+    // Create user-restaurant relationship
+    await db.collection(collections.userRestaurants).add({
+      userId: userId,
+      restaurantId: restaurantRef.id,
+      role: 'owner',
+      createdAt: new Date(),
+      updatedAt: new Date()
+    });
+
     const qrData = `${process.env.FRONTEND_URL}/menu/${restaurantRef.id}`;
     const qrCode = await QRCode.toDataURL(qrData);
 
@@ -3604,6 +3613,446 @@ app.post('/api/auth/fix-user-roles', async (req, res) => {
   }
 });
 
+// Tax Management APIs
+
+// Get tax settings for a restaurant
+app.get('/api/admin/tax/:restaurantId', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+    const userId = req.user.userId;
+
+    console.log(`📊 Getting tax settings for restaurant: ${restaurantId}, userId: ${userId}`);
+
+    // Verify user has admin access to this restaurant
+    const userRestaurantSnapshot = await db.collection(collections.userRestaurants)
+      .where('userId', '==', userId)
+      .where('restaurantId', '==', restaurantId)
+      .where('role', 'in', ['owner', 'manager', 'admin'])
+      .get();
+
+    console.log(`🔍 User restaurant access check: userId=${userId}, restaurantId=${restaurantId}, found=${userRestaurantSnapshot.size} records`);
+    
+    if (userRestaurantSnapshot.empty) {
+      // Debug: Let's see what roles exist for this user-restaurant combination
+      const allUserRestaurants = await db.collection(collections.userRestaurants)
+        .where('userId', '==', userId)
+        .where('restaurantId', '==', restaurantId)
+        .get();
+
+      console.log(`🔍 All user-restaurant records for debugging:`, allUserRestaurants.docs.map(doc => ({
+        id: doc.id,
+        ...doc.data()
+      })));
+
+      // Fallback: Check if user is the owner directly from restaurant document
+      const restaurantRef = db.collection(collections.restaurants).doc(restaurantId);
+      const restaurantDoc = await restaurantRef.get();
+
+      if (!restaurantDoc.exists) {
+        return res.status(404).json({ error: 'Restaurant not found' });
+      }
+
+      const restaurant = restaurantDoc.data();
+      if (restaurant.ownerId !== userId) {
+        return res.status(403).json({ error: 'Access denied. Admin role required.' });
+      }
+
+      console.log(`✅ Access granted via restaurant owner check: userId=${userId}, ownerId=${restaurant.ownerId}`);
+    }
+
+    // Get restaurant to verify it exists
+    const restaurantRef = db.collection(collections.restaurants).doc(restaurantId);
+    const restaurantDoc = await restaurantRef.get();
+
+    if (!restaurantDoc.exists) {
+      return res.status(404).json({ error: 'Restaurant not found' });
+    }
+
+    const restaurant = restaurantDoc.data();
+
+    // Get tax settings from restaurant document
+    const taxSettings = restaurant.taxSettings || {
+      enabled: true,
+      taxes: [
+        {
+          id: 'gst',
+          name: 'GST',
+          rate: 5,
+          enabled: true,
+          type: 'percentage'
+        }
+      ],
+      defaultTaxRate: 5
+    };
+
+    res.json({
+      success: true,
+      taxSettings
+    });
+
+  } catch (error) {
+    console.error('Get tax settings error:', error);
+    res.status(500).json({ error: 'Failed to get tax settings' });
+  }
+});
+
+// Update tax settings for a restaurant
+app.put('/api/admin/tax/:restaurantId', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+    const userId = req.user.userId;
+    const { taxSettings } = req.body;
+
+    console.log(`📊 Updating tax settings for restaurant: ${restaurantId}, userId: ${userId}`);
+
+    // Verify user has admin access to this restaurant
+    const userRestaurantSnapshot = await db.collection(collections.userRestaurants)
+      .where('userId', '==', userId)
+      .where('restaurantId', '==', restaurantId)
+      .where('role', 'in', ['owner', 'manager', 'admin'])
+      .get();
+
+    if (userRestaurantSnapshot.empty) {
+      // Fallback: Check if user is the owner directly from restaurant document
+      const restaurantRef = db.collection(collections.restaurants).doc(restaurantId);
+      const restaurantDoc = await restaurantRef.get();
+
+      if (!restaurantDoc.exists) {
+        return res.status(404).json({ error: 'Restaurant not found' });
+      }
+
+      const restaurant = restaurantDoc.data();
+      if (restaurant.ownerId !== userId) {
+        return res.status(403).json({ error: 'Access denied. Admin role required.' });
+      }
+
+      console.log(`✅ Access granted via restaurant owner check: userId=${userId}, ownerId=${restaurant.ownerId}`);
+    }
+
+    // Validate tax settings
+    if (!taxSettings || !Array.isArray(taxSettings.taxes)) {
+      return res.status(400).json({ error: 'Invalid tax settings format' });
+    }
+
+    // Validate each tax
+    for (const tax of taxSettings.taxes) {
+      if (!tax.id || !tax.name || typeof tax.rate !== 'number' || tax.rate < 0 || tax.rate > 100) {
+        return res.status(400).json({ error: 'Invalid tax configuration' });
+      }
+    }
+
+    // Get restaurant to verify it exists
+    const restaurantRef = db.collection(collections.restaurants).doc(restaurantId);
+    const restaurantDoc = await restaurantRef.get();
+
+    if (!restaurantDoc.exists) {
+      return res.status(404).json({ error: 'Restaurant not found' });
+    }
+
+    // Update tax settings
+    await restaurantRef.update({
+      taxSettings: {
+        ...taxSettings,
+        updatedAt: new Date(),
+        updatedBy: userId
+      }
+    });
+
+    res.json({
+      success: true,
+      message: 'Tax settings updated successfully',
+      taxSettings
+    });
+
+  } catch (error) {
+    console.error('Update tax settings error:', error);
+    res.status(500).json({ error: 'Failed to update tax settings' });
+  }
+});
+
+// Calculate tax for an order
+app.post('/api/tax/calculate/:restaurantId', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+    const { items, subtotal } = req.body;
+
+    console.log(`🧮 Calculating tax for restaurant: ${restaurantId}, subtotal: ${subtotal}`);
+
+    // Get restaurant tax settings
+    const restaurantRef = db.collection(collections.restaurants).doc(restaurantId);
+    const restaurantDoc = await restaurantRef.get();
+
+    if (!restaurantDoc.exists) {
+      return res.status(404).json({ error: 'Restaurant not found' });
+    }
+
+    const restaurant = restaurantDoc.data();
+    const taxSettings = restaurant.taxSettings || {
+      enabled: true,
+      taxes: [
+        {
+          id: 'gst',
+          name: 'GST',
+          rate: 5,
+          enabled: true,
+          type: 'percentage'
+        }
+      ],
+      defaultTaxRate: 5
+    };
+
+    if (!taxSettings.enabled) {
+      return res.json({
+        success: true,
+        taxBreakdown: [],
+        totalTax: 0,
+        grandTotal: subtotal
+      });
+    }
+
+    // Calculate taxes
+    const taxBreakdown = [];
+    let totalTax = 0;
+
+    for (const tax of taxSettings.taxes) {
+      if (tax.enabled) {
+        const taxAmount = (subtotal * tax.rate) / 100;
+        taxBreakdown.push({
+          id: tax.id,
+          name: tax.name,
+          rate: tax.rate,
+          amount: Math.round(taxAmount * 100) / 100
+        });
+        totalTax += taxAmount;
+      }
+    }
+
+    const grandTotal = subtotal + totalTax;
+
+    res.json({
+      success: true,
+      taxBreakdown,
+      totalTax: Math.round(totalTax * 100) / 100,
+      grandTotal: Math.round(grandTotal * 100) / 100
+    });
+
+  } catch (error) {
+    console.error('Calculate tax error:', error);
+    res.status(500).json({ error: 'Failed to calculate tax' });
+  }
+});
+
+// Generate invoice for an order
+app.post('/api/invoice/generate/:orderId', authenticateToken, async (req, res) => {
+  try {
+    const { orderId } = req.params;
+    const userId = req.user.userId;
+
+    console.log(`📄 Generating invoice for order: ${orderId}`);
+
+    // Get order details
+    const orderRef = db.collection(collections.orders).doc(orderId);
+    const orderDoc = await orderRef.get();
+
+    if (!orderDoc.exists) {
+      return res.status(404).json({ error: 'Order not found' });
+    }
+
+    const order = orderDoc.data();
+    
+    // Get restaurant details
+    const restaurantRef = db.collection(collections.restaurants).doc(order.restaurantId);
+    const restaurantDoc = await restaurantRef.get();
+    
+    if (!restaurantDoc.exists) {
+      return res.status(404).json({ error: 'Restaurant not found' });
+    }
+
+    const restaurant = restaurantDoc.data();
+    const taxSettings = restaurant.taxSettings || {
+      enabled: true,
+      taxes: [
+        {
+          id: 'gst',
+          name: 'GST',
+          rate: 5,
+          enabled: true,
+          type: 'percentage'
+        }
+      ],
+      defaultTaxRate: 5
+    };
+
+    // Calculate totals
+    const subtotal = order.items.reduce((sum, item) => sum + (item.price * item.quantity), 0);
+    
+    let totalTax = 0;
+    const taxBreakdown = [];
+    
+    if (taxSettings.enabled) {
+      for (const tax of taxSettings.taxes) {
+        if (tax.enabled) {
+          const taxAmount = (subtotal * tax.rate) / 100;
+          taxBreakdown.push({
+            id: tax.id,
+            name: tax.name,
+            rate: tax.rate,
+            amount: Math.round(taxAmount * 100) / 100
+          });
+          totalTax += taxAmount;
+        }
+      }
+    }
+
+    const grandTotal = subtotal + totalTax;
+
+    // Generate invoice
+    const invoice = {
+      id: `INV-${Date.now()}-${Math.random().toString(36).substr(2, 4).toUpperCase()}`,
+      orderId: orderId,
+      restaurantId: order.restaurantId,
+      restaurantName: restaurant.name,
+      restaurantAddress: restaurant.address || '',
+      restaurantPhone: restaurant.phone || '',
+      restaurantEmail: restaurant.email || '',
+      customerName: order.customerInfo?.name || 'Walk-in Customer',
+      customerPhone: order.customerInfo?.phone || '',
+      customerEmail: order.customerInfo?.email || '',
+      tableNumber: order.tableNumber || '',
+      orderType: order.orderType || 'dine-in',
+      items: order.items,
+      subtotal: Math.round(subtotal * 100) / 100,
+      taxBreakdown,
+      totalTax: Math.round(totalTax * 100) / 100,
+      grandTotal: Math.round(grandTotal * 100) / 100,
+      paymentMethod: order.paymentMethod || 'cash',
+      invoiceDate: new Date(),
+      generatedBy: userId,
+      status: 'generated'
+    };
+
+    // Save invoice to database
+    const invoiceRef = await db.collection('invoices').add(invoice);
+    invoice.id = invoiceRef.id;
+
+    // Update order with invoice ID
+    await orderRef.update({
+      invoiceId: invoice.id,
+      invoiceGeneratedAt: new Date()
+    });
+
+    res.json({
+      success: true,
+      invoice
+    });
+
+  } catch (error) {
+    console.error('Generate invoice error:', error);
+    res.status(500).json({ error: 'Failed to generate invoice' });
+  }
+});
+
+// Get invoice by ID
+app.get('/api/invoice/:invoiceId', authenticateToken, async (req, res) => {
+  try {
+    const { invoiceId } = req.params;
+    const userId = req.user.userId;
+
+    console.log(`📄 Getting invoice: ${invoiceId}`);
+
+    const invoiceRef = db.collection('invoices').doc(invoiceId);
+    const invoiceDoc = await invoiceRef.get();
+
+    if (!invoiceDoc.exists) {
+      return res.status(404).json({ error: 'Invoice not found' });
+    }
+
+    const invoice = invoiceDoc.data();
+    invoice.id = invoiceDoc.id;
+
+    // Verify access to this invoice
+    const restaurantRef = db.collection(collections.restaurants).doc(invoice.restaurantId);
+    const restaurantDoc = await restaurantRef.get();
+    
+    if (restaurantDoc.exists) {
+      const restaurant = restaurantDoc.data();
+      const hasAccess = restaurant.ownerId === userId || 
+                       (restaurant.staff && restaurant.staff.some(staff => staff.userId === userId));
+      
+      if (!hasAccess) {
+        return res.status(403).json({ error: 'Access denied' });
+      }
+    }
+
+    res.json({
+      success: true,
+      invoice
+    });
+
+  } catch (error) {
+    console.error('Get invoice error:', error);
+    res.status(500).json({ error: 'Failed to get invoice' });
+  }
+});
+
+// Get invoices for a restaurant
+app.get('/api/invoices/:restaurantId', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+    const userId = req.user.userId;
+    const { limit = 50, offset = 0, startDate, endDate } = req.query;
+
+    console.log(`📄 Getting invoices for restaurant: ${restaurantId}`);
+
+    // Verify access to restaurant
+    const restaurantRef = db.collection(collections.restaurants).doc(restaurantId);
+    const restaurantDoc = await restaurantRef.get();
+
+    if (!restaurantDoc.exists) {
+      return res.status(404).json({ error: 'Restaurant not found' });
+    }
+
+    const restaurant = restaurantDoc.data();
+    const hasAccess = restaurant.ownerId === userId || 
+                     (restaurant.staff && restaurant.staff.some(staff => staff.userId === userId));
+    
+    if (!hasAccess) {
+      return res.status(403).json({ error: 'Access denied' });
+    }
+
+    // Build query
+    let query = db.collection('invoices')
+      .where('restaurantId', '==', restaurantId)
+      .orderBy('invoiceDate', 'desc')
+      .limit(parseInt(limit))
+      .offset(parseInt(offset));
+
+    // Apply date filters if provided
+    if (startDate) {
+      query = query.where('invoiceDate', '>=', new Date(startDate));
+    }
+    if (endDate) {
+      query = query.where('invoiceDate', '<=', new Date(endDate));
+    }
+
+    const invoicesSnapshot = await query.get();
+    const invoices = invoicesSnapshot.docs.map(doc => ({
+      id: doc.id,
+      ...doc.data()
+    }));
+
+    res.json({
+      success: true,
+      invoices,
+      total: invoices.length
+    });
+
+  } catch (error) {
+    console.error('Get invoices error:', error);
+    res.status(500).json({ error: 'Failed to get invoices' });
+  }
+});
+
 // KOT (Kitchen Order Ticket) Management APIs
 
 // Get KOT orders for kitchen - only orders with status 'confirmed' or later, not 'cancelled'
@@ -4755,7 +5204,11 @@ app.post('/api/customers', authenticateToken, async (req, res) => {
         email: email || customerData.email,
         city: city || customerData.city,
         dob: dob || customerData.dob,
-        orderHistory: [...customerData.orderHistory, ...orderHistory],
+        orderHistory: [...customerData.orderHistory, ...orderHistory.map(order => ({
+          ...order,
+          invoiceId: order.invoiceId || null,
+          invoiceGenerated: order.invoiceId ? true : false
+        }))],
         lastOrderDate: orderHistory.length > 0 ? new Date() : customerData.lastOrderDate,
         updatedAt: new Date()
       };
@@ -4779,7 +5232,11 @@ app.post('/api/customers', authenticateToken, async (req, res) => {
         city: city || null,
         dob: dob || null,
         restaurantId,
-        orderHistory: orderHistory || [],
+        orderHistory: (orderHistory || []).map(order => ({
+          ...order,
+          invoiceId: order.invoiceId || null,
+          invoiceGenerated: order.invoiceId ? true : false
+        })),
         totalOrders: orderHistory.length,
         totalSpent: orderHistory.reduce((sum, order) => sum + (order.totalAmount || 0), 0),
         lastOrderDate: orderHistory.length > 0 ? new Date() : null,
