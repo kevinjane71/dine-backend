@@ -1111,6 +1111,18 @@ app.post('/api/auth/firebase/verify', async (req, res) => {
       { expiresIn: '7d' }
     );
 
+    // Get user's restaurants for the response
+    let userRestaurants = [];
+    if (hasRestaurants) {
+      const restaurantsQuery = await db.collection(collections.restaurants)
+        .where('ownerId', '==', userId)
+        .get();
+      userRestaurants = restaurantsQuery.docs.map(doc => ({
+        id: doc.id,
+        ...doc.data()
+      }));
+    }
+
     res.json({
       message: 'Firebase verification successful',
       token,
@@ -1121,10 +1133,13 @@ app.post('/api/auth/firebase/verify', async (req, res) => {
         name: displayName || 'Restaurant Owner',
         role: 'owner',
         photoURL,
-        provider: email ? 'google' : 'firebase'
+        provider: email ? 'google' : 'firebase',
+        restaurantId: userRestaurants.length > 0 ? userRestaurants[0].id : null,
+        restaurant: userRestaurants.length > 0 ? userRestaurants[0] : null
       },
       isNewUser,
       hasRestaurants,
+      restaurants: userRestaurants,
       redirectTo: hasRestaurants ? '/dashboard' : '/admin'
     });
 
