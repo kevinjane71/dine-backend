@@ -15,7 +15,23 @@ const Razorpay = require('razorpay');
 require('dotenv').config();
 
 const { db, collections } = require('./firebase');
+
+// DineBot Configuration
+const dinebotConfig = {
+  name: 'DineBot',
+  version: '1.0.0',
+  description: 'Intelligent Restaurant Assistant',
+  maxTokens: 500,
+  temperature: 0.1,
+  model: 'text-davinci-003'
+};
+
+// Initialize OpenAI
+const openai = new OpenAI({
+  apiKey: process.env.OPENAI_API_KEY,
+});
 const initializePaymentRoutes = require('./payment');
+const emailService = require('./emailService');
 
 const app = express();
 const PORT = process.env.PORT || 3003;
@@ -74,10 +90,6 @@ if (process.env.NODE_ENV === 'production') {
 }
 const bucket = storage.bucket(process.env.FIREBASE_STORAGE_BUCKET || 'dine-menu-uploads');
 
-// Initialize OpenAI
-const openai = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY,
-});
 
 // Configure multer for file uploads
 const upload = multer({ 
@@ -157,6 +169,343 @@ const authenticateToken = (req, res, next) => {
     next();
   });
 };
+
+// ==================== DINEBOT FUNCTIONS ====================
+
+// Security: Sanitize and validate user input
+function sanitizeInput(input) {
+  if (typeof input !== 'string') return '';
+  
+  // Remove potentially dangerous characters
+  return input
+    .replace(/[<>\"'%;()&+]/g, '') // Remove SQL injection characters
+    .replace(/script/gi, '') // Remove script tags
+    .replace(/javascript/gi, '') // Remove javascript
+    .trim()
+    .substring(0, 500); // Limit length
+}
+
+// Security: Validate restaurant access
+async function validateRestaurantAccess(userId, restaurantId) {
+  try {
+    // Check if user has access to this restaurant
+    const userRestaurantSnapshot = await db.collection(collections.userRestaurants)
+      .where('userId', '==', userId)
+      .where('restaurantId', '==', restaurantId)
+      .get();
+
+    if (!userRestaurantSnapshot.empty) {
+      return true;
+    }
+
+    // Fallback: Check if user is the owner directly
+    const restaurantDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
+    if (restaurantDoc.exists) {
+      const restaurant = restaurantDoc.data();
+      return restaurant.ownerId === userId;
+    }
+
+    return false;
+  } catch (error) {
+    console.error('Restaurant access validation error:', error);
+    return false;
+  }
+}
+
+// Generate database schema documentation for ChatGPT
+function generateDatabaseSchema(restaurantId) {
+  return `
+RESTAURANT DATABASE SCHEMA (Restaurant ID: ${restaurantId})
+
+COLLECTIONS AND STRUCTURES:
+
+1. ORDERS Collection:
+   - Fields: id, restaurantId, items[], totalAmount, customer{}, tableNumber, status, waiterId, createdAt, updatedAt
+   - Status values: 'pending', 'preparing', 'ready', 'completed', 'cancelled'
+   - Items structure: [{name, price, quantity, category, shortCode}]
+   - Customer structure: {name, phone, email}
+
+2. CUSTOMERS Collection:
+   - Fields: id, restaurantId, name, phone, email, city, dob, orderHistory[], createdAt, updatedAt
+   - OrderHistory: [{orderId, date, totalAmount, items[]}]
+
+3. RESTAURANTS Collection:
+   - Fields: id, name, description, ownerId, settings{}, menu{}, tables[], floors[], createdAt, updatedAt
+   - Settings: {openTime, closeTime, lastOrderTime, taxSettings{}, features{}}
+   - Tables: [{id, number, floorId, status, capacity}]
+   - Floors: [{id, name, tables[]}]
+
+4. MENUS Collection (embedded in restaurants):
+   - Structure: restaurant.menu.items[]
+   - Fields: {id, name, price, category, description, shortCode, isVeg, isAvailable, image}
+
+5. INVOICES Collection:
+   - Fields: id, orderId, restaurantId, invoiceNumber, subtotal, taxBreakdown[], total, generatedBy, generatedAt
+
+6. USER_RESTAURANTS Collection:
+   - Fields: userId, restaurantId, role, createdAt, updatedAt
+   - Roles: 'owner', 'manager', 'admin', 'staff'
+
+QUERY OPERATIONS AVAILABLE:
+- COUNT: Count documents matching filters
+- SUM: Sum numeric fields (totalAmount, price, quantity)
+- GROUP_BY: Group by field and count/sum
+- LIST: Get list of documents
+- FILTER: Filter by date ranges, status, restaurantId
+
+DATE FILTERS:
+- today: Current day (00:00 to 23:59)
+- yesterday: Previous day
+- this_week: Current week (Monday to Sunday)
+- last_week: Previous week
+- this_month: Current month
+- last_month: Previous month
+
+SECURITY CONSTRAINTS:
+- ALL queries MUST include restaurantId filter
+- User can ONLY access their own restaurant data
+- No cross-restaurant data access allowed
+- Input sanitization required for all user queries
+`;
+}
+
+// Dynamic query executor with security controls
+async function executeSecureQuery(operations, restaurantId, userId) {
+  const results = {};
+  
+  // Security: Validate restaurant access
+  const hasAccess = await validateRestaurantAccess(userId, restaurantId);
+  if (!hasAccess) {
+    throw new Error('Access denied to restaurant data');
+  }
+
+  for (const operation of operations) {
+    try {
+      let query = db.collection(operation.collection);
+      
+      // Security: Always add restaurantId filter
+      query = query.where('restaurantId', '==', restaurantId);
+      
+      // Apply additional filters
+      if (operation.filters) {
+        for (const [field, value] of Object.entries(operation.filters)) {
+          // Security: Prevent injection attacks
+          const sanitizedValue = sanitizeInput(value);
+          
+          if (field === 'createdAt') {
+            // Simplified date filtering to avoid composite indexes
+            if (value === 'today') {
+              const today = new Date();
+              today.setHours(0, 0, 0, 0);
+              // Use only one where clause to avoid composite index requirement
+              query = query.where(field, '>=', today);
+            } else if (value === 'yesterday') {
+              const yesterday = new Date();
+              yesterday.setDate(yesterday.getDate() - 1);
+              yesterday.setHours(0, 0, 0, 0);
+              query = query.where(field, '>=', yesterday);
+            } else if (value === 'this_week') {
+              const startOfWeek = new Date();
+              startOfWeek.setDate(startOfWeek.getDate() - startOfWeek.getDay());
+              startOfWeek.setHours(0, 0, 0, 0);
+              query = query.where(field, '>=', startOfWeek);
+            }
+          } else if (field === 'status') {
+            query = query.where(field, '==', sanitizedValue);
+          } else if (field === 'tableNumber') {
+            query = query.where(field, '==', parseInt(sanitizedValue));
+          } else {
+            query = query.where(field, '==', sanitizedValue);
+          }
+        }
+      }
+      
+      const snapshot = await query.get();
+      let docs = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+      
+      // Apply client-side date filtering to avoid composite indexes
+      if (operation.filters && operation.filters.createdAt) {
+        const now = new Date();
+        docs = docs.filter(doc => {
+          const docDate = doc.createdAt ? doc.createdAt.toDate() : new Date(doc.createdAt);
+          
+          if (operation.filters.createdAt === 'today') {
+            const today = new Date();
+            today.setHours(0, 0, 0, 0);
+            const tomorrow = new Date(today);
+            tomorrow.setDate(tomorrow.getDate() + 1);
+            return docDate >= today && docDate < tomorrow;
+          } else if (operation.filters.createdAt === 'yesterday') {
+            const yesterday = new Date();
+            yesterday.setDate(yesterday.getDate() - 1);
+            yesterday.setHours(0, 0, 0, 0);
+            const today = new Date();
+            today.setHours(0, 0, 0, 0);
+            return docDate >= yesterday && docDate < today;
+          } else if (operation.filters.createdAt === 'this_week') {
+            const startOfWeek = new Date();
+            startOfWeek.setDate(startOfWeek.getDate() - startOfWeek.getDay());
+            startOfWeek.setHours(0, 0, 0, 0);
+            const endOfWeek = new Date(startOfWeek);
+            endOfWeek.setDate(endOfWeek.getDate() + 7);
+            return docDate >= startOfWeek && docDate < endOfWeek;
+          }
+          return true;
+        });
+      }
+      
+      // Apply aggregation
+      switch (operation.aggregation) {
+        case 'count':
+          results[operation.collection] = { count: docs.length };
+          break;
+          
+        case 'sum':
+          const sumField = operation.fields[0];
+          const sum = docs.reduce((total, doc) => total + (doc[sumField] || 0), 0);
+          results[operation.collection] = { sum: sum };
+          break;
+          
+        case 'groupBy':
+          const groupField = operation.fields[0];
+          const grouped = {};
+          docs.forEach(doc => {
+            if (doc[groupField]) {
+              if (Array.isArray(doc[groupField])) {
+                // Handle array fields like items
+                doc[groupField].forEach(item => {
+                  const key = item.name || item.id || 'unknown';
+                  grouped[key] = (grouped[key] || 0) + (item.quantity || 1);
+                });
+              } else {
+                const key = doc[groupField];
+                grouped[key] = (grouped[key] || 0) + 1;
+              }
+            }
+          });
+          results[operation.collection] = { grouped: grouped };
+          break;
+          
+        case 'list':
+          results[operation.collection] = { items: docs };
+          break;
+          
+        case 'average':
+          const avgField = operation.fields[0];
+          const total = docs.reduce((sum, doc) => sum + (doc[avgField] || 0), 0);
+          const average = docs.length > 0 ? total / docs.length : 0;
+          results[operation.collection] = { average: average };
+          break;
+          
+        default:
+          results[operation.collection] = { data: docs };
+      }
+      
+    } catch (error) {
+      console.error(`Error executing operation on ${operation.collection}:`, error);
+      results[operation.collection] = { error: 'Failed to fetch data' };
+    }
+  }
+  
+  return results;
+}
+
+// Get restaurant static data and FAQ
+async function getRestaurantStaticData(restaurantId) {
+  try {
+    const restaurantDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
+    if (!restaurantDoc.exists) {
+      return null;
+    }
+    
+    const restaurant = restaurantDoc.data();
+    
+    return {
+      name: restaurant.name,
+      description: restaurant.description,
+      openTime: restaurant.settings?.openTime || '9:00 AM',
+      closeTime: restaurant.settings?.closeTime || '11:00 PM',
+      lastOrderTime: restaurant.settings?.lastOrderTime || '10:30 PM',
+      totalTables: restaurant.tables?.length || 0,
+      totalFloors: restaurant.floors?.length || 0,
+      menuItems: restaurant.menu?.items?.length || 0,
+      features: restaurant.settings?.features || {},
+      taxEnabled: restaurant.settings?.taxSettings?.enabled || false,
+      taxRate: restaurant.settings?.taxSettings?.defaultTaxRate || 0
+    };
+  } catch (error) {
+    console.error('Error fetching restaurant static data:', error);
+    return null;
+  }
+}
+
+// Generate dynamic response using ChatGPT
+async function generateDynamicResponse(query, data, restaurantData, intent) {
+  try {
+    const prompt = `
+You are DineBot, an intelligent restaurant management assistant for "${restaurantData.name}".
+
+Restaurant Information:
+- Name: ${restaurantData.name}
+- Open Time: ${restaurantData.openTime}
+- Close Time: ${restaurantData.closeTime}
+- Last Order Time: ${restaurantData.lastOrderTime}
+- Total Tables: ${restaurantData.totalTables}
+- Total Floors: ${restaurantData.totalFloors}
+- Menu Items: ${restaurantData.menuItems}
+- Tax Enabled: ${restaurantData.taxEnabled ? 'Yes' : 'No'}
+- Tax Rate: ${restaurantData.taxRate}%
+
+User Query: "${query}"
+
+Database Results:
+${JSON.stringify(data, null, 2)}
+
+Generate a friendly, conversational response that:
+1. Answers the user's question directly and accurately
+2. Includes relevant numbers and data from the database
+3. Uses restaurant terminology appropriately
+4. Sounds professional but warm and helpful
+5. Is concise but informative (max 2-3 sentences)
+6. Includes appropriate emojis
+7. Provides actionable insights when possible
+
+Response:`;
+
+    const completion = await openai.chat.completions.create({
+      model: 'gpt-3.5-turbo',
+      messages: [
+        {
+          role: 'user',
+          content: prompt
+        }
+      ],
+      max_tokens: dinebotConfig.maxTokens,
+      temperature: dinebotConfig.temperature,
+    });
+
+    return completion.choices[0].message.content.trim();
+    
+  } catch (error) {
+    console.error('ChatGPT response generation error:', error);
+    return generateFallbackResponse(query, data, restaurantData, intent);
+  }
+}
+
+// Fallback response generator
+function generateFallbackResponse(query, data, restaurantData, intent) {
+  const responses = {
+    'orders_today': `Today ${restaurantData.name} has ${data.orders?.count || 0} orders placed. ${data.orders?.count > 50 ? 'Great day!' : 'Room for growth!'} 📊`,
+    'customers_today': `We've served ${data.customers?.count || 0} unique customers today. ${data.customers?.count > 30 ? 'Excellent!' : 'Let\'s attract more!'} 👥`,
+    'revenue_today': `Today's revenue is ₹${data.orders?.sum?.toFixed(2) || '0.00'} from ${data.orders?.count || 0} completed orders. ${data.orders?.sum > 10000 ? 'Outstanding!' : 'Keep pushing!'} 💰`,
+    'table_status': `Currently ${data.orders?.count || 0} tables are occupied out of ${restaurantData.totalTables} total tables. ${restaurantData.totalTables - (data.orders?.count || 0)} tables are available. 🪑`,
+    'popular_items': `The most popular items today are: ${Object.entries(data.orders?.grouped || {}).slice(0, 3).map(([name, count]) => `${name} (${count})`).join(', ')}. 🍽️`
+  };
+  
+  return responses[intent] || `Here's the data you requested: ${JSON.stringify(data)}`;
+}
+
+// ==================== END DINEBOT FUNCTIONS ====================
 
 const generateOTP = (phone) => {
   // Only use hardcoded OTP for dummy account
@@ -5554,6 +5903,200 @@ app.delete('/api/categories/:restaurantId/:categoryId', authenticateToken, async
   }
 });
 
+// ==================== DINEBOT API ENDPOINT ====================
+
+// DineBot Query Endpoint
+app.post('/api/dinebot/query', authenticateToken, async (req, res) => {
+  try {
+    const { query, restaurantId } = req.body;
+    const userId = req.user.userId;
+    
+    console.log(`🤖 DineBot Query: "${query}" from user ${userId} for restaurant ${restaurantId}`);
+    
+    // Security: Sanitize input
+    const sanitizedQuery = sanitizeInput(query);
+    if (!sanitizedQuery) {
+      return res.status(400).json({
+        success: false,
+        error: 'Invalid query format'
+      });
+    }
+    
+    // Security: Validate restaurant access
+    const hasAccess = await validateRestaurantAccess(userId, restaurantId);
+    if (!hasAccess) {
+      return res.status(403).json({
+        success: false,
+        error: 'Access denied to restaurant data'
+      });
+    }
+    
+    // Step 1: Use ChatGPT to understand the query dynamically
+    const databaseSchema = generateDatabaseSchema(restaurantId);
+    
+    const prompt = `
+You are DineBot, an intelligent restaurant management assistant.
+
+${databaseSchema}
+
+Based on this query: "${sanitizedQuery}"
+
+Determine what database operations are needed and respond with JSON:
+
+{
+  "operations": [
+    {
+      "collection": "orders",
+      "filters": {"createdAt": "today"},
+      "fields": ["totalAmount"],
+      "aggregation": "sum"
+    }
+  ],
+  "responseTemplate": "Today's revenue is ₹{orders.sum} 💰",
+  "intent": "revenue_today",
+  "confidence": 0.9
+}
+
+Examples:
+Query: "How many orders today?"
+Response: {"operations": [{"collection": "orders", "filters": {"createdAt": "today"}, "fields": ["id"], "aggregation": "count"}], "responseTemplate": "Today we have {orders.count} orders 📊", "intent": "orders_today", "confidence": 0.9}
+
+Query: "What's our revenue today?"
+Response: {"operations": [{"collection": "orders", "filters": {"createdAt": "today", "status": "completed"}, "fields": ["totalAmount"], "aggregation": "sum"}], "responseTemplate": "Today's revenue is ₹{orders.sum} 💰", "intent": "revenue_today", "confidence": 0.9}
+
+Query: "Show me popular items today"
+Response: {"operations": [{"collection": "orders", "filters": {"createdAt": "today"}, "fields": ["items"], "aggregation": "groupBy"}], "responseTemplate": "Most popular items today: {orders.grouped} 🍽️", "intent": "popular_items", "confidence": 0.8}
+
+Query: "How many customers today?"
+Response: {"operations": [{"collection": "orders", "filters": {"createdAt": "today"}, "fields": ["customer"], "aggregation": "count"}], "responseTemplate": "We served {orders.count} customers today 👥", "intent": "customers_today", "confidence": 0.9}
+
+IMPORTANT: 
+- ALL operations MUST include restaurantId filter (automatically added)
+- Use only the collections and fields listed in the schema
+- Be specific with date filters (today, yesterday, this_week, etc.)
+- Use appropriate aggregation types (count, sum, groupBy, list, average)
+- Keep responseTemplate concise and friendly
+- Include relevant emojis
+
+Response:`;
+
+    const completion = await openai.chat.completions.create({
+      model: 'gpt-3.5-turbo',
+      messages: [
+        {
+          role: 'user',
+          content: prompt
+        }
+      ],
+      max_tokens: 400,
+      temperature: dinebotConfig.temperature,
+    });
+
+    let queryPlan;
+    try {
+      queryPlan = JSON.parse(completion.choices[0].message.content.trim());
+    } catch (parseError) {
+      console.error('Failed to parse ChatGPT response:', parseError);
+      return res.status(500).json({
+        success: false,
+        error: 'Failed to understand query'
+      });
+    }
+    
+    // Step 2: Execute dynamic database queries
+    const data = await executeSecureQuery(queryPlan.operations, restaurantId, userId);
+    
+    // Step 3: Get restaurant static data
+    const restaurantData = await getRestaurantStaticData(restaurantId);
+    if (!restaurantData) {
+      return res.status(404).json({
+        success: false,
+        error: 'Restaurant not found'
+      });
+    }
+    
+    // Step 4: Generate response using ChatGPT
+    const response = await generateDynamicResponse(sanitizedQuery, data, restaurantData, queryPlan.intent);
+    
+    console.log(`✅ DineBot Response: "${response}"`);
+    
+    res.json({
+      success: true,
+      response: response,
+      data: data,
+      intent: queryPlan.intent,
+      confidence: queryPlan.confidence,
+      restaurant: restaurantData.name,
+      timestamp: new Date().toISOString()
+    });
+    
+  } catch (error) {
+    console.error('DineBot query error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to process query',
+      message: error.message
+    });
+  }
+});
+
+// DineBot Status Endpoint
+app.get('/api/dinebot/status', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const restaurantId = req.query.restaurantId;
+    
+    if (!restaurantId) {
+      return res.status(400).json({
+        success: false,
+        error: 'Restaurant ID required'
+      });
+    }
+    
+    // Security: Validate restaurant access
+    const hasAccess = await validateRestaurantAccess(userId, restaurantId);
+    if (!hasAccess) {
+      return res.status(403).json({
+        success: false,
+        error: 'Access denied to restaurant data'
+      });
+    }
+    
+    const restaurantData = await getRestaurantStaticData(restaurantId);
+    
+    res.json({
+      success: true,
+      bot: {
+        name: dinebotConfig.name,
+        version: dinebotConfig.version,
+        description: dinebotConfig.description,
+        status: 'active'
+      },
+      restaurant: restaurantData,
+      capabilities: [
+        'Order analytics and reporting',
+        'Customer insights and statistics',
+        'Revenue and sales analysis',
+        'Table and floor management',
+        'Menu performance tracking',
+        'Inventory status queries',
+        'Staff performance metrics',
+        'Restaurant operational data'
+      ],
+      timestamp: new Date().toISOString()
+    });
+    
+  } catch (error) {
+    console.error('DineBot status error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to get bot status'
+    });
+  }
+});
+
+// ==================== END DINEBOT API ====================
+
 // 404 handler - must be last
 app.use((req, res) => {
   res.status(404).json({ 
@@ -5571,10 +6114,243 @@ app.use((req, res) => {
       '/api/analytics/*',
       '/api/kot/*',
       '/api/admin/settings/*',
-      '/api/categories/*'
+      '/api/categories/*',
+      '/api/email/*',
+      '/api/dinebot/*'
     ]
   });
 });
+
+// ==================== EMAIL SERVICE API ENDPOINTS ====================
+
+// Send welcome email to new users
+app.post('/api/email/welcome', authenticateToken, async (req, res) => {
+  try {
+    const { email, name } = req.body;
+    const userId = req.user.userId;
+    
+    console.log(`📧 Sending welcome email to: ${email} for user: ${userId}`);
+    
+    if (!email || !name) {
+      return res.status(400).json({
+        success: false,
+        error: 'Email and name are required'
+      });
+    }
+
+    const userData = {
+      email: email,
+      name: name,
+      userId: userId
+    };
+
+    const result = await emailService.sendWelcomeEmail(userData);
+    
+    res.json({
+      success: true,
+      message: 'Welcome email sent successfully',
+      messageId: result.messageId
+    });
+    
+  } catch (error) {
+    console.error('Welcome email error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to send welcome email',
+      message: error.message
+    });
+  }
+});
+
+// Send weekly analytics report
+app.post('/api/email/weekly-analytics', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId } = req.body;
+    const userId = req.user.userId;
+    
+    console.log(`📊 Generating weekly analytics report for restaurant: ${restaurantId}`);
+    
+    // Security: Validate restaurant access
+    const hasAccess = await validateRestaurantAccess(userId, restaurantId);
+    if (!hasAccess) {
+      return res.status(403).json({
+        success: false,
+        error: 'Access denied to restaurant data'
+      });
+    }
+
+    // Get restaurant data
+    const restaurantDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
+    if (!restaurantDoc.exists) {
+      return res.status(404).json({
+        success: false,
+        error: 'Restaurant not found'
+      });
+    }
+
+    const restaurant = restaurantDoc.data();
+    
+    // Get owner data
+    const ownerDoc = await db.collection(collections.users).doc(restaurant.ownerId).get();
+    if (!ownerDoc.exists) {
+      return res.status(404).json({
+        success: false,
+        error: 'Restaurant owner not found'
+      });
+    }
+
+    const owner = ownerDoc.data();
+    
+    // Calculate date range for this week
+    const now = new Date();
+    const startOfWeek = new Date(now);
+    startOfWeek.setDate(now.getDate() - now.getDay());
+    startOfWeek.setHours(0, 0, 0, 0);
+    
+    const endOfWeek = new Date(startOfWeek);
+    endOfWeek.setDate(startOfWeek.getDate() + 6);
+    endOfWeek.setHours(23, 59, 59, 999);
+
+    // Get orders for this week
+    const ordersSnapshot = await db.collection(collections.orders)
+      .where('restaurantId', '==', restaurantId)
+      .where('createdAt', '>=', startOfWeek)
+      .where('createdAt', '<=', endOfWeek)
+      .get();
+
+    const orders = ordersSnapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+    
+    // Get previous week orders for comparison
+    const prevStartOfWeek = new Date(startOfWeek);
+    prevStartOfWeek.setDate(startOfWeek.getDate() - 7);
+    const prevEndOfWeek = new Date(endOfWeek);
+    prevEndOfWeek.setDate(endOfWeek.getDate() - 7);
+
+    const prevOrdersSnapshot = await db.collection(collections.orders)
+      .where('restaurantId', '==', restaurantId)
+      .where('createdAt', '>=', prevStartOfWeek)
+      .where('createdAt', '<=', prevEndOfWeek)
+      .get();
+
+    const prevOrders = prevOrdersSnapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+
+    // Calculate analytics
+    const totalOrders = orders.length;
+    const totalRevenue = orders.reduce((sum, order) => sum + (order.totalAmount || 0), 0);
+    const averageOrderValue = totalOrders > 0 ? totalRevenue / totalOrders : 0;
+    
+    // Get unique customers
+    const customerEmails = new Set(orders.map(order => order.customer?.email).filter(Boolean));
+    const totalCustomers = customerEmails.size;
+    
+    // Get new customers (customers who ordered this week but not last week)
+    const prevCustomerEmails = new Set(prevOrders.map(order => order.customer?.email).filter(Boolean));
+    const newCustomers = Array.from(customerEmails).filter(email => !prevCustomerEmails.has(email)).length;
+
+    // Calculate growth percentages
+    const prevTotalOrders = prevOrders.length;
+    const prevTotalRevenue = prevOrders.reduce((sum, order) => sum + (order.totalAmount || 0), 0);
+    const prevTotalCustomers = new Set(prevOrders.map(order => order.customer?.email).filter(Boolean)).size;
+
+    const orderGrowth = prevTotalOrders > 0 ? ((totalOrders - prevTotalOrders) / prevTotalOrders) * 100 : 0;
+    const revenueGrowth = prevTotalRevenue > 0 ? ((totalRevenue - prevTotalRevenue) / prevTotalRevenue) * 100 : 0;
+    const customerGrowth = prevTotalCustomers > 0 ? ((totalCustomers - prevTotalCustomers) / prevTotalCustomers) * 100 : 0;
+
+    // Get top items
+    const itemCounts = {};
+    const itemRevenue = {};
+    orders.forEach(order => {
+      if (order.items) {
+        order.items.forEach(item => {
+          const itemName = item.name || 'Unknown Item';
+          itemCounts[itemName] = (itemCounts[itemName] || 0) + (item.quantity || 1);
+          itemRevenue[itemName] = (itemRevenue[itemName] || 0) + ((item.price || 0) * (item.quantity || 1));
+        });
+      }
+    });
+
+    const topItems = Object.keys(itemCounts)
+      .map(name => ({
+        name,
+        orders: itemCounts[name],
+        revenue: itemRevenue[name] || 0
+      }))
+      .sort((a, b) => b.orders - a.orders)
+      .slice(0, 5);
+
+    // Get busiest hours
+    const hourCounts = {};
+    orders.forEach(order => {
+      const hour = new Date(order.createdAt).getHours();
+      hourCounts[hour] = (hourCounts[hour] || 0) + 1;
+    });
+
+    const busiestHours = Object.keys(hourCounts)
+      .map(hour => ({ hour: parseInt(hour), orders: hourCounts[hour] }))
+      .sort((a, b) => b.orders - a.orders)
+      .slice(0, 5);
+
+    // Get daily breakdown
+    const dailyBreakdown = [];
+    for (let i = 0; i < 7; i++) {
+      const date = new Date(startOfWeek);
+      date.setDate(startOfWeek.getDate() + i);
+      
+      const dayOrders = orders.filter(order => {
+        const orderDate = new Date(order.createdAt);
+        return orderDate.toDateString() === date.toDateString();
+      });
+      
+      const dayRevenue = dayOrders.reduce((sum, order) => sum + (order.totalAmount || 0), 0);
+      
+      dailyBreakdown.push({
+        date: date.toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' }),
+        orders: dayOrders.length,
+        revenue: Math.round(dayRevenue)
+      });
+    }
+
+    // Format week range
+    const weekRange = `${startOfWeek.toLocaleDateString('en-US', { month: 'short', day: 'numeric' })} - ${endOfWeek.toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}`;
+
+    const analyticsData = {
+      ownerEmail: owner.email || owner.phone,
+      ownerName: owner.name || 'Restaurant Owner',
+      restaurantName: restaurant.name,
+      weekRange: weekRange,
+      totalOrders: totalOrders,
+      totalRevenue: Math.round(totalRevenue),
+      averageOrderValue: Math.round(averageOrderValue),
+      totalCustomers: totalCustomers,
+      newCustomers: newCustomers,
+      orderGrowth: Math.round(orderGrowth * 100) / 100,
+      revenueGrowth: Math.round(revenueGrowth * 100) / 100,
+      customerGrowth: Math.round(customerGrowth * 100) / 100,
+      topItems: topItems,
+      busiestHours: busiestHours,
+      dailyBreakdown: dailyBreakdown
+    };
+
+    const result = await emailService.sendWeeklyAnalyticsReport(analyticsData);
+    
+    res.json({
+      success: true,
+      message: 'Weekly analytics report sent successfully',
+      messageId: result.messageId,
+      analytics: analyticsData
+    });
+    
+  } catch (error) {
+    console.error('Weekly analytics email error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to send weekly analytics report',
+      message: error.message
+    });
+  }
+});
+
+// ==================== END EMAIL SERVICE API ====================
 
 // Start server for both local development and production
 const server = app.listen(PORT, '0.0.0.0', () => {
