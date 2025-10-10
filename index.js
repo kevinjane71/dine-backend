@@ -224,43 +224,99 @@ async function validateRestaurantAccess(userId, restaurantId) {
 // Generate database schema documentation for ChatGPT
 function generateDatabaseSchema(restaurantId) {
   return `
-RESTAURANT DATABASE SCHEMA (Restaurant ID: ${restaurantId})
+COMPLETE RESTAURANT DATABASE SCHEMA (Restaurant ID: ${restaurantId})
 
-COLLECTIONS AND STRUCTURES:
+ALL COLLECTIONS AND EXACT FIELD NAMES:
 
 1. ORDERS Collection:
-   - Fields: id, restaurantId, items[], totalAmount, customer{}, tableNumber, status, waiterId, createdAt, updatedAt
-   - Status values: 'pending', 'preparing', 'ready', 'completed', 'cancelled'
-   - Items structure: [{name, price, quantity, category, shortCode}]
-   - Customer structure: {name, phone, email}
+   Fields: id, restaurantId, items[], totalAmount, customer{}, tableNumber, status, waiterId, waiterName, paymentMethod, paymentStatus, taxAmount, discountAmount, notes, createdAt, updatedAt, completedAt
+   Status values: 'pending', 'preparing', 'ready', 'completed', 'cancelled'
+   Items structure: [{id, name, price, quantity, category, shortCode, isVeg}]
+   Customer structure: {name, phone, email, address}
+   Payment methods: 'cash', 'card', 'upi', 'online'
 
 2. CUSTOMERS Collection:
-   - Fields: id, restaurantId, name, phone, email, city, dob, orderHistory[], createdAt, updatedAt
-   - OrderHistory: [{orderId, date, totalAmount, items[]}]
+   Fields: id, restaurantId, name, phone, email, city, dob, address, orderHistory[], totalSpent, lastVisit, createdAt, updatedAt
+   OrderHistory: [{orderId, date, totalAmount, items[], status}]
 
 3. RESTAURANTS Collection:
-   - Fields: id, name, description, ownerId, settings{}, menu{}, tables[], floors[], createdAt, updatedAt
-   - Settings: {openTime, closeTime, lastOrderTime, taxSettings{}, features{}}
-   - Tables: [{id, number, floorId, status, capacity}]
-   - Floors: [{id, name, tables[]}]
+   Fields: id, name, description, ownerId, address, phone, email, cuisine[], settings{}, menu{}, tables[], floors[], createdAt, updatedAt
+   Settings: {openTime, closeTime, lastOrderTime, taxSettings{}, features{}, notifications{}}
+   Menu structure: {items: [{id, name, price, category, description, shortCode, isVeg, isAvailable, image}]}
+   Tables: [{id, number, floorId, status, capacity, section}]
+   Floors: [{id, name, tables[], capacity}]
 
-4. MENUS Collection (embedded in restaurants):
-   - Structure: restaurant.menu.items[]
-   - Fields: {id, name, price, category, description, shortCode, isVeg, isAvailable, image}
+4. TABLES Collection:
+   Fields: id, restaurantId, name, floor, capacity, section, status, currentOrderId, lastOrderTime, waiterId, createdAt, updatedAt
+   Status values: 'available', 'occupied', 'reserved', 'cleaning', 'maintenance'
+   Floor: Floor name or ID where table is located
 
-5. INVOICES Collection:
-   - Fields: id, orderId, restaurantId, invoiceNumber, subtotal, taxBreakdown[], total, generatedBy, generatedAt
+5. FLOORS Collection:
+   Fields: id, restaurantId, name, description, capacity, tables[], createdAt, updatedAt
+   Tables: [{id, name, capacity, status, section}]
 
-6. USER_RESTAURANTS Collection:
-   - Fields: userId, restaurantId, role, createdAt, updatedAt
-   - Roles: 'owner', 'manager', 'admin', 'staff'
+6. MENUS Collection (embedded in restaurants):
+   Structure: restaurant.menu.items[]
+   Fields: {id, name, price, category, description, shortCode, isVeg, isAvailable, image, preparationTime, ingredients[], allergens[]}
+
+7. INVENTORY Collection:
+   Fields: id, restaurantId, name, category, unit, currentStock, minStock, maxStock, costPerUnit, supplierId, location, barcode, expiryDate, createdAt, updatedAt
+   Categories: 'vegetables', 'meat', 'dairy', 'spices', 'beverages', 'packaged', 'other'
+
+8. SUPPLIERS Collection:
+   Fields: id, restaurantId, name, contactPerson, phone, email, address, paymentTerms, notes, createdAt, updatedAt
+
+9. RECIPES Collection:
+   Fields: id, restaurantId, name, description, category, servings, prepTime, cookTime, ingredients[], instructions[], notes, createdAt, updatedAt
+   Ingredients: [{inventoryItemId, inventoryItemName, quantity, unit}]
+
+10. PURCHASE_ORDERS Collection:
+    Fields: id, restaurantId, supplierId, items[], totalAmount, status, notes, expectedDeliveryDate, createdAt, updatedAt, createdBy
+    Status values: 'pending', 'confirmed', 'shipped', 'delivered', 'cancelled'
+    Items: [{inventoryItemId, inventoryItemName, quantity, unitPrice, totalPrice}]
+
+11. INVOICES Collection:
+    Fields: id, orderId, restaurantId, invoiceNumber, subtotal, taxBreakdown[], total, generatedBy, generatedAt, customer{}, items[]
+
+12. PAYMENTS Collection:
+    Fields: id, orderId, restaurantId, amount, method, status, transactionId, razorpayOrderId, razorpayPaymentId, createdAt, updatedAt
+    Status values: 'pending', 'completed', 'failed', 'refunded'
+
+13. ANALYTICS Collection:
+    Fields: id, restaurantId, date, revenue, ordersCount, customersCount, popularItems[], peakHours[], createdAt
+
+14. USER_RESTAURANTS Collection:
+    Fields: userId, restaurantId, role, permissions[], createdAt, updatedAt
+    Roles: 'owner', 'manager', 'admin', 'staff', 'waiter'
+    Permissions: ['orders', 'menu', 'tables', 'analytics', 'inventory', 'customers']
+
+15. RESTAURANT_SETTINGS Collection:
+    Fields: id, restaurantId, taxSettings{}, discountSettings{}, notificationSettings{}, featureSettings{}, createdAt, updatedAt
+    TaxSettings: {enabled, rate, type}
+    DiscountSettings: {enabled, maxDiscount, rules[]}
+
+16. DISCOUNT_SETTINGS Collection:
+    Fields: id, restaurantId, name, type, value, conditions[], isActive, createdAt, updatedAt
+    Types: 'percentage', 'fixed', 'buy_x_get_y'
+
+17. BOOKINGS Collection:
+    Fields: id, restaurantId, customerName, customerPhone, customerEmail, tableId, floorId, date, time, duration, partySize, status, notes, createdAt, updatedAt
+    Status values: 'pending', 'confirmed', 'seated', 'completed', 'cancelled', 'no_show'
+
+18. FEEDBACK Collection:
+    Fields: id, restaurantId, orderId, customerId, rating, comment, category, createdAt, updatedAt
+    Categories: 'food_quality', 'service', 'ambiance', 'value', 'other'
+
+19. LOYALTY Collection:
+    Fields: id, restaurantId, customerId, points, tier, totalSpent, lastActivity, createdAt, updatedAt
 
 QUERY OPERATIONS AVAILABLE:
 - COUNT: Count documents matching filters
-- SUM: Sum numeric fields (totalAmount, price, quantity)
+- SUM: Sum numeric fields (totalAmount, price, quantity, currentStock, etc.)
 - GROUP_BY: Group by field and count/sum
 - LIST: Get list of documents
 - FILTER: Filter by date ranges, status, restaurantId
+- AVERAGE: Calculate average of numeric fields
 
 DATE FILTERS:
 - today: Current day (00:00 to 23:59)
@@ -269,12 +325,20 @@ DATE FILTERS:
 - last_week: Previous week
 - this_month: Current month
 - last_month: Previous month
+- this_year: Current year
+- last_year: Previous year
+
+FIELD TYPES AND VALUES:
+- Status fields: Check specific collection for valid values
+- Date fields: All use createdAt, updatedAt, date, time formats
+- Numeric fields: totalAmount, price, quantity, capacity, rating, points
+- Boolean fields: isVeg, isAvailable, isActive
+- Array fields: items[], ingredients[], instructions[], permissions[]
 
 SECURITY CONSTRAINTS:
 - ALL queries MUST include restaurantId filter
-- User can ONLY access their own restaurant data
-- No cross-restaurant data access allowed
 - Input sanitization required for all user queries
+- No real data exposure - only schema and field names
 `;
 }
 
@@ -290,74 +354,54 @@ async function executeSecureQuery(operations, restaurantId, userId) {
 
   for (const operation of operations) {
     try {
+      // CRITICAL FIX: Use only ONE where clause to avoid composite index requirements
       let query = db.collection(operation.collection);
       
-      // Security: Always add restaurantId filter
+      // Security: Always add restaurantId filter (this is the only where clause we use)
       query = query.where('restaurantId', '==', restaurantId);
       
-      // Apply additional filters
-      if (operation.filters) {
-        for (const [field, value] of Object.entries(operation.filters)) {
-          // Security: Prevent injection attacks
-          const sanitizedValue = sanitizeInput(value);
-          
-          if (field === 'createdAt') {
-            // Simplified date filtering to avoid composite indexes
-            if (value === 'today') {
-              const today = new Date();
-              today.setHours(0, 0, 0, 0);
-              // Use only one where clause to avoid composite index requirement
-              query = query.where(field, '>=', today);
-            } else if (value === 'yesterday') {
-              const yesterday = new Date();
-              yesterday.setDate(yesterday.getDate() - 1);
-              yesterday.setHours(0, 0, 0, 0);
-              query = query.where(field, '>=', yesterday);
-            } else if (value === 'this_week') {
-              const startOfWeek = new Date();
-              startOfWeek.setDate(startOfWeek.getDate() - startOfWeek.getDay());
-              startOfWeek.setHours(0, 0, 0, 0);
-              query = query.where(field, '>=', startOfWeek);
-            }
-          } else if (field === 'status') {
-            query = query.where(field, '==', sanitizedValue);
-          } else if (field === 'tableNumber') {
-            query = query.where(field, '==', parseInt(sanitizedValue));
-          } else {
-            query = query.where(field, '==', sanitizedValue);
-          }
-        }
-      }
-      
+      // Get all documents for this restaurant and filter client-side
       const snapshot = await query.get();
       let docs = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
       
-      // Apply client-side date filtering to avoid composite indexes
-      if (operation.filters && operation.filters.createdAt) {
-        const now = new Date();
+      // Apply ALL filters client-side to avoid composite indexes
+      if (operation.filters) {
         docs = docs.filter(doc => {
-          const docDate = doc.createdAt ? doc.createdAt.toDate() : new Date(doc.createdAt);
-          
-          if (operation.filters.createdAt === 'today') {
-            const today = new Date();
-            today.setHours(0, 0, 0, 0);
-            const tomorrow = new Date(today);
-            tomorrow.setDate(tomorrow.getDate() + 1);
-            return docDate >= today && docDate < tomorrow;
-          } else if (operation.filters.createdAt === 'yesterday') {
-            const yesterday = new Date();
-            yesterday.setDate(yesterday.getDate() - 1);
-            yesterday.setHours(0, 0, 0, 0);
-            const today = new Date();
-            today.setHours(0, 0, 0, 0);
-            return docDate >= yesterday && docDate < today;
-          } else if (operation.filters.createdAt === 'this_week') {
-            const startOfWeek = new Date();
-            startOfWeek.setDate(startOfWeek.getDate() - startOfWeek.getDay());
-            startOfWeek.setHours(0, 0, 0, 0);
-            const endOfWeek = new Date(startOfWeek);
-            endOfWeek.setDate(endOfWeek.getDate() + 7);
-            return docDate >= startOfWeek && docDate < endOfWeek;
+          for (const [field, value] of Object.entries(operation.filters)) {
+            // Security: Prevent injection attacks
+            const sanitizedValue = sanitizeInput(value);
+            
+            if (field === 'createdAt') {
+              const docDate = doc.createdAt ? doc.createdAt.toDate() : new Date(doc.createdAt);
+              
+              if (value === 'today') {
+                const today = new Date();
+                today.setHours(0, 0, 0, 0);
+                const tomorrow = new Date(today);
+                tomorrow.setDate(tomorrow.getDate() + 1);
+                if (!(docDate >= today && docDate < tomorrow)) return false;
+              } else if (value === 'yesterday') {
+                const yesterday = new Date();
+                yesterday.setDate(yesterday.getDate() - 1);
+                yesterday.setHours(0, 0, 0, 0);
+                const today = new Date();
+                today.setHours(0, 0, 0, 0);
+                if (!(docDate >= yesterday && docDate < today)) return false;
+              } else if (value === 'this_week') {
+                const startOfWeek = new Date();
+                startOfWeek.setDate(startOfWeek.getDate() - startOfWeek.getDay());
+                startOfWeek.setHours(0, 0, 0, 0);
+                const endOfWeek = new Date(startOfWeek);
+                endOfWeek.setDate(endOfWeek.getDate() + 7);
+                if (!(docDate >= startOfWeek && docDate < endOfWeek)) return false;
+              }
+            } else if (field === 'status') {
+              if (doc[field] !== sanitizedValue) return false;
+            } else if (field === 'tableNumber') {
+              if (doc[field] !== parseInt(sanitizedValue)) return false;
+            } else {
+              if (doc[field] !== sanitizedValue) return false;
+            }
           }
           return true;
         });
@@ -7101,6 +7145,36 @@ Response: {"operations": [{"collection": "orders", "filters": {"createdAt": "tod
 Query: "How many customers today?"
 Response: {"operations": [{"collection": "orders", "filters": {"createdAt": "today"}, "fields": ["customer"], "aggregation": "count"}], "responseTemplate": "We served {orders.count} customers today 👥", "intent": "customers_today", "confidence": 0.9}
 
+Query: "table status 2"
+Response: {"operations": [{"collection": "tables", "filters": {"name": "2"}, "fields": ["status", "currentOrderId"], "aggregation": "list"}], "responseTemplate": "Table 2 is currently {tables.items[0].status} 🍽️", "intent": "table_status", "confidence": 0.9}
+
+Query: "how many tables are occupied"
+Response: {"operations": [{"collection": "tables", "filters": {"status": "occupied"}, "fields": ["id"], "aggregation": "count"}], "responseTemplate": "Currently {tables.count} tables are occupied 🍽️", "intent": "occupied_tables", "confidence": 0.9}
+
+Query: "show me all reserved tables"
+Response: {"operations": [{"collection": "tables", "filters": {"status": "reserved"}, "fields": ["name", "floor", "capacity"], "aggregation": "list"}], "responseTemplate": "Reserved tables: {tables.items}", "intent": "reserved_tables", "confidence": 0.9}
+
+Query: "how many customers visited today"
+Response: {"operations": [{"collection": "orders", "filters": {"createdAt": "today"}, "fields": ["customer"], "aggregation": "count"}], "responseTemplate": "We served {orders.count} customers today 👥", "intent": "customers_today", "confidence": 0.9}
+
+Query: "what is our revenue this month"
+Response: {"operations": [{"collection": "orders", "filters": {"createdAt": "this_month", "status": "completed"}, "fields": ["totalAmount"], "aggregation": "sum"}], "responseTemplate": "Revenue this month: ₹{orders.sum} 💰", "intent": "monthly_revenue", "confidence": 0.9}
+
+Query: "show me low stock items"
+Response: {"operations": [{"collection": "inventory", "filters": {"currentStock": "< minStock"}, "fields": ["name", "currentStock", "minStock"], "aggregation": "list"}], "responseTemplate": "Low stock items: {inventory.items}", "intent": "low_stock", "confidence": 0.9}
+
+Query: "how many pending orders"
+Response: {"operations": [{"collection": "orders", "filters": {"status": "pending"}, "fields": ["id"], "aggregation": "count"}], "responseTemplate": "There are {orders.count} pending orders 📋", "intent": "pending_orders", "confidence": 0.9}
+
+Query: "average order value today"
+Response: {"operations": [{"collection": "orders", "filters": {"createdAt": "today", "status": "completed"}, "fields": ["totalAmount"], "aggregation": "average"}], "responseTemplate": "Average order value today: ₹{orders.average} 📊", "intent": "avg_order_value", "confidence": 0.9}
+
+Query: "which floor has most tables"
+Response: {"operations": [{"collection": "tables", "filters": {}, "fields": ["floor"], "aggregation": "groupBy"}], "responseTemplate": "Floor distribution: {tables.grouped}", "intent": "floor_distribution", "confidence": 0.8}
+
+Query: "show me customer feedback"
+Response: {"operations": [{"collection": "feedback", "filters": {"createdAt": "this_week"}, "fields": ["rating", "comment", "category"], "aggregation": "list"}], "responseTemplate": "Recent feedback: {feedback.items}", "intent": "customer_feedback", "confidence": 0.9}
+
 IMPORTANT: 
 - ALL operations MUST include restaurantId filter (automatically added)
 - Use only the collections and fields listed in the schema
@@ -7108,6 +7182,7 @@ IMPORTANT:
 - Use appropriate aggregation types (count, sum, groupBy, list, average)
 - Keep responseTemplate concise and friendly
 - Include relevant emojis
+- CRITICAL: Avoid complex queries with multiple filters - use simple queries and let the system filter client-side
 
 Response:`;
 
