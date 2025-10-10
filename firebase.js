@@ -39,6 +39,7 @@ const collections = {
   feedback: 'feedback',
   loyalty: 'loyalty',
   tables: 'tables',
+  floors: 'floors',
   bookings: 'bookings',
   userRestaurants: 'userRestaurants',
   restaurantSettings: 'restaurantSettings',

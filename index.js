@@ -864,31 +864,130 @@ app.post('/api/auth/google', async (req, res) => {
 
     let userId;
 
+    let isNewUser = false;
+    let hasRestaurants = false;
+
     if (userDoc.empty) {
+      // New Gmail user - assume restaurant owner
       const newUser = {
         email,
         name,
         picture,
-        role: 'customer',
+        role: 'owner', // Changed from 'customer' to 'owner' for restaurant management
         emailVerified: true,
         phoneVerified: false,
         provider: 'google',
+        setupComplete: false,
         createdAt: new Date(),
         updatedAt: new Date()
       };
 
       const userRef = await db.collection(collections.users).add(newUser);
       userId = userRef.id;
+      isNewUser = true;
+
+      // Create default restaurant for new Gmail users
+      try {
+        const defaultRestaurant = {
+          name: 'My Restaurant',
+          description: 'Welcome to your restaurant! You can customize this information later.',
+          address: '',
+          phone: '',
+          email: email,
+          cuisine: ['Indian'],
+          timings: {
+            openTime: '09:00',
+            closeTime: '22:00',
+            lastOrderTime: '21:30'
+          },
+          ownerId: userId,
+          menu: {
+            items: []
+          },
+          categories: [
+            {
+              id: 'appetizer',
+              name: 'Appetizers',
+              emoji: '🥗',
+              description: 'Starters and appetizers'
+            },
+            {
+              id: 'main-course',
+              name: 'Main Course',
+              emoji: '🍽️',
+              description: 'Main dishes'
+            },
+            {
+              id: 'dessert',
+              name: 'Desserts',
+              emoji: '🍰',
+              description: 'Sweet treats'
+            },
+            {
+              id: 'beverages',
+              name: 'Beverages',
+              emoji: '🥤',
+              description: 'Drinks and beverages'
+            }
+          ],
+          isActive: true,
+          createdAt: new Date(),
+          updatedAt: new Date()
+        };
+
+        const restaurantRef = await db.collection(collections.restaurants).add(defaultRestaurant);
+        console.log(`✅ Default restaurant created for new Gmail user ${userId}: ${restaurantRef.id}`);
+        
+        // Update user to mark setup as complete
+        await userRef.update({
+          setupComplete: true,
+          updatedAt: new Date()
+        });
+        
+        hasRestaurants = true;
+      } catch (restaurantError) {
+        console.error('❌ Error creating default restaurant:', restaurantError);
+        hasRestaurants = false;
+      }
+
+      // Send welcome email to new Gmail users
+      try {
+        console.log(`📧 Sending welcome email to new Gmail user: ${email}`);
+        const userData = {
+          email: email,
+          name: name,
+          userId: userId
+        };
+        
+        const emailResult = await emailService.sendWelcomeEmail(userData);
+        console.log(`✅ Welcome email sent successfully to ${email}:`, emailResult.messageId);
+      } catch (emailError) {
+        console.error('❌ Failed to send welcome email:', emailError);
+        // Don't fail the login if email sending fails
+      }
     } else {
+      // Existing user login
       userId = userDoc.docs[0].id;
+      const userData = userDoc.docs[0].data();
+      
       await userDoc.docs[0].ref.update({
         updatedAt: new Date(),
-        picture: picture || userDoc.docs[0].data().picture
+        picture: picture || userData.picture
       });
+
+      // Check if owner has restaurants
+      const restaurantsQuery = await db.collection(collections.restaurants)
+        .where('ownerId', '==', userId)
+        .limit(1)
+        .get();
+      
+      hasRestaurants = !restaurantsQuery.empty;
     }
 
+    const userRole = userDoc.empty ? 'owner' : userDoc.docs[0].data().role;
+    
     const jwtToken = jwt.sign(
-      { userId, email, role: userDoc.empty ? 'customer' : userDoc.docs[0].data().role },
+      { userId, email, role: userRole },
       process.env.JWT_SECRET,
       { expiresIn: '7d' }
     );
@@ -901,8 +1000,11 @@ app.post('/api/auth/google', async (req, res) => {
         email,
         name,
         picture,
-        role: userDoc.empty ? 'customer' : userDoc.docs[0].data().role
-      }
+        role: userRole
+      },
+      isNewUser,
+      hasRestaurants,
+      redirectTo: hasRestaurants ? '/dashboard' : '/admin'
     });
 
   } catch (error) {
@@ -2043,6 +2145,14 @@ app.post('/api/public/orders/:restaurantId', async (req, res) => {
 
 app.post('/api/orders', async (req, res) => {
   try {
+    console.log('🛒 Order Creation Request:', {
+      restaurantId: req.body.restaurantId,
+      tableNumber: req.body.tableNumber,
+      itemsCount: req.body.items?.length || 0,
+      orderType: req.body.orderType,
+      paymentMethod: req.body.paymentMethod
+    });
+
     const { 
       restaurantId, 
       tableNumber, 
@@ -2058,6 +2168,7 @@ app.post('/api/orders', async (req, res) => {
     } = req.body;
 
     if (!restaurantId || !items || items.length === 0) {
+      console.log('❌ Order Creation Error: Missing required fields', { restaurantId: !!restaurantId, itemsCount: items?.length || 0 });
       return res.status(400).json({ error: 'Restaurant ID and items are required' });
     }
 
@@ -2077,6 +2188,84 @@ app.post('/api/orders', async (req, res) => {
 
     const restaurantData = restaurantDoc.data();
     const menuItems = restaurantData.menu?.items || [];
+
+    // Validate table number if provided
+    if (tableNumber && tableNumber.trim()) {
+      console.log('🪑 Validating table number:', tableNumber);
+      
+      try {
+        // Use the SAME logic as the floors API endpoint
+        console.log('🪑 Using floors API logic for restaurant:', restaurantId);
+        
+        // Get all tables for this restaurant (same as floors API)
+        const tablesSnapshot = await db.collection(collections.tables)
+          .where('restaurantId', '==', restaurantId)
+          .get();
+        
+        console.log('🪑 Found tables:', tablesSnapshot.size);
+        
+        let tableFound = false;
+        let tableStatus = null;
+        let tableId = null;
+        
+        // Search for the table directly in tables collection
+        for (const doc of tablesSnapshot.docs) {
+          const table = {
+            id: doc.id,
+            ...doc.data()
+          };
+          
+          if (table.name && table.name.toString().toLowerCase() === tableNumber.trim().toLowerCase()) {
+            tableFound = true;
+            tableStatus = table.status;
+            tableId = table.id;
+            console.log('🪑 Found table:', { id: tableId, number: tableNumber, status: tableStatus, floor: table.floor });
+            break;
+          }
+        }
+        
+        if (!tableFound) {
+          console.log('❌ Table not found:', tableNumber);
+          return res.status(400).json({ 
+            error: `Table "${tableNumber}" not found in this restaurant. Please check the table number.` 
+          });
+        }
+        
+        // Check table availability - only allow "available" status
+        if (tableStatus !== 'available') {
+          let statusMessage = '';
+          switch (tableStatus) {
+            case 'occupied':
+              statusMessage = 'is currently occupied by another customer';
+              break;
+            case 'serving':
+              statusMessage = 'is currently being served';
+              break;
+            case 'out-of-service':
+              statusMessage = 'is out of service and cannot be used';
+              break;
+            case 'reserved':
+              statusMessage = 'is reserved for another customer';
+              break;
+            case 'maintenance':
+              statusMessage = 'is under maintenance';
+              break;
+            default:
+              statusMessage = `has status "${tableStatus}" and cannot be used`;
+          }
+          
+          console.log('❌ Table not available:', { table: tableNumber, status: tableStatus });
+          return res.status(400).json({ 
+            error: `Table "${tableNumber}" ${statusMessage}. Please choose another table.` 
+          });
+        }
+        
+        console.log('✅ Table validation passed:', { tableNumber, status: tableStatus });
+      } catch (tableError) {
+        console.error('❌ Table validation error:', tableError);
+        return res.status(500).json({ error: 'Failed to validate table number' });
+      }
+    }
 
     for (const item of items) {
       // Find menu item in the embedded menu structure
@@ -2137,6 +2326,7 @@ app.post('/api/orders', async (req, res) => {
     console.log('🛒 Backend Order Creation - StaffInfo received:', req.body.staffInfo);
     console.log('🛒 Backend Order Creation - StaffInfo in orderData:', orderData.staffInfo);
 
+    console.log('🛒 Creating order in database...');
     const orderRef = await db.collection(collections.orders).add(orderData);
     console.log('🛒 Backend Order Creation - Order saved to DB with ID:', orderRef.id);
     console.log('🛒 Backend Order Creation - Order data saved:', orderData);
@@ -2197,6 +2387,35 @@ app.post('/api/orders', async (req, res) => {
       console.log(`👤 Customer ID: ${customerId}`);
     }
 
+    // Update table status to "occupied" if table number is provided
+    if (tableNumber && tableNumber.trim()) {
+      try {
+        console.log('🔄 Updating table status to occupied:', tableNumber);
+        
+        // Find the table document
+        const tablesSnapshot = await db.collection(collections.tables)
+          .where('restaurantId', '==', restaurantId)
+          .where('name', '==', tableNumber.trim())
+          .get();
+        
+        if (!tablesSnapshot.empty) {
+          const tableDoc = tablesSnapshot.docs[0];
+          await tableDoc.ref.update({
+            status: 'occupied',
+            currentOrderId: orderRef.id,
+            lastOrderTime: new Date(),
+            updatedAt: new Date()
+          });
+          console.log('✅ Table status updated to occupied:', tableNumber);
+        } else {
+          console.log('⚠️ Table not found for status update:', tableNumber);
+        }
+      } catch (tableUpdateError) {
+        console.error('❌ Failed to update table status:', tableUpdateError);
+        // Don't fail the order if table status update fails
+      }
+    }
+
     res.status(201).json({
       message: 'Order created successfully',
       order: {
@@ -2206,7 +2425,12 @@ app.post('/api/orders', async (req, res) => {
     });
 
   } catch (error) {
-    console.error('Create order error:', error);
+    console.error('❌ Create order error:', error);
+    console.error('❌ Error details:', {
+      message: error.message,
+      stack: error.stack,
+      name: error.name
+    });
     res.status(500).json({ error: 'Failed to create order' });
   }
 });
@@ -2458,6 +2682,80 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
       return res.status(403).json({ error: 'Access denied: Order does not belong to your restaurant' });
     }
     
+    // Validate table number if provided and different from original
+    if (tableNumber !== undefined && tableNumber !== currentOrder.tableNumber) {
+      console.log('🪑 Table number changed from', currentOrder.tableNumber, 'to', tableNumber);
+      
+      if (tableNumber && tableNumber.trim()) {
+        // Use the SAME logic as the floors API endpoint
+        console.log('🪑 Using floors API logic for update, restaurant:', currentOrder.restaurantId);
+        
+        // Get all tables for this restaurant (same as floors API)
+        const tablesSnapshot = await db.collection(collections.tables)
+          .where('restaurantId', '==', currentOrder.restaurantId)
+          .get();
+        
+        console.log('🪑 Found tables for update:', tablesSnapshot.size);
+        
+        let tableFound = false;
+        let tableStatus = null;
+        let tableId = null;
+        
+        // Search for the table directly in tables collection
+        for (const doc of tablesSnapshot.docs) {
+          const table = {
+            id: doc.id,
+            ...doc.data()
+          };
+          
+          if (table.name && table.name.toString().toLowerCase() === tableNumber.trim().toLowerCase()) {
+            tableFound = true;
+            tableStatus = table.status;
+            tableId = table.id;
+            console.log('🪑 Found table for update:', { id: tableId, number: tableNumber, status: tableStatus, floor: table.floor });
+            break;
+          }
+        }
+        
+        if (!tableFound) {
+          return res.status(400).json({ 
+            error: `Table "${tableNumber}" not found in this restaurant. Please check the table number.` 
+          });
+        }
+        
+        // Check table availability - only allow "available" status
+        if (tableStatus !== 'available') {
+          let statusMessage = '';
+          switch (tableStatus) {
+            case 'occupied':
+              statusMessage = 'is currently occupied by another customer';
+              break;
+            case 'serving':
+              statusMessage = 'is currently being served';
+              break;
+            case 'out-of-service':
+              statusMessage = 'is out of service and cannot be used';
+              break;
+            case 'reserved':
+              statusMessage = 'is reserved for another customer';
+              break;
+            case 'maintenance':
+              statusMessage = 'is under maintenance';
+              break;
+            default:
+              statusMessage = `has status "${tableStatus}" and cannot be used`;
+          }
+          
+          console.log('❌ Table not available for update:', { table: tableNumber, status: tableStatus });
+          return res.status(400).json({ 
+            error: `Table "${tableNumber}" ${statusMessage}. Please choose another table.` 
+          });
+        }
+        
+        console.log('✅ New table validation passed:', { tableNumber, status: tableStatus });
+      }
+    }
+    
     // Don't allow updates to completed or cancelled orders unless we're completing them
     if ((currentOrder.status === 'completed' || currentOrder.status === 'cancelled') && status !== 'completed') {
       return res.status(400).json({ error: 'Cannot update completed or cancelled orders' });
@@ -2519,6 +2817,79 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
 
     console.log('🔄 Backend - Updating order:', orderId, 'with data:', updateData);
     await db.collection(collections.orders).doc(orderId).update(updateData);
+
+    // Release table if order is being completed (Complete Billing in edit mode)
+    if (status === 'completed' && currentOrder.tableNumber && currentOrder.tableNumber.trim()) {
+      try {
+        console.log('🔄 Releasing table due to order completion:', currentOrder.tableNumber);
+        const tablesSnapshot = await db.collection(collections.tables)
+          .where('restaurantId', '==', currentOrder.restaurantId)
+          .where('name', '==', currentOrder.tableNumber.trim())
+          .get();
+        
+        if (!tablesSnapshot.empty) {
+          const tableDoc = tablesSnapshot.docs[0];
+          await tableDoc.ref.update({
+            status: 'available',
+            currentOrderId: null,
+            updatedAt: new Date()
+          });
+          console.log('✅ Table released after order completion:', currentOrder.tableNumber);
+        } else {
+          console.log('⚠️ Table not found for release:', currentOrder.tableNumber);
+        }
+      } catch (tableReleaseError) {
+        console.error('❌ Failed to release table after order completion:', tableReleaseError);
+        // Don't fail the order update if table release fails
+      }
+    }
+
+    // Update table status if table number changed
+    if (tableNumber !== undefined && tableNumber !== currentOrder.tableNumber) {
+      try {
+        // Free up the old table if it exists
+        if (currentOrder.tableNumber && currentOrder.tableNumber.trim()) {
+          console.log('🔄 Freeing up old table:', currentOrder.tableNumber);
+          const oldTablesSnapshot = await db.collection(collections.tables)
+            .where('restaurantId', '==', currentOrder.restaurantId)
+            .where('name', '==', currentOrder.tableNumber.trim())
+            .get();
+          
+          if (!oldTablesSnapshot.empty) {
+            const oldTableDoc = oldTablesSnapshot.docs[0];
+            await oldTableDoc.ref.update({
+              status: 'available',
+              currentOrderId: null,
+              updatedAt: new Date()
+            });
+            console.log('✅ Old table freed:', currentOrder.tableNumber);
+          }
+        }
+        
+        // Occupy the new table if provided
+        if (tableNumber && tableNumber.trim()) {
+          console.log('🔄 Occupying new table:', tableNumber);
+          const newTablesSnapshot = await db.collection(collections.tables)
+            .where('restaurantId', '==', currentOrder.restaurantId)
+            .where('name', '==', tableNumber.trim())
+            .get();
+          
+          if (!newTablesSnapshot.empty) {
+            const newTableDoc = newTablesSnapshot.docs[0];
+            await newTableDoc.ref.update({
+              status: 'occupied',
+              currentOrderId: orderId,
+              lastOrderTime: new Date(),
+              updatedAt: new Date()
+            });
+            console.log('✅ New table occupied:', tableNumber);
+          }
+        }
+      } catch (tableUpdateError) {
+        console.error('❌ Failed to update table status during order update:', tableUpdateError);
+        // Don't fail the order update if table status update fails
+      }
+    }
 
     res.json({ 
       message: 'Order updated successfully',
@@ -6456,6 +6827,8 @@ const server = app.listen(PORT, '0.0.0.0', () => {
     console.log(`🚀 Dine Backend server running on port ${PORT}`);
   console.log(`🌐 Environment: ${process.env.NODE_ENV || 'development'}`);
     console.log(`🍽️ Ready to serve your restaurant management app!`);
+    console.log(`🔗 Database: dine`);
+    console.log(`📁 Collections: ${Object.keys(collections).join(', ')}`);
   });
 
 // Handle server errors
