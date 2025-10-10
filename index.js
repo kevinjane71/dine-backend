@@ -2628,6 +2628,169 @@ app.get('/api/orders/:restaurantId', authenticateToken, async (req, res) => {
   }
 });
 
+// Analytics endpoints
+app.get('/api/analytics/:restaurantId', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+    const { period = '7d' } = req.query;
+    
+    console.log(`📊 Fetching analytics for restaurant ${restaurantId}, period: ${period}`);
+    
+    // Calculate date range based on period
+    const now = new Date();
+    let startDate;
+    
+    switch (period) {
+      case '7d':
+        startDate = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
+        break;
+      case '30d':
+        startDate = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000);
+        break;
+      case '90d':
+        startDate = new Date(now.getTime() - 90 * 24 * 60 * 60 * 1000);
+        break;
+      default:
+        startDate = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
+    }
+    
+    // Fetch orders for the restaurant in the date range
+    const ordersQuery = await db.collection(collections.orders)
+      .where('restaurantId', '==', restaurantId)
+      .where('createdAt', '>=', startDate)
+      .where('createdAt', '<=', now)
+      .get();
+    
+    const orders = ordersQuery.docs.map(doc => ({
+      id: doc.id,
+      ...doc.data()
+    }));
+    
+    console.log(`📊 Found ${orders.length} orders for analytics`);
+    
+    // Calculate analytics
+    const analytics = calculateAnalytics(orders, period);
+    
+    res.json({
+      success: true,
+      analytics,
+      period,
+      totalOrders: orders.length
+    });
+    
+  } catch (error) {
+    console.error('Analytics error:', error);
+    res.status(500).json({ error: 'Failed to fetch analytics' });
+  }
+});
+
+// Helper function to calculate analytics
+function calculateAnalytics(orders, period) {
+  if (orders.length === 0) {
+    return {
+      totalRevenue: 0,
+      totalOrders: 0,
+      avgOrderValue: 0,
+      newCustomers: 0,
+      popularItems: [],
+      revenueData: [],
+      ordersByType: [],
+      busyHours: []
+    };
+  }
+  
+  // Calculate basic metrics
+  const totalRevenue = orders.reduce((sum, order) => sum + (order.totalAmount || 0), 0);
+  const totalOrders = orders.length;
+  const avgOrderValue = totalOrders > 0 ? Math.round(totalRevenue / totalOrders) : 0;
+  
+  // Calculate new customers (customers who placed their first order in this period)
+  const customerIds = [...new Set(orders.map(order => order.customerId).filter(Boolean))];
+  const newCustomers = customerIds.length; // Simplified - in real app, check against historical data
+  
+  // Calculate popular items
+  const itemCounts = {};
+  const itemRevenue = {};
+  
+  orders.forEach(order => {
+    if (order.items && Array.isArray(order.items)) {
+      order.items.forEach(item => {
+        const itemName = item.name || item.itemName;
+        if (itemName) {
+          itemCounts[itemName] = (itemCounts[itemName] || 0) + (item.quantity || 1);
+          itemRevenue[itemName] = (itemRevenue[itemName] || 0) + (item.price || 0) * (item.quantity || 1);
+        }
+      });
+    }
+  });
+  
+  const popularItems = Object.keys(itemCounts)
+    .map(name => ({
+      name,
+      orders: itemCounts[name],
+      revenue: itemRevenue[name] || 0
+    }))
+    .sort((a, b) => b.orders - a.orders)
+    .slice(0, 5);
+  
+  // Calculate revenue data by day
+  const revenueByDay = {};
+  const dayNames = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+  
+  orders.forEach(order => {
+    const orderDate = order.createdAt?.toDate ? order.createdAt.toDate() : new Date(order.createdAt);
+    const dayName = dayNames[orderDate.getDay()];
+    revenueByDay[dayName] = (revenueByDay[dayName] || 0) + (order.totalAmount || 0);
+  });
+  
+  const revenueData = dayNames.map(day => ({
+    day,
+    revenue: revenueByDay[day] || 0
+  }));
+  
+  // Calculate orders by type
+  const ordersByType = {};
+  orders.forEach(order => {
+    const type = order.orderType || 'Dine In';
+    ordersByType[type] = (ordersByType[type] || 0) + 1;
+  });
+  
+  const totalOrderCount = Object.values(ordersByType).reduce((sum, count) => sum + count, 0);
+  const ordersByTypeArray = Object.keys(ordersByType).map(type => ({
+    type,
+    count: ordersByType[type],
+    percentage: totalOrderCount > 0 ? Math.round((ordersByType[type] / totalOrderCount) * 100 * 10) / 10 : 0
+  }));
+  
+  // Calculate busy hours
+  const hourCounts = {};
+  orders.forEach(order => {
+    const orderDate = order.createdAt?.toDate ? order.createdAt.toDate() : new Date(order.createdAt);
+    const hour = orderDate.getHours();
+    const hourStr = `${hour.toString().padStart(2, '0')}:00`;
+    hourCounts[hourStr] = (hourCounts[hourStr] || 0) + 1;
+  });
+  
+  const busyHours = Object.keys(hourCounts)
+    .map(hour => ({
+      hour,
+      orders: hourCounts[hour]
+    }))
+    .sort((a, b) => b.orders - a.orders)
+    .slice(0, 6);
+  
+  return {
+    totalRevenue,
+    totalOrders,
+    avgOrderValue,
+    newCustomers,
+    popularItems,
+    revenueData,
+    ordersByType: ordersByTypeArray,
+    busyHours
+  };
+}
+
 app.patch('/api/orders/:orderId/status', authenticateToken, async (req, res) => {
   try {
     const { orderId } = req.params;
