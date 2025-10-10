@@ -157,6 +157,7 @@ const initializePaymentRoutes = (db, razorpay) => {
         await paymentRef.set(paymentDoc);
 
         // Update order status to completed
+        console.log('[PAYMENT] Updating order status to completed:', orderId);
         await db.collection('orders').doc(orderId).update({
           status: 'completed',
           paymentStatus: 'paid',
@@ -170,7 +171,8 @@ const initializePaymentRoutes = (db, razorpay) => {
           orderId,
           paymentId,
           paymentMethod,
-          amount: orderData.totalAmount
+          amount: orderData.totalAmount,
+          status: 'completed'
         });
 
         res.json({ 

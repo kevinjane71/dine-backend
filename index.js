@@ -2125,14 +2125,21 @@ app.post('/api/orders', async (req, res) => {
         kitchenNotes: 'Direct customer order'
       } : (staffInfo || null),
       notes: notes || (orderType === 'customer_self_order' ? `Customer self-order from seat ${seatNumber || 'Walk-in'}` : ''),
-      status: req.body.status || (orderType === 'customer_self_order' ? 'confirmed' : 'confirmed'),
+      status: req.body.status || 'confirmed',
       kotSent: false,
       paymentStatus: 'pending',
       createdAt: new Date(),
       updatedAt: new Date()
     };
 
+    console.log('🛒 Backend Order Creation - Status from frontend:', req.body.status);
+    console.log('🛒 Backend Order Creation - Final status:', orderData.status);
+    console.log('🛒 Backend Order Creation - StaffInfo received:', req.body.staffInfo);
+    console.log('🛒 Backend Order Creation - StaffInfo in orderData:', orderData.staffInfo);
+
     const orderRef = await db.collection(collections.orders).add(orderData);
+    console.log('🛒 Backend Order Creation - Order saved to DB with ID:', orderRef.id);
+    console.log('🛒 Backend Order Creation - Order data saved:', orderData);
     
     // Create/update customer if customer info is provided
     let customerId = null;
@@ -2207,17 +2214,37 @@ app.post('/api/orders', async (req, res) => {
 app.get('/api/orders/:restaurantId', authenticateToken, async (req, res) => {
   try {
     const { restaurantId } = req.params;
-    const { status, date, search, waiterId } = req.query;
+    const { 
+      page = 1, 
+      limit = 10, 
+      status, 
+      date, 
+      search, 
+      waiterId,
+      orderType 
+    } = req.query;
 
-    console.log(`🔍 Orders API - Restaurant: ${restaurantId}, Status: ${status || 'all'}, Search: ${search || 'none'}, Waiter: ${waiterId || 'all'}`);
+    console.log(`🔍 Orders API - Restaurant: ${restaurantId}, Page: ${page}, Limit: ${limit}, Status: ${status || 'all'}, Search: ${search || 'none'}, Waiter: ${waiterId || 'all'}`);
+
+    // Calculate pagination
+    const pageNum = parseInt(page);
+    const limitNum = parseInt(limit);
+    const offset = (pageNum - 1) * limitNum;
 
     let query = db.collection(collections.orders)
       .where('restaurantId', '==', restaurantId);
 
-    if (status) {
+    // Apply status filter
+    if (status && status !== 'all') {
       query = query.where('status', '==', status);
     }
 
+    // Apply order type filter
+    if (orderType && orderType !== 'all') {
+      query = query.where('orderType', '==', orderType);
+    }
+
+    // Apply date filter
     if (date) {
       const startDate = new Date(date);
       const endDate = new Date(date);
@@ -2227,72 +2254,110 @@ app.get('/api/orders/:restaurantId', authenticateToken, async (req, res) => {
                    .where('createdAt', '<', endDate);
     }
 
-    const snapshot = await query.orderBy('createdAt', 'desc').get();
-    let orders = [];
+    // Get all orders first (for proper filtering and pagination)
+    const allSnapshot = await query.orderBy('createdAt', 'desc').get();
+    let allOrders = [];
 
-    snapshot.forEach(doc => {
-      orders.push({
+    allSnapshot.forEach(doc => {
+      const orderData = doc.data();
+      const order = {
         id: doc.id,
-        ...doc.data()
-      });
+        ...orderData,
+        // Ensure proper date formatting
+        createdAt: orderData.createdAt,
+        updatedAt: orderData.updatedAt,
+        completedAt: orderData.completedAt || null,
+        // Add order flow information
+        orderFlow: {
+          isDirectBilling: orderData.status === 'completed' && !orderData.kotSent,
+          isKitchenOrder: orderData.kotSent || orderData.status === 'confirmed',
+          isCompleted: orderData.status === 'completed',
+          isPending: orderData.status === 'pending' || orderData.status === 'confirmed'
+        },
+        // Format customer info
+        customerDisplay: {
+          name: orderData.customerInfo?.name || 'Walk-in Customer',
+          phone: orderData.customerInfo?.phone || null,
+          tableNumber: orderData.tableNumber || null
+        },
+        // Format staff info
+        staffDisplay: {
+          name: orderData.staffInfo?.name || 'Staff',
+          role: orderData.staffInfo?.role || 'waiter',
+          userId: orderData.staffInfo?.userId || null
+        }
+      };
+      allOrders.push(order);
     });
 
+    console.log(`📋 Order History - Total orders before filtering: ${allOrders.length}`);
+
     // Apply waiter filter if provided
-    if (waiterId) {
-      orders = orders.filter(order => {
+    if (waiterId && waiterId !== 'all') {
+      allOrders = allOrders.filter(order => {
         return order.staffInfo && order.staffInfo.userId === waiterId;
       });
-      console.log(`👤 Filtered by waiter ${waiterId}: ${orders.length} orders found`);
+      console.log(`👤 Filtered by waiter ${waiterId}: ${allOrders.length} orders found`);
     }
 
     // Apply search filter if provided
-    if (search) {
+    if (search && search.trim()) {
       const searchValue = search.toLowerCase().trim();
       console.log(`🔎 Searching orders for: "${searchValue}"`);
       
-      orders = orders.filter(order => {
-        // Search by order ID (case insensitive) - Order IDs are unique, return regardless of status
+      allOrders = allOrders.filter(order => {
+        // Search by order ID
         if (order.id.toLowerCase().includes(searchValue)) {
-          console.log(`✅ Found match by order ID: ${order.id} (status: ${order.status})`);
           return true;
         }
         
-        // Search by table number (if exists) - Only return non-completed for table searches
+        // Search by order number
+        if (order.orderNumber && order.orderNumber.toLowerCase().includes(searchValue)) {
+          return true;
+        }
+        
+        // Search by table number
         if (order.tableNumber && order.tableNumber.toString().toLowerCase().includes(searchValue)) {
-          if (order.status !== 'completed' && order.status !== 'cancelled') {
-            console.log(`✅ Found match by table number: ${order.tableNumber} (status: ${order.status})`);
+          return true;
+        }
+        
+        // Search by customer info
+        if (order.customerInfo) {
+          if (order.customerInfo.name && order.customerInfo.name.toLowerCase().includes(searchValue)) {
             return true;
-          } else {
-            console.log(`❌ Found order by table ${order.tableNumber} but it's ${order.status}`);
           }
-        }
-        
-        // Search by waiter name (if exists)
-        if (order.staffInfo && order.staffInfo.name && order.staffInfo.name.toLowerCase().includes(searchValue)) {
-          console.log(`✅ Found match by waiter name: ${order.staffInfo.name} (status: ${order.status})`);
-          return true;
-        }
-        
-        // Search by waiter login ID (if exists)
-        if (order.staffInfo && order.staffInfo.loginId && order.staffInfo.loginId.toLowerCase().includes(searchValue)) {
-          console.log(`✅ Found match by waiter login ID: ${order.staffInfo.loginId} (status: ${order.status})`);
-          return true;
+          if (order.customerInfo.phone && order.customerInfo.phone.includes(searchValue)) {
+            return true;
+          }
         }
         
         return false;
       });
-      
-      console.log(`📊 Search results: ${orders.length} orders found`);
-    } else {
-      // If no search, filter out completed orders by default
-      orders = orders.filter(order => order.status !== 'completed' && order.status !== 'cancelled');
-      console.log(`📊 All active orders: ${orders.length} orders found`);
+      console.log(`🔎 Search results: ${allOrders.length} orders found`);
     }
 
-    res.json({ orders });
+    // Calculate pagination after filtering
+    const totalOrders = allOrders.length;
+    const totalPages = Math.ceil(totalOrders / limitNum);
+    
+    // Apply pagination
+    const orders = allOrders.slice(offset, offset + limitNum);
+    
+    console.log(`📋 Order History - Found ${orders.length} orders (page ${pageNum}/${totalPages})`);
 
+    res.json({ 
+      orders,
+      pagination: {
+        currentPage: pageNum,
+        totalPages,
+        totalOrders,
+        limit: limitNum,
+        hasNextPage: pageNum < totalPages,
+        hasPrevPage: pageNum > 1
+      }
+    });
   } catch (error) {
-    console.error('Get orders error:', error);
+    console.error('Orders API error:', error);
     res.status(500).json({ error: 'Failed to fetch orders' });
   }
 });
