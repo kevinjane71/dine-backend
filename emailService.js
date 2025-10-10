@@ -36,19 +36,11 @@ class EmailService {
         text: (userData) => `
 Dear ${userData.name},
 
-Welcome to DineOpen! You've just unlocked the future of restaurant management.
+Welcome to DineOpen! 🎉
 
-Key Features:
-- AI-Powered POS System: Intelligent order management and billing
-- Real-time Analytics: Track sales, customers, and performance
-- Multi-Restaurant Management: Manage multiple locations from one dashboard
-- QR Code Menus: Contactless ordering for customers
-- Inventory Management: Track stock and prevent waste
-- Staff Management: Manage waiters and kitchen staff
-- Customer Analytics: Understand your customers better
-- DineBot Assistant: Ask questions about your restaurant data
+You've made the right choice. Your restaurant is about to become smarter, more efficient, and more profitable.
 
-Get started by setting up your first restaurant!
+Get started by setting up your first restaurant and watch your business transform.
 
 Best regards,
 The DineOpen Team`,
@@ -67,74 +59,29 @@ The DineOpen Team`,
     </div>
 
     <!-- Main Content -->
-    <div style="padding: 32px 24px; background-color: #ffffff;">
-      <p style="font-size: 16px; color: #4B5563; margin-top: 0;">Dear ${userData.name},</p>
+    <div style="padding: 40px 30px;">
+      <h2 style="color: #dc2626; margin: 0 0 20px 0; font-size: 24px; font-weight: 600;">
+        Dear ${userData.name},
+      </h2>
       
-      <p style="font-size: 16px; color: #4B5563; margin-bottom: 24px;">
-        Welcome to DineOpen! You've just unlocked the future of restaurant management. Here's what makes DineOpen special:
-      </p>
-
-      <!-- Feature Grid -->
-      <div style="display: grid; gap: 20px; margin-bottom: 32px;">
-        <!-- AI POS -->
-        <div style="padding: 16px; background-color: #fef2f2; border-radius: 8px; border-left: 4px solid #ef4444;">
-          <h3 style="color: #1F2937; margin: 0 0 8px 0;">🤖 AI-Powered POS</h3>
-          <p style="color: #6B7280; margin: 0;">Intelligent order management with smart billing and real-time analytics.</p>
-        </div>
-
-        <!-- Multi-Restaurant -->
-        <div style="padding: 16px; background-color: #f0f9ff; border-radius: 8px; border-left: 4px solid #3b82f6;">
-          <h3 style="color: #1F2937; margin: 0 0 8px 0;">🏢 Multi-Restaurant Management</h3>
-          <p style="color: #6B7280; margin: 0;">Manage multiple restaurant locations from a single dashboard.</p>
-        </div>
-
-        <!-- QR Menus -->
-        <div style="padding: 16px; background-color: #f0fdf4; border-radius: 8px; border-left: 4px solid #10b981;">
-          <h3 style="color: #1F2937; margin: 0 0 8px 0;">📱 QR Code Menus</h3>
-          <p style="color: #6B7280; margin: 0;">Contactless ordering with beautiful QR code menus for customers.</p>
-        </div>
-
-        <!-- DineBot -->
-        <div style="padding: 16px; background-color: #fef3c7; border-radius: 8px; border-left: 4px solid #f59e0b;">
-          <h3 style="color: #1F2937; margin: 0 0 8px 0;">🤖 DineBot Assistant</h3>
-          <p style="color: #6B7280; margin: 0;">Ask questions about your restaurant data in natural language.</p>
-        </div>
-
-        <!-- Analytics -->
-        <div style="padding: 16px; background-color: #f3e8ff; border-radius: 8px; border-left: 4px solid #8b5cf6;">
-          <h3 style="color: #1F2937; margin: 0 0 8px 0;">📊 Real-time Analytics</h3>
-          <p style="color: #6B7280; margin: 0;">Track sales, customers, popular items, and performance metrics.</p>
-        </div>
-
-        <!-- Inventory -->
-        <div style="padding: 16px; background-color: #ecfdf5; border-radius: 8px; border-left: 4px solid #059669;">
-          <h3 style="color: #1F2937; margin: 0 0 8px 0;">📦 Inventory Management</h3>
-          <p style="color: #6B7280; margin: 0;">Track stock levels, prevent waste, and manage suppliers.</p>
-        </div>
-      </div>
-
-      <!-- CTA Button -->
-      <div style="text-align: center; margin: 32px 0;">
-        <a href="https://www.dineopen.com/dashboard" target="_blank" 
-           style="display: inline-block; background: linear-gradient(135deg, #ef4444 0%, #dc2626 100%); color: white; padding: 18px 40px; text-decoration: none; border-radius: 10px; font-weight: bold; font-size: 18px; text-transform: uppercase; letter-spacing: 1px; box-shadow: 0 6px 20px rgba(239, 68, 68, 0.4);">
-          Start Managing Your Restaurant
-        </a>
-        <p style="margin: 16px 0 0 0; font-size: 14px; color: #6B7280;">
-          Click the button above to access your dashboard
+      <div style="background: linear-gradient(135deg, #fef2f2 0%, #fef7f7 100%); border-left: 4px solid #dc2626; padding: 25px; border-radius: 8px; margin: 25px 0;">
+        <p style="margin: 0; font-size: 18px; color: #374151; font-weight: 500;">
+          🎉 <strong>You've made the right choice.</strong>
+        </p>
+        <p style="margin: 15px 0 0 0; font-size: 16px; color: #6b7280;">
+          Your restaurant is about to become smarter, more efficient, and more profitable.
         </p>
       </div>
 
-      <!-- Quick Start Tips -->
-      <div style="background-color: #f9fafb; border: 1px solid #e5e7eb; border-radius: 8px; padding: 20px; margin: 24px 0;">
-        <h3 style="margin: 0 0 16px 0; color: #111827; font-size: 18px;">🚀 Quick Start Tips</h3>
-        <ul style="margin: 0; padding-left: 20px; color: #4B5563;">
-          <li style="margin-bottom: 8px;">Set up your first restaurant in the admin panel</li>
-          <li style="margin-bottom: 8px;">Upload your menu or use AI to extract it from photos</li>
-          <li style="margin-bottom: 8px;">Configure your tables and floor plan</li>
-          <li style="margin-bottom: 8px;">Try DineBot by asking "How many orders today?"</li>
-          <li style="margin-bottom: 0;">Generate QR codes for contactless ordering</li>
-        </ul>
+      <div style="text-align: center; margin: 35px 0;">
+        <div style="background: linear-gradient(135deg, #dc2626 0%, #b91c1c 100%); color: white; padding: 15px 30px; border-radius: 25px; display: inline-block; font-weight: 600; font-size: 16px; text-decoration: none; box-shadow: 0 4px 12px rgba(220, 38, 38, 0.3);">
+          Get Started Now →
+        </div>
       </div>
+
+      <p style="text-align: center; margin: 30px 0 0 0; font-size: 14px; color: #9ca3af;">
+        Watch your business transform with AI-powered insights and automation.
+      </p>
     </div>
 
     <!-- Footer -->

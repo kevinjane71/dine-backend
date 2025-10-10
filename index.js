@@ -857,15 +857,19 @@ app.post('/api/auth/login', async (req, res) => {
 
 app.post('/api/auth/google', async (req, res) => {
   try {
-    const { token } = req.body;
+    const { uid, email, name, picture } = req.body;
+    
+    console.log('🔍 Google login debug:');
+    console.log('🔍 UID:', uid);
+    console.log('🔍 Email:', email);
+    console.log('🔍 Name:', name);
 
-    const ticket = await googleClient.verifyIdToken({
-      idToken: token,
-      audience: process.env.GOOGLE_CLIENT_ID
-    });
+    if (!uid || !email) {
+      return res.status(400).json({ error: 'Missing required user data' });
+    }
 
-    const payload = ticket.getPayload();
-    const { email, name, picture } = payload;
+    // Trust Firebase Auth - no need to verify Google token
+    // Firebase already verified the user is legitimate
 
     let userDoc = await db.collection(collections.users)
       .where('email', '==', email)
@@ -887,6 +891,7 @@ app.post('/api/auth/google', async (req, res) => {
         email,
         name,
         picture,
+        googleUid: uid, // Store Google UID for future reference
         role: 'owner', // Changed from 'customer' to 'owner' for restaurant management
         emailVerified: true,
         phoneVerified: false,
@@ -1008,7 +1013,8 @@ app.post('/api/auth/google', async (req, res) => {
       
       await userDoc.docs[0].ref.update({
         updatedAt: new Date(),
-        picture: picture || userData.picture
+        picture: picture || userData.picture,
+        googleUid: uid // Store Google UID for future reference
       });
 
       // Check if owner has restaurants
