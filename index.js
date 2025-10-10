@@ -33,6 +33,15 @@ const openai = new OpenAI({
 const initializePaymentRoutes = require('./payment');
 const emailService = require('./emailService');
 
+// Debug email service initialization
+console.log('📧 Email service loaded:', !!emailService);
+if (emailService) {
+  console.log('📧 Email service methods:', Object.keys(emailService));
+  console.log('📧 sendWelcomeEmail available:', !!emailService.sendWelcomeEmail);
+} else {
+  console.error('❌ Email service failed to load!');
+}
+
 const app = express();
 const PORT = process.env.PORT || 3003;
 
@@ -867,7 +876,12 @@ app.post('/api/auth/google', async (req, res) => {
     let isNewUser = false;
     let hasRestaurants = false;
 
+    console.log('🔍 Gmail login debug - User exists:', !userDoc.empty);
+    console.log('🔍 Gmail login debug - Email:', email);
+    console.log('🔍 Gmail login debug - Name:', name);
+
     if (userDoc.empty) {
+      console.log('🆕 NEW Gmail user detected - will send welcome email');
       // New Gmail user - assume restaurant owner
       const newUser = {
         email,
@@ -951,18 +965,40 @@ app.post('/api/auth/google', async (req, res) => {
       }
 
       // Send welcome email to new Gmail users
+      console.log('📧 === REACHING EMAIL SENDING SECTION ===');
       try {
-        console.log(`📧 Sending welcome email to new Gmail user: ${email}`);
+        console.log(`📧 === WELCOME EMAIL DEBUG START ===`);
+        console.log(`📧 User details:`, { email, name, userId, isNewUser });
+        console.log(`📧 Email service available:`, !!emailService);
+        console.log(`📧 Email service methods:`, Object.keys(emailService || {}));
+        
+        if (!emailService) {
+          console.error('❌ Email service not available!');
+          throw new Error('Email service not initialized');
+        }
+        
+        if (!emailService.sendWelcomeEmail) {
+          console.error('❌ sendWelcomeEmail method not found!');
+          throw new Error('sendWelcomeEmail method not available');
+        }
+        
         const userData = {
           email: email,
           name: name,
           userId: userId
         };
         
+        console.log(`📧 Calling sendWelcomeEmail with data:`, userData);
         const emailResult = await emailService.sendWelcomeEmail(userData);
-        console.log(`✅ Welcome email sent successfully to ${email}:`, emailResult.messageId);
+        console.log(`✅ Welcome email sent successfully to ${email}:`, emailResult);
+        console.log(`📧 === WELCOME EMAIL DEBUG END ===`);
       } catch (emailError) {
-        console.error('❌ Failed to send welcome email:', emailError);
+        console.error('❌ === WELCOME EMAIL ERROR DEBUG ===');
+        console.error('❌ Email error type:', typeof emailError);
+        console.error('❌ Email error message:', emailError.message);
+        console.error('❌ Email error stack:', emailError.stack);
+        console.error('❌ Email error details:', emailError);
+        console.error('❌ === WELCOME EMAIL ERROR DEBUG END ===');
         // Don't fail the login if email sending fails
       }
     } else {

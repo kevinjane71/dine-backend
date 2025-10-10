@@ -9,7 +9,7 @@ async function testEmailService() {
     // Test welcome email
     console.log('📧 Testing welcome email...');
     const welcomeResult = await emailService.sendWelcomeEmail({
-      email: 'test@example.com',
+      email: 'malik.vk07@gmail.com',
       name: 'Test User'
     });
     console.log('✅ Welcome email test result:', welcomeResult);

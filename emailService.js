@@ -2,13 +2,24 @@ const nodemailer = require('nodemailer');
 
 class EmailService {
   constructor() {
+    console.log('📧 Email Service Debug:');
+    console.log('📧 GODADY_EMAIL:', process.env.GODADY_EMAIL ? 'SET' : 'NOT SET');
+    console.log('📧 GODADY_PA:', process.env.GODADY_PA ? 'SET' : 'NOT SET');
+    
+    if (!process.env.GODADY_EMAIL || !process.env.GODADY_PA) {
+      console.error('❌ Missing email credentials!');
+      console.error('❌ GODADY_EMAIL:', process.env.GODADY_EMAIL);
+      console.error('❌ GODADY_PA:', process.env.GODADY_PA ? '[HIDDEN]' : 'NOT SET');
+      throw new Error('Missing email credentials');
+    }
+    
     this.transporter = nodemailer.createTransport({
       host: 'smtpout.secureserver.net',
       port: 465,
       secure: true,
       auth: {
         user: process.env.GODADY_EMAIL,
-        pass: process.env.GODADY_PASSWORD
+        pass: process.env.GODADY_PA
       },
       tls: {
         rejectUnauthorized: false
