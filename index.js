@@ -5350,7 +5350,7 @@ app.get('/api/inventory/:restaurantId', authenticateToken, async (req, res) => {
       if (status && status !== 'all') {
         if (status === 'low' && itemData.currentStock > itemData.minStock) return;
         if (status === 'good' && itemData.currentStock <= itemData.minStock) return;
-        if (status === 'expired' && new Date(itemData.expiryDate) > new Date()) return;
+        if (status === 'expired' && itemData.expiryDate && new Date(itemData.expiryDate) > new Date()) return;
       }
       
       // Apply search filter
@@ -5363,10 +5363,19 @@ app.get('/api/inventory/:restaurantId', authenticateToken, async (req, res) => {
         }
       }
       
+      // Determine status
+      if (itemData.currentStock <= itemData.minStock) {
+        itemData.status = 'low';
+      } else if (itemData.expiryDate && new Date(itemData.expiryDate) < new Date()) {
+        itemData.status = 'expired';
+      } else {
+        itemData.status = 'good';
+      }
+      
       items.push(itemData);
     });
 
-    console.log(`📊 Inventory results: ${items.length} items found`);
+    console.log(`📊 Inventory results: ${items.length} items found for restaurant ${restaurantId}`);
 
     res.json({ 
       items,
@@ -5377,6 +5386,99 @@ app.get('/api/inventory/:restaurantId', authenticateToken, async (req, res) => {
   } catch (error) {
     console.error('Get inventory error:', error);
     res.status(500).json({ error: 'Failed to fetch inventory items' });
+  }
+});
+
+// Get inventory categories
+app.get('/api/inventory/:restaurantId/categories', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+
+    console.log(`📂 Categories API - Restaurant: ${restaurantId}`);
+
+    const snapshot = await db.collection(collections.inventory)
+      .where('restaurantId', '==', restaurantId)
+      .get();
+
+    console.log(`📊 Categories query result: ${snapshot.size} documents found`);
+
+    const categories = new Set();
+    snapshot.forEach(doc => {
+      const itemData = doc.data();
+      if (itemData.category) {
+        categories.add(itemData.category);
+      }
+    });
+
+    const categoriesArray = Array.from(categories).sort();
+    console.log(`📋 Categories found: ${categoriesArray.join(', ')}`);
+
+    res.json({ 
+      categories: categoriesArray,
+      timestamp: new Date().toISOString()
+    });
+
+  } catch (error) {
+    console.error('Get inventory categories error:', error);
+    res.status(500).json({ error: 'Failed to fetch categories' });
+  }
+});
+
+// Get inventory dashboard stats
+app.get('/api/inventory/:restaurantId/dashboard', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+
+    console.log(`📊 Dashboard API - Restaurant: ${restaurantId}`);
+
+    const snapshot = await db.collection(collections.inventory)
+      .where('restaurantId', '==', restaurantId)
+      .get();
+
+    let totalItems = 0;
+    let lowStockItems = 0;
+    let expiredItems = 0;
+    let totalValue = 0;
+    let categories = new Set();
+
+    snapshot.forEach(doc => {
+      const itemData = doc.data();
+      totalItems++;
+      
+      if (itemData.category) {
+        categories.add(itemData.category);
+      }
+      
+      if (itemData.currentStock <= itemData.minStock) {
+        lowStockItems++;
+      }
+      
+      if (itemData.expiryDate && new Date(itemData.expiryDate) < new Date()) {
+        expiredItems++;
+      }
+      
+      totalValue += (itemData.currentStock || 0) * (itemData.costPerUnit || 0);
+    });
+
+    const stats = {
+      totalItems,
+      lowStockItems,
+      expiredItems,
+      totalValue: Math.round(totalValue * 100) / 100,
+      totalCategories: categories.size,
+      timestamp: new Date().toISOString()
+    };
+
+    console.log(`📈 Dashboard stats: ${JSON.stringify(stats)}`);
+
+    res.json({ 
+      stats,
+      timestamp: new Date().toISOString()
+    });
+
+  } catch (error) {
+    console.error('Get inventory dashboard error:', error);
+    res.status(500).json({ error: 'Failed to fetch dashboard stats' });
   }
 });
 
@@ -5605,80 +5707,6 @@ app.delete('/api/inventory/:restaurantId/:itemId', authenticateToken, async (req
   }
 });
 
-// Get inventory categories
-app.get('/api/inventory/:restaurantId/categories', authenticateToken, async (req, res) => {
-  try {
-    const { restaurantId } = req.params;
-
-    const snapshot = await db.collection(collections.inventory)
-      .where('restaurantId', '==', restaurantId)
-      .get();
-
-    const categories = new Set();
-    snapshot.forEach(doc => {
-      const itemData = doc.data();
-      if (itemData.category) {
-        categories.add(itemData.category);
-      }
-    });
-
-    res.json({ 
-      categories: Array.from(categories).sort(),
-      timestamp: new Date().toISOString()
-    });
-
-  } catch (error) {
-    console.error('Get inventory categories error:', error);
-    res.status(500).json({ error: 'Failed to fetch categories' });
-  }
-});
-
-// Get inventory dashboard stats
-app.get('/api/inventory/:restaurantId/dashboard', authenticateToken, async (req, res) => {
-  try {
-    const { restaurantId } = req.params;
-
-    const snapshot = await db.collection(collections.inventory)
-      .where('restaurantId', '==', restaurantId)
-      .get();
-
-    let totalItems = 0;
-    let lowStockItems = 0;
-    let expiredItems = 0;
-    let totalValue = 0;
-    let categories = new Set();
-
-    snapshot.forEach(doc => {
-      const itemData = doc.data();
-      totalItems++;
-      
-      if (itemData.status === 'low') lowStockItems++;
-      if (itemData.status === 'expired') expiredItems++;
-      
-      totalValue += itemData.currentStock * itemData.costPerUnit;
-      
-      if (itemData.category) {
-        categories.add(itemData.category);
-      }
-    });
-
-    res.json({
-      stats: {
-        totalItems,
-        lowStockItems,
-        expiredItems,
-        totalValue,
-        totalCategories: categories.size
-      },
-      timestamp: new Date().toISOString()
-    });
-
-  } catch (error) {
-    console.error('Get inventory dashboard error:', error);
-    res.status(500).json({ error: 'Failed to fetch dashboard stats' });
-  }
-});
-
 // ========================================
 // SUPPLIER MANAGEMENT APIs
 // ========================================
@@ -5746,6 +5774,434 @@ app.post('/api/suppliers/:restaurantId', authenticateToken, async (req, res) => 
   } catch (error) {
     console.error('Create supplier error:', error);
     res.status(500).json({ error: 'Failed to create supplier' });
+  }
+});
+
+// ========================================
+// RECIPES MANAGEMENT APIs
+// ========================================
+
+// Get all recipes for a restaurant
+app.get('/api/recipes/:restaurantId', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+    const { category } = req.query;
+
+    let query = db.collection(collections.recipes)
+      .where('restaurantId', '==', restaurantId);
+
+    if (category && category !== 'all') {
+      query = query.where('category', '==', category);
+    }
+
+    const snapshot = await query.orderBy('name', 'asc').get();
+
+    const recipes = [];
+    snapshot.forEach(doc => {
+      recipes.push({ id: doc.id, ...doc.data() });
+    });
+
+    res.json({ recipes, total: recipes.length });
+
+  } catch (error) {
+    console.error('Get recipes error:', error);
+    res.status(500).json({ error: 'Failed to fetch recipes' });
+  }
+});
+
+// Create new recipe
+app.post('/api/recipes/:restaurantId', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+    const { userId, role } = req.user;
+    
+    if (role !== 'owner' && role !== 'manager') {
+      return res.status(403).json({ error: 'Access denied. Owner or manager privileges required.' });
+    }
+
+    const { name, description, ingredients, instructions, servings, prepTime, cookTime, category } = req.body;
+
+    if (!name || !ingredients || ingredients.length === 0) {
+      return res.status(400).json({ error: 'Recipe name and ingredients are required' });
+    }
+
+    const recipeData = {
+      restaurantId,
+      name: name.trim(),
+      description: description?.trim() || '',
+      ingredients: ingredients.map(ing => ({
+        inventoryItemId: ing.inventoryItemId,
+        inventoryItemName: ing.inventoryItemName,
+        quantity: parseFloat(ing.quantity) || 0,
+        unit: ing.unit || 'g'
+      })),
+      instructions: instructions?.trim() || '',
+      servings: parseInt(servings) || 1,
+      prepTime: parseInt(prepTime) || 0,
+      cookTime: parseInt(cookTime) || 0,
+      category: category?.trim() || 'Main Course',
+      isActive: true,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+      createdBy: userId
+    };
+
+    const recipeRef = await db.collection(collections.recipes).add(recipeData);
+    
+    res.status(201).json({
+      message: 'Recipe created successfully',
+      recipe: { id: recipeRef.id, ...recipeData }
+    });
+
+  } catch (error) {
+    console.error('Create recipe error:', error);
+    res.status(500).json({ error: 'Failed to create recipe' });
+  }
+});
+
+// Update recipe
+app.patch('/api/recipes/:restaurantId/:recipeId', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId, recipeId } = req.params;
+    const { userId, role } = req.user;
+    
+    if (role !== 'owner' && role !== 'manager') {
+      return res.status(403).json({ error: 'Access denied. Owner or manager privileges required.' });
+    }
+
+    const updateData = { ...req.body, updatedAt: new Date(), updatedBy: userId };
+
+    const recipeDoc = await db.collection(collections.recipes).doc(recipeId).get();
+    if (!recipeDoc.exists || recipeDoc.data().restaurantId !== restaurantId) {
+      return res.status(404).json({ error: 'Recipe not found' });
+    }
+
+    await db.collection(collections.recipes).doc(recipeId).update(updateData);
+    
+    res.json({
+      message: 'Recipe updated successfully',
+      recipe: { id: recipeId, ...recipeDoc.data(), ...updateData }
+    });
+
+  } catch (error) {
+    console.error('Update recipe error:', error);
+    res.status(500).json({ error: 'Failed to update recipe' });
+  }
+});
+
+// Delete recipe
+app.delete('/api/recipes/:restaurantId/:recipeId', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId, recipeId } = req.params;
+    const { userId, role } = req.user;
+    
+    if (role !== 'owner' && role !== 'manager') {
+      return res.status(403).json({ error: 'Access denied. Owner or manager privileges required.' });
+    }
+
+    const recipeDoc = await db.collection(collections.recipes).doc(recipeId).get();
+    if (!recipeDoc.exists || recipeDoc.data().restaurantId !== restaurantId) {
+      return res.status(404).json({ error: 'Recipe not found' });
+    }
+
+    await db.collection(collections.recipes).doc(recipeId).delete();
+    
+    res.json({ message: 'Recipe deleted successfully' });
+
+  } catch (error) {
+    console.error('Delete recipe error:', error);
+    res.status(500).json({ error: 'Failed to delete recipe' });
+  }
+});
+
+// ========================================
+// PURCHASE ORDERS APIs
+// ========================================
+
+// Get all purchase orders for a restaurant
+app.get('/api/purchase-orders/:restaurantId', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+    const { status, supplierId } = req.query;
+
+    let query = db.collection(collections.purchaseOrders)
+      .where('restaurantId', '==', restaurantId);
+
+    if (status && status !== 'all') {
+      query = query.where('status', '==', status);
+    }
+
+    if (supplierId && supplierId !== 'all') {
+      query = query.where('supplierId', '==', supplierId);
+    }
+
+    const snapshot = await query.orderBy('createdAt', 'desc').get();
+
+    const orders = [];
+    snapshot.forEach(doc => {
+      orders.push({ id: doc.id, ...doc.data() });
+    });
+
+    res.json({ orders, total: orders.length });
+
+  } catch (error) {
+    console.error('Get purchase orders error:', error);
+    res.status(500).json({ error: 'Failed to fetch purchase orders' });
+  }
+});
+
+// Create new purchase order
+app.post('/api/purchase-orders/:restaurantId', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+    const { userId, role } = req.user;
+    
+    if (role !== 'owner' && role !== 'manager') {
+      return res.status(403).json({ error: 'Access denied. Owner or manager privileges required.' });
+    }
+
+    const { supplierId, items, notes, expectedDeliveryDate } = req.body;
+
+    if (!supplierId || !items || items.length === 0) {
+      return res.status(400).json({ error: 'Supplier and items are required' });
+    }
+
+    const totalAmount = items.reduce((sum, item) => sum + (item.quantity * item.unitPrice), 0);
+
+    const orderData = {
+      restaurantId,
+      supplierId,
+      items: items.map(item => ({
+        inventoryItemId: item.inventoryItemId,
+        inventoryItemName: item.inventoryItemName,
+        quantity: parseFloat(item.quantity) || 0,
+        unitPrice: parseFloat(item.unitPrice) || 0,
+        totalPrice: parseFloat(item.quantity) * parseFloat(item.unitPrice)
+      })),
+      totalAmount,
+      notes: notes?.trim() || '',
+      expectedDeliveryDate: expectedDeliveryDate ? new Date(expectedDeliveryDate) : null,
+      status: 'pending',
+      createdAt: new Date(),
+      updatedAt: new Date(),
+      createdBy: userId
+    };
+
+    const orderRef = await db.collection(collections.purchaseOrders).add(orderData);
+    
+    res.status(201).json({
+      message: 'Purchase order created successfully',
+      order: { id: orderRef.id, ...orderData }
+    });
+
+  } catch (error) {
+    console.error('Create purchase order error:', error);
+    res.status(500).json({ error: 'Failed to create purchase order' });
+  }
+});
+
+// Update purchase order status
+app.patch('/api/purchase-orders/:restaurantId/:orderId', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId, orderId } = req.params;
+    const { userId, role } = req.user;
+    
+    if (role !== 'owner' && role !== 'manager') {
+      return res.status(403).json({ error: 'Access denied. Owner or manager privileges required.' });
+    }
+
+    const { status, receivedItems } = req.body;
+
+    const orderDoc = await db.collection(collections.purchaseOrders).doc(orderId).get();
+    if (!orderDoc.exists || orderDoc.data().restaurantId !== restaurantId) {
+      return res.status(404).json({ error: 'Purchase order not found' });
+    }
+
+    const updateData = { 
+      status, 
+      updatedAt: new Date(),
+      updatedBy: userId
+    };
+
+    if (status === 'received' && receivedItems) {
+      updateData.receivedItems = receivedItems;
+      updateData.receivedAt = new Date();
+      
+      // Update inventory stock
+      for (const item of receivedItems) {
+        const inventoryDoc = await db.collection(collections.inventory).doc(item.inventoryItemId).get();
+        if (inventoryDoc.exists) {
+          const currentStock = inventoryDoc.data().currentStock || 0;
+          await db.collection(collections.inventory).doc(item.inventoryItemId).update({
+            currentStock: currentStock + item.quantity,
+            lastUpdated: new Date()
+          });
+        }
+      }
+    }
+
+    await db.collection(collections.purchaseOrders).doc(orderId).update(updateData);
+    
+    res.json({
+      message: 'Purchase order updated successfully',
+      order: { id: orderId, ...orderDoc.data(), ...updateData }
+    });
+
+  } catch (error) {
+    console.error('Update purchase order error:', error);
+    res.status(500).json({ error: 'Failed to update purchase order' });
+  }
+});
+
+// Generate purchase order invoice HTML
+function generatePurchaseOrderInvoice(orderData, restaurantData, supplierName) {
+  const orderDate = new Date(orderData.createdAt).toLocaleDateString();
+  const expectedDelivery = orderData.expectedDeliveryDate ? new Date(orderData.expectedDeliveryDate).toLocaleDateString() : 'Not specified';
+  
+  return `
+    <!DOCTYPE html>
+    <html>
+    <head>
+      <meta charset="utf-8">
+      <title>Purchase Order Invoice</title>
+      <style>
+        body { font-family: Arial, sans-serif; margin: 0; padding: 20px; color: #333; }
+        .header { text-align: center; margin-bottom: 30px; border-bottom: 2px solid #059669; padding-bottom: 20px; }
+        .header h1 { color: #059669; margin: 0; font-size: 28px; }
+        .header p { margin: 5px 0; color: #666; }
+        .info-section { display: flex; justify-content: space-between; margin-bottom: 30px; }
+        .info-box { flex: 1; margin: 0 10px; }
+        .info-box h3 { color: #059669; border-bottom: 1px solid #eee; padding-bottom: 5px; }
+        .items-table { width: 100%; border-collapse: collapse; margin-bottom: 30px; }
+        .items-table th, .items-table td { border: 1px solid #ddd; padding: 12px; text-align: left; }
+        .items-table th { background-color: #059669; color: white; }
+        .items-table tr:nth-child(even) { background-color: #f9f9f9; }
+        .total-section { text-align: right; margin-top: 20px; }
+        .total-row { font-weight: bold; font-size: 18px; color: #059669; }
+        .notes { margin-top: 30px; padding: 15px; background-color: #f5f5f5; border-radius: 5px; }
+        .footer { margin-top: 40px; text-align: center; color: #666; font-size: 12px; }
+      </style>
+    </head>
+    <body>
+      <div class="header">
+        <h1>PURCHASE ORDER</h1>
+        <p><strong>${restaurantData.name || 'Restaurant'}</strong></p>
+        <p>Order #${orderData.id ? orderData.id.slice(-8) : 'N/A'}</p>
+        <p>Date: ${orderDate}</p>
+      </div>
+
+      <div class="info-section">
+        <div class="info-box">
+          <h3>Restaurant Details</h3>
+          <p><strong>${restaurantData.name || 'Restaurant'}</strong></p>
+          <p>${restaurantData.address || 'Address not provided'}</p>
+          <p>Phone: ${restaurantData.phone || 'Not provided'}</p>
+          <p>Email: ${restaurantData.email || 'Not provided'}</p>
+        </div>
+        <div class="info-box">
+          <h3>Supplier Details</h3>
+          <p><strong>${supplierName || 'Supplier'}</strong></p>
+          <p>Expected Delivery: ${expectedDelivery}</p>
+        </div>
+      </div>
+
+      <table class="items-table">
+        <thead>
+          <tr>
+            <th>Item</th>
+            <th>Quantity</th>
+            <th>Unit Price</th>
+            <th>Total</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${orderData.items.map(item => `
+            <tr>
+              <td>${item.inventoryItemName || 'Item'}</td>
+              <td>${item.quantity}</td>
+              <td>₹${item.unitPrice.toFixed(2)}</td>
+              <td>₹${(item.quantity * item.unitPrice).toFixed(2)}</td>
+            </tr>
+          `).join('')}
+        </tbody>
+      </table>
+
+      <div class="total-section">
+        <div class="total-row">
+          Total Amount: ₹${orderData.totalAmount.toFixed(2)}
+        </div>
+      </div>
+
+      ${orderData.notes ? `
+        <div class="notes">
+          <h3>Notes:</h3>
+          <p>${orderData.notes}</p>
+        </div>
+      ` : ''}
+
+      <div class="footer">
+        <p>This is an automated purchase order from ${restaurantData.name || 'Restaurant'}</p>
+        <p>Please confirm receipt and delivery details</p>
+      </div>
+    </body>
+    </html>
+  `;
+}
+
+// Email purchase order to supplier
+app.post('/api/purchase-orders/:restaurantId/:orderId/email', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId, orderId } = req.params;
+    const { userId, role } = req.user;
+    const { supplierEmail, supplierName } = req.body;
+    
+    if (role !== 'owner' && role !== 'manager') {
+      return res.status(403).json({ error: 'Access denied. Owner or manager privileges required.' });
+    }
+
+    if (!supplierEmail) {
+      return res.status(400).json({ error: 'Supplier email is required' });
+    }
+
+    // Get purchase order details
+    const orderDoc = await db.collection(collections.purchaseOrders).doc(orderId).get();
+    if (!orderDoc.exists) {
+      return res.status(404).json({ error: 'Purchase order not found' });
+    }
+
+    const orderData = orderDoc.data();
+    
+    // Get restaurant details
+    const restaurantDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
+    const restaurantData = restaurantDoc.exists ? restaurantDoc.data() : {};
+
+    // Generate purchase order invoice HTML
+    const invoiceHtml = generatePurchaseOrderInvoice(orderData, restaurantData, supplierName);
+
+    // Send email with invoice attachment
+    const emailService = require('./emailService');
+    const emailResult = await emailService.sendPurchaseOrderEmail({
+      to: supplierEmail,
+      supplierName: supplierName || 'Supplier',
+      restaurantName: restaurantData.name || 'Restaurant',
+      orderNumber: orderId.slice(-8),
+      orderData,
+      invoiceHtml
+    });
+
+    if (emailResult.success) {
+      res.json({ 
+        success: true, 
+        message: 'Purchase order sent successfully',
+        emailId: emailResult.emailId 
+      });
+    } else {
+      res.status(500).json({ error: 'Failed to send email', details: emailResult.error });
+    }
+
+  } catch (error) {
+    console.error('Email purchase order error:', error);
+    res.status(500).json({ error: 'Failed to send purchase order email' });
   }
 });
 

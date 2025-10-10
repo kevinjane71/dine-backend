@@ -320,6 +320,152 @@ DineOpen Analytics Team`,
     });
   }
 
+  // Send purchase order email to supplier
+  async sendPurchaseOrderEmail(emailData) {
+    console.log('📦 Sending purchase order email to:', emailData.to);
+    
+    if (!emailData.to || !emailData.supplierName || !emailData.restaurantName) {
+      throw new Error('Supplier email, name, and restaurant name are required for purchase order email');
+    }
+
+    const subject = `Purchase Order #${emailData.orderNumber} from ${emailData.restaurantName}`;
+    
+    const textContent = `
+Dear ${emailData.supplierName},
+
+We are pleased to place the following purchase order with your company:
+
+Order Number: ${emailData.orderNumber}
+Restaurant: ${emailData.restaurantName}
+Order Date: ${new Date(emailData.orderData.createdAt).toLocaleDateString()}
+Expected Delivery: ${emailData.orderData.expectedDeliveryDate ? new Date(emailData.orderData.expectedDeliveryDate).toLocaleDateString() : 'Not specified'}
+
+Items Ordered:
+${emailData.orderData.items.map(item => `- ${item.inventoryItemName}: ${item.quantity} units @ ₹${item.unitPrice} each`).join('\n')}
+
+Total Amount: ₹${emailData.orderData.totalAmount}
+
+${emailData.orderData.notes ? `Notes: ${emailData.orderData.notes}` : ''}
+
+Please confirm receipt of this order and provide delivery details.
+
+Thank you for your business.
+
+Best regards,
+${emailData.restaurantName}
+    `;
+
+    const htmlContent = `
+    <!DOCTYPE html>
+    <html>
+    <head>
+      <meta charset="utf-8">
+      <style>
+        body { font-family: Arial, sans-serif; line-height: 1.6; color: #333; max-width: 600px; margin: 0 auto; padding: 20px; }
+        .header { background-color: #059669; color: white; padding: 20px; text-align: center; border-radius: 8px 8px 0 0; }
+        .content { background-color: #f9f9f9; padding: 20px; border-radius: 0 0 8px 8px; }
+        .order-details { background-color: white; padding: 15px; border-radius: 5px; margin: 15px 0; }
+        .items-table { width: 100%; border-collapse: collapse; margin: 15px 0; }
+        .items-table th, .items-table td { border: 1px solid #ddd; padding: 8px; text-align: left; }
+        .items-table th { background-color: #059669; color: white; }
+        .total { font-weight: bold; font-size: 18px; color: #059669; text-align: right; margin-top: 15px; }
+        .footer { margin-top: 20px; padding-top: 20px; border-top: 1px solid #ddd; color: #666; }
+      </style>
+    </head>
+    <body>
+      <div class="header">
+        <h1>Purchase Order</h1>
+        <p>Order #${emailData.orderNumber}</p>
+      </div>
+      
+      <div class="content">
+        <p>Dear ${emailData.supplierName},</p>
+        
+        <p>We are pleased to place the following purchase order with your company:</p>
+        
+        <div class="order-details">
+          <p><strong>Order Number:</strong> ${emailData.orderNumber}</p>
+          <p><strong>Restaurant:</strong> ${emailData.restaurantName}</p>
+          <p><strong>Order Date:</strong> ${new Date(emailData.orderData.createdAt).toLocaleDateString()}</p>
+          <p><strong>Expected Delivery:</strong> ${emailData.orderData.expectedDeliveryDate ? new Date(emailData.orderData.expectedDeliveryDate).toLocaleDateString() : 'Not specified'}</p>
+        </div>
+
+        <h3>Items Ordered:</h3>
+        <table class="items-table">
+          <thead>
+            <tr>
+              <th>Item</th>
+              <th>Quantity</th>
+              <th>Unit Price</th>
+              <th>Total</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${emailData.orderData.items.map(item => `
+              <tr>
+                <td>${item.inventoryItemName}</td>
+                <td>${item.quantity}</td>
+                <td>₹${item.unitPrice}</td>
+                <td>₹${(item.quantity * item.unitPrice).toFixed(2)}</td>
+              </tr>
+            `).join('')}
+          </tbody>
+        </table>
+
+        <div class="total">
+          Total Amount: ₹${emailData.orderData.totalAmount}
+        </div>
+
+        ${emailData.orderData.notes ? `
+          <div class="order-details">
+            <h4>Notes:</h4>
+            <p>${emailData.orderData.notes}</p>
+          </div>
+        ` : ''}
+
+        <p>Please confirm receipt of this order and provide delivery details.</p>
+        
+        <p>Thank you for your business.</p>
+        
+        <p>Best regards,<br>
+        <strong>${emailData.restaurantName}</strong></p>
+      </div>
+      
+      <div class="footer">
+        <p>This is an automated email from DineOpen Restaurant Management System.</p>
+        <p>Please find the detailed purchase order invoice attached.</p>
+      </div>
+    </body>
+    </html>
+    `;
+
+    try {
+      const result = await this.sendEmail({
+        to: emailData.to,
+        subject: subject,
+        text: textContent,
+        html: htmlContent,
+        attachments: [{
+          filename: `Purchase_Order_${emailData.orderNumber}.html`,
+          content: emailData.invoiceHtml,
+          contentType: 'text/html'
+        }]
+      });
+
+      return {
+        success: true,
+        emailId: result.messageId,
+        message: 'Purchase order email sent successfully'
+      };
+    } catch (error) {
+      console.error('Error sending purchase order email:', error);
+      return {
+        success: false,
+        error: error.message
+      };
+    }
+  }
+
   // Helper method to format dates
   formatDate(date) {
     if (!date) return '';

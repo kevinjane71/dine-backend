@@ -35,6 +35,8 @@ const collections = {
   payments: 'payments',
   inventory: 'inventory',
   suppliers: 'suppliers',
+  recipes: 'recipes',
+  purchaseOrders: 'purchaseOrders',
   analytics: 'analytics',
   feedback: 'feedback',
   loyalty: 'loyalty',
