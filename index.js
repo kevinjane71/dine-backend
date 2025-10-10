@@ -2415,7 +2415,18 @@ app.patch('/api/orders/:orderId/status', authenticateToken, async (req, res) => 
 app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
   try {
     const { orderId } = req.params;
-    const { items, tableNumber, orderType, paymentMethod, updatedAt, lastUpdatedBy } = req.body;
+    const { 
+      items, 
+      tableNumber, 
+      orderType, 
+      paymentMethod, 
+      status,
+      paymentStatus,
+      completedAt,
+      customerInfo,
+      updatedAt, 
+      lastUpdatedBy 
+    } = req.body;
 
     // Validate items if provided
     if (items && (!Array.isArray(items) || items.length === 0)) {
@@ -2447,8 +2458,8 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
       return res.status(403).json({ error: 'Access denied: Order does not belong to your restaurant' });
     }
     
-    // Don't allow updates to completed or cancelled orders
-    if (currentOrder.status === 'completed' || currentOrder.status === 'cancelled') {
+    // Don't allow updates to completed or cancelled orders unless we're completing them
+    if ((currentOrder.status === 'completed' || currentOrder.status === 'cancelled') && status !== 'completed') {
       return res.status(400).json({ error: 'Cannot update completed or cancelled orders' });
     }
 
@@ -2483,6 +2494,10 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
     if (tableNumber !== undefined) updateData.tableNumber = tableNumber;
     if (orderType) updateData.orderType = orderType;
     if (paymentMethod) updateData.paymentMethod = paymentMethod;
+    if (status) updateData.status = status;
+    if (paymentStatus) updateData.paymentStatus = paymentStatus;
+    if (completedAt) updateData.completedAt = new Date(completedAt);
+    if (customerInfo) updateData.customerInfo = customerInfo;
     if (lastUpdatedBy) updateData.lastUpdatedBy = lastUpdatedBy;
 
     // Add update history
@@ -2494,11 +2509,15 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
         items: items ? `Updated to ${items.length} items` : null,
         tableNumber: tableNumber !== undefined ? `Changed to ${tableNumber}` : null,
         orderType: orderType ? `Changed to ${orderType}` : null,
-        paymentMethod: paymentMethod ? `Changed to ${paymentMethod}` : null
+        paymentMethod: paymentMethod ? `Changed to ${paymentMethod}` : null,
+        status: status ? `Changed to ${status}` : null,
+        paymentStatus: paymentStatus ? `Changed to ${paymentStatus}` : null,
+        customerInfo: customerInfo ? 'Customer information updated' : null
       }
     });
     updateData.updateHistory = updateHistory;
 
+    console.log('🔄 Backend - Updating order:', orderId, 'with data:', updateData);
     await db.collection(collections.orders).doc(orderId).update(updateData);
 
     res.json({ 
