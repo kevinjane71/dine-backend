@@ -12,7 +12,7 @@ const authenticateUser = async (req) => {
 
     const token = authHeader.substring(7);
     
-    // Verify token (using your existing token verification logic)
+    // Verify token (using your existing token verification logic) oo
     const admin = require('firebase-admin');
     const decodedToken = await admin.auth().verifyIdToken(token);
     
