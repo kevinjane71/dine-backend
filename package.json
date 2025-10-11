@@ -5,7 +5,8 @@
   "scripts": {
     "start": "node index.js",
     "dev": "node index.js",
-    "build": "echo 'No build process needed'",
+    "build": "echo 'No build process needed for Node.js server'",
+    "vercel-build": "echo 'Vercel build completed'",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "keywords": [],

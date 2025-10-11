@@ -1,0 +1,16 @@
+# Ignore development files
+*.log
+backend.log
+test-*.js
+cleanup.sh
+index.js.backup
+
+# Ignore node_modules (handled by Vercel)
+node_modules/
+
+# Ignore development files
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
