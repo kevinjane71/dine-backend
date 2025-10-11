@@ -1,6 +1,6 @@
 const { GraphQLError } = require('graphql');
 
-// Security and validation utilities
+// Security and validation utilitiesjj
 const validateRestaurantAccess = async (userId, restaurantId, db) => {
   if (!userId || !restaurantId) {
     throw new GraphQLError('Authentication required', {
