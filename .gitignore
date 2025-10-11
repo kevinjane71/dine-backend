@@ -132,3 +132,4 @@ dist/
 
 # Package-lock files (optional, some prefer to keep them)
 # package-lock.json
+.vercel
