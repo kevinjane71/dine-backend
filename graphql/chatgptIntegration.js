@@ -484,6 +484,14 @@ function generateUserResponse(query, data, userQuery) {
       return `Table status updated successfully!`;
     }
     
+    if (query.includes('updateTableStatusByNumber')) {
+      const table = data.updateTableStatusByNumber;
+      if (table) {
+        return `Table ${table.name} status has been updated to **${table.status.toLowerCase()}** successfully!`;
+      }
+      return `Table status updated successfully!`;
+    }
+    
     if (query.includes('createCustomer')) {
       return `Customer created successfully! Customer ID: ${data.createCustomer?.id}`;
     }
@@ -498,6 +506,19 @@ function generateUserResponse(query, data, userQuery) {
       if (tables.length === 0) {
         return "No tables found matching your criteria.";
       }
+      
+      // Check if user was asking for a specific table number
+      const tableMatch = userQuery.match(/table\s+(?:number\s+)?(\d+)/i);
+      if (tableMatch) {
+        const targetTableNumber = tableMatch[1];
+        const targetTable = tables.find(t => t.name === targetTableNumber);
+        if (targetTable) {
+          return `The status of table number ${targetTableNumber} is currently **${targetTable.status.toLowerCase()}**.`;
+        } else {
+          return `Table number ${targetTableNumber} was not found. Available tables: ${tables.map(t => t.name).join(', ')}`;
+        }
+      }
+      
       return `Found ${tables.length} tables. Status: ${tables.map(t => `${t.name} (${t.status})`).join(', ')}`;
     }
     

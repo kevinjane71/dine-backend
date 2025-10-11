@@ -181,18 +181,564 @@ const authenticateToken = (req, res, next) => {
 };
 
 // GraphQL endpoint for direct access
+app.use('/api/graphql', require('./api/graphql'));
 
 // Enhanced DineBot API with GraphQL integration
+app.post('/api/dinebot/graphql', authenticateToken, async (req, res) => {
+  try {
+    const { query: userQuery, restaurantId } = req.body;
+    const userId = req.user.userId;
+
+    if (!userQuery || !restaurantId) {
+      return res.status(400).json({
+        error: 'Query and restaurantId are required'
+      });
+    }
+
+    // Step 1: Detect intent with minimal ChatGPT usage
+    const { detectIntent, generateQueryFromIntent, resolveDynamicValues, templateToGraphQL } = require('./graphql/intentDetection');
+    const { executeGraphQLQuery, generateUserResponse } = require('./graphql/chatgptIntegration');
+    
+    // Get conversation context for intent detection
+    let conversationContext = null;
+    try {
+      const conversationQuery = `
+        query GetConversation($userId: ID!, $restaurantId: ID!) {
+          conversation(userId: $userId, restaurantId: $restaurantId) {
+            id
+            messages {
+              id
+              role
+              content
+              timestamp
+            }
+            context {
+              lastTableNumber
+              lastCustomerName
+              lastCustomerPhone
+              preferences
+            }
+          }
+        }
+      `;
+
+      const conversationVariables = { userId, restaurantId };
+      const conversationContextData = {
+        user: req.user,
+        db: db
+      };
+
+      conversationContext = await executeGraphQLQuery(conversationQuery, conversationVariables, conversationContextData);
+    } catch (error) {
+      console.log('No existing conversation found');
+    }
+
+    // Detect intent with minimal token usage
+    const intent = await detectIntent(userQuery, conversationContext?.conversation?.context);
+    console.log(`🎯 Detected intent: ${intent}`);
+
+    let graphqlQuery;
+    let variables = { restaurantId };
+
+    // Step 2: Generate query based on intent
+    if (intent !== 'UNKNOWN') {
+      const queryTemplate = generateQueryFromIntent(intent, userQuery, restaurantId, conversationContext?.conversation?.context);
+      const resolvedTemplate = await resolveDynamicValues(queryTemplate, userQuery, db, restaurantId);
+      graphqlQuery = templateToGraphQL(resolvedTemplate);
+      
+      if (graphqlQuery) {
+        console.log(`✅ Generated query from intent: ${intent}`);
+      }
+    }
+
+    // Step 3: Fallback to ChatGPT for complex queries
+    if (!graphqlQuery) {
+      console.log(`🔄 Fallback to ChatGPT for complex query`);
+      const { generateGraphQLQuery } = require('./graphql/chatgptIntegration');
+      graphqlQuery = await generateGraphQLQuery(userQuery, restaurantId, userId, db, conversationContext);
+    }
+    console.log('Generated GraphQL Query:', graphqlQuery);
+
+    // Step 4: Execute GraphQL query
+    const context = {
+      user: req.user,
+      db: db
+    };
+
+    const data = await executeGraphQLQuery(graphqlQuery, variables, context);
+
+    // Step 4: Generate user-friendly response
+    const userResponse = generateUserResponse(graphqlQuery, data, userQuery);
+
+    // Step 5: Save conversation messages
+    try {
+      // Save user message
+      await executeGraphQLQuery(`
+        mutation SaveUserMessage($userId: ID!, $restaurantId: ID!, $role: MessageRole!, $content: String!) {
+          saveConversationMessage(userId: $userId, restaurantId: $restaurantId, role: $role, content: $content) {
+            id
+          }
+        }
+      `, { userId, restaurantId, role: 'USER', content: userQuery }, context);
+
+      // Save assistant response
+      await executeGraphQLQuery(`
+        mutation SaveAssistantMessage($userId: ID!, $restaurantId: ID!, $role: MessageRole!, $content: String!) {
+          saveConversationMessage(userId: $userId, restaurantId: $restaurantId, role: $role, content: $content) {
+            id
+          }
+        }
+      `, { userId, restaurantId, role: 'ASSISTANT', content: userResponse }, context);
+
+      // Update context if order was created
+      if (graphqlQuery.includes('createOrder') && data.createOrder) {
+        const orderContext = {
+          lastTableNumber: data.createOrder.tableNumber,
+          lastCustomerName: data.createOrder.customerInfo?.name,
+          lastCustomerPhone: data.createOrder.customerInfo?.phone,
+          preferences: conversationData?.conversation?.context?.preferences || {}
+        };
+
+        await executeGraphQLQuery(`
+          mutation UpdateContext($userId: ID!, $restaurantId: ID!, $context: JSON!) {
+            updateConversationContext(userId: $userId, restaurantId: $restaurantId, context: $context) {
+              id
+            }
+          }
+        `, { userId, restaurantId, context: orderContext }, context);
+      }
+    } catch (error) {
+      console.error('Error saving conversation:', error);
+      // Don't fail the request if conversation saving fails
+    }
+
+    // Step 6: Return response
+    res.json({
+      success: true,
+      response: userResponse,
+      data: data,
+      query: graphqlQuery,
+      timestamp: new Date().toISOString()
+    });
+
+  } catch (error) {
+    console.error('DineBot GraphQL query error:', error);
+    
+    // Handle specific error types
+    if (error.message.includes('Authentication')) {
+      return res.status(401).json({
+        error: 'Authentication failed',
+        message: 'Please log in again'
+      });
+    }
+    
+    if (error.message.includes('Access denied')) {
+      return res.status(403).json({
+        error: 'Access denied',
+        message: 'You do not have permission to access this restaurant data'
+      });
+    }
+    
+    if (error.message.includes('Invalid GraphQL')) {
+      return res.status(400).json({
+        error: 'Invalid query',
+        message: 'Could not understand your request. Please try rephrasing.'
+      });
+    }
+
+    res.status(500).json({
+      error: 'Query execution failed',
+      message: 'An error occurred while processing your request. Please try again.'
+    });
+  }
+});
 
 // Enhanced DineBot API with Function Calling integration
+app.post('/api/dinebot/function-calling', authenticateToken, async (req, res) => {
+  try {
+    const { query: userQuery, restaurantId } = req.body;
+    const userId = req.user.userId;
+
+    if (!userQuery || !restaurantId) {
+      return res.status(400).json({
+        success: false,
+        error: 'Query and restaurantId are required'
+      });
+    }
+
+    // Use Function Calling approach for better scalability
+    const { processWithFunctionCalling } = require('./graphql/functionCallingIntegration');
+    const { executeGraphQLQuery } = require('./graphql/chatgptIntegration');
+
+    // Step 1: Get conversation context
+    const conversationQuery = `
+      query GetConversation($userId: ID!, $restaurantId: ID!) {
+        conversation(userId: $userId, restaurantId: $restaurantId) {
+          id
+          messages {
+            id
+            role
+            content
+            timestamp
+          }
+          context {
+            lastTableNumber
+            lastCustomerName
+            lastCustomerPhone
+            preferences
+          }
+        }
+      }
+    `;
+
+    const conversationVariables = { userId, restaurantId };
+    const conversationContext = {
+      user: req.user,
+      db: db
+    };
+
+    let conversationData = null;
+    try {
+      conversationData = await executeGraphQLQuery(conversationQuery, conversationVariables, conversationContext);
+    } catch (error) {
+      console.log('No existing conversation found, creating new one');
+    }
+
+    // Step 2: Process with Function Calling
+    console.log('🚀 Using Function Calling approach');
+    const result = await processWithFunctionCalling(userQuery, restaurantId, userId, db, conversationData?.conversation);
+
+    // Step 3: Save conversation messages
+    try {
+      const context = { user: req.user, db: db };
+      
+      // Save user message
+      if (userQuery && userQuery.trim()) {
+        await executeGraphQLQuery(`
+          mutation SaveUserMessage($userId: ID!, $restaurantId: ID!, $role: MessageRole!, $content: String!) {
+            saveConversationMessage(userId: $userId, restaurantId: $restaurantId, role: $role, content: $content) {
+              id
+            }
+          }
+        `, { userId, restaurantId, role: 'USER', content: userQuery }, context);
+      }
+
+      // Save assistant response
+      if (result.response && result.response.trim()) {
+        await executeGraphQLQuery(`
+          mutation SaveAssistantMessage($userId: ID!, $restaurantId: ID!, $role: MessageRole!, $content: String!) {
+            saveConversationMessage(userId: $userId, restaurantId: $restaurantId, role: $role, content: $content) {
+              id
+            }
+          }
+        `, { userId, restaurantId, role: 'ASSISTANT', content: result.response }, context);
+      }
+
+      // Update context if order was created
+      if (result.functionCalls) {
+        const createOrderCall = result.functionCalls.find(call => call.function.name === 'create_order');
+        if (createOrderCall && result.functionResults) {
+          const orderResult = result.functionResults.find(r => r.tool_call_id === createOrderCall.id);
+          if (orderResult && !orderResult.content.includes('error')) {
+            const orderData = JSON.parse(orderResult.content);
+            if (orderData.createOrder) {
+              const orderContext = {
+                lastTableNumber: orderData.createOrder.tableNumber,
+                lastCustomerName: orderData.createOrder.customer?.name,
+                lastCustomerPhone: orderData.createOrder.customer?.phone,
+                preferences: conversationData?.conversation?.context?.preferences || {}
+              };
+
+              await executeGraphQLQuery(`
+                mutation UpdateContext($userId: ID!, $restaurantId: ID!, $context: JSON!) {
+                  updateConversationContext(userId: $userId, restaurantId: $restaurantId, context: $context) {
+                    id
+                  }
+                }
+              `, { userId, restaurantId, context: orderContext }, context);
+            }
+          }
+        }
+      }
+    } catch (error) {
+      console.error('Error saving conversation:', error);
+      // Don't fail the request if conversation saving fails
+    }
+
+    // Step 4: Return response
+    res.json({
+      success: result.success,
+      response: result.response,
+      functionCalls: result.functionCalls,
+      functionResults: result.functionResults,
+      timestamp: result.timestamp
+    });
+
+  } catch (error) {
+    console.error('DineBot Function Calling error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Internal server error',
+      details: error.message
+    });
+  }
+});
 
 // Optimized Dynamic Function Agent endpoint (minimal tokens + smart caching)
+app.post('/api/dinebot/optimized', authenticateToken, async (req, res) => {
+  try {
+    const { query: userQuery, restaurantId } = req.body;
+    const userId = req.user.userId;
+
+    if (!userQuery || !restaurantId) {
+      return res.status(400).json({
+        success: false,
+        error: 'Query and restaurantId are required'
+      });
+    }
+
+    // Use the optimized dynamic function agent
+    const { dynamicAgent } = require('./graphql/dynamicFunctionAgent');
+    const { executeGraphQLQuery } = require('./graphql/chatgptIntegration');
+
+    // Get conversation context
+    const conversationQuery = `
+      query GetConversation($userId: ID!, $restaurantId: ID!) {
+        conversation(userId: $userId, restaurantId: $restaurantId) {
+          id
+          messages {
+            id
+            role
+            content
+            timestamp
+          }
+          context {
+            lastTableNumber
+            lastCustomerName
+            lastCustomerPhone
+            preferences
+          }
+        }
+      }
+    `;
+
+    const conversationVariables = { userId, restaurantId };
+    const conversationContext = {
+      user: req.user,
+      db: db
+    };
+
+    let conversationData = null;
+    try {
+      conversationData = await executeGraphQLQuery(conversationQuery, conversationVariables, conversationContext);
+    } catch (error) {
+      console.log('No existing conversation found');
+    }
+
+    // Process with optimized dynamic agent
+    console.log('🚀 Using Optimized Dynamic Function Agent');
+    const result = await dynamicAgent.processQuery(userQuery, restaurantId, userId, db, conversationData?.conversation);
+
+    // Save conversation messages
+    try {
+      const context = { user: req.user, db: db };
+      
+      if (userQuery && userQuery.trim()) {
+        await executeGraphQLQuery(`
+          mutation SaveUserMessage($userId: ID!, $restaurantId: ID!, $role: MessageRole!, $content: String!) {
+            saveConversationMessage(userId: $userId, restaurantId: $restaurantId, role: $role, content: $content) {
+              id
+            }
+          }
+        `, { userId, restaurantId, role: 'USER', content: userQuery }, context);
+      }
+
+      if (result.response && result.response.trim()) {
+        await executeGraphQLQuery(`
+          mutation SaveAssistantMessage($userId: ID!, $restaurantId: ID!, $role: MessageRole!, $content: String!) {
+            saveConversationMessage(userId: $userId, restaurantId: $restaurantId, role: $role, content: $content) {
+              id
+            }
+          }
+        `, { userId, restaurantId, role: 'ASSISTANT', content: result.response }, context);
+      }
+    } catch (error) {
+      console.error('Error saving conversation:', error);
+    }
+
+    res.json({
+      success: result.success,
+      response: result.response,
+      functionCalls: result.functionCalls,
+      functionResults: result.functionResults,
+      timestamp: result.timestamp
+    });
+
+  } catch (error) {
+    console.error('Optimized Agent error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Internal server error',
+      details: error.message
+    });
+  }
+});
 
 // Ultra-modern AI Agent endpoint (zero maintenance)
+app.post('/api/dinebot/ai-agent', authenticateToken, async (req, res) => {
+  try {
+    const { query: userQuery, restaurantId } = req.body;
+    const userId = req.user.userId;
+
+    if (!userQuery || !restaurantId) {
+      return res.status(400).json({
+        success: false,
+        error: 'Query and restaurantId are required'
+      });
+    }
+
+    // Use the most modern AI Agent approach
+    const { processWithAIAgent } = require('./graphql/aiAgentIntegration');
+    const { executeGraphQLQuery } = require('./graphql/chatgptIntegration');
+
+    // Get conversation context
+    const conversationQuery = `
+      query GetConversation($userId: ID!, $restaurantId: ID!) {
+        conversation(userId: $userId, restaurantId: $restaurantId) {
+          id
+          messages {
+            id
+            role
+            content
+            timestamp
+          }
+          context {
+            lastTableNumber
+            lastCustomerName
+            lastCustomerPhone
+            preferences
+          }
+        }
+      }
+    `;
+
+    const conversationVariables = { userId, restaurantId };
+    const conversationContext = {
+      user: req.user,
+      db: db
+    };
+
+    let conversationData = null;
+    try {
+      conversationData = await executeGraphQLQuery(conversationQuery, conversationVariables, conversationContext);
+    } catch (error) {
+      console.log('No existing conversation found');
+    }
+
+    // Process with AI Agent
+    console.log('🤖 Using AI Agent approach (zero maintenance)');
+    const result = await processWithAIAgent(userQuery, restaurantId, userId, db, conversationData?.conversation);
+
+    // Save conversation messages
+    try {
+      const context = { user: req.user, db: db };
+      
+      if (userQuery && userQuery.trim()) {
+        await executeGraphQLQuery(`
+          mutation SaveUserMessage($userId: ID!, $restaurantId: ID!, $role: MessageRole!, $content: String!) {
+            saveConversationMessage(userId: $userId, restaurantId: $restaurantId, role: $role, content: $content) {
+              id
+            }
+          }
+        `, { userId, restaurantId, role: 'USER', content: userQuery }, context);
+      }
+
+      if (result.response && result.response.trim()) {
+        await executeGraphQLQuery(`
+          mutation SaveAssistantMessage($userId: ID!, $restaurantId: ID!, $role: MessageRole!, $content: String!) {
+            saveConversationMessage(userId: $userId, restaurantId: $restaurantId, role: $role, content: $content) {
+              id
+            }
+          }
+        `, { userId, restaurantId, role: 'ASSISTANT', content: result.response }, context);
+      }
+    } catch (error) {
+      console.error('Error saving conversation:', error);
+    }
+
+    res.json({
+      success: result.success,
+      response: result.response,
+      plan: result.plan,
+      results: result.results,
+      timestamp: result.timestamp
+    });
+
+  } catch (error) {
+    console.error('AI Agent error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Internal server error',
+      details: error.message
+    });
+  }
+});
 
 // Test endpoint to show what query is sent to ChatGPT (no auth for testing)
+app.get('/api/test-schema-public', async (req, res) => {
+  try {
+    const { generateGraphQLSchemaForChatGPT, getDatabaseCollections } = require('./graphql/chatgptIntegration');
+    
+    // Get actual database collections
+    const collections = await getDatabaseCollections(db);
+    
+    // Generate dynamic schema
+    const schema = await generateGraphQLSchemaForChatGPT(db);
+    
+    res.json({
+      success: true,
+      collections: collections,
+      schemaPreview: schema.substring(0, 2000) + '...',
+      fullSchema: schema,
+      timestamp: new Date().toISOString()
+    });
+    
+  } catch (error) {
+    console.error('Test schema error:', error);
+    res.status(500).json({
+      error: 'Failed to generate schema',
+      message: error.message
+    });
+  }
+});
 
 // Test endpoint to show what query is sent to ChatGPT
+app.get('/api/test-schema', authenticateToken, async (req, res) => {
+  try {
+    const { generateGraphQLSchemaForChatGPT, getDatabaseCollections } = require('./graphql/chatgptIntegration');
+    
+    // Get actual database collections
+    const collections = await getDatabaseCollections(db);
+    
+    // Generate dynamic schema
+    const schema = await generateGraphQLSchemaForChatGPT(db);
+    
+    res.json({
+      success: true,
+      collections: collections,
+      schemaPreview: schema.substring(0, 1000) + '...',
+      fullSchema: schema,
+      timestamp: new Date().toISOString()
+    });
+    
+  } catch (error) {
+    console.error('Test schema error:', error);
+    res.status(500).json({
+      error: 'Failed to generate schema',
+      message: error.message
+    });
+  }
+});
 
 // ==================== DINEBOT FUNCTIONS ====================
 
@@ -7389,7 +7935,7 @@ app.post('/api/dinebot/query', authenticateToken, async (req, res) => {
       }
     };
 
-    const result = await chatbot.processQuery(userQuery, restaurantId, userId, apiClient, db);
+    const result = await chatbot.processQuery(userQuery, restaurantId, userId, apiClient);
 
     res.json({
       success: result.success,
