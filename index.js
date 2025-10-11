@@ -43,6 +43,7 @@ if (emailService) {
 }
 
 const app = express();
+
 const PORT = process.env.PORT || 3003;
 
 const googleClient = new OAuth2Client(process.env.GOOGLE_CLIENT_ID);
@@ -178,6 +179,235 @@ const authenticateToken = (req, res, next) => {
     next();
   });
 };
+
+// GraphQL endpoint for direct access
+app.use('/api/graphql', require('./api/graphql'));
+
+// Enhanced DineBot API with GraphQL integration
+app.post('/api/dinebot/graphql', authenticateToken, async (req, res) => {
+  try {
+    const { query: userQuery, restaurantId } = req.body;
+    const userId = req.user.userId;
+
+    if (!userQuery || !restaurantId) {
+      return res.status(400).json({
+        error: 'Query and restaurantId are required'
+      });
+    }
+
+    // Step 1: Detect intent with minimal ChatGPT usage
+    const { detectIntent, generateQueryFromIntent, resolveDynamicValues, templateToGraphQL } = require('./graphql/intentDetection');
+    const { executeGraphQLQuery, generateUserResponse } = require('./graphql/chatgptIntegration');
+    
+    // Get conversation context for intent detection
+    let conversationContext = null;
+    try {
+      const conversationQuery = `
+        query GetConversation($userId: ID!, $restaurantId: ID!) {
+          conversation(userId: $userId, restaurantId: $restaurantId) {
+            id
+            messages {
+              id
+              role
+              content
+              timestamp
+            }
+            context {
+              lastTableNumber
+              lastCustomerName
+              lastCustomerPhone
+              preferences
+            }
+          }
+        }
+      `;
+
+      const conversationVariables = { userId, restaurantId };
+      const conversationContextData = {
+        user: req.user,
+        db: db
+      };
+
+      conversationContext = await executeGraphQLQuery(conversationQuery, conversationVariables, conversationContextData);
+    } catch (error) {
+      console.log('No existing conversation found');
+    }
+
+    // Detect intent with minimal token usage
+    const intent = await detectIntent(userQuery, conversationContext?.conversation?.context);
+    console.log(`🎯 Detected intent: ${intent}`);
+
+    let graphqlQuery;
+    let variables = { restaurantId };
+
+    // Step 2: Generate query based on intent
+    if (intent !== 'UNKNOWN') {
+      const queryTemplate = generateQueryFromIntent(intent, userQuery, restaurantId, conversationContext?.conversation?.context);
+      const resolvedTemplate = await resolveDynamicValues(queryTemplate, userQuery, db, restaurantId);
+      graphqlQuery = templateToGraphQL(resolvedTemplate);
+      
+      if (graphqlQuery) {
+        console.log(`✅ Generated query from intent: ${intent}`);
+      }
+    }
+
+    // Step 3: Fallback to ChatGPT for complex queries
+    if (!graphqlQuery) {
+      console.log(`🔄 Fallback to ChatGPT for complex query`);
+      const { generateGraphQLQuery } = require('./graphql/chatgptIntegration');
+      graphqlQuery = await generateGraphQLQuery(userQuery, restaurantId, userId, db, conversationContext);
+    }
+    console.log('Generated GraphQL Query:', graphqlQuery);
+
+    // Step 4: Execute GraphQL query
+    const context = {
+      user: req.user,
+      db: db
+    };
+
+    const data = await executeGraphQLQuery(graphqlQuery, variables, context);
+
+    // Step 4: Generate user-friendly response
+    const userResponse = generateUserResponse(graphqlQuery, data, userQuery);
+
+    // Step 5: Save conversation messages
+    try {
+      // Save user message
+      await executeGraphQLQuery(`
+        mutation SaveUserMessage($userId: ID!, $restaurantId: ID!, $role: MessageRole!, $content: String!) {
+          saveConversationMessage(userId: $userId, restaurantId: $restaurantId, role: $role, content: $content) {
+            id
+          }
+        }
+      `, { userId, restaurantId, role: 'USER', content: userQuery }, context);
+
+      // Save assistant response
+      await executeGraphQLQuery(`
+        mutation SaveAssistantMessage($userId: ID!, $restaurantId: ID!, $role: MessageRole!, $content: String!) {
+          saveConversationMessage(userId: $userId, restaurantId: $restaurantId, role: $role, content: $content) {
+            id
+          }
+        }
+      `, { userId, restaurantId, role: 'ASSISTANT', content: userResponse }, context);
+
+      // Update context if order was created
+      if (graphqlQuery.includes('createOrder') && data.createOrder) {
+        const orderContext = {
+          lastTableNumber: data.createOrder.tableNumber,
+          lastCustomerName: data.createOrder.customerInfo?.name,
+          lastCustomerPhone: data.createOrder.customerInfo?.phone,
+          preferences: conversationData?.conversation?.context?.preferences || {}
+        };
+
+        await executeGraphQLQuery(`
+          mutation UpdateContext($userId: ID!, $restaurantId: ID!, $context: JSON!) {
+            updateConversationContext(userId: $userId, restaurantId: $restaurantId, context: $context) {
+              id
+            }
+          }
+        `, { userId, restaurantId, context: orderContext }, context);
+      }
+    } catch (error) {
+      console.error('Error saving conversation:', error);
+      // Don't fail the request if conversation saving fails
+    }
+
+    // Step 6: Return response
+    res.json({
+      success: true,
+      response: userResponse,
+      data: data,
+      query: graphqlQuery,
+      timestamp: new Date().toISOString()
+    });
+
+  } catch (error) {
+    console.error('DineBot GraphQL query error:', error);
+    
+    // Handle specific error types
+    if (error.message.includes('Authentication')) {
+      return res.status(401).json({
+        error: 'Authentication failed',
+        message: 'Please log in again'
+      });
+    }
+    
+    if (error.message.includes('Access denied')) {
+      return res.status(403).json({
+        error: 'Access denied',
+        message: 'You do not have permission to access this restaurant data'
+      });
+    }
+    
+    if (error.message.includes('Invalid GraphQL')) {
+      return res.status(400).json({
+        error: 'Invalid query',
+        message: 'Could not understand your request. Please try rephrasing.'
+      });
+    }
+
+    res.status(500).json({
+      error: 'Query execution failed',
+      message: 'An error occurred while processing your request. Please try again.'
+    });
+  }
+});
+
+// Test endpoint to show what query is sent to ChatGPT (no auth for testing)
+app.get('/api/test-schema-public', async (req, res) => {
+  try {
+    const { generateGraphQLSchemaForChatGPT, getDatabaseCollections } = require('./graphql/chatgptIntegration');
+    
+    // Get actual database collections
+    const collections = await getDatabaseCollections(db);
+    
+    // Generate dynamic schema
+    const schema = await generateGraphQLSchemaForChatGPT(db);
+    
+    res.json({
+      success: true,
+      collections: collections,
+      schemaPreview: schema.substring(0, 2000) + '...',
+      fullSchema: schema,
+      timestamp: new Date().toISOString()
+    });
+    
+  } catch (error) {
+    console.error('Test schema error:', error);
+    res.status(500).json({
+      error: 'Failed to generate schema',
+      message: error.message
+    });
+  }
+});
+
+// Test endpoint to show what query is sent to ChatGPT
+app.get('/api/test-schema', authenticateToken, async (req, res) => {
+  try {
+    const { generateGraphQLSchemaForChatGPT, getDatabaseCollections } = require('./graphql/chatgptIntegration');
+    
+    // Get actual database collections
+    const collections = await getDatabaseCollections(db);
+    
+    // Generate dynamic schema
+    const schema = await generateGraphQLSchemaForChatGPT(db);
+    
+    res.json({
+      success: true,
+      collections: collections,
+      schemaPreview: schema.substring(0, 1000) + '...',
+      fullSchema: schema,
+      timestamp: new Date().toISOString()
+    });
+    
+  } catch (error) {
+    console.error('Test schema error:', error);
+    res.status(500).json({
+      error: 'Failed to generate schema',
+      message: error.message
+    });
+  }
+});
 
 // ==================== DINEBOT FUNCTIONS ====================
 
@@ -342,8 +572,8 @@ SECURITY CONSTRAINTS:
 `;
 }
 
-// Dynamic query executor with security controls
-async function executeSecureQuery(operations, restaurantId, userId) {
+// Dynamic operation executor with security controls (READ + WRITE)
+async function executeSecureOperation(operations, restaurantId, userId) {
   const results = {};
   
   // Security: Validate restaurant access
@@ -461,6 +691,236 @@ async function executeSecureQuery(operations, restaurantId, userId) {
   }
   
   return results;
+}
+
+// READ Operation Handler
+async function executeReadOperation(operation, restaurantId) {
+  // CRITICAL FIX: Use only ONE where clause to avoid composite index requirements
+  let query = db.collection(operation.collection);
+  
+  // Security: Always add restaurantId filter (this is the only where clause we use)
+  query = query.where('restaurantId', '==', restaurantId);
+  
+  // Get all documents for this restaurant and filter client-side
+  const snapshot = await query.get();
+  let docs = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+  
+  // Apply ALL filters client-side to avoid composite indexes
+  if (operation.filters) {
+    docs = docs.filter(doc => {
+      for (const [field, value] of Object.entries(operation.filters)) {
+        // Security: Prevent injection attacks
+        const sanitizedValue = sanitizeInput(value);
+        
+        if (field === 'createdAt') {
+          const docDate = doc.createdAt ? doc.createdAt.toDate() : new Date(doc.createdAt);
+          
+          if (value === 'today') {
+            const today = new Date();
+            today.setHours(0, 0, 0, 0);
+            const tomorrow = new Date(today);
+            tomorrow.setDate(tomorrow.getDate() + 1);
+            if (!(docDate >= today && docDate < tomorrow)) return false;
+          } else if (value === 'yesterday') {
+            const yesterday = new Date();
+            yesterday.setDate(yesterday.getDate() - 1);
+            yesterday.setHours(0, 0, 0, 0);
+            const today = new Date();
+            today.setHours(0, 0, 0, 0);
+            if (!(docDate >= yesterday && docDate < today)) return false;
+          } else if (value === 'this_week') {
+            const startOfWeek = new Date();
+            startOfWeek.setDate(startOfWeek.getDate() - startOfWeek.getDay());
+            startOfWeek.setHours(0, 0, 0, 0);
+            const endOfWeek = new Date(startOfWeek);
+            endOfWeek.setDate(endOfWeek.getDate() + 7);
+            if (!(docDate >= startOfWeek && docDate < endOfWeek)) return false;
+          } else if (value === 'this_month') {
+            const startOfMonth = new Date();
+            startOfMonth.setDate(1);
+            startOfMonth.setHours(0, 0, 0, 0);
+            const endOfMonth = new Date(startOfMonth);
+            endOfMonth.setMonth(endOfMonth.getMonth() + 1);
+            if (!(docDate >= startOfMonth && docDate < endOfMonth)) return false;
+          }
+        } else if (field.includes('>')) {
+          const [fieldName, operator] = field.split(' ');
+          if (operator === '>' && doc[fieldName] <= sanitizedValue) return false;
+          if (operator === '<' && doc[fieldName] >= sanitizedValue) return false;
+          if (operator === '>=' && doc[fieldName] < sanitizedValue) return false;
+          if (operator === '<=' && doc[fieldName] > sanitizedValue) return false;
+        } else if (doc[field] !== sanitizedValue) {
+          return false;
+        }
+      }
+      return true;
+    });
+  }
+  
+  // Apply aggregation
+  switch (operation.aggregation) {
+    case 'count':
+      return { count: docs.length };
+    case 'sum':
+      const sumField = operation.fields[0];
+      const sum = docs.reduce((acc, doc) => acc + (doc[sumField] || 0), 0);
+      return { sum };
+    case 'average':
+      const avgField = operation.fields[0];
+      const avg = docs.length > 0 ? docs.reduce((acc, doc) => acc + (doc[avgField] || 0), 0) / docs.length : 0;
+      return { average: avg };
+    case 'groupBy':
+      const groupField = operation.fields[0];
+      const grouped = {};
+      docs.forEach(doc => {
+        const key = doc[groupField] || 'Unknown';
+        grouped[key] = (grouped[key] || 0) + 1;
+      });
+      return { grouped };
+    case 'list':
+    default:
+      const selectedFields = operation.fields || ['id'];
+      const items = docs.map(doc => {
+        const item = {};
+        selectedFields.forEach(field => {
+          item[field] = doc[field];
+        });
+        return item;
+      });
+      return { items };
+  }
+}
+
+// CREATE Operation Handler
+async function executeCreateOperation(operation, restaurantId, userId) {
+  const data = operation.data || {};
+  
+  // Security: Always add restaurantId and audit fields
+  const documentData = {
+    ...data,
+    restaurantId,
+    createdAt: new Date(),
+    updatedAt: new Date(),
+    createdBy: userId
+  };
+  
+  // Collection-specific validation and defaults
+  switch (operation.collection) {
+    case 'tables':
+      if (!data.name) throw new Error('Table name is required');
+      documentData.status = data.status || 'available';
+      documentData.capacity = data.capacity || 4;
+      documentData.section = data.section || 'Main';
+      break;
+    case 'customers':
+      if (!data.name && !data.phone) throw new Error('Customer name or phone is required');
+      break;
+    case 'inventory':
+      if (!data.name) throw new Error('Inventory item name is required');
+      documentData.currentStock = data.currentStock || 0;
+      documentData.minStock = data.minStock || 0;
+      break;
+  }
+  
+  const docRef = await db.collection(operation.collection).add(documentData);
+  
+  return {
+    success: true,
+    id: docRef.id,
+    message: `${operation.collection.slice(0, -1)} created successfully`
+  };
+}
+
+// UPDATE Operation Handler
+async function executeUpdateOperation(operation, restaurantId, userId) {
+  const { filters, data } = operation;
+  
+  if (!filters || !data) {
+    throw new Error('Update operation requires filters and data');
+  }
+  
+  // Find documents to update
+  let query = db.collection(operation.collection).where('restaurantId', '==', restaurantId);
+  const snapshot = await query.get();
+  
+  let docsToUpdate = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+  
+  // Apply filters client-side
+  if (filters) {
+    docsToUpdate = docsToUpdate.filter(doc => {
+      for (const [field, value] of Object.entries(filters)) {
+        if (doc[field] !== sanitizeInput(value)) return false;
+      }
+      return true;
+    });
+  }
+  
+  if (docsToUpdate.length === 0) {
+    return { success: false, message: 'No documents found to update' };
+  }
+  
+  // Update documents
+  const updateData = {
+    ...data,
+    updatedAt: new Date(),
+    updatedBy: userId
+  };
+  
+  const batch = db.batch();
+  docsToUpdate.forEach(doc => {
+    const docRef = db.collection(operation.collection).doc(doc.id);
+    batch.update(docRef, updateData);
+  });
+  
+  await batch.commit();
+  
+  return {
+    success: true,
+    updatedCount: docsToUpdate.length,
+    message: `${docsToUpdate.length} ${operation.collection} updated successfully`
+  };
+}
+
+// DELETE Operation Handler
+async function executeDeleteOperation(operation, restaurantId, userId) {
+  const { filters } = operation;
+  
+  if (!filters) {
+    throw new Error('Delete operation requires filters');
+  }
+  
+  // Find documents to delete
+  let query = db.collection(operation.collection).where('restaurantId', '==', restaurantId);
+  const snapshot = await query.get();
+  
+  let docsToDelete = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+  
+  // Apply filters client-side
+  docsToDelete = docsToDelete.filter(doc => {
+    for (const [field, value] of Object.entries(filters)) {
+      if (doc[field] !== sanitizeInput(value)) return false;
+    }
+    return true;
+  });
+  
+  if (docsToDelete.length === 0) {
+    return { success: false, message: 'No documents found to delete' };
+  }
+  
+  // Delete documents
+  const batch = db.batch();
+  docsToDelete.forEach(doc => {
+    const docRef = db.collection(operation.collection).doc(doc.id);
+    batch.delete(docRef);
+  });
+  
+  await batch.commit();
+  
+  return {
+    success: true,
+    deletedCount: docsToDelete.length,
+    message: `${docsToDelete.length} ${operation.collection} deleted successfully`
+  };
 }
 
 // Get restaurant static data and FAQ
@@ -1906,7 +2366,7 @@ app.patch('/api/menus/item/:id', authenticateToken, async (req, res) => {
     // Update categories as well
     const updatedCategories = currentMenu.categories.map(category => ({
       ...category,
-      items: category.items.map(item => {
+      items: (category.items || []).map(item => {
         if (item.id === id) {
           return { ...item, ...updateData };
         }
@@ -1984,7 +2444,7 @@ app.delete('/api/menus/item/:id', authenticateToken, async (req, res) => {
     // Update categories as well
     const updatedCategories = currentMenu.categories.map(category => ({
       ...category,
-      items: category.items.map(item => {
+      items: (category.items || []).map(item => {
         if (item.id === id) {
           return { 
             ...item, 
@@ -7080,171 +7540,6 @@ app.delete('/api/categories/:restaurantId/:categoryId', authenticateToken, async
 
 // ==================== DINEBOT API ENDPOINT ====================
 
-// DineBot Query Endpoint
-app.post('/api/dinebot/query', authenticateToken, async (req, res) => {
-  try {
-    const { query, restaurantId } = req.body;
-    const userId = req.user.userId;
-    
-    console.log(`🤖 DineBot Query: "${query}" from user ${userId} for restaurant ${restaurantId}`);
-    
-    // Security: Sanitize input
-    const sanitizedQuery = sanitizeInput(query);
-    if (!sanitizedQuery) {
-      return res.status(400).json({
-        success: false,
-        error: 'Invalid query format'
-      });
-    }
-    
-    // Security: Validate restaurant access
-    const hasAccess = await validateRestaurantAccess(userId, restaurantId);
-    if (!hasAccess) {
-      return res.status(403).json({
-        success: false,
-        error: 'Access denied to restaurant data'
-      });
-    }
-    
-    // Step 1: Use ChatGPT to understand the query dynamically
-    const databaseSchema = generateDatabaseSchema(restaurantId);
-    
-    const prompt = `
-You are DineBot, an intelligent restaurant management assistant.
-
-${databaseSchema}
-
-Based on this query: "${sanitizedQuery}"
-
-Determine what database operations are needed and respond with JSON:
-
-{
-  "operations": [
-    {
-      "collection": "orders",
-      "filters": {"createdAt": "today"},
-      "fields": ["totalAmount"],
-      "aggregation": "sum"
-    }
-  ],
-  "responseTemplate": "Today's revenue is ₹{orders.sum} 💰",
-  "intent": "revenue_today",
-  "confidence": 0.9
-}
-
-Examples:
-Query: "How many orders today?"
-Response: {"operations": [{"collection": "orders", "filters": {"createdAt": "today"}, "fields": ["id"], "aggregation": "count"}], "responseTemplate": "Today we have {orders.count} orders 📊", "intent": "orders_today", "confidence": 0.9}
-
-Query: "What's our revenue today?"
-Response: {"operations": [{"collection": "orders", "filters": {"createdAt": "today", "status": "completed"}, "fields": ["totalAmount"], "aggregation": "sum"}], "responseTemplate": "Today's revenue is ₹{orders.sum} 💰", "intent": "revenue_today", "confidence": 0.9}
-
-Query: "Show me popular items today"
-Response: {"operations": [{"collection": "orders", "filters": {"createdAt": "today"}, "fields": ["items"], "aggregation": "groupBy"}], "responseTemplate": "Most popular items today: {orders.grouped} 🍽️", "intent": "popular_items", "confidence": 0.8}
-
-Query: "How many customers today?"
-Response: {"operations": [{"collection": "orders", "filters": {"createdAt": "today"}, "fields": ["customer"], "aggregation": "count"}], "responseTemplate": "We served {orders.count} customers today 👥", "intent": "customers_today", "confidence": 0.9}
-
-Query: "table status 2"
-Response: {"operations": [{"collection": "tables", "filters": {"name": "2"}, "fields": ["status", "currentOrderId"], "aggregation": "list"}], "responseTemplate": "Table 2 is currently {tables.items[0].status} 🍽️", "intent": "table_status", "confidence": 0.9}
-
-Query: "how many tables are occupied"
-Response: {"operations": [{"collection": "tables", "filters": {"status": "occupied"}, "fields": ["id"], "aggregation": "count"}], "responseTemplate": "Currently {tables.count} tables are occupied 🍽️", "intent": "occupied_tables", "confidence": 0.9}
-
-Query: "show me all reserved tables"
-Response: {"operations": [{"collection": "tables", "filters": {"status": "reserved"}, "fields": ["name", "floor", "capacity"], "aggregation": "list"}], "responseTemplate": "Reserved tables: {tables.items}", "intent": "reserved_tables", "confidence": 0.9}
-
-Query: "how many customers visited today"
-Response: {"operations": [{"collection": "orders", "filters": {"createdAt": "today"}, "fields": ["customer"], "aggregation": "count"}], "responseTemplate": "We served {orders.count} customers today 👥", "intent": "customers_today", "confidence": 0.9}
-
-Query: "what is our revenue this month"
-Response: {"operations": [{"collection": "orders", "filters": {"createdAt": "this_month", "status": "completed"}, "fields": ["totalAmount"], "aggregation": "sum"}], "responseTemplate": "Revenue this month: ₹{orders.sum} 💰", "intent": "monthly_revenue", "confidence": 0.9}
-
-Query: "show me low stock items"
-Response: {"operations": [{"collection": "inventory", "filters": {"currentStock": "< minStock"}, "fields": ["name", "currentStock", "minStock"], "aggregation": "list"}], "responseTemplate": "Low stock items: {inventory.items}", "intent": "low_stock", "confidence": 0.9}
-
-Query: "how many pending orders"
-Response: {"operations": [{"collection": "orders", "filters": {"status": "pending"}, "fields": ["id"], "aggregation": "count"}], "responseTemplate": "There are {orders.count} pending orders 📋", "intent": "pending_orders", "confidence": 0.9}
-
-Query: "average order value today"
-Response: {"operations": [{"collection": "orders", "filters": {"createdAt": "today", "status": "completed"}, "fields": ["totalAmount"], "aggregation": "average"}], "responseTemplate": "Average order value today: ₹{orders.average} 📊", "intent": "avg_order_value", "confidence": 0.9}
-
-Query: "which floor has most tables"
-Response: {"operations": [{"collection": "tables", "filters": {}, "fields": ["floor"], "aggregation": "groupBy"}], "responseTemplate": "Floor distribution: {tables.grouped}", "intent": "floor_distribution", "confidence": 0.8}
-
-Query: "show me customer feedback"
-Response: {"operations": [{"collection": "feedback", "filters": {"createdAt": "this_week"}, "fields": ["rating", "comment", "category"], "aggregation": "list"}], "responseTemplate": "Recent feedback: {feedback.items}", "intent": "customer_feedback", "confidence": 0.9}
-
-IMPORTANT: 
-- ALL operations MUST include restaurantId filter (automatically added)
-- Use only the collections and fields listed in the schema
-- Be specific with date filters (today, yesterday, this_week, etc.)
-- Use appropriate aggregation types (count, sum, groupBy, list, average)
-- Keep responseTemplate concise and friendly
-- Include relevant emojis
-- CRITICAL: Avoid complex queries with multiple filters - use simple queries and let the system filter client-side
-
-Response:`;
-
-    const completion = await openai.chat.completions.create({
-      model: 'gpt-3.5-turbo',
-      messages: [
-        {
-          role: 'user',
-          content: prompt
-        }
-      ],
-      max_tokens: 400,
-      temperature: dinebotConfig.temperature,
-    });
-
-    let queryPlan;
-    try {
-      queryPlan = JSON.parse(completion.choices[0].message.content.trim());
-    } catch (parseError) {
-      console.error('Failed to parse ChatGPT response:', parseError);
-      return res.status(500).json({
-        success: false,
-        error: 'Failed to understand query'
-      });
-    }
-    
-    // Step 2: Execute dynamic database queries
-    const data = await executeSecureQuery(queryPlan.operations, restaurantId, userId);
-    
-    // Step 3: Get restaurant static data
-    const restaurantData = await getRestaurantStaticData(restaurantId);
-    if (!restaurantData) {
-      return res.status(404).json({
-        success: false,
-        error: 'Restaurant not found'
-      });
-    }
-    
-    // Step 4: Generate response using ChatGPT
-    const response = await generateDynamicResponse(sanitizedQuery, data, restaurantData, queryPlan.intent);
-    
-    console.log(`✅ DineBot Response: "${response}"`);
-    
-    res.json({
-      success: true,
-      response: response,
-      data: data,
-      intent: queryPlan.intent,
-      confidence: queryPlan.confidence,
-      restaurant: restaurantData.name,
-      timestamp: new Date().toISOString()
-    });
-    
-  } catch (error) {
-    console.error('DineBot query error:', error);
-    res.status(500).json({
-      success: false,
-      error: 'Failed to process query',
-      message: error.message
-    });
-  }
-});
 
 // DineBot Status Endpoint
 app.get('/api/dinebot/status', authenticateToken, async (req, res) => {

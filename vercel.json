@@ -4,14 +4,30 @@
     {
       "src": "index.js",
       "use": "@vercel/node"
+    },
+    {
+      "src": "api/graphql.js",
+      "use": "@vercel/node"
     }
   ],
   "rewrites": [
+    {
+      "source": "/api/graphql",
+      "destination": "/api/graphql.js"
+    },
     {
       "source": "/(.*)",
       "destination": "/index.js"
     }
   ],
+  "functions": {
+    "api/graphql.js": {
+      "maxDuration": 30
+    },
+    "index.js": {
+      "maxDuration": 30
+    }
+  },
   "env": {
     "NODE_ENV": "production"
   },
