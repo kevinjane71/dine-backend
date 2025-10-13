@@ -2,7 +2,7 @@ const { db, collections } = require('../firebase');
 
 // ChatGPT API Usage Limiter
 const chatgptUsageLimiter = {
-  // Default configuration (can be overridden by DB config)
+  // Default configuration (can be overridden by DB config) 
   defaultConfig: {
     dailyLimit: 5,
     resetTime: '00:00', // UTC time for daily reset
