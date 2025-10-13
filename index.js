@@ -1937,6 +1937,7 @@ app.get('/api/public/menu/:restaurantId', async (req, res) => {
         spiceLevel: item.spiceLevel || 'medium',
         shortCode: item.shortCode || item.name.substring(0, 3).toUpperCase(),
         image: item.image || null,
+        images: item.images || [], // Add images array
         allergens: item.allergens || []
       }));
 
@@ -3462,6 +3463,216 @@ async function calculateOrderTotal(items) {
 const paymentRoutes = initializePaymentRoutes(db, razorpay);
 app.use('/api/payments', paymentRoutes);
 
+
+// Menu item image upload API
+app.post('/api/menu-items/:itemId/images', authenticateToken, upload.array('images', 4), async (req, res) => {
+  try {
+    const { itemId } = req.params;
+    const { userId } = req.user;
+    const files = req.files;
+
+    console.log('Menu item image upload:', {
+      itemId,
+      userId,
+      filesCount: files ? files.length : 0
+    });
+
+    if (!files || files.length === 0) {
+      return res.status(400).json({ error: 'No images uploaded' });
+    }
+
+    if (files.length > 4) {
+      return res.status(400).json({ error: 'Maximum 4 images allowed per menu item' });
+    }
+
+    // Validate file types
+    const allowedTypes = ['image/jpeg', 'image/png', 'image/jpg', 'image/webp'];
+    for (const file of files) {
+      if (!allowedTypes.includes(file.mimetype)) {
+        return res.status(400).json({ 
+          error: `Invalid file type: ${file.originalname}. Only JPEG, PNG, and WebP images are allowed.` 
+        });
+      }
+    }
+
+    // Find the menu item in the restaurant's menu structure
+    console.log('🔍 Looking up menu item with ID:', itemId);
+    
+    // We need to find which restaurant this menu item belongs to
+    // Since we don't have restaurantId in the URL, we'll need to search through restaurants
+    const restaurantsSnapshot = await db.collection('restaurants').get();
+    let menuItem = null;
+    let restaurantId = null;
+    let restaurantDoc = null;
+    
+    for (const restaurantDocSnapshot of restaurantsSnapshot.docs) {
+      const restaurantData = restaurantDocSnapshot.data();
+      if (restaurantData.ownerId === userId && restaurantData.menu && restaurantData.menu.items) {
+        const foundItem = restaurantData.menu.items.find(item => item.id === itemId);
+        if (foundItem) {
+          menuItem = foundItem;
+          restaurantId = restaurantDocSnapshot.id;
+          restaurantDoc = restaurantDocSnapshot;
+          break;
+        }
+      }
+    }
+    
+    if (!menuItem) {
+      console.log('❌ Menu item not found in any restaurant');
+      return res.status(404).json({ error: 'Menu item not found' });
+    }
+    
+    console.log('✅ Found menu item:', { name: menuItem.name, restaurantId });
+
+    const uploadedImages = [];
+
+    // Upload images to Firebase Storage
+    for (let i = 0; i < files.length; i++) {
+      const file = files[i];
+      try {
+        const filename = `menu-items/${menuItem.restaurantId}/${itemId}/${Date.now()}-${i}-${file.originalname}`;
+        const blob = bucket.file(filename);
+        
+        await blob.save(file.buffer, {
+          contentType: file.mimetype,
+          metadata: {
+            restaurantId: menuItem.restaurantId,
+            menuItemId: itemId,
+            uploadedAt: new Date().toISOString(),
+            uploadedBy: userId
+          }
+        });
+        
+        const imageUrl = `https://storage.googleapis.com/${bucket.name}/${filename}`;
+        uploadedImages.push({
+          url: imageUrl,
+          filename: filename,
+          originalName: file.originalname,
+          size: file.size,
+          mimetype: file.mimetype,
+          uploadedAt: new Date().toISOString()
+        });
+        
+        console.log(`✅ Image ${i + 1} uploaded successfully: ${imageUrl}`);
+      } catch (error) {
+        console.error(`❌ Error uploading image ${i + 1}:`, error);
+        return res.status(500).json({ 
+          error: `Failed to upload image ${file.originalname}: ${error.message}` 
+        });
+      }
+    }
+
+    // Update menu item with new images in restaurant's menu structure
+    const existingImages = menuItem.images || [];
+    const updatedImages = [...existingImages, ...uploadedImages];
+    
+    // Update the menu item in the restaurant's menu structure
+    const restaurantData = restaurantDoc.data();
+    const updatedMenuItems = restaurantData.menu.items.map(item => 
+      item.id === itemId 
+        ? { ...item, images: updatedImages, updatedAt: new Date().toISOString() }
+        : item
+    );
+    
+    // Update the restaurant document
+    await restaurantDoc.ref.update({
+      'menu.items': updatedMenuItems,
+      'menu.lastUpdated': new Date().toISOString()
+    });
+
+    console.log(`✅ Menu item ${itemId} updated with ${uploadedImages.length} new images`);
+
+    res.json({
+      success: true,
+      message: `Successfully uploaded ${uploadedImages.length} image(s)`,
+      images: uploadedImages,
+      totalImages: updatedImages.length
+    });
+
+  } catch (error) {
+    console.error('Error uploading menu item images:', error);
+    res.status(500).json({ error: 'Failed to upload images' });
+  }
+});
+
+// Delete menu item image API
+app.delete('/api/menu-items/:itemId/images/:imageIndex', authenticateToken, async (req, res) => {
+  try {
+    const { itemId, imageIndex } = req.params;
+    const { userId } = req.user;
+
+    // Find the menu item in the restaurant's menu structure
+    const restaurantsSnapshot = await db.collection('restaurants').get();
+    let menuItem = null;
+    let restaurantId = null;
+    let restaurantDoc = null;
+    
+    for (const restaurantDocSnapshot of restaurantsSnapshot.docs) {
+      const restaurantData = restaurantDocSnapshot.data();
+      if (restaurantData.ownerId === userId && restaurantData.menu && restaurantData.menu.items) {
+        const foundItem = restaurantData.menu.items.find(item => item.id === itemId);
+        if (foundItem) {
+          menuItem = foundItem;
+          restaurantId = restaurantDocSnapshot.id;
+          restaurantDoc = restaurantDocSnapshot;
+          break;
+        }
+      }
+    }
+    
+    if (!menuItem) {
+      return res.status(404).json({ error: 'Menu item not found' });
+    }
+
+    const images = menuItem.images || [];
+    const index = parseInt(imageIndex);
+    
+    if (index < 0 || index >= images.length) {
+      return res.status(400).json({ error: 'Invalid image index' });
+    }
+
+    const imageToDelete = images[index];
+    
+    // Delete from Firebase Storage
+    try {
+      const filename = imageToDelete.filename;
+      if (filename) {
+        const blob = bucket.file(filename);
+        await blob.delete();
+        console.log(`✅ Deleted image from storage: ${filename}`);
+      }
+    } catch (storageError) {
+      console.warn('Warning: Could not delete image from storage:', storageError.message);
+    }
+
+    // Remove from array and update restaurant's menu structure
+    const updatedImages = images.filter((_, i) => i !== index);
+    
+    const restaurantData = restaurantDoc.data();
+    const updatedMenuItems = restaurantData.menu.items.map(item => 
+      item.id === itemId 
+        ? { ...item, images: updatedImages, updatedAt: new Date().toISOString() }
+        : item
+    );
+    
+    // Update the restaurant document
+    await restaurantDoc.ref.update({
+      'menu.items': updatedMenuItems,
+      'menu.lastUpdated': new Date().toISOString()
+    });
+
+    res.json({
+      success: true,
+      message: 'Image deleted successfully',
+      remainingImages: updatedImages.length
+    });
+
+  } catch (error) {
+    console.error('Error deleting menu item image:', error);
+    res.status(500).json({ error: 'Failed to delete image' });
+  }
+});
 
 // Bulk menu upload API
 app.post('/api/menus/bulk-upload/:restaurantId', authenticateToken, upload.array('menuFiles', 10), async (req, res) => {
