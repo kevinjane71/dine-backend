@@ -23,6 +23,9 @@ const { vercelRateLimiter } = require('./middleware/vercelRateLimiter');
 // ChatGPT Usage Limiter
 const chatgptUsageLimiter = require('./middleware/chatgptUsageLimiter');
 
+// Subdomain Context Middleware
+const { subdomainContext, generateSubdomain, isSubdomainAvailable } = require('./middleware/subdomainContext');
+
 // DineBot Configuration
 const dinebotConfig = {
   name: 'DineBot',
@@ -136,11 +139,27 @@ const upload = multer({
 
 const corsOptions = {
   origin: (origin, callback) => {
-    if (!origin || allowedOrigins.includes(origin)) {
-      callback(null, true);
-    } else {
-      callback(new Error("CORS not allowed"));
+    // Allow requests with no origin (like mobile apps or curl requests)
+    if (!origin) {
+      return callback(null, true);
     }
+    
+    // Check if origin is in allowed list
+    if (allowedOrigins.includes(origin)) {
+      return callback(null, true);
+    }
+    
+    // Allow localhost subdomains for development (e.g., temp.localhost:3002)
+    if (origin.match(/^http:\/\/[a-z0-9-]+\.localhost:3002$/)) {
+      return callback(null, true);
+    }
+    
+    // Allow production subdomains (e.g., restaurant-name.dineopen.com)
+    if (origin.match(/^https:\/\/[a-z0-9-]+\.dineopen\.com$/)) {
+      return callback(null, true);
+    }
+    
+    callback(new Error("CORS not allowed"));
   },
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS', 'PATCH'],
@@ -1223,10 +1242,37 @@ app.post('/api/auth/google', async (req, res) => {
       userId = userRef.id;
       isNewUser = true;
 
-      // Create default restaurant for new Gmail users
+      // Create default restaurant for new Gmail users with random name
       try {
+        // Generate random restaurant name
+        const randomNames = [
+          'Golden Spoon', 'Royal Kitchen', 'Spice Garden', 'Flavor Palace', 'Taste Haven',
+          'Culinary Corner', 'Gourmet Spot', 'Foodie Hub', 'Dining Delight', 'Kitchen Magic',
+          'Flavor Fusion', 'Taste Buds', 'Culinary Craft', 'Food Paradise', 'Dining Dreams',
+          'Kitchen Stories', 'Flavor Quest', 'Taste Trail', 'Culinary Journey', 'Food Explorer'
+        ];
+        const randomName = randomNames[Math.floor(Math.random() * randomNames.length)];
+        
+        // Generate subdomain from random name
+        const { generateSubdomain, isSubdomainAvailable } = require('./middleware/subdomainContext');
+        let subdomain = generateSubdomain(randomName);
+        let subdomainCounter = 1;
+        let finalSubdomain = subdomain;
+
+        // Check if subdomain already exists and make it unique
+        while (true) {
+          const isAvailable = await isSubdomainAvailable(finalSubdomain);
+          if (isAvailable) {
+            break;
+          }
+          
+          finalSubdomain = `${subdomain}-${subdomainCounter}`;
+          subdomainCounter++;
+        }
+
         const defaultRestaurant = {
-          name: 'My Restaurant',
+          name: randomName,
+          subdomain: finalSubdomain,
           description: 'Welcome to your restaurant! You can customize this information later.',
           address: '',
           phone: '',
@@ -1274,6 +1320,20 @@ app.post('/api/auth/google', async (req, res) => {
 
         const restaurantRef = await db.collection(collections.restaurants).add(defaultRestaurant);
         console.log(`✅ Default restaurant created for new Gmail user ${userId}: ${restaurantRef.id}`);
+        
+        // Create user-restaurant relationship
+        await db.collection(collections.userRestaurants).add({
+          userId: userId,
+          restaurantId: restaurantRef.id,
+          role: 'owner',
+          createdAt: new Date(),
+          updatedAt: new Date()
+        });
+
+        // Generate QR code with subdomain
+        const qrData = `https://${finalSubdomain}.dineopen.com`;
+        const qrCode = await QRCode.toDataURL(qrData);
+        await restaurantRef.update({ qrCode, qrData });
         
         // Update user to mark setup as complete
         await userRef.update({
@@ -1346,6 +1406,24 @@ app.post('/api/auth/google', async (req, res) => {
 
     const userRole = userDoc.empty ? 'owner' : userDoc.docs[0].data().role;
 
+    // Get restaurant information for new users
+    let restaurantInfo = null;
+    if (isNewUser && hasRestaurants) {
+      const restaurantsQuery = await db.collection(collections.restaurants)
+        .where('ownerId', '==', userId)
+        .limit(1)
+        .get();
+      
+      if (!restaurantsQuery.empty) {
+        const restaurantData = restaurantsQuery.docs[0].data();
+        restaurantInfo = {
+          id: restaurantsQuery.docs[0].id,
+          name: restaurantData.name,
+          subdomain: restaurantData.subdomain
+        };
+      }
+    }
+
     const jwtToken = jwt.sign(
       { userId, email, role: userRole },
       process.env.JWT_SECRET,
@@ -1364,7 +1442,8 @@ app.post('/api/auth/google', async (req, res) => {
       },
       isNewUser,
       hasRestaurants,
-      redirectTo: hasRestaurants ? '/dashboard' : '/admin'
+      restaurant: restaurantInfo,
+      redirectTo: isNewUser && restaurantInfo ? `https://${restaurantInfo.subdomain}.dineopen.com` : '/restaurant-selection'
     });
 
   } catch (error) {
@@ -1470,10 +1549,37 @@ app.post('/api/auth/firebase/verify', async (req, res) => {
       userId = userRef.id;
       isNewUser = true;
 
-      // Create default restaurant for new users
+      // Create default restaurant for new users with random name
       try {
+        // Generate random restaurant name
+        const randomNames = [
+          'Golden Spoon', 'Royal Kitchen', 'Spice Garden', 'Flavor Palace', 'Taste Haven',
+          'Culinary Corner', 'Gourmet Spot', 'Foodie Hub', 'Dining Delight', 'Kitchen Magic',
+          'Flavor Fusion', 'Taste Buds', 'Culinary Craft', 'Food Paradise', 'Dining Dreams',
+          'Kitchen Stories', 'Flavor Quest', 'Taste Trail', 'Culinary Journey', 'Food Explorer'
+        ];
+        const randomName = randomNames[Math.floor(Math.random() * randomNames.length)];
+        
+        // Generate subdomain from random name
+        const { generateSubdomain, isSubdomainAvailable } = require('./middleware/subdomainContext');
+        let subdomain = generateSubdomain(randomName);
+        let subdomainCounter = 1;
+        let finalSubdomain = subdomain;
+
+        // Check if subdomain already exists and make it unique
+        while (true) {
+          const isAvailable = await isSubdomainAvailable(finalSubdomain);
+          if (isAvailable) {
+            break;
+          }
+          
+          finalSubdomain = `${subdomain}-${subdomainCounter}`;
+          subdomainCounter++;
+        }
+
         const defaultRestaurant = {
-          name: 'My Restaurant',
+          name: randomName,
+          subdomain: finalSubdomain,
           description: 'Welcome to your restaurant! You can customize this information later.',
           address: '',
           phone: phoneNumber || '',
@@ -1521,6 +1627,20 @@ app.post('/api/auth/firebase/verify', async (req, res) => {
 
         const restaurantRef = await db.collection(collections.restaurants).add(defaultRestaurant);
         console.log(`✅ Default restaurant created for new user ${userId}: ${restaurantRef.id}`);
+        
+        // Create user-restaurant relationship
+        await db.collection(collections.userRestaurants).add({
+          userId: userId,
+          restaurantId: restaurantRef.id,
+          role: 'owner',
+          createdAt: new Date(),
+          updatedAt: new Date()
+        });
+
+        // Generate QR code with subdomain
+        const qrData = `https://${finalSubdomain}.dineopen.com`;
+        const qrCode = await QRCode.toDataURL(qrData);
+        await restaurantRef.update({ qrCode, qrData });
         
         // Update user to mark setup as complete
         await userRef.update({
@@ -1585,6 +1705,14 @@ app.post('/api/auth/firebase/verify', async (req, res) => {
       }));
     }
 
+    // Determine redirect URL
+    let redirectTo = '/restaurant-selection';
+    if (isNewUser && userRestaurants.length > 0 && userRestaurants[0].subdomain) {
+      redirectTo = `https://${userRestaurants[0].subdomain}.dineopen.com`;
+    } else if (userRestaurants.length === 1 && userRestaurants[0].subdomain) {
+      redirectTo = `https://${userRestaurants[0].subdomain}.dineopen.com`;
+    }
+
     res.json({
       message: 'Firebase verification successful',
       token,
@@ -1602,7 +1730,7 @@ app.post('/api/auth/firebase/verify', async (req, res) => {
       isNewUser,
       hasRestaurants,
       restaurants: userRestaurants,
-      redirectTo: hasRestaurants ? '/dashboard' : '/admin'
+      redirectTo
     });
 
   } catch (error) {
@@ -1623,26 +1751,92 @@ app.post('/api/auth/phone/verify-otp', async (req, res) => {
       return res.status(400).json({ error: 'Phone and OTP are required' });
     }
 
+    // Helper function to normalize phone number
+    const normalizePhone = (phone) => {
+      if (!phone) return null;
+      // Remove all non-digit characters
+      const digits = phone.replace(/\D/g, '');
+      
+      // Handle Indian phone numbers
+      if (digits.length === 12 && digits.startsWith('91')) {
+        // Remove country code for Indian numbers
+        return digits.substring(2);
+      } else if (digits.length === 10) {
+        // Already a 10-digit number
+        return digits;
+      } else if (digits.length === 11 && digits.startsWith('0')) {
+        // Remove leading zero
+        return digits.substring(1);
+      }
+      
+      // Return as-is for other formats
+      return digits;
+    };
+
     const otpQuery = await db.collection('otp_verification')
       .where('phone', '==', phone)
       .where('otp', '==', otp)
       .limit(1)
       .get();
 
+    // If OTP not found with exact phone, try with normalized phone
+    let otpDoc = null;
     if (otpQuery.empty) {
+      const normalizedPhone = normalizePhone(phone);
+      if (normalizedPhone) {
+        // Try to find OTP with normalized phone
+        const normalizedOtpQuery = await db.collection('otp_verification')
+          .where('otp', '==', otp)
+          .get();
+        
+        otpDoc = normalizedOtpQuery.docs.find(doc => {
+          const storedPhone = normalizePhone(doc.data().phone);
+          return storedPhone === normalizedPhone;
+        });
+      }
+    } else {
+      otpDoc = otpQuery.docs[0];
+    }
+
+    if (!otpDoc) {
       return res.status(400).json({ error: 'Invalid OTP' });
     }
 
-    const otpDoc = otpQuery.docs[0];
     const otpData = otpDoc.data();
 
     if (new Date() > otpData.otpExpiry.toDate()) {
       return res.status(400).json({ error: 'OTP expired' });
     }
 
+    // Try to find user with exact phone match first
     let userDoc = await db.collection(collections.users)
       .where('phone', '==', phone)
       .get();
+
+    console.log(`🔍 Phone login attempt: ${phone}`);
+    console.log(`📞 Exact match found: ${!userDoc.empty}`);
+
+    // If not found, try with normalized phone
+    if (userDoc.empty) {
+      const normalizedPhone = normalizePhone(phone);
+      console.log(`🔧 Normalized phone: ${normalizedPhone}`);
+      
+      if (normalizedPhone) {
+        // Get all users and find by normalized phone
+        const allUsers = await db.collection(collections.users).get();
+        const matchingUser = allUsers.docs.find(doc => {
+          const userPhone = normalizePhone(doc.data().phone);
+          return userPhone === normalizedPhone;
+        });
+        
+        if (matchingUser) {
+          console.log(`✅ Found user with normalized phone: ${matchingUser.id}`);
+          userDoc = { docs: [matchingUser], empty: false };
+        } else {
+          console.log(`❌ No user found with normalized phone: ${normalizedPhone}`);
+        }
+      }
+    }
 
     let userId, isNewUser = false, hasRestaurants = false;
 
@@ -1664,10 +1858,37 @@ app.post('/api/auth/phone/verify-otp', async (req, res) => {
       userId = userRef.id;
       isNewUser = true;
 
-      // Create default restaurant for new users
+      // Create default restaurant for new users with random name
       try {
+        // Generate random restaurant name
+        const randomNames = [
+          'Golden Spoon', 'Royal Kitchen', 'Spice Garden', 'Flavor Palace', 'Taste Haven',
+          'Culinary Corner', 'Gourmet Spot', 'Foodie Hub', 'Dining Delight', 'Kitchen Magic',
+          'Flavor Fusion', 'Taste Buds', 'Culinary Craft', 'Food Paradise', 'Dining Dreams',
+          'Kitchen Stories', 'Flavor Quest', 'Taste Trail', 'Culinary Journey', 'Food Explorer'
+        ];
+        const randomName = randomNames[Math.floor(Math.random() * randomNames.length)];
+        
+        // Generate subdomain from random name
+        const { generateSubdomain, isSubdomainAvailable } = require('./middleware/subdomainContext');
+        let subdomain = generateSubdomain(randomName);
+        let subdomainCounter = 1;
+        let finalSubdomain = subdomain;
+
+        // Check if subdomain already exists and make it unique
+        while (true) {
+          const isAvailable = await isSubdomainAvailable(finalSubdomain);
+          if (isAvailable) {
+            break;
+          }
+          
+          finalSubdomain = `${subdomain}-${subdomainCounter}`;
+          subdomainCounter++;
+        }
+
         const defaultRestaurant = {
-          name: 'My Restaurant',
+          name: randomName,
+          subdomain: finalSubdomain,
           description: 'Welcome to your restaurant! You can customize this information later.',
           address: '',
           phone: phone,
@@ -1716,6 +1937,20 @@ app.post('/api/auth/phone/verify-otp', async (req, res) => {
         const restaurantRef = await db.collection(collections.restaurants).add(defaultRestaurant);
         console.log(`✅ Default restaurant created for new phone user ${userId}: ${restaurantRef.id}`);
         
+        // Create user-restaurant relationship
+        await db.collection(collections.userRestaurants).add({
+          userId: userId,
+          restaurantId: restaurantRef.id,
+          role: 'owner',
+          createdAt: new Date(),
+          updatedAt: new Date()
+        });
+
+        // Generate QR code with subdomain
+        const qrData = `https://${finalSubdomain}.dineopen.com`;
+        const qrCode = await QRCode.toDataURL(qrData);
+        await restaurantRef.update({ qrCode, qrData });
+        
         // Update user to mark setup as complete
         await userRef.update({
           setupComplete: true,
@@ -1749,6 +1984,27 @@ app.post('/api/auth/phone/verify-otp', async (req, res) => {
 
     await otpDoc.ref.delete();
 
+    // Get user's restaurants for the response
+    let userRestaurants = [];
+    let redirectTo = '/restaurant-selection';
+    
+    if (hasRestaurants) {
+      const restaurantsQuery = await db.collection(collections.restaurants)
+        .where('ownerId', '==', userId)
+        .get();
+      userRestaurants = restaurantsQuery.docs.map(doc => ({
+        id: doc.id,
+        ...doc.data()
+      }));
+      
+      // Determine redirect URL
+      if (isNewUser && userRestaurants.length > 0 && userRestaurants[0].subdomain) {
+        redirectTo = `https://${userRestaurants[0].subdomain}.dineopen.com`;
+      } else if (userRestaurants.length === 1 && userRestaurants[0].subdomain) {
+        redirectTo = `https://${userRestaurants[0].subdomain}.dineopen.com`;
+      }
+    }
+
     const token = jwt.sign(
       { userId, phone, role: 'owner' },
       process.env.JWT_SECRET,
@@ -1762,11 +2018,14 @@ app.post('/api/auth/phone/verify-otp', async (req, res) => {
         id: userId,
         phone,
         name: name || userDoc.docs[0]?.data()?.name || 'Restaurant Owner',
-        role: 'owner'
+        role: 'owner',
+        restaurantId: userRestaurants.length > 0 ? userRestaurants[0].id : null,
+        restaurant: userRestaurants.length > 0 ? userRestaurants[0] : null
       },
       isNewUser,
       hasRestaurants,
-      redirectTo: hasRestaurants ? '/dashboard' : '/admin'
+      restaurants: userRestaurants,
+      redirectTo
     });
 
   } catch (error) {
@@ -1825,8 +2084,25 @@ app.post('/api/restaurants', authenticateToken, async (req, res) => {
       return res.status(400).json({ error: 'Restaurant name is required' });
     }
 
+    // Generate subdomain from restaurant name
+    let subdomain = generateSubdomain(name);
+    let subdomainCounter = 1;
+    let finalSubdomain = subdomain;
+
+    // Check if subdomain already exists and make it unique
+    while (true) {
+      const isAvailable = await isSubdomainAvailable(finalSubdomain);
+      if (isAvailable) {
+        break;
+      }
+      
+      finalSubdomain = `${subdomain}-${subdomainCounter}`;
+      subdomainCounter++;
+    }
+
     const restaurantData = {
       name,
+      subdomain: finalSubdomain,
       address: address || null,
       city: req.body.city || null,
       phone: phone || null,
@@ -1837,6 +2113,7 @@ app.post('/api/restaurants', authenticateToken, async (req, res) => {
       features: features || [],
       ownerId: userId,
       status: 'active',
+      isActive: true,
       createdAt: new Date(),
       updatedAt: new Date()
     };
@@ -1852,7 +2129,7 @@ app.post('/api/restaurants', authenticateToken, async (req, res) => {
       updatedAt: new Date()
     });
 
-    const qrData = `${process.env.FRONTEND_URL}/menu/${restaurantRef.id}`;
+    const qrData = `https://${finalSubdomain}.dineopen.com`;
     const qrCode = await QRCode.toDataURL(qrData);
 
     await restaurantRef.update({ qrCode, qrData });
@@ -1930,6 +2207,58 @@ app.delete('/api/restaurants/:restaurantId', authenticateToken, async (req, res)
   } catch (error) {
     console.error('Delete restaurant error:', error);
     res.status(500).json({ error: 'Failed to delete restaurant' });
+  }
+});
+
+// Public API - Get restaurant by subdomain
+app.get('/api/public/restaurant-by-subdomain/:subdomain', vercelSecurityMiddleware.publicAPI, async (req, res) => {
+  try {
+    const { subdomain } = req.params;
+
+    if (!subdomain) {
+      return res.status(400).json({ error: 'Subdomain is required' });
+    }
+
+    // Search for restaurant by subdomain
+    const snapshot = await db.collection(collections.restaurants)
+      .where('subdomain', '==', subdomain)
+      .where('isActive', '==', true)
+      .limit(1)
+      .get();
+
+    if (snapshot.empty) {
+      return res.status(404).json({ error: 'Restaurant not found' });
+    }
+
+    const restaurantDoc = snapshot.docs[0];
+    const restaurantData = restaurantDoc.data();
+
+    // Return minimal restaurant data for public access
+    const publicRestaurantData = {
+      id: restaurantDoc.id,
+      name: restaurantData.name,
+      subdomain: restaurantData.subdomain,
+      description: restaurantData.description,
+      address: restaurantData.address,
+      phone: restaurantData.phone,
+      email: restaurantData.email,
+      logo: restaurantData.logo,
+      coverImage: restaurantData.coverImage,
+      menu: restaurantData.menu,
+      settings: {
+        currency: restaurantData.settings?.currency || 'INR',
+        timezone: restaurantData.settings?.timezone || 'Asia/Kolkata'
+      }
+    };
+
+    res.json({
+      success: true,
+      restaurant: publicRestaurantData
+    });
+
+  } catch (error) {
+    console.error('Error fetching restaurant by subdomain:', error);
+    res.status(500).json({ error: 'Failed to fetch restaurant' });
   }
 });
 
@@ -2796,9 +3125,15 @@ app.post('/api/orders', async (req, res) => {
   }
 });
 
-app.get('/api/orders/:restaurantId', authenticateToken, async (req, res) => {
+app.get('/api/orders/:restaurantId', subdomainContext, authenticateToken, async (req, res) => {
   try {
-    const { restaurantId } = req.params;
+    // Use subdomain context if available, otherwise use URL parameter
+    const restaurantId = req.restaurantId || req.params.restaurantId;
+    
+    if (!restaurantId) {
+      return res.status(400).json({ error: 'Restaurant ID is required' });
+    }
+    
     const { 
       page = 1, 
       limit = 10, 
@@ -4109,9 +4444,14 @@ app.get('/api/menus/upload-status/:restaurantId', authenticateToken, async (req,
 
 
 // Table Management APIs
-app.get('/api/tables/:restaurantId', async (req, res) => {
+app.get('/api/tables/:restaurantId', subdomainContext, authenticateToken, async (req, res) => {
   try {
-    const { restaurantId } = req.params;
+    // Use subdomain context if available, otherwise use URL parameter
+    const restaurantId = req.restaurantId || req.params.restaurantId;
+    
+    if (!restaurantId) {
+      return res.status(400).json({ error: 'Restaurant ID is required' });
+    }
 
     const snapshot = await db.collection(collections.tables)
       .where('restaurantId', '==', restaurantId)
@@ -8193,7 +8533,250 @@ app.post('/api/admin/chatgpt/cleanup', authenticateToken, async (req, res) => {
   }
 });
 
-// ==================== END CHATGPT USAGE MANAGEMENT ====================
+// Update restaurant subdomain
+app.put('/api/restaurants/:restaurantId/subdomain', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+    const { subdomain } = req.body;
+    const { userId } = req.user;
+
+    if (!subdomain) {
+      return res.status(400).json({ error: 'Subdomain is required' });
+    }
+
+    // Validate subdomain format
+    const subdomainRegex = /^[a-z0-9-]+$/;
+    if (!subdomainRegex.test(subdomain) || subdomain.length < 3 || subdomain.length > 30) {
+      return res.status(400).json({ 
+        error: 'Subdomain must be 3-30 characters long and contain only lowercase letters, numbers, and hyphens' 
+      });
+    }
+
+    // Check if user owns the restaurant
+    const restaurant = await db.collection(collections.restaurants).doc(restaurantId).get();
+    if (!restaurant.exists || restaurant.data().ownerId !== userId) {
+      return res.status(403).json({ error: 'Access denied' });
+    }
+
+    // Check if subdomain is already taken
+    const existingRestaurant = await db.collection(collections.restaurants)
+      .where('subdomain', '==', subdomain)
+      .limit(1)
+      .get();
+    
+    if (!existingRestaurant.empty && existingRestaurant.docs[0].id !== restaurantId) {
+      return res.status(400).json({ error: 'Subdomain is already taken' });
+    }
+
+    // Update restaurant with new subdomain
+    await db.collection(collections.restaurants).doc(restaurantId).update({
+      subdomain,
+      updatedAt: new Date()
+    });
+
+    // Generate new QR code with subdomain
+    const qrData = `https://${subdomain}.dineopen.com`;
+    const qrCode = await QRCode.toDataURL(qrData);
+    
+    await db.collection(collections.restaurants).doc(restaurantId).update({ 
+      qrCode, 
+      qrData 
+    });
+
+    res.json({
+      success: true,
+      message: 'Subdomain updated successfully',
+      subdomain,
+      qrData
+    });
+
+  } catch (error) {
+    console.error('Update subdomain error:', error);
+    res.status(500).json({ error: 'Failed to update subdomain' });
+  }
+});
+
+// Check subdomain availability
+app.get('/api/restaurants/subdomain-availability/:subdomain', authenticateToken, async (req, res) => {
+  try {
+    const { subdomain } = req.params;
+
+    // Validate subdomain format
+    const subdomainRegex = /^[a-z0-9-]+$/;
+    if (!subdomainRegex.test(subdomain) || subdomain.length < 3 || subdomain.length > 30) {
+      return res.json({
+        available: false,
+        reason: 'Invalid format. Must be 3-30 characters with only lowercase letters, numbers, and hyphens'
+      });
+    }
+
+    // Check if subdomain is already taken
+    const existingRestaurant = await db.collection(collections.restaurants)
+      .where('subdomain', '==', subdomain)
+      .limit(1)
+      .get();
+    
+    if (!existingRestaurant.empty) {
+      return res.json({
+        available: false,
+        reason: 'Subdomain is already taken'
+      });
+    }
+
+    res.json({
+      available: true,
+      subdomain
+    });
+
+  } catch (error) {
+    console.error('Check subdomain availability error:', error);
+    res.status(500).json({ error: 'Failed to check subdomain availability' });
+  }
+});
+
+// ==================== SUBDOMAIN MANAGEMENT ====================
+
+// Get restaurant by subdomain (public API)
+app.get('/api/public/restaurant-by-subdomain/:subdomain', vercelSecurityMiddleware.publicAPI, async (req, res) => {
+  try {
+    const { subdomain } = req.params;
+
+    if (!subdomain) {
+      return res.status(400).json({ error: 'Subdomain is required' });
+    }
+
+    // Search for restaurant by subdomain
+    const snapshot = await db.collection(collections.restaurants)
+      .where('subdomain', '==', subdomain)
+      .where('isActive', '==', true)
+      .limit(1)
+      .get();
+
+    if (snapshot.empty) {
+      return res.status(404).json({ error: 'Restaurant not found' });
+    }
+
+    const restaurantDoc = snapshot.docs[0];
+    const restaurantData = restaurantDoc.data();
+
+    // Return minimal restaurant data for public access
+    const publicRestaurantData = {
+      id: restaurantDoc.id,
+      name: restaurantData.name,
+      subdomain: restaurantData.subdomain,
+      description: restaurantData.description,
+      address: restaurantData.address,
+      phone: restaurantData.phone,
+      email: restaurantData.email,
+      logo: restaurantData.logo,
+      coverImage: restaurantData.coverImage,
+      menu: restaurantData.menu,
+      settings: {
+        currency: restaurantData.settings?.currency || 'INR',
+        timezone: restaurantData.settings?.timezone || 'Asia/Kolkata'
+      }
+    };
+
+    res.json({
+      success: true,
+      restaurant: publicRestaurantData
+    });
+
+  } catch (error) {
+    console.error('Error fetching restaurant by subdomain:', error);
+    res.status(500).json({ error: 'Failed to fetch restaurant' });
+  }
+});
+
+// Check subdomain availability
+app.get('/api/restaurants/subdomain-availability/:subdomain', authenticateToken, async (req, res) => {
+  try {
+    const { subdomain } = req.params;
+
+    // Validate subdomain format
+    const { isValidRestaurantSubdomain } = require('./middleware/subdomainContext');
+    if (!isValidRestaurantSubdomain(subdomain)) {
+      return res.json({
+        available: false,
+        reason: 'Invalid format. Must be 3-30 characters with only lowercase letters, numbers, and hyphens'
+      });
+    }
+
+    // Check if subdomain is available
+    const isAvailable = await isSubdomainAvailable(subdomain);
+    
+    res.json({
+      available: isAvailable,
+      subdomain: isAvailable ? subdomain : null,
+      reason: isAvailable ? null : 'Subdomain is already taken'
+    });
+
+  } catch (error) {
+    console.error('Check subdomain availability error:', error);
+    res.status(500).json({ error: 'Failed to check subdomain availability' });
+  }
+});
+
+// Update restaurant subdomain
+app.put('/api/restaurants/:restaurantId/subdomain', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+    const { subdomain } = req.body;
+    const { userId } = req.user;
+
+    if (!subdomain) {
+      return res.status(400).json({ error: 'Subdomain is required' });
+    }
+
+    // Validate subdomain format
+    const { isValidRestaurantSubdomain } = require('./middleware/subdomainContext');
+    if (!isValidRestaurantSubdomain(subdomain)) {
+      return res.status(400).json({ 
+        error: 'Subdomain must be 3-30 characters long and contain only lowercase letters, numbers, and hyphens' 
+      });
+    }
+
+    // Check if user owns the restaurant
+    const restaurant = await db.collection(collections.restaurants).doc(restaurantId).get();
+    if (!restaurant.exists || restaurant.data().ownerId !== userId) {
+      return res.status(403).json({ error: 'Access denied' });
+    }
+
+    // Check if subdomain is available
+    const isAvailable = await isSubdomainAvailable(subdomain, restaurantId);
+    if (!isAvailable) {
+      return res.status(400).json({ error: 'Subdomain is already taken' });
+    }
+
+    // Update restaurant with new subdomain
+    await db.collection(collections.restaurants).doc(restaurantId).update({
+      subdomain,
+      updatedAt: new Date()
+    });
+
+    // Generate new QR code with subdomain
+    const qrData = `https://${subdomain}.dineopen.com`;
+    const qrCode = await QRCode.toDataURL(qrData);
+    
+    await db.collection(collections.restaurants).doc(restaurantId).update({ 
+      qrCode, 
+      qrData 
+    });
+
+    res.json({
+      success: true,
+      message: 'Subdomain updated successfully',
+      subdomain,
+      qrData
+    });
+
+  } catch (error) {
+    console.error('Update subdomain error:', error);
+    res.status(500).json({ error: 'Failed to update subdomain' });
+  }
+});
+
+// ==================== END SUBDOMAIN MANAGEMENT ====================
 
 // ==================== END EMAIL SERVICE API ====================
 

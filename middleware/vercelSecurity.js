@@ -209,17 +209,17 @@ const vercelSecurityMiddleware = {
 
   // Public API security (most restrictive)
   publicAPI: function(req, res, next) {
-    return this.middleware('public')(req, res, next);
+    return vercelSecurityMiddleware.middleware('public')(req, res, next);
   },
 
   // Authenticated API security (less restrictive)
   authenticatedAPI: function(req, res, next) {
-    return this.middleware('authenticated')(req, res, next);
+    return vercelSecurityMiddleware.middleware('authenticated')(req, res, next);
   },
 
   // Chatbot API security (moderate)
   chatbotAPI: function(req, res, next) {
-    return this.middleware('chatbot')(req, res, next);
+    return vercelSecurityMiddleware.middleware('chatbot')(req, res, next);
   },
 
   // Add IP to block list
