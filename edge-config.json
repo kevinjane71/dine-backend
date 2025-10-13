@@ -1,0 +1,27 @@
+{
+  "version": 1,
+  "config": {
+    "rateLimits": {
+      "public": {
+        "windowMs": 900000,
+        "maxRequests": 100,
+        "blockDurationMs": 3600000
+      },
+      "authenticated": {
+        "windowMs": 900000,
+        "maxRequests": 1000,
+        "blockDurationMs": 1800000
+      },
+      "chatbot": {
+        "windowMs": 900000,
+        "maxRequests": 200,
+        "blockDurationMs": 3600000
+      }
+    },
+    "security": {
+      "enableBlocking": true,
+      "enableLogging": true,
+      "cleanupInterval": 3600000
+    }
+  }
+}

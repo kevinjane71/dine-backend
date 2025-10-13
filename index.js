@@ -16,6 +16,13 @@ require('dotenv').config();
 
 const { db, collections } = require('./firebase');
 
+// Security middleware (Vercel-compatible)
+const vercelSecurityMiddleware = require('./middleware/vercelSecurity');
+const { vercelRateLimiter } = require('./middleware/vercelRateLimiter');
+
+// ChatGPT Usage Limiter
+const chatgptUsageLimiter = require('./middleware/chatgptUsageLimiter');
+
 // DineBot Configuration
 const dinebotConfig = {
   name: 'DineBot',
@@ -152,6 +159,28 @@ app.use(bodyParser.urlencoded({ extended: true, limit: '10mb' }));
 app.use((req, res, next) => {
   req.id = Math.random().toString(36).substring(2, 15);
   res.setHeader('X-Request-ID', req.id);
+  next();
+});
+
+// Security middleware setup
+console.log('🔒 Initializing security middleware...');
+
+// Global security headers
+app.use((req, res, next) => {
+  // Add security headers
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('X-Frame-Options', 'DENY');
+  res.setHeader('X-XSS-Protection', '1; mode=block');
+  res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+  res.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=()');
+  
+  // Log all requests for monitoring
+  const clientIP = req.headers['x-forwarded-for']?.split(',')[0]?.trim() || 
+                   req.headers['x-real-ip'] || 
+                   req.connection.remoteAddress || 
+                   'unknown';
+  
+  console.log(`📊 Request: ${req.method} ${req.url} from ${clientIP}`);
   next();
 });
 
@@ -1316,7 +1345,7 @@ app.post('/api/auth/google', async (req, res) => {
     }
 
     const userRole = userDoc.empty ? 'owner' : userDoc.docs[0].data().role;
-    
+
     const jwtToken = jwt.sign(
       { userId, email, role: userRole },
       process.env.JWT_SECRET,
@@ -1905,7 +1934,7 @@ app.delete('/api/restaurants/:restaurantId', authenticateToken, async (req, res)
 });
 
 // Public API - Get menu for customer ordering (no authentication required)
-app.get('/api/public/menu/:restaurantId', async (req, res) => {
+app.get('/api/public/menu/:restaurantId', vercelSecurityMiddleware.publicAPI, async (req, res) => {
   try {
     const { restaurantId } = req.params;
 
@@ -2263,7 +2292,7 @@ app.delete('/api/menus/item/:id', authenticateToken, async (req, res) => {
 });
 
 // Public API - Place order with OTP verification
-app.post('/api/public/orders/:restaurantId', async (req, res) => {
+app.post('/api/public/orders/:restaurantId', vercelSecurityMiddleware.publicAPI, async (req, res) => {
   try {
     const { restaurantId } = req.params;
     const { 
@@ -3355,8 +3384,8 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
             await oldTableDoc.ref.update({
               status: 'available',
               currentOrderId: null,
-              updatedAt: new Date()
-            });
+        updatedAt: new Date()
+      });
             console.log('✅ Old table freed:', currentOrder.tableNumber);
           }
         }
@@ -3675,7 +3704,7 @@ app.delete('/api/menu-items/:itemId/images/:imageIndex', authenticateToken, asyn
 });
 
 // Bulk menu upload API
-app.post('/api/menus/bulk-upload/:restaurantId', authenticateToken, upload.array('menuFiles', 10), async (req, res) => {
+app.post('/api/menus/bulk-upload/:restaurantId', chatgptUsageLimiter.middleware(), authenticateToken, upload.array('menuFiles', 10), async (req, res) => {
   try {
     console.log(`\n=== BULK UPLOAD REQUEST RECEIVED ===`);
     const { restaurantId } = req.params;
@@ -3760,6 +3789,9 @@ app.post('/api/menus/bulk-upload/:restaurantId', authenticateToken, upload.array
           const menuData = await extractMenuFromImage(uploadedFile.url);
           console.log('✅ AI extraction successful!');
           console.log('Extracted items:', menuData.menuItems ? menuData.menuItems.length : 0);
+          
+          // Record successful ChatGPT API call for menu extraction
+          await chatgptUsageLimiter.recordSuccessfulCall(req, 0);
           
           // Add original file info to each menu item
           const menuItemsWithFile = (menuData.menuItems || []).map(item => ({
@@ -7534,12 +7566,95 @@ app.delete('/api/categories/:restaurantId/:categoryId', authenticateToken, async
   }
 });
 
+// ==================== SECURITY MONITORING ====================
+
+// Security monitoring endpoint (admin only)
+app.get('/api/admin/security/stats', authenticateToken, async (req, res) => {
+  try {
+    const user = req.user;
+    
+    // Check if user is admin/owner
+    const userDoc = await db.collection(collections.users).doc(user.userId).get();
+    if (!userDoc.exists) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+    
+    const userData = userDoc.data();
+    if (!['OWNER', 'ADMIN'].includes(userData.role)) {
+      return res.status(403).json({ error: 'Access denied. Admin role required.' });
+    }
+
+    const stats = await vercelSecurityMiddleware.getStats();
+    res.json({
+      success: true,
+      stats: {
+        ...stats,
+        timestamp: new Date().toISOString(),
+        uptime: process.uptime()
+      }
+    });
+  } catch (error) {
+    console.error('Security stats error:', error);
+    res.status(500).json({ error: 'Failed to get security stats' });
+  }
+});
+
+// Block IP endpoint (admin only)
+app.post('/api/admin/security/block-ip', authenticateToken, async (req, res) => {
+  try {
+    const user = req.user;
+    const { ip, duration } = req.body;
+    
+    // Check if user is admin/owner
+    const userDoc = await db.collection(collections.users).doc(user.userId).get();
+    if (!userDoc.exists) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+    
+    const userData = userDoc.data();
+    if (!['OWNER', 'ADMIN'].includes(userData.role)) {
+      return res.status(403).json({ error: 'Access denied. Admin role required.' });
+    }
+
+    if (!ip) {
+      return res.status(400).json({ error: 'IP address is required' });
+    }
+
+    const blockDuration = duration || 60 * 60 * 1000; // Default 1 hour
+    await vercelSecurityMiddleware.blockIP(ip, blockDuration);
+    
+    await vercelSecurityMiddleware.logSecurityEvent(req, 'MANUAL_IP_BLOCK', { ip, duration: blockDuration });
+    
+    res.json({
+      success: true,
+      message: `IP ${ip} blocked for ${blockDuration / 1000 / 60} minutes`
+    });
+  } catch (error) {
+    console.error('Block IP error:', error);
+    res.status(500).json({ error: 'Failed to block IP' });
+  }
+});
+
+// Health check endpoint with security info
+app.get('/api/health', async (req, res) => {
+  const stats = await vercelSecurityMiddleware.getStats();
+  res.json({
+    status: 'healthy',
+    timestamp: new Date().toISOString(),
+    uptime: process.uptime(),
+    security: {
+      blockedIPs: stats.blockedIPs,
+      activeClients: stats.rateLimitClients
+    }
+  });
+});
+
 // ==================== DINEBOT API ENDPOINT ====================
 
 
 // DineBot Status Endpoint
 // Simple Intent-Based Chatbot endpoint
-app.post('/api/dinebot/query', authenticateToken, async (req, res) => {
+app.post('/api/dinebot/query', vercelSecurityMiddleware.chatbotAPI, chatgptUsageLimiter.middleware(), authenticateToken, async (req, res) => {
   try {
     const { query: userQuery, restaurantId } = req.body;
     const userId = req.user.userId;
@@ -7601,6 +7716,11 @@ app.post('/api/dinebot/query', authenticateToken, async (req, res) => {
     };
 
     const result = await chatbot.processQuery(userQuery, restaurantId, userId, apiClient, db);
+
+    // Record successful ChatGPT API call
+    if (result.success) {
+      await chatgptUsageLimiter.recordSuccessfulCall(req, 0); // We don't track exact tokens for chatbot
+    }
 
     res.json({
       success: result.success,
@@ -7928,6 +8048,152 @@ app.post('/api/email/weekly-analytics', authenticateToken, async (req, res) => {
     });
   }
 });
+
+// ==================== CHATGPT USAGE MANAGEMENT ====================
+
+// Get ChatGPT usage statistics (admin only)
+app.get('/api/admin/chatgpt/stats', authenticateToken, async (req, res) => {
+  try {
+    const user = req.user;
+    
+    // Check if user is admin/owner
+    const userDoc = await db.collection(collections.users).doc(user.userId).get();
+    if (!userDoc.exists) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+    
+    const userData = userDoc.data();
+    if (!['OWNER', 'ADMIN'].includes(userData.role)) {
+      return res.status(403).json({ error: 'Access denied. Admin role required.' });
+    }
+
+    const stats = await chatgptUsageLimiter.getUsageStats();
+    const config = await chatgptUsageLimiter.getConfig();
+    
+    res.json({
+      success: true,
+      stats: {
+        ...stats,
+        config,
+        timestamp: new Date().toISOString()
+      }
+    });
+  } catch (error) {
+    console.error('ChatGPT stats error:', error);
+    res.status(500).json({ error: 'Failed to get ChatGPT stats' });
+  }
+});
+
+// Update ChatGPT limits configuration (admin only)
+app.post('/api/admin/chatgpt/config', authenticateToken, async (req, res) => {
+  try {
+    const user = req.user;
+    const { dailyLimit, ipLimit, userLimit, enabled } = req.body;
+    
+    // Check if user is admin/owner
+    const userDoc = await db.collection(collections.users).doc(user.userId).get();
+    if (!userDoc.exists) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+    
+    const userData = userDoc.data();
+    if (!['OWNER', 'ADMIN'].includes(userData.role)) {
+      return res.status(403).json({ error: 'Access denied. Admin role required.' });
+    }
+
+    const newConfig = {
+      dailyLimit: dailyLimit || 5,
+      ipLimit: ipLimit || 10,
+      userLimit: userLimit || 5,
+      enabled: enabled !== undefined ? enabled : true
+    };
+
+    const success = await chatgptUsageLimiter.updateConfig(newConfig);
+    
+    if (success) {
+      res.json({
+        success: true,
+        message: 'ChatGPT limits configuration updated successfully',
+        config: newConfig
+      });
+    } else {
+      res.status(500).json({ error: 'Failed to update configuration' });
+    }
+  } catch (error) {
+    console.error('Update ChatGPT config error:', error);
+    res.status(500).json({ error: 'Failed to update ChatGPT configuration' });
+  }
+});
+
+// Get user's ChatGPT usage (user can check their own usage)
+app.get('/api/chatgpt/usage', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const ipAddress = req.headers['x-forwarded-for']?.split(',')[0]?.trim() || 
+                     req.headers['x-real-ip'] || 
+                     req.connection?.remoteAddress || 
+                     'unknown';
+
+    const userUsage = await chatgptUsageLimiter.getUserUsage(userId);
+    const ipUsage = await chatgptUsageLimiter.getIPUsage(ipAddress);
+    const config = await chatgptUsageLimiter.getConfig();
+    
+    res.json({
+      success: true,
+      usage: {
+        user: {
+          callCount: userUsage?.callCount || 0,
+          limit: config.userLimit,
+          remaining: Math.max(0, config.userLimit - (userUsage?.callCount || 0)),
+          lastCallAt: userUsage?.lastCallAt
+        },
+        ip: {
+          callCount: ipUsage?.callCount || 0,
+          limit: config.ipLimit,
+          remaining: Math.max(0, config.ipLimit - (ipUsage?.callCount || 0)),
+          lastCallAt: ipUsage?.lastCallAt
+        },
+        config: {
+          enabled: config.enabled,
+          resetTime: chatgptUsageLimiter.getNextResetTime()
+        }
+      }
+    });
+  } catch (error) {
+    console.error('Get ChatGPT usage error:', error);
+    res.status(500).json({ error: 'Failed to get ChatGPT usage' });
+  }
+});
+
+// Clean up old ChatGPT usage data (admin only)
+app.post('/api/admin/chatgpt/cleanup', authenticateToken, async (req, res) => {
+  try {
+    const user = req.user;
+    
+    // Check if user is admin/owner
+    const userDoc = await db.collection(collections.users).doc(user.userId).get();
+    if (!userDoc.exists) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+    
+    const userData = userDoc.data();
+    if (!['OWNER', 'ADMIN'].includes(userData.role)) {
+      return res.status(403).json({ error: 'Access denied. Admin role required.' });
+    }
+
+    await chatgptUsageLimiter.cleanupOldData();
+    
+    res.json({
+      success: true,
+      message: 'Old ChatGPT usage data cleaned up successfully'
+    });
+  } catch (error) {
+    console.error('ChatGPT cleanup error:', error);
+    res.status(500).json({ error: 'Failed to cleanup ChatGPT data' });
+  }
+});
+
+// ==================== END CHATGPT USAGE MANAGEMENT ====================
 
 // ==================== END EMAIL SERVICE API ====================
 
