@@ -8634,6 +8634,56 @@ app.get('/api/restaurants/subdomain-availability/:subdomain', authenticateToken,
   }
 });
 
+// Get restaurant by subdomain (authenticated API)
+app.get('/api/restaurants/by-subdomain/:subdomain', authenticateToken, async (req, res) => {
+  try {
+    const { subdomain } = req.params;
+    const userId = req.user.id;
+
+    if (!subdomain) {
+      return res.status(400).json({ error: 'Subdomain is required' });
+    }
+
+    // Search for restaurant by subdomain
+    const snapshot = await db.collection(collections.restaurants)
+      .where('subdomain', '==', subdomain)
+      .where('isActive', '==', true)
+      .limit(1)
+      .get();
+
+    if (snapshot.empty) {
+      return res.status(404).json({ error: 'Restaurant not found' });
+    }
+
+    const restaurantDoc = snapshot.docs[0];
+    const restaurantData = restaurantDoc.data();
+
+    // Check if user has access to this restaurant
+    const userRestaurantQuery = await db.collection(collections.userRestaurants)
+      .where('userId', '==', userId)
+      .where('restaurantId', '==', restaurantDoc.id)
+      .limit(1)
+      .get();
+
+    if (userRestaurantQuery.empty) {
+      return res.status(403).json({ error: 'Access denied to this restaurant' });
+    }
+
+    // Return restaurant data
+    res.json({
+      success: true,
+      restaurant: {
+        id: restaurantDoc.id,
+        ...restaurantData
+      }
+    });
+
+  } catch (error) {
+    console.error('Get restaurant by subdomain error:', error);
+    res.status(500).json({ error: 'Failed to get restaurant' });
+  }
+});
+
 // ==================== SUBDOMAIN MANAGEMENT ====================
 
 // Get restaurant by subdomain (public API)
