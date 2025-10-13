@@ -1751,6 +1751,25 @@ app.post('/api/auth/phone/verify-otp', async (req, res) => {
       return res.status(400).json({ error: 'Phone and OTP are required' });
     }
 
+    // Check if request is coming from a subdomain
+    const hostname = req.headers.host || '';
+    let subdomain = null;
+    
+    // Check for localhost subdomains (e.g., myrestaurant.localhost:3003)
+    if (hostname.includes('localhost')) {
+      const localhostParts = hostname.split('.localhost');
+      if (localhostParts.length > 1) {
+        subdomain = localhostParts[0];
+      }
+    }
+    // Check for production subdomains (e.g., restaurant-name.dineopen.com)
+    else if (hostname.includes('.dineopen.com')) {
+      const subdomainParts = hostname.split('.');
+      if (subdomainParts.length > 2) {
+        subdomain = subdomainParts[0];
+      }
+    }
+
     // Helper function to normalize phone number
     const normalizePhone = (phone) => {
       if (!phone) return null;
@@ -2003,6 +2022,53 @@ app.post('/api/auth/phone/verify-otp', async (req, res) => {
       } else if (userRestaurants.length === 1 && userRestaurants[0].subdomain) {
         redirectTo = `https://${userRestaurants[0].subdomain}.dineopen.com`;
       }
+    }
+
+    // If login is from a subdomain, validate user access to that restaurant
+    if (subdomain && subdomain !== 'www') {
+      console.log(`🏢 Subdomain login detected: ${subdomain}`);
+      
+      // Find restaurant by subdomain
+      const restaurantBySubdomain = await db.collection(collections.restaurants)
+        .where('subdomain', '==', subdomain)
+        .where('isActive', '==', true)
+        .limit(1)
+        .get();
+      
+      if (restaurantBySubdomain.empty) {
+        return res.status(404).json({ 
+          error: 'Restaurant not found',
+          message: `No restaurant found with subdomain: ${subdomain}`
+        });
+      }
+      
+      const restaurantDoc = restaurantBySubdomain.docs[0];
+      const restaurantData = restaurantDoc.data();
+      
+      // Check if user has access to this restaurant
+      const userRestaurantQuery = await db.collection(collections.userRestaurants)
+        .where('userId', '==', userId)
+        .where('restaurantId', '==', restaurantDoc.id)
+        .limit(1)
+        .get();
+      
+      if (userRestaurantQuery.empty) {
+        return res.status(403).json({ 
+          error: 'Access denied',
+          message: `You don't have access to restaurant: ${restaurantData.name}`
+        });
+      }
+      
+      console.log(`✅ User ${userId} has access to restaurant: ${restaurantData.name}`);
+      
+      // Override redirectTo to stay on subdomain
+      redirectTo = null; // Let frontend handle subdomain redirect
+      
+      // Update userRestaurants to include the subdomain restaurant
+      userRestaurants = [{
+        id: restaurantDoc.id,
+        ...restaurantData
+      }];
     }
 
     const token = jwt.sign(
