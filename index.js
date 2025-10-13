@@ -8678,9 +8678,29 @@ app.get('/api/restaurants/by-subdomain/:subdomain', authenticateToken, async (re
         console.log(`   User Agent: ${req.headers['user-agent']}`);
         console.log(`   Timestamp: ${new Date().toISOString()}`);
         
+        // Get user's restaurants for redirect
+        const userRestaurantsQuery = await db.collection(collections.userRestaurants)
+          .where('userId', '==', userId)
+          .get();
+        
+        const userRestaurantIds = userRestaurantsQuery.docs.map(doc => doc.data().restaurantId);
+        const userRestaurants = [];
+        
+        if (userRestaurantIds.length > 0) {
+          const restaurantsSnapshot = await db.collection(collections.restaurants)
+            .where('__name__', 'in', userRestaurantIds)
+            .get();
+          
+          userRestaurants.push(...restaurantsSnapshot.docs.map(doc => ({
+            id: doc.id,
+            ...doc.data()
+          })));
+        }
+        
         return res.status(403).json({ 
           error: 'Access denied to this restaurant',
-          message: 'You do not have permission to access this restaurant'
+          message: 'You do not have permission to access this restaurant',
+          userRestaurants: userRestaurants
         });
       }
 
