@@ -129,11 +129,143 @@ class RestaurantChatbot {
       apiCall: 'getCustomerHistory'
     },
 
-    // Analytics
+    // Analytics and Reporting
     'GET_ANALYTICS': {
-      keywords: ['revenue', 'sales', 'income', 'analytics', 'report'],
-      examples: ['today revenue', 'monthly sales', 'analytics report'],
+      keywords: ['revenue', 'sales', 'income', 'analytics', 'report', 'earnings', 'profit'],
+      examples: ['today revenue', 'monthly sales', 'analytics report', 'show earnings', 'profit today'],
       apiCall: 'getAnalytics'
+    },
+
+    // Staff Management
+    'GET_STAFF': {
+      keywords: ['show staff', 'list staff', 'staff members', 'employees', 'team'],
+      examples: ['show staff', 'list employees', 'staff members', 'team list'],
+      apiCall: 'getStaff'
+    },
+    'CREATE_STAFF': {
+      keywords: ['add staff', 'hire staff', 'new employee', 'add employee', 'create staff'],
+      examples: ['add new staff member', 'hire employee', 'create staff profile'],
+      apiCall: 'createStaff'
+    },
+    'UPDATE_STAFF': {
+      keywords: ['update staff', 'modify staff', 'edit staff', 'change staff'],
+      examples: ['update staff info', 'modify employee details', 'edit staff profile'],
+      apiCall: 'updateStaff'
+    },
+    'DELETE_STAFF': {
+      keywords: ['delete staff', 'remove staff', 'fire employee', 'remove employee'],
+      examples: ['delete staff member', 'remove employee', 'fire staff'],
+      apiCall: 'deleteStaff'
+    },
+
+    // Inventory Management
+    'GET_INVENTORY': {
+      keywords: ['show inventory', 'list inventory', 'stock', 'inventory items'],
+      examples: ['show inventory', 'list stock', 'inventory items', 'stock levels'],
+      apiCall: 'getInventory'
+    },
+    'CREATE_INVENTORY_ITEM': {
+      keywords: ['add inventory', 'new inventory item', 'add stock', 'create inventory'],
+      examples: ['add inventory item', 'new stock item', 'create inventory entry'],
+      apiCall: 'createInventoryItem'
+    },
+    'UPDATE_INVENTORY_ITEM': {
+      keywords: ['update inventory', 'modify inventory', 'edit inventory', 'change stock'],
+      examples: ['update inventory item', 'modify stock', 'edit inventory'],
+      apiCall: 'updateInventoryItem'
+    },
+    'DELETE_INVENTORY_ITEM': {
+      keywords: ['delete inventory', 'remove inventory', 'remove stock'],
+      examples: ['delete inventory item', 'remove stock item'],
+      apiCall: 'deleteInventoryItem'
+    },
+    'GET_INVENTORY_CATEGORIES': {
+      keywords: ['inventory categories', 'stock categories', 'inventory types'],
+      examples: ['show inventory categories', 'list stock categories'],
+      apiCall: 'getInventoryCategories'
+    },
+    'GET_INVENTORY_DASHBOARD': {
+      keywords: ['inventory dashboard', 'stock dashboard', 'inventory summary'],
+      examples: ['show inventory dashboard', 'stock summary', 'inventory overview'],
+      apiCall: 'getInventoryDashboard'
+    },
+
+    // Supplier Management
+    'GET_SUPPLIERS': {
+      keywords: ['show suppliers', 'list suppliers', 'vendors', 'supplier list'],
+      examples: ['show suppliers', 'list vendors', 'supplier database'],
+      apiCall: 'getSuppliers'
+    },
+    'CREATE_SUPPLIER': {
+      keywords: ['add supplier', 'new supplier', 'add vendor', 'create supplier'],
+      examples: ['add new supplier', 'create vendor', 'new supplier'],
+      apiCall: 'createSupplier'
+    },
+    'UPDATE_SUPPLIER': {
+      keywords: ['update supplier', 'modify supplier', 'edit supplier', 'change supplier'],
+      examples: ['update supplier info', 'modify vendor details'],
+      apiCall: 'updateSupplier'
+    },
+    'DELETE_SUPPLIER': {
+      keywords: ['delete supplier', 'remove supplier', 'remove vendor'],
+      examples: ['delete supplier', 'remove vendor'],
+      apiCall: 'deleteSupplier'
+    },
+
+    // Recipe Management
+    'GET_RECIPES': {
+      keywords: ['show recipes', 'list recipes', 'recipe book', 'recipes'],
+      examples: ['show recipes', 'list recipe book', 'all recipes'],
+      apiCall: 'getRecipes'
+    },
+    'CREATE_RECIPE': {
+      keywords: ['add recipe', 'new recipe', 'create recipe', 'add dish recipe'],
+      examples: ['add new recipe', 'create dish recipe', 'new recipe'],
+      apiCall: 'createRecipe'
+    },
+    'UPDATE_RECIPE': {
+      keywords: ['update recipe', 'modify recipe', 'edit recipe', 'change recipe'],
+      examples: ['update recipe', 'modify dish recipe', 'edit recipe'],
+      apiCall: 'updateRecipe'
+    },
+    'DELETE_RECIPE': {
+      keywords: ['delete recipe', 'remove recipe', 'remove dish recipe'],
+      examples: ['delete recipe', 'remove dish recipe'],
+      apiCall: 'deleteRecipe'
+    },
+
+    // Payment Management
+    'CREATE_PAYMENT': {
+      keywords: ['create payment', 'process payment', 'make payment', 'payment'],
+      examples: ['create payment', 'process payment', 'make payment'],
+      apiCall: 'createPayment'
+    },
+    'VERIFY_PAYMENT': {
+      keywords: ['verify payment', 'confirm payment', 'check payment'],
+      examples: ['verify payment', 'confirm payment status'],
+      apiCall: 'verifyPayment'
+    },
+
+    // Settings Management
+    'GET_SETTINGS': {
+      keywords: ['show settings', 'get settings', 'restaurant settings', 'settings'],
+      examples: ['show settings', 'restaurant settings', 'get settings'],
+      apiCall: 'getSettings'
+    },
+    'UPDATE_SETTINGS': {
+      keywords: ['update settings', 'modify settings', 'change settings', 'edit settings'],
+      examples: ['update settings', 'modify restaurant settings'],
+      apiCall: 'updateSettings'
+    },
+    'GET_TAX_SETTINGS': {
+      keywords: ['tax settings', 'tax configuration', 'tax rates'],
+      examples: ['show tax settings', 'tax configuration', 'tax rates'],
+      apiCall: 'getTaxSettings'
+    },
+    'UPDATE_TAX_SETTINGS': {
+      keywords: ['update tax', 'modify tax', 'change tax', 'edit tax'],
+      examples: ['update tax settings', 'modify tax rates'],
+      apiCall: 'updateTaxSettings'
     },
 
     // General
@@ -256,6 +388,84 @@ class RestaurantChatbot {
       // Analytics
       'GET_ANALYTICS': `Extract these parameters from the user query: ${userQuery}
       Return JSON with: {"period": "time period (today/week/month)", "type": "analytics type (revenue/sales/orders)"}`,
+
+      // Staff Management
+      'GET_STAFF': `Extract these parameters from the user query: ${userQuery}
+      Return JSON with: {"limit": "number of staff to show (optional)", "role": "staff role filter (optional)"}`,
+
+      'CREATE_STAFF': `Extract these parameters from the user query: ${userQuery}
+      Return JSON with: {"name": "staff name", "phone": "phone number", "email": "email address", "role": "staff role", "address": "address"}`,
+
+      'UPDATE_STAFF': `Extract these parameters from the user query: ${userQuery}
+      Return JSON with: {"staffId": "staff ID", "name": "new name (optional)", "phone": "new phone (optional)", "email": "new email (optional)", "role": "new role (optional)"}`,
+
+      'DELETE_STAFF': `Extract these parameters from the user query: ${userQuery}
+      Return JSON with: {"staffId": "staff ID to delete"}`,
+
+      // Inventory Management
+      'GET_INVENTORY': `Extract these parameters from the user query: ${userQuery}
+      Return JSON with: {"category": "category filter (optional)", "search": "search term (optional)"}`,
+
+      'CREATE_INVENTORY_ITEM': `Extract these parameters from the user query: ${userQuery}
+      Return JSON with: {"name": "item name", "category": "category", "quantity": "quantity", "unit": "unit", "price": "price per unit"}`,
+
+      'UPDATE_INVENTORY_ITEM': `Extract these parameters from the user query: ${userQuery}
+      Return JSON with: {"itemId": "item ID", "name": "new name (optional)", "quantity": "new quantity (optional)", "price": "new price (optional)"}`,
+
+      'DELETE_INVENTORY_ITEM': `Extract these parameters from the user query: ${userQuery}
+      Return JSON with: {"itemId": "inventory item ID to delete"}`,
+
+      'GET_INVENTORY_CATEGORIES': `Extract these parameters from the user query: ${userQuery}
+      Return JSON with: {}`,
+
+      'GET_INVENTORY_DASHBOARD': `Extract these parameters from the user query: ${userQuery}
+      Return JSON with: {}`,
+
+      // Supplier Management
+      'GET_SUPPLIERS': `Extract these parameters from the user query: ${userQuery}
+      Return JSON with: {"limit": "number of suppliers to show (optional)"}`,
+
+      'CREATE_SUPPLIER': `Extract these parameters from the user query: ${userQuery}
+      Return JSON with: {"name": "supplier name", "contact": "contact person", "phone": "phone number", "email": "email address", "address": "address"}`,
+
+      'UPDATE_SUPPLIER': `Extract these parameters from the user query: ${userQuery}
+      Return JSON with: {"supplierId": "supplier ID", "name": "new name (optional)", "contact": "new contact (optional)", "phone": "new phone (optional)"}`,
+
+      'DELETE_SUPPLIER': `Extract these parameters from the user query: ${userQuery}
+      Return JSON with: {"supplierId": "supplier ID to delete"}`,
+
+      // Recipe Management
+      'GET_RECIPES': `Extract these parameters from the user query: ${userQuery}
+      Return JSON with: {"category": "recipe category (optional)", "search": "search term (optional)"}`,
+
+      'CREATE_RECIPE': `Extract these parameters from the user query: ${userQuery}
+      Return JSON with: {"name": "recipe name", "description": "recipe description", "ingredients": "ingredients list", "instructions": "cooking instructions"}`,
+
+      'UPDATE_RECIPE': `Extract these parameters from the user query: ${userQuery}
+      Return JSON with: {"recipeId": "recipe ID", "name": "new name (optional)", "description": "new description (optional)", "ingredients": "new ingredients (optional)"}`,
+
+      'DELETE_RECIPE': `Extract these parameters from the user query: ${userQuery}
+      Return JSON with: {"recipeId": "recipe ID to delete"}`,
+
+      // Payment Management
+      'CREATE_PAYMENT': `Extract these parameters from the user query: ${userQuery}
+      Return JSON with: {"amount": "payment amount", "method": "payment method", "orderId": "order ID"}`,
+
+      'VERIFY_PAYMENT': `Extract these parameters from the user query: ${userQuery}
+      Return JSON with: {"paymentId": "payment ID", "transactionId": "transaction ID"}`,
+
+      // Settings Management
+      'GET_SETTINGS': `Extract these parameters from the user query: ${userQuery}
+      Return JSON with: {}`,
+
+      'UPDATE_SETTINGS': `Extract these parameters from the user query: ${userQuery}
+      Return JSON with: {"settings": "settings object", "key": "setting key", "value": "setting value"}`,
+
+      'GET_TAX_SETTINGS': `Extract these parameters from the user query: ${userQuery}
+      Return JSON with: {}`,
+
+      'UPDATE_TAX_SETTINGS': `Extract these parameters from the user query: ${userQuery}
+      Return JSON with: {"taxRate": "tax rate percentage", "taxType": "tax type"}`,
 
       // General
       'LOGOUT': `Extract these parameters from the user query: ${userQuery}
@@ -385,17 +595,25 @@ Respond with ONLY the intent name (e.g., GET_TABLE_STATUS). If unclear, respond 
 
         case 'getOrders':
           const ordersResponse = await this.apiClient.getOrders(restaurantId);
-          const orders = ordersResponse.orders || [];
+          const orderList = ordersResponse.orders || [];
           result = {
             success: true,
-            response: `Found ${orders.length} orders. ${orders.slice(0, 3).map(o => `Order ${o.orderNumber}: ${o.status}`).join(', ')}${orders.length > 3 ? '...' : ''}`,
-            data: orders
+            response: `Found ${orderList.length} orders. ${orderList.slice(0, 3).map(o => `Order ${o.orderNumber}: ${o.status}`).join(', ')}${orderList.length > 3 ? '...' : ''}`,
+            data: orderList
           };
           break;
 
         case 'getMenu':
-          const menuResponse = await this.apiClient.getMenu(restaurantId);
-          const menuItems = menuResponse.menuItems || [];
+          // Get menu items from database
+          const getMenuSnapshot = await db.collection('menuItems')
+            .where('restaurantId', '==', restaurantId)
+            .get();
+          
+          const menuItems = [];
+          getMenuSnapshot.forEach(doc => {
+            menuItems.push({ id: doc.id, ...doc.data() });
+          });
+          
           result = {
             success: true,
             response: `Menu has ${menuItems.length} items. ${menuItems.slice(0, 3).map(m => m.name).join(', ')}${menuItems.length > 3 ? '...' : ''}`,
@@ -405,8 +623,15 @@ Respond with ONLY the intent name (e.g., GET_TABLE_STATUS). If unclear, respond 
 
         case 'createOrder':
           // Find the menu item by name
-          const menuForOrder = await this.apiClient.getMenu(restaurantId);
-          const menuItemsForOrder = menuForOrder.menuItems || [];
+          const orderMenuSnapshot = await db.collection('menuItems')
+            .where('restaurantId', '==', restaurantId)
+            .get();
+          
+          const menuItemsForOrder = [];
+          orderMenuSnapshot.forEach(doc => {
+            menuItemsForOrder.push({ id: doc.id, ...doc.data() });
+          });
+          
           const targetItem = menuItemsForOrder.find(item => 
             extractedData.itemName && item.name.toLowerCase().includes(extractedData.itemName.toLowerCase())
           );
@@ -483,8 +708,17 @@ Respond with ONLY the intent name (e.g., GET_TABLE_STATUS). If unclear, respond 
 
         // Menu Management - Comprehensive
         case 'getMenuByCategory':
-          const menuByCategoryResponse = await this.apiClient.getMenu(restaurantId, extractedData.category);
-          const categoryItems = menuByCategoryResponse.menuItems || [];
+          // Get menu items by category from database
+          const categorySnapshot = await db.collection('menuItems')
+            .where('restaurantId', '==', restaurantId)
+            .where('category', '==', extractedData.category)
+            .get();
+          
+          const categoryItems = [];
+          categorySnapshot.forEach(doc => {
+            categoryItems.push({ id: doc.id, ...doc.data() });
+          });
+          
           result = {
             success: true,
             response: `Found ${categoryItems.length} items in ${extractedData.category} category. ${categoryItems.slice(0, 3).map(m => m.name).join(', ')}${categoryItems.length > 3 ? '...' : ''}`,
@@ -507,21 +741,35 @@ Respond with ONLY the intent name (e.g., GET_TABLE_STATUS). If unclear, respond 
             updatedAt: new Date()
           };
           
-          const menuItemResponse = await this.apiClient.createMenuItem(restaurantId, menuItemData);
+          // Create menu item directly in database
+          const menuItemDoc = await db.collection('menuItems').add({
+            ...menuItemData,
+            restaurantId: restaurantId
+          });
+          
           result = {
             success: true,
             response: `Menu item "${extractedData.name}" added successfully! Price: ₹${extractedData.price}`,
-            data: menuItemResponse
+            data: { id: menuItemDoc.id, ...menuItemData }
           };
           break;
 
         case 'updateMenuItem':
           // Find menu item by name first
-          const menuForUpdate = await this.apiClient.getMenu(restaurantId);
-          const menuItemsForUpdate = menuForUpdate.menuItems || [];
-          const itemToUpdate = menuItemsForUpdate.find(item => 
-            item.name.toLowerCase().includes(extractedData.itemName.toLowerCase())
-          );
+          const updateMenuSnapshot = await db.collection('menuItems')
+            .where('restaurantId', '==', restaurantId)
+            .get();
+          
+          let itemToUpdate = null;
+          let updateItemDocRef = null;
+          
+          updateMenuSnapshot.forEach(doc => {
+            const item = doc.data();
+            if (item.name.toLowerCase().includes(extractedData.itemName.toLowerCase())) {
+              itemToUpdate = { id: doc.id, ...item };
+              updateItemDocRef = doc.ref;
+            }
+          });
           
           if (!itemToUpdate) {
             result = {
@@ -537,7 +785,7 @@ Respond with ONLY the intent name (e.g., GET_TABLE_STATUS). If unclear, respond 
           if (extractedData.name) updateData.name = extractedData.name;
           updateData.updatedAt = new Date();
 
-          await this.apiClient.updateMenuItem(itemToUpdate.id, updateData);
+          await updateItemDocRef.update(updateData);
           result = {
             success: true,
             response: `Menu item "${extractedData.itemName}" updated successfully!`,
@@ -547,11 +795,20 @@ Respond with ONLY the intent name (e.g., GET_TABLE_STATUS). If unclear, respond 
 
         case 'deleteMenuItem':
           // Find menu item by name first
-          const menuForDelete = await this.apiClient.getMenu(restaurantId);
-          const menuItemsForDelete = menuForDelete.menuItems || [];
-          const itemToDelete = menuItemsForDelete.find(item => 
-            item.name.toLowerCase().includes(extractedData.itemName.toLowerCase())
-          );
+          const deleteMenuSnapshot = await db.collection('menuItems')
+            .where('restaurantId', '==', restaurantId)
+            .get();
+          
+          let itemToDelete = null;
+          let deleteItemDocRef = null;
+          
+          deleteMenuSnapshot.forEach(doc => {
+            const item = doc.data();
+            if (item.name.toLowerCase().includes(extractedData.itemName.toLowerCase())) {
+              itemToDelete = { id: doc.id, ...item };
+              deleteItemDocRef = doc.ref;
+            }
+          });
           
           if (!itemToDelete) {
             result = {
@@ -561,7 +818,7 @@ Respond with ONLY the intent name (e.g., GET_TABLE_STATUS). If unclear, respond 
             break;
           }
 
-          await this.apiClient.deleteMenuItem(itemToDelete.id);
+          await deleteItemDocRef.delete();
           result = {
             success: true,
             response: `Menu item "${extractedData.itemName}" deleted successfully!`
@@ -569,8 +826,16 @@ Respond with ONLY the intent name (e.g., GET_TABLE_STATUS). If unclear, respond 
           break;
 
         case 'searchMenuItems':
-          const menuForSearch = await this.apiClient.getMenu(restaurantId);
-          const allMenuItems = menuForSearch.menuItems || [];
+          // Search menu items in database
+          const searchMenuSnapshot = await db.collection('menuItems')
+            .where('restaurantId', '==', restaurantId)
+            .get();
+          
+          const allMenuItems = [];
+          searchMenuSnapshot.forEach(doc => {
+            allMenuItems.push({ id: doc.id, ...doc.data() });
+          });
+          
           const searchResults = allMenuItems.filter(item => 
             item.name.toLowerCase().includes(extractedData.searchTerm.toLowerCase()) ||
             item.description.toLowerCase().includes(extractedData.searchTerm.toLowerCase())
@@ -585,8 +850,18 @@ Respond with ONLY the intent name (e.g., GET_TABLE_STATUS). If unclear, respond 
 
         // Customer Management - Comprehensive
         case 'getCustomers':
-          const customersResponse = await this.apiClient.getCustomers(restaurantId);
-          const customers = customersResponse.customers || [];
+          // Get customers from database
+          const customersSnapshot = await db.collection('customers')
+            .where('restaurantId', '==', restaurantId)
+            .orderBy('lastOrderDate', 'desc')
+            .limit(100)
+            .get();
+          
+          const customers = [];
+          customersSnapshot.forEach(doc => {
+            customers.push({ id: doc.id, ...doc.data() });
+          });
+          
           result = {
             success: true,
             response: `Found ${customers.length} customers. ${customers.slice(0, 3).map(c => c.name).join(', ')}${customers.length > 3 ? '...' : ''}`,
@@ -610,15 +885,28 @@ Respond with ONLY the intent name (e.g., GET_TABLE_STATUS). If unclear, respond 
             updatedAt: new Date()
           };
           
-          const customerResponse = await this.apiClient.createCustomer(restaurantId, customerData);
+          // Create customer directly in database
+          const customerDoc = await db.collection('customers').add(customerData);
+          
           result = {
             success: true,
             response: `Customer "${extractedData.name}" created successfully!`,
-            data: customerResponse
+            data: { id: customerDoc.id, ...customerData }
           };
           break;
 
         case 'updateCustomer':
+          // Find customer by ID
+          const updateCustomerDoc = await db.collection('customers').doc(extractedData.customerId).get();
+          
+          if (!updateCustomerDoc.exists) {
+            result = {
+              success: false,
+              response: `Customer not found.`
+            };
+            break;
+          }
+
           const customerUpdateData = {};
           if (extractedData.name) customerUpdateData.name = extractedData.name;
           if (extractedData.phone) customerUpdateData.phone = extractedData.phone;
@@ -626,7 +914,7 @@ Respond with ONLY the intent name (e.g., GET_TABLE_STATUS). If unclear, respond 
           if (extractedData.city) customerUpdateData.city = extractedData.city;
           customerUpdateData.updatedAt = new Date();
 
-          await this.apiClient.updateCustomer(extractedData.customerId, customerUpdateData);
+          await updateCustomerDoc.ref.update(customerUpdateData);
           result = {
             success: true,
             response: `Customer updated successfully!`,
@@ -635,7 +923,17 @@ Respond with ONLY the intent name (e.g., GET_TABLE_STATUS). If unclear, respond 
           break;
 
         case 'deleteCustomer':
-          await this.apiClient.deleteCustomer(extractedData.customerId);
+          const customerToDelete = await db.collection('customers').doc(extractedData.customerId).get();
+          
+          if (!customerToDelete.exists) {
+            result = {
+              success: false,
+              response: `Customer not found.`
+            };
+            break;
+          }
+
+          await customerToDelete.ref.delete();
           result = {
             success: true,
             response: `Customer deleted successfully!`
@@ -643,8 +941,16 @@ Respond with ONLY the intent name (e.g., GET_TABLE_STATUS). If unclear, respond 
           break;
 
         case 'searchCustomer':
-          const customersForSearch = await this.apiClient.getCustomers(restaurantId);
-          const allCustomers = customersForSearch.customers || [];
+          // Search customers in database
+          const searchCustomersSnapshot = await db.collection('customers')
+            .where('restaurantId', '==', restaurantId)
+            .get();
+          
+          const allCustomers = [];
+          searchCustomersSnapshot.forEach(doc => {
+            allCustomers.push({ id: doc.id, ...doc.data() });
+          });
+          
           const customerSearchResults = allCustomers.filter(customer => {
             const searchTerm = extractedData.searchTerm.toLowerCase();
             return customer.name?.toLowerCase().includes(searchTerm) ||
@@ -660,8 +966,16 @@ Respond with ONLY the intent name (e.g., GET_TABLE_STATUS). If unclear, respond 
           break;
 
         case 'getCustomerHistory':
-          const customersForHistory = await this.apiClient.getCustomers(restaurantId);
-          const allCustomersForHistory = customersForHistory.customers || [];
+          // Get customer history from database
+          const historyCustomersSnapshot = await db.collection('customers')
+            .where('restaurantId', '==', restaurantId)
+            .get();
+          
+          const allCustomersForHistory = [];
+          historyCustomersSnapshot.forEach(doc => {
+            allCustomersForHistory.push({ id: doc.id, ...doc.data() });
+          });
+          
           const targetCustomer = allCustomersForHistory.find(customer => 
             customer.id === extractedData.customerId || 
             customer.name?.toLowerCase().includes(extractedData.customerName?.toLowerCase())
@@ -679,6 +993,589 @@ Respond with ONLY the intent name (e.g., GET_TABLE_STATUS). If unclear, respond 
             success: true,
             response: `Customer "${targetCustomer.name}" has ${targetCustomer.totalOrders} orders totaling ₹${targetCustomer.totalSpent}. Last order: ${targetCustomer.lastOrderDate ? new Date(targetCustomer.lastOrderDate).toLocaleDateString() : 'Never'}`,
             data: targetCustomer
+          };
+          break;
+
+        // Staff Management
+        case 'getStaff':
+          // Get staff from database
+          const staffSnapshot = await db.collection('staff')
+            .where('restaurantId', '==', restaurantId)
+            .get();
+          
+          const staff = [];
+          staffSnapshot.forEach(doc => {
+            staff.push({ id: doc.id, ...doc.data() });
+          });
+          
+          result = {
+            success: true,
+            response: `Found ${staff.length} staff members. ${staff.slice(0, 3).map(s => s.name).join(', ')}${staff.length > 3 ? '...' : ''}`,
+            data: staff
+          };
+          break;
+
+        case 'createStaff':
+          const staffData = {
+            name: extractedData.name,
+            phone: extractedData.phone,
+            email: extractedData.email,
+            role: extractedData.role || 'employee',
+            address: extractedData.address,
+            restaurantId: restaurantId,
+            isActive: true,
+            createdAt: new Date(),
+            updatedAt: new Date()
+          };
+          
+          const staffDoc = await db.collection('staff').add(staffData);
+          
+          result = {
+            success: true,
+            response: `Staff member "${extractedData.name}" created successfully!`,
+            data: { id: staffDoc.id, ...staffData }
+          };
+          break;
+
+        case 'updateStaff':
+          const updateStaffDoc = await db.collection('staff').doc(extractedData.staffId).get();
+          
+          if (!updateStaffDoc.exists) {
+            result = {
+              success: false,
+              response: `Staff member not found.`
+            };
+            break;
+          }
+
+          const staffUpdateData = {};
+          if (extractedData.name) staffUpdateData.name = extractedData.name;
+          if (extractedData.phone) staffUpdateData.phone = extractedData.phone;
+          if (extractedData.email) staffUpdateData.email = extractedData.email;
+          if (extractedData.role) staffUpdateData.role = extractedData.role;
+          staffUpdateData.updatedAt = new Date();
+
+          await updateStaffDoc.ref.update(staffUpdateData);
+          result = {
+            success: true,
+            response: `Staff member updated successfully!`,
+            data: staffUpdateData
+          };
+          break;
+
+        case 'deleteStaff':
+          const deleteStaffDoc = await db.collection('staff').doc(extractedData.staffId).get();
+          
+          if (!deleteStaffDoc.exists) {
+            result = {
+              success: false,
+              response: `Staff member not found.`
+            };
+            break;
+          }
+
+          await deleteStaffDoc.ref.delete();
+          result = {
+            success: true,
+            response: `Staff member deleted successfully!`
+          };
+          break;
+
+        // Inventory Management
+        case 'getInventory':
+          // Get inventory items from database
+          const inventorySnapshot = await db.collection('inventory')
+            .where('restaurantId', '==', restaurantId)
+            .get();
+          
+          const inventoryItems = [];
+          inventorySnapshot.forEach(doc => {
+            inventoryItems.push({ id: doc.id, ...doc.data() });
+          });
+          
+          result = {
+            success: true,
+            response: `Found ${inventoryItems.length} inventory items. ${inventoryItems.slice(0, 3).map(i => i.name).join(', ')}${inventoryItems.length > 3 ? '...' : ''}`,
+            data: inventoryItems
+          };
+          break;
+
+        case 'createInventoryItem':
+          const inventoryData = {
+            name: extractedData.name,
+            category: extractedData.category || 'general',
+            quantity: extractedData.quantity || 0,
+            unit: extractedData.unit || 'pieces',
+            price: extractedData.price || 0,
+            restaurantId: restaurantId,
+            createdAt: new Date(),
+            updatedAt: new Date()
+          };
+          
+          const inventoryDoc = await db.collection('inventory').add(inventoryData);
+          
+          result = {
+            success: true,
+            response: `Inventory item "${extractedData.name}" created successfully!`,
+            data: { id: inventoryDoc.id, ...inventoryData }
+          };
+          break;
+
+        case 'updateInventoryItem':
+          const updateInventoryDoc = await db.collection('inventory').doc(extractedData.itemId).get();
+          
+          if (!updateInventoryDoc.exists) {
+            result = {
+              success: false,
+              response: `Inventory item not found.`
+            };
+            break;
+          }
+
+          const inventoryUpdateData = {};
+          if (extractedData.name) inventoryUpdateData.name = extractedData.name;
+          if (extractedData.quantity) inventoryUpdateData.quantity = extractedData.quantity;
+          if (extractedData.price) inventoryUpdateData.price = extractedData.price;
+          inventoryUpdateData.updatedAt = new Date();
+
+          await updateInventoryDoc.ref.update(inventoryUpdateData);
+          result = {
+            success: true,
+            response: `Inventory item updated successfully!`,
+            data: inventoryUpdateData
+          };
+          break;
+
+        case 'deleteInventoryItem':
+          const deleteInventoryDoc = await db.collection('inventory').doc(extractedData.itemId).get();
+          
+          if (!deleteInventoryDoc.exists) {
+            result = {
+              success: false,
+              response: `Inventory item not found.`
+            };
+            break;
+          }
+
+          await deleteInventoryDoc.ref.delete();
+          result = {
+            success: true,
+            response: `Inventory item deleted successfully!`
+          };
+          break;
+
+        case 'getInventoryCategories':
+          // Get inventory categories from database
+          const categoriesSnapshot = await db.collection('inventoryCategories')
+            .where('restaurantId', '==', restaurantId)
+            .get();
+          
+          const categories = [];
+          categoriesSnapshot.forEach(doc => {
+            categories.push({ id: doc.id, ...doc.data() });
+          });
+          
+          result = {
+            success: true,
+            response: `Found ${categories.length} inventory categories. ${categories.slice(0, 3).map(c => c.name).join(', ')}${categories.length > 3 ? '...' : ''}`,
+            data: categories
+          };
+          break;
+
+        case 'getInventoryDashboard':
+          // Get inventory dashboard data
+          const dashboardSnapshot = await db.collection('inventory')
+            .where('restaurantId', '==', restaurantId)
+            .get();
+          
+          const dashboardItems = [];
+          dashboardSnapshot.forEach(doc => {
+            dashboardItems.push({ id: doc.id, ...doc.data() });
+          });
+
+          const totalItems = dashboardItems.length;
+          const lowStockItems = dashboardItems.filter(item => item.quantity < 10).length;
+          const totalValue = dashboardItems.reduce((sum, item) => sum + (item.quantity * item.price), 0);
+
+          result = {
+            success: true,
+            response: `📊 Inventory Dashboard:\n• Total Items: ${totalItems}\n• Low Stock Items: ${lowStockItems}\n• Total Value: ₹${totalValue.toFixed(2)}`,
+            data: {
+              totalItems,
+              lowStockItems,
+              totalValue,
+              items: dashboardItems.slice(0, 10)
+            }
+          };
+          break;
+
+        // Supplier Management
+        case 'getSuppliers':
+          // Get suppliers from database
+          const suppliersSnapshot = await db.collection('suppliers')
+            .where('restaurantId', '==', restaurantId)
+            .get();
+          
+          const suppliers = [];
+          suppliersSnapshot.forEach(doc => {
+            suppliers.push({ id: doc.id, ...doc.data() });
+          });
+          
+          result = {
+            success: true,
+            response: `Found ${suppliers.length} suppliers. ${suppliers.slice(0, 3).map(s => s.name).join(', ')}${suppliers.length > 3 ? '...' : ''}`,
+            data: suppliers
+          };
+          break;
+
+        case 'createSupplier':
+          const supplierData = {
+            name: extractedData.name,
+            contact: extractedData.contact,
+            phone: extractedData.phone,
+            email: extractedData.email,
+            address: extractedData.address,
+            restaurantId: restaurantId,
+            isActive: true,
+            createdAt: new Date(),
+            updatedAt: new Date()
+          };
+          
+          const supplierDoc = await db.collection('suppliers').add(supplierData);
+          
+          result = {
+            success: true,
+            response: `Supplier "${extractedData.name}" created successfully!`,
+            data: { id: supplierDoc.id, ...supplierData }
+          };
+          break;
+
+        case 'updateSupplier':
+          const updateSupplierDoc = await db.collection('suppliers').doc(extractedData.supplierId).get();
+          
+          if (!updateSupplierDoc.exists) {
+            result = {
+              success: false,
+              response: `Supplier not found.`
+            };
+            break;
+          }
+
+          const supplierUpdateData = {};
+          if (extractedData.name) supplierUpdateData.name = extractedData.name;
+          if (extractedData.contact) supplierUpdateData.contact = extractedData.contact;
+          if (extractedData.phone) supplierUpdateData.phone = extractedData.phone;
+          supplierUpdateData.updatedAt = new Date();
+
+          await updateSupplierDoc.ref.update(supplierUpdateData);
+          result = {
+            success: true,
+            response: `Supplier updated successfully!`,
+            data: supplierUpdateData
+          };
+          break;
+
+        case 'deleteSupplier':
+          const deleteSupplierDoc = await db.collection('suppliers').doc(extractedData.supplierId).get();
+          
+          if (!deleteSupplierDoc.exists) {
+            result = {
+              success: false,
+              response: `Supplier not found.`
+            };
+            break;
+          }
+
+          await deleteSupplierDoc.ref.delete();
+          result = {
+            success: true,
+            response: `Supplier deleted successfully!`
+          };
+          break;
+
+        // Recipe Management
+        case 'getRecipes':
+          // Get recipes from database
+          const recipesSnapshot = await db.collection('recipes')
+            .where('restaurantId', '==', restaurantId)
+            .get();
+          
+          const recipes = [];
+          recipesSnapshot.forEach(doc => {
+            recipes.push({ id: doc.id, ...doc.data() });
+          });
+          
+          result = {
+            success: true,
+            response: `Found ${recipes.length} recipes. ${recipes.slice(0, 3).map(r => r.name).join(', ')}${recipes.length > 3 ? '...' : ''}`,
+            data: recipes
+          };
+          break;
+
+        case 'createRecipe':
+          const recipeData = {
+            name: extractedData.name,
+            description: extractedData.description,
+            ingredients: extractedData.ingredients || [],
+            instructions: extractedData.instructions,
+            restaurantId: restaurantId,
+            createdAt: new Date(),
+            updatedAt: new Date()
+          };
+          
+          const recipeDoc = await db.collection('recipes').add(recipeData);
+          
+          result = {
+            success: true,
+            response: `Recipe "${extractedData.name}" created successfully!`,
+            data: { id: recipeDoc.id, ...recipeData }
+          };
+          break;
+
+        case 'updateRecipe':
+          const updateRecipeDoc = await db.collection('recipes').doc(extractedData.recipeId).get();
+          
+          if (!updateRecipeDoc.exists) {
+            result = {
+              success: false,
+              response: `Recipe not found.`
+            };
+            break;
+          }
+
+          const recipeUpdateData = {};
+          if (extractedData.name) recipeUpdateData.name = extractedData.name;
+          if (extractedData.description) recipeUpdateData.description = extractedData.description;
+          if (extractedData.ingredients) recipeUpdateData.ingredients = extractedData.ingredients;
+          recipeUpdateData.updatedAt = new Date();
+
+          await updateRecipeDoc.ref.update(recipeUpdateData);
+          result = {
+            success: true,
+            response: `Recipe updated successfully!`,
+            data: recipeUpdateData
+          };
+          break;
+
+        case 'deleteRecipe':
+          const deleteRecipeDoc = await db.collection('recipes').doc(extractedData.recipeId).get();
+          
+          if (!deleteRecipeDoc.exists) {
+            result = {
+              success: false,
+              response: `Recipe not found.`
+            };
+            break;
+          }
+
+          await deleteRecipeDoc.ref.delete();
+          result = {
+            success: true,
+            response: `Recipe deleted successfully!`
+          };
+          break;
+
+        // Payment Management
+        case 'createPayment':
+          const paymentData = {
+            amount: extractedData.amount,
+            method: extractedData.method || 'CASH',
+            orderId: extractedData.orderId,
+            restaurantId: restaurantId,
+            status: 'PENDING',
+            createdAt: new Date(),
+            updatedAt: new Date()
+          };
+          
+          const paymentDoc = await db.collection('payments').add(paymentData);
+          
+          result = {
+            success: true,
+            response: `Payment of ₹${extractedData.amount} created successfully!`,
+            data: { id: paymentDoc.id, ...paymentData }
+          };
+          break;
+
+        case 'verifyPayment':
+          const verifyPaymentDoc = await db.collection('payments').doc(extractedData.paymentId).get();
+          
+          if (!verifyPaymentDoc.exists) {
+            result = {
+              success: false,
+              response: `Payment not found.`
+            };
+            break;
+          }
+
+          await verifyPaymentDoc.ref.update({
+            status: 'VERIFIED',
+            transactionId: extractedData.transactionId,
+            verifiedAt: new Date(),
+            updatedAt: new Date()
+          });
+
+          result = {
+            success: true,
+            response: `Payment verified successfully!`,
+            data: { paymentId: extractedData.paymentId, status: 'VERIFIED' }
+          };
+          break;
+
+        // Settings Management
+        case 'getSettings':
+          // Get restaurant settings from database
+          const settingsDoc = await db.collection('restaurants').doc(restaurantId).get();
+          
+          if (!settingsDoc.exists) {
+            result = {
+              success: false,
+              response: `Restaurant settings not found.`
+            };
+            break;
+          }
+
+          const restaurantData = settingsDoc.data();
+          result = {
+            success: true,
+            response: `Restaurant settings loaded successfully!`,
+            data: restaurantData
+          };
+          break;
+
+        case 'updateSettings':
+          const updateSettingsDoc = await db.collection('restaurants').doc(restaurantId).get();
+          
+          if (!updateSettingsDoc.exists) {
+            result = {
+              success: false,
+              response: `Restaurant not found.`
+            };
+            break;
+          }
+
+          const settingsUpdateData = {};
+          if (extractedData.key && extractedData.value) {
+            settingsUpdateData[extractedData.key] = extractedData.value;
+          }
+          settingsUpdateData.updatedAt = new Date();
+
+          await updateSettingsDoc.ref.update(settingsUpdateData);
+          result = {
+            success: true,
+            response: `Settings updated successfully!`,
+            data: settingsUpdateData
+          };
+          break;
+
+        case 'getTaxSettings':
+          // Get tax settings from database
+          const taxDoc = await db.collection('taxSettings')
+            .where('restaurantId', '==', restaurantId)
+            .limit(1)
+            .get();
+          
+          if (taxDoc.empty) {
+            result = {
+              success: true,
+              response: `No tax settings found. Default tax rate: 0%`,
+              data: { taxRate: 0, taxType: 'percentage' }
+            };
+            break;
+          }
+
+          const taxData = taxDoc.docs[0].data();
+          result = {
+            success: true,
+            response: `Tax settings loaded successfully!`,
+            data: taxData
+          };
+          break;
+
+        case 'updateTaxSettings':
+          const taxSettingsData = {
+            taxRate: extractedData.taxRate || 0,
+            taxType: extractedData.taxType || 'percentage',
+            restaurantId: restaurantId,
+            updatedAt: new Date()
+          };
+          
+          // Check if tax settings exist
+          const existingTaxDoc = await db.collection('taxSettings')
+            .where('restaurantId', '==', restaurantId)
+            .limit(1)
+            .get();
+          
+          if (existingTaxDoc.empty) {
+            await db.collection('taxSettings').add(taxSettingsData);
+          } else {
+            await existingTaxDoc.docs[0].ref.update(taxSettingsData);
+          }
+          
+          result = {
+            success: true,
+            response: `Tax settings updated successfully! Tax rate: ${extractedData.taxRate}%`,
+            data: taxSettingsData
+          };
+          break;
+
+        // Analytics and Reporting
+        case 'getAnalytics':
+          // Get analytics data from database
+          const today = new Date();
+          today.setHours(0, 0, 0, 0);
+          const tomorrow = new Date(today);
+          tomorrow.setDate(tomorrow.getDate() + 1);
+
+          // Get orders for the specified period
+          let ordersSnapshot;
+          if (extractedData.period === 'today') {
+            ordersSnapshot = await db.collection('orders')
+              .where('restaurantId', '==', restaurantId)
+              .where('createdAt', '>=', today)
+              .where('createdAt', '<', tomorrow)
+              .get();
+          } else if (extractedData.period === 'week') {
+            const weekAgo = new Date(today);
+            weekAgo.setDate(weekAgo.getDate() - 7);
+            ordersSnapshot = await db.collection('orders')
+              .where('restaurantId', '==', restaurantId)
+              .where('createdAt', '>=', weekAgo)
+              .get();
+          } else if (extractedData.period === 'month') {
+            const monthAgo = new Date(today);
+            monthAgo.setMonth(monthAgo.getMonth() - 1);
+            ordersSnapshot = await db.collection('orders')
+              .where('restaurantId', '==', restaurantId)
+              .where('createdAt', '>=', monthAgo)
+              .get();
+          } else {
+            ordersSnapshot = await db.collection('orders')
+              .where('restaurantId', '==', restaurantId)
+              .get();
+          }
+
+          const analyticsOrders = [];
+          ordersSnapshot.forEach(doc => {
+            analyticsOrders.push({ id: doc.id, ...doc.data() });
+          });
+
+          // Calculate analytics
+          const totalRevenue = analyticsOrders.reduce((sum, order) => sum + (order.finalAmount || 0), 0);
+          const totalOrders = analyticsOrders.length;
+          const completedOrders = analyticsOrders.filter(o => o.status === 'COMPLETED').length;
+          const averageOrderValue = totalOrders > 0 ? totalRevenue / totalOrders : 0;
+
+          result = {
+            success: true,
+            response: `📊 ${extractedData.period || 'Overall'} Analytics:\n• Total Revenue: ₹${totalRevenue.toFixed(2)}\n• Total Orders: ${totalOrders}\n• Completed Orders: ${completedOrders}\n• Average Order Value: ₹${averageOrderValue.toFixed(2)}`,
+            data: {
+              period: extractedData.period || 'overall',
+              totalRevenue,
+              totalOrders,
+              completedOrders,
+              averageOrderValue,
+              orders: analyticsOrders.slice(0, 10) // Show first 10 orders
+            }
           };
           break;
 
