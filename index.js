@@ -8667,9 +8667,31 @@ app.get('/api/restaurants/by-subdomain/:subdomain', authenticateToken, async (re
       .limit(1)
       .get();
 
-    if (userRestaurantQuery.empty) {
-      return res.status(403).json({ error: 'Access denied to this restaurant' });
-    }
+      if (userRestaurantQuery.empty) {
+        // Log unauthorized access attempt for security monitoring
+        console.log(`🚨 SECURITY ALERT: Unauthorized access attempt`);
+        console.log(`   User ID: ${userId}`);
+        console.log(`   Subdomain: ${subdomain}`);
+        console.log(`   Restaurant ID: ${restaurantDoc.id}`);
+        console.log(`   Restaurant Name: ${restaurantData.name}`);
+        console.log(`   IP: ${req.ip || req.connection.remoteAddress}`);
+        console.log(`   User Agent: ${req.headers['user-agent']}`);
+        console.log(`   Timestamp: ${new Date().toISOString()}`);
+        
+        return res.status(403).json({ 
+          error: 'Access denied to this restaurant',
+          message: 'You do not have permission to access this restaurant'
+        });
+      }
+
+      // Log successful access for audit trail
+      console.log(`✅ Authorized access granted`);
+      console.log(`   User ID: ${userId}`);
+      console.log(`   Subdomain: ${subdomain}`);
+      console.log(`   Restaurant ID: ${restaurantDoc.id}`);
+      console.log(`   Restaurant Name: ${restaurantData.name}`);
+      console.log(`   IP: ${req.ip || req.connection.remoteAddress}`);
+      console.log(`   Timestamp: ${new Date().toISOString()}`);
 
     // Return restaurant data
     res.json({
