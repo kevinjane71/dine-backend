@@ -683,3 +683,7 @@ curl -X PUT "http://localhost:3003/api/restaurants/RESTAURANT_ID/subdomain" \
 **Version**: 1.0  
 **Status**: Production Ready ✅  
 **Compatibility**: Vercel + Next.js ✅
+
+
+
+
