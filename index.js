@@ -1812,11 +1812,11 @@ app.post('/api/auth/firebase/verify', async (req, res) => {
     }
 
     // Determine redirect URL
-    let redirectTo = '/restaurant-selection';
+    let redirectTo = '/dashboard';
     if (isNewUser && userRestaurants.length > 0 && userRestaurants[0].subdomain) {
-      redirectTo = `https://${userRestaurants[0].subdomain}.dineopen.com`;
+      redirectTo = `https://${userRestaurants[0].subdomain}.dineopen.com/dashboard`;
     } else if (userRestaurants.length === 1 && userRestaurants[0].subdomain) {
-      redirectTo = `https://${userRestaurants[0].subdomain}.dineopen.com`;
+      redirectTo = `https://${userRestaurants[0].subdomain}.dineopen.com/dashboard`;
     }
 
     // Fetch complete user profile from database
