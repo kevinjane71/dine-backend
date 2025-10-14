@@ -242,6 +242,47 @@ const authenticateToken = (req, res, next) => {
 
 // Test endpoint to show what query is sent to ChatGPT
 
+// Update user's default restaurant
+app.put('/api/user/default-restaurant', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId } = req.body;
+    const userId = req.user.userId;
+
+    if (!restaurantId) {
+      return res.status(400).json({ error: 'Restaurant ID is required' });
+    }
+
+    // Verify user has access to this restaurant
+    const userRestaurantQuery = await db.collection(collections.userRestaurants)
+      .where('userId', '==', userId)
+      .where('restaurantId', '==', restaurantId)
+      .get();
+
+    if (userRestaurantQuery.empty) {
+      return res.status(403).json({ error: 'Access denied to this restaurant' });
+    }
+
+    // Update user's default restaurant
+    await db.collection(collections.users).doc(userId).update({
+      defaultRestaurantId: restaurantId,
+      updatedAt: new Date()
+    });
+
+    // Get restaurant details
+    const restaurantDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
+    const restaurant = { id: restaurantDoc.id, ...restaurantDoc.data() };
+
+    res.json({
+      message: 'Default restaurant updated successfully',
+      defaultRestaurant: restaurant
+    });
+
+  } catch (error) {
+    console.error('Error updating default restaurant:', error);
+    res.status(500).json({ error: 'Failed to update default restaurant' });
+  }
+});
+
 // ==================== DINEBOT FUNCTIONS ====================
 
 // Security: Sanitize and validate user input
@@ -1985,9 +2026,10 @@ app.post('/api/auth/phone/verify-otp', async (req, res) => {
 
     await otpDoc.ref.delete();
 
-    // Get user's restaurants for the response
+    // Get user's restaurants and determine default restaurant
     let userRestaurants = [];
-    let redirectTo = '/restaurant-selection';
+    let defaultRestaurant = null;
+    let redirectTo = '/dashboard';
     
     if (hasRestaurants) {
       const restaurantsQuery = await db.collection(collections.restaurants)
@@ -1998,11 +2040,31 @@ app.post('/api/auth/phone/verify-otp', async (req, res) => {
         ...doc.data()
       }));
       
-      // Determine redirect URL
-      if (isNewUser && userRestaurants.length > 0 && userRestaurants[0].subdomain) {
-        redirectTo = `https://${userRestaurants[0].subdomain}.dineopen.com`;
-      } else if (userRestaurants.length === 1 && userRestaurants[0].subdomain) {
-        redirectTo = `https://${userRestaurants[0].subdomain}.dineopen.com`;
+      // Get user's default restaurant preference
+      const userDoc = await db.collection(collections.users).doc(userId).get();
+      const userData = userDoc.data();
+      const defaultRestaurantId = userData?.defaultRestaurantId;
+      
+      // Find default restaurant or use first one
+      if (defaultRestaurantId) {
+        defaultRestaurant = userRestaurants.find(r => r.id === defaultRestaurantId);
+      }
+      
+      if (!defaultRestaurant && userRestaurants.length > 0) {
+        defaultRestaurant = userRestaurants[0];
+        
+        // Set first restaurant as default if none set
+        if (!defaultRestaurantId) {
+          await db.collection(collections.users).doc(userId).update({
+            defaultRestaurantId: defaultRestaurant.id,
+            updatedAt: new Date()
+          });
+        }
+      }
+      
+      // Determine redirect URL based on default restaurant
+      if (defaultRestaurant && defaultRestaurant.subdomain) {
+        redirectTo = `https://${defaultRestaurant.subdomain}.dineopen.com/dashboard`;
       }
     }
 
@@ -2021,12 +2083,14 @@ app.post('/api/auth/phone/verify-otp', async (req, res) => {
         phone,
         name: name || userDoc.docs[0]?.data()?.name || 'Restaurant Owner',
         role: 'owner',
-        restaurantId: userRestaurants.length > 0 ? userRestaurants[0].id : null,
-        restaurant: userRestaurants.length > 0 ? userRestaurants[0] : null
+        restaurantId: defaultRestaurant?.id || null,
+        restaurant: defaultRestaurant || null,
+        defaultRestaurantId: defaultRestaurant?.id || null
       },
       isNewUser,
       hasRestaurants,
       restaurants: userRestaurants,
+      defaultRestaurant: defaultRestaurant,
       redirectTo
     });
 
