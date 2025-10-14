@@ -1471,6 +1471,49 @@ app.post('/api/auth/google', async (req, res) => {
       { expiresIn: '7d' }
     );
 
+    // Fetch complete user profile from database
+    const userProfileDoc = await db.collection(collections.users).doc(userId).get();
+    const userProfile = userProfileDoc.data();
+    
+    // Get user's restaurants and determine default restaurant
+    let userRestaurants = [];
+    let defaultRestaurant = null;
+    let redirectTo = '/dashboard';
+    
+    if (hasRestaurants) {
+      const restaurantsQuery = await db.collection(collections.restaurants)
+        .where('ownerId', '==', userId)
+        .get();
+      userRestaurants = restaurantsQuery.docs.map(doc => ({
+        id: doc.id,
+        ...doc.data()
+      }));
+      
+      // Get user's default restaurant preference
+      const defaultRestaurantId = userProfile?.defaultRestaurantId;
+      
+      // Find default restaurant or use first one
+      if (defaultRestaurantId) {
+        defaultRestaurant = userRestaurants.find(r => r.id === defaultRestaurantId);
+      }
+      
+      if (!defaultRestaurant && userRestaurants.length > 0) {
+        defaultRestaurant = userRestaurants[0];
+        // Set this as default if not already set
+        if (!defaultRestaurantId) {
+          await db.collection(collections.users).doc(userId).update({
+            defaultRestaurantId: defaultRestaurant.id,
+            updatedAt: new Date()
+          });
+        }
+      }
+      
+      // Set redirect URL based on user type and default restaurant
+      if (!isNewUser && defaultRestaurant && defaultRestaurant.subdomain) {
+        redirectTo = `https://${defaultRestaurant.subdomain}.dineopen.com/dashboard`;
+      }
+    }
+
     res.json({
       message: 'Google login successful',
       token: jwtToken,
@@ -1479,12 +1522,17 @@ app.post('/api/auth/google', async (req, res) => {
         email,
         name,
         picture,
-        role: userRole
+        role: userRole,
+        restaurantId: defaultRestaurant?.id || null,
+        restaurant: defaultRestaurant || null,
+        defaultRestaurantId: defaultRestaurant?.id || null,
+        ...userProfile // Include all user profile data
       },
       isNewUser,
       hasRestaurants,
-      restaurant: restaurantInfo,
-      redirectTo: isNewUser && restaurantInfo ? `https://${restaurantInfo.subdomain}.dineopen.com` : '/restaurant-selection'
+      restaurants: userRestaurants,
+      defaultRestaurant: defaultRestaurant,
+      redirectTo
     });
 
   } catch (error) {
@@ -1754,6 +1802,10 @@ app.post('/api/auth/firebase/verify', async (req, res) => {
       redirectTo = `https://${userRestaurants[0].subdomain}.dineopen.com`;
     }
 
+    // Fetch complete user profile from database
+    const userProfileDoc = await db.collection(collections.users).doc(userId).get();
+    const userProfile = userProfileDoc.data();
+
     res.json({
       message: 'Firebase verification successful',
       token,
@@ -1761,12 +1813,13 @@ app.post('/api/auth/firebase/verify', async (req, res) => {
         id: userId,
         phone: phoneNumber,
         email,
-        name: displayName || 'Restaurant Owner',
+        name: displayName || userProfile?.name || 'Restaurant Owner',
         role: 'owner',
         photoURL,
         provider: email ? 'google' : 'firebase',
         restaurantId: userRestaurants.length > 0 ? userRestaurants[0].id : null,
-        restaurant: userRestaurants.length > 0 ? userRestaurants[0] : null
+        restaurant: userRestaurants.length > 0 ? userRestaurants[0] : null,
+        ...userProfile // Include all user profile data
       },
       isNewUser,
       hasRestaurants,
@@ -2076,17 +2129,22 @@ app.post('/api/auth/phone/verify-otp', async (req, res) => {
       { expiresIn: '7d' }
     );
 
+    // Fetch complete user profile from database
+    const userProfileDoc = await db.collection(collections.users).doc(userId).get();
+    const userProfile = userProfileDoc.data();
+
     res.json({
       message: 'Phone verification successful',
       token,
       user: {
         id: userId,
         phone,
-        name: name || userDoc.docs[0]?.data()?.name || 'Restaurant Owner',
+        name: name || userProfile?.name || 'Restaurant Owner',
         role: 'owner',
         restaurantId: defaultRestaurant?.id || null,
         restaurant: defaultRestaurant || null,
-        defaultRestaurantId: defaultRestaurant?.id || null
+        defaultRestaurantId: defaultRestaurant?.id || null,
+        ...userProfile // Include all user profile data
       },
       isNewUser,
       hasRestaurants,
