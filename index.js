@@ -1233,6 +1233,123 @@ app.post('/api/auth/login', async (req, res) => {
   }
 });
 
+// Create restaurant with custom name for new users
+app.post('/api/auth/create-restaurant', async (req, res) => {
+  try {
+    const { userId, restaurantName, userEmail } = req.body;
+    
+    if (!userId || !restaurantName) {
+      return res.status(400).json({ error: 'User ID and restaurant name are required' });
+    }
+
+    console.log('🏪 Creating restaurant for user:', userId, 'with name:', restaurantName);
+
+    // Generate subdomain from restaurant name
+    const { generateSubdomain, isSubdomainAvailable } = require('./middleware/subdomainContext');
+    let subdomain = generateSubdomain(restaurantName);
+    let subdomainCounter = 1;
+    let finalSubdomain = subdomain;
+
+    // Check if subdomain already exists and make it unique
+    while (true) {
+      const isAvailable = await isSubdomainAvailable(finalSubdomain);
+      if (isAvailable) {
+        break;
+      }
+      
+      finalSubdomain = `${subdomain}-${subdomainCounter}`;
+      subdomainCounter++;
+    }
+
+    const restaurant = {
+      name: restaurantName,
+      subdomain: finalSubdomain,
+      description: 'Welcome to your restaurant! You can customize this information later.',
+      address: '',
+      phone: '',
+      email: userEmail || '',
+      cuisine: ['Indian'],
+      timings: {
+        openTime: '09:00',
+        closeTime: '22:00',
+        lastOrderTime: '21:30'
+      },
+      ownerId: userId,
+      menu: {
+        items: []
+      },
+      categories: [
+        {
+          id: 'appetizer',
+          name: 'Appetizers',
+          emoji: '🥗',
+          items: []
+        },
+        {
+          id: 'main-course',
+          name: 'Main Course',
+          emoji: '🍽️',
+          items: []
+        },
+        {
+          id: 'dessert',
+          name: 'Desserts',
+          emoji: '🍰',
+          items: []
+        },
+        {
+          id: 'beverages',
+          name: 'Beverages',
+          emoji: '🥤',
+          items: []
+        }
+      ],
+      floors: [
+        {
+          id: 'floor_ground_floor',
+          name: 'Ground Floor',
+          tables: []
+        }
+      ],
+      settings: {
+        currency: 'INR',
+        taxRate: 18,
+        serviceCharge: 0,
+        allowOnlineOrders: true,
+        requireCustomerDetails: false
+      },
+      createdAt: new Date(),
+      updatedAt: new Date()
+    };
+
+    const restaurantRef = await db.collection(collections.restaurants).add(restaurant);
+    const restaurantId = restaurantRef.id;
+
+    // Update user with restaurant info
+    await db.collection(collections.users).doc(userId).update({
+      restaurantId: restaurantId,
+      defaultRestaurant: restaurantId,
+      setupComplete: true,
+      updatedAt: new Date()
+    });
+
+    console.log('✅ Restaurant created successfully:', restaurantId);
+
+    res.json({
+      success: true,
+      restaurant: {
+        id: restaurantId,
+        ...restaurant
+      },
+      message: 'Restaurant created successfully!'
+    });
+
+  } catch (error) {
+    console.error('❌ Error creating restaurant:', error);
+    res.status(500).json({ error: 'Failed to create restaurant' });
+  }
+});
+
 app.post('/api/auth/google', async (req, res) => {
   try {
     const { uid, email, name, picture } = req.body;
@@ -1282,111 +1399,6 @@ app.post('/api/auth/google', async (req, res) => {
       const userRef = await db.collection(collections.users).add(newUser);
       userId = userRef.id;
       isNewUser = true;
-
-      // Create default restaurant for new Gmail users with random name
-      try {
-        // Generate random restaurant name
-        const randomNames = [
-          'Golden Spoon', 'Royal Kitchen', 'Spice Garden', 'Flavor Palace', 'Taste Haven',
-          'Culinary Corner', 'Gourmet Spot', 'Foodie Hub', 'Dining Delight', 'Kitchen Magic',
-          'Flavor Fusion', 'Taste Buds', 'Culinary Craft', 'Food Paradise', 'Dining Dreams',
-          'Kitchen Stories', 'Flavor Quest', 'Taste Trail', 'Culinary Journey', 'Food Explorer'
-        ];
-        const randomName = randomNames[Math.floor(Math.random() * randomNames.length)];
-        
-        // Generate subdomain from random name
-        const { generateSubdomain, isSubdomainAvailable } = require('./middleware/subdomainContext');
-        let subdomain = generateSubdomain(randomName);
-        let subdomainCounter = 1;
-        let finalSubdomain = subdomain;
-
-        // Check if subdomain already exists and make it unique
-        while (true) {
-          const isAvailable = await isSubdomainAvailable(finalSubdomain);
-          if (isAvailable) {
-            break;
-          }
-          
-          finalSubdomain = `${subdomain}-${subdomainCounter}`;
-          subdomainCounter++;
-        }
-
-        const defaultRestaurant = {
-          name: randomName,
-          subdomain: finalSubdomain,
-          description: 'Welcome to your restaurant! You can customize this information later.',
-          address: '',
-          phone: '',
-          email: email,
-          cuisine: ['Indian'],
-          timings: {
-            openTime: '09:00',
-            closeTime: '22:00',
-            lastOrderTime: '21:30'
-          },
-          ownerId: userId,
-          menu: {
-            items: []
-          },
-          categories: [
-            {
-              id: 'appetizer',
-              name: 'Appetizers',
-              emoji: '🥗',
-              description: 'Starters and appetizers'
-            },
-            {
-              id: 'main-course',
-              name: 'Main Course',
-              emoji: '🍽️',
-              description: 'Main dishes'
-            },
-            {
-              id: 'dessert',
-              name: 'Desserts',
-              emoji: '🍰',
-              description: 'Sweet treats'
-            },
-            {
-              id: 'beverages',
-              name: 'Beverages',
-              emoji: '🥤',
-              description: 'Drinks and beverages'
-            }
-          ],
-          isActive: true,
-          createdAt: new Date(),
-          updatedAt: new Date()
-        };
-
-        const restaurantRef = await db.collection(collections.restaurants).add(defaultRestaurant);
-        console.log(`✅ Default restaurant created for new Gmail user ${userId}: ${restaurantRef.id}`);
-        
-        // Create user-restaurant relationship
-        await db.collection(collections.userRestaurants).add({
-          userId: userId,
-          restaurantId: restaurantRef.id,
-          role: 'owner',
-          createdAt: new Date(),
-          updatedAt: new Date()
-        });
-
-        // Generate QR code with subdomain
-        const qrData = `https://${finalSubdomain}.dineopen.com`;
-        const qrCode = await QRCode.toDataURL(qrData);
-        await restaurantRef.update({ qrCode, qrData });
-        
-        // Update user to mark setup as complete
-        await userRef.update({
-          setupComplete: true,
-          updatedAt: new Date()
-        });
-        
-        hasRestaurants = true;
-      } catch (restaurantError) {
-        console.error('❌ Error creating default restaurant:', restaurantError);
-        hasRestaurants = false;
-      }
 
       // Send welcome email to new Gmail users
       console.log('📧 === REACHING EMAIL SENDING SECTION ===');
@@ -1654,112 +1666,6 @@ app.post('/api/auth/firebase/verify', async (req, res) => {
       const userRef = await db.collection(collections.users).add(newUser);
       userId = userRef.id;
       isNewUser = true;
-
-      // Create default restaurant for new users with random name
-      try {
-        // Generate random restaurant name
-        const randomNames = [
-          'Golden Spoon', 'Royal Kitchen', 'Spice Garden', 'Flavor Palace', 'Taste Haven',
-          'Culinary Corner', 'Gourmet Spot', 'Foodie Hub', 'Dining Delight', 'Kitchen Magic',
-          'Flavor Fusion', 'Taste Buds', 'Culinary Craft', 'Food Paradise', 'Dining Dreams',
-          'Kitchen Stories', 'Flavor Quest', 'Taste Trail', 'Culinary Journey', 'Food Explorer'
-        ];
-        const randomName = randomNames[Math.floor(Math.random() * randomNames.length)];
-        
-        // Generate subdomain from random name
-        const { generateSubdomain, isSubdomainAvailable } = require('./middleware/subdomainContext');
-        let subdomain = generateSubdomain(randomName);
-        let subdomainCounter = 1;
-        let finalSubdomain = subdomain;
-
-        // Check if subdomain already exists and make it unique
-        while (true) {
-          const isAvailable = await isSubdomainAvailable(finalSubdomain);
-          if (isAvailable) {
-            break;
-          }
-          
-          finalSubdomain = `${subdomain}-${subdomainCounter}`;
-          subdomainCounter++;
-        }
-
-        const defaultRestaurant = {
-          name: randomName,
-          subdomain: finalSubdomain,
-          description: 'Welcome to your restaurant! You can customize this information later.',
-          address: '',
-          phone: phoneNumber || '',
-          email: email || '',
-          cuisine: ['Indian'],
-          timings: {
-            openTime: '09:00',
-            closeTime: '22:00',
-            lastOrderTime: '21:30'
-          },
-          ownerId: userId,
-          menu: {
-            items: []
-          },
-          categories: [
-            {
-              id: 'appetizer',
-              name: 'Appetizers',
-              emoji: '🥗',
-              description: 'Starters and appetizers'
-            },
-            {
-              id: 'main-course',
-              name: 'Main Course',
-              emoji: '🍽️',
-              description: 'Main dishes'
-            },
-            {
-              id: 'dessert',
-              name: 'Desserts',
-              emoji: '🍰',
-              description: 'Sweet treats'
-            },
-            {
-              id: 'beverages',
-              name: 'Beverages',
-              emoji: '🥤',
-              description: 'Drinks and beverages'
-            }
-          ],
-          isActive: true,
-          createdAt: new Date(),
-          updatedAt: new Date()
-        };
-
-        const restaurantRef = await db.collection(collections.restaurants).add(defaultRestaurant);
-        console.log(`✅ Default restaurant created for new user ${userId}: ${restaurantRef.id}`);
-        
-        // Create user-restaurant relationship
-        await db.collection(collections.userRestaurants).add({
-          userId: userId,
-          restaurantId: restaurantRef.id,
-          role: 'owner',
-          createdAt: new Date(),
-          updatedAt: new Date()
-        });
-
-        // Generate QR code with subdomain
-        const qrData = `https://${finalSubdomain}.dineopen.com`;
-        const qrCode = await QRCode.toDataURL(qrData);
-        await restaurantRef.update({ qrCode, qrData });
-        
-        // Update user to mark setup as complete
-        await userRef.update({
-          setupComplete: true,
-          updatedAt: new Date()
-        });
-        
-        hasRestaurants = true;
-      } catch (restaurantError) {
-        console.error('❌ Error creating default restaurant:', restaurantError);
-        // Don't fail the login if restaurant creation fails
-        hasRestaurants = false;
-      }
     } else {
       // Existing user login
       const userData = userDoc.docs[0].data();
@@ -1969,112 +1875,6 @@ app.post('/api/auth/phone/verify-otp', async (req, res) => {
       const userRef = await db.collection(collections.users).add(newUser);
       userId = userRef.id;
       isNewUser = true;
-
-      // Create default restaurant for new users with random name
-      try {
-        // Generate random restaurant name
-        const randomNames = [
-          'Golden Spoon', 'Royal Kitchen', 'Spice Garden', 'Flavor Palace', 'Taste Haven',
-          'Culinary Corner', 'Gourmet Spot', 'Foodie Hub', 'Dining Delight', 'Kitchen Magic',
-          'Flavor Fusion', 'Taste Buds', 'Culinary Craft', 'Food Paradise', 'Dining Dreams',
-          'Kitchen Stories', 'Flavor Quest', 'Taste Trail', 'Culinary Journey', 'Food Explorer'
-        ];
-        const randomName = randomNames[Math.floor(Math.random() * randomNames.length)];
-        
-        // Generate subdomain from random name
-        const { generateSubdomain, isSubdomainAvailable } = require('./middleware/subdomainContext');
-        let subdomain = generateSubdomain(randomName);
-        let subdomainCounter = 1;
-        let finalSubdomain = subdomain;
-
-        // Check if subdomain already exists and make it unique
-        while (true) {
-          const isAvailable = await isSubdomainAvailable(finalSubdomain);
-          if (isAvailable) {
-            break;
-          }
-          
-          finalSubdomain = `${subdomain}-${subdomainCounter}`;
-          subdomainCounter++;
-        }
-
-        const defaultRestaurant = {
-          name: randomName,
-          subdomain: finalSubdomain,
-          description: 'Welcome to your restaurant! You can customize this information later.',
-          address: '',
-          phone: phone,
-          email: '',
-          cuisine: ['Indian'],
-          timings: {
-            openTime: '09:00',
-            closeTime: '22:00',
-            lastOrderTime: '21:30'
-          },
-          ownerId: userId,
-          menu: {
-            items: []
-          },
-          categories: [
-            {
-              id: 'appetizer',
-              name: 'Appetizers',
-              emoji: '🥗',
-              description: 'Starters and appetizers'
-            },
-            {
-              id: 'main-course',
-              name: 'Main Course',
-              emoji: '🍽️',
-              description: 'Main dishes'
-            },
-            {
-              id: 'dessert',
-              name: 'Desserts',
-              emoji: '🍰',
-              description: 'Sweet treats'
-            },
-            {
-              id: 'beverages',
-              name: 'Beverages',
-              emoji: '🥤',
-              description: 'Drinks and beverages'
-            }
-          ],
-          isActive: true,
-          createdAt: new Date(),
-          updatedAt: new Date()
-        };
-
-        const restaurantRef = await db.collection(collections.restaurants).add(defaultRestaurant);
-        console.log(`✅ Default restaurant created for new phone user ${userId}: ${restaurantRef.id}`);
-        
-        // Create user-restaurant relationship
-        await db.collection(collections.userRestaurants).add({
-          userId: userId,
-          restaurantId: restaurantRef.id,
-          role: 'owner',
-          createdAt: new Date(),
-          updatedAt: new Date()
-        });
-
-        // Generate QR code with subdomain
-        const qrData = `https://${finalSubdomain}.dineopen.com`;
-        const qrCode = await QRCode.toDataURL(qrData);
-        await restaurantRef.update({ qrCode, qrData });
-        
-        // Update user to mark setup as complete
-        await userRef.update({
-          setupComplete: true,
-          updatedAt: new Date()
-        });
-        
-        hasRestaurants = true;
-      } catch (restaurantError) {
-        console.error('❌ Error creating default restaurant:', restaurantError);
-        // Don't fail the login if restaurant creation fails
-        hasRestaurants = false;
-      }
     } else {
       // Existing owner login
       const userData = userDoc.docs[0].data();
