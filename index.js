@@ -1509,9 +1509,26 @@ app.post('/api/auth/google', async (req, res) => {
       }
       
       // Set redirect URL based on user type and default restaurant
-      if (!isNewUser && defaultRestaurant && defaultRestaurant.subdomain) {
+      if (defaultRestaurant && defaultRestaurant.subdomain) {
         redirectTo = `https://${defaultRestaurant.subdomain}.dineopen.com/dashboard`;
+        console.log('🎯 Google login redirect set to:', redirectTo);
+      } else {
+        console.log('⚠️ Google login: No subdomain found for redirect');
+        console.log('⚠️ defaultRestaurant:', defaultRestaurant);
       }
+    }
+
+    // Ensure redirectTo is set correctly based on the defaultRestaurant
+    console.log('🔍 Debug redirect logic:');
+    console.log('🔍 defaultRestaurant:', defaultRestaurant);
+    console.log('🔍 defaultRestaurant.subdomain:', defaultRestaurant?.subdomain);
+    console.log('🔍 Current redirectTo:', redirectTo);
+    
+    if (defaultRestaurant && defaultRestaurant.subdomain) {
+      redirectTo = `https://${defaultRestaurant.subdomain}.dineopen.com/dashboard`;
+      console.log('🎯 Final redirect set to:', redirectTo);
+    } else {
+      console.log('⚠️ No subdomain found, keeping redirectTo as:', redirectTo);
     }
 
     res.json({
@@ -2116,8 +2133,8 @@ app.post('/api/auth/phone/verify-otp', async (req, res) => {
       }
       
       // Determine redirect URL based on default restaurant
-      // Only redirect to subdomain if user is NOT a first-time user
-      if (defaultRestaurant && defaultRestaurant.subdomain && !isNewUser) {
+      // Redirect to subdomain for all users with restaurants
+      if (defaultRestaurant && defaultRestaurant.subdomain) {
         redirectTo = `https://${defaultRestaurant.subdomain}.dineopen.com/dashboard`;
       }
     }
