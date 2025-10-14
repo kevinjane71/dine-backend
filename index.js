@@ -3981,7 +3981,7 @@ app.delete('/api/menu-items/:itemId/images/:imageIndex', authenticateToken, asyn
 });
 
 // Bulk menu upload API
-app.post('/api/menus/bulk-upload/:restaurantId', chatgptUsageLimiter.middleware(), authenticateToken, upload.array('menuFiles', 10), async (req, res) => {
+app.post('/api/menus/bulk-upload/:restaurantId', authenticateToken, chatgptUsageLimiter.middleware(), upload.array('menuFiles', 10), async (req, res) => {
   try {
     console.log(`\n=== BULK UPLOAD REQUEST RECEIVED ===`);
     const { restaurantId } = req.params;
@@ -7936,7 +7936,7 @@ app.get('/api/health', async (req, res) => {
 
 // DineBot Status Endpoint
 // Simple Intent-Based Chatbot endpoint
-app.post('/api/dinebot/query', vercelSecurityMiddleware.chatbotAPI, chatgptUsageLimiter.middleware(), authenticateToken, async (req, res) => {
+app.post('/api/dinebot/query', vercelSecurityMiddleware.chatbotAPI, authenticateToken, chatgptUsageLimiter.middleware(), async (req, res) => {
   try {
     const { query: userQuery, restaurantId } = req.body;
     const userId = req.user.userId;
