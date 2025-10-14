@@ -1222,70 +1222,9 @@ app.post('/api/auth/google', async (req, res) => {
       const userRef = await db.collection(collections.users).add(newUser);
       userId = userRef.id;
       isNewUser = true;
-
-      // Create default restaurant for new Gmail users
-      try {
-        const defaultRestaurant = {
-          name: 'My Restaurant',
-          description: 'Welcome to your restaurant! You can customize this information later.',
-          address: '',
-          phone: '',
-          email: email,
-          cuisine: ['Indian'],
-          timings: {
-            openTime: '09:00',
-            closeTime: '22:00',
-            lastOrderTime: '21:30'
-          },
-          ownerId: userId,
-          menu: {
-            items: []
-          },
-          categories: [
-            {
-              id: 'appetizer',
-              name: 'Appetizers',
-              emoji: '🥗',
-              description: 'Starters and appetizers'
-            },
-            {
-              id: 'main-course',
-              name: 'Main Course',
-              emoji: '🍽️',
-              description: 'Main dishes'
-            },
-            {
-              id: 'dessert',
-              name: 'Desserts',
-              emoji: '🍰',
-              description: 'Sweet treats'
-            },
-            {
-              id: 'beverages',
-              name: 'Beverages',
-              emoji: '🥤',
-              description: 'Drinks and beverages'
-            }
-          ],
-          isActive: true,
-          createdAt: new Date(),
-          updatedAt: new Date()
-        };
-
-        const restaurantRef = await db.collection(collections.restaurants).add(defaultRestaurant);
-        console.log(`✅ Default restaurant created for new Gmail user ${userId}: ${restaurantRef.id}`);
-        
-        // Update user to mark setup as complete
-        await userRef.update({
-          setupComplete: true,
-          updatedAt: new Date()
-        });
-        
-        hasRestaurants = true;
-      } catch (restaurantError) {
-        console.error('❌ Error creating default restaurant:', restaurantError);
-        hasRestaurants = false;
-      }
+      
+      console.log('✅ New Google user created (no auto-restaurant):', userId);
+      hasRestaurants = false; // No restaurant created yet
 
       // Send welcome email to new Gmail users
       console.log('📧 === REACHING EMAIL SENDING SECTION ===');
@@ -1353,16 +1292,19 @@ app.post('/api/auth/google', async (req, res) => {
     );
 
     res.json({
-      message: 'Google login successful',
+      success: true,
+      message: isNewUser ? 'Welcome! Account created successfully.' : 'Google login successful',
       token: jwtToken,
       user: {
         id: userId,
         email,
         name,
         picture,
-        role: userRole
+        role: userRole,
+        setupComplete: userDoc.empty ? true : userDoc.docs[0].data().setupComplete || false
       },
-      isNewUser,
+      firstTimeUser: isNewUser,
+      isNewUser, // Keep for backward compatibility
       hasRestaurants,
       redirectTo: hasRestaurants ? '/dashboard' : '/admin'
     });
@@ -1442,14 +1384,74 @@ app.post('/api/auth/firebase/verify', async (req, res) => {
       return res.status(400).json({ error: 'Firebase UID is required' });
     }
 
-    // Check if user exists in our database
-    let userDoc = await db.collection(collections.users)
+    console.log('🔍 Firebase OTP verification debug:');
+    console.log('🔍 UID:', uid);
+    console.log('🔍 Phone:', phoneNumber);
+    console.log('🔍 Email:', email);
+    console.log('🔍 Display Name:', displayName);
+
+    let userId, isNewUser = false, hasRestaurants = false;
+    let userDoc = null;
+
+    // Check if user exists by Firebase UID first
+    let existingUserQuery = await db.collection(collections.users)
       .where('firebaseUid', '==', uid)
       .get();
 
-    let userId, isNewUser = false, hasRestaurants = false;
+    if (!existingUserQuery.empty) {
+      // User exists with this Firebase UID
+      userDoc = existingUserQuery.docs[0];
+      userId = userDoc.id;
+      isNewUser = false;
+      console.log('✅ User found by Firebase UID:', userId);
+    } else {
+      // Check if user exists by phone number or email
+      let phoneQuery = null;
+      let emailQuery = null;
 
-    if (userDoc.empty) {
+      if (phoneNumber) {
+        phoneQuery = await db.collection(collections.users)
+          .where('phone', '==', phoneNumber)
+          .get();
+      }
+
+      if (email) {
+        emailQuery = await db.collection(collections.users)
+          .where('email', '==', email)
+          .get();
+      }
+
+      if (phoneQuery && !phoneQuery.empty) {
+        // User exists with this phone number
+        userDoc = phoneQuery.docs[0];
+        userId = userDoc.id;
+        isNewUser = false;
+        
+        // Update existing user with Firebase UID
+        await db.collection(collections.users).doc(userId).update({
+          firebaseUid: uid,
+          phoneVerified: true,
+          updatedAt: new Date()
+        });
+        
+        console.log('✅ User found by phone number, updated with Firebase UID:', userId);
+      } else if (emailQuery && !emailQuery.empty) {
+        // User exists with this email
+        userDoc = emailQuery.docs[0];
+        userId = userDoc.id;
+        isNewUser = false;
+        
+        // Update existing user with Firebase UID
+        await db.collection(collections.users).doc(userId).update({
+          firebaseUid: uid,
+          emailVerified: true,
+          updatedAt: new Date()
+        });
+        
+        console.log('✅ User found by email, updated with Firebase UID:', userId);
+      } else {
+        // Completely new user - create new account
+        console.log('🆕 Creating new user account');
       // New user registration via Firebase
       const newUser = {
         firebaseUid: uid,
@@ -1469,75 +1471,16 @@ app.post('/api/auth/firebase/verify', async (req, res) => {
       const userRef = await db.collection(collections.users).add(newUser);
       userId = userRef.id;
       isNewUser = true;
-
-      // Create default restaurant for new users
-      try {
-        const defaultRestaurant = {
-          name: 'My Restaurant',
-          description: 'Welcome to your restaurant! You can customize this information later.',
-          address: '',
-          phone: phoneNumber || '',
-          email: email || '',
-          cuisine: ['Indian'],
-          timings: {
-            openTime: '09:00',
-            closeTime: '22:00',
-            lastOrderTime: '21:30'
-          },
-          ownerId: userId,
-          menu: {
-            items: []
-          },
-          categories: [
-            {
-              id: 'appetizer',
-              name: 'Appetizers',
-              emoji: '🥗',
-              description: 'Starters and appetizers'
-            },
-            {
-              id: 'main-course',
-              name: 'Main Course',
-              emoji: '🍽️',
-              description: 'Main dishes'
-            },
-            {
-              id: 'dessert',
-              name: 'Desserts',
-              emoji: '🍰',
-              description: 'Sweet treats'
-            },
-            {
-              id: 'beverages',
-              name: 'Beverages',
-              emoji: '🥤',
-              description: 'Drinks and beverages'
-            }
-          ],
-          isActive: true,
-          createdAt: new Date(),
-          updatedAt: new Date()
-        };
-
-        const restaurantRef = await db.collection(collections.restaurants).add(defaultRestaurant);
-        console.log(`✅ Default restaurant created for new user ${userId}: ${restaurantRef.id}`);
-        
-        // Update user to mark setup as complete
-        await userRef.update({
-          setupComplete: true,
-          updatedAt: new Date()
-        });
-        
-        hasRestaurants = true;
-      } catch (restaurantError) {
-        console.error('❌ Error creating default restaurant:', restaurantError);
-        // Don't fail the login if restaurant creation fails
-        hasRestaurants = false;
+      userDoc = { data: () => newUser };
+      
+      console.log('✅ New user created (no auto-restaurant):', userId);
+      hasRestaurants = false; // No restaurant created yet
       }
-    } else {
-      // Existing user login
-      const userData = userDoc.docs[0].data();
-      userId = userDoc.docs[0].id;
+    }
+
+    // For existing users, update their info
+    if (!isNewUser) {
+      const userData = userDoc.data();
       
       // Update user info if needed
       const updateData = {
@@ -1555,16 +1498,16 @@ app.post('/api/auth/firebase/verify', async (req, res) => {
         updateData.provider = 'google';
       }
 
-      await userDoc.docs[0].ref.update(updateData);
-
-      // Check if owner has restaurants
-      const restaurantsQuery = await db.collection(collections.restaurants)
-        .where('ownerId', '==', userId)
-        .limit(1)
-        .get();
-      
-      hasRestaurants = !restaurantsQuery.empty;
+      await userDoc.ref.update(updateData);
     }
+
+    // Check if user has restaurants (for both new and existing users)
+    const restaurantsQuery = await db.collection(collections.restaurants)
+      .where('ownerId', '==', userId)
+      .limit(1)
+      .get();
+    
+    hasRestaurants = !restaurantsQuery.empty;
 
     // Generate JWT token
     const token = jwt.sign(
@@ -1586,7 +1529,8 @@ app.post('/api/auth/firebase/verify', async (req, res) => {
     }
 
     res.json({
-      message: 'Firebase verification successful',
+      success: true,
+      message: isNewUser ? 'Welcome! Account created successfully.' : 'Login successful',
       token,
       user: {
         id: userId,
@@ -1597,9 +1541,11 @@ app.post('/api/auth/firebase/verify', async (req, res) => {
         photoURL,
         provider: email ? 'google' : 'firebase',
         restaurantId: userRestaurants.length > 0 ? userRestaurants[0].id : null,
-        restaurant: userRestaurants.length > 0 ? userRestaurants[0] : null
+        restaurant: userRestaurants.length > 0 ? userRestaurants[0] : null,
+        setupComplete: userDoc ? userDoc.data().setupComplete || false : false
       },
-      isNewUser,
+      firstTimeUser: isNewUser,
+      isNewUser, // Keep for backward compatibility
       hasRestaurants,
       restaurants: userRestaurants,
       redirectTo: hasRestaurants ? '/dashboard' : '/admin'
@@ -1663,71 +1609,9 @@ app.post('/api/auth/phone/verify-otp', async (req, res) => {
       const userRef = await db.collection(collections.users).add(newUser);
       userId = userRef.id;
       isNewUser = true;
-
-      // Create default restaurant for new users
-      try {
-        const defaultRestaurant = {
-          name: 'My Restaurant',
-          description: 'Welcome to your restaurant! You can customize this information later.',
-          address: '',
-          phone: phone,
-          email: '',
-          cuisine: ['Indian'],
-          timings: {
-            openTime: '09:00',
-            closeTime: '22:00',
-            lastOrderTime: '21:30'
-          },
-          ownerId: userId,
-          menu: {
-            items: []
-          },
-          categories: [
-            {
-              id: 'appetizer',
-              name: 'Appetizers',
-              emoji: '🥗',
-              description: 'Starters and appetizers'
-            },
-            {
-              id: 'main-course',
-              name: 'Main Course',
-              emoji: '🍽️',
-              description: 'Main dishes'
-            },
-            {
-              id: 'dessert',
-              name: 'Desserts',
-              emoji: '🍰',
-              description: 'Sweet treats'
-            },
-            {
-              id: 'beverages',
-              name: 'Beverages',
-              emoji: '🥤',
-              description: 'Drinks and beverages'
-            }
-          ],
-          isActive: true,
-          createdAt: new Date(),
-          updatedAt: new Date()
-        };
-
-        const restaurantRef = await db.collection(collections.restaurants).add(defaultRestaurant);
-        console.log(`✅ Default restaurant created for new phone user ${userId}: ${restaurantRef.id}`);
-        
-        // Update user to mark setup as complete
-        await userRef.update({
-          setupComplete: true,
-          updatedAt: new Date()
-        });
-        
-        hasRestaurants = true;
-      } catch (restaurantError) {
-        console.error('❌ Error creating default restaurant:', restaurantError);
-        // Don't fail the login if restaurant creation fails
-        hasRestaurants = false;
-      }
+      
+      console.log('✅ New phone user created (no auto-restaurant):', userId);
+      hasRestaurants = false; // No restaurant created yet
     } else {
       // Existing owner login
       const userData = userDoc.docs[0].data();
@@ -1756,15 +1640,18 @@ app.post('/api/auth/phone/verify-otp', async (req, res) => {
     );
 
     res.json({
-      message: 'Phone verification successful',
+      success: true,
+      message: isNewUser ? 'Welcome! Account created successfully.' : 'Phone verification successful',
       token,
       user: {
         id: userId,
         phone,
         name: name || userDoc.docs[0]?.data()?.name || 'Restaurant Owner',
-        role: 'owner'
+        role: 'owner',
+        setupComplete: userDoc.empty ? false : userDoc.docs[0]?.data()?.setupComplete || false
       },
-      isNewUser,
+      firstTimeUser: isNewUser,
+      isNewUser, // Keep for backward compatibility
       hasRestaurants,
       redirectTo: hasRestaurants ? '/dashboard' : '/admin'
     });
