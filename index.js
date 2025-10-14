@@ -2063,7 +2063,8 @@ app.post('/api/auth/phone/verify-otp', async (req, res) => {
       }
       
       // Determine redirect URL based on default restaurant
-      if (defaultRestaurant && defaultRestaurant.subdomain) {
+      // Only redirect to subdomain if user is NOT a first-time user
+      if (defaultRestaurant && defaultRestaurant.subdomain && !isNewUser) {
         redirectTo = `https://${defaultRestaurant.subdomain}.dineopen.com/dashboard`;
       }
     }
@@ -8956,3 +8957,4 @@ server.on('error', (error) => {
 });
 
 module.exports = app;
+
