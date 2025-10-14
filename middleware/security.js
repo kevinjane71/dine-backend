@@ -2,7 +2,7 @@ const rateLimiter = require('./rateLimiter');
 
 // Security middleware for API protection
 const securityMiddleware = {
-  // Suspicious patterns to detect
+  // Suspicious patterns to detect dd
   suspiciousPatterns: [
     /\.\./, // Directory traversal
     /<script/i, // XSS attempts
