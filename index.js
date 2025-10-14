@@ -23,6 +23,9 @@ const { vercelRateLimiter } = require('./middleware/vercelRateLimiter');
 // ChatGPT Usage Limiter
 const chatgptUsageLimiter = require('./middleware/chatgptUsageLimiter');
 
+// Subdomain utilities
+const { generateSubdomain, getSubdomainUrl } = require('./utils/subdomain');
+
 // DineBot Configuration
 const dinebotConfig = {
   name: 'DineBot',
@@ -136,11 +139,32 @@ const upload = multer({
 
 const corsOptions = {
   origin: (origin, callback) => {
-    if (!origin || allowedOrigins.includes(origin)) {
+    // Allow requests with no origin (like mobile apps or curl requests)
+    if (!origin) {
       callback(null, true);
-    } else {
-      callback(new Error("CORS not allowed"));
+      return;
     }
+    
+    // Check if origin is in allowed origins list
+    if (allowedOrigins.includes(origin)) {
+      callback(null, true);
+      return;
+    }
+    
+    // Check if origin is a subdomain of dineopen.com
+    if (origin.match(/^https:\/\/[a-zA-Z0-9-]+\.dineopen\.com$/)) {
+      callback(null, true);
+      return;
+    }
+    
+    // Check if origin is a localhost subdomain (for development)
+    if (origin.match(/^http:\/\/[a-zA-Z0-9-]+\.localhost:3002$/)) {
+      callback(null, true);
+      return;
+    }
+    
+    // Reject all other origins
+    callback(new Error("CORS not allowed"));
   },
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS', 'PATCH'],
@@ -1518,6 +1542,8 @@ app.post('/api/auth/firebase/verify', async (req, res) => {
 
     // Get user's restaurants for the response
     let userRestaurants = [];
+    let subdomainUrl = null;
+    
     if (hasRestaurants) {
       const restaurantsQuery = await db.collection(collections.restaurants)
         .where('ownerId', '==', userId)
@@ -1526,6 +1552,12 @@ app.post('/api/auth/firebase/verify', async (req, res) => {
         id: doc.id,
         ...doc.data()
       }));
+      
+      // Check if subdomain is enabled for the first restaurant
+      const firstRestaurant = userRestaurants[0];
+      if (firstRestaurant && firstRestaurant.subdomainEnabled && firstRestaurant.subdomain) {
+        subdomainUrl = getSubdomainUrl(firstRestaurant.subdomain, '/dashboard');
+      }
     }
 
     res.json({
@@ -1548,7 +1580,8 @@ app.post('/api/auth/firebase/verify', async (req, res) => {
       isNewUser, // Keep for backward compatibility
       hasRestaurants,
       restaurants: userRestaurants,
-      redirectTo: hasRestaurants ? '/dashboard' : '/admin'
+      subdomainUrl, // Include subdomain URL if enabled
+      redirectTo: subdomainUrl || (hasRestaurants ? '/dashboard' : '/admin')
     });
 
   } catch (error) {
@@ -1639,6 +1672,22 @@ app.post('/api/auth/phone/verify-otp', async (req, res) => {
       { expiresIn: '7d' }
     );
 
+    // Get user's restaurants for subdomain check
+    let subdomainUrl = null;
+    if (hasRestaurants) {
+      const restaurantsQuery = await db.collection(collections.restaurants)
+        .where('ownerId', '==', userId)
+        .limit(1)
+        .get();
+      
+      if (!restaurantsQuery.empty) {
+        const restaurant = restaurantsQuery.docs[0].data();
+        if (restaurant.subdomainEnabled && restaurant.subdomain) {
+          subdomainUrl = getSubdomainUrl(restaurant.subdomain, '/dashboard');
+        }
+      }
+    }
+
     res.json({
       success: true,
       message: isNewUser ? 'Welcome! Account created successfully.' : 'Phone verification successful',
@@ -1653,7 +1702,8 @@ app.post('/api/auth/phone/verify-otp', async (req, res) => {
       firstTimeUser: isNewUser,
       isNewUser, // Keep for backward compatibility
       hasRestaurants,
-      redirectTo: hasRestaurants ? '/dashboard' : '/admin'
+      subdomainUrl, // Include subdomain URL if enabled
+      redirectTo: subdomainUrl || (hasRestaurants ? '/dashboard' : '/admin')
     });
 
   } catch (error) {
@@ -1712,6 +1762,9 @@ app.post('/api/restaurants', authenticateToken, async (req, res) => {
       return res.status(400).json({ error: 'Restaurant name is required' });
     }
 
+    // Generate subdomain for the restaurant
+    const subdomain = await generateSubdomain(name, 'temp'); // We'll update with actual ID after creation
+    
     const restaurantData = {
       name,
       address: address || null,
@@ -1723,12 +1776,18 @@ app.post('/api/restaurants', authenticateToken, async (req, res) => {
       operatingHours: operatingHours || {},
       features: features || [],
       ownerId: userId,
+      subdomain: subdomain,
+      subdomainEnabled: false, // Default: disabled, user can enable later
       status: 'active',
       createdAt: new Date(),
       updatedAt: new Date()
     };
 
     const restaurantRef = await db.collection(collections.restaurants).add(restaurantData);
+    
+    // Update subdomain with actual restaurant ID for uniqueness
+    const finalSubdomain = await generateSubdomain(name, restaurantRef.id);
+    await restaurantRef.update({ subdomain: finalSubdomain });
 
     // Create user-restaurant relationship
     await db.collection(collections.userRestaurants).add({
@@ -1749,6 +1808,8 @@ app.post('/api/restaurants', authenticateToken, async (req, res) => {
       restaurant: {
         id: restaurantRef.id,
         ...restaurantData,
+        subdomain: finalSubdomain, // Include the final subdomain
+        subdomainUrl: getSubdomainUrl(finalSubdomain),
         qrCode,
         qrData
       }
