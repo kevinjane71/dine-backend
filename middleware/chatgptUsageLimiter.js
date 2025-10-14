@@ -4,10 +4,10 @@ const { db, collections } = require('../firebase');
 const chatgptUsageLimiter = {
   // Default configuration (can be overridden by DB config)
   defaultConfig: {
-    dailyLimit: 5,
+    dailyLimit: process.env.NODE_ENV === 'development' ? 50 : 5, // Higher limits for development
     resetTime: '00:00', // UTC time for daily reset
-    ipLimit: 10, // Max calls per IP per day
-    userLimit: 5, // Max calls per user per day
+    ipLimit: process.env.NODE_ENV === 'development' ? 100 : 10, // Higher limits for development
+    userLimit: process.env.NODE_ENV === 'development' ? 50 : 5, // Higher limits for development
     enabled: true
   },
 
@@ -361,3 +361,4 @@ const chatgptUsageLimiter = {
 };
 
 module.exports = chatgptUsageLimiter;
+

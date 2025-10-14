@@ -3704,7 +3704,7 @@ app.delete('/api/menu-items/:itemId/images/:imageIndex', authenticateToken, asyn
 });
 
 // Bulk menu upload API
-app.post('/api/menus/bulk-upload/:restaurantId', chatgptUsageLimiter.middleware(), authenticateToken, upload.array('menuFiles', 10), async (req, res) => {
+app.post('/api/menus/bulk-upload/:restaurantId', authenticateToken, chatgptUsageLimiter.middleware(), upload.array('menuFiles', 10), async (req, res) => {
   try {
     console.log(`\n=== BULK UPLOAD REQUEST RECEIVED ===`);
     const { restaurantId } = req.params;

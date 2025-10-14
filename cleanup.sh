@@ -17,3 +17,5 @@ sed -i '' '/app.post.*dinebot\/ai-agent/,/^});$/d' /Users/vkumar4/code-test/dine
 sed -i '' '/app.get.*test-schema/,/^});$/d' /Users/vkumar4/code-test/dine/dine-backend/index.js
 
 echo "GraphQL endpoints removed from index.js"
+
+
