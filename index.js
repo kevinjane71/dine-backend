@@ -920,80 +920,226 @@ const uploadToFirebase = async (file, restaurantId) => {
   }
 };
 
-// Helper function to extract menu from image using OpenAI Vision
-const extractMenuFromImage = async (imageUrl) => {
+// Enhanced function to extract menu from large images with chunking
+const extractMenuFromLargeImage = async (imageUrl) => {
   try {
-    const response = await openai.chat.completions.create({
-      model: "gpt-4-turbo",
+    console.log('🔍 Starting enhanced menu extraction for large image...');
+    
+    // First attempt with the enhanced prompt
+    const primaryResult = await extractMenuFromImage(imageUrl);
+    
+    // If we got a good result, return it
+    if (primaryResult.menuItems && primaryResult.menuItems.length > 0) {
+      console.log('✅ Primary extraction successful:', primaryResult.menuItems.length, 'items');
+      return primaryResult;
+    }
+    
+    // If primary failed or returned few items, try alternative approach
+    console.log('🔄 Primary extraction returned few/no items, trying alternative approach...');
+    
+    const alternativeResponse = await openai.chat.completions.create({
+      model: "gpt-4o",
       messages: [
         {
           role: "user",
           content: [
             {
               type: "text",
-              text: `Analyze this menu image and extract all menu items. Return the data in the following JSON format:
-              {
-                "menuItems": [
-                  {
-                    "name": "Item Name",
-                    "description": "Item description",
-                    "price": 100,
-                    "category": "appetizer|main-course|dessert|beverages|bread|rice|dal|fast-food|chinese|pizza|south-indian|north-indian",
-                    "isVeg": true,
-                    "spiceLevel": "mild|medium|hot",
-                    "allergens": ["dairy", "gluten", "nuts"],
-                    "shortCode": "ABC"
-                  }
-                ]
-              }
-              
-              Category mapping guidelines:
-              - appetizer: Starters, snacks, small plates, finger foods
-              - main-course: Main dishes, entrees, substantial meals
-              - dessert: Sweet dishes, ice cream, cakes, sweets
-              - beverages: Drinks, juices, soft drinks, tea, coffee
-              - rice: Rice dishes, biryani, pulao, fried rice
-              - bread: Roti, naan, paratha, bread items
-              - dal: Dal, curry, gravy dishes, lentil preparations
-              - fast-food: Burgers, sandwiches, quick bites
-              - chinese: Chinese cuisine items
-              - pizza: Pizza varieties
-              - south-indian: Dosa, idli, sambar, rasam, South Indian dishes
-              - north-indian: North Indian curries, tandoor items
-              
-              Important: Choose the most appropriate category based on the dish type and cuisine style.
-              
-              Rules:
-              - Extract ALL visible menu items
-              - Convert prices to numbers (remove currency symbols)
-              - Categorize items appropriately
-              - Set isVeg based on item content (true for vegetarian, false for non-vegetarian)
-              - Generate shortCode as first 3 letters of item name
-              - Include allergens if mentioned
-              - If description is not available, leave empty string
-              - Ensure all prices are numeric values`
+              text: `This is a restaurant menu image. Please read ALL text visible and extract every menu item with its price.
+
+IMPORTANT: 
+- Read the ENTIRE image systematically
+- Don't miss any items in any section
+- Extract names and prices for EVERY item
+- Some items might be in small text or different sections
+
+Return JSON:
+{
+  "menuItems": [
+    {
+      "name": "Full item name",
+      "price": 100,
+      "category": "main-course",
+      "isVeg": true,
+      "shortCode": "ABC"
+    }
+  ]
+}
+
+Categories: appetizer, main-course, dessert, beverages, rice, bread, dal, fast-food, chinese, pizza, south-indian, north-indian`
             },
             {
               type: "image_url",
               image_url: {
-                url: imageUrl
+                url: imageUrl,
+                detail: "high"
               }
             }
           ]
         }
       ],
-      max_tokens: 4000
+      max_tokens: 10000, // Even higher token limit
+      temperature: 0.05 // Very low temperature for consistency
+    });
+    
+    const altContent = alternativeResponse.choices[0].message.content;
+    console.log('📄 Alternative response length:', altContent.length);
+    
+    const altJsonMatch = altContent.match(/\{[\s\S]*\}/);
+    if (altJsonMatch) {
+      const altData = JSON.parse(altJsonMatch[0]);
+      console.log('✅ Alternative extraction successful:', altData.menuItems?.length || 0, 'items');
+      return altData;
+    }
+    
+    throw new Error('Both extraction methods failed');
+    
+  } catch (error) {
+    console.error('❌ Enhanced extraction failed:', error);
+    throw error;
+  }
+};
+
+// Helper function to extract menu from image using OpenAI Vision
+const extractMenuFromImage = async (imageUrl) => {
+  try {
+    console.log('🔍 Starting menu extraction with enhanced prompt...');
+    
+    const response = await openai.chat.completions.create({
+      model: "gpt-4o", // Updated to latest model
+      messages: [
+        {
+          role: "user",
+          content: [
+            {
+              type: "text",
+              text: `You are an expert menu extraction AI. Analyze this restaurant menu image and extract EVERY SINGLE menu item visible. 
+
+CRITICAL: Do not miss any items - scan the entire image systematically.
+
+Return ONLY valid JSON in this exact format:
+{
+  "menuItems": [
+    {
+      "name": "Item Name",
+      "description": "Item description",
+      "price": 100,
+      "category": "appetizer|main-course|dessert|beverages|bread|rice|dal|fast-food|chinese|pizza|south-indian|north-indian",
+      "isVeg": true,
+      "spiceLevel": "mild|medium|hot",
+      "allergens": ["dairy", "gluten", "nuts"],
+      "shortCode": "ABC"
+    }
+  ]
+}
+
+Categories:
+- appetizer: Starters, snacks, small plates
+- main-course: Main dishes, entrees
+- dessert: Sweet dishes, ice cream, cakes
+- beverages: Drinks, juices, tea, coffee
+- rice: Rice dishes, biryani, pulao
+- bread: Roti, naan, paratha
+- dal: Dal, curry, gravy dishes
+- fast-food: Burgers, sandwiches
+- chinese: Chinese cuisine
+- pizza: Pizza varieties
+- south-indian: Dosa, idli, sambar
+- north-indian: North Indian curries
+
+RULES:
+1. Extract ALL visible menu items - scan every section
+2. Convert prices to numbers only (remove ₹, $, etc.)
+3. Set isVeg: true for vegetarian, false for non-vegetarian
+4. Generate shortCode: first 3 letters of item name
+5. Include allergens only if mentioned
+6. If no description, use empty string ""
+7. Be thorough - don't skip any items`
+            },
+            {
+              type: "image_url",
+              image_url: {
+                url: imageUrl,
+                detail: "high" // Enhanced detail for better text recognition
+              }
+            }
+          ]
+        }
+      ],
+      max_tokens: 8000, // Increased token limit
+      temperature: 0.1 // Lower temperature for more consistent results
     });
 
     const content = response.choices[0].message.content;
-    // Extract JSON from the response
+    console.log('📄 Raw ChatGPT response length:', content.length);
+    console.log('📄 Raw ChatGPT response preview:', content.substring(0, 200) + '...');
+    
+    // Extract JSON from the response with better error handling
     const jsonMatch = content.match(/\{[\s\S]*\}/);
     if (jsonMatch) {
-      return JSON.parse(jsonMatch[0]);
+      const extractedData = JSON.parse(jsonMatch[0]);
+      console.log('✅ Successfully extracted menu items:', extractedData.menuItems?.length || 0);
+      return extractedData;
     }
+    
+    // If no JSON found, try to extract any structured data
+    console.log('⚠️ No JSON found, attempting to parse response...');
     throw new Error('No valid JSON found in response');
+    
   } catch (error) {
-    console.error('Error extracting menu from image:', error);
+    console.error('❌ Error extracting menu from image:', error);
+    
+    // Retry with a simpler prompt
+    try {
+      console.log('🔄 Retrying with simplified prompt...');
+      const retryResponse = await openai.chat.completions.create({
+        model: "gpt-4o",
+        messages: [
+          {
+            role: "user",
+            content: [
+              {
+                type: "text",
+                text: `Extract all menu items from this image. Return JSON format:
+{
+  "menuItems": [
+    {
+      "name": "Item Name",
+      "price": 100,
+      "category": "main-course",
+      "isVeg": true,
+      "shortCode": "ABC"
+    }
+  ]
+}
+
+Extract EVERY item visible. Categories: appetizer, main-course, dessert, beverages, rice, bread, dal, fast-food, chinese, pizza, south-indian, north-indian.`
+              },
+              {
+                type: "image_url",
+                image_url: {
+                  url: imageUrl,
+                  detail: "high"
+                }
+              }
+            ]
+          }
+        ],
+        max_tokens: 6000,
+        temperature: 0.1
+      });
+      
+      const retryContent = retryResponse.choices[0].message.content;
+      const retryJsonMatch = retryContent.match(/\{[\s\S]*\}/);
+      if (retryJsonMatch) {
+        const retryData = JSON.parse(retryJsonMatch[0]);
+        console.log('✅ Retry successful, extracted items:', retryData.menuItems?.length || 0);
+        return retryData;
+      }
+    } catch (retryError) {
+      console.error('❌ Retry also failed:', retryError);
+    }
+    
     throw error;
   }
 };
@@ -3734,7 +3880,7 @@ app.post('/api/menus/bulk-upload/:restaurantId', authenticateToken, chatgptUsage
       try {
         if (uploadedFile.mimetype.startsWith('image/')) {
           console.log('Starting AI extraction for image...');
-          const menuData = await extractMenuFromImage(uploadedFile.url);
+          const menuData = await extractMenuFromLargeImage(uploadedFile.url);
           console.log('✅ AI extraction successful!');
           console.log('Extracted items:', menuData.menuItems ? menuData.menuItems.length : 0);
           
