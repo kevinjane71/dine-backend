@@ -920,24 +920,39 @@ const uploadToFirebase = async (file, restaurantId) => {
   }
 };
 
-// Enhanced function to extract menu from large images with chunking
-const extractMenuFromLargeImage = async (imageUrl) => {
+// Enhanced function to extract menu from any file type (images, PDFs, docs, CSV, etc.)
+const extractMenuFromAnyFile = async (fileUrl, fileType, fileName) => {
   try {
-    console.log('🔍 Starting enhanced menu extraction for large image...');
+    console.log(`🔍 Starting enhanced menu extraction for ${fileType} file: ${fileName}`);
     
-    // First attempt with the enhanced prompt
-    const primaryResult = await extractMenuFromImage(imageUrl);
-    
-    // If we got a good result, return it
-    if (primaryResult.menuItems && primaryResult.menuItems.length > 0) {
-      console.log('✅ Primary extraction successful:', primaryResult.menuItems.length, 'items');
-      return primaryResult;
+    // Determine the appropriate extraction method based on file type
+    if (fileType.startsWith('image/')) {
+      return await extractMenuFromImage(fileUrl);
+    } else if (fileType === 'application/pdf') {
+      return await extractMenuFromPDF(fileUrl);
+    } else if (fileType.includes('csv') || fileType.includes('excel') || fileType.includes('spreadsheet')) {
+      return await extractMenuFromCSV(fileUrl);
+    } else if (fileType.includes('document') || fileType.includes('text')) {
+      return await extractMenuFromDocument(fileUrl);
+    } else {
+      // For unknown file types, try image extraction as fallback
+      console.log('⚠️ Unknown file type, attempting image extraction as fallback...');
+      return await extractMenuFromImage(fileUrl);
     }
     
-    // If primary failed or returned few items, try alternative approach
-    console.log('🔄 Primary extraction returned few/no items, trying alternative approach...');
+  } catch (error) {
+    console.error('❌ Enhanced extraction failed:', error);
+    // Return empty result instead of throwing error
+    return { menuItems: [] };
+  }
+};
+
+// Extract menu from PDF files
+const extractMenuFromPDF = async (pdfUrl) => {
+  try {
+    console.log('📄 Extracting menu from PDF...');
     
-    const alternativeResponse = await openai.chat.completions.create({
+    const response = await openai.chat.completions.create({
       model: "gpt-4o",
       messages: [
         {
@@ -945,58 +960,200 @@ const extractMenuFromLargeImage = async (imageUrl) => {
           content: [
             {
               type: "text",
-              text: `This is a restaurant menu image. Please read ALL text visible and extract every menu item with its price.
+              text: `This is a PDF document that may contain a restaurant menu. Please analyze the content and extract any menu items you can find.
 
 IMPORTANT: 
-- Read the ENTIRE image systematically
-- Don't miss any items in any section
-- Extract names and prices for EVERY item
-- Some items might be in small text or different sections
+- This might be a PDF, document, or any text-based file
+- Look for menu items, prices, and descriptions
+- If this is NOT a menu or contains no menu data, return empty array
+- Extract ALL visible menu items with their prices
 
 Return JSON:
 {
   "menuItems": [
     {
-      "name": "Full item name",
+      "name": "Item Name",
+      "description": "Item description",
       "price": 100,
       "category": "main-course",
       "isVeg": true,
-      "shortCode": "ABC"
+      "shortCode": "1"
     }
   ]
 }
 
-Categories: appetizer, main-course, dessert, beverages, rice, bread, dal, fast-food, chinese, pizza, south-indian, north-indian`
+Categories: appetizer, main-course, dessert, beverages, rice, bread, dal, fast-food, chinese, pizza, south-indian, north-indian
+
+RULES:
+- Generate shortCode: sequential numbers starting from 1 (1, 2, 3, 4, etc.)
+- If no menu items are found, return: {"menuItems": []}`
             },
             {
               type: "image_url",
               image_url: {
-                url: imageUrl,
+                url: pdfUrl,
                 detail: "high"
               }
             }
           ]
         }
       ],
-      max_tokens: 10000, // Even higher token limit
-      temperature: 0.05 // Very low temperature for consistency
+      max_tokens: 8000,
+      temperature: 0.1
     });
     
-    const altContent = alternativeResponse.choices[0].message.content;
-    console.log('📄 Alternative response length:', altContent.length);
-    
-    const altJsonMatch = altContent.match(/\{[\s\S]*\}/);
-    if (altJsonMatch) {
-      const altData = JSON.parse(altJsonMatch[0]);
-      console.log('✅ Alternative extraction successful:', altData.menuItems?.length || 0, 'items');
-      return altData;
+    const content = response.choices[0].message.content;
+    const jsonMatch = content.match(/\{[\s\S]*\}/);
+    if (jsonMatch) {
+      const extractedData = JSON.parse(jsonMatch[0]);
+      console.log('✅ PDF extraction successful:', extractedData.menuItems?.length || 0, 'items');
+      return extractedData;
     }
     
-    throw new Error('Both extraction methods failed');
-    
+    return { menuItems: [] };
   } catch (error) {
-    console.error('❌ Enhanced extraction failed:', error);
-    throw error;
+    console.error('❌ PDF extraction failed:', error);
+    return { menuItems: [] };
+  }
+};
+
+// Extract menu from CSV/Excel files
+const extractMenuFromCSV = async (csvUrl) => {
+  try {
+    console.log('📊 Extracting menu from CSV/Excel...');
+    
+    const response = await openai.chat.completions.create({
+      model: "gpt-4o",
+      messages: [
+        {
+          role: "user",
+          content: [
+            {
+              type: "text",
+              text: `This is a CSV, Excel, or spreadsheet file that may contain restaurant menu data. Please analyze the content and extract any menu items.
+
+IMPORTANT: 
+- Look for columns with item names, prices, descriptions, categories
+- Common column names: Name, Item, Price, Cost, Description, Category, Type
+- If this is NOT a menu or contains no menu data, return empty array
+- Extract ALL menu items with their prices
+
+Return JSON:
+{
+  "menuItems": [
+    {
+      "name": "Item Name",
+      "description": "Item description",
+      "price": 100,
+      "category": "main-course",
+      "isVeg": true,
+      "shortCode": "1"
+    }
+  ]
+}
+
+Categories: appetizer, main-course, dessert, beverages, rice, bread, dal, fast-food, chinese, pizza, south-indian, north-indian
+
+RULES:
+- Generate shortCode: sequential numbers starting from 1 (1, 2, 3, 4, etc.)
+- If no menu items are found, return: {"menuItems": []}`
+            },
+            {
+              type: "image_url",
+              image_url: {
+                url: csvUrl,
+                detail: "high"
+              }
+            }
+          ]
+        }
+      ],
+      max_tokens: 8000,
+      temperature: 0.1
+    });
+    
+    const content = response.choices[0].message.content;
+    const jsonMatch = content.match(/\{[\s\S]*\}/);
+    if (jsonMatch) {
+      const extractedData = JSON.parse(jsonMatch[0]);
+      console.log('✅ CSV extraction successful:', extractedData.menuItems?.length || 0, 'items');
+      return extractedData;
+    }
+    
+    return { menuItems: [] };
+  } catch (error) {
+    console.error('❌ CSV extraction failed:', error);
+    return { menuItems: [] };
+  }
+};
+
+// Extract menu from document files
+const extractMenuFromDocument = async (docUrl) => {
+  try {
+    console.log('📝 Extracting menu from document...');
+    
+    const response = await openai.chat.completions.create({
+      model: "gpt-4o",
+      messages: [
+        {
+          role: "user",
+          content: [
+            {
+              type: "text",
+              text: `This is a document file (Word, text, or other format) that may contain restaurant menu data. Please analyze the content and extract any menu items.
+
+IMPORTANT: 
+- Look for menu items, prices, descriptions, categories
+- This could be a Word document, text file, or any document format
+- If this is NOT a menu or contains no menu data, return empty array
+- Extract ALL menu items with their prices
+
+Return JSON:
+{
+  "menuItems": [
+    {
+      "name": "Item Name",
+      "description": "Item description",
+      "price": 100,
+      "category": "main-course",
+      "isVeg": true,
+      "shortCode": "1"
+    }
+  ]
+}
+
+Categories: appetizer, main-course, dessert, beverages, rice, bread, dal, fast-food, chinese, pizza, south-indian, north-indian
+
+RULES:
+- Generate shortCode: sequential numbers starting from 1 (1, 2, 3, 4, etc.)
+- If no menu items are found, return: {"menuItems": []}`
+            },
+            {
+              type: "image_url",
+              image_url: {
+                url: docUrl,
+                detail: "high"
+              }
+            }
+          ]
+        }
+      ],
+      max_tokens: 8000,
+      temperature: 0.1
+    });
+    
+    const content = response.choices[0].message.content;
+    const jsonMatch = content.match(/\{[\s\S]*\}/);
+    if (jsonMatch) {
+      const extractedData = JSON.parse(jsonMatch[0]);
+      console.log('✅ Document extraction successful:', extractedData.menuItems?.length || 0, 'items');
+      return extractedData;
+    }
+    
+    return { menuItems: [] };
+  } catch (error) {
+    console.error('❌ Document extraction failed:', error);
+    return { menuItems: [] };
   }
 };
 
@@ -1013,9 +1170,13 @@ const extractMenuFromImage = async (imageUrl) => {
           content: [
             {
               type: "text",
-              text: `You are an expert menu extraction AI. Analyze this restaurant menu image and extract EVERY SINGLE menu item visible. 
+              text: `You are an expert menu extraction AI. Analyze this image and extract menu items if this is a restaurant menu.
 
-CRITICAL: Do not miss any items - scan the entire image systematically.
+IMPORTANT: 
+- This could be ANY type of file: image, PDF, document, CSV, live photo, etc.
+- If this is NOT a restaurant menu or contains no menu data, return empty array
+- If this IS a menu, extract EVERY SINGLE menu item visible
+- Scan the entire content systematically
 
 Return ONLY valid JSON in this exact format:
 {
@@ -1028,7 +1189,7 @@ Return ONLY valid JSON in this exact format:
       "isVeg": true,
       "spiceLevel": "mild|medium|hot",
       "allergens": ["dairy", "gluten", "nuts"],
-      "shortCode": "ABC"
+      "shortCode": "1"
     }
   ]
 }
@@ -1048,13 +1209,14 @@ Categories:
 - north-indian: North Indian curries
 
 RULES:
-1. Extract ALL visible menu items - scan every section
-2. Convert prices to numbers only (remove ₹, $, etc.)
-3. Set isVeg: true for vegetarian, false for non-vegetarian
-4. Generate shortCode: first 3 letters of item name
-5. Include allergens only if mentioned
-6. If no description, use empty string ""
-7. Be thorough - don't skip any items`
+1. If this is NOT a menu, return: {"menuItems": []}
+2. If this IS a menu, extract ALL visible menu items
+3. Convert prices to numbers only (remove ₹, $, etc.)
+4. Set isVeg: true for vegetarian, false for non-vegetarian
+5. Generate shortCode: sequential numbers starting from 1 (1, 2, 3, 4, etc.)
+6. Include allergens only if mentioned
+7. If no description, use empty string ""
+8. Be thorough - don't skip any items`
             },
             {
               type: "image_url",
@@ -1108,12 +1270,15 @@ RULES:
       "price": 100,
       "category": "main-course",
       "isVeg": true,
-      "shortCode": "ABC"
+      "shortCode": "1"
     }
   ]
 }
 
-Extract EVERY item visible. Categories: appetizer, main-course, dessert, beverages, rice, bread, dal, fast-food, chinese, pizza, south-indian, north-indian.`
+Extract EVERY item visible. Categories: appetizer, main-course, dessert, beverages, rice, bread, dal, fast-food, chinese, pizza, south-indian, north-indian.
+
+RULES:
+- Generate shortCode: sequential numbers starting from 1 (1, 2, 3, 4, etc.)`
               },
               {
                 type: "image_url",
@@ -3831,6 +3996,24 @@ app.post('/api/menus/bulk-upload/:restaurantId', authenticateToken, chatgptUsage
       return res.status(400).json({ error: 'Maximum 10 files allowed' });
     }
 
+    // Validate file types - now support all types
+    const supportedTypes = [
+      'image/jpeg', 'image/jpg', 'image/png', 'image/webp', 'image/gif', 'image/bmp', 'image/tiff',
+      'application/pdf',
+      'text/csv', 'application/csv', 'application/vnd.ms-excel', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+      'application/msword', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document', 'text/plain',
+      'application/octet-stream' // For live photos and unknown types
+    ];
+
+    const invalidFiles = files.filter(file => {
+      const isValidType = supportedTypes.some(type => file.mimetype.includes(type.split('/')[1]) || file.mimetype === type);
+      return !isValidType;
+    });
+
+    if (invalidFiles.length > 0) {
+      console.log('⚠️ Some files have unsupported types, but will attempt extraction anyway:', invalidFiles.map(f => f.originalname));
+    }
+
     // Check if user owns the restaurant
     const restaurant = await db.collection(collections.restaurants).doc(restaurantId).get();
     if (!restaurant.exists || restaurant.data().ownerId !== userId) {
@@ -3878,32 +4061,45 @@ app.post('/api/menus/bulk-upload/:restaurantId', authenticateToken, chatgptUsage
       console.log('File type:', uploadedFile.mimetype);
       
       try {
-        if (uploadedFile.mimetype.startsWith('image/')) {
-          console.log('Starting AI extraction for image...');
-          const menuData = await extractMenuFromLargeImage(uploadedFile.url);
-          console.log('✅ AI extraction successful!');
-          console.log('Extracted items:', menuData.menuItems ? menuData.menuItems.length : 0);
-          
-          // Record successful ChatGPT API call for menu extraction
-          await chatgptUsageLimiter.recordSuccessfulCall(req, 0);
-          
-          // Add original file info to each menu item
-          const menuItemsWithFile = (menuData.menuItems || []).map(item => ({
-            ...item,
-            originalFile: uploadedFile.originalName
-          }));
-          
-          extractedMenus.push({
-            file: uploadedFile.originalName,
-            menuItems: menuItemsWithFile
-          });
-        } else {
-          console.log('⚠️ Skipping non-image file (PDF processing not implemented)');
-          errors.push(`PDF processing not implemented yet: ${uploadedFile.originalName}`);
+        console.log(`Starting AI extraction for ${uploadedFile.mimetype} file: ${uploadedFile.originalName}`);
+        const menuData = await extractMenuFromAnyFile(uploadedFile.url, uploadedFile.mimetype, uploadedFile.originalName);
+        console.log('✅ AI extraction completed!');
+        console.log('Extracted items:', menuData.menuItems ? menuData.menuItems.length : 0);
+        
+        // Record successful ChatGPT API call for menu extraction
+        await chatgptUsageLimiter.recordSuccessfulCall(req, 0);
+        
+        // Add original file info to each menu item
+        const menuItemsWithFile = (menuData.menuItems || []).map(item => ({
+          ...item,
+          originalFile: uploadedFile.originalName,
+          fileType: uploadedFile.mimetype
+        }));
+        
+        extractedMenus.push({
+          file: uploadedFile.originalName,
+          fileType: uploadedFile.mimetype,
+          menuItems: menuItemsWithFile,
+          extractionStatus: menuItemsWithFile.length > 0 ? 'success' : 'no_menu_data',
+          message: menuItemsWithFile.length > 0 ? 'Menu items extracted successfully' : 'No menu data found in this file'
+        });
+        
+        if (menuItemsWithFile.length === 0) {
+          console.log(`ℹ️ No menu data found in ${uploadedFile.originalName} - this might not be a menu file`);
         }
       } catch (error) {
         console.error(`❌ Error extracting menu from ${uploadedFile.originalName}:`, error);
         errors.push(`Failed to extract menu from ${uploadedFile.originalName}: ${error.message}`);
+        
+        // Add failed extraction to results
+        extractedMenus.push({
+          file: uploadedFile.originalName,
+          fileType: uploadedFile.mimetype,
+          menuItems: [],
+          extractionStatus: 'failed',
+          message: `Failed to extract menu: ${error.message}`,
+          error: error.message
+        });
       }
     }
     
