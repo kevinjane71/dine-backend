@@ -3752,6 +3752,90 @@ const paymentRoutes = initializePaymentRoutes(db, razorpay);
 app.use('/api/payments', paymentRoutes);
 
 
+// Generic image upload API
+app.post('/api/upload/image', authenticateToken, upload.single('image'), async (req, res) => {
+  try {
+    const { userId } = req.user;
+    const file = req.file;
+
+    console.log('Generic image upload:', {
+      userId,
+      fileName: file ? file.originalname : 'none',
+      fileSize: file ? file.size : 0
+    });
+
+    if (!file) {
+      return res.status(400).json({ error: 'No image uploaded' });
+    }
+
+    // Validate file type
+    const allowedTypes = ['image/jpeg', 'image/png', 'image/jpg', 'image/webp'];
+    if (!allowedTypes.includes(file.mimetype)) {
+      return res.status(400).json({ 
+        error: 'Invalid file type. Only JPEG, PNG, and WebP images are allowed.' 
+      });
+    }
+
+    // Validate file size (5MB max)
+    const maxSize = 5 * 1024 * 1024; // 5MB
+    if (file.size > maxSize) {
+      return res.status(400).json({ 
+        error: 'File too large. Maximum file size is 5MB.' 
+      });
+    }
+
+    // Upload to Firebase Storage
+    const fileName = `images/${Date.now()}-${file.originalname}`;
+    const fileUpload = bucket.file(fileName);
+
+    const stream = fileUpload.createWriteStream({
+      metadata: {
+        contentType: file.mimetype,
+        metadata: {
+          uploadedBy: userId,
+          originalName: file.originalname,
+          uploadDate: new Date().toISOString()
+        }
+      }
+    });
+
+    stream.on('error', (error) => {
+      console.error('Error uploading to Firebase Storage:', error);
+      res.status(500).json({ error: 'Failed to upload image' });
+    });
+
+    stream.on('finish', async () => {
+      try {
+        // Make the file publicly accessible
+        await fileUpload.makePublic();
+        
+        // Get the public URL
+        const imageUrl = `https://storage.googleapis.com/${bucket.name}/${fileName}`;
+        
+        console.log('✅ Image uploaded successfully:', imageUrl);
+        
+        res.json({
+          success: true,
+          imageUrl: imageUrl,
+          fileName: fileName,
+          originalName: file.originalname,
+          size: file.size,
+          message: 'Image uploaded successfully'
+        });
+      } catch (error) {
+        console.error('Error making file public:', error);
+        res.status(500).json({ error: 'Failed to process uploaded image' });
+      }
+    });
+
+    stream.end(file.buffer);
+
+  } catch (error) {
+    console.error('Error in generic image upload:', error);
+    res.status(500).json({ error: 'Failed to upload image' });
+  }
+});
+
 // Menu item image upload API
 app.post('/api/menu-items/:itemId/images', authenticateToken, upload.array('images', 4), async (req, res) => {
   try {
