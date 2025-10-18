@@ -229,6 +229,34 @@ const authenticateToken = (req, res, next) => {
     }
     console.log('Token verified successfully for user:', user.userId);
     req.user = user;
+    
+    // Demo account restrictions with whitelist
+    if (user.phone === '+919000000000') {
+      // Whitelist of endpoints that demo accounts can access (any method)
+      const demoAllowedEndpoints = [
+        '/api/auth/phone/verify-otp',
+        '/api/auth/logout',
+        '/api/auth/refresh-token'
+      ];
+      
+      // Allow GET requests and whitelisted endpoints
+      if (req.method === 'GET' || demoAllowedEndpoints.includes(req.path)) {
+        console.log(`🎭 Demo account accessing allowed endpoint: ${req.method} ${req.path}`);
+        return next();
+      }
+      
+      // Block all other non-GET requests
+      if (req.method === 'POST' || req.method === 'PATCH' || req.method === 'DELETE') {
+        console.log(`🎭 Demo account detected: ${req.method} ${req.path} - Blocking request`);
+        return res.status(403).json({
+          success: false,
+          error: 'Demo Mode Restriction',
+          message: 'Demo accounts are restricted to read-only access. Please sign up for a full account to perform this action.',
+          demoMode: true
+        });
+      }
+    }
+    
     next();
   });
 };
@@ -1913,21 +1941,31 @@ app.post('/api/auth/phone/verify-otp', async (req, res) => {
       return res.status(400).json({ error: 'Phone and OTP are required' });
     }
 
-    const otpQuery = await db.collection('otp_verification')
-      .where('phone', '==', phone)
-      .where('otp', '==', otp)
-      .limit(1)
-      .get();
+    // Check if this is a demo account
+    const isDemoAccount = phone === '+919000000000' && otp === '1234';
+    let otpDoc = null;
+    
+    if (isDemoAccount) {
+      console.log('🎭 Demo account login detected:', phone);
+      // Skip OTP verification for demo account
+    } else {
+      // Regular OTP verification for non-demo accounts
+      const otpQuery = await db.collection('otp_verification')
+        .where('phone', '==', phone)
+        .where('otp', '==', otp)
+        .limit(1)
+        .get();
 
-    if (otpQuery.empty) {
-      return res.status(400).json({ error: 'Invalid OTP' });
-    }
+      if (otpQuery.empty) {
+        return res.status(400).json({ error: 'Invalid OTP' });
+      }
 
-    const otpDoc = otpQuery.docs[0];
-    const otpData = otpDoc.data();
+      otpDoc = otpQuery.docs[0];
+      const otpData = otpDoc.data();
 
-    if (new Date() > otpData.otpExpiry.toDate()) {
-      return res.status(400).json({ error: 'OTP expired' });
+      if (new Date() > otpData.otpExpiry.toDate()) {
+        return res.status(400).json({ error: 'OTP expired' });
+      }
     }
 
     let userDoc = await db.collection(collections.users)
@@ -1975,7 +2013,10 @@ app.post('/api/auth/phone/verify-otp', async (req, res) => {
       hasRestaurants = !restaurantsQuery.empty;
     }
 
-    await otpDoc.ref.delete();
+    // Only delete OTP if it's not a demo account
+    if (!isDemoAccount && otpDoc) {
+      await otpDoc.ref.delete();
+    }
 
     const token = jwt.sign(
       { userId, phone, role: 'owner' },
