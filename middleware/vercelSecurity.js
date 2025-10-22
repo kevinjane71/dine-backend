@@ -137,6 +137,21 @@ const vercelSecurityMiddleware = {
         const clientIP = this.getClientIP(req);
         const clientId = vercelRateLimiter.getClientId(req);
 
+        // Whitelist for development and localhost
+        const whitelistedIPs = [
+          '127.0.0.1',      // localhost IPv4
+          '::1',            // localhost IPv6
+          '::ffff:127.0.0.1', // localhost IPv4 mapped to IPv6
+          'localhost',      // localhost hostname
+          '0.0.0.0'         // all interfaces
+        ];
+
+        // Skip security checks for whitelisted IPs
+        if (whitelistedIPs.includes(clientIP) || clientIP.startsWith('127.') || clientIP.startsWith('192.168.') || clientIP.startsWith('10.')) {
+          console.log(`🔓 Whitelisted IP accessing API: ${clientIP}`);
+          return next();
+        }
+
         // Check if IP is blocked
         const blockedIPs = await this.getBlockedIPs();
         if (blockedIPs.has(clientIP)) {
@@ -156,7 +171,7 @@ const vercelSecurityMiddleware = {
           });
           
           // Block suspicious IPs temporarily
-          await this.blockIP(clientIP, 60 * 60 * 1000); // Block for 1 hour
+          await vercelSecurityMiddleware.blockIP(clientIP, 60 * 60 * 1000); // Block for 1 hour
 
           return res.status(403).json({ 
             error: 'Suspicious activity detected',
@@ -209,23 +224,61 @@ const vercelSecurityMiddleware = {
 
   // Public API security (most restrictive)
   publicAPI: function(req, res, next) {
-    return this.middleware('public')(req, res, next);
+    return vercelSecurityMiddleware.middleware('public')(req, res, next);
   },
 
   // Authenticated API security (less restrictive)
   authenticatedAPI: function(req, res, next) {
-    return this.middleware('authenticated')(req, res, next);
+    return vercelSecurityMiddleware.middleware('authenticated')(req, res, next);
   },
 
   // Chatbot API security (moderate)
   chatbotAPI: function(req, res, next) {
-    return this.middleware('chatbot')(req, res, next);
+    return vercelSecurityMiddleware.middleware('chatbot')(req, res, next);
   },
 
-  // Add IP to block list
-  async blockIP(ip, duration = 60 * 60 * 1000) {
-    await this.blockIP(ip, duration);
+  // Add IP to block list (wrapper function)
+  async addToBlockList(ip, duration = 60 * 60 * 1000) {
+    await vercelSecurityMiddleware.blockIP(ip, duration);
     console.log(`🚫 Blocked IP: ${ip} for ${duration / 1000 / 60} minutes`);
+  },
+
+  // Clear blocked IPs for localhost/development
+  async clearLocalhostBlocks() {
+    try {
+      const whitelistedIPs = [
+        '127.0.0.1',
+        '::1',
+        '::ffff:127.0.0.1',
+        'localhost',
+        '0.0.0.0'
+      ];
+
+      for (const ip of whitelistedIPs) {
+        try {
+          await db.collection('blockedIPs').doc(ip).delete();
+          console.log(`🔓 Cleared block for IP: ${ip}`);
+        } catch (error) {
+          // Ignore if document doesn't exist
+        }
+      }
+
+      // Also clear any 127.x.x.x, 192.168.x.x, and 10.x.x.x ranges
+      const snapshot = await db.collection('blockedIPs').get();
+      const batch = db.batch();
+      
+      snapshot.docs.forEach(doc => {
+        const ip = doc.id;
+        if (ip.startsWith('127.') || ip.startsWith('192.168.') || ip.startsWith('10.')) {
+          batch.delete(doc.ref);
+          console.log(`🔓 Cleared block for local IP: ${ip}`);
+        }
+      });
+      
+      await batch.commit();
+    } catch (error) {
+      console.error('Error clearing localhost blocks:', error);
+    }
   },
 
   // Get security stats

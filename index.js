@@ -2239,13 +2239,19 @@ app.get('/api/public/menu/:restaurantId', vercelSecurityMiddleware.publicAPI, as
     const { restaurantId } = req.params;
 
     if (!restaurantId) {
-      return res.status(400).json({ error: 'Restaurant ID is required' });
+      return res.status(400).json({ 
+        success: false,
+        error: 'Restaurant ID is required' 
+      });
     }
 
     // Get restaurant info
     const restaurantDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
     if (!restaurantDoc.exists) {
-      return res.status(404).json({ error: 'Restaurant not found' });
+      return res.status(404).json({ 
+        success: false,
+        error: 'Restaurant not found' 
+      });
     }
 
     const restaurantData = restaurantDoc.data();
@@ -2271,6 +2277,7 @@ app.get('/api/public/menu/:restaurantId', vercelSecurityMiddleware.publicAPI, as
       }));
 
     res.json({
+      success: true,
       restaurant: {
         id: restaurantId,
         name: restaurantData.name,
@@ -2284,7 +2291,24 @@ app.get('/api/public/menu/:restaurantId', vercelSecurityMiddleware.publicAPI, as
 
   } catch (error) {
     console.error('Public menu fetch error:', error);
-    res.status(500).json({ error: 'Failed to fetch menu' });
+    
+    // Provide more specific error messages
+    if (error.code === 'permission-denied') {
+      return res.status(403).json({ 
+        success: false,
+        error: 'Access denied to restaurant data' 
+      });
+    } else if (error.code === 'not-found') {
+      return res.status(404).json({ 
+        success: false,
+        error: 'Restaurant not found' 
+      });
+    } else {
+      return res.status(500).json({ 
+        success: false,
+        error: 'Failed to fetch menu data. Please try again later.' 
+      });
+    }
   }
 });
 
@@ -8613,12 +8637,20 @@ app.post('/api/admin/chatgpt/cleanup', authenticateToken, async (req, res) => {
 // ==================== END EMAIL SERVICE API ====================
 
 // Start server for both local development and production
-const server = app.listen(PORT, '0.0.0.0', () => {
+const server = app.listen(PORT, '0.0.0.0', async () => {
     console.log(`🚀 Dine Backend server running on port ${PORT}`);
   console.log(`🌐 Environment: ${process.env.NODE_ENV || 'development'}`);
     console.log(`🍽️ Ready to serve your restaurant management app!`);
     console.log(`🔗 Database: dine`);
     console.log(`📁 Collections: ${Object.keys(collections).join(', ')}`);
+    
+    // Clear localhost blocks for development
+    try {
+      await vercelSecurityMiddleware.clearLocalhostBlocks();
+      console.log(`🔓 Cleared localhost blocks for development`);
+    } catch (error) {
+      console.error('Error clearing localhost blocks:', error);
+    }
   });
 
 // Handle server errors
