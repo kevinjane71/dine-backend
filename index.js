@@ -5136,19 +5136,32 @@ app.post('/api/bookings/:restaurantId', async (req, res) => {
       occasionType
     } = req.body;
 
-    if (!tableId || !customerName || !customerPhone || !bookingDate || !bookingTime || !partySize) {
+    if (!tableId || !customerName || !bookingDate || !bookingTime || !partySize) {
       return res.status(400).json({ 
-        error: 'Table ID, customer name, phone, booking date, time, and party size are required' 
+        error: 'Table ID, customer name, booking date, time, and party size are required' 
       });
     }
 
-    // Check if table exists and is available
-    const tableDoc = await db.collection(collections.tables).doc(tableId).get();
-    if (!tableDoc.exists) {
+    // Check if table exists and is available - using new restaurant-centric structure
+    let tableData = null;
+    let tableFound = false;
+    
+    // Search for table across all floors in the restaurant
+    const floorsSnapshot = await db.collection('restaurants').doc(restaurantId).collection('floors').get();
+    
+    for (const floorDoc of floorsSnapshot.docs) {
+      const tableDoc = await floorDoc.ref.collection('tables').doc(tableId).get();
+      if (tableDoc.exists) {
+        tableData = tableDoc.data();
+        tableFound = true;
+        break;
+      }
+    }
+    
+    if (!tableFound) {
       return res.status(404).json({ error: 'Table not found' });
     }
-
-    const tableData = tableDoc.data();
+    
     if (tableData.status === 'out-of-service') {
       return res.status(400).json({ error: 'Table is out of service' });
     }
@@ -5197,11 +5210,20 @@ app.post('/api/bookings/:restaurantId', async (req, res) => {
     const minutesDiff = Math.floor(timeDiff / (1000 * 60));
 
     if (minutesDiff <= 30 && minutesDiff >= -15) { // 30 min before to 15 min after
-      await db.collection(collections.tables).doc(tableId).update({
-        status: 'reserved',
-        currentBookingId: bookingRef.id,
-        updatedAt: new Date()
-      });
+      // Find and update the table in the new structure
+      const floorsSnapshot = await db.collection('restaurants').doc(restaurantId).collection('floors').get();
+      
+      for (const floorDoc of floorsSnapshot.docs) {
+        const tableDoc = await floorDoc.ref.collection('tables').doc(tableId).get();
+        if (tableDoc.exists) {
+          await tableDoc.ref.update({
+            status: 'reserved',
+            currentBookingId: bookingRef.id,
+            updatedAt: new Date()
+          });
+          break;
+        }
+      }
     }
 
     res.status(201).json({
