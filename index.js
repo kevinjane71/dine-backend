@@ -5119,6 +5119,128 @@ app.get('/api/bookings/:restaurantId', authenticateToken, async (req, res) => {
   }
 });
 
+// Get availability data for a specific date
+app.get('/api/bookings/availability/:restaurantId', async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+    const { date } = req.query;
+
+    if (!date) {
+      return res.status(400).json({ error: 'Date parameter is required' });
+    }
+
+    // Parse the date
+    const selectedDate = new Date(date);
+    const startOfDay = new Date(selectedDate);
+    startOfDay.setHours(0, 0, 0, 0);
+    const endOfDay = new Date(selectedDate);
+    endOfDay.setHours(23, 59, 59, 999);
+
+    // Get all floors and tables for the restaurant
+    const floorsSnapshot = await db.collection('restaurants').doc(restaurantId).collection('floors').get();
+    const allTables = [];
+    
+    for (const floorDoc of floorsSnapshot.docs) {
+      const tablesSnapshot = await floorDoc.ref.collection('tables').get();
+      tablesSnapshot.docs.forEach(tableDoc => {
+        allTables.push({
+          id: tableDoc.id,
+          ...tableDoc.data(),
+          floor: floorDoc.data().name
+        });
+      });
+    }
+
+    // Get existing bookings for the selected date
+    const bookingsSnapshot = await db.collection(collections.bookings || 'bookings')
+      .where('restaurantId', '==', restaurantId)
+      .where('bookingDate', '>=', startOfDay)
+      .where('bookingDate', '<=', endOfDay)
+      .where('status', 'in', ['confirmed', 'arrived'])
+      .get();
+
+    const bookedTableIds = new Set();
+    const timeSlotBookings = {};
+
+    bookingsSnapshot.docs.forEach(doc => {
+      const booking = doc.data();
+      bookedTableIds.add(booking.tableId);
+      
+      // Track time slot bookings
+      const timeSlot = booking.bookingTime;
+      if (!timeSlotBookings[timeSlot]) {
+        timeSlotBookings[timeSlot] = [];
+      }
+      timeSlotBookings[timeSlot].push(booking.tableId);
+    });
+
+    // Generate time slots (10 AM to 11 PM, 30-minute intervals)
+    const timeSlots = [];
+    for (let hour = 10; hour <= 23; hour++) {
+      for (let minute = 0; minute < 60; minute += 30) {
+        const time = new Date();
+        time.setHours(hour, minute, 0, 0);
+        
+        const timeString = time.toLocaleTimeString('en-US', {
+          hour: 'numeric',
+          minute: '2-digit',
+          hour12: true
+        });
+        
+        const timeSlotValue = time.toTimeString().slice(0, 5);
+        const bookedTablesForSlot = timeSlotBookings[timeSlotValue] || [];
+        const availableTablesForSlot = allTables.filter(table => 
+          !bookedTablesForSlot.includes(table.id) && 
+          table.status !== 'out-of-service'
+        );
+        
+        timeSlots.push({
+          value: timeSlotValue,
+          display: timeString,
+          available: availableTablesForSlot.length > 0,
+          availableTablesCount: availableTablesForSlot.length,
+          totalTablesCount: allTables.length
+        });
+      }
+    }
+
+    // Filter available tables (not booked and not out of service)
+    const availableTablesForBooking = allTables.filter(table => 
+      !bookedTableIds.has(table.id) && 
+      table.status !== 'out-of-service'
+    );
+
+    // Calculate table counts based on table status
+    const totalTables = allTables.length;
+    const availableTables = allTables.filter(table => table.status === 'available').length;
+    const reservedTables = allTables.filter(table => table.status !== 'available' && table.status !== 'out-of-service').length;
+
+    res.json({
+      success: true,
+      date: date,
+      availableTables: availableTablesForBooking,
+      timeSlots: timeSlots,
+      totalTables: allTables.length,
+      bookedTables: bookedTableIds.size,
+      stats: {
+        available: availableTablesForBooking.length,
+        booked: bookedTableIds.size,
+        outOfService: allTables.filter(t => t.status === 'out-of-service').length,
+        totalTables: totalTables,
+        availableTables: availableTables,
+        reservedTables: reservedTables
+      }
+    });
+
+  } catch (error) {
+    console.error('Error fetching availability:', error);
+    res.status(500).json({ 
+      success: false,
+      error: 'Failed to fetch availability data' 
+    });
+  }
+});
+
 // Create new booking
 app.post('/api/bookings/:restaurantId', async (req, res) => {
   try {
