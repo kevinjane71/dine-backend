@@ -2882,34 +2882,47 @@ app.post('/api/orders', async (req, res) => {
       console.log('🪑 Validating table number:', tableNumber);
       
       try {
-        // Use the SAME logic as the floors API endpoint
-        console.log('🪑 Using floors API logic for restaurant:', restaurantId);
+        // Use the new restaurant-centric structure
+        console.log('🪑 Using new restaurant-centric structure for restaurant:', restaurantId);
         
-        // Get all tables for this restaurant (same as floors API)
-        const tablesSnapshot = await db.collection(collections.tables)
-          .where('restaurantId', '==', restaurantId)
+        // Get floors from restaurant subcollection
+        const floorsSnapshot = await db.collection('restaurants')
+          .doc(restaurantId)
+          .collection('floors')
           .get();
         
-        console.log('🪑 Found tables:', tablesSnapshot.size);
+        console.log('🪑 Found floors:', floorsSnapshot.size);
         
         let tableFound = false;
         let tableStatus = null;
         let tableId = null;
+        let tableFloor = null;
         
-        // Search for the table directly in tables collection
-        for (const doc of tablesSnapshot.docs) {
-          const table = {
-            id: doc.id,
-            ...doc.data()
-          };
+        // Search for the table across all floors
+        for (const floorDoc of floorsSnapshot.docs) {
+          const floorData = floorDoc.data();
           
-          if (table.name && table.name.toString().toLowerCase() === tableNumber.trim().toLowerCase()) {
-            tableFound = true;
-            tableStatus = table.status;
-            tableId = table.id;
-            console.log('🪑 Found table:', { id: tableId, number: tableNumber, status: tableStatus, floor: table.floor });
-            break;
+          const tablesSnapshot = await db.collection('restaurants')
+            .doc(restaurantId)
+            .collection('floors')
+            .doc(floorDoc.id)
+            .collection('tables')
+            .get();
+
+          for (const tableDoc of tablesSnapshot.docs) {
+            const tableData = tableDoc.data();
+            
+            if (tableData.name && tableData.name.toString().toLowerCase() === tableNumber.trim().toLowerCase()) {
+              tableFound = true;
+              tableStatus = tableData.status;
+              tableId = tableDoc.id;
+              tableFloor = floorData.name;
+              console.log('🪑 Found table:', { id: tableId, number: tableNumber, status: tableStatus, floor: tableFloor });
+              break;
+            }
           }
+          
+          if (tableFound) break;
         }
         
         if (!tableFound) {
@@ -3080,22 +3093,37 @@ app.post('/api/orders', async (req, res) => {
       try {
         console.log('🔄 Updating table status to occupied:', tableNumber);
         
-        // Find the table document
-        const tablesSnapshot = await db.collection(collections.tables)
-          .where('restaurantId', '==', restaurantId)
-          .where('name', '==', tableNumber.trim())
+        // Find the table in the new restaurant-centric structure
+        const floorsSnapshot = await db.collection('restaurants')
+          .doc(restaurantId)
+          .collection('floors')
           .get();
         
-        if (!tablesSnapshot.empty) {
-          const tableDoc = tablesSnapshot.docs[0];
-          await tableDoc.ref.update({
-            status: 'occupied',
-            currentOrderId: orderRef.id,
-            lastOrderTime: new Date(),
-            updatedAt: new Date()
-          });
-          console.log('✅ Table status updated to occupied:', tableNumber);
-        } else {
+        let tableUpdated = false;
+        for (const floorDoc of floorsSnapshot.docs) {
+          const tablesSnapshot = await db.collection('restaurants')
+            .doc(restaurantId)
+            .collection('floors')
+            .doc(floorDoc.id)
+            .collection('tables')
+            .where('name', '==', tableNumber.trim())
+            .get();
+          
+          if (!tablesSnapshot.empty) {
+            const tableDoc = tablesSnapshot.docs[0];
+            await tableDoc.ref.update({
+              status: 'occupied',
+              currentOrderId: orderRef.id,
+              lastOrderTime: new Date(),
+              updatedAt: new Date()
+            });
+            console.log('✅ Table status updated to occupied:', tableNumber);
+            tableUpdated = true;
+            break;
+          }
+        }
+        
+        if (!tableUpdated) {
           console.log('⚠️ Table not found for status update:', tableNumber);
         }
       } catch (tableUpdateError) {
