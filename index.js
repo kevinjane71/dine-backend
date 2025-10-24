@@ -43,6 +43,9 @@ const openai = new OpenAI({
 const initializePaymentRoutes = require('./payment');
 const emailService = require('./emailService');
 
+// Chatbot RAG routes
+const chatbotRoutes = require('./routes/chatbot');
+
 // Debug email service initialization
 console.log('📧 Email service loaded:', !!emailService);
 if (emailService) {
@@ -3816,6 +3819,9 @@ async function calculateOrderTotal(items) {
 const paymentRoutes = initializePaymentRoutes(db, razorpay);
 app.use('/api/payments', paymentRoutes);
 
+// Initialize chatbot RAG routes
+app.use('/api', chatbotRoutes);
+
 
 // Generic image upload API
 app.post('/api/upload/image', authenticateToken, upload.single('image'), async (req, res) => {
@@ -4585,30 +4591,70 @@ app.post('/api/tables/:restaurantId', authenticateToken, async (req, res) => {
       return res.status(400).json({ error: 'Floor is required' });
     }
 
-    // Check for duplicate table name across all floors in the restaurant
-    const existingTablesSnapshot = await db.collection(collections.tables)
-      .where('restaurantId', '==', restaurantId)
+    // Find the floor document, create it if it doesn't exist
+    const floorId = `floor_${floor.toLowerCase().replace(/\s+/g, '_')}`;
+    let floorDoc = await db.collection('restaurants')
+      .doc(restaurantId)
+      .collection('floors')
+      .doc(floorId)
+      .get();
+
+    // If floor doesn't exist, create it automatically
+    if (!floorDoc.exists) {
+      console.log(`🔄 Auto-creating floor "${floor}" for restaurant ${restaurantId}`);
+      const floorData = {
+        name: floor,
+        description: `Auto-created floor: ${floor}`,
+        restaurantId,
+        createdAt: new Date(),
+        updatedAt: new Date()
+      };
+
+      await db.collection('restaurants')
+        .doc(restaurantId)
+        .collection('floors')
+        .doc(floorId)
+        .set(floorData);
+
+      // Re-fetch the floor document
+      floorDoc = await db.collection('restaurants')
+        .doc(restaurantId)
+        .collection('floors')
+        .doc(floorId)
+        .get();
+    }
+
+    // Check for duplicate table name in this floor
+    const existingTablesSnapshot = await db.collection('restaurants')
+      .doc(restaurantId)
+      .collection('floors')
+      .doc(floorId)
+      .collection('tables')
       .where('name', '==', name)
       .get();
 
     if (!existingTablesSnapshot.empty) {
-      return res.status(400).json({ error: `Table "${name}" already exists in this restaurant` });
+      return res.status(400).json({ error: `Table "${name}" already exists on floor "${floor}"` });
     }
 
     const tableData = {
-      restaurantId,
       name,
       floor: floor,
       capacity: capacity || 4,
       section: section || 'Main',
-      status: 'available', // available, occupied, reserved, cleaning
+      status: 'available',
       currentOrderId: null,
       lastOrderTime: null,
       createdAt: new Date(),
       updatedAt: new Date()
     };
 
-    const tableRef = await db.collection(collections.tables).add(tableData);
+    const tableRef = await db.collection('restaurants')
+      .doc(restaurantId)
+      .collection('floors')
+      .doc(floorId)
+      .collection('tables')
+      .add(tableData);
 
     res.status(201).json({
       message: 'Table created successfully',
@@ -4627,12 +4673,16 @@ app.post('/api/tables/:restaurantId', authenticateToken, async (req, res) => {
 app.patch('/api/tables/:tableId/status', authenticateToken, async (req, res) => {
   try {
     const { tableId } = req.params;
-    const { status, orderId } = req.body;
+    const { status, orderId, restaurantId } = req.body;
 
     const validStatuses = ['available', 'occupied', 'serving', 'reserved', 'cleaning', 'out-of-service'];
     
     if (!validStatuses.includes(status)) {
       return res.status(400).json({ error: 'Invalid status' });
+    }
+
+    if (!restaurantId) {
+      return res.status(400).json({ error: 'Restaurant ID is required' });
     }
 
     const updateData = {
@@ -4647,7 +4697,39 @@ app.patch('/api/tables/:tableId/status', authenticateToken, async (req, res) => 
       updateData.currentOrderId = null;
     }
 
-    await db.collection(collections.tables).doc(tableId).update(updateData);
+    // Find the table across all floors
+    const floorsSnapshot = await db.collection('restaurants')
+      .doc(restaurantId)
+      .collection('floors')
+      .get();
+
+    let tableFound = false;
+    for (const floorDoc of floorsSnapshot.docs) {
+      const tableDoc = await db.collection('restaurants')
+        .doc(restaurantId)
+        .collection('floors')
+        .doc(floorDoc.id)
+        .collection('tables')
+        .doc(tableId)
+        .get();
+
+      if (tableDoc.exists) {
+        await db.collection('restaurants')
+          .doc(restaurantId)
+          .collection('floors')
+          .doc(floorDoc.id)
+          .collection('tables')
+          .doc(tableId)
+          .update(updateData);
+        
+        tableFound = true;
+        break;
+      }
+    }
+
+    if (!tableFound) {
+      return res.status(404).json({ error: 'Table not found' });
+    }
 
     res.json({ message: 'Table status updated successfully' });
 
@@ -4661,7 +4743,11 @@ app.patch('/api/tables/:tableId/status', authenticateToken, async (req, res) => 
 app.patch('/api/tables/:tableId', authenticateToken, async (req, res) => {
   try {
     const { tableId } = req.params;
-    const { name, floor, capacity, section } = req.body;
+    const { name, floor, capacity, section, restaurantId } = req.body;
+
+    if (!restaurantId) {
+      return res.status(400).json({ error: 'Restaurant ID is required' });
+    }
 
     const updateData = {
       updatedAt: new Date()
@@ -4676,7 +4762,39 @@ app.patch('/api/tables/:tableId', authenticateToken, async (req, res) => {
       return res.status(400).json({ error: 'No valid fields to update' });
     }
 
-    await db.collection(collections.tables).doc(tableId).update(updateData);
+    // Find the table across all floors in the restaurant
+    const floorsSnapshot = await db.collection('restaurants')
+      .doc(restaurantId)
+      .collection('floors')
+      .get();
+
+    let tableFound = false;
+    for (const floorDoc of floorsSnapshot.docs) {
+      const tableDoc = await db.collection('restaurants')
+        .doc(restaurantId)
+        .collection('floors')
+        .doc(floorDoc.id)
+        .collection('tables')
+        .doc(tableId)
+        .get();
+
+      if (tableDoc.exists) {
+        await db.collection('restaurants')
+          .doc(restaurantId)
+          .collection('floors')
+          .doc(floorDoc.id)
+          .collection('tables')
+          .doc(tableId)
+          .update(updateData);
+        
+        tableFound = true;
+        break;
+      }
+    }
+
+    if (!tableFound) {
+      return res.status(404).json({ error: 'Table not found' });
+    }
 
     res.json({ message: 'Table updated successfully' });
 
@@ -4690,8 +4808,45 @@ app.patch('/api/tables/:tableId', authenticateToken, async (req, res) => {
 app.delete('/api/tables/:tableId', authenticateToken, async (req, res) => {
   try {
     const { tableId } = req.params;
+    const { restaurantId } = req.body;
 
-    await db.collection(collections.tables).doc(tableId).delete();
+    if (!restaurantId) {
+      return res.status(400).json({ error: 'Restaurant ID is required' });
+    }
+
+    // Find the table across all floors in the restaurant
+    const floorsSnapshot = await db.collection('restaurants')
+      .doc(restaurantId)
+      .collection('floors')
+      .get();
+
+    let tableFound = false;
+    for (const floorDoc of floorsSnapshot.docs) {
+      const tableDoc = await db.collection('restaurants')
+        .doc(restaurantId)
+        .collection('floors')
+        .doc(floorDoc.id)
+        .collection('tables')
+        .doc(tableId)
+        .get();
+
+      if (tableDoc.exists) {
+        await db.collection('restaurants')
+          .doc(restaurantId)
+          .collection('floors')
+          .doc(floorDoc.id)
+          .collection('tables')
+          .doc(tableId)
+          .delete();
+        
+        tableFound = true;
+        break;
+      }
+    }
+
+    if (!tableFound) {
+      return res.status(404).json({ error: 'Table not found' });
+    }
 
     res.json({ message: 'Table deleted successfully' });
 
@@ -4706,40 +4861,62 @@ app.get('/api/floors/:restaurantId', async (req, res) => {
   try {
     const { restaurantId } = req.params;
 
-    // Get all tables for this restaurant
-    const tablesSnapshot = await db.collection(collections.tables)
-      .where('restaurantId', '==', restaurantId)
+    // Get floors from restaurant subcollection
+    const floorsSnapshot = await db.collection('restaurants')
+      .doc(restaurantId)
+      .collection('floors')
       .get();
 
-    const tables = [];
-    tablesSnapshot.forEach(doc => {
-      tables.push({
-        id: doc.id,
-        ...doc.data()
+    const floors = [];
+    
+    for (const floorDoc of floorsSnapshot.docs) {
+      const floorData = floorDoc.data();
+      
+      // Get tables for this floor
+      const tablesSnapshot = await db.collection('restaurants')
+        .doc(restaurantId)
+        .collection('floors')
+        .doc(floorDoc.id)
+        .collection('tables')
+        .get();
+
+      const tables = [];
+      tablesSnapshot.forEach(tableDoc => {
+        tables.push({
+          id: tableDoc.id,
+          ...tableDoc.data()
+        });
       });
-    });
 
-    // Group tables by floor
-    const floorsMap = {};
-    tables.forEach(table => {
-      const floorName = table.floor || 'Ground Floor';
-      if (!floorsMap[floorName]) {
-        floorsMap[floorName] = {
-          id: `floor_${floorName.toLowerCase().replace(/\s+/g, '_')}`,
-          name: floorName,
-          restaurantId,
-          tables: []
-        };
-      }
-      floorsMap[floorName].tables.push(table);
-    });
-
-    const floors = Object.values(floorsMap);
+      floors.push({
+        id: floorDoc.id,
+        name: floorData.name,
+        restaurantId,
+        tables: tables
+      });
+    }
     
     // If no floors exist, create default floor structure
     if (floors.length === 0) {
+      console.log(`🔄 No floors found, creating default "Ground Floor" for restaurant ${restaurantId}`);
+      
+      const defaultFloorId = 'floor_ground_floor';
+      const defaultFloorData = {
+        name: 'Ground Floor',
+        description: 'Default main dining area',
+        restaurantId,
+        createdAt: new Date(),
+        updatedAt: new Date()
+      };
+
+      await db.collection('restaurants')
+        .doc(restaurantId)
+        .collection('floors')
+        .doc(defaultFloorId)
+        .set(defaultFloorData);
+
       floors.push({
-        id: 'floor_ground_floor',
+        id: defaultFloorId,
         name: 'Ground Floor',
         restaurantId,
         tables: []
@@ -4764,33 +4941,30 @@ app.post('/api/floors/:restaurantId', authenticateToken, async (req, res) => {
       return res.status(400).json({ error: 'Floor name is required' });
     }
 
-    // Create a sample table for this floor to establish the floor
-    const tableData = {
+    // Create floor document in restaurant subcollection
+    const floorId = `floor_${name.toLowerCase().replace(/\s+/g, '_')}`;
+    const floorData = {
+      name,
+      description: description || '',
       restaurantId,
-      name: 'Table 1',
-      floor: name,
-      capacity: 4,
-      section: 'Main',
-      status: 'available',
-      currentOrderId: null,
-      lastOrderTime: null,
       createdAt: new Date(),
       updatedAt: new Date()
     };
 
-    const tableRef = await db.collection(collections.tables).add(tableData);
+    await db.collection('restaurants')
+      .doc(restaurantId)
+      .collection('floors')
+      .doc(floorId)
+      .set(floorData);
 
     res.status(201).json({
-      message: 'Floor created successfully with initial table',
+      message: 'Floor created successfully',
       floor: {
-        id: `floor_${name.toLowerCase().replace(/\s+/g, '_')}`,
+        id: floorId,
         name,
-        description: description || null,
+        description: description || '',
         restaurantId,
-        tables: [{
-          id: tableRef.id,
-          ...tableData
-        }]
+        tables: []
       }
     });
 
