@@ -16,6 +16,46 @@ require('dotenv').config();
 
 const { db, collections } = require('./firebase');
 
+// Generate daily order ID (starts from 1 each day)
+async function generateDailyOrderId(restaurantId) {
+  try {
+    const today = new Date();
+    const todayStr = today.toISOString().split('T')[0]; // YYYY-MM-DD format
+    
+    // Get or create daily counter document
+    const counterRef = db.collection('daily_order_counters').doc(`${restaurantId}_${todayStr}`);
+    const counterDoc = await counterRef.get();
+    
+    if (!counterDoc.exists) {
+      // First order of the day - start from 1
+      await counterRef.set({
+        restaurantId,
+        date: todayStr,
+        lastOrderId: 1,
+        createdAt: new Date(),
+        updatedAt: new Date()
+      });
+      return 1;
+    } else {
+      // Increment the counter
+      const counterData = counterDoc.data();
+      const newOrderId = counterData.lastOrderId + 1;
+      
+      await counterRef.update({
+        lastOrderId: newOrderId,
+        updatedAt: new Date()
+      });
+      
+      return newOrderId;
+    }
+  } catch (error) {
+    console.error('Error generating daily order ID:', error);
+    // Fallback to timestamp-based ID
+    return Date.now() % 10000; // Last 4 digits of timestamp
+  }
+}
+
+
 // Security middleware (Vercel-compatible)
 const vercelSecurityMiddleware = require('./middleware/vercelSecurity');
 const { vercelRateLimiter } = require('./middleware/vercelRateLimiter');
@@ -2770,12 +2810,14 @@ app.post('/api/public/orders/:restaurantId', vercelSecurityMiddleware.publicAPI,
       });
     }
 
-    // Generate order number
+    // Generate order number and daily order ID
     const orderNumber = `ORD-${Date.now()}-${Math.random().toString(36).substr(2, 4).toUpperCase()}`;
+    const dailyOrderId = await generateDailyOrderId(restaurantId);
 
     const orderData = {
       restaurantId,
       orderNumber,
+      dailyOrderId,
       customerId,
       tableNumber: seatNumber || null,
       orderType: 'customer_self_order',
@@ -2990,12 +3032,14 @@ app.post('/api/orders', async (req, res) => {
       });
     }
 
-    // Generate order number
+    // Generate order number and daily order ID
     const orderNumber = `ORD-${Date.now()}-${Math.random().toString(36).substr(2, 4).toUpperCase()}`;
+    const dailyOrderId = await generateDailyOrderId(restaurantId);
 
     const orderData = {
       restaurantId,
       orderNumber,
+      dailyOrderId,
       tableNumber: tableNumber || seatNumber || null,
       orderType,
       items: orderItems,
@@ -3713,20 +3757,37 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
     if (status === 'completed' && currentOrder.tableNumber && currentOrder.tableNumber.trim()) {
       try {
         console.log('🔄 Releasing table due to order completion:', currentOrder.tableNumber);
-        const tablesSnapshot = await db.collection(collections.tables)
-          .where('restaurantId', '==', currentOrder.restaurantId)
-          .where('name', '==', currentOrder.tableNumber.trim())
+        
+        // Use the new restaurant-centric structure
+        const floorsSnapshot = await db.collection('restaurants')
+          .doc(currentOrder.restaurantId)
+          .collection('floors')
           .get();
         
-        if (!tablesSnapshot.empty) {
-          const tableDoc = tablesSnapshot.docs[0];
-          await tableDoc.ref.update({
-            status: 'available',
-            currentOrderId: null,
-            updatedAt: new Date()
-          });
-          console.log('✅ Table released after order completion:', currentOrder.tableNumber);
-        } else {
+        let tableReleased = false;
+        for (const floorDoc of floorsSnapshot.docs) {
+          const tablesSnapshot = await db.collection('restaurants')
+            .doc(currentOrder.restaurantId)
+            .collection('floors')
+            .doc(floorDoc.id)
+            .collection('tables')
+            .where('name', '==', currentOrder.tableNumber.trim())
+            .get();
+          
+          if (!tablesSnapshot.empty) {
+            const tableDoc = tablesSnapshot.docs[0];
+            await tableDoc.ref.update({
+              status: 'available',
+              currentOrderId: null,
+              updatedAt: new Date()
+            });
+            console.log('✅ Table released after order completion:', currentOrder.tableNumber);
+            tableReleased = true;
+            break;
+          }
+        }
+        
+        if (!tableReleased) {
           console.log('⚠️ Table not found for release:', currentOrder.tableNumber);
         }
       } catch (tableReleaseError) {
@@ -3741,39 +3802,77 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
         // Free up the old table if it exists
         if (currentOrder.tableNumber && currentOrder.tableNumber.trim()) {
           console.log('🔄 Freeing up old table:', currentOrder.tableNumber);
-          const oldTablesSnapshot = await db.collection(collections.tables)
-            .where('restaurantId', '==', currentOrder.restaurantId)
-            .where('name', '==', currentOrder.tableNumber.trim())
+          
+          // Use the new restaurant-centric structure
+          const floorsSnapshot = await db.collection('restaurants')
+            .doc(currentOrder.restaurantId)
+            .collection('floors')
             .get();
           
-          if (!oldTablesSnapshot.empty) {
-            const oldTableDoc = oldTablesSnapshot.docs[0];
-            await oldTableDoc.ref.update({
-              status: 'available',
-              currentOrderId: null,
-        updatedAt: new Date()
-      });
-            console.log('✅ Old table freed:', currentOrder.tableNumber);
+          let oldTableFreed = false;
+          for (const floorDoc of floorsSnapshot.docs) {
+            const oldTablesSnapshot = await db.collection('restaurants')
+              .doc(currentOrder.restaurantId)
+              .collection('floors')
+              .doc(floorDoc.id)
+              .collection('tables')
+              .where('name', '==', currentOrder.tableNumber.trim())
+              .get();
+            
+            if (!oldTablesSnapshot.empty) {
+              const oldTableDoc = oldTablesSnapshot.docs[0];
+              await oldTableDoc.ref.update({
+                status: 'available',
+                currentOrderId: null,
+                updatedAt: new Date()
+              });
+              console.log('✅ Old table freed:', currentOrder.tableNumber);
+              oldTableFreed = true;
+              break;
+            }
+          }
+          
+          if (!oldTableFreed) {
+            console.log('⚠️ Old table not found for freeing:', currentOrder.tableNumber);
           }
         }
         
         // Occupy the new table if provided
         if (tableNumber && tableNumber.trim()) {
           console.log('🔄 Occupying new table:', tableNumber);
-          const newTablesSnapshot = await db.collection(collections.tables)
-            .where('restaurantId', '==', currentOrder.restaurantId)
-            .where('name', '==', tableNumber.trim())
+          
+          // Use the new restaurant-centric structure
+          const floorsSnapshot = await db.collection('restaurants')
+            .doc(currentOrder.restaurantId)
+            .collection('floors')
             .get();
           
-          if (!newTablesSnapshot.empty) {
-            const newTableDoc = newTablesSnapshot.docs[0];
-            await newTableDoc.ref.update({
-              status: 'occupied',
-              currentOrderId: orderId,
-              lastOrderTime: new Date(),
-              updatedAt: new Date()
-            });
-            console.log('✅ New table occupied:', tableNumber);
+          let tableUpdated = false;
+          for (const floorDoc of floorsSnapshot.docs) {
+            const tablesSnapshot = await db.collection('restaurants')
+              .doc(currentOrder.restaurantId)
+              .collection('floors')
+              .doc(floorDoc.id)
+              .collection('tables')
+              .where('name', '==', tableNumber.trim())
+              .get();
+            
+            if (!tablesSnapshot.empty) {
+              const newTableDoc = tablesSnapshot.docs[0];
+              await newTableDoc.ref.update({
+                status: 'occupied',
+                currentOrderId: orderId,
+                lastOrderTime: new Date(),
+                updatedAt: new Date()
+              });
+              console.log('✅ New table occupied:', tableNumber);
+              tableUpdated = true;
+              break;
+            }
+          }
+          
+          if (!tableUpdated) {
+            console.log('⚠️ New table not found for occupation:', tableNumber);
           }
         }
       } catch (tableUpdateError) {
@@ -5203,7 +5302,10 @@ app.get('/api/bookings/availability/:restaurantId', async (req, res) => {
         const bookedTablesForSlot = timeSlotBookings[timeSlotValue] || [];
         const availableTablesForSlot = allTables.filter(table => 
           !bookedTablesForSlot.includes(table.id) && 
-          table.status !== 'out-of-service'
+          table.status !== 'out-of-service' &&
+          table.status !== 'occupied' &&
+          table.status !== 'serving' &&
+          table.status !== 'reserved'
         );
         
         timeSlots.push({
@@ -5216,10 +5318,13 @@ app.get('/api/bookings/availability/:restaurantId', async (req, res) => {
       }
     }
 
-    // Filter available tables (not booked and not out of service)
+    // Filter available tables (not booked, not occupied, and not out of service)
     const availableTablesForBooking = allTables.filter(table => 
       !bookedTableIds.has(table.id) && 
-      table.status !== 'out-of-service'
+      table.status !== 'out-of-service' &&
+      table.status !== 'occupied' &&
+      table.status !== 'serving' &&
+      table.status !== 'reserved'
     );
 
     // Calculate table counts based on table status
@@ -9012,6 +9117,88 @@ const server = app.listen(PORT, '0.0.0.0', async () => {
   });
 
 // Handle server errors
+// Temporary endpoint to fix table status
+app.post('/api/debug/fix-table', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId, tableNumber } = req.body;
+    
+    if (!restaurantId || !tableNumber) {
+      return res.status(400).json({ error: 'Restaurant ID and table number are required' });
+    }
+    
+    console.log(`🔧 Debug: Fixing table "${tableNumber}" in restaurant ${restaurantId}`);
+    
+    // Get floors from restaurant subcollection
+    const floorsSnapshot = await db.collection('restaurants')
+      .doc(restaurantId)
+      .collection('floors')
+      .get();
+    
+    console.log('🪑 Found floors:', floorsSnapshot.size);
+    
+    let tableFound = false;
+    let tableUpdated = false;
+    
+    // Search for the table across all floors
+    for (const floorDoc of floorsSnapshot.docs) {
+      const floorData = floorDoc.data();
+      console.log(`🔍 Checking floor: ${floorData.name}`);
+      
+      const tablesSnapshot = await db.collection('restaurants')
+        .doc(restaurantId)
+        .collection('floors')
+        .doc(floorDoc.id)
+        .collection('tables')
+        .get();
+
+      for (const tableDoc of tablesSnapshot.docs) {
+        const tableData = tableDoc.data();
+        
+        if (tableData.name && tableData.name.toString().toLowerCase() === tableNumber.trim().toLowerCase()) {
+          tableFound = true;
+          console.log('🪑 Found table:', { 
+            id: tableDoc.id, 
+            name: tableData.name, 
+            status: tableData.status, 
+            floor: floorData.name,
+            capacity: tableData.capacity,
+            currentOrderId: tableData.currentOrderId
+          });
+          
+          // Update table to available status
+          await tableDoc.ref.update({
+            status: 'available',
+            currentOrderId: null,
+            updatedAt: new Date()
+          });
+          
+          console.log('✅ Table has been set to AVAILABLE status');
+          tableUpdated = true;
+          break;
+        }
+      }
+      
+      if (tableFound) break;
+    }
+    
+    if (!tableFound) {
+      return res.status(404).json({ error: `Table "${tableNumber}" not found in any floor` });
+    } else if (!tableUpdated) {
+      return res.status(500).json({ error: 'Table found but could not be updated' });
+    } else {
+      return res.json({ 
+        message: `Table "${tableNumber}" is now available for new orders!`,
+        tableNumber,
+        status: 'available'
+      });
+    }
+    
+  } catch (error) {
+    console.error('❌ Error fixing table:', error);
+    res.status(500).json({ error: 'Failed to fix table status' });
+  }
+});
+
 server.on('error', (error) => {
   console.error('❌ Server error:', error);
   if (error.code === 'EADDRINUSE') {
