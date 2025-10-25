@@ -3161,10 +3161,11 @@ app.get('/api/orders/:restaurantId', authenticateToken, async (req, res) => {
       date, 
       search, 
       waiterId,
-      orderType 
+      orderType,
+      todayOnly 
     } = req.query;
 
-    console.log(`🔍 Orders API - Restaurant: ${restaurantId}, Page: ${page}, Limit: ${limit}, Status: ${status || 'all'}, Search: ${search || 'none'}, Waiter: ${waiterId || 'all'}`);
+    console.log(`🔍 Orders API - Restaurant: ${restaurantId}, Page: ${page}, Limit: ${limit}, Status: ${status || 'all'}, Search: ${search || 'none'}, Waiter: ${waiterId || 'all'}, TodayOnly: ${todayOnly}`);
 
     // Calculate pagination
     const pageNum = parseInt(page);
@@ -3184,8 +3185,19 @@ app.get('/api/orders/:restaurantId', authenticateToken, async (req, res) => {
       query = query.where('orderType', '==', orderType);
     }
 
-    // Apply date filter
-    if (date) {
+    // Apply today filter
+    if (todayOnly === 'true') {
+      const todayStart = new Date();
+      todayStart.setHours(0, 0, 0, 0);
+      const todayEnd = new Date();
+      todayEnd.setHours(23, 59, 59, 999);
+      
+      query = query.where('createdAt', '>=', todayStart)
+                   .where('createdAt', '<=', todayEnd);
+    }
+
+    // Apply date filter (for specific date)
+    if (date && todayOnly !== 'true') {
       const startDate = new Date(date);
       const endDate = new Date(date);
       endDate.setDate(endDate.getDate() + 1);
