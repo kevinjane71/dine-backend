@@ -3707,21 +3707,47 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
       const processedItems = items.map(newItem => {
         const existingItem = existingItems.find(existing => existing.menuItemId === newItem.menuItemId);
         
+        // Ensure each item has proper price and total information
+        const itemWithTotals = {
+          ...newItem,
+          // Ensure price is available
+          price: newItem.price || existingItem?.price || 0,
+          // Calculate total if not provided
+          total: newItem.total || (newItem.price || existingItem?.price || 0) * newItem.quantity
+        };
+        
         if (!existingItem) {
           // This is a completely new item
-          return { ...newItem, isNew: true, addedAt: new Date().toISOString() };
+          return { ...itemWithTotals, isNew: true, addedAt: new Date().toISOString() };
         } else if (existingItem.quantity !== newItem.quantity) {
           // This item's quantity was updated
-          return { ...newItem, isUpdated: true, updatedAt: new Date().toISOString() };
+          return { ...itemWithTotals, isUpdated: true, updatedAt: new Date().toISOString() };
         } else {
           // This item was not changed
-          return { ...newItem };
+          return { ...itemWithTotals };
         }
       });
       
       updateData.items = processedItems;
       updateData.itemCount = processedItems.reduce((sum, item) => sum + item.quantity, 0);
       updateData.totalAmount = await calculateOrderTotal(processedItems);
+      
+      // Double-check totalAmount calculation
+      if (updateData.totalAmount === 0 && processedItems.length > 0) {
+        console.warn('⚠️ Total amount calculated as 0, recalculating from items...');
+        updateData.totalAmount = processedItems.reduce((sum, item) => sum + (item.total || 0), 0);
+      }
+      
+      console.log('🔄 Updated order totals:', {
+        itemCount: updateData.itemCount,
+        totalAmount: updateData.totalAmount,
+        items: processedItems.map(item => ({
+          name: item.name,
+          price: item.price,
+          quantity: item.quantity,
+          total: item.total
+        }))
+      });
     }
 
     if (tableNumber !== undefined) updateData.tableNumber = tableNumber;
@@ -3940,10 +3966,25 @@ async function calculateOrderTotal(items) {
   
   for (const item of items) {
     try {
+      // First try to use the embedded price data from the order item
+      if (item.price && item.quantity) {
+        total += item.price * item.quantity;
+        continue;
+      }
+      
+      // Fallback: try to use the total field if available
+      if (item.total) {
+        total += item.total;
+        continue;
+      }
+      
+      // Last resort: fetch from menu items collection (legacy support)
       const menuItemDoc = await db.collection(collections.menuItems).doc(item.menuItemId).get();
       if (menuItemDoc.exists) {
         const menuItem = menuItemDoc.data();
         total += menuItem.price * item.quantity;
+      } else {
+        console.warn(`Menu item ${item.menuItemId} not found in separate collection`);
       }
     } catch (error) {
       console.error('Error calculating item total:', error);
