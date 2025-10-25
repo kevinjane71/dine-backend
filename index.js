@@ -2114,12 +2114,29 @@ app.post('/api/auth/phone/verify-otp', async (req, res) => {
 
 app.get('/api/restaurants', authenticateToken, async (req, res) => {
   try {
-    const { userId, role } = req.user;
+    const { userId, role, restaurantId } = req.user;
 
     let query = db.collection(collections.restaurants);
 
-    if (role !== 'admin') {
+    if (role === 'admin') {
+      // Admin can see all restaurants
+      query = query;
+    } else if (role === 'owner' || role === 'customer') {
+      // Owners and customers see their own restaurants
       query = query.where('ownerId', '==', userId);
+    } else if (restaurantId) {
+      // Staff members see only their assigned restaurant
+      const restaurantDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
+      if (restaurantDoc.exists) {
+        restaurants.push({
+          id: restaurantDoc.id,
+          ...restaurantDoc.data()
+        });
+      }
+      return res.json({ restaurants });
+    } else {
+      // No access
+      return res.json({ restaurants: [] });
     }
 
     const snapshot = await query.get();
@@ -5703,10 +5720,36 @@ app.get('/api/staff/:restaurantId', authenticateToken, requireOwnerRole, async (
       .get();
 
     const staff = [];
-    snapshot.forEach(doc => {
+    
+    // Process each staff member and fetch their credentials
+    for (const doc of snapshot.docs) {
       const userData = doc.data();
+      const staffId = doc.id;
+      
+      // Check if temporary credentials exist
+      let tempPassword = null;
+      let hasTemporaryPassword = false;
+      
+      try {
+        const credentialsDoc = await db.collection('staffCredentials').doc(staffId).get();
+        if (credentialsDoc.exists) {
+          const credentialsData = credentialsDoc.data();
+          
+          // Check if credentials have expired
+          if (credentialsData.expiresAt && new Date() > credentialsData.expiresAt.toDate()) {
+            // Delete expired credentials
+            await db.collection('staffCredentials').doc(staffId).delete();
+          } else {
+            tempPassword = credentialsData.temporaryPassword;
+            hasTemporaryPassword = true;
+          }
+        }
+      } catch (error) {
+        console.log('Error fetching credentials for staff:', staffId, error);
+      }
+      
       staff.push({
-        id: doc.id,
+        id: staffId,
         name: userData.name,
         phone: userData.phone,
         email: userData.email,
@@ -5715,15 +5758,106 @@ app.get('/api/staff/:restaurantId', authenticateToken, requireOwnerRole, async (
         startDate: userData.startDate,
         lastLogin: userData.lastLogin,
         createdAt: userData.createdAt,
-        updatedAt: userData.updatedAt
+        updatedAt: userData.updatedAt,
+        loginId: userData.loginId,
+        tempPassword: tempPassword, // Include actual temporary password
+        hasTemporaryPassword: hasTemporaryPassword
       });
-    });
+    }
 
     res.json({ staff });
 
   } catch (error) {
     console.error('Get staff error:', error);
     res.status(500).json({ error: 'Failed to fetch staff' });
+  }
+});
+
+// Get staff credentials (for admin display)
+app.get('/api/staff/:staffId/credentials', authenticateToken, requireOwnerRole, async (req, res) => {
+  try {
+    const { staffId } = req.params;
+
+    const staffDoc = await db.collection(collections.users).doc(staffId).get();
+    if (!staffDoc.exists) {
+      return res.status(404).json({ error: 'Staff member not found' });
+    }
+
+    const staffData = staffDoc.data();
+    
+    // Check if temporary credentials exist
+    const credentialsDoc = await db.collection('staffCredentials').doc(staffId).get();
+    
+    if (credentialsDoc.exists) {
+      const credentialsData = credentialsDoc.data();
+      
+      // Check if credentials have expired
+      if (credentialsData.expiresAt && new Date() > credentialsData.expiresAt.toDate()) {
+        // Delete expired credentials
+        await db.collection('staffCredentials').doc(staffId).delete();
+        
+        res.json({
+          loginId: staffData.loginId,
+          hasTemporaryPassword: false,
+          message: 'Temporary password has expired. Staff member should use their current password.'
+        });
+      } else {
+        res.json({
+          loginId: credentialsData.loginId,
+          temporaryPassword: credentialsData.temporaryPassword,
+          hasTemporaryPassword: true,
+          message: 'This staff member has a temporary password.'
+        });
+      }
+    } else {
+      res.json({
+        loginId: staffData.loginId,
+        hasTemporaryPassword: false,
+        message: 'This staff member has already changed their password.'
+      });
+    }
+
+  } catch (error) {
+    console.error('Get staff credentials error:', error);
+    res.status(500).json({ error: 'Failed to get staff credentials' });
+  }
+});
+
+// Delete staff member
+app.delete('/api/staff/:staffId', authenticateToken, requireOwnerRole, async (req, res) => {
+  try {
+    const { staffId } = req.params;
+
+    console.log(`🗑️ Delete Staff API - Staff ID: ${staffId}`);
+
+    // Get the staff member to verify they exist and get restaurant info
+    const staffDoc = await db.collection(collections.users).doc(staffId).get();
+    if (!staffDoc.exists) {
+      return res.status(404).json({ error: 'Staff member not found' });
+    }
+
+    const staffData = staffDoc.data();
+
+    // Delete the staff member
+    await db.collection(collections.users).doc(staffId).delete();
+
+    // Also delete any temporary credentials if they exist
+    try {
+      await db.collection('staffCredentials').doc(staffId).delete();
+    } catch (error) {
+      console.log('No temporary credentials to delete for staff:', staffId);
+    }
+
+    console.log(`✅ Staff member ${staffData.name} deleted successfully`);
+    
+    res.json({
+      success: true,
+      message: 'Staff member deleted successfully'
+    });
+
+  } catch (error) {
+    console.error('Delete staff error:', error);
+    res.status(500).json({ error: 'Failed to delete staff member' });
   }
 });
 
@@ -5794,6 +5928,15 @@ app.post('/api/staff/:restaurantId', authenticateToken, requireOwnerRole, async 
     };
 
     const staffRef = await db.collection(collections.users).add(staffData);
+
+    // Store temporary password for admin display (will be deleted after first login)
+    await db.collection('staffCredentials').doc(staffRef.id).set({
+      staffId: staffRef.id,
+      loginId: userId,
+      temporaryPassword: temporaryPassword,
+      createdAt: new Date(),
+      expiresAt: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000) // 7 days
+    });
 
     // TODO: Send email with login credentials
     console.log(`📧 Staff Login Credentials for ${name}:`);
@@ -6045,7 +6188,7 @@ app.post('/api/auth/staff/login', async (req, res) => {
         pageAccess: staffData.pageAccess
       },
       restaurant: restaurantData ? {
-        id: restaurantData.id,
+        id: staffData.restaurantId, // Use the restaurantId from staff data
         name: restaurantData.name,
         address: restaurantData.address,
         phone: restaurantData.phone,
@@ -6678,7 +6821,7 @@ app.patch('/api/kot/:orderId/status', async (req, res) => {
     const { orderId } = req.params;
     const { status, cookingStartTime, cookingEndTime, notes } = req.body;
 
-    const validStatuses = ['confirmed', 'preparing', 'ready', 'served', 'completed'];
+    const validStatuses = ['pending', 'confirmed', 'preparing', 'ready', 'served', 'completed', 'cancelled'];
     if (!validStatuses.includes(status)) {
       return res.status(400).json({ error: 'Invalid status' });
     }
@@ -6794,6 +6937,84 @@ app.get('/api/kot/:restaurantId/:orderId', async (req, res) => {
   } catch (error) {
     console.error('Get KOT details error:', error);
     res.status(500).json({ error: 'Failed to fetch KOT details' });
+  }
+});
+
+// Cancel Order API
+app.patch('/api/orders/:orderId/cancel', authenticateToken, async (req, res) => {
+  try {
+    const { orderId } = req.params;
+    const { reason } = req.body;
+
+    console.log(`🚫 Cancel Order API - Order: ${orderId}, Reason: ${reason || 'No reason provided'}`);
+
+    // Get the order
+    const orderDoc = await db.collection(collections.orders).doc(orderId).get();
+    if (!orderDoc.exists) {
+      return res.status(404).json({ error: 'Order not found' });
+    }
+
+    const orderData = orderDoc.data();
+
+    // Check if order can be cancelled (not completed billing)
+    if (orderData.status === 'completed' || orderData.paymentStatus === 'completed') {
+      return res.status(400).json({ 
+        error: 'Cannot cancel order that has been completed or billed' 
+      });
+    }
+
+    // Check if order is already cancelled
+    if (orderData.status === 'cancelled') {
+      return res.status(400).json({ 
+        error: 'Order is already cancelled' 
+      });
+    }
+
+    // Update order status to cancelled
+    const updateData = {
+      status: 'cancelled',
+      cancelledAt: new Date(),
+      cancelledBy: req.user.userId,
+      cancellationReason: reason || 'No reason provided',
+      updatedAt: new Date()
+    };
+
+    await db.collection(collections.orders).doc(orderId).update(updateData);
+
+    // If order has a table, update table status
+    if (orderData.tableNumber) {
+      try {
+        const tablesSnapshot = await db.collection(collections.tables)
+          .where('restaurantId', '==', orderData.restaurantId)
+          .where('number', '==', orderData.tableNumber)
+          .limit(1)
+          .get();
+        
+        if (!tablesSnapshot.empty) {
+          await db.collection(collections.tables).doc(tablesSnapshot.docs[0].id).update({
+            status: 'available',
+            currentOrderId: null,
+            updatedAt: new Date()
+          });
+          console.log(`🔄 Updated table ${orderData.tableNumber} to available after order cancellation`);
+        }
+      } catch (error) {
+        console.error('Error updating table status after cancellation:', error);
+      }
+    }
+
+    console.log(`✅ Order ${orderId} cancelled successfully`);
+    
+    res.json({
+      success: true,
+      message: 'Order cancelled successfully',
+      orderId: orderId,
+      cancelledAt: updateData.cancelledAt
+    });
+
+  } catch (error) {
+    console.error('Cancel order error:', error);
+    res.status(500).json({ error: 'Failed to cancel order' });
   }
 });
 
