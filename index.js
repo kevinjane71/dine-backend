@@ -2115,6 +2115,7 @@ app.post('/api/auth/phone/verify-otp', async (req, res) => {
 app.get('/api/restaurants', authenticateToken, async (req, res) => {
   try {
     const { userId, role, restaurantId } = req.user;
+    const restaurants = []; // Move declaration to top
 
     let query = db.collection(collections.restaurants);
 
@@ -2140,7 +2141,6 @@ app.get('/api/restaurants', authenticateToken, async (req, res) => {
     }
 
     const snapshot = await query.get();
-    const restaurants = [];
 
     snapshot.forEach(doc => {
       restaurants.push({
