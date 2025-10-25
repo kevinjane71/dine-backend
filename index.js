@@ -15,6 +15,7 @@ const Razorpay = require('razorpay');
 require('dotenv').config();
 
 const { db, collections } = require('./firebase');
+const { FieldValue } = require('firebase-admin/firestore');
 
 // Generate daily order ID (starts from 1 each day)
 async function generateDailyOrderId(restaurantId) {
@@ -2848,8 +2849,8 @@ app.post('/api/public/orders/:restaurantId', vercelSecurityMiddleware.publicAPI,
 
     // Update customer stats
     await db.collection('customers').doc(customerId).update({
-      totalOrders: db.FieldValue.increment(1),
-      totalSpent: db.FieldValue.increment(calculatedTotal)
+      totalOrders: FieldValue.increment(1),
+      totalSpent: FieldValue.increment(calculatedTotal)
     });
     
     console.log(`🛒 Customer order created successfully: ${orderRef.id}`);

@@ -33,7 +33,10 @@ const vercelRateLimiter = {
                'unknown';
     
     const userAgent = req.headers['user-agent'] || 'unknown';
-    return `${ip}-${userAgent}`;
+    
+    // Create safe document ID by replacing invalid characters
+    const combined = `${ip}-${userAgent}`;
+    return combined.replace(/[\/\\#\$\[\]]/g, '_').substring(0, 150);
   },
 
   // Get rate limit data from Firestore
