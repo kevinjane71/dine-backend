@@ -31,6 +31,7 @@ const collections = {
   users: 'users',
   restaurants: 'restaurants',
   menus: 'menus',
+  menuItems: 'menuItems',
   orders: 'orders',
   payments: 'payments',
   inventory: 'inventory',

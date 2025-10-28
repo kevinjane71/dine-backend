@@ -7019,6 +7019,156 @@ app.patch('/api/orders/:orderId/cancel', authenticateToken, async (req, res) => 
 });
 
 // ========================================
+// VOICE ASSISTANT API
+// ========================================
+
+// Process voice order using ChatGPT
+app.post('/api/voice/process-order', authenticateToken, async (req, res) => {
+  try {
+    const { transcript, restaurantId } = req.body;
+    
+    if (!transcript || !restaurantId) {
+      return res.status(400).json({ error: 'Transcript and restaurantId are required' });
+    }
+
+    console.log('🎤 Voice order processing:', { transcript, restaurantId });
+
+    // Get menu items from restaurant document (menu is stored in restaurant.menu.items)
+    const restaurantDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
+    
+    if (!restaurantDoc.exists) {
+      return res.status(404).json({ error: 'Restaurant not found' });
+    }
+
+    const restaurantData = restaurantDoc.data();
+    const menuData = restaurantData.menu || { categories: [], items: [] };
+    let menuItems = menuData.items || [];
+
+    // Filter only active items
+    menuItems = menuItems.filter(item => item.status === 'active' || item.active === true);
+
+    if (menuItems.length === 0) {
+      return res.status(404).json({ error: 'No menu items found' });
+    }
+
+    // Create menu context for ChatGPT
+    const menuContext = menuItems.map(item => 
+      `- ${item.name} (₹${item.price}) - ID: ${item.id}`
+    ).join('\n');
+
+    // Use ChatGPT to parse the voice command
+    const openai = new OpenAI({
+      apiKey: process.env.OPENAI_API_KEY
+    });
+
+    const completion = await openai.chat.completions.create({
+      model: "gpt-4o-mini",
+      messages: [
+        {
+          role: "system",
+          content: `You are a restaurant order assistant for Indian cuisine. Parse the user's voice command with Indian accents and extract menu items with quantities.
+          
+Available menu items:
+${menuContext}
+
+Instructions:
+1. Understand Indian accent variations (e.g., "paneer" as "paneer" or "panir"; "chhole" as "chhole", "chole", "chhola")
+2. Extract all mentioned menu items and their quantities
+3. Match items using phonetic similarity and common variations
+4. Be flexible with spelling and pronunciation
+5. Return ONLY valid menu items that exist in the list
+6. Extract quantity (default is 1 if not specified)
+7. Return as a JSON array of objects with: id, name, quantity
+
+Example responses:
+- "Add 2 samosas" → [{"id":"item123","name":"Samosa","quantity":2}]
+- "I want one Paneer Tikka and two Chhole Bhature" → [{"id":"item456","name":"Paneer Tikka","quantity":1},{"id":"item789","name":"Cholle Bhature","quantity":2}]
+- "Give me one Panir tika and one Chole Bhatura" → [{"id":"item456","name":"Paneer Tikka","quantity":1},{"id":"item789","name":"Cholle Bhature","quantity":1}]`
+        },
+        {
+          role: "user",
+          content: transcript
+        }
+      ],
+      temperature: 0.2,
+      max_tokens: 300
+    });
+
+    const responseText = completion.choices[0].message.content.trim();
+    console.log('🤖 ChatGPT response:', responseText);
+
+    // Parse the response (might be JSON or markdown code block)
+    let parsedItems;
+    try {
+      // Try to extract JSON from markdown code block
+      const jsonMatch = responseText.match(/```json\s*([\s\S]*?)\s*```/) || responseText.match(/```\s*([\s\S]*?)\s*```/);
+      if (jsonMatch) {
+        parsedItems = JSON.parse(jsonMatch[1]);
+      } else {
+        parsedItems = JSON.parse(responseText);
+      }
+    } catch (parseError) {
+      console.error('Failed to parse ChatGPT response:', responseText);
+      return res.status(500).json({ error: 'Failed to parse voice command' });
+    }
+
+    // Helper function for fuzzy name matching
+    const fuzzyMatch = (name1, name2) => {
+      const n1 = name1.toLowerCase().replace(/[^a-z0-9]/g, '');
+      const n2 = name2.toLowerCase().replace(/[^a-z0-9]/g, '');
+      return n1.includes(n2) || n2.includes(n1);
+    };
+
+    // Validate and enrich items with prices
+    const enrichedItems = [];
+    for (const item of parsedItems) {
+      // First try exact match by name
+      let menuItem = menuItems.find(m => m.name.toLowerCase() === item.name.toLowerCase());
+      
+      // If not found, try fuzzy matching
+      if (!menuItem) {
+        menuItem = menuItems.find(m => fuzzyMatch(m.name, item.name));
+      }
+      
+      // If still not found, try to match by id if provided
+      if (!menuItem && item.id) {
+        menuItem = menuItems.find(m => m.id === item.id);
+      }
+      
+      if (!menuItem) {
+        console.log(`⚠️ Could not match item: ${item.name}`);
+        continue; // Skip items that don't match
+      }
+      
+      enrichedItems.push({
+        id: menuItem.id,
+        name: menuItem.name,
+        price: menuItem.price,
+        quantity: item.quantity || 1
+      });
+    }
+
+    if (enrichedItems.length === 0) {
+      return res.status(404).json({ error: 'Could not match any menu items' });
+    }
+
+    console.log('✅ Voice order parsed:', enrichedItems);
+
+    res.json({
+      success: true,
+      items: enrichedItems
+    });
+
+  } catch (error) {
+    console.error('Voice processing error:', error);
+    res.status(500).json({ 
+      error: 'Failed to process voice command',
+      message: error.message 
+    });
+  }
+});
+
+// ========================================
 // INVENTORY MANAGEMENT APIs
 // ========================================
 
@@ -9470,3 +9620,4 @@ server.on('error', (error) => {
 });
 
 module.exports = app;
+
