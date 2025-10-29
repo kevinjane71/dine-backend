@@ -1391,6 +1391,77 @@ app.get('/health', (req, res) => {
   });
 });
 
+// Demo request endpoint - public, no auth required
+app.post('/api/demo-request', async (req, res) => {
+  try {
+    const { contactType, phone, email, comment } = req.body;
+
+    // Validate required fields
+    if (!contactType || (contactType !== 'phone' && contactType !== 'email')) {
+      return res.status(400).json({ 
+        error: 'Invalid contact type. Must be "phone" or "email"' 
+      });
+    }
+
+    if (contactType === 'phone' && !phone) {
+      return res.status(400).json({ 
+        error: 'Phone number is required when contact type is phone' 
+      });
+    }
+
+    if (contactType === 'email' && !email) {
+      return res.status(400).json({ 
+        error: 'Email is required when contact type is email' 
+      });
+    }
+
+    // Validate phone format if provided
+    if (phone && !/^[\d\s\-\+\(\)]+$/.test(phone)) {
+      return res.status(400).json({ 
+        error: 'Invalid phone number format' 
+      });
+    }
+
+    // Validate email format if provided
+    if (email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+      return res.status(400).json({ 
+        error: 'Invalid email format' 
+      });
+    }
+
+    // Create demo request document
+    const demoRequestRef = db.collection('demoRequests').doc();
+    const demoRequestData = {
+      id: demoRequestRef.id,
+      contactType,
+      phone: phone || null,
+      email: email || null,
+      comment: comment || '',
+      status: 'pending',
+      createdAt: new Date(),
+      updatedAt: new Date(),
+      ipAddress: req.ip || req.connection.remoteAddress,
+      userAgent: req.get('user-agent') || ''
+    };
+
+    await demoRequestRef.set(demoRequestData);
+
+    console.log('✅ Demo request saved:', demoRequestData.id);
+
+    res.status(201).json({
+      success: true,
+      message: 'Demo request submitted successfully! We\'ll contact you soon.',
+      requestId: demoRequestRef.id
+    });
+
+  } catch (error) {
+    console.error('❌ Error saving demo request:', error);
+    res.status(500).json({ 
+      error: 'Failed to submit demo request. Please try again.' 
+    });
+  }
+});
+
 app.get('/', (req, res) => {
   res.json({
     message: '🍽️ Welcome to Dine - Restaurant Management System!',
