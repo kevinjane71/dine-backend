@@ -2489,7 +2489,9 @@ app.post('/api/menus/:restaurantId', authenticateToken, async (req, res) => {
       spiceLevel, 
       allergens,
       image,
-      shortCode 
+      shortCode,
+      variants,
+      customizations
     } = req.body;
 
     if (!name || !price || !category) {
@@ -2527,6 +2529,22 @@ app.post('/api/menus/:restaurantId', authenticateToken, async (req, res) => {
       isStockManaged: req.body.isStockManaged || false,
       availableFrom: req.body.availableFrom || null,
       availableUntil: req.body.availableUntil || null,
+      // Variants and customizations (ensure prices are numbers)
+      variants: variants && Array.isArray(variants) && variants.length > 0 
+        ? variants.map(v => ({
+            name: v.name,
+            price: typeof v.price === 'number' ? v.price : parseFloat(v.price) || 0,
+            description: v.description || ''
+          }))
+        : [],
+      customizations: customizations && Array.isArray(customizations) && customizations.length > 0
+        ? customizations.map(c => ({
+            id: c.id || `cust_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+            name: c.name,
+            price: typeof c.price === 'number' ? c.price : parseFloat(c.price) || 0,
+            description: c.description || ''
+          }))
+        : [],
       createdAt: new Date(),
       updatedAt: new Date()
     };
@@ -2608,13 +2626,32 @@ app.patch('/api/menus/item/:id', authenticateToken, async (req, res) => {
       'name', 'description', 'price', 'category', 'isVeg', 'spiceLevel', 
       'allergens', 'image', 'shortCode', 'status', 'order',
       'isAvailable', 'stockQuantity', 'lowStockThreshold', 'isStockManaged',
-      'availableFrom', 'availableUntil'
+      'availableFrom', 'availableUntil', 'variants', 'customizations'
     ];
     
     allowedFields.forEach(field => {
       if (req.body[field] !== undefined) {
         if (field === 'price') {
           updateData[field] = parseFloat(req.body[field]);
+        } else if (field === 'variants') {
+          // Ensure variants are arrays with parsed prices
+          updateData[field] = Array.isArray(req.body[field]) 
+            ? req.body[field].map(v => ({
+                name: v.name,
+                price: typeof v.price === 'number' ? v.price : parseFloat(v.price) || 0,
+                description: v.description || ''
+              }))
+            : [];
+        } else if (field === 'customizations') {
+          // Ensure customizations are arrays with parsed prices
+          updateData[field] = Array.isArray(req.body[field])
+            ? req.body[field].map(c => ({
+                id: c.id || `cust_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+                name: c.name,
+                price: typeof c.price === 'number' ? c.price : parseFloat(c.price) || 0,
+                description: c.description || ''
+              }))
+            : [];
         } else {
           updateData[field] = req.body[field];
         }
@@ -3107,17 +3144,34 @@ app.post('/api/orders', async (req, res) => {
         return res.status(400).json({ error: `Menu item ${item.menuItemId} not found` });
       }
 
-      const itemTotal = menuItem.price * item.quantity;
+      // Compute unit price considering variant and selected customizations (toppings)
+      const selectedVariant = item.selectedVariant || item.variant || null; // { name, price }
+      const customizations = Array.isArray(item.selectedCustomizations)
+        ? item.selectedCustomizations
+        : (Array.isArray(item.customizations) ? item.customizations : []);
+
+      const basePrice = typeof selectedVariant?.price === 'number'
+        ? selectedVariant.price
+        : (typeof item.basePrice === 'number' ? item.basePrice : (typeof item.price === 'number' ? item.price : menuItem.price));
+
+      const customizationPrice = customizations.reduce((sum, c) => sum + (typeof c.price === 'number' ? c.price : 0), 0);
+      const unitPrice = (basePrice || 0) + (customizationPrice || 0);
+
+      const itemQuantity = Math.max(1, parseInt(item.quantity, 10) || 1);
+      const itemTotal = unitPrice * itemQuantity;
       totalAmount += itemTotal;
 
       orderItems.push({
         menuItemId: item.menuItemId,
         name: menuItem.name,
-        price: menuItem.price,
-        quantity: item.quantity,
+        price: unitPrice,
+        quantity: itemQuantity,
         total: itemTotal,
         shortCode: menuItem.shortCode || null,
-        notes: item.notes || ''
+        notes: item.notes || '',
+        // Persist kitchen-facing details
+        selectedVariant: selectedVariant ? { name: selectedVariant.name, price: selectedVariant.price || 0 } : null,
+        selectedCustomizations: customizations.map(c => ({ id: c.id || null, name: c.name || c, price: typeof c.price === 'number' ? c.price : 0 }))
       });
     }
 
