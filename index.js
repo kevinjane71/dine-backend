@@ -87,6 +87,9 @@ const emailService = require('./emailService');
 // Chatbot RAG routes
 const chatbotRoutes = require('./routes/chatbot');
 
+// Hotel PMS routes
+const hotelRoutes = require('./routes/hotel');
+
 // Debug email service initialization
 console.log('📧 Email service loaded:', !!emailService);
 if (emailService) {
@@ -174,11 +177,14 @@ const upload = multer({
 });
 //hello ddd
     const allowedOrigins = [
+      'http://localhost:3001',
       'http://localhost:3002',
       'http://localhost:3003',
       'https://dine-frontend-ecru.vercel.app',
       'https://www.dineopen.com',
-      'https://dineopen.com'
+      'https://dineopen.com',
+      'https://pms-hotel.vercel.app',
+      'https://hotel.dineopen.com'
 ];
 
 const corsOptions = {
@@ -202,7 +208,7 @@ const corsOptions = {
     }
     
     // Check if origin is a localhost subdomain (for development)
-    if (origin.match(/^http:\/\/[a-zA-Z0-9-]+\.localhost:3002$/)) {
+    if (origin.match(/^http:\/\/[a-zA-Z0-9-]+\.localhost:(3001|3002)$/)) {
       callback(null, true);
       return;
     }
@@ -4145,6 +4151,9 @@ app.use('/api/payments', paymentRoutes);
 // Initialize chatbot RAG routes
 app.use('/api', chatbotRoutes);
 
+// Initialize hotel PMS routes
+app.use('/api/hotel', hotelRoutes);
+
 
 // Generic image upload API
 app.post('/api/upload/image', authenticateToken, upload.single('image'), async (req, res) => {
@@ -6168,6 +6177,46 @@ app.get('/api/user/page-access', authenticateToken, async (req, res) => {
   } catch (error) {
     console.error('Get page access error:', error);
     res.status(500).json({ error: 'Failed to get page access' });
+  }
+});
+
+// Get current authenticated user (for hotel PMS and other apps)
+app.get('/api/auth/me', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    console.log('🔍 /api/auth/me - userId:', userId);
+    
+    const userDoc = await db.collection(collections.users).doc(userId).get();
+    
+    if (!userDoc.exists) {
+      console.log('❌ User not found:', userId);
+      return res.status(404).json({ error: 'User not found' });
+    }
+    
+    const userData = userDoc.data();
+    console.log('✅ User found, data keys:', Object.keys(userData));
+    
+    const responseData = {
+      id: userDoc.id,
+      userId: userId,
+      name: userData.name || null,
+      email: userData.email || null,
+      phone: userData.phone || null,
+      role: userData.role || null,
+      restaurantId: userData.restaurantId || null,
+      permissions: userData.permissions || {},
+      pageAccess: userData.pageAccess || null,
+      status: userData.status || null,
+      createdAt: userData.createdAt || null,
+      lastLogin: userData.lastLogin || null
+    };
+    
+    console.log('📤 Sending response:', JSON.stringify(responseData, null, 2));
+    res.json(responseData);
+  } catch (error) {
+    console.error('❌ Get current user error:', error);
+    console.error('Error stack:', error.stack);
+    res.status(500).json({ error: 'Failed to get user information', details: error.message });
   }
 });
 
@@ -9255,7 +9304,8 @@ app.use((req, res) => {
       '/api/admin/settings/*',
       '/api/categories/*',
       '/api/email/*',
-      '/api/dinebot/*'
+      '/api/dinebot/*',
+      '/api/hotel/*'
     ]
   });
 });
