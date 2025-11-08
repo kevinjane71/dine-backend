@@ -9348,8 +9348,8 @@ app.get('/api/supplier-invoices/:restaurantId', authenticateToken, async (req, r
   }
 });
 
-// Create supplier invoice (manual entry or from OCR)
-app.post('/api/supplier-invoices/:restaurantId', authenticateToken, async (req, res) => {
+// Create supplier invoice (manual entry, from OCR, or file upload)
+app.post('/api/supplier-invoices/:restaurantId', authenticateToken, upload.single('invoiceFile'), async (req, res) => {
   try {
     const { restaurantId } = req.params;
     const { userId, role } = req.user;
@@ -9358,7 +9358,53 @@ app.post('/api/supplier-invoices/:restaurantId', authenticateToken, async (req, 
       return res.status(403).json({ error: 'Access denied' });
     }
 
-    const { purchaseOrderId, grnId, supplierId, invoiceNumber, invoiceDate, items, subtotal, taxAmount, totalAmount, paymentTerms, dueDate, imageUrl, extractedData } = req.body;
+    const { 
+      purchaseOrderId, 
+      grnId, 
+      supplierId, 
+      invoiceNumber, 
+      invoiceDate, 
+      items, 
+      subtotal, 
+      taxAmount, 
+      totalAmount, 
+      paymentTerms, 
+      dueDate, 
+      imageUrl, 
+      extractedData,
+      receivedMethod, // 'email', 'physical', 'uploaded', 'generated'
+      receivedDate,
+      paymentStatus // 'unpaid', 'partial', 'paid'
+    } = req.body;
+
+    // Handle file upload if present
+    let invoiceFileUrl = imageUrl || null;
+    let invoiceFileName = null;
+    
+    if (req.file) {
+      try {
+        // Upload invoice file (PDF or image) to Firebase Storage
+        const filename = `invoices/${restaurantId}/${Date.now()}-${req.file.originalname}`;
+        const blob = bucket.file(filename);
+        
+        await blob.save(req.file.buffer, {
+          contentType: req.file.mimetype,
+          metadata: {
+            restaurantId: restaurantId,
+            uploadedBy: userId,
+            uploadedAt: new Date().toISOString(),
+            originalName: req.file.originalname
+          }
+        });
+        
+        invoiceFileUrl = `https://storage.googleapis.com/${bucket.name}/${filename}`;
+        invoiceFileName = req.file.originalname;
+        console.log('✅ Invoice file uploaded:', invoiceFileUrl);
+      } catch (uploadError) {
+        console.error('Error uploading invoice file:', uploadError);
+        return res.status(500).json({ error: 'Failed to upload invoice file' });
+      }
+    }
 
     if (!supplierId || !invoiceNumber || !invoiceDate || !items || items.length === 0) {
       return res.status(400).json({ error: 'Supplier, invoice number, date, and items are required' });
@@ -9386,7 +9432,12 @@ app.post('/api/supplier-invoices/:restaurantId', authenticateToken, async (req, 
       dueDate: dueDate ? new Date(dueDate) : null,
       status: 'pending', // 'pending', 'matched', 'paid', 'discrepancy'
       matchStatus: 'pending', // 'pending', 'matched', 'discrepancy'
-      imageUrl: imageUrl || null,
+      paymentStatus: paymentStatus || 'unpaid', // 'unpaid', 'partial', 'paid'
+      receivedMethod: receivedMethod || (invoiceFileUrl ? 'uploaded' : 'manual'), // 'email', 'physical', 'uploaded', 'generated', 'manual'
+      receivedDate: receivedDate ? new Date(receivedDate) : new Date(),
+      invoiceFileUrl: invoiceFileUrl, // Original invoice file (PDF/image)
+      invoiceFileName: invoiceFileName, // Original file name
+      imageUrl: invoiceFileUrl || imageUrl || null, // Keep for backward compatibility
       extractedData: extractedData || null, // OCR extracted data
       createdAt: new Date(),
       updatedAt: new Date(),
@@ -9403,6 +9454,120 @@ app.post('/api/supplier-invoices/:restaurantId', authenticateToken, async (req, 
   } catch (error) {
     console.error('Create supplier invoice error:', error);
     res.status(500).json({ error: 'Failed to create supplier invoice' });
+  }
+});
+
+// Generate invoice from Purchase Order
+app.post('/api/supplier-invoices/:restaurantId/generate-from-po', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+    const { userId, role } = req.user;
+    const { purchaseOrderId } = req.body;
+    
+    if (role !== 'owner' && role !== 'manager') {
+      return res.status(403).json({ error: 'Access denied' });
+    }
+
+    if (!purchaseOrderId) {
+      return res.status(400).json({ error: 'Purchase Order ID is required' });
+    }
+
+    // Get Purchase Order
+    const poDoc = await db.collection(collections.purchaseOrders).doc(purchaseOrderId).get();
+    if (!poDoc.exists || poDoc.data().restaurantId !== restaurantId) {
+      return res.status(404).json({ error: 'Purchase Order not found' });
+    }
+
+    const poData = poDoc.data();
+
+    // Check if PO is in valid status (received or delivered)
+    if (poData.status !== 'received' && poData.status !== 'delivered') {
+      return res.status(400).json({ 
+        error: `Cannot generate invoice. Purchase Order must be 'received' or 'delivered'. Current status: ${poData.status}` 
+      });
+    }
+
+    // Check if invoice already exists for this PO
+    const existingInvoiceSnapshot = await db.collection(collections.supplierInvoices)
+      .where('restaurantId', '==', restaurantId)
+      .where('purchaseOrderId', '==', purchaseOrderId)
+      .get();
+
+    if (!existingInvoiceSnapshot.empty) {
+      return res.status(400).json({ error: 'Invoice already exists for this Purchase Order' });
+    }
+
+    // Generate invoice number
+    const invoiceCountSnapshot = await db.collection(collections.supplierInvoices)
+      .where('restaurantId', '==', restaurantId)
+      .get();
+    
+    const invoiceNumber = `INV-${new Date().getFullYear()}-${String(invoiceCountSnapshot.size + 1).padStart(4, '0')}`;
+
+    // Convert PO items to invoice items
+    const invoiceItems = (poData.items || []).map(item => ({
+      inventoryItemId: item.inventoryItemId,
+      inventoryItemName: item.inventoryItemName,
+      quantity: item.quantity || 0,
+      unitPrice: item.unitPrice || 0,
+      tax: 0, // Can be calculated if tax info is available
+      total: (item.quantity || 0) * (item.unitPrice || 0)
+    }));
+
+    // Calculate totals
+    const subtotal = invoiceItems.reduce((sum, item) => sum + item.total, 0);
+    const taxAmount = 0; // Can be calculated if tax rates are available
+    const totalAmount = subtotal + taxAmount;
+
+    // Get GRN if exists
+    let grnId = null;
+    const grnSnapshot = await db.collection(collections.goodsReceiptNotes)
+      .where('restaurantId', '==', restaurantId)
+      .where('purchaseOrderId', '==', purchaseOrderId)
+      .limit(1)
+      .get();
+    
+    if (!grnSnapshot.empty) {
+      grnId = grnSnapshot.docs[0].id;
+    }
+
+    // Create invoice
+    const invoiceData = {
+      restaurantId,
+      purchaseOrderId,
+      grnId,
+      supplierId: poData.supplierId,
+      invoiceNumber,
+      invoiceDate: new Date(),
+      items: invoiceItems,
+      subtotal,
+      taxAmount,
+      totalAmount,
+      paymentTerms: poData.paymentTerms || 'Net 30',
+      dueDate: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000), // 30 days from now
+      status: 'pending',
+      matchStatus: 'matched', // Auto-matched since generated from PO
+      paymentStatus: 'unpaid', // 'unpaid', 'partial', 'paid'
+      receivedMethod: 'generated', // 'email', 'physical', 'uploaded', 'generated', 'manual'
+      receivedDate: new Date(),
+      invoiceFileUrl: null, // No file for auto-generated invoices
+      invoiceFileName: null,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+      createdBy: userId
+    };
+
+    const invoiceRef = await db.collection(collections.supplierInvoices).add(invoiceData);
+
+    res.status(201).json({
+      success: true,
+      message: 'Invoice generated from Purchase Order successfully',
+      invoice: { id: invoiceRef.id, ...invoiceData }
+    });
+
+  } catch (error) {
+    console.error('Generate invoice from PO error:', error);
+    res.status(500).json({ error: 'Failed to generate invoice from Purchase Order' });
   }
 });
 
@@ -9522,7 +9687,7 @@ app.patch('/api/supplier-invoices/:restaurantId/:invoiceId', authenticateToken, 
       return res.status(403).json({ error: 'Access denied' });
     }
 
-    const { status, paidAmount, paidDate, paymentMethod } = req.body;
+    const { status, paidAmount, paidDate, paymentMethod, paymentStatus, receivedMethod, receivedDate } = req.body;
 
     const invoiceDoc = await db.collection(collections.supplierInvoices).doc(invoiceId).get();
     if (!invoiceDoc.exists || invoiceDoc.data().restaurantId !== restaurantId) {
@@ -9530,13 +9695,37 @@ app.patch('/api/supplier-invoices/:restaurantId/:invoiceId', authenticateToken, 
     }
 
     const updateData = {
-      status: status || 'paid',
-      paidAmount: paidAmount ? parseFloat(paidAmount) : null,
-      paidDate: paidDate ? new Date(paidDate) : new Date(),
-      paymentMethod: paymentMethod || 'cash',
-      paidBy: userId,
-      updatedAt: new Date()
+      updatedAt: new Date(),
+      updatedBy: userId
     };
+
+    if (status) updateData.status = status;
+    if (paymentStatus) updateData.paymentStatus = paymentStatus; // 'unpaid', 'partial', 'paid'
+    if (paidAmount !== undefined) updateData.paidAmount = paidAmount ? parseFloat(paidAmount) : null;
+    if (paidDate) updateData.paidDate = new Date(paidDate);
+    if (paymentMethod) updateData.paymentMethod = paymentMethod;
+    if (receivedMethod) updateData.receivedMethod = receivedMethod;
+    if (receivedDate) updateData.receivedDate = new Date(receivedDate);
+    
+    // Auto-set payment status based on paid amount
+    if (paidAmount !== undefined) {
+      const invoiceData = invoiceDoc.data();
+      const totalAmount = invoiceData.totalAmount || 0;
+      if (paidAmount >= totalAmount) {
+        updateData.paymentStatus = 'paid';
+        updateData.status = 'paid';
+      } else if (paidAmount > 0) {
+        updateData.paymentStatus = 'partial';
+      } else {
+        updateData.paymentStatus = 'unpaid';
+      }
+      if (!updateData.paidDate && paidAmount > 0) {
+        updateData.paidDate = new Date();
+      }
+      if (!updateData.paidBy && paidAmount > 0) {
+        updateData.paidBy = userId;
+      }
+    }
 
     await db.collection(collections.supplierInvoices).doc(invoiceId).update(updateData);
 
