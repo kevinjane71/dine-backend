@@ -47,7 +47,16 @@ const collections = {
   userRestaurants: 'userRestaurants',
   restaurantSettings: 'restaurantSettings',
   discountSettings: 'discountSettings',
-  customers: 'customers'
+  customers: 'customers',
+  // SCM Collections
+  purchaseRequisitions: 'purchase-requisitions',
+  goodsReceiptNotes: 'goods-receipt-notes',
+  supplierInvoices: 'supplier-invoices',
+  supplierReturns: 'supplier-returns',
+  stockTransfers: 'stock-transfers',
+  poTemplates: 'po-templates',
+  supplierQuotations: 'supplier-quotations',
+  supplierPerformance: 'supplier-performance'
 };
 
 const admin = null; // We don't need the legacy admin object anymore

@@ -7343,6 +7343,501 @@ Example responses:
 });
 
 // ========================================
+// VOICE PURCHASE ORDER API
+// ========================================
+
+// Process voice command for Purchase Order creation
+app.post('/api/voice/process-purchase-order', authenticateToken, async (req, res) => {
+  try {
+    const { transcript, restaurantId } = req.body;
+    
+    if (!transcript || !restaurantId) {
+      return res.status(400).json({ error: 'Transcript and restaurantId are required' });
+    }
+
+    console.log('🎤 Voice PO processing:', { transcript, restaurantId });
+
+    // Get inventory items and suppliers
+    const inventorySnapshot = await db.collection(collections.inventory)
+      .where('restaurantId', '==', restaurantId)
+      .get();
+    
+    const inventoryItems = [];
+    inventorySnapshot.forEach(doc => {
+      inventoryItems.push({ id: doc.id, ...doc.data() });
+    });
+
+    const suppliersSnapshot = await db.collection(collections.suppliers)
+      .where('restaurantId', '==', restaurantId)
+      .get();
+    
+    const suppliers = [];
+    suppliersSnapshot.forEach(doc => {
+      suppliers.push({ id: doc.id, ...doc.data() });
+    });
+
+    if (inventoryItems.length === 0) {
+      return res.status(404).json({ error: 'No inventory items found' });
+    }
+
+    // Create context for ChatGPT
+    const inventoryContext = inventoryItems.map(item => 
+      `- ${item.name} (${item.unit || 'unit'}) - ID: ${item.id}`
+    ).join('\n');
+
+    const suppliersContext = suppliers.map(supplier => 
+      `- ${supplier.name} - ID: ${supplier.id}`
+    ).join('\n');
+
+    // Use ChatGPT to parse the voice command
+    const openai = new OpenAI({
+      apiKey: process.env.OPENAI_API_KEY
+    });
+
+    const completion = await openai.chat.completions.create({
+      model: "gpt-4o-mini",
+      messages: [
+        {
+          role: "system",
+          content: `You are a purchase order assistant. Parse the user's voice command and extract:
+1. Inventory items with quantities
+2. Supplier name (if mentioned)
+3. Delivery date (if mentioned)
+4. Priority/urgency (if mentioned)
+
+Available inventory items:
+${inventoryContext}
+
+Available suppliers:
+${suppliersContext}
+
+Instructions:
+1. Extract all mentioned items and quantities (handle units: kg, kgs, kilogram, units, boxes, etc.)
+2. Match supplier name if mentioned
+3. Extract delivery date (today, tomorrow, next week, specific date)
+4. Return as JSON with structure:
+{
+  "items": [{"inventoryItemId": "id", "inventoryItemName": "name", "quantity": number, "unit": "kg"}],
+  "supplierId": "id or null",
+  "supplierName": "name or null",
+  "expectedDeliveryDate": "YYYY-MM-DD or null",
+  "priority": "low/medium/high or null",
+  "notes": "any additional notes or null"
+}
+
+Example responses:
+- "Create PO for 50kg tomatoes and 20kg onions from supplier ABC" → {"items": [{"inventoryItemId": "...", "inventoryItemName": "Tomatoes", "quantity": 50, "unit": "kg"}, {"inventoryItemId": "...", "inventoryItemName": "Onions", "quantity": 20, "unit": "kg"}], "supplierId": "...", "supplierName": "ABC", "expectedDeliveryDate": null, "priority": null, "notes": null}
+- "Order 100 units of rice from XYZ suppliers for tomorrow" → {"items": [{"inventoryItemId": "...", "inventoryItemName": "Rice", "quantity": 100, "unit": "unit"}], "supplierId": "...", "supplierName": "XYZ", "expectedDeliveryDate": "2024-01-29", "priority": null, "notes": null}`
+        },
+        {
+          role: "user",
+          content: transcript
+        }
+      ],
+      temperature: 0.2,
+      max_tokens: 500
+    });
+
+    const responseText = completion.choices[0].message.content.trim();
+    console.log('🤖 ChatGPT PO response:', responseText);
+
+    // Parse the response
+    let parsedData;
+    try {
+      const jsonMatch = responseText.match(/```json\s*([\s\S]*?)\s*```/) || responseText.match(/```\s*([\s\S]*?)\s*```/);
+      if (jsonMatch) {
+        parsedData = JSON.parse(jsonMatch[1]);
+      } else {
+        parsedData = JSON.parse(responseText);
+      }
+    } catch (parseError) {
+      console.error('Failed to parse ChatGPT response:', responseText);
+      return res.status(500).json({ error: 'Failed to parse voice command' });
+    }
+
+    // Match inventory items and suppliers
+    const matchedItems = [];
+    for (const item of parsedData.items || []) {
+      // Try exact match first
+      let inventoryItem = inventoryItems.find(i => 
+        i.name.toLowerCase() === item.inventoryItemName.toLowerCase()
+      );
+      
+      // Fuzzy match
+      if (!inventoryItem) {
+        inventoryItem = inventoryItems.find(i => 
+          i.name.toLowerCase().includes(item.inventoryItemName.toLowerCase()) ||
+          item.inventoryItemName.toLowerCase().includes(i.name.toLowerCase())
+        );
+      }
+      
+      if (inventoryItem) {
+        matchedItems.push({
+          inventoryItemId: inventoryItem.id,
+          inventoryItemName: inventoryItem.name,
+          quantity: item.quantity || 1,
+          unit: item.unit || inventoryItem.unit || 'unit',
+          unitPrice: inventoryItem.costPerUnit || 0,
+          totalPrice: (item.quantity || 1) * (inventoryItem.costPerUnit || 0)
+        });
+      }
+    }
+
+    // Match supplier
+    let matchedSupplier = null;
+    if (parsedData.supplierName) {
+      matchedSupplier = suppliers.find(s => 
+        s.name.toLowerCase().includes(parsedData.supplierName.toLowerCase()) ||
+        parsedData.supplierName.toLowerCase().includes(s.name.toLowerCase())
+      );
+    }
+
+    // Calculate delivery date
+    let deliveryDate = null;
+    if (parsedData.expectedDeliveryDate) {
+      deliveryDate = parsedData.expectedDeliveryDate;
+    } else if (parsedData.deliveryDate) {
+      // Handle relative dates
+      const today = new Date();
+      if (parsedData.deliveryDate.toLowerCase().includes('tomorrow')) {
+        today.setDate(today.getDate() + 1);
+        deliveryDate = today.toISOString().split('T')[0];
+      } else if (parsedData.deliveryDate.toLowerCase().includes('next week')) {
+        today.setDate(today.getDate() + 7);
+        deliveryDate = today.toISOString().split('T')[0];
+      }
+    }
+
+    if (matchedItems.length === 0) {
+      return res.status(404).json({ error: 'Could not match any inventory items' });
+    }
+
+    console.log('✅ Voice PO parsed:', { items: matchedItems, supplier: matchedSupplier });
+
+    res.json({
+      success: true,
+      items: matchedItems,
+      supplierId: matchedSupplier?.id || null,
+      supplierName: matchedSupplier?.name || parsedData.supplierName || null,
+      expectedDeliveryDate: deliveryDate,
+      priority: parsedData.priority || 'medium',
+      notes: parsedData.notes || null
+    });
+
+  } catch (error) {
+    console.error('Voice PO processing error:', error);
+    res.status(500).json({ 
+      error: 'Failed to process voice command',
+      message: error.message 
+    });
+  }
+});
+
+// ========================================
+// INVOICE OCR API
+// ========================================
+
+// Process invoice image using GPT-4 Vision
+app.post('/api/invoice/ocr', authenticateToken, upload.single('image'), async (req, res) => {
+  try {
+    const { restaurantId } = req.body;
+    const file = req.file;
+
+    if (!file) {
+      return res.status(400).json({ error: 'No image uploaded' });
+    }
+
+    if (!restaurantId) {
+      return res.status(400).json({ error: 'RestaurantId is required' });
+    }
+
+    console.log('📸 Invoice OCR processing:', { restaurantId, fileName: file.originalname });
+
+    // Get suppliers for matching
+    const suppliersSnapshot = await db.collection(collections.suppliers)
+      .where('restaurantId', '==', restaurantId)
+      .get();
+    
+    const suppliers = [];
+    suppliersSnapshot.forEach(doc => {
+      suppliers.push({ id: doc.id, ...doc.data() });
+    });
+
+    // Convert image to base64
+    const imageBase64 = file.buffer.toString('base64');
+    const imageMimeType = file.mimetype;
+
+    // Use GPT-4 Vision to extract invoice data
+    const openai = new OpenAI({
+      apiKey: process.env.OPENAI_API_KEY
+    });
+
+    const completion = await openai.chat.completions.create({
+      model: "gpt-4o",
+      messages: [
+        {
+          role: "user",
+          content: [
+            {
+              type: "text",
+              text: `Extract all information from this invoice image. Return a JSON object with:
+{
+  "supplierName": "supplier name from invoice",
+  "invoiceNumber": "invoice number",
+  "invoiceDate": "date in YYYY-MM-DD format",
+  "totalAmount": number (total amount),
+  "taxAmount": number (tax if mentioned),
+  "subtotal": number (subtotal if mentioned),
+  "items": [{"name": "item name", "quantity": number, "unitPrice": number, "totalPrice": number}],
+  "paymentTerms": "payment terms if mentioned",
+  "dueDate": "due date in YYYY-MM-DD format if mentioned",
+  "notes": "any additional notes"
+}
+
+Extract all text visible in the image. Be accurate with numbers and dates.`
+            },
+            {
+              type: "image_url",
+              image_url: {
+                url: `data:${imageMimeType};base64,${imageBase64}`
+              }
+            }
+          ]
+        }
+      ],
+      max_tokens: 1000
+    });
+
+    const responseText = completion.choices[0].message.content.trim();
+    console.log('🤖 GPT-4 Vision response:', responseText);
+
+    // Parse the response
+    let extractedData;
+    try {
+      const jsonMatch = responseText.match(/```json\s*([\s\S]*?)\s*```/) || responseText.match(/```\s*([\s\S]*?)\s*```/);
+      if (jsonMatch) {
+        extractedData = JSON.parse(jsonMatch[1]);
+      } else {
+        extractedData = JSON.parse(responseText);
+      }
+    } catch (parseError) {
+      console.error('Failed to parse GPT-4 Vision response:', responseText);
+      return res.status(500).json({ error: 'Failed to extract invoice data' });
+    }
+
+    // Match supplier
+    let matchedSupplier = null;
+    if (extractedData.supplierName) {
+      matchedSupplier = suppliers.find(s => 
+        s.name.toLowerCase().includes(extractedData.supplierName.toLowerCase()) ||
+        extractedData.supplierName.toLowerCase().includes(s.name.toLowerCase())
+      );
+    }
+
+    console.log('✅ Invoice OCR extracted:', extractedData);
+
+    res.json({
+      success: true,
+      supplierId: matchedSupplier?.id || null,
+      supplierName: matchedSupplier?.name || extractedData.supplierName || null,
+      invoiceNumber: extractedData.invoiceNumber || null,
+      invoiceDate: extractedData.invoiceDate || null,
+      totalAmount: extractedData.totalAmount || extractedData.subtotal || 0,
+      taxAmount: extractedData.taxAmount || 0,
+      items: extractedData.items || [],
+      paymentTerms: extractedData.paymentTerms || null,
+      dueDate: extractedData.dueDate || null,
+      notes: extractedData.notes || null
+    });
+
+  } catch (error) {
+    console.error('Invoice OCR error:', error);
+    res.status(500).json({ 
+      error: 'Failed to process invoice image',
+      message: error.message 
+    });
+  }
+});
+
+// ========================================
+// SMART AUTO-FILL API
+// ========================================
+
+// Get smart suggestions for PO/Invoice based on historical data
+app.get('/api/smart-suggestions/:restaurantId', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+    const { type } = req.query; // 'po' or 'invoice'
+
+    if (!restaurantId) {
+      return res.status(400).json({ error: 'RestaurantId is required' });
+    }
+
+    console.log('🤖 Smart suggestions request:', { restaurantId, type });
+
+    // Get recent purchase orders
+    let poSnapshot;
+    try {
+      poSnapshot = await db.collection(collections.purchaseOrders)
+        .where('restaurantId', '==', restaurantId)
+        .orderBy('createdAt', 'desc')
+        .limit(20)
+        .get();
+    } catch (error) {
+      // If orderBy fails, fetch without it
+      poSnapshot = await db.collection(collections.purchaseOrders)
+        .where('restaurantId', '==', restaurantId)
+        .limit(20)
+        .get();
+    }
+
+    const recentPOs = [];
+    poSnapshot.forEach(doc => {
+      recentPOs.push({ id: doc.id, ...doc.data() });
+    });
+
+    // Sort manually if needed
+    if (recentPOs.length > 0) {
+      recentPOs.sort((a, b) => {
+        const dateA = a.createdAt?.toDate?.() || a.createdAt || new Date(0);
+        const dateB = b.createdAt?.toDate?.() || b.createdAt || new Date(0);
+        return dateB - dateA;
+      });
+    }
+
+    // Get recent invoices
+    let invoiceSnapshot;
+    try {
+      invoiceSnapshot = await db.collection(collections.supplierInvoices)
+        .where('restaurantId', '==', restaurantId)
+        .orderBy('invoiceDate', 'desc')
+        .limit(20)
+        .get();
+    } catch (error) {
+      invoiceSnapshot = await db.collection(collections.supplierInvoices)
+        .where('restaurantId', '==', restaurantId)
+        .limit(20)
+        .get();
+    }
+
+    const recentInvoices = [];
+    invoiceSnapshot.forEach(doc => {
+      recentInvoices.push({ id: doc.id, ...doc.data() });
+    });
+
+    // Analyze most used suppliers
+    const supplierUsage = {};
+    [...recentPOs, ...recentInvoices].forEach(doc => {
+      const supplierId = doc.supplierId;
+      if (supplierId) {
+        supplierUsage[supplierId] = (supplierUsage[supplierId] || 0) + 1;
+      }
+    });
+
+    const topSuppliers = Object.entries(supplierUsage)
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 5)
+      .map(([supplierId]) => supplierId);
+
+    // Get supplier details
+    const suppliersData = [];
+    for (const supplierId of topSuppliers) {
+      const supplierDoc = await db.collection(collections.suppliers).doc(supplierId).get();
+      if (supplierDoc.exists) {
+        suppliersData.push({ id: supplierDoc.id, ...supplierDoc.data() });
+      }
+    }
+
+    // Analyze most ordered items
+    const itemUsage = {};
+    recentPOs.forEach(po => {
+      if (po.items && Array.isArray(po.items)) {
+        po.items.forEach(item => {
+          const itemId = item.inventoryItemId;
+          if (itemId) {
+            if (!itemUsage[itemId]) {
+              itemUsage[itemId] = { count: 0, totalQuantity: 0, avgPrice: 0, prices: [] };
+            }
+            itemUsage[itemId].count++;
+            itemUsage[itemId].totalQuantity += item.quantity || 0;
+            if (item.unitPrice) {
+              itemUsage[itemId].prices.push(item.unitPrice);
+            }
+          }
+        });
+      }
+    });
+
+    // Calculate averages
+    Object.keys(itemUsage).forEach(itemId => {
+      const usage = itemUsage[itemId];
+      usage.avgQuantity = usage.totalQuantity / usage.count;
+      if (usage.prices.length > 0) {
+        usage.avgPrice = usage.prices.reduce((a, b) => a + b, 0) / usage.prices.length;
+      }
+    });
+
+    const topItems = Object.entries(itemUsage)
+      .sort((a, b) => b[1].count - a[1].count)
+      .slice(0, 10)
+      .map(([itemId, data]) => ({ itemId, ...data }));
+
+    // Get item details
+    const itemsData = [];
+    for (const { itemId } of topItems) {
+      const itemDoc = await db.collection(collections.inventory).doc(itemId).get();
+      if (itemDoc.exists) {
+        const itemData = itemDoc.data();
+        const usageData = itemUsage[itemId];
+        itemsData.push({
+          id: itemId,
+          name: itemData.name,
+          unit: itemData.unit || 'unit',
+          avgQuantity: usageData.avgQuantity,
+          avgPrice: usageData.avgPrice || itemData.costPerUnit || 0,
+          lastOrdered: usageData.count > 0 ? 'Recently' : 'Never'
+        });
+      }
+    }
+
+    // Get average delivery time
+    const deliveryTimes = [];
+    recentPOs.forEach(po => {
+      if (po.expectedDeliveryDate && po.createdAt) {
+        const expected = po.expectedDeliveryDate.toDate ? po.expectedDeliveryDate.toDate() : new Date(po.expectedDeliveryDate);
+        const created = po.createdAt.toDate ? po.createdAt.toDate() : new Date(po.createdAt);
+        const days = Math.ceil((expected - created) / (1000 * 60 * 60 * 24));
+        if (days > 0 && days < 30) {
+          deliveryTimes.push(days);
+        }
+      }
+    });
+
+    const avgDeliveryDays = deliveryTimes.length > 0
+      ? Math.round(deliveryTimes.reduce((a, b) => a + b, 0) / deliveryTimes.length)
+      : 7;
+
+    console.log('✅ Smart suggestions generated');
+
+    res.json({
+      success: true,
+      topSuppliers: suppliersData,
+      topItems: itemsData,
+      avgDeliveryDays,
+      recentPOsCount: recentPOs.length,
+      recentInvoicesCount: recentInvoices.length
+    });
+
+  } catch (error) {
+    console.error('Smart suggestions error:', error);
+    res.status(500).json({ 
+      error: 'Failed to generate smart suggestions',
+      message: error.message 
+    });
+  }
+});
+
+// ========================================
 // INVENTORY MANAGEMENT APIs
 // ========================================
 
@@ -8031,22 +8526,71 @@ app.patch('/api/purchase-orders/:restaurantId/:orderId', authenticateToken, asyn
       return res.status(403).json({ error: 'Access denied. Owner or manager privileges required.' });
     }
 
-    const { status, receivedItems } = req.body;
+    const { status, receivedItems, notes } = req.body;
+
+    // Valid status flow: pending → approved → sent → received/delivered
+    const validStatuses = ['pending', 'approved', 'sent', 'received', 'delivered', 'cancelled'];
+    if (status && !validStatuses.includes(status)) {
+      return res.status(400).json({ error: `Invalid status. Valid statuses: ${validStatuses.join(', ')}` });
+    }
 
     const orderDoc = await db.collection(collections.purchaseOrders).doc(orderId).get();
     if (!orderDoc.exists || orderDoc.data().restaurantId !== restaurantId) {
       return res.status(404).json({ error: 'Purchase order not found' });
     }
 
+    const currentOrder = orderDoc.data();
+    const currentStatus = currentOrder.status;
+
+    // Status transition validation
+    if (status) {
+      const statusFlow = {
+        'pending': ['approved', 'cancelled'],
+        'approved': ['sent', 'cancelled'],
+        'sent': ['received', 'delivered', 'cancelled'],
+        'received': ['delivered'],
+        'delivered': [],
+        'cancelled': []
+      };
+
+      if (statusFlow[currentStatus] && !statusFlow[currentStatus].includes(status)) {
+        return res.status(400).json({ 
+          error: `Invalid status transition. Cannot change from '${currentStatus}' to '${status}'. Valid next statuses: ${statusFlow[currentStatus].join(', ')}` 
+        });
+      }
+    }
+
     const updateData = { 
-      status, 
       updatedAt: new Date(),
       updatedBy: userId
     };
 
+    if (status) {
+      updateData.status = status;
+      
+      // Set timestamps based on status
+      if (status === 'approved') {
+        updateData.approvedAt = new Date();
+        updateData.approvedBy = userId;
+      } else if (status === 'sent') {
+        updateData.sentAt = new Date();
+        updateData.sentBy = userId;
+      } else if (status === 'received' || status === 'delivered') {
+        updateData.receivedAt = new Date();
+        updateData.receivedBy = userId;
+      } else if (status === 'cancelled') {
+        updateData.cancelledAt = new Date();
+        updateData.cancelledBy = userId;
+        updateData.cancellationNotes = notes?.trim() || '';
+      }
+    }
+
+    if (notes && notes.trim()) {
+      updateData.notes = (currentOrder.notes || '') + '\n' + notes.trim();
+    }
+
     if (status === 'received' && receivedItems) {
       updateData.receivedItems = receivedItems;
-      updateData.receivedAt = new Date();
       
       // Update inventory stock
       for (const item of receivedItems) {
@@ -8063,9 +8607,11 @@ app.patch('/api/purchase-orders/:restaurantId/:orderId', authenticateToken, asyn
 
     await db.collection(collections.purchaseOrders).doc(orderId).update(updateData);
     
+    const updatedOrder = { id: orderId, ...currentOrder, ...updateData };
+    
     res.json({
       message: 'Purchase order updated successfully',
-      order: { id: orderId, ...orderDoc.data(), ...updateData }
+      order: updatedOrder
     });
 
   } catch (error) {
@@ -8223,6 +8769,1663 @@ app.post('/api/purchase-orders/:restaurantId/:orderId/email', authenticateToken,
   } catch (error) {
     console.error('Email purchase order error:', error);
     res.status(500).json({ error: 'Failed to send purchase order email' });
+  }
+});
+
+// ========================================
+// GOODS RECEIPT NOTE (GRN) APIs
+// ========================================
+
+// Get all GRNs for a restaurant
+app.get('/api/grn/:restaurantId', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+    const { status, purchaseOrderId } = req.query;
+
+    let query = db.collection(collections.goodsReceiptNotes)
+      .where('restaurantId', '==', restaurantId);
+
+    if (status && status !== 'all') {
+      query = query.where('status', '==', status);
+    }
+
+    if (purchaseOrderId && purchaseOrderId !== 'all') {
+      query = query.where('purchaseOrderId', '==', purchaseOrderId);
+    }
+
+    // Only use orderBy if no additional filters (to avoid index requirements)
+    let snapshot;
+    try {
+      if ((status && status !== 'all') || (purchaseOrderId && purchaseOrderId !== 'all')) {
+        snapshot = await query.get();
+      } else {
+        snapshot = await query.orderBy('receivedAt', 'desc').get();
+      }
+    } catch (error) {
+      // If orderBy fails (no index), try without it
+      console.warn('OrderBy failed, fetching without order:', error.message);
+      snapshot = await query.get();
+    }
+
+    const grns = [];
+    snapshot.forEach(doc => {
+      grns.push({ id: doc.id, ...doc.data() });
+    });
+
+    // Sort manually if we couldn't use orderBy
+    if ((status && status !== 'all') || (purchaseOrderId && purchaseOrderId !== 'all')) {
+      grns.sort((a, b) => {
+        const dateA = a.receivedAt?.toDate?.() || a.receivedAt || new Date(0);
+        const dateB = b.receivedAt?.toDate?.() || b.receivedAt || new Date(0);
+        return dateB - dateA; // Descending
+      });
+    }
+
+    res.json({ grns, total: grns.length });
+
+  } catch (error) {
+    console.error('Get GRNs error:', error);
+    res.status(500).json({ error: 'Failed to fetch GRNs' });
+  }
+});
+
+// Get single GRN
+app.get('/api/grn/:restaurantId/:grnId', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId, grnId } = req.params;
+
+    const grnDoc = await db.collection(collections.goodsReceiptNotes).doc(grnId).get();
+    
+    if (!grnDoc.exists) {
+      return res.status(404).json({ error: 'GRN not found' });
+    }
+
+    const grnData = grnDoc.data();
+    
+    if (grnData.restaurantId !== restaurantId) {
+      return res.status(403).json({ error: 'Access denied' });
+    }
+
+    res.json({ grn: { id: grnDoc.id, ...grnData } });
+
+  } catch (error) {
+    console.error('Get GRN error:', error);
+    res.status(500).json({ error: 'Failed to fetch GRN' });
+  }
+});
+
+// Create GRN from Purchase Order
+app.post('/api/grn/:restaurantId', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+    const { userId, role } = req.user;
+    
+    if (role !== 'owner' && role !== 'manager' && role !== 'staff') {
+      return res.status(403).json({ error: 'Access denied' });
+    }
+
+    const { purchaseOrderId, items, notes, receivedBy } = req.body;
+
+    if (!purchaseOrderId || !items || items.length === 0) {
+      return res.status(400).json({ error: 'Purchase order ID and items are required' });
+    }
+
+    // Get purchase order
+    const poDoc = await db.collection(collections.purchaseOrders).doc(purchaseOrderId).get();
+    if (!poDoc.exists || poDoc.data().restaurantId !== restaurantId) {
+      return res.status(404).json({ error: 'Purchase order not found' });
+    }
+
+    const poData = poDoc.data();
+
+    // Calculate totals
+    let totalReceived = 0;
+    let totalExpected = 0;
+    const processedItems = items.map(item => {
+      const expectedItem = poData.items.find(poItem => poItem.inventoryItemId === item.inventoryItemId);
+      const receivedQty = parseFloat(item.receivedQuantity) || 0;
+      const acceptedQty = parseFloat(item.acceptedQuantity) || receivedQty;
+      const rejectedQty = parseFloat(item.rejectedQuantity) || 0;
+      const unitPrice = expectedItem?.unitPrice || item.unitPrice || 0;
+      
+      totalReceived += receivedQty;
+      totalExpected += expectedItem?.quantity || 0;
+
+      return {
+        inventoryItemId: item.inventoryItemId,
+        inventoryItemName: item.inventoryItemName || expectedItem?.inventoryItemName,
+        orderedQuantity: expectedItem?.quantity || 0,
+        receivedQuantity: receivedQty,
+        acceptedQuantity: acceptedQty,
+        rejectedQuantity: rejectedQty,
+        rejectionReason: item.rejectionReason || '',
+        unitPrice: unitPrice,
+        batchNumber: item.batchNumber || '',
+        expiryDate: item.expiryDate || null,
+        qualityStatus: item.qualityStatus || 'good', // 'good', 'damaged', 'defective'
+        notes: item.notes || ''
+      };
+    });
+
+    // Determine status
+    let status = 'complete';
+    if (totalReceived < totalExpected) {
+      status = 'partial';
+    }
+
+    const grnData = {
+      restaurantId,
+      purchaseOrderId,
+      supplierId: poData.supplierId,
+      items: processedItems,
+      status,
+      notes: notes?.trim() || '',
+      receivedBy: receivedBy || userId,
+      receivedAt: new Date(),
+      createdAt: new Date(),
+      updatedAt: new Date(),
+      createdBy: userId
+    };
+
+    const grnRef = await db.collection(collections.goodsReceiptNotes).add(grnData);
+
+    // Update inventory stock for accepted items
+    for (const item of processedItems) {
+      if (item.acceptedQuantity > 0) {
+        const inventoryDoc = await db.collection(collections.inventory).doc(item.inventoryItemId).get();
+        if (inventoryDoc.exists) {
+          const currentStock = inventoryDoc.data().currentStock || 0;
+          await db.collection(collections.inventory).doc(item.inventoryItemId).update({
+            currentStock: currentStock + item.acceptedQuantity,
+            lastUpdated: new Date()
+          });
+        }
+      }
+    }
+
+    // Update PO status if all items received
+    if (status === 'complete') {
+      await db.collection(collections.purchaseOrders).doc(purchaseOrderId).update({
+        status: 'received',
+        receivedAt: new Date(),
+        updatedAt: new Date()
+      });
+    } else {
+      await db.collection(collections.purchaseOrders).doc(purchaseOrderId).update({
+        status: 'partially_received',
+        updatedAt: new Date()
+      });
+    }
+
+    res.status(201).json({
+      message: 'GRN created successfully',
+      grn: { id: grnRef.id, ...grnData }
+    });
+
+  } catch (error) {
+    console.error('Create GRN error:', error);
+    res.status(500).json({ error: 'Failed to create GRN' });
+  }
+});
+
+// Update GRN
+app.patch('/api/grn/:restaurantId/:grnId', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId, grnId } = req.params;
+    const { userId, role } = req.user;
+    
+    if (role !== 'owner' && role !== 'manager') {
+      return res.status(403).json({ error: 'Access denied' });
+    }
+
+    const grnDoc = await db.collection(collections.goodsReceiptNotes).doc(grnId).get();
+    if (!grnDoc.exists || grnDoc.data().restaurantId !== restaurantId) {
+      return res.status(404).json({ error: 'GRN not found' });
+    }
+
+    const updateData = {
+      ...req.body,
+      updatedAt: new Date(),
+      updatedBy: userId
+    };
+
+    await db.collection(collections.goodsReceiptNotes).doc(grnId).update(updateData);
+
+    res.json({
+      message: 'GRN updated successfully',
+      grn: { id: grnId, ...grnDoc.data(), ...updateData }
+    });
+
+  } catch (error) {
+    console.error('Update GRN error:', error);
+    res.status(500).json({ error: 'Failed to update GRN' });
+  }
+});
+
+// ========================================
+// PURCHASE REQUISITIONS APIs
+// ========================================
+
+// Get all purchase requisitions
+app.get('/api/purchase-requisitions/:restaurantId', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+    const { status, requestedBy } = req.query;
+
+    let query = db.collection(collections.purchaseRequisitions)
+      .where('restaurantId', '==', restaurantId);
+
+    if (status && status !== 'all') {
+      query = query.where('status', '==', status);
+    }
+
+    if (requestedBy && requestedBy !== 'all') {
+      query = query.where('requestedBy', '==', requestedBy);
+    }
+
+    // Only use orderBy if no additional filters (to avoid index requirements)
+    let snapshot;
+    try {
+      if ((status && status !== 'all') || (requestedBy && requestedBy !== 'all')) {
+        snapshot = await query.get();
+      } else {
+        snapshot = await query.orderBy('createdAt', 'desc').get();
+      }
+    } catch (error) {
+      // If orderBy fails (no index), try without it
+      console.warn('OrderBy failed, fetching without order:', error.message);
+      snapshot = await query.get();
+    }
+
+    const requisitions = [];
+    snapshot.forEach(doc => {
+      requisitions.push({ id: doc.id, ...doc.data() });
+    });
+
+    // Sort manually if we couldn't use orderBy
+    if ((status && status !== 'all') || (requestedBy && requestedBy !== 'all')) {
+      requisitions.sort((a, b) => {
+        const dateA = a.createdAt?.toDate?.() || a.createdAt || new Date(0);
+        const dateB = b.createdAt?.toDate?.() || b.createdAt || new Date(0);
+        return dateB - dateA; // Descending
+      });
+    }
+
+    res.json({ requisitions, total: requisitions.length });
+
+  } catch (error) {
+    console.error('Get purchase requisitions error:', error);
+    res.status(500).json({ error: 'Failed to fetch purchase requisitions' });
+  }
+});
+
+// Create purchase requisition
+app.post('/api/purchase-requisitions/:restaurantId', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+    const { userId, role } = req.user;
+
+    const { items, priority, notes, reason } = req.body;
+
+    if (!items || items.length === 0) {
+      return res.status(400).json({ error: 'Items are required' });
+    }
+
+    const requisitionData = {
+      restaurantId,
+      requestedBy: userId,
+      requestedByRole: role,
+      items: items.map(item => ({
+        inventoryItemId: item.inventoryItemId,
+        inventoryItemName: item.inventoryItemName,
+        quantity: parseFloat(item.quantity) || 0,
+        unit: item.unit || '',
+        reason: item.reason || '',
+        currentStock: item.currentStock || 0,
+        minStock: item.minStock || 0
+      })),
+      priority: priority || 'medium', // 'low', 'medium', 'high', 'urgent'
+      status: 'pending',
+      notes: notes?.trim() || '',
+      reason: reason?.trim() || '',
+      createdAt: new Date(),
+      updatedAt: new Date()
+    };
+
+    const reqRef = await db.collection(collections.purchaseRequisitions).add(requisitionData);
+
+    res.status(201).json({
+      message: 'Purchase requisition created successfully',
+      requisition: { id: reqRef.id, ...requisitionData }
+    });
+
+  } catch (error) {
+    console.error('Create purchase requisition error:', error);
+    res.status(500).json({ error: 'Failed to create purchase requisition' });
+  }
+});
+
+// Approve/Reject purchase requisition
+app.patch('/api/purchase-requisitions/:restaurantId/:reqId', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId, reqId } = req.params;
+    const { userId, role } = req.user;
+    
+    if (role !== 'owner' && role !== 'manager') {
+      return res.status(403).json({ error: 'Access denied. Owner or manager privileges required.' });
+    }
+
+    const { status, notes, autoCreatePO, supplierId, expectedDeliveryDate } = req.body; // status: 'approved', 'rejected'
+
+    if (!status || !['approved', 'rejected'].includes(status)) {
+      return res.status(400).json({ error: 'Valid status (approved/rejected) is required' });
+    }
+
+    const reqDoc = await db.collection(collections.purchaseRequisitions).doc(reqId).get();
+    if (!reqDoc.exists || reqDoc.data().restaurantId !== restaurantId) {
+      return res.status(404).json({ error: 'Purchase requisition not found' });
+    }
+
+    const reqData = reqDoc.data();
+
+    // If already converted, don't allow status change
+    if (reqData.status === 'converted') {
+      return res.status(400).json({ error: 'Requisition already converted to Purchase Order' });
+    }
+
+    const updateData = {
+      status,
+      approvedBy: userId,
+      approvedAt: new Date(),
+      approvalNotes: notes?.trim() || '',
+      updatedAt: new Date()
+    };
+
+    await db.collection(collections.purchaseRequisitions).doc(reqId).update(updateData);
+
+    let purchaseOrder = null;
+
+    // If approved and autoCreatePO is true (or not specified, default behavior), create PO automatically
+    if (status === 'approved' && (autoCreatePO !== false)) {
+      // If supplierId is provided, create PO immediately
+      if (supplierId) {
+        try {
+          // Get inventory items to get prices
+          const itemsWithPrices = await Promise.all(
+            reqData.items.map(async (item) => {
+              const inventoryDoc = await db.collection(collections.inventory).doc(item.inventoryItemId).get();
+              const inventoryData = inventoryDoc.exists ? inventoryDoc.data() : {};
+              return {
+                inventoryItemId: item.inventoryItemId,
+                inventoryItemName: item.inventoryItemName,
+                quantity: item.quantity,
+                unit: item.unit || '',
+                unitPrice: inventoryData.costPerUnit || 0,
+                totalPrice: item.quantity * (inventoryData.costPerUnit || 0)
+              };
+            })
+          );
+
+          const totalAmount = itemsWithPrices.reduce((sum, item) => sum + item.totalPrice, 0);
+
+          // Create Purchase Order with status 'pending' (awaiting approval)
+          const poData = {
+            restaurantId,
+            supplierId,
+            items: itemsWithPrices,
+            totalAmount,
+            notes: notes?.trim() || `Auto-created from requisition ${reqId.slice(-8)}`,
+            expectedDeliveryDate: expectedDeliveryDate ? new Date(expectedDeliveryDate) : null,
+            status: 'pending', // PO starts as pending, needs approval before sending to supplier
+            requisitionId: reqId,
+            createdAt: new Date(),
+            updatedAt: new Date(),
+            createdBy: userId
+          };
+
+          const poRef = await db.collection(collections.purchaseOrders).add(poData);
+          purchaseOrder = { id: poRef.id, ...poData };
+
+          // Update requisition to link to PO
+          await db.collection(collections.purchaseRequisitions).doc(reqId).update({
+            purchaseOrderId: poRef.id,
+            updatedAt: new Date()
+          });
+        } catch (poError) {
+          console.error('Error auto-creating PO from requisition:', poError);
+          // Don't fail the requisition approval if PO creation fails
+        }
+      }
+    }
+
+    res.json({
+      message: `Purchase requisition ${status} successfully${purchaseOrder ? '. Purchase Order created.' : ''}`,
+      requisition: { id: reqId, ...reqData, ...updateData, purchaseOrderId: purchaseOrder?.id },
+      purchaseOrder: purchaseOrder
+    });
+
+  } catch (error) {
+    console.error('Update purchase requisition error:', error);
+    res.status(500).json({ error: 'Failed to update purchase requisition' });
+  }
+});
+
+// Convert requisition to Purchase Order
+app.post('/api/purchase-requisitions/:restaurantId/:reqId/convert-to-po', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId, reqId } = req.params;
+    const { userId, role } = req.user;
+    
+    if (role !== 'owner' && role !== 'manager') {
+      return res.status(403).json({ error: 'Access denied' });
+    }
+
+    const { supplierId, expectedDeliveryDate, notes } = req.body;
+
+    if (!supplierId) {
+      return res.status(400).json({ error: 'Supplier ID is required' });
+    }
+
+    const reqDoc = await db.collection(collections.purchaseRequisitions).doc(reqId).get();
+    if (!reqDoc.exists || reqDoc.data().restaurantId !== restaurantId) {
+      return res.status(404).json({ error: 'Purchase requisition not found' });
+    }
+
+    const reqData = reqDoc.data();
+
+    if (reqData.status !== 'approved') {
+      return res.status(400).json({ error: 'Only approved requisitions can be converted to PO' });
+    }
+
+    // Get inventory items to get prices
+    const itemsWithPrices = await Promise.all(
+      reqData.items.map(async (item) => {
+        const inventoryDoc = await db.collection(collections.inventory).doc(item.inventoryItemId).get();
+        const inventoryData = inventoryDoc.exists ? inventoryDoc.data() : {};
+        return {
+          inventoryItemId: item.inventoryItemId,
+          inventoryItemName: item.inventoryItemName,
+          quantity: item.quantity,
+          unitPrice: inventoryData.costPerUnit || 0,
+          totalPrice: item.quantity * (inventoryData.costPerUnit || 0)
+        };
+      })
+    );
+
+    const totalAmount = itemsWithPrices.reduce((sum, item) => sum + item.totalPrice, 0);
+
+    // Create Purchase Order
+    const poData = {
+      restaurantId,
+      supplierId,
+      items: itemsWithPrices,
+      totalAmount,
+      notes: notes?.trim() || `Converted from requisition ${reqId}`,
+      expectedDeliveryDate: expectedDeliveryDate ? new Date(expectedDeliveryDate) : null,
+      status: 'pending',
+      requisitionId: reqId,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+      createdBy: userId
+    };
+
+    const poRef = await db.collection(collections.purchaseOrders).add(poData);
+
+    // Update requisition status
+    await db.collection(collections.purchaseRequisitions).doc(reqId).update({
+      status: 'converted',
+      convertedToPO: poRef.id,
+      convertedAt: new Date(),
+      updatedAt: new Date()
+    });
+
+    res.status(201).json({
+      message: 'Purchase order created from requisition',
+      purchaseOrder: { id: poRef.id, ...poData },
+      requisition: { id: reqId, ...reqData, status: 'converted', convertedToPO: poRef.id }
+    });
+
+  } catch (error) {
+    console.error('Convert requisition to PO error:', error);
+    res.status(500).json({ error: 'Failed to convert requisition to PO' });
+  }
+});
+
+// ========================================
+// SUPPLIER INVOICES APIs
+// ========================================
+
+// Get all supplier invoices
+app.get('/api/supplier-invoices/:restaurantId', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+    const { status, supplierId } = req.query;
+
+    let query = db.collection(collections.supplierInvoices)
+      .where('restaurantId', '==', restaurantId);
+
+    if (status && status !== 'all') {
+      query = query.where('status', '==', status);
+    }
+
+    if (supplierId && supplierId !== 'all') {
+      query = query.where('supplierId', '==', supplierId);
+    }
+
+    // Only use orderBy if no additional filters (to avoid index requirements)
+    let snapshot;
+    try {
+      if ((status && status !== 'all') || (supplierId && supplierId !== 'all')) {
+        snapshot = await query.get();
+      } else {
+        snapshot = await query.orderBy('invoiceDate', 'desc').get();
+      }
+    } catch (error) {
+      // If orderBy fails (no index), try without it
+      console.warn('OrderBy failed, fetching without order:', error.message);
+      snapshot = await query.get();
+    }
+
+    const invoices = [];
+    snapshot.forEach(doc => {
+      invoices.push({ id: doc.id, ...doc.data() });
+    });
+
+    // Sort manually if we couldn't use orderBy
+    if ((status && status !== 'all') || (supplierId && supplierId !== 'all')) {
+      invoices.sort((a, b) => {
+        const dateA = a.invoiceDate?.toDate?.() || a.invoiceDate || new Date(0);
+        const dateB = b.invoiceDate?.toDate?.() || b.invoiceDate || new Date(0);
+        return dateB - dateA; // Descending
+      });
+    }
+
+    res.json({ invoices, total: invoices.length });
+
+  } catch (error) {
+    console.error('Get supplier invoices error:', error);
+    res.status(500).json({ error: 'Failed to fetch supplier invoices' });
+  }
+});
+
+// Create supplier invoice (manual entry or from OCR)
+app.post('/api/supplier-invoices/:restaurantId', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+    const { userId, role } = req.user;
+    
+    if (role !== 'owner' && role !== 'manager') {
+      return res.status(403).json({ error: 'Access denied' });
+    }
+
+    const { purchaseOrderId, grnId, supplierId, invoiceNumber, invoiceDate, items, subtotal, taxAmount, totalAmount, paymentTerms, dueDate, imageUrl, extractedData } = req.body;
+
+    if (!supplierId || !invoiceNumber || !invoiceDate || !items || items.length === 0) {
+      return res.status(400).json({ error: 'Supplier, invoice number, date, and items are required' });
+    }
+
+    const invoiceData = {
+      restaurantId,
+      purchaseOrderId: purchaseOrderId || null,
+      grnId: grnId || null,
+      supplierId,
+      invoiceNumber: invoiceNumber.trim(),
+      invoiceDate: new Date(invoiceDate),
+      items: items.map(item => ({
+        inventoryItemId: item.inventoryItemId,
+        inventoryItemName: item.inventoryItemName,
+        quantity: parseFloat(item.quantity) || 0,
+        unitPrice: parseFloat(item.unitPrice) || 0,
+        tax: parseFloat(item.tax) || 0,
+        total: parseFloat(item.total) || 0
+      })),
+      subtotal: parseFloat(subtotal) || 0,
+      taxAmount: parseFloat(taxAmount) || 0,
+      totalAmount: parseFloat(totalAmount) || 0,
+      paymentTerms: paymentTerms || 'Net 30',
+      dueDate: dueDate ? new Date(dueDate) : null,
+      status: 'pending', // 'pending', 'matched', 'paid', 'discrepancy'
+      matchStatus: 'pending', // 'pending', 'matched', 'discrepancy'
+      imageUrl: imageUrl || null,
+      extractedData: extractedData || null, // OCR extracted data
+      createdAt: new Date(),
+      updatedAt: new Date(),
+      createdBy: userId
+    };
+
+    const invoiceRef = await db.collection(collections.supplierInvoices).add(invoiceData);
+
+    res.status(201).json({
+      message: 'Supplier invoice created successfully',
+      invoice: { id: invoiceRef.id, ...invoiceData }
+    });
+
+  } catch (error) {
+    console.error('Create supplier invoice error:', error);
+    res.status(500).json({ error: 'Failed to create supplier invoice' });
+  }
+});
+
+// 3-way match (PO vs GRN vs Invoice)
+app.post('/api/supplier-invoices/:restaurantId/:invoiceId/match', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId, invoiceId } = req.params;
+    const { userId, role } = req.user;
+    
+    if (role !== 'owner' && role !== 'manager') {
+      return res.status(403).json({ error: 'Access denied' });
+    }
+
+    const invoiceDoc = await db.collection(collections.supplierInvoices).doc(invoiceId).get();
+    if (!invoiceDoc.exists || invoiceDoc.data().restaurantId !== restaurantId) {
+      return res.status(404).json({ error: 'Invoice not found' });
+    }
+
+    const invoiceData = invoiceDoc.data();
+    const discrepancies = [];
+
+    // Match with Purchase Order
+    if (invoiceData.purchaseOrderId) {
+      const poDoc = await db.collection(collections.purchaseOrders).doc(invoiceData.purchaseOrderId).get();
+      if (poDoc.exists) {
+        const poData = poDoc.data();
+        
+        // Compare totals
+        if (Math.abs(invoiceData.totalAmount - poData.totalAmount) > 0.01) {
+          discrepancies.push({
+            type: 'total_mismatch',
+            poTotal: poData.totalAmount,
+            invoiceTotal: invoiceData.totalAmount,
+            difference: invoiceData.totalAmount - poData.totalAmount
+          });
+        }
+
+        // Compare items
+        invoiceData.items.forEach(invItem => {
+          const poItem = poData.items.find(po => po.inventoryItemId === invItem.inventoryItemId);
+          if (poItem) {
+            if (Math.abs(invItem.quantity - poItem.quantity) > 0.01) {
+              discrepancies.push({
+                type: 'quantity_mismatch',
+                itemName: invItem.inventoryItemName,
+                poQuantity: poItem.quantity,
+                invoiceQuantity: invItem.quantity
+              });
+            }
+            if (Math.abs(invItem.unitPrice - poItem.unitPrice) > 0.01) {
+              discrepancies.push({
+                type: 'price_mismatch',
+                itemName: invItem.inventoryItemName,
+                poPrice: poItem.unitPrice,
+                invoicePrice: invItem.unitPrice
+              });
+            }
+          }
+        });
+      }
+    }
+
+    // Match with GRN
+    if (invoiceData.grnId) {
+      const grnDoc = await db.collection(collections.goodsReceiptNotes).doc(invoiceData.grnId).get();
+      if (grnDoc.exists) {
+        const grnData = grnDoc.data();
+        
+        invoiceData.items.forEach(invItem => {
+          const grnItem = grnData.items.find(grn => grn.inventoryItemId === invItem.inventoryItemId);
+          if (grnItem) {
+            if (Math.abs(invItem.quantity - grnItem.acceptedQuantity) > 0.01) {
+              discrepancies.push({
+                type: 'grn_quantity_mismatch',
+                itemName: invItem.inventoryItemName,
+                grnQuantity: grnItem.acceptedQuantity,
+                invoiceQuantity: invItem.quantity
+              });
+            }
+          }
+        });
+      }
+    }
+
+    const matchStatus = discrepancies.length === 0 ? 'matched' : 'discrepancy';
+    const invoiceStatus = discrepancies.length === 0 ? 'matched' : 'discrepancy';
+
+    await db.collection(collections.supplierInvoices).doc(invoiceId).update({
+      matchStatus,
+      status: invoiceStatus,
+      discrepancies,
+      matchedAt: new Date(),
+      matchedBy: userId,
+      updatedAt: new Date()
+    });
+
+    res.json({
+      message: `Invoice ${matchStatus === 'matched' ? 'matched successfully' : 'has discrepancies'}`,
+      matchStatus,
+      discrepancies,
+      invoice: { id: invoiceId, ...invoiceData, matchStatus, status: invoiceStatus, discrepancies }
+    });
+
+  } catch (error) {
+    console.error('Invoice match error:', error);
+    res.status(500).json({ error: 'Failed to match invoice' });
+  }
+});
+
+// Mark invoice as paid
+app.patch('/api/supplier-invoices/:restaurantId/:invoiceId', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId, invoiceId } = req.params;
+    const { userId, role } = req.user;
+    
+    if (role !== 'owner' && role !== 'manager') {
+      return res.status(403).json({ error: 'Access denied' });
+    }
+
+    const { status, paidAmount, paidDate, paymentMethod } = req.body;
+
+    const invoiceDoc = await db.collection(collections.supplierInvoices).doc(invoiceId).get();
+    if (!invoiceDoc.exists || invoiceDoc.data().restaurantId !== restaurantId) {
+      return res.status(404).json({ error: 'Invoice not found' });
+    }
+
+    const updateData = {
+      status: status || 'paid',
+      paidAmount: paidAmount ? parseFloat(paidAmount) : null,
+      paidDate: paidDate ? new Date(paidDate) : new Date(),
+      paymentMethod: paymentMethod || 'cash',
+      paidBy: userId,
+      updatedAt: new Date()
+    };
+
+    await db.collection(collections.supplierInvoices).doc(invoiceId).update(updateData);
+
+    res.json({
+      message: 'Invoice updated successfully',
+      invoice: { id: invoiceId, ...invoiceDoc.data(), ...updateData }
+    });
+
+  } catch (error) {
+    console.error('Update invoice error:', error);
+    res.status(500).json({ error: 'Failed to update invoice' });
+  }
+});
+
+// ========================================
+// ENHANCED SUPPLIER APIs
+// ========================================
+
+// Update supplier
+app.patch('/api/suppliers/:restaurantId/:supplierId', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId, supplierId } = req.params;
+    const { userId, role } = req.user;
+    
+    if (role !== 'owner' && role !== 'manager') {
+      return res.status(403).json({ error: 'Access denied' });
+    }
+
+    const supplierDoc = await db.collection(collections.suppliers).doc(supplierId).get();
+    if (!supplierDoc.exists || supplierDoc.data().restaurantId !== restaurantId) {
+      return res.status(404).json({ error: 'Supplier not found' });
+    }
+
+    const updateData = {
+      ...req.body,
+      updatedAt: new Date(),
+      updatedBy: userId
+    };
+
+    // Clean up undefined fields
+    Object.keys(updateData).forEach(key => {
+      if (updateData[key] === undefined) delete updateData[key];
+    });
+
+    await db.collection(collections.suppliers).doc(supplierId).update(updateData);
+
+    res.json({
+      message: 'Supplier updated successfully',
+      supplier: { id: supplierId, ...supplierDoc.data(), ...updateData }
+    });
+
+  } catch (error) {
+    console.error('Update supplier error:', error);
+    res.status(500).json({ error: 'Failed to update supplier' });
+  }
+});
+
+// Delete supplier
+app.delete('/api/suppliers/:restaurantId/:supplierId', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId, supplierId } = req.params;
+    const { userId, role } = req.user;
+    
+    if (role !== 'owner' && role !== 'manager') {
+      return res.status(403).json({ error: 'Access denied' });
+    }
+
+    const supplierDoc = await db.collection(collections.suppliers).doc(supplierId).get();
+    if (!supplierDoc.exists || supplierDoc.data().restaurantId !== restaurantId) {
+      return res.status(404).json({ error: 'Supplier not found' });
+    }
+
+    await db.collection(collections.suppliers).doc(supplierId).update({
+      isActive: false,
+      deletedAt: new Date(),
+      deletedBy: userId,
+      updatedAt: new Date()
+    });
+
+    res.json({ message: 'Supplier deleted successfully' });
+
+  } catch (error) {
+    console.error('Delete supplier error:', error);
+    res.status(500).json({ error: 'Failed to delete supplier' });
+  }
+});
+
+// Get single supplier
+app.get('/api/suppliers/:restaurantId/:supplierId', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId, supplierId } = req.params;
+
+    const supplierDoc = await db.collection(collections.suppliers).doc(supplierId).get();
+    
+    if (!supplierDoc.exists) {
+      return res.status(404).json({ error: 'Supplier not found' });
+    }
+
+    const supplierData = supplierDoc.data();
+    
+    if (supplierData.restaurantId !== restaurantId) {
+      return res.status(403).json({ error: 'Access denied' });
+    }
+
+    res.json({ supplier: { id: supplierDoc.id, ...supplierData } });
+
+  } catch (error) {
+    console.error('Get supplier error:', error);
+    res.status(500).json({ error: 'Failed to fetch supplier' });
+  }
+});
+
+// ========================================
+// SUPPLIER PERFORMANCE APIs
+// ========================================
+
+// Get supplier performance
+app.get('/api/suppliers/:restaurantId/:supplierId/performance', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId, supplierId } = req.params;
+
+    // Get all purchase orders for this supplier
+    const poSnapshot = await db.collection(collections.purchaseOrders)
+      .where('restaurantId', '==', restaurantId)
+      .where('supplierId', '==', supplierId)
+      .get();
+
+    let totalOrders = 0;
+    let onTimeDeliveries = 0;
+    let lateDeliveries = 0;
+    let totalDeliveryTime = 0;
+    let qualityIssues = 0;
+    let totalAmount = 0;
+
+    poSnapshot.forEach(doc => {
+      const po = doc.data();
+      totalOrders++;
+      totalAmount += po.totalAmount || 0;
+
+      if (po.status === 'received' && po.expectedDeliveryDate && po.receivedAt) {
+        const expected = po.expectedDeliveryDate.toDate();
+        const received = po.receivedAt.toDate();
+        const deliveryTime = (received - expected) / (1000 * 60 * 60 * 24); // days
+        
+        totalDeliveryTime += Math.abs(deliveryTime);
+        
+        if (deliveryTime <= 0) {
+          onTimeDeliveries++;
+        } else {
+          lateDeliveries++;
+        }
+      }
+
+      // Check for quality issues in GRNs
+      // This would require querying GRNs, simplified here
+    });
+
+    // Get GRNs for quality analysis
+    const grnSnapshot = await db.collection(collections.goodsReceiptNotes)
+      .where('restaurantId', '==', restaurantId)
+      .where('supplierId', '==', supplierId)
+      .get();
+
+    let totalItemsReceived = 0;
+    let totalItemsRejected = 0;
+
+    grnSnapshot.forEach(doc => {
+      const grn = doc.data();
+      grn.items.forEach(item => {
+        totalItemsReceived += item.receivedQuantity || 0;
+        totalItemsRejected += item.rejectedQuantity || 0;
+        if (item.qualityStatus === 'damaged' || item.qualityStatus === 'defective') {
+          qualityIssues++;
+        }
+      });
+    });
+
+    const onTimeRate = totalOrders > 0 ? (onTimeDeliveries / totalOrders) * 100 : 0;
+    const averageDeliveryTime = totalOrders > 0 ? totalDeliveryTime / totalOrders : 0;
+    const qualityScore = totalItemsReceived > 0 ? ((totalItemsReceived - totalItemsRejected - qualityIssues) / totalItemsReceived) * 100 : 100;
+    const overallScore = (onTimeRate * 0.3 + qualityScore * 0.3 + 70 * 0.4); // Simplified scoring
+
+    const performance = {
+      supplierId,
+      restaurantId,
+      totalOrders,
+      onTimeDeliveries,
+      lateDeliveries,
+      onTimeRate: parseFloat(onTimeRate.toFixed(2)),
+      averageDeliveryTime: parseFloat(averageDeliveryTime.toFixed(2)),
+      qualityScore: parseFloat(qualityScore.toFixed(2)),
+      overallScore: parseFloat(overallScore.toFixed(2)),
+      grade: overallScore >= 90 ? 'A' : overallScore >= 80 ? 'B' : overallScore >= 70 ? 'C' : overallScore >= 60 ? 'D' : 'F',
+      totalAmount,
+      lastUpdated: new Date()
+    };
+
+    // Store/update performance record
+    const perfSnapshot = await db.collection(collections.supplierPerformance)
+      .where('restaurantId', '==', restaurantId)
+      .where('supplierId', '==', supplierId)
+      .limit(1)
+      .get();
+
+    if (perfSnapshot.empty) {
+      await db.collection(collections.supplierPerformance).add(performance);
+    } else {
+      await perfSnapshot.docs[0].ref.update(performance);
+    }
+
+    res.json({ performance });
+
+  } catch (error) {
+    console.error('Get supplier performance error:', error);
+    res.status(500).json({ error: 'Failed to fetch supplier performance' });
+  }
+});
+
+// Get all suppliers performance
+app.get('/api/suppliers/:restaurantId/performance', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+
+    const perfSnapshot = await db.collection(collections.supplierPerformance)
+      .where('restaurantId', '==', restaurantId)
+      .orderBy('overallScore', 'desc')
+      .get();
+
+    const performances = [];
+    perfSnapshot.forEach(doc => {
+      performances.push({ id: doc.id, ...doc.data() });
+    });
+
+    res.json({ performances, total: performances.length });
+
+  } catch (error) {
+    console.error('Get suppliers performance error:', error);
+    res.status(500).json({ error: 'Failed to fetch suppliers performance' });
+  }
+});
+
+// ========================================
+// AI SERVICES APIs
+// ========================================
+
+const aiReorderService = require('./services/aiReorderService');
+const aiWastePredictionService = require('./services/aiWastePredictionService');
+const aiInvoiceOCRService = require('./services/aiInvoiceOCRService');
+const aiPriceIntelligenceService = require('./services/aiPriceIntelligenceService');
+
+// Get AI reorder suggestions
+app.get('/api/ai/reorder-suggestions/:restaurantId', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+
+    const suggestions = await aiReorderService.getReorderSuggestions(restaurantId);
+
+    res.json({
+      success: true,
+      suggestions,
+      total: suggestions.length
+    });
+
+  } catch (error) {
+    console.error('AI reorder suggestions error:', error);
+    res.status(500).json({ error: 'Failed to get reorder suggestions' });
+  }
+});
+
+// Get demand prediction for an item
+app.get('/api/ai/demand-prediction/:restaurantId/:itemId', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId, itemId } = req.params;
+    const { daysAhead } = req.query;
+
+    const prediction = await aiReorderService.predictDemand(
+      itemId, 
+      restaurantId, 
+      parseInt(daysAhead) || 7
+    );
+
+    res.json({
+      success: true,
+      prediction
+    });
+
+  } catch (error) {
+    console.error('Demand prediction error:', error);
+    res.status(500).json({ error: 'Failed to predict demand' });
+  }
+});
+
+// Get waste risk predictions
+app.get('/api/ai/waste-prediction/:restaurantId', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+
+    const predictions = await aiWastePredictionService.predictWasteRisk(restaurantId);
+
+    res.json({
+      success: true,
+      predictions,
+      total: predictions.length
+    });
+
+  } catch (error) {
+    console.error('Waste prediction error:', error);
+    res.status(500).json({ error: 'Failed to predict waste risk' });
+  }
+});
+
+// Get waste summary
+app.get('/api/ai/waste-summary/:restaurantId', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+
+    const summary = await aiWastePredictionService.getWasteSummary(restaurantId);
+
+    res.json({
+      success: true,
+      summary
+    });
+
+  } catch (error) {
+    console.error('Waste summary error:', error);
+    res.status(500).json({ error: 'Failed to get waste summary' });
+  }
+});
+
+// Process invoice image with OCR
+app.post('/api/ai/invoice-ocr/:restaurantId', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+    const { userId, role } = req.user;
+    
+    if (role !== 'owner' && role !== 'manager') {
+      return res.status(403).json({ error: 'Access denied' });
+    }
+
+    const { imageUrl } = req.body;
+
+    if (!imageUrl) {
+      return res.status(400).json({ error: 'Image URL is required' });
+    }
+
+    // Extract invoice data
+    const ocrResult = await aiInvoiceOCRService.extractInvoiceData(imageUrl);
+
+    if (!ocrResult.success) {
+      return res.status(400).json({ 
+        error: 'Failed to extract invoice data',
+        details: ocrResult.error 
+      });
+    }
+
+    // Try to match with Purchase Order
+    const matchResult = await aiInvoiceOCRService.matchWithPurchaseOrder(
+      ocrResult.extractedData,
+      restaurantId
+    );
+
+    res.json({
+      success: true,
+      extractedData: ocrResult.extractedData,
+      matchResult,
+      imageUrl
+    });
+
+  } catch (error) {
+    console.error('Invoice OCR error:', error);
+    res.status(500).json({ error: 'Failed to process invoice image' });
+  }
+});
+
+// Price Intelligence APIs
+app.get('/api/ai/price-comparison/:restaurantId/:itemId', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId, itemId } = req.params;
+
+    const comparison = await aiPriceIntelligenceService.comparePrices(restaurantId, itemId);
+
+    res.json({
+      success: true,
+      comparison
+    });
+
+  } catch (error) {
+    console.error('Price comparison error:', error);
+    res.status(500).json({ error: 'Failed to compare prices' });
+  }
+});
+
+app.get('/api/ai/price-trend/:restaurantId/:itemId', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId, itemId } = req.params;
+    const { days } = req.query;
+
+    const trend = await aiPriceIntelligenceService.analyzePriceTrend(
+      restaurantId, 
+      itemId, 
+      parseInt(days) || 90
+    );
+
+    res.json({
+      success: true,
+      trend
+    });
+
+  } catch (error) {
+    console.error('Price trend error:', error);
+    res.status(500).json({ error: 'Failed to analyze price trend' });
+  }
+});
+
+app.get('/api/ai/price-anomalies/:restaurantId/:itemId', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId, itemId } = req.params;
+
+    const anomalies = await aiPriceIntelligenceService.detectPriceAnomalies(restaurantId, itemId);
+
+    res.json({
+      success: true,
+      anomalies
+    });
+
+  } catch (error) {
+    console.error('Price anomaly detection error:', error);
+    res.status(500).json({ error: 'Failed to detect price anomalies' });
+  }
+});
+
+app.get('/api/ai/best-supplier/:restaurantId/:itemId', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId, itemId } = req.params;
+
+    const recommendation = await aiPriceIntelligenceService.getBestSupplier(restaurantId, itemId);
+
+    res.json({
+      success: true,
+      recommendation
+    });
+
+  } catch (error) {
+    console.error('Best supplier recommendation error:', error);
+    res.status(500).json({ error: 'Failed to get supplier recommendation' });
+  }
+});
+
+// ========================================
+// SUPPLIER RETURNS APIs
+// ========================================
+
+// Get all supplier returns
+app.get('/api/supplier-returns/:restaurantId', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+    const { status, supplierId } = req.query;
+
+    let query = db.collection(collections.supplierReturns)
+      .where('restaurantId', '==', restaurantId);
+
+    if (status && status !== 'all') {
+      query = query.where('status', '==', status);
+    }
+
+    if (supplierId && supplierId !== 'all') {
+      query = query.where('supplierId', '==', supplierId);
+    }
+
+    // Only use orderBy if no additional filters (to avoid index requirements)
+    let snapshot;
+    try {
+      if ((status && status !== 'all') || (supplierId && supplierId !== 'all')) {
+        snapshot = await query.get();
+      } else {
+        snapshot = await query.orderBy('createdAt', 'desc').get();
+      }
+    } catch (error) {
+      // If orderBy fails (no index), try without it
+      console.warn('OrderBy failed, fetching without order:', error.message);
+      snapshot = await query.get();
+    }
+
+    const returns = [];
+    snapshot.forEach(doc => {
+      returns.push({ id: doc.id, ...doc.data() });
+    });
+
+    // Sort manually if we couldn't use orderBy
+    if ((status && status !== 'all') || (supplierId && supplierId !== 'all')) {
+      returns.sort((a, b) => {
+        const dateA = a.createdAt?.toDate?.() || a.createdAt || new Date(0);
+        const dateB = b.createdAt?.toDate?.() || b.createdAt || new Date(0);
+        return dateB - dateA; // Descending
+      });
+    }
+
+    res.json({ returns, total: returns.length });
+
+  } catch (error) {
+    console.error('Get supplier returns error:', error);
+    res.status(500).json({ error: 'Failed to fetch supplier returns' });
+  }
+});
+
+// Create supplier return
+app.post('/api/supplier-returns/:restaurantId', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+    const { userId, role } = req.user;
+    
+    if (role !== 'owner' && role !== 'manager') {
+      return res.status(403).json({ error: 'Access denied' });
+    }
+
+    const { purchaseOrderId, supplierId, items, returnType, reason, notes } = req.body;
+
+    if (!supplierId || !items || items.length === 0) {
+      return res.status(400).json({ error: 'Supplier and items are required' });
+    }
+
+    const returnData = {
+      restaurantId,
+      purchaseOrderId: purchaseOrderId || null,
+      supplierId,
+      items: items.map(item => ({
+        inventoryItemId: item.inventoryItemId,
+        inventoryItemName: item.inventoryItemName,
+        quantity: parseFloat(item.quantity) || 0,
+        unit: item.unit || '',
+        reason: item.reason || '',
+        costPerUnit: parseFloat(item.costPerUnit) || 0,
+        totalCost: (parseFloat(item.quantity) || 0) * (parseFloat(item.costPerUnit) || 0)
+      })),
+      returnType: returnType || 'damaged', // 'damaged', 'defective', 'wrong_item', 'excess'
+      reason: reason?.trim() || '',
+      notes: notes?.trim() || '',
+      status: 'pending', // 'pending', 'approved', 'returned', 'credited', 'rejected'
+      totalAmount: items.reduce((sum, item) => 
+        sum + ((parseFloat(item.quantity) || 0) * (parseFloat(item.costPerUnit) || 0)), 0
+      ),
+      createdAt: new Date(),
+      updatedAt: new Date(),
+      createdBy: userId
+    };
+
+    const returnRef = await db.collection(collections.supplierReturns).add(returnData);
+
+    res.status(201).json({
+      message: 'Return order created successfully',
+      returnOrder: { id: returnRef.id, ...returnData }
+    });
+
+  } catch (error) {
+    console.error('Create supplier return error:', error);
+    res.status(500).json({ error: 'Failed to create return order' });
+  }
+});
+
+// Update return status
+app.patch('/api/supplier-returns/:restaurantId/:returnId', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId, returnId } = req.params;
+    const { userId, role } = req.user;
+    
+    if (role !== 'owner' && role !== 'manager') {
+      return res.status(403).json({ error: 'Access denied' });
+    }
+
+    const { status, creditNoteNumber, notes } = req.body;
+
+    const returnDoc = await db.collection(collections.supplierReturns).doc(returnId).get();
+    if (!returnDoc.exists || returnDoc.data().restaurantId !== restaurantId) {
+      return res.status(404).json({ error: 'Return order not found' });
+    }
+
+    const returnData = returnDoc.data();
+    const updateData = {
+      status: status || returnData.status,
+      updatedAt: new Date(),
+      updatedBy: userId
+    };
+
+    if (creditNoteNumber) {
+      updateData.creditNoteNumber = creditNoteNumber.trim();
+    }
+
+    if (notes) {
+      updateData.notes = notes.trim();
+    }
+
+    // If status changed to 'returned' or 'credited', update inventory
+    if ((status === 'returned' || status === 'credited') && returnData.status !== 'returned' && returnData.status !== 'credited') {
+      // Deduct returned items from inventory
+      for (const item of returnData.items) {
+        const inventoryDoc = await db.collection(collections.inventory).doc(item.inventoryItemId).get();
+        if (inventoryDoc.exists) {
+          const currentStock = inventoryDoc.data().currentStock || 0;
+          await db.collection(collections.inventory).doc(item.inventoryItemId).update({
+            currentStock: Math.max(0, currentStock - item.quantity),
+            lastUpdated: new Date()
+          });
+        }
+      }
+    }
+
+    await db.collection(collections.supplierReturns).doc(returnId).update(updateData);
+
+    res.json({
+      message: 'Return order updated successfully',
+      returnOrder: { id: returnId, ...returnData, ...updateData }
+    });
+
+  } catch (error) {
+    console.error('Update return error:', error);
+    res.status(500).json({ error: 'Failed to update return order' });
+  }
+});
+
+// Delete return order
+app.delete('/api/supplier-returns/:restaurantId/:returnId', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId, returnId } = req.params;
+    const { userId, role } = req.user;
+    
+    if (role !== 'owner' && role !== 'manager') {
+      return res.status(403).json({ error: 'Access denied' });
+    }
+
+    const returnDoc = await db.collection(collections.supplierReturns).doc(returnId).get();
+    if (!returnDoc.exists || returnDoc.data().restaurantId !== restaurantId) {
+      return res.status(404).json({ error: 'Return order not found' });
+    }
+
+    await db.collection(collections.supplierReturns).doc(returnId).delete();
+
+    res.json({ message: 'Return order deleted successfully' });
+
+  } catch (error) {
+    console.error('Delete return error:', error);
+    res.status(500).json({ error: 'Failed to delete return order' });
+  }
+});
+
+// ========================================
+// STOCK TRANSFERS APIs
+// ========================================
+
+// Get all stock transfers
+app.get('/api/stock-transfers/:restaurantId', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+    const { status, fromLocation, toLocation } = req.query;
+
+    let query = db.collection(collections.stockTransfers)
+      .where('restaurantId', '==', restaurantId);
+
+    if (status && status !== 'all') {
+      query = query.where('status', '==', status);
+    }
+
+    if (fromLocation && fromLocation !== 'all') {
+      query = query.where('fromLocation', '==', fromLocation);
+    }
+
+    if (toLocation && toLocation !== 'all') {
+      query = query.where('toLocation', '==', toLocation);
+    }
+
+    // Only use orderBy if no additional filters (to avoid index requirements)
+    let snapshot;
+    try {
+      if ((status && status !== 'all') || (fromLocation && fromLocation !== 'all') || (toLocation && toLocation !== 'all')) {
+        snapshot = await query.get();
+      } else {
+        snapshot = await query.orderBy('createdAt', 'desc').get();
+      }
+    } catch (error) {
+      // If orderBy fails (no index), try without it
+      console.warn('OrderBy failed, fetching without order:', error.message);
+      snapshot = await query.get();
+    }
+
+    const transfers = [];
+    snapshot.forEach(doc => {
+      transfers.push({ id: doc.id, ...doc.data() });
+    });
+
+    // Sort manually if we couldn't use orderBy
+    if ((status && status !== 'all') || (fromLocation && fromLocation !== 'all') || (toLocation && toLocation !== 'all')) {
+      transfers.sort((a, b) => {
+        const dateA = a.createdAt?.toDate?.() || a.createdAt || new Date(0);
+        const dateB = b.createdAt?.toDate?.() || b.createdAt || new Date(0);
+        return dateB - dateA; // Descending
+      });
+    }
+
+    res.json({ transfers, total: transfers.length });
+
+  } catch (error) {
+    console.error('Get stock transfers error:', error);
+    res.status(500).json({ error: 'Failed to fetch stock transfers' });
+  }
+});
+
+// Create stock transfer
+app.post('/api/stock-transfers/:restaurantId', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+    const { userId, role } = req.user;
+    
+    if (role !== 'owner' && role !== 'manager') {
+      return res.status(403).json({ error: 'Access denied' });
+    }
+
+    const { fromLocation, toLocation, items, reason, notes } = req.body;
+
+    if (!fromLocation || !toLocation || !items || items.length === 0) {
+      return res.status(400).json({ error: 'From location, to location, and items are required' });
+    }
+
+    // Validate items exist and have sufficient stock
+    for (const item of items) {
+      const inventoryDoc = await db.collection(collections.inventory).doc(item.inventoryItemId).get();
+      if (!inventoryDoc.exists) {
+        return res.status(400).json({ error: `Item ${item.inventoryItemName} not found` });
+      }
+
+      const inventoryData = inventoryDoc.data();
+      if (inventoryData.location === fromLocation) {
+        if (inventoryData.currentStock < item.quantity) {
+          return res.status(400).json({ 
+            error: `Insufficient stock for ${item.inventoryItemName}. Available: ${inventoryData.currentStock}, Requested: ${item.quantity}` 
+          });
+        }
+      }
+    }
+
+    const transferData = {
+      restaurantId,
+      fromLocation: fromLocation.trim(),
+      toLocation: toLocation.trim(),
+      items: items.map(item => ({
+        inventoryItemId: item.inventoryItemId,
+        inventoryItemName: item.inventoryItemName,
+        quantity: parseFloat(item.quantity) || 0,
+        unit: item.unit || ''
+      })),
+      reason: reason?.trim() || '',
+      notes: notes?.trim() || '',
+      status: 'pending', // 'pending', 'approved', 'in_transit', 'completed', 'cancelled'
+      createdAt: new Date(),
+      updatedAt: new Date(),
+      createdBy: userId
+    };
+
+    const transferRef = await db.collection(collections.stockTransfers).add(transferData);
+
+    res.status(201).json({
+      message: 'Stock transfer created successfully',
+      transfer: { id: transferRef.id, ...transferData }
+    });
+
+  } catch (error) {
+    console.error('Create stock transfer error:', error);
+    res.status(500).json({ error: 'Failed to create stock transfer' });
+  }
+});
+
+// Approve and execute stock transfer
+app.patch('/api/stock-transfers/:restaurantId/:transferId', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId, transferId } = req.params;
+    const { userId, role } = req.user;
+    
+    if (role !== 'owner' && role !== 'manager') {
+      return res.status(403).json({ error: 'Access denied' });
+    }
+
+    const { status } = req.body;
+
+    const transferDoc = await db.collection(collections.stockTransfers).doc(transferId).get();
+    if (!transferDoc.exists || transferDoc.data().restaurantId !== restaurantId) {
+      return res.status(404).json({ error: 'Stock transfer not found' });
+    }
+
+    const transferData = transferDoc.data();
+
+    // If approving, deduct from source and add to destination
+    if (status === 'approved' && transferData.status === 'pending') {
+      for (const item of transferData.items) {
+        // Deduct from source location
+        const inventoryDoc = await db.collection(collections.inventory).doc(item.inventoryItemId).get();
+        if (inventoryDoc.exists) {
+          const inventoryData = inventoryDoc.data();
+          
+          if (inventoryData.location === transferData.fromLocation) {
+            const currentStock = inventoryData.currentStock || 0;
+            await db.collection(collections.inventory).doc(item.inventoryItemId).update({
+              currentStock: Math.max(0, currentStock - item.quantity),
+              lastUpdated: new Date()
+            });
+          }
+
+          // Add to destination location
+          // Note: In a multi-location system, you might need separate inventory records per location
+          // For now, we'll update the location field and add stock
+          if (inventoryData.location !== transferData.toLocation) {
+            // If item doesn't exist at destination, create it or update location
+            // Simplified: just update the location
+            await db.collection(collections.inventory).doc(item.inventoryItemId).update({
+              location: transferData.toLocation,
+              currentStock: (inventoryData.currentStock || 0) + item.quantity,
+              lastUpdated: new Date()
+            });
+          } else {
+            // Item already at destination, just add stock
+            await db.collection(collections.inventory).doc(item.inventoryItemId).update({
+              currentStock: (inventoryData.currentStock || 0) + item.quantity,
+              lastUpdated: new Date()
+            });
+          }
+        }
+      }
+    }
+
+    // If completing, mark as completed
+    if (status === 'completed' && transferData.status === 'approved') {
+      // Transfer already executed, just update status
+    }
+
+    const updateData = {
+      status: status || transferData.status,
+      updatedAt: new Date(),
+      updatedBy: userId
+    };
+
+    if (status === 'approved') {
+      updateData.approvedAt = new Date();
+      updateData.approvedBy = userId;
+    }
+
+    if (status === 'completed') {
+      updateData.completedAt = new Date();
+      updateData.completedBy = userId;
+    }
+
+    await db.collection(collections.stockTransfers).doc(transferId).update(updateData);
+
+    res.json({
+      message: 'Stock transfer updated successfully',
+      transfer: { id: transferId, ...transferData, ...updateData }
+    });
+
+  } catch (error) {
+    console.error('Update stock transfer error:', error);
+    res.status(500).json({ error: 'Failed to update stock transfer' });
+  }
+});
+
+// Delete stock transfer
+app.delete('/api/stock-transfers/:restaurantId/:transferId', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId, transferId } = req.params;
+    const { userId, role } = req.user;
+    
+    if (role !== 'owner' && role !== 'manager') {
+      return res.status(403).json({ error: 'Access denied' });
+    }
+
+    const transferDoc = await db.collection(collections.stockTransfers).doc(transferId).get();
+    if (!transferDoc.exists || transferDoc.data().restaurantId !== restaurantId) {
+      return res.status(404).json({ error: 'Stock transfer not found' });
+    }
+
+    const transferData = transferDoc.data();
+    
+    // Only allow deletion of pending or cancelled transfers
+    if (transferData.status !== 'pending' && transferData.status !== 'cancelled') {
+      return res.status(400).json({ error: 'Cannot delete approved or completed transfers' });
+    }
+
+    await db.collection(collections.stockTransfers).doc(transferId).delete();
+
+    res.json({ message: 'Stock transfer deleted successfully' });
+
+  } catch (error) {
+    console.error('Delete stock transfer error:', error);
+    res.status(500).json({ error: 'Failed to delete stock transfer' });
   }
 });
 
