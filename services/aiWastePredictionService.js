@@ -230,3 +230,5 @@ class AIWastePredictionService {
 
 module.exports = new AIWastePredictionService();
 
+
+
