@@ -6,6 +6,7 @@ const { FieldValue } = require('firebase-admin/firestore');
  * Tracks and limits AI agent (chatbot/voice bot) usage per user based on their subscription plan
  * 
  * Plan Limits:
+ * - Free Trial: 50 credits/month
  * - Starter: 500 credits/month
  * - Professional: 1000 credits/month
  * - Enterprise: 2000 credits/month
@@ -15,6 +16,7 @@ const { FieldValue } = require('firebase-admin/firestore');
 class AIUsageLimiter {
   constructor() {
     this.planLimits = {
+      'free-trial': 50,
       'starter': 500,
       'professional': 1000,
       'enterprise': 2000
@@ -44,6 +46,7 @@ class AIUsageLimiter {
         if (userData.subscription?.planId) {
           const planId = userData.subscription.planId.toLowerCase();
           // Map plan IDs to standard format
+          if (planId.includes('free-trial') || planId.includes('freetrial')) return 'free-trial';
           if (planId.includes('starter')) return 'starter';
           if (planId.includes('professional')) return 'professional';
           if (planId.includes('enterprise')) return 'enterprise';
@@ -51,6 +54,7 @@ class AIUsageLimiter {
         }
         if (userData.subscription?.planName) {
           const planName = userData.subscription.planName.toLowerCase();
+          if (planName.includes('free trial') || planName.includes('freetrial')) return 'free-trial';
           if (planName.includes('starter')) return 'starter';
           if (planName.includes('professional')) return 'professional';
           if (planName.includes('enterprise')) return 'enterprise';
@@ -68,6 +72,7 @@ class AIUsageLimiter {
         // Check if plan is stored in userRestaurants
         if (userData.plan) {
           const plan = userData.plan.toLowerCase();
+          if (plan.includes('free-trial') || plan.includes('freetrial')) return 'free-trial';
           if (plan.includes('starter')) return 'starter';
           if (plan.includes('professional')) return 'professional';
           if (plan.includes('enterprise')) return 'enterprise';
@@ -87,6 +92,7 @@ class AIUsageLimiter {
         const subscription = subscriptionSnapshot.docs[0].data();
         if (subscription.planId) {
           const planId = subscription.planId.toLowerCase();
+          if (planId.includes('free-trial') || planId.includes('freetrial')) return 'free-trial';
           if (planId.includes('starter')) return 'starter';
           if (planId.includes('professional')) return 'professional';
           if (planId.includes('enterprise')) return 'enterprise';
@@ -95,17 +101,18 @@ class AIUsageLimiter {
         if (subscription.planName) {
           // Map plan names to IDs
           const planName = subscription.planName.toLowerCase();
+          if (planName.includes('free trial') || planName.includes('freetrial')) return 'free-trial';
           if (planName.includes('starter')) return 'starter';
           if (planName.includes('professional')) return 'professional';
           if (planName.includes('enterprise')) return 'enterprise';
         }
       }
 
-      // Default to starter if no plan found
-      return 'starter';
+      // Default to free-trial if no plan found
+      return 'free-trial';
     } catch (error) {
       console.error('Error getting user plan:', error);
-      return 'starter'; // Default to starter on error
+      return 'free-trial'; // Default to free-trial on error
     }
   }
 
@@ -192,7 +199,7 @@ class AIUsageLimiter {
   async checkLimit(userId) {
     try {
       const plan = await this.getUserPlan(userId);
-      const limit = this.planLimits[plan] || this.planLimits['starter'];
+      const limit = this.planLimits[plan] || this.planLimits['free-trial'];
       
       const currentMonth = this.getCurrentMonth();
       const usageData = await this.getAIUsage(userId);
@@ -225,10 +232,10 @@ class AIUsageLimiter {
       // Allow on error to prevent blocking users
       return {
         allowed: true,
-        limit: this.planLimits['starter'],
+        limit: this.planLimits['free-trial'],
         used: 0,
-        remaining: this.planLimits['starter'],
-        plan: 'starter',
+        remaining: this.planLimits['free-trial'],
+        plan: 'free-trial',
         reset: false
       };
     }
@@ -287,7 +294,7 @@ class AIUsageLimiter {
         // Get updated usage after increment
         const updatedUsage = await this.getAIUsage(userId);
         const plan = await this.getUserPlan(userId);
-        const limit = this.planLimits[plan] || this.planLimits['starter'];
+        const limit = this.planLimits[plan] || this.planLimits['free-trial'];
 
         // Add usage info to request for logging
         req.aiUsage = {
@@ -342,10 +349,10 @@ class AIUsageLimiter {
     } catch (error) {
       console.error('Error getting AI usage:', error);
       return {
-        plan: 'starter',
-        limit: this.planLimits['starter'],
+        plan: 'free-trial',
+        limit: this.planLimits['free-trial'],
         used: 0,
-        remaining: this.planLimits['starter'],
+        remaining: this.planLimits['free-trial'],
         month: this.getCurrentMonth(),
         resetDate: this.getNextMonthResetDate()
       };

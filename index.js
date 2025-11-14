@@ -56,6 +56,64 @@ async function generateDailyOrderId(restaurantId) {
   }
 }
 
+// Helper function to create default free-trial subscription for new users
+async function createDefaultSubscription(userId, email, phone, role) {
+  try {
+    // Check if subscription already exists
+    const userRef = db.collection('dine_user_data').doc(userId);
+    const userDoc = await userRef.get();
+
+    if (userDoc.exists) {
+      console.log(`[SUBSCRIPTION] User ${userId} already has subscription record`);
+      return;
+    }
+
+    // Create subscription with free-trial plan
+    const currentDate = new Date();
+    const planDetails = {
+      name: 'Free Trial',
+      features: {
+        maxProducts: 200,
+        maxLocations: 1,
+        maxTransactions: 'unlimited',
+        inventoryTracking: true,
+        multiStore: false,
+        advancedReports: false,
+        prioritySupport: false,
+        backupEnabled: false,
+        staffAccounts: 1,
+        tableManagement: 100
+      }
+    };
+
+    const newUserData = {
+      uid: userId,
+      email: email || '',
+      phone: phone || '',
+      role: role || 'owner',
+      restaurantInfo: {},
+      createdAt: currentDate.toISOString(),
+      lastUpdated: currentDate.toISOString(),
+      app: 'Dine',
+      subscription: {
+        planId: 'free-trial',
+        planName: planDetails.name,
+        status: 'active',
+        startDate: currentDate.toISOString(),
+        endDate: null, // Free trial has no end date
+        features: planDetails.features,
+        lastUpdated: currentDate.toISOString(),
+        app: 'Dine'
+      }
+    };
+
+    await userRef.set(newUserData);
+    console.log(`✅ Created free-trial subscription for user ${userId}`);
+  } catch (error) {
+    console.error(`❌ Error creating default subscription for user ${userId}:`, error);
+    // Don't throw - allow user registration to continue even if subscription creation fails
+  }
+}
 
 // Security middleware (Vercel-compatible)
 const vercelSecurityMiddleware = require('./middleware/vercelSecurity');
@@ -1713,6 +1771,9 @@ app.post('/api/auth/google', async (req, res) => {
       console.log('✅ New Google user created (no auto-restaurant):', userId);
       hasRestaurants = false; // No restaurant created yet
 
+      // Create default free-trial subscription for new user
+      await createDefaultSubscription(userId, email, phone || null, 'owner');
+
       // Send welcome email to new Gmail users
       console.log('📧 === REACHING EMAIL SENDING SECTION ===');
       try {
@@ -1962,6 +2023,9 @@ app.post('/api/auth/firebase/verify', async (req, res) => {
       
       console.log('✅ New user created (no auto-restaurant):', userId);
       hasRestaurants = false; // No restaurant created yet
+
+      // Create default free-trial subscription for new user
+      await createDefaultSubscription(userId, email || null, phoneNumber || null, 'owner');
       }
     }
 
@@ -2118,6 +2182,9 @@ app.post('/api/auth/phone/verify-otp', async (req, res) => {
       
       console.log('✅ New phone user created (no auto-restaurant):', userId);
       hasRestaurants = false; // No restaurant created yet
+
+      // Create default free-trial subscription for new user
+      await createDefaultSubscription(userId, null, phone, 'owner');
     } else {
       // Existing owner login
       const userData = userDoc.docs[0].data();

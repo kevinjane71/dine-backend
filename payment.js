@@ -577,7 +577,7 @@ const initializePaymentRoutes = (db, razorpay) => {
   // 7. Create User with Default Subscription API
   router.post('/create-user', async (req, res) => {
     try {
-      const { userId, email, phone, role, planId = 'starter', restaurantInfo } = req.body;
+      const { userId, email, phone, role, planId = 'free-trial', restaurantInfo } = req.body;
 
       console.log('[PAYMENT] Creating billing user:', { userId, email, role, planId });
 
@@ -627,7 +627,7 @@ const initializePaymentRoutes = (db, razorpay) => {
           planName: planDetails.name,
           status: 'active',
           startDate: currentDate.toISOString(),
-          endDate: planId === 'starter' ? null : new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString(),
+          endDate: (planId === 'starter' || planId === 'free-trial') ? null : new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString(),
           features: planDetails.features,
           lastUpdated: currentDate.toISOString(),
           app: 'Dine'
@@ -654,7 +654,60 @@ const initializePaymentRoutes = (db, razorpay) => {
     }
   });
 
-  // 8. Get Billing Information API
+  // 8. Update Subscription API (for free-trial or plan changes without payment)
+  router.post('/update-subscription', async (req, res) => {
+    try {
+      const { userId, email, planId } = req.body;
+
+      if (!userId || !planId) {
+        return res.status(400).json({
+          success: false,
+          error: 'User ID and plan ID are required'
+        });
+      }
+
+      console.log('[PAYMENT] Updating subscription:', { userId, email, planId });
+
+      // Update subscription using helper function
+      await updateUserSubscription(db, userId, email, planId);
+
+      // Get updated subscription data
+      const userDoc = await db.collection('dine_user_data').doc(userId).get();
+      
+      if (!userDoc.exists) {
+        return res.status(404).json({
+          success: false,
+          error: 'User not found'
+        });
+      }
+
+      const userData = userDoc.data();
+      const subscription = userData.subscription || {};
+
+      res.json({
+        success: true,
+        message: 'Subscription updated successfully',
+        subscription: {
+          planId: subscription.planId,
+          planName: subscription.planName,
+          status: subscription.status,
+          startDate: subscription.startDate,
+          endDate: subscription.endDate,
+          features: subscription.features
+        }
+      });
+
+    } catch (error) {
+      console.error('[PAYMENT] Error updating subscription:', error);
+      res.status(500).json({
+        success: false,
+        error: 'Failed to update subscription',
+        details: error.message
+      });
+    }
+  });
+
+  // 9. Get Billing Information API
   router.post('/billing', async (req, res) => {
     try {
       const { email } = req.body;
@@ -771,32 +824,39 @@ async function updateUserSubscriptionDoc(userRef, planId) {
   const endDate = new Date(currentDate);
   
   // Set end date based on plan (default to 1 month)
-  switch (planId) {
-    case 'yearly':
-      endDate.setFullYear(endDate.getFullYear() + 1);
-      break;
-    case 'quarterly':
-      endDate.setMonth(endDate.getMonth() + 3);
-      break;
-    default:
-      endDate.setMonth(endDate.getMonth() + 1); // Monthly plan
+  // Free-trial and starter plans have no end date
+  if (planId === 'free-trial' || planId === 'starter') {
+    endDate = null;
+  } else {
+    switch (planId) {
+      case 'yearly':
+        endDate.setFullYear(endDate.getFullYear() + 1);
+        break;
+      case 'quarterly':
+        endDate.setMonth(endDate.getMonth() + 3);
+        break;
+      default:
+        endDate.setMonth(endDate.getMonth() + 1); // Monthly plan
+    }
   }
   
   // Get plan details
   const planDetails = getPlanDetails(planId);
   
   // Update user document with subscription information
+  const subscriptionData = {
+    planId,
+    planName: planDetails.name,
+    status: 'active',
+    startDate: currentDate.toISOString(),
+    endDate: endDate ? endDate.toISOString() : null,
+    features: planDetails.features,
+    lastUpdated: currentDate.toISOString(),
+    app: 'Dine' // Add app name
+  };
+
   await userRef.update({
-    subscription: {
-      planId,
-      planName: planDetails.name,
-      status: 'active',
-      startDate: currentDate.toISOString(),
-      endDate: endDate.toISOString(),
-      features: planDetails.features,
-      lastUpdated: currentDate.toISOString(),
-      app: 'Dine' // Add app name
-    },
+    subscription: subscriptionData,
     lastUpdated: currentDate
   });
   
@@ -817,6 +877,10 @@ function getPlanDetails(planId) {
     'enterprise': {
       name: 'Enterprise',
       features: getFeaturesByPlan('enterprise')
+    },
+    'free-trial': {
+      name: 'Free Trial',
+      features: getFeaturesByPlan('free-trial')
     },
     'free': {
       name: 'Free Plan',
@@ -844,7 +908,7 @@ function getPlanDetails(planId) {
     }
   };
   
-  return plans[planId] || plans['starter'];
+  return plans[planId] || plans['free-trial'];
 }
 
 // Helper function to get features by plan
@@ -877,9 +941,9 @@ function getFeaturesByPlan(planId) {
         staffAccounts: 10,
         customBranding: true
       };
-    case 'starter':
+    case 'free-trial':
       return {
-        maxProducts: 50,
+        maxProducts: 200,
         maxLocations: 1,
         maxTransactions: 'unlimited',
         inventoryTracking: true,
@@ -888,7 +952,20 @@ function getFeaturesByPlan(planId) {
         prioritySupport: false,
         backupEnabled: false,
         staffAccounts: 1,
-        tableManagement: 20
+        tableManagement: 100
+      };
+    case 'starter':
+      return {
+        maxProducts: 500,
+        maxLocations: 1,
+        maxTransactions: 'unlimited',
+        inventoryTracking: true,
+        multiStore: false,
+        advancedReports: false,
+        prioritySupport: false,
+        backupEnabled: false,
+        staffAccounts: 1,
+        tableManagement: 200
       };
     case 'pro':
       return {
