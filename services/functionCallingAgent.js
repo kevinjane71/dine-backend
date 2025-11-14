@@ -277,6 +277,289 @@ class FunctionCallingAgent {
             required: ['items']
           }
         }
+      },
+      // Menu Management Functions
+      {
+        type: 'function',
+        function: {
+          name: 'add_menu_item',
+          description: 'Add a new item to the restaurant menu. Returns the created menu item with ID.',
+          parameters: {
+            type: 'object',
+            properties: {
+              name: {
+                type: 'string',
+                description: 'Name of the menu item'
+              },
+              price: {
+                type: 'number',
+                description: 'Price of the item'
+              },
+              category: {
+                type: 'string',
+                description: 'Category name (e.g., "Main Course", "Appetizers", "Desserts")'
+              },
+              description: {
+                type: 'string',
+                description: 'Description of the menu item'
+              },
+              is_veg: {
+                type: 'boolean',
+                description: 'Whether the item is vegetarian'
+              },
+              spice_level: {
+                type: 'string',
+                enum: ['mild', 'medium', 'hot', 'extra-hot'],
+                description: 'Spice level of the item'
+              },
+              short_code: {
+                type: 'string',
+                description: 'Short code for quick ordering (e.g., "PZ01")'
+              }
+            },
+            required: ['name', 'price', 'category']
+          }
+        }
+      },
+      {
+        type: 'function',
+        function: {
+          name: 'update_menu_item',
+          description: 'Update an existing menu item. Provide the menu item ID and fields to update.',
+          parameters: {
+            type: 'object',
+            properties: {
+              menu_item_id: {
+                type: 'string',
+                description: 'The ID of the menu item to update'
+              },
+              name: {
+                type: 'string',
+                description: 'Updated name'
+              },
+              price: {
+                type: 'number',
+                description: 'Updated price'
+              },
+              category: {
+                type: 'string',
+                description: 'Updated category'
+              },
+              description: {
+                type: 'string',
+                description: 'Updated description'
+              },
+              is_veg: {
+                type: 'boolean',
+                description: 'Updated vegetarian status'
+              },
+              is_available: {
+                type: 'boolean',
+                description: 'Whether the item is currently available'
+              }
+            },
+            required: ['menu_item_id']
+          }
+        }
+      },
+      {
+        type: 'function',
+        function: {
+          name: 'delete_menu_item',
+          description: 'Delete (soft delete) a menu item from the menu. The item will be marked as deleted but not permanently removed.',
+          parameters: {
+            type: 'object',
+            properties: {
+              menu_item_id: {
+                type: 'string',
+                description: 'The ID of the menu item to delete'
+              }
+            },
+            required: ['menu_item_id']
+          }
+        }
+      },
+      {
+        type: 'function',
+        function: {
+          name: 'search_menu_items',
+          description: 'Search for menu items by name, category, or other criteria. Returns matching items.',
+          parameters: {
+            type: 'object',
+            properties: {
+              search_term: {
+                type: 'string',
+                description: 'Search term to find items by name or description'
+              },
+              category: {
+                type: 'string',
+                description: 'Filter by category name'
+              },
+              is_veg: {
+                type: 'boolean',
+                description: 'Filter vegetarian items only'
+              },
+              is_available: {
+                type: 'boolean',
+                description: 'Filter only available items'
+              }
+            }
+          }
+        }
+      },
+      // Customer Management Functions
+      {
+        type: 'function',
+        function: {
+          name: 'get_customers',
+          description: 'Get list of customers for the restaurant. Returns customer details including name, phone, email, order history, and total spent.',
+          parameters: {
+            type: 'object',
+            properties: {
+              limit: {
+                type: 'number',
+                description: 'Maximum number of customers to return. Default is 50.',
+                default: 50
+              },
+              search: {
+                type: 'string',
+                description: 'Search customers by name, phone, or email'
+              }
+            }
+          }
+        }
+      },
+      {
+        type: 'function',
+        function: {
+          name: 'get_customer_by_id',
+          description: 'Get detailed information about a specific customer by their ID, phone number, or email.',
+          parameters: {
+            type: 'object',
+            properties: {
+              customer_id: {
+                type: 'string',
+                description: 'Customer ID'
+              },
+              phone: {
+                type: 'string',
+                description: 'Customer phone number'
+              },
+              email: {
+                type: 'string',
+                description: 'Customer email address'
+              }
+            }
+          }
+        }
+      },
+      {
+        type: 'function',
+        function: {
+          name: 'add_customer',
+          description: 'Add a new customer to the restaurant database. If customer exists (by phone/email), updates their information.',
+          parameters: {
+            type: 'object',
+            properties: {
+              name: {
+                type: 'string',
+                description: 'Customer name'
+              },
+              phone: {
+                type: 'string',
+                description: 'Customer phone number'
+              },
+              email: {
+                type: 'string',
+                description: 'Customer email address'
+              },
+              city: {
+                type: 'string',
+                description: 'Customer city'
+              },
+              dob: {
+                type: 'string',
+                description: 'Date of birth (YYYY-MM-DD format)'
+              }
+            },
+            required: []
+          }
+        }
+      },
+      {
+        type: 'function',
+        function: {
+          name: 'update_customer',
+          description: 'Update customer information. Provide customer ID and fields to update.',
+          parameters: {
+            type: 'object',
+            properties: {
+              customer_id: {
+                type: 'string',
+                description: 'The ID of the customer to update'
+              },
+              name: {
+                type: 'string',
+                description: 'Updated name'
+              },
+              phone: {
+                type: 'string',
+                description: 'Updated phone number'
+              },
+              email: {
+                type: 'string',
+                description: 'Updated email address'
+              },
+              city: {
+                type: 'string',
+                description: 'Updated city'
+              }
+            },
+            required: ['customer_id']
+          }
+        }
+      },
+      {
+        type: 'function',
+        function: {
+          name: 'delete_customer',
+          description: 'Delete a customer from the restaurant database.',
+          parameters: {
+            type: 'object',
+            properties: {
+              customer_id: {
+                type: 'string',
+                description: 'The ID of the customer to delete'
+              }
+            },
+            required: ['customer_id']
+          }
+        }
+      },
+      {
+        type: 'function',
+        function: {
+          name: 'get_customer_history',
+          description: 'Get order history for a specific customer. Returns all past orders with details.',
+          parameters: {
+            type: 'object',
+            properties: {
+              customer_id: {
+                type: 'string',
+                description: 'Customer ID'
+              },
+              phone: {
+                type: 'string',
+                description: 'Customer phone number (alternative to customer_id)'
+              },
+              limit: {
+                type: 'number',
+                description: 'Maximum number of orders to return. Default is 20.',
+                default: 20
+              }
+            }
+          }
+        }
       }
     ];
   }
@@ -457,6 +740,38 @@ class FunctionCallingAgent {
         
         case 'place_order':
           return await this.placeOrder(restaurantId, arguments_, userId);
+        
+        // Menu Management
+        case 'add_menu_item':
+          return await this.addMenuItem(restaurantId, arguments_);
+        
+        case 'update_menu_item':
+          return await this.updateMenuItem(restaurantId, arguments_);
+        
+        case 'delete_menu_item':
+          return await this.deleteMenuItem(restaurantId, arguments_);
+        
+        case 'search_menu_items':
+          return await this.searchMenuItems(restaurantId, arguments_);
+        
+        // Customer Management
+        case 'get_customers':
+          return await this.getCustomers(restaurantId, arguments_);
+        
+        case 'get_customer_by_id':
+          return await this.getCustomerById(restaurantId, arguments_);
+        
+        case 'add_customer':
+          return await this.addCustomer(restaurantId, arguments_);
+        
+        case 'update_customer':
+          return await this.updateCustomer(restaurantId, arguments_);
+        
+        case 'delete_customer':
+          return await this.deleteCustomer(restaurantId, arguments_);
+        
+        case 'get_customer_history':
+          return await this.getCustomerHistory(restaurantId, arguments_);
         
         default:
           return { error: `Unknown function: ${functionName}` };
@@ -914,6 +1229,554 @@ class FunctionCallingAgent {
         ...orderData
       },
       action: 'place_order'
+    };
+  }
+
+  /**
+   * Menu Management Functions
+   */
+  async addMenuItem(restaurantId, args) {
+    console.log(`🍽️ Adding menu item: ${args.name} to restaurant: ${restaurantId}`);
+    
+    // Get restaurant document
+    const restaurantDoc = await db.collection('restaurants').doc(restaurantId).get();
+    if (!restaurantDoc.exists) {
+      return { success: false, error: 'Restaurant not found' };
+    }
+
+    const restaurantData = restaurantDoc.data();
+    const currentMenu = restaurantData.menu || { categories: [], items: [] };
+
+    // Create new menu item
+    const newMenuItem = {
+      id: `item_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+      name: args.name,
+      price: parseFloat(args.price),
+      category: args.category,
+      description: args.description || '',
+      isVeg: args.is_veg || false,
+      spiceLevel: args.spice_level || null,
+      shortCode: args.short_code || null,
+      isAvailable: true,
+      status: 'active',
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString()
+    };
+
+    // Add to items array
+    const updatedItems = [...(currentMenu.items || []), newMenuItem];
+
+    // Update categories
+    const categories = [...(currentMenu.categories || [])];
+    const categoryIndex = categories.findIndex(cat => cat.name === args.category);
+    
+    if (categoryIndex === -1) {
+      // New category
+      categories.push({
+        name: args.category,
+        items: [newMenuItem]
+      });
+    } else {
+      // Existing category
+      categories[categoryIndex].items = [...(categories[categoryIndex].items || []), newMenuItem];
+    }
+
+    // Update restaurant document
+    await db.collection('restaurants').doc(restaurantId).update({
+      menu: {
+        categories,
+        items: updatedItems,
+        lastUpdated: new Date()
+      }
+    });
+
+    return {
+      success: true,
+      message: `Menu item "${args.name}" added successfully`,
+      menuItem: newMenuItem
+    };
+  }
+
+  async updateMenuItem(restaurantId, args) {
+    console.log(`✏️ Updating menu item: ${args.menu_item_id}`);
+    
+    // Find menu item in restaurant
+    const restaurantDoc = await db.collection('restaurants').doc(restaurantId).get();
+    if (!restaurantDoc.exists) {
+      return { success: false, error: 'Restaurant not found' };
+    }
+
+    const restaurantData = restaurantDoc.data();
+    const currentMenu = restaurantData.menu || { categories: [], items: [] };
+    
+    // Find item
+    const itemIndex = currentMenu.items.findIndex(item => item.id === args.menu_item_id);
+    if (itemIndex === -1) {
+      return { success: false, error: 'Menu item not found' };
+    }
+
+    // Update item
+    const updatedItem = {
+      ...currentMenu.items[itemIndex],
+      ...(args.name && { name: args.name }),
+      ...(args.price !== undefined && { price: parseFloat(args.price) }),
+      ...(args.category && { category: args.category }),
+      ...(args.description !== undefined && { description: args.description }),
+      ...(args.is_veg !== undefined && { isVeg: args.is_veg }),
+      ...(args.is_available !== undefined && { isAvailable: args.is_available }),
+      updatedAt: new Date().toISOString()
+    };
+
+    // Update items array
+    const updatedItems = [...currentMenu.items];
+    updatedItems[itemIndex] = updatedItem;
+
+    // Update categories if category changed
+    let updatedCategories = [...currentMenu.categories];
+    if (args.category && args.category !== currentMenu.items[itemIndex].category) {
+      // Remove from old category
+      const oldCategoryIndex = updatedCategories.findIndex(cat => cat.name === currentMenu.items[itemIndex].category);
+      if (oldCategoryIndex !== -1) {
+        updatedCategories[oldCategoryIndex].items = updatedCategories[oldCategoryIndex].items.filter(
+          item => item.id !== args.menu_item_id
+        );
+      }
+      
+      // Add to new category
+      const newCategoryIndex = updatedCategories.findIndex(cat => cat.name === args.category);
+      if (newCategoryIndex === -1) {
+        updatedCategories.push({
+          name: args.category,
+          items: [updatedItem]
+        });
+      } else {
+        updatedCategories[newCategoryIndex].items.push(updatedItem);
+      }
+    } else {
+      // Update item in existing category
+      const categoryIndex = updatedCategories.findIndex(cat => cat.name === updatedItem.category);
+      if (categoryIndex !== -1) {
+        const itemInCategoryIndex = updatedCategories[categoryIndex].items.findIndex(
+          item => item.id === args.menu_item_id
+        );
+        if (itemInCategoryIndex !== -1) {
+          updatedCategories[categoryIndex].items[itemInCategoryIndex] = updatedItem;
+        }
+      }
+    }
+
+    // Update restaurant document
+    await db.collection('restaurants').doc(restaurantId).update({
+      menu: {
+        categories: updatedCategories,
+        items: updatedItems,
+        lastUpdated: new Date()
+      }
+    });
+
+    return {
+      success: true,
+      message: `Menu item "${updatedItem.name}" updated successfully`,
+      menuItem: updatedItem
+    };
+  }
+
+  async deleteMenuItem(restaurantId, args) {
+    console.log(`🗑️ Deleting menu item: ${args.menu_item_id}`);
+    
+    // Find menu item in restaurant
+    const restaurantDoc = await db.collection('restaurants').doc(restaurantId).get();
+    if (!restaurantDoc.exists) {
+      return { success: false, error: 'Restaurant not found' };
+    }
+
+    const restaurantData = restaurantDoc.data();
+    const currentMenu = restaurantData.menu || { categories: [], items: [] };
+    
+    // Find item
+    const itemIndex = currentMenu.items.findIndex(item => item.id === args.menu_item_id);
+    if (itemIndex === -1) {
+      return { success: false, error: 'Menu item not found' };
+    }
+
+    const item = currentMenu.items[itemIndex];
+
+    // Soft delete - mark as deleted
+    const deletedItem = {
+      ...item,
+      status: 'deleted',
+      deletedAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString()
+    };
+
+    // Update items array
+    const updatedItems = [...currentMenu.items];
+    updatedItems[itemIndex] = deletedItem;
+
+    // Update categories
+    const updatedCategories = currentMenu.categories.map(category => ({
+      ...category,
+      items: category.items.map(catItem => 
+        catItem.id === args.menu_item_id ? deletedItem : catItem
+      )
+    }));
+
+    // Update restaurant document
+    await db.collection('restaurants').doc(restaurantId).update({
+      menu: {
+        categories: updatedCategories,
+        items: updatedItems,
+        lastUpdated: new Date()
+      }
+    });
+
+    return {
+      success: true,
+      message: `Menu item "${item.name}" deleted successfully`,
+      menuItem: deletedItem
+    };
+  }
+
+  async searchMenuItems(restaurantId, args) {
+    console.log(`🔍 Searching menu items:`, args);
+    
+    // Get restaurant menu
+    const restaurantDoc = await db.collection('restaurants').doc(restaurantId).get();
+    if (!restaurantDoc.exists) {
+      return { success: false, error: 'Restaurant not found' };
+    }
+
+    const restaurantData = restaurantDoc.data();
+    const menuItems = (restaurantData.menu?.items || []).filter(item => item.status !== 'deleted');
+
+    // Apply filters
+    let filteredItems = menuItems;
+
+    if (args.search_term) {
+      const searchLower = args.search_term.toLowerCase();
+      filteredItems = filteredItems.filter(item =>
+        item.name?.toLowerCase().includes(searchLower) ||
+        item.description?.toLowerCase().includes(searchLower) ||
+        item.category?.toLowerCase().includes(searchLower)
+      );
+    }
+
+    if (args.category) {
+      filteredItems = filteredItems.filter(item => 
+        item.category?.toLowerCase() === args.category.toLowerCase()
+      );
+    }
+
+    if (args.is_veg !== undefined) {
+      filteredItems = filteredItems.filter(item => item.isVeg === args.is_veg);
+    }
+
+    if (args.is_available !== undefined) {
+      filteredItems = filteredItems.filter(item => item.isAvailable === args.is_available);
+    }
+
+    return {
+      success: true,
+      menuItems: filteredItems,
+      count: filteredItems.length,
+      totalItems: menuItems.length
+    };
+  }
+
+  /**
+   * Customer Management Functions
+   */
+  async getCustomers(restaurantId, args) {
+    console.log(`👥 Getting customers for restaurant: ${restaurantId}`);
+    
+    let query = db.collection(collections.customers || 'customers')
+      .where('restaurantId', '==', restaurantId);
+
+    const snapshot = await query
+      .orderBy('lastOrderDate', 'desc')
+      .limit(args.limit || 50)
+      .get();
+
+    let customers = [];
+    snapshot.forEach(doc => {
+      const data = doc.data();
+      customers.push({
+        id: doc.id,
+        name: data.name,
+        phone: data.phone,
+        email: data.email,
+        city: data.city,
+        totalOrders: data.totalOrders || 0,
+        totalSpent: data.totalSpent || 0,
+        lastOrderDate: data.lastOrderDate?.toDate?.()?.toISOString() || data.lastOrderDate
+      });
+    });
+
+    // Apply search filter if provided
+    if (args.search) {
+      const searchLower = args.search.toLowerCase();
+      customers = customers.filter(customer =>
+        customer.name?.toLowerCase().includes(searchLower) ||
+        customer.phone?.includes(searchLower) ||
+        customer.email?.toLowerCase().includes(searchLower)
+      );
+    }
+
+    return {
+      success: true,
+      customers,
+      count: customers.length
+    };
+  }
+
+  async getCustomerById(restaurantId, args) {
+    console.log(`👤 Getting customer:`, args);
+    
+    let customerDoc = null;
+
+    if (args.customer_id) {
+      customerDoc = await db.collection('customers').doc(args.customer_id).get();
+    } else if (args.phone) {
+      const snapshot = await db.collection(collections.customers || 'customers')
+        .where('restaurantId', '==', restaurantId)
+        .where('phone', '==', args.phone)
+        .limit(1)
+        .get();
+      
+      if (!snapshot.empty) {
+        customerDoc = snapshot.docs[0];
+      }
+    } else if (args.email) {
+      const snapshot = await db.collection(collections.customers || 'customers')
+        .where('restaurantId', '==', restaurantId)
+        .where('email', '==', args.email)
+        .limit(1)
+        .get();
+      
+      if (!snapshot.empty) {
+        customerDoc = snapshot.docs[0];
+      }
+    }
+
+    if (!customerDoc || !customerDoc.exists) {
+      return { success: false, error: 'Customer not found' };
+    }
+
+    const data = customerDoc.data();
+    
+    // Verify restaurant access
+    if (data.restaurantId !== restaurantId) {
+      return { success: false, error: 'Access denied' };
+    }
+
+    return {
+      success: true,
+      customer: {
+        id: customerDoc.id,
+        name: data.name,
+        phone: data.phone,
+        email: data.email,
+        city: data.city,
+        dob: data.dob,
+        totalOrders: data.totalOrders || 0,
+        totalSpent: data.totalSpent || 0,
+        lastOrderDate: data.lastOrderDate?.toDate?.()?.toISOString() || data.lastOrderDate,
+        orderHistory: data.orderHistory || []
+      }
+    };
+  }
+
+  async addCustomer(restaurantId, args) {
+    console.log(`➕ Adding customer:`, args);
+    
+    // Normalize phone number
+    const normalizePhone = (phone) => {
+      if (!phone) return null;
+      const digits = phone.replace(/\D/g, '');
+      if (digits.length === 12 && digits.startsWith('91')) {
+        return digits.substring(2);
+      } else if (digits.length === 10) {
+        return digits;
+      } else if (digits.length === 11 && digits.startsWith('0')) {
+        return digits.substring(1);
+      }
+      return digits;
+    };
+
+    const normalizedPhone = args.phone ? normalizePhone(args.phone) : null;
+
+    // Check if customer already exists
+    let existingCustomer = null;
+    if (normalizedPhone || args.email) {
+      let query = db.collection(collections.customers || 'customers')
+        .where('restaurantId', '==', restaurantId);
+      
+      if (normalizedPhone) {
+        query = query.where('phone', '==', normalizedPhone);
+      }
+      
+      const snapshot = await query.limit(1).get();
+      if (!snapshot.empty) {
+        existingCustomer = snapshot.docs[0];
+      }
+    }
+
+    if (existingCustomer) {
+      // Update existing customer
+      const existingData = existingCustomer.data();
+      const updatedData = {
+        ...existingData,
+        ...(args.name && { name: args.name }),
+        ...(args.email && { email: args.email }),
+        ...(args.city && { city: args.city }),
+        ...(args.dob && { dob: args.dob }),
+        updatedAt: new Date()
+      };
+
+      await existingCustomer.ref.update(updatedData);
+
+      return {
+        success: true,
+        message: 'Customer information updated',
+        customer: {
+          id: existingCustomer.id,
+          ...updatedData
+        }
+      };
+    } else {
+      // Create new customer
+      const customerData = {
+        name: args.name || null,
+        phone: normalizedPhone,
+        email: args.email || null,
+        city: args.city || null,
+        dob: args.dob || null,
+        restaurantId,
+        orderHistory: [],
+        totalOrders: 0,
+        totalSpent: 0,
+        lastOrderDate: null,
+        createdAt: new Date(),
+        updatedAt: new Date()
+      };
+
+      const customerRef = await db.collection(collections.customers || 'customers').add(customerData);
+
+      return {
+        success: true,
+        message: 'Customer added successfully',
+        customer: {
+          id: customerRef.id,
+          ...customerData
+        }
+      };
+    }
+  }
+
+  async updateCustomer(restaurantId, args) {
+    console.log(`✏️ Updating customer: ${args.customer_id}`);
+    
+    const customerDoc = await db.collection(collections.customers || 'customers').doc(args.customer_id).get();
+    if (!customerDoc.exists) {
+      return { success: false, error: 'Customer not found' };
+    }
+
+    const customerData = customerDoc.data();
+    
+    // Verify restaurant access
+    if (customerData.restaurantId !== restaurantId) {
+      return { success: false, error: 'Access denied' };
+    }
+
+    const updateData = {
+      ...(args.name && { name: args.name }),
+      ...(args.phone && { phone: args.phone }),
+      ...(args.email && { email: args.email }),
+      ...(args.city && { city: args.city }),
+      updatedAt: new Date()
+    };
+
+    await customerDoc.ref.update(updateData);
+
+    return {
+      success: true,
+      message: 'Customer updated successfully',
+      customer: {
+        id: args.customer_id,
+        ...customerData,
+        ...updateData
+      }
+    };
+  }
+
+  async deleteCustomer(restaurantId, args) {
+    console.log(`🗑️ Deleting customer: ${args.customer_id}`);
+    
+    const customerDoc = await db.collection(collections.customers || 'customers').doc(args.customer_id).get();
+    if (!customerDoc.exists) {
+      return { success: false, error: 'Customer not found' };
+    }
+
+    const customerData = customerDoc.data();
+    
+    // Verify restaurant access
+    if (customerData.restaurantId !== restaurantId) {
+      return { success: false, error: 'Access denied' };
+    }
+
+    await customerDoc.ref.delete();
+
+    return {
+      success: true,
+      message: `Customer "${customerData.name || 'Unknown'}" deleted successfully`
+    };
+  }
+
+  async getCustomerHistory(restaurantId, args) {
+    console.log(`📜 Getting customer history:`, args);
+    
+    // First get customer
+    let customerDoc = null;
+    
+    if (args.customer_id) {
+      customerDoc = await db.collection('customers').doc(args.customer_id).get();
+    } else if (args.phone) {
+      const snapshot = await db.collection(collections.customers || 'customers')
+        .where('restaurantId', '==', restaurantId)
+        .where('phone', '==', args.phone)
+        .limit(1)
+        .get();
+      
+      if (!snapshot.empty) {
+        customerDoc = snapshot.docs[0];
+      }
+    }
+
+    if (!customerDoc || !customerDoc.exists) {
+      return { success: false, error: 'Customer not found' };
+    }
+
+    const customerData = customerDoc.data();
+    
+    // Verify restaurant access
+    if (customerData.restaurantId !== restaurantId) {
+      return { success: false, error: 'Access denied' };
+    }
+
+    // Get order history from customer data
+    const orderHistory = (customerData.orderHistory || []).slice(0, args.limit || 20);
+
+    return {
+      success: true,
+      customer: {
+        id: customerDoc.id,
+        name: customerData.name,
+        phone: customerData.phone,
+        email: customerData.email
+      },
+      orderHistory,
+      totalOrders: customerData.totalOrders || 0,
+      totalSpent: customerData.totalSpent || 0
     };
   }
 
