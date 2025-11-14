@@ -64,6 +64,9 @@ const { vercelRateLimiter } = require('./middleware/vercelRateLimiter');
 // ChatGPT Usage Limiter
 const chatgptUsageLimiter = require('./middleware/chatgptUsageLimiter');
 
+// AI Usage Limiter (for chatbot and voice bot)
+const aiUsageLimiter = require('./middleware/aiUsageLimiter');
+
 // Subdomain utilities
 const { generateSubdomain, getSubdomainUrl } = require('./utils/subdomain');
 
@@ -7197,7 +7200,7 @@ app.patch('/api/orders/:orderId/cancel', authenticateToken, async (req, res) => 
 // ========================================
 
 // Process voice order using ChatGPT
-app.post('/api/voice/process-order', authenticateToken, async (req, res) => {
+app.post('/api/voice/process-order', authenticateToken, aiUsageLimiter.middleware(), async (req, res) => {
   try {
     const { transcript, restaurantId } = req.body;
     
@@ -7347,7 +7350,7 @@ Example responses:
 // ========================================
 
 // Process voice command for Purchase Order creation
-app.post('/api/voice/process-purchase-order', authenticateToken, async (req, res) => {
+app.post('/api/voice/process-purchase-order', authenticateToken, aiUsageLimiter.middleware(), async (req, res) => {
   try {
     const { transcript, restaurantId } = req.body;
     

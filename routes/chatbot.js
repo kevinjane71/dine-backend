@@ -6,8 +6,28 @@ const IntelligentAgentService = require('../services/intelligentAgent');
 const FunctionCallingAgent = require('../services/functionCallingAgent');
 const { authenticateToken } = require('../middleware/auth');
 const { authenticateRAGAccess } = require('../middleware/ragSecurity');
+const aiUsageLimiter = require('../middleware/aiUsageLimiter');
 const { db } = require('../firebase');
 const { FieldValue } = require('firebase-admin/firestore');
+
+// Get AI usage status for current user
+router.get('/chatbot/usage', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const usage = await aiUsageLimiter.getUsage(userId);
+    
+    res.json({
+      success: true,
+      ...usage
+    });
+  } catch (error) {
+    console.error('Error getting AI usage:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to get AI usage'
+    });
+  }
+});
 
 const chatbotRAG = new ChatbotRAGService();
 const enhancedRAG = new EnhancedRAGService();
@@ -116,7 +136,7 @@ router.post('/chatbot/update-rag', authenticateToken, authenticateRAGAccess, asy
 });
 
 // Function Calling Agent Query Endpoint - NEW (Primary)
-router.post('/chatbot/intelligent-query', authenticateToken, async (req, res) => {
+router.post('/chatbot/intelligent-query', authenticateToken, aiUsageLimiter.middleware(), async (req, res) => {
   try {
     const { query, restaurantId, context } = req.body;
     const userId = req.user.userId;

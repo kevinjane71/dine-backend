@@ -56,7 +56,8 @@ const collections = {
   stockTransfers: 'stock-transfers',
   poTemplates: 'po-templates',
   supplierQuotations: 'supplier-quotations',
-  supplierPerformance: 'supplier-performance'
+  supplierPerformance: 'supplier-performance',
+  aiUsage: 'aiUsage'
 };
 
 const admin = null; // We don't need the legacy admin object anymore
