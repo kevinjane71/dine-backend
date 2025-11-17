@@ -151,6 +151,12 @@ const chatbotRoutes = require('./routes/chatbot');
 // Hotel PMS routes
 const hotelRoutes = require('./routes/hotel');
 
+// Shift Scheduling routes
+const shiftSchedulingRoutes = require('./routes/shiftScheduling');
+
+// Google Reviews routes
+const googleReviewsRoutes = require('./routes/googleReviews');
+
 // Debug email service initialization
 console.log('📧 Email service loaded:', !!emailService);
 if (emailService) {
@@ -4223,6 +4229,12 @@ app.use('/api', chatbotRoutes);
 
 // Initialize hotel PMS routes
 app.use('/api/hotel', hotelRoutes);
+
+// Initialize shift scheduling routes
+app.use('/api/shift-scheduling', shiftSchedulingRoutes);
+
+// Initialize Google Reviews routes
+app.use('/api/google-reviews', googleReviewsRoutes);
 
 
 // Generic image upload API
