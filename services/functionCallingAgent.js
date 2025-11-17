@@ -560,6 +560,96 @@ class FunctionCallingAgent {
             }
           }
         }
+      },
+      // Google Reviews Management
+      {
+        type: 'function',
+        function: {
+          name: 'get_google_review_settings',
+          description: 'Get Google Review settings for the restaurant including review URL, QR code status, and AI settings.',
+          parameters: {
+            type: 'object',
+            properties: {}
+          }
+        }
+      },
+      {
+        type: 'function',
+        function: {
+          name: 'update_google_review_settings',
+          description: 'Update Google Review settings. Can set the Google Review URL/Place ID, enable/disable AI review generation, and add custom messages.',
+          parameters: {
+            type: 'object',
+            properties: {
+              google_review_url: {
+                type: 'string',
+                description: 'Google Review URL or Place ID. Can be a Place ID (e.g., ChIJN1t_tDeuEmsRUsoyG83frY4) or full Google Maps URL.'
+              },
+              ai_enabled: {
+                type: 'boolean',
+                description: 'Enable or disable AI-powered review content generation'
+              },
+              custom_message: {
+                type: 'string',
+                description: 'Custom message to display with QR code (optional)'
+              }
+            }
+          }
+        }
+      },
+      {
+        type: 'function',
+        function: {
+          name: 'generate_qr_code',
+          description: 'Generate a QR code for the Google Review link. The QR code can be scanned by customers to directly open the Google Review writing page.',
+          parameters: {
+            type: 'object',
+            properties: {
+              url: {
+                type: 'string',
+                description: 'Google Review URL or Place ID to generate QR code for. If not provided, uses saved URL from settings.'
+              }
+            }
+          }
+        }
+      },
+      {
+        type: 'function',
+        function: {
+          name: 'generate_review_content',
+          description: 'Generate AI-powered review content for a customer. Creates authentic, genuine review text based on restaurant details, customer name, and rating.',
+          parameters: {
+            type: 'object',
+            properties: {
+              customer_name: {
+                type: 'string',
+                description: 'Name of the customer for whom to generate the review'
+              },
+              rating: {
+                type: 'number',
+                enum: [1, 2, 3, 4, 5],
+                description: 'Star rating (1-5) for the review'
+              }
+            },
+            required: ['customer_name', 'rating']
+          }
+        }
+      },
+      {
+        type: 'function',
+        function: {
+          name: 'get_review_link',
+          description: 'Get the Google Review link/URL for the restaurant. Returns the direct link that opens the Google Review writing page.',
+          parameters: {
+            type: 'object',
+            properties: {
+              place_id: {
+                type: 'string',
+                description: 'Optional Place ID. If not provided, uses saved Place ID from settings.'
+              }
+            }
+          }
+        }
       }
     ];
   }
@@ -772,6 +862,22 @@ class FunctionCallingAgent {
         
         case 'get_customer_history':
           return await this.getCustomerHistory(restaurantId, arguments_);
+        
+        // Google Reviews Management
+        case 'get_google_review_settings':
+          return await this.getGoogleReviewSettings(restaurantId);
+        
+        case 'update_google_review_settings':
+          return await this.updateGoogleReviewSettings(restaurantId, arguments_);
+        
+        case 'generate_qr_code':
+          return await this.generateQRCode(restaurantId, arguments_.url);
+        
+        case 'generate_review_content':
+          return await this.generateReviewContent(restaurantId, arguments_.customer_name, arguments_.rating);
+        
+        case 'get_review_link':
+          return await this.getReviewLink(restaurantId, arguments_.place_id);
         
         default:
           return { error: `Unknown function: ${functionName}` };
