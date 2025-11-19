@@ -2283,11 +2283,13 @@ app.get('/api/restaurants', authenticateToken, async (req, res) => {
       const restaurantDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
       if (restaurantDoc.exists) {
         const restaurantData = restaurantDoc.data();
-        // Remove qrCode (large base64 string) to reduce payload size
-        const { qrCode, ...restaurantWithoutQR } = restaurantData;
+        // Remove qrCode (large base64 string) and menu (huge data) to reduce payload size
+        // QR code can be generated on-demand via separate endpoint or client-side
+        // Menu items are fetched separately via /api/menus/:restaurantId
+        const { qrCode, menu, ...restaurantWithoutLargeData } = restaurantData;
         restaurants.push({
           id: restaurantDoc.id,
-          ...restaurantWithoutQR
+          ...restaurantWithoutLargeData
         });
       }
       return res.json({ restaurants });
@@ -2300,12 +2302,13 @@ app.get('/api/restaurants', authenticateToken, async (req, res) => {
 
     snapshot.forEach(doc => {
       const restaurantData = doc.data();
-      // Remove qrCode (large base64 string) to reduce payload size
+      // Remove qrCode (large base64 string) and menu (huge data) to reduce payload size
       // QR code can be generated on-demand via separate endpoint or client-side
-      const { qrCode, ...restaurantWithoutQR } = restaurantData;
+      // Menu items are fetched separately via /api/menus/:restaurantId
+      const { qrCode, menu, ...restaurantWithoutLargeData } = restaurantData;
       restaurants.push({
         id: doc.id,
-        ...restaurantWithoutQR
+        ...restaurantWithoutLargeData
       });
     });
 
