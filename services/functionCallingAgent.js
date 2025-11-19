@@ -239,7 +239,7 @@ class FunctionCallingAgent {
         type: 'function',
         function: {
           name: 'place_order',
-          description: 'Place an order to the kitchen. Creates a new order from the cart or provided items.',
+          description: 'Place an order to the kitchen. Creates a new order with proper price calculation, tax, and table status update. Prices are automatically fetched from the menu, and tax is calculated if enabled. Table status is automatically updated to "occupied" if a table number is provided.',
           parameters: {
             type: 'object',
             properties: {
@@ -248,30 +248,72 @@ class FunctionCallingAgent {
                 items: {
                   type: 'object',
                   properties: {
-                    menu_item_id: { type: 'string' },
-                    name: { type: 'string' },
-                    quantity: { type: 'number' },
-                    price: { type: 'number' }
+                    menu_item_id: { 
+                      type: 'string',
+                      description: 'Menu item ID (preferred)'
+                    },
+                    id: {
+                      type: 'string',
+                      description: 'Alternative menu item ID'
+                    },
+                    name: { 
+                      type: 'string',
+                      description: 'Menu item name (used if ID not provided, will search by name)'
+                    },
+                    quantity: { 
+                      type: 'number',
+                      description: 'Quantity to order (default: 1)'
+                    },
+                    price: { 
+                      type: 'number',
+                      description: 'Price per item (optional, will be fetched from menu if not provided)'
+                    },
+                    basePrice: {
+                      type: 'number',
+                      description: 'Base price if variant is selected (optional)'
+                    },
+                    selectedVariant: {
+                      type: 'object',
+                      description: 'Selected variant (e.g., Half/Full) with name and price'
+                    },
+                    selectedCustomizations: {
+                      type: 'array',
+                      description: 'Selected customizations/toppings with name and price'
+                    },
+                    notes: {
+                      type: 'string',
+                      description: 'Special notes for this item'
+                    }
                   },
-                  required: ['menu_item_id', 'name', 'quantity', 'price']
-                }
+                  required: []
+                },
+                description: 'Array of items to order. Each item should have either menu_item_id/id or name, and quantity.'
               },
               table_number: {
                 type: 'string',
-                description: 'Table number for dine-in orders'
+                description: 'Table number for dine-in orders. Table status will be automatically updated to "occupied".'
               },
               order_type: {
                 type: 'string',
                 enum: ['dine-in', 'takeaway', 'delivery'],
-                description: 'Type of order'
+                description: 'Type of order (default: dine-in)'
               },
               customer_name: {
                 type: 'string',
-                description: 'Customer name'
+                description: 'Customer name (optional)'
               },
               customer_phone: {
                 type: 'string',
-                description: 'Customer phone number'
+                description: 'Customer phone number (optional)'
+              },
+              payment_method: {
+                type: 'string',
+                enum: ['cash', 'card', 'upi', 'online'],
+                description: 'Payment method (default: cash)'
+              },
+              notes: {
+                type: 'string',
+                description: 'Order notes or special instructions'
               }
             },
             required: ['items']
@@ -1306,36 +1348,304 @@ class FunctionCallingAgent {
   }
 
   async placeOrder(restaurantId, args, userId) {
-    // Create order in database
-    const orderData = {
-      restaurantId,
-      items: args.items,
-      total: args.items.reduce((sum, item) => sum + (item.price * item.quantity), 0),
-      status: 'pending',
-      tableNumber: args.table_number || null,
-      orderType: args.order_type || 'dine-in',
-      customerName: args.customer_name || null,
-      customerPhone: args.customer_phone || null,
-      createdAt: FieldValue.serverTimestamp(),
-      updatedAt: FieldValue.serverTimestamp()
-    };
-
-    const orderRef = await db.collection('orders').add(orderData);
+    console.log(`🛒 Placing order via chatbot for restaurant: ${restaurantId}`, args);
     
-    // Generate order ID
-    const orderId = orderRef.id.slice(-6).toUpperCase();
-    await orderRef.update({ orderId });
+    try {
+      // Get restaurant document to access embedded menu items and settings
+      const restaurantDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
+      if (!restaurantDoc.exists) {
+        return { success: false, error: 'Restaurant not found' };
+      }
 
-    return {
-      success: true,
-      message: `Order placed successfully. Order ID: ${orderId}`,
-      order: {
-        id: orderRef.id,
-        orderId,
-        ...orderData
-      },
-      action: 'place_order'
-    };
+      const restaurantData = restaurantDoc.data();
+      const menuItems = restaurantData.menu?.items || [];
+      
+      // Get tax settings
+      const taxSettings = restaurantData.settings?.taxSettings || {};
+      const taxEnabled = taxSettings.enabled || false;
+      const taxRate = taxSettings.rate || 0;
+
+      // Validate and process items
+      let totalAmount = 0;
+      const orderItems = [];
+
+      if (!args.items || args.items.length === 0) {
+        return { success: false, error: 'No items provided for order' };
+      }
+
+      for (const item of args.items) {
+        // Find menu item in the embedded menu structure
+        const menuItem = menuItems.find(mi => 
+          mi.id === item.menu_item_id || 
+          mi.id === item.id ||
+          mi.name?.toLowerCase() === item.name?.toLowerCase()
+        );
+        
+        if (!menuItem) {
+          return { success: false, error: `Menu item "${item.name || item.menu_item_id}" not found` };
+        }
+
+        // Compute unit price considering variant and selected customizations (toppings)
+        const selectedVariant = item.selectedVariant || item.variant || null;
+        const customizations = Array.isArray(item.selectedCustomizations)
+          ? item.selectedCustomizations
+          : (Array.isArray(item.customizations) ? item.customizations : []);
+
+        const basePrice = typeof selectedVariant?.price === 'number'
+          ? selectedVariant.price
+          : (typeof item.basePrice === 'number' ? item.basePrice : (typeof item.price === 'number' ? item.price : menuItem.price));
+
+        const customizationPrice = customizations.reduce((sum, c) => sum + (typeof c.price === 'number' ? c.price : 0), 0);
+        const unitPrice = (basePrice || 0) + (customizationPrice || 0);
+
+        const itemQuantity = Math.max(1, parseInt(item.quantity, 10) || 1);
+        const itemTotal = unitPrice * itemQuantity;
+        totalAmount += itemTotal;
+
+        orderItems.push({
+          menuItemId: menuItem.id,
+          name: menuItem.name,
+          price: unitPrice,
+          quantity: itemQuantity,
+          total: itemTotal,
+          shortCode: menuItem.shortCode || null,
+          notes: item.notes || '',
+          // Persist kitchen-facing details
+          selectedVariant: selectedVariant ? { name: selectedVariant.name, price: selectedVariant.price || 0 } : null,
+          selectedCustomizations: customizations.map(c => ({ 
+            id: c.id || null, 
+            name: c.name || c, 
+            price: typeof c.price === 'number' ? c.price : 0 
+          }))
+        });
+      }
+
+      // Calculate tax
+      const taxAmount = taxEnabled ? (totalAmount * taxRate / 100) : 0;
+      const finalAmount = totalAmount + taxAmount;
+
+      // Validate table number if provided
+      let tableId = null;
+      let tableFloorId = null;
+      if (args.table_number) {
+        const floorsSnapshot = await db.collection('restaurants')
+          .doc(restaurantId)
+          .collection('floors')
+          .get();
+        
+        let tableFound = false;
+        for (const floorDoc of floorsSnapshot.docs) {
+          const tablesSnapshot = await db.collection('restaurants')
+            .doc(restaurantId)
+            .collection('floors')
+            .doc(floorDoc.id)
+            .collection('tables')
+            .get();
+
+          for (const tableDoc of tablesSnapshot.docs) {
+            const tableData = tableDoc.data();
+            if (tableData.name && tableData.name.toString().toLowerCase() === args.table_number.trim().toLowerCase()) {
+              if (tableData.status !== 'available') {
+                return { 
+                  success: false, 
+                  error: `Table "${args.table_number}" is ${tableData.status}. Please choose another table.` 
+                };
+              }
+              tableFound = true;
+              tableId = tableDoc.id;
+              tableFloorId = floorDoc.id;
+              break;
+            }
+          }
+          if (tableFound) break;
+        }
+        
+        if (!tableFound) {
+          return { success: false, error: `Table "${args.table_number}" not found` };
+        }
+      }
+
+      // Generate order number and daily order ID
+      const orderNumber = `ORD-${Date.now()}-${Math.random().toString(36).substr(2, 4).toUpperCase()}`;
+      
+      // Generate daily order ID
+      const today = new Date();
+      const todayStr = today.toISOString().split('T')[0];
+      const counterRef = db.collection('daily_order_counters').doc(`${restaurantId}_${todayStr}`);
+      const counterDoc = await counterRef.get();
+      let dailyOrderId = 1;
+      if (counterDoc.exists) {
+        const counterData = counterDoc.data();
+        dailyOrderId = counterData.lastOrderId + 1;
+        await counterRef.update({
+          lastOrderId: dailyOrderId,
+          updatedAt: new Date()
+        });
+      } else {
+        await counterRef.set({
+          restaurantId,
+          date: todayStr,
+          lastOrderId: 1,
+          createdAt: new Date(),
+          updatedAt: new Date()
+        });
+      }
+
+      // Get user info for staffInfo
+      let staffName = 'Chatbot';
+      let userRole = 'staff';
+      try {
+        const userRestaurantDoc = await db.collection('userRestaurants')
+          .where('userId', '==', userId)
+          .where('restaurantId', '==', restaurantId)
+          .limit(1)
+          .get();
+        
+        if (!userRestaurantDoc.empty) {
+          const userData = userRestaurantDoc.docs[0].data();
+          staffName = userData.name || 'Chatbot';
+          userRole = userData.role || 'staff';
+        }
+      } catch (error) {
+        console.error('Error fetching user info:', error);
+      }
+
+      // Create order data
+      const orderData = {
+        restaurantId,
+        orderNumber,
+        dailyOrderId,
+        tableNumber: args.table_number || null,
+        orderType: args.order_type || 'dine-in',
+        items: orderItems,
+        totalAmount,
+        taxAmount,
+        discountAmount: 0,
+        finalAmount,
+        customerInfo: {
+          name: args.customer_name || 'Walk-in Customer',
+          phone: args.customer_phone || null,
+          email: null,
+          city: null,
+          seatNumber: args.table_number || 'Walk-in'
+        },
+        paymentMethod: args.payment_method || 'cash',
+        staffInfo: {
+          userId: userId,
+          name: staffName,
+          loginId: userId,
+          role: userRole
+        },
+        notes: args.notes || 'Order placed via chatbot',
+        status: 'confirmed',
+        kotSent: false,
+        paymentStatus: 'pending',
+        createdAt: new Date(),
+        updatedAt: new Date()
+      };
+
+      // Create order in database
+      const orderRef = await db.collection(collections.orders).add(orderData);
+      
+      // Update table status to "occupied" if table number is provided
+      if (tableId && tableFloorId) {
+        try {
+          await db.collection('restaurants')
+            .doc(restaurantId)
+            .collection('floors')
+            .doc(tableFloorId)
+            .collection('tables')
+            .doc(tableId)
+            .update({
+              status: 'occupied',
+              currentOrderId: orderRef.id,
+              lastOrderTime: new Date(),
+              updatedAt: new Date()
+            });
+          console.log(`✅ Table ${args.table_number} status updated to occupied`);
+        } catch (tableUpdateError) {
+          console.error('❌ Failed to update table status:', tableUpdateError);
+          // Don't fail the order if table status update fails
+        }
+      }
+
+      // Create/update customer if customer info is provided
+      if (args.customer_name || args.customer_phone) {
+        try {
+          const customerData = {
+            name: args.customer_name || null,
+            phone: args.customer_phone || null,
+            restaurantId: restaurantId,
+            orderHistory: [{
+              orderId: orderRef.id,
+              orderNumber: orderNumber,
+              totalAmount: finalAmount,
+              orderDate: new Date(),
+              tableNumber: args.table_number || null
+            }]
+          };
+
+          // Check if customer exists
+          let customerQuery = db.collection(collections.customers || 'customers')
+            .where('restaurantId', '==', restaurantId);
+          
+          if (args.customer_phone) {
+            customerQuery = customerQuery.where('phone', '==', args.customer_phone);
+          } else if (args.customer_name) {
+            customerQuery = customerQuery.where('name', '==', args.customer_name);
+          }
+
+          const existingCustomer = await customerQuery.limit(1).get();
+          
+          if (!existingCustomer.empty) {
+            // Update existing customer
+            const customerDoc = existingCustomer.docs[0];
+            const existingData = customerDoc.data();
+            const updatedHistory = [...(existingData.orderHistory || []), customerData.orderHistory[0]];
+            await customerDoc.ref.update({
+              orderHistory: updatedHistory,
+              totalOrders: (existingData.totalOrders || 0) + 1,
+              totalSpent: (existingData.totalSpent || 0) + finalAmount,
+              lastOrderDate: new Date(),
+              updatedAt: new Date()
+            });
+          } else {
+            // Create new customer
+            await db.collection(collections.customers || 'customers').add({
+              ...customerData,
+              totalOrders: 1,
+              totalSpent: finalAmount,
+              lastOrderDate: new Date(),
+              createdAt: new Date(),
+              updatedAt: new Date()
+            });
+          }
+        } catch (customerError) {
+          console.error('Customer creation/update error:', customerError);
+          // Don't fail the order if customer creation fails
+        }
+      }
+
+      return {
+        success: true,
+        message: `Order placed successfully. Order Number: ${orderNumber}, Total: ₹${finalAmount.toFixed(2)}${taxAmount > 0 ? ` (Tax: ₹${taxAmount.toFixed(2)})` : ''}`,
+        order: {
+          id: orderRef.id,
+          orderNumber,
+          dailyOrderId,
+          tableNumber: args.table_number || null,
+          items: orderItems,
+          totalAmount,
+          taxAmount,
+          finalAmount,
+          status: 'confirmed'
+        },
+        action: 'place_order'
+      };
+    } catch (error) {
+      console.error('Error placing order:', error);
+      return { success: false, error: error.message || 'Failed to place order' };
+    }
   }
 
   /**
@@ -1884,6 +2194,286 @@ class FunctionCallingAgent {
       totalOrders: customerData.totalOrders || 0,
       totalSpent: customerData.totalSpent || 0
     };
+  }
+
+  // Google Reviews Management Functions
+  async getGoogleReviewSettings(restaurantId) {
+    console.log(`⭐ Getting Google Review settings for restaurant: ${restaurantId}`);
+    
+    try {
+      const settingsDoc = await db.collection('googleReviewSettings').doc(restaurantId).get();
+      
+      if (settingsDoc.exists) {
+        const settings = settingsDoc.data();
+        return {
+          success: true,
+          settings: {
+            googleReviewUrl: settings.googleReviewUrl || '',
+            aiEnabled: settings.aiEnabled !== undefined ? settings.aiEnabled : true,
+            customMessage: settings.customMessage || '',
+            hasQRCode: !!settings.qrCodeUrl,
+            updatedAt: settings.updatedAt?.toDate?.()?.toISOString() || settings.updatedAt
+          }
+        };
+      } else {
+        return {
+          success: true,
+          settings: {
+            googleReviewUrl: '',
+            aiEnabled: true,
+            customMessage: '',
+            hasQRCode: false
+          },
+          message: 'No settings configured yet'
+        };
+      }
+    } catch (error) {
+      console.error('Error fetching Google Review settings:', error);
+      return { success: false, error: 'Failed to fetch settings' };
+    }
+  }
+
+  async updateGoogleReviewSettings(restaurantId, args) {
+    console.log(`✏️ Updating Google Review settings:`, args);
+    
+    try {
+      const QRCode = require('qrcode');
+      
+      // Normalize URL to ensure it's a write review URL
+      let normalizedUrl = args.google_review_url || '';
+      
+      if (normalizedUrl) {
+        // If it's a Place ID (long alphanumeric string), construct write review URL
+        if (normalizedUrl.length > 20 && !normalizedUrl.startsWith('http') && !normalizedUrl.includes('/')) {
+          normalizedUrl = `https://search.google.com/local/writereview?placeid=${normalizedUrl}`;
+        }
+        // If it's a Google Maps URL, try to extract Place ID
+        else if (normalizedUrl.includes('maps/place/')) {
+          const placeIdMatch = normalizedUrl.match(/place\/([^\/]+)/);
+          if (placeIdMatch) {
+            normalizedUrl = `https://search.google.com/local/writereview?placeid=${placeIdMatch[1]}`;
+          }
+        }
+        // If it's already a write review URL, keep it
+        else if (!normalizedUrl.includes('writereview') && !normalizedUrl.includes('placeid')) {
+          // If it's a regular Google Maps URL, try to extract Place ID
+          const placeIdMatch = normalizedUrl.match(/placeid=([^&]+)/);
+          if (placeIdMatch) {
+            normalizedUrl = `https://search.google.com/local/writereview?placeid=${placeIdMatch[1]}`;
+          }
+        }
+      }
+
+      const settings = {
+        restaurantId,
+        ...(normalizedUrl && { googleReviewUrl: normalizedUrl }),
+        ...(args.ai_enabled !== undefined && { aiEnabled: args.ai_enabled }),
+        ...(args.custom_message !== undefined && { customMessage: args.custom_message }),
+        updatedAt: new Date()
+      };
+
+      // Generate QR code if URL is provided
+      if (normalizedUrl) {
+        try {
+          const qrCodeDataUrl = await QRCode.toDataURL(normalizedUrl, {
+            width: 400,
+            margin: 2,
+            color: {
+              dark: '#000000',
+              light: '#FFFFFF'
+            }
+          });
+          settings.qrCodeUrl = qrCodeDataUrl;
+        } catch (qrError) {
+          console.error('Error generating QR code:', qrError);
+        }
+      }
+
+      await db.collection('googleReviewSettings').doc(restaurantId).set(settings, { merge: true });
+
+      return {
+        success: true,
+        message: 'Google Review settings updated successfully',
+        settings: {
+          googleReviewUrl: normalizedUrl || settings.googleReviewUrl,
+          aiEnabled: args.ai_enabled !== undefined ? args.ai_enabled : settings.aiEnabled,
+          customMessage: args.custom_message !== undefined ? args.custom_message : settings.customMessage,
+          hasQRCode: !!settings.qrCodeUrl
+        }
+      };
+    } catch (error) {
+      console.error('Error updating Google Review settings:', error);
+      return { success: false, error: 'Failed to update settings' };
+    }
+  }
+
+  async generateQRCode(restaurantId, url) {
+    console.log(`📱 Generating QR code for restaurant: ${restaurantId}`);
+    
+    try {
+      const QRCode = require('qrcode');
+      
+      // If URL not provided, get from settings
+      if (!url) {
+        const settingsDoc = await db.collection('googleReviewSettings').doc(restaurantId).get();
+        if (settingsDoc.exists && settingsDoc.data().googleReviewUrl) {
+          url = settingsDoc.data().googleReviewUrl;
+        } else {
+          return { success: false, error: 'No Google Review URL configured. Please set the URL first.' };
+        }
+      }
+
+      // Normalize URL
+      let normalizedUrl = url;
+      if (normalizedUrl.length > 20 && !normalizedUrl.startsWith('http') && !normalizedUrl.includes('/')) {
+        normalizedUrl = `https://search.google.com/local/writereview?placeid=${normalizedUrl}`;
+      } else if (normalizedUrl.includes('maps/place/')) {
+        const placeIdMatch = normalizedUrl.match(/place\/([^\/]+)/);
+        if (placeIdMatch) {
+          normalizedUrl = `https://search.google.com/local/writereview?placeid=${placeIdMatch[1]}`;
+        }
+      } else if (!normalizedUrl.includes('writereview') && !normalizedUrl.includes('placeid')) {
+        const placeIdMatch = normalizedUrl.match(/placeid=([^&]+)/);
+        if (placeIdMatch) {
+          normalizedUrl = `https://search.google.com/local/writereview?placeid=${placeIdMatch[1]}`;
+        }
+      }
+
+      const qrCodeDataUrl = await QRCode.toDataURL(normalizedUrl, {
+        width: 400,
+        margin: 2,
+        color: {
+          dark: '#000000',
+          light: '#FFFFFF'
+        }
+      });
+
+      // Update settings with QR code
+      await db.collection('googleReviewSettings').doc(restaurantId).set({
+        restaurantId,
+        qrCodeUrl: qrCodeDataUrl,
+        googleReviewUrl: normalizedUrl,
+        updatedAt: new Date()
+      }, { merge: true });
+
+      return {
+        success: true,
+        message: 'QR code generated successfully',
+        hasQRCode: true,
+        reviewUrl: normalizedUrl
+      };
+    } catch (error) {
+      console.error('Error generating QR code:', error);
+      return { success: false, error: 'Failed to generate QR code' };
+    }
+  }
+
+  async generateReviewContent(restaurantId, customerName, rating) {
+    console.log(`🤖 Generating AI review content for: ${customerName}, Rating: ${rating}`);
+    
+    try {
+      // Fetch restaurant details
+      const restaurantDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
+      if (!restaurantDoc.exists) {
+        return { success: false, error: 'Restaurant not found' };
+      }
+
+      const restaurantData = restaurantDoc.data();
+      const restaurantName = restaurantData.name || 'this restaurant';
+      const cuisine = restaurantData.cuisine || [];
+      const address = restaurantData.address || '';
+
+      // Generate AI review content
+      const aiPrompt = `Generate a genuine, authentic Google review for a restaurant. The review should:
+- Be natural and conversational (not overly promotional)
+- Mention specific positive aspects (food quality, service, ambiance, value)
+- Be appropriate for a ${rating || 5}-star rating
+- Be between 50-200 words
+- Sound like a real customer wrote it
+- Follow Google Review guidelines (honest, helpful, relevant)
+
+Restaurant Details:
+- Name: ${restaurantName}
+- Cuisine: ${cuisine.join(', ') || 'Various'}
+- Location: ${address}
+
+Customer Name: ${customerName}
+Rating: ${rating || 5} stars
+
+Generate a review that feels authentic and would be helpful to other customers. Return only the review text, no additional formatting.`;
+
+      const completion = await this.openai.chat.completions.create({
+        model: 'gpt-4o-mini',
+        messages: [
+          {
+            role: 'system',
+            content: 'You are a helpful assistant that generates authentic, genuine restaurant reviews that sound like real customers wrote them. Reviews should be honest, helpful, and follow Google Review guidelines.'
+          },
+          {
+            role: 'user',
+            content: aiPrompt
+          }
+        ],
+        temperature: 0.8,
+        max_tokens: 300
+      });
+
+      const reviewContent = completion.choices[0].message.content.trim();
+
+      return {
+        success: true,
+        reviewContent,
+        customerName,
+        rating,
+        message: 'Review content generated successfully'
+      };
+    } catch (error) {
+      console.error('Error generating AI review content:', error);
+      return { success: false, error: 'Failed to generate review content' };
+    }
+  }
+
+  async getReviewLink(restaurantId, placeId) {
+    console.log(`🔗 Getting review link for restaurant: ${restaurantId}`);
+    
+    try {
+      const settingsDoc = await db.collection('googleReviewSettings').doc(restaurantId).get();
+      const savedUrl = settingsDoc.exists ? settingsDoc.data().googleReviewUrl : null;
+
+      let reviewUrl = '';
+
+      if (placeId) {
+        // If placeId is provided, construct the write review URL
+        reviewUrl = `https://search.google.com/local/writereview?placeid=${placeId}`;
+      } else if (savedUrl) {
+        // Use saved URL, but ensure it's a write review URL
+        if (savedUrl.includes('writereview') || savedUrl.includes('placeid')) {
+          reviewUrl = savedUrl;
+        } else if (savedUrl.includes('maps/place/')) {
+          const placeIdMatch = savedUrl.match(/place\/([^\/]+)/);
+          if (placeIdMatch) {
+            reviewUrl = `https://search.google.com/local/writereview?placeid=${placeIdMatch[1]}`;
+          } else {
+            reviewUrl = savedUrl;
+          }
+        } else if (savedUrl.length > 20 && !savedUrl.startsWith('http')) {
+          reviewUrl = `https://search.google.com/local/writereview?placeid=${savedUrl}`;
+        } else {
+          reviewUrl = savedUrl;
+        }
+      } else {
+        return { success: false, error: 'No Google Review URL or Place ID configured. Please add a Place ID or direct URL in settings.' };
+      }
+
+      return {
+        success: true,
+        reviewUrl,
+        message: 'Review link retrieved successfully'
+      };
+    } catch (error) {
+      console.error('Error getting review link:', error);
+      return { success: false, error: 'Failed to get review link' };
+    }
   }
 
   /**
