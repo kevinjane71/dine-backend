@@ -2282,9 +2282,12 @@ app.get('/api/restaurants', authenticateToken, async (req, res) => {
       // Staff members see only their assigned restaurant
       const restaurantDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
       if (restaurantDoc.exists) {
+        const restaurantData = restaurantDoc.data();
+        // Remove qrCode (large base64 string) to reduce payload size
+        const { qrCode, ...restaurantWithoutQR } = restaurantData;
         restaurants.push({
           id: restaurantDoc.id,
-          ...restaurantDoc.data()
+          ...restaurantWithoutQR
         });
       }
       return res.json({ restaurants });
@@ -2296,9 +2299,13 @@ app.get('/api/restaurants', authenticateToken, async (req, res) => {
     const snapshot = await query.get();
 
     snapshot.forEach(doc => {
+      const restaurantData = doc.data();
+      // Remove qrCode (large base64 string) to reduce payload size
+      // QR code can be generated on-demand via separate endpoint or client-side
+      const { qrCode, ...restaurantWithoutQR } = restaurantData;
       restaurants.push({
         id: doc.id,
-        ...doc.data()
+        ...restaurantWithoutQR
       });
     });
 
@@ -2364,10 +2371,10 @@ app.post('/api/restaurants', authenticateToken, async (req, res) => {
       updatedAt: new Date()
     });
 
-    const qrData = `${process.env.FRONTEND_URL}/menu/${restaurantRef.id}`;
-    const qrCode = await QRCode.toDataURL(qrData);
-
-    await restaurantRef.update({ qrCode, qrData });
+    // Store qrData for reference, but don't generate qrCode here to save bandwidth
+    // QR code can be generated on-demand client-side or via separate endpoint
+    const qrData = `${process.env.FRONTEND_URL || 'https://www.dineopen.com'}/placeorder?restaurant=${restaurantRef.id}`;
+    await restaurantRef.update({ qrData });
 
     res.status(201).json({
       message: 'Restaurant created successfully',
@@ -2376,8 +2383,7 @@ app.post('/api/restaurants', authenticateToken, async (req, res) => {
         ...restaurantData,
         subdomain: finalSubdomain, // Include the final subdomain
         subdomainUrl: getSubdomainUrl(finalSubdomain),
-        qrCode,
-        qrData
+        qrData // Include qrData but not qrCode (large base64 string)
       }
     });
 
