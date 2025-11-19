@@ -3605,25 +3605,49 @@ app.get('/api/analytics/:restaurantId', authenticateToken, async (req, res) => {
     let startDate;
     
     switch (period) {
+      case 'today':
+        // Today's orders only
+        startDate = new Date(now);
+        startDate.setHours(0, 0, 0, 0);
+        break;
+      case '24h':
+      case 'last24hours':
+        // Last 24 hours
+        startDate = new Date(now.getTime() - 24 * 60 * 60 * 1000);
+        break;
       case '7d':
+      case 'last7days':
+        // Last 7 days
         startDate = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
         break;
       case '30d':
+      case 'last30days':
+        // Last 30 days
         startDate = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000);
         break;
-      case '90d':
-        startDate = new Date(now.getTime() - 90 * 24 * 60 * 60 * 1000);
+      case 'all':
+        // All orders (no date filter)
+        startDate = null;
         break;
       default:
         startDate = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
     }
     
     // Fetch orders for the restaurant in the date range
-    const ordersQuery = await db.collection(collections.orders)
-      .where('restaurantId', '==', restaurantId)
-      .where('createdAt', '>=', startDate)
-      .where('createdAt', '<=', now)
-      .get();
+    let ordersQuery;
+    if (startDate === null) {
+      // All orders - no date filter
+      ordersQuery = await db.collection(collections.orders)
+        .where('restaurantId', '==', restaurantId)
+        .get();
+    } else {
+      // Filter by date range
+      ordersQuery = await db.collection(collections.orders)
+        .where('restaurantId', '==', restaurantId)
+        .where('createdAt', '>=', startDate)
+        .where('createdAt', '<=', now)
+        .get();
+    }
     
     const orders = ordersQuery.docs.map(doc => ({
       id: doc.id,
