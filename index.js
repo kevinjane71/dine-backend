@@ -3410,6 +3410,29 @@ app.post('/api/orders', async (req, res) => {
       }
     }
 
+    // Trigger automation: Sync customer and send welcome message (non-blocking)
+    try {
+      const customerId = await automationService.syncCustomerFromOrder({
+        ...orderData,
+        restaurantId: restaurantId
+      });
+      
+      // Trigger new_order automation if customer exists
+      if (customerId && (orderData.customerDisplay?.phone || orderData.customer?.phone)) {
+        automationService.processTrigger(restaurantId, 'new_order', {
+          customerId: customerId,
+          orderAmount: totalAmount,
+          orderNumber: dailyOrderId || orderNumber,
+          restaurantName: restaurant.name || 'Restaurant'
+        }).catch(err => {
+          console.error('Automation trigger error (non-blocking):', err);
+        });
+      }
+    } catch (error) {
+      console.error('Automation sync error (non-blocking):', error);
+      // Don't fail order creation if automation fails
+    }
+
     res.status(201).json({
       message: 'Order created successfully',
       order: {
@@ -12193,6 +12216,754 @@ app.post('/api/admin/chatgpt/cleanup', authenticateToken, async (req, res) => {
 // ==================== END CHATGPT USAGE MANAGEMENT ====================
 
 // ==================== END EMAIL SERVICE API ====================
+
+// ==================== AUTOMATION & LOYALTY APIs ====================
+
+const automationService = require('./services/automationService');
+const whatsappService = require('./services/whatsappService');
+
+// Get automations
+app.get('/api/automation/:restaurantId/automations', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+    const snapshot = await db.collection(collections.automations)
+      .where('restaurantId', '==', restaurantId)
+      .get();
+
+    const automations = snapshot.docs.map(doc => ({
+      id: doc.id,
+      ...doc.data()
+    }));
+
+    res.json({ success: true, automations });
+  } catch (error) {
+    console.error('Get automations error:', error);
+    res.status(500).json({ error: 'Failed to get automations' });
+  }
+});
+
+// Create automation
+app.post('/api/automation/:restaurantId/automations', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+    const automationData = {
+      restaurantId,
+      ...req.body,
+      enabled: req.body.enabled !== undefined ? req.body.enabled : true,
+      stats: {
+        sent: 0,
+        delivered: 0,
+        read: 0,
+        converted: 0
+      },
+      createdAt: new Date(),
+      updatedAt: new Date()
+    };
+
+    const docRef = await db.collection(collections.automations).add(automationData);
+    res.json({ success: true, automation: { id: docRef.id, ...automationData } });
+  } catch (error) {
+    console.error('Create automation error:', error);
+    res.status(500).json({ error: 'Failed to create automation' });
+  }
+});
+
+// Update automation
+app.patch('/api/automation/:restaurantId/automations/:automationId', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId, automationId } = req.params;
+    const updateData = {
+      ...req.body,
+      updatedAt: new Date()
+    };
+
+    await db.collection(collections.automations).doc(automationId).update(updateData);
+    res.json({ success: true });
+  } catch (error) {
+    console.error('Update automation error:', error);
+    res.status(500).json({ error: 'Failed to update automation' });
+  }
+});
+
+// Delete automation
+app.delete('/api/automation/:restaurantId/automations/:automationId', authenticateToken, async (req, res) => {
+  try {
+    const { automationId } = req.params;
+    await db.collection(collections.automations).doc(automationId).delete();
+    res.json({ success: true });
+  } catch (error) {
+    console.error('Delete automation error:', error);
+    res.status(500).json({ error: 'Failed to delete automation' });
+  }
+});
+
+// Get templates
+app.get('/api/automation/:restaurantId/templates', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+    const snapshot = await db.collection(collections.automationTemplates)
+      .where('restaurantId', '==', restaurantId)
+      .get();
+
+    const templates = snapshot.docs.map(doc => ({
+      id: doc.id,
+      ...doc.data()
+    }));
+
+    res.json({ success: true, templates });
+  } catch (error) {
+    console.error('Get templates error:', error);
+    res.status(500).json({ error: 'Failed to get templates' });
+  }
+});
+
+// Create template
+app.post('/api/automation/:restaurantId/templates', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+    const templateData = {
+      restaurantId,
+      ...req.body,
+      approved: false, // Templates need Meta approval
+      createdAt: new Date(),
+      updatedAt: new Date()
+    };
+
+    const docRef = await db.collection(collections.automationTemplates).add(templateData);
+    res.json({ success: true, template: { id: docRef.id, ...templateData } });
+  } catch (error) {
+    console.error('Create template error:', error);
+    res.status(500).json({ error: 'Failed to create template' });
+  }
+});
+
+// Update template
+app.patch('/api/automation/:restaurantId/templates/:templateId', authenticateToken, async (req, res) => {
+  try {
+    const { templateId } = req.params;
+    const updateData = {
+      ...req.body,
+      updatedAt: new Date()
+    };
+
+    await db.collection(collections.automationTemplates).doc(templateId).update(updateData);
+    res.json({ success: true });
+  } catch (error) {
+    console.error('Update template error:', error);
+    res.status(500).json({ error: 'Failed to update template' });
+  }
+});
+
+// Delete template
+app.delete('/api/automation/:restaurantId/templates/:templateId', authenticateToken, async (req, res) => {
+  try {
+    const { templateId } = req.params;
+    await db.collection(collections.automationTemplates).doc(templateId).delete();
+    res.json({ success: true });
+  } catch (error) {
+    console.error('Delete template error:', error);
+    res.status(500).json({ error: 'Failed to delete template' });
+  }
+});
+
+// Get analytics
+app.get('/api/automation/:restaurantId/analytics', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+    const { period = '30d' } = req.query;
+
+    // Calculate date range
+    const now = new Date();
+    const days = period === '7d' ? 7 : period === '30d' ? 30 : 90;
+    const startDate = new Date(now.getTime() - days * 24 * 60 * 60 * 1000);
+
+    // Get message logs
+    const logsSnapshot = await db.collection(collections.automationLogs)
+      .where('restaurantId', '==', restaurantId)
+      .where('timestamp', '>=', startDate)
+      .get();
+
+    const logs = logsSnapshot.docs.map(doc => doc.data());
+    
+    // Get customers
+    const customersSnapshot = await db.collection(collections.customers)
+      .where('restaurantId', '==', restaurantId)
+      .get();
+
+    const customers = customersSnapshot.docs.map(doc => doc.data());
+
+    // Calculate segments
+    const segments = {
+      new: customers.filter(c => c.segment === 'new').length,
+      returning: customers.filter(c => c.segment === 'returning').length,
+      highValue: customers.filter(c => c.segment === 'highValue').length,
+      lost: customers.filter(c => c.segment === 'lost').length
+    };
+
+    // Calculate metrics
+    const analytics = {
+      messagesSent: logs.length,
+      messagesDelivered: logs.filter(l => l.status === 'delivered').length,
+      messagesRead: logs.filter(l => l.status === 'read').length,
+      conversions: logs.filter(l => l.converted).length,
+      ordersPlaced: 0, // Would need to track this separately
+      revenueGenerated: 0, // Would need to track this separately
+      totalCustomers: customers.length,
+      segments,
+      recentActivity: logs.slice(-10).map(log => ({
+        type: 'message',
+        description: `Sent ${log.type} to ${log.phone}`,
+        time: log.timestamp?.toDate?.()?.toLocaleString() || 'N/A'
+      }))
+    };
+
+    res.json({ success: true, analytics });
+  } catch (error) {
+    console.error('Get analytics error:', error);
+    res.status(500).json({ error: 'Failed to get analytics' });
+  }
+});
+
+// Get coupons
+app.get('/api/automation/:restaurantId/coupons', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+    const snapshot = await db.collection(collections.coupons)
+      .where('restaurantId', '==', restaurantId)
+      .get();
+
+    const coupons = snapshot.docs.map(doc => ({
+      id: doc.id,
+      ...doc.data()
+    }));
+
+    res.json({ success: true, coupons });
+  } catch (error) {
+    console.error('Get coupons error:', error);
+    res.status(500).json({ error: 'Failed to get coupons' });
+  }
+});
+
+// Create coupon
+app.post('/api/automation/:restaurantId/coupons', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+    const couponData = {
+      restaurantId,
+      ...req.body,
+      usedCount: 0,
+      createdAt: new Date(),
+      updatedAt: new Date()
+    };
+
+    const docRef = await db.collection(collections.coupons).add(couponData);
+    res.json({ success: true, coupon: { id: docRef.id, ...couponData } });
+  } catch (error) {
+    console.error('Create coupon error:', error);
+    res.status(500).json({ error: 'Failed to create coupon' });
+  }
+});
+
+// Update coupon
+app.patch('/api/automation/:restaurantId/coupons/:couponId', authenticateToken, async (req, res) => {
+  try {
+    const { couponId } = req.params;
+    const updateData = {
+      ...req.body,
+      updatedAt: new Date()
+    };
+
+    await db.collection(collections.coupons).doc(couponId).update(updateData);
+    res.json({ success: true });
+  } catch (error) {
+    console.error('Update coupon error:', error);
+    res.status(500).json({ error: 'Failed to update coupon' });
+  }
+});
+
+// Delete coupon
+app.delete('/api/automation/:restaurantId/coupons/:couponId', authenticateToken, async (req, res) => {
+  try {
+    const { couponId } = req.params;
+    await db.collection(collections.coupons).doc(couponId).delete();
+    res.json({ success: true });
+  } catch (error) {
+    console.error('Delete coupon error:', error);
+    res.status(500).json({ error: 'Failed to delete coupon' });
+  }
+});
+
+// Get WhatsApp settings
+app.get('/api/automation/:restaurantId/whatsapp', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+    const snapshot = await db.collection(collections.automationSettings)
+      .where('restaurantId', '==', restaurantId)
+      .where('type', '==', 'whatsapp')
+      .limit(1)
+      .get();
+
+    if (snapshot.empty) {
+      // Return webhook URL even if not connected
+      const webhookUrl = `${req.protocol}://${req.get('host')}/api/automation/webhook/whatsapp`;
+      return res.json({ 
+        success: true, 
+        connected: false, 
+        settings: null,
+        webhookUrl: webhookUrl // Provide webhook URL for setup
+      });
+    }
+
+    const settings = snapshot.docs[0].data();
+    const webhookUrl = `${req.protocol}://${req.get('host')}/api/automation/webhook/whatsapp`;
+    
+    res.json({ 
+      success: true, 
+      connected: settings.connected || false, 
+      settings: {
+        ...settings,
+        // Don't expose sensitive tokens in response
+        accessToken: settings.accessToken ? '***' : null
+      },
+      webhookUrl: webhookUrl
+    });
+  } catch (error) {
+    console.error('Get WhatsApp settings error:', error);
+    res.status(500).json({ error: 'Failed to get WhatsApp settings' });
+  }
+});
+
+// Get webhook URL (public endpoint for documentation)
+app.get('/api/automation/webhook/url', (req, res) => {
+  try {
+    const webhookUrl = `${req.protocol}://${req.get('host')}/api/automation/webhook/whatsapp`;
+    res.json({ 
+      success: true, 
+      webhookUrl: webhookUrl,
+      instructions: 'Use this URL when configuring webhook in Meta Business Suite'
+    });
+  } catch (error) {
+    console.error('Get webhook URL error:', error);
+    res.status(500).json({ error: 'Failed to get webhook URL' });
+  }
+});
+
+// Connect WhatsApp
+app.post('/api/automation/:restaurantId/whatsapp/connect', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+    const { mode, accessToken, phoneNumberId, businessAccountId, webhookVerifyToken } = req.body;
+
+    // Check if using restaurant's own number or DineOpen's shared number
+    if (mode === 'restaurant') {
+      // Restaurant's own WhatsApp number
+      if (!accessToken || !phoneNumberId || !businessAccountId) {
+        return res.status(400).json({ error: 'Missing required credentials for restaurant WhatsApp' });
+      }
+
+      // Verify credentials by making a test API call
+      try {
+        await whatsappService.initialize(restaurantId, {
+          accessToken,
+          phoneNumberId,
+          businessAccountId
+        });
+
+        // Test connection by getting phone number info
+        const axios = require('axios');
+        const testResponse = await axios.get(
+          `https://graph.facebook.com/v18.0/${phoneNumberId}`,
+          {
+            headers: {
+              'Authorization': `Bearer ${accessToken}`
+            },
+            params: {
+              fields: 'verified_name,display_phone_number'
+            }
+          }
+        );
+
+        const phoneNumber = testResponse.data.display_phone_number || 'N/A';
+
+        // Save settings
+        const settingsData = {
+          restaurantId,
+          type: 'whatsapp',
+          mode: 'restaurant',
+          connected: true,
+          accessToken,
+          phoneNumberId,
+          businessAccountId,
+          webhookVerifyToken, // Store verify token for webhook verification
+          phoneNumber: phoneNumber,
+          createdAt: new Date(),
+          updatedAt: new Date()
+        };
+
+        // Check if settings exist
+        const existingSnapshot = await db.collection(collections.automationSettings)
+          .where('restaurantId', '==', restaurantId)
+          .where('type', '==', 'whatsapp')
+          .limit(1)
+          .get();
+
+        if (!existingSnapshot.empty) {
+          await existingSnapshot.docs[0].ref.update(settingsData);
+        } else {
+          await db.collection(collections.automationSettings).add(settingsData);
+        }
+
+        res.json({ 
+          success: true, 
+          message: 'Restaurant WhatsApp connected successfully',
+          phoneNumber: phoneNumber
+        });
+      } catch (error) {
+        console.error('WhatsApp connection test error:', error.response?.data || error.message);
+        return res.status(400).json({ 
+          error: 'Invalid WhatsApp credentials. Please check your Access Token, Phone Number ID, and Business Account ID.',
+          details: error.response?.data || error.message
+        });
+      }
+    } else if (mode === 'dineopen') {
+      // Use DineOpen's shared WhatsApp number
+      // Get DineOpen's WhatsApp credentials from environment or config
+      const dineopenAccessToken = process.env.DINEOPEN_WHATSAPP_ACCESS_TOKEN;
+      const dineopenPhoneNumberId = process.env.DINEOPEN_WHATSAPP_PHONE_NUMBER_ID;
+      const dineopenBusinessAccountId = process.env.DINEOPEN_WHATSAPP_BUSINESS_ACCOUNT_ID;
+
+      if (!dineopenAccessToken || !dineopenPhoneNumberId || !dineopenBusinessAccountId) {
+        return res.status(500).json({ 
+          error: 'DineOpen WhatsApp service not configured. Please contact support or use your own WhatsApp number.' 
+        });
+      }
+
+      // Save settings (using DineOpen's credentials)
+      const settingsData = {
+        restaurantId,
+        type: 'whatsapp',
+        mode: 'dineopen',
+        connected: true,
+        accessToken: dineopenAccessToken, // Store reference, not actual token for security
+        phoneNumberId: dineopenPhoneNumberId,
+        businessAccountId: dineopenBusinessAccountId,
+        phoneNumber: 'DineOpen Shared Number',
+        createdAt: new Date(),
+        updatedAt: new Date()
+      };
+
+      // Check if settings exist
+      const existingSnapshot = await db.collection(collections.automationSettings)
+        .where('restaurantId', '==', restaurantId)
+        .where('type', '==', 'whatsapp')
+        .limit(1)
+        .get();
+
+      if (!existingSnapshot.empty) {
+        await existingSnapshot.docs[0].ref.update(settingsData);
+      } else {
+        await db.collection(collections.automationSettings).add(settingsData);
+      }
+
+      res.json({ 
+        success: true, 
+        message: 'DineOpen WhatsApp enabled successfully',
+        note: 'Messages will be sent from DineOpen\'s shared number'
+      });
+    } else {
+      return res.status(400).json({ error: 'Invalid mode. Use "restaurant" or "dineopen"' });
+    }
+  } catch (error) {
+    console.error('Connect WhatsApp error:', error);
+    res.status(500).json({ error: 'Failed to connect WhatsApp' });
+  }
+});
+
+// Disconnect WhatsApp
+app.post('/api/automation/:restaurantId/whatsapp/disconnect', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+    const snapshot = await db.collection(collections.automationSettings)
+      .where('restaurantId', '==', restaurantId)
+      .where('type', '==', 'whatsapp')
+      .limit(1)
+      .get();
+
+    if (!snapshot.empty) {
+      await snapshot.docs[0].ref.update({
+        connected: false,
+        updatedAt: new Date()
+      });
+    }
+
+    res.json({ success: true, message: 'WhatsApp disconnected' });
+  } catch (error) {
+    console.error('Disconnect WhatsApp error:', error);
+    res.status(500).json({ error: 'Failed to disconnect WhatsApp' });
+  }
+});
+
+// Webhook for WhatsApp (for receiving messages and status updates)
+// GET endpoint for webhook verification
+app.get('/api/automation/webhook/whatsapp', async (req, res) => {
+  try {
+    const mode = req.query['hub.mode'];
+    const token = req.query['hub.verify_token'];
+    const challenge = req.query['hub.challenge'];
+
+    console.log('🔍 Webhook verification request:', { mode, hasToken: !!token, hasChallenge: !!challenge });
+
+    // Meta sends 'subscribe' mode during webhook setup
+    if (mode === 'subscribe') {
+      // Try to match token against restaurant settings or default token
+      let tokenMatched = false;
+
+      // First, try default token from environment
+      if (token === process.env.WHATSAPP_WEBHOOK_VERIFY_TOKEN) {
+        tokenMatched = true;
+        console.log('✅ Webhook verified with default token');
+      } else {
+        // Try to find restaurant with matching verify token
+        const settingsSnapshot = await db.collection(collections.automationSettings)
+          .where('type', '==', 'whatsapp')
+          .where('webhookVerifyToken', '==', token)
+          .limit(1)
+          .get();
+
+        if (!settingsSnapshot.empty) {
+          tokenMatched = true;
+          console.log('✅ Webhook verified with restaurant token:', settingsSnapshot.docs[0].data().restaurantId);
+        }
+      }
+
+      if (tokenMatched && challenge) {
+        console.log('✅ WhatsApp webhook verified successfully');
+        res.status(200).send(challenge);
+      } else {
+        console.log('❌ Webhook verification failed - token mismatch');
+        res.sendStatus(403);
+      }
+    } else {
+      // Not a subscription request
+      res.sendStatus(200);
+    }
+  } catch (error) {
+    console.error('Webhook verification error:', error);
+    res.sendStatus(500);
+  }
+});
+
+// POST endpoint for receiving webhook events
+app.post('/api/automation/webhook/whatsapp', async (req, res) => {
+  try {
+    const body = req.body;
+    const signature = req.headers['x-hub-signature-256'];
+
+    console.log('📨 WhatsApp webhook received:', {
+      object: body.object,
+      entryCount: body.entry?.length || 0,
+      hasSignature: !!signature
+    });
+
+    // Verify webhook signature if provided (for security)
+    if (signature && process.env.WHATSAPP_WEBHOOK_SECRET) {
+      const crypto = require('crypto');
+      const expectedSignature = 'sha256=' + crypto
+        .createHmac('sha256', process.env.WHATSAPP_WEBHOOK_SECRET)
+        .update(JSON.stringify(body))
+        .digest('hex');
+
+      if (signature !== expectedSignature) {
+        console.error('❌ Webhook signature verification failed');
+        return res.sendStatus(403);
+      }
+      console.log('✅ Webhook signature verified');
+    }
+
+    // Handle incoming events
+    if (body.object === 'whatsapp_business_account') {
+      for (const entry of body.entry || []) {
+        const changes = entry.changes || [];
+        
+        for (const change of changes) {
+          const value = change.value;
+
+          // Handle message status updates (delivered, read, sent, failed)
+          if (value?.statuses && Array.isArray(value.statuses)) {
+            for (const statusUpdate of value.statuses) {
+              const messageId = statusUpdate.id;
+              const status = statusUpdate.status; // sent, delivered, read, failed
+              const timestamp = statusUpdate.timestamp;
+
+              console.log('📊 Message status update:', { messageId, status, timestamp });
+
+              // Find and update message log
+              try {
+                const logsSnapshot = await db.collection(collections.automationLogs)
+                  .where('messageId', '==', messageId)
+                  .limit(1)
+                  .get();
+
+                if (!logsSnapshot.empty) {
+                  const logDoc = logsSnapshot.docs[0];
+                  const logData = logDoc.data();
+
+                  // Update status
+                  await logDoc.ref.update({
+                    status: status,
+                    statusUpdatedAt: new Date(),
+                    ...(status === 'read' && { readAt: new Date() }),
+                    ...(status === 'delivered' && { deliveredAt: new Date() }),
+                    ...(status === 'failed' && { 
+                      error: statusUpdate.errors?.[0]?.message || 'Message failed',
+                      failedAt: new Date()
+                    })
+                  });
+
+                  // Update automation stats
+                  if (logData.automationId) {
+                    const automationRef = db.collection(collections.automations).doc(logData.automationId);
+                    const automationDoc = await automationRef.get();
+                    
+                    if (automationDoc.exists) {
+                      const stats = automationDoc.data().stats || { sent: 0, delivered: 0, read: 0, failed: 0 };
+                      
+                      if (status === 'delivered' && logData.status !== 'delivered') {
+                        stats.delivered = (stats.delivered || 0) + 1;
+                      }
+                      if (status === 'read' && logData.status !== 'read') {
+                        stats.read = (stats.read || 0) + 1;
+                      }
+                      if (status === 'failed' && logData.status !== 'failed') {
+                        stats.failed = (stats.failed || 0) + 1;
+                      }
+
+                      await automationRef.update({ stats });
+                    }
+                  }
+
+                  console.log('✅ Message status updated in logs');
+                }
+              } catch (error) {
+                console.error('Error updating message status:', error);
+              }
+            }
+          }
+
+          // Handle incoming messages from customers
+          if (value?.messages && Array.isArray(value.messages)) {
+            for (const message of value.messages) {
+              const processedMessage = whatsappService.handleIncomingMessage({
+                entry: [{
+                  changes: [{
+                    value: {
+                      messages: [message],
+                      contacts: value.contacts || []
+                    }
+                  }]
+                }]
+              });
+
+              if (processedMessage) {
+                console.log('📨 Incoming WhatsApp message:', {
+                  from: processedMessage.from,
+                  type: processedMessage.type,
+                  text: processedMessage.text?.substring(0, 50) || 'N/A'
+                });
+
+                // Find restaurant by phone number or business account
+                try {
+                  // Try to find restaurant settings that might match
+                  // This is a simplified approach - you might want to store phone mapping
+                  const settingsSnapshot = await db.collection(collections.automationSettings)
+                    .where('type', '==', 'whatsapp')
+                    .where('connected', '==', true)
+                    .get();
+
+                  // Log incoming message for all connected restaurants
+                  // In production, you'd want to match by phone number or business account ID
+                  for (const settingDoc of settingsSnapshot.docs) {
+                    const setting = settingDoc.data();
+                    
+                    // Log incoming message
+                    await db.collection(collections.automationLogs).add({
+                      restaurantId: setting.restaurantId,
+                      type: 'incoming',
+                      phone: processedMessage.from,
+                      message: processedMessage.text,
+                      messageId: processedMessage.messageId,
+                      timestamp: new Date(),
+                      status: 'received'
+                    });
+                  }
+                } catch (error) {
+                  console.error('Error logging incoming message:', error);
+                }
+
+                // TODO: Could trigger automation based on incoming message
+                // e.g., customer replies "STOP" to unsubscribe
+              }
+            }
+          }
+        }
+      }
+    }
+
+    // Always return 200 to acknowledge receipt
+    res.sendStatus(200);
+  } catch (error) {
+    console.error('❌ Webhook processing error:', error);
+    // Still return 200 to prevent Meta from retrying
+    res.sendStatus(200);
+  }
+});
+
+// Trigger automation manually (for testing)
+app.post('/api/automation/:restaurantId/trigger', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+    const { triggerType, triggerData } = req.body;
+
+    const result = await automationService.processTrigger(restaurantId, triggerType, triggerData);
+    res.json(result);
+  } catch (error) {
+    console.error('Trigger automation error:', error);
+    res.status(500).json({ error: 'Failed to trigger automation' });
+  }
+});
+
+// Sync customer from order (called when order is created)
+app.post('/api/automation/:restaurantId/sync-customer', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+    const { order } = req.body;
+
+    const customerId = await automationService.syncCustomerFromOrder({
+      ...order,
+      restaurantId
+    });
+
+    // Trigger welcome automation if first order
+    if (customerId) {
+      const customer = await automationService.getCustomerData(customerId, restaurantId);
+      if (customer && customer.visitCount === 1) {
+        await automationService.processTrigger(restaurantId, 'new_order', {
+          customerId,
+          orderAmount: order.totalAmount,
+          orderNumber: order.dailyOrderId || order.orderNumber,
+          restaurantName: order.restaurantName
+        });
+      }
+    }
+
+    res.json({ success: true, customerId });
+  } catch (error) {
+    console.error('Sync customer error:', error);
+    res.status(500).json({ error: 'Failed to sync customer' });
+  }
+});
+
+// ==================== END AUTOMATION & LOYALTY APIs ====================
 
 // Start server for both local development and production
 const server = app.listen(PORT, '0.0.0.0', async () => {

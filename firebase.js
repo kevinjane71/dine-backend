@@ -57,7 +57,14 @@ const collections = {
   poTemplates: 'po-templates',
   supplierQuotations: 'supplier-quotations',
   supplierPerformance: 'supplier-performance',
-  aiUsage: 'aiUsage'
+  aiUsage: 'aiUsage',
+  // Automation & Loyalty Collections
+  automations: 'automations',
+  automationTemplates: 'automation-templates',
+  automationSettings: 'automation-settings',
+  automationLogs: 'automation-logs',
+  coupons: 'coupons',
+  customerSegments: 'customer-segments'
 };
 
 const admin = null; // We don't need the legacy admin object anymore
