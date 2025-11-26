@@ -3410,20 +3410,31 @@ app.post('/api/orders', async (req, res) => {
       }
     }
 
-    // Trigger automation: Sync customer and send welcome message (non-blocking)
+    // Trigger automation: Sync customer, send WhatsApp confirmation, and trigger automations (non-blocking)
     try {
       const customerId = await automationService.syncCustomerFromOrder({
         ...orderData,
+        id: orderRef.id,
         restaurantId: restaurantId
       });
       
+      // Send WhatsApp order confirmation message if customer phone is available
+      if (orderData.customerInfo?.phone || orderData.customerDisplay?.phone || orderData.customer?.phone) {
+        automationService.sendOrderConfirmationMessage(restaurantId, {
+          ...orderData,
+          id: orderRef.id
+        }).catch(err => {
+          console.error('📱 WhatsApp order confirmation error (non-blocking):', err);
+        });
+      }
+      
       // Trigger new_order automation if customer exists
-      if (customerId && (orderData.customerDisplay?.phone || orderData.customer?.phone)) {
+      if (customerId && (orderData.customerInfo?.phone || orderData.customerDisplay?.phone || orderData.customer?.phone)) {
         automationService.processTrigger(restaurantId, 'new_order', {
           customerId: customerId,
           orderAmount: totalAmount,
           orderNumber: dailyOrderId || orderNumber,
-          restaurantName: restaurant.name || 'Restaurant'
+          restaurantName: restaurantData.name || 'Restaurant'
         }).catch(err => {
           console.error('Automation trigger error (non-blocking):', err);
         });
@@ -11815,31 +11826,6 @@ app.get('/api/dinebot/status', authenticateToken, async (req, res) => {
 
 // ==================== END DINEBOT API ====================
 
-// 404 handler - must be last
-app.use((req, res) => {
-  res.status(404).json({ 
-    error: 'Not Found', 
-    message: `Endpoint ${req.originalUrl} not found`,
-    requestId: req.id,
-    available_endpoints: [
-      '/',
-      '/health', 
-      '/api/auth/*',
-      '/api/restaurants/*',
-      '/api/menus/*',
-      '/api/orders/*',
-      '/api/payments/*',
-      '/api/analytics/*',
-      '/api/kot/*',
-      '/api/admin/settings/*',
-      '/api/categories/*',
-      '/api/email/*',
-      '/api/dinebot/*',
-      '/api/hotel/*'
-    ]
-  });
-});
-
 // ==================== EMAIL SERVICE API ENDPOINTS ====================
 
 // Send welcome email to new users
@@ -12221,6 +12207,11 @@ app.post('/api/admin/chatgpt/cleanup', authenticateToken, async (req, res) => {
 
 const automationService = require('./services/automationService');
 const whatsappService = require('./services/whatsappService');
+
+// Test endpoint to verify automation routes are loaded
+app.get('/api/automation/test', (req, res) => {
+  res.json({ success: true, message: 'Automation routes are loaded' });
+});
 
 // Get automations
 app.get('/api/automation/:restaurantId/automations', authenticateToken, async (req, res) => {
@@ -12629,12 +12620,13 @@ app.post('/api/automation/:restaurantId/whatsapp/connect', authenticateToken, as
       // Use DineOpen's shared WhatsApp number
       // Get DineOpen's WhatsApp credentials from environment or config
       const dineopenAccessToken = process.env.DINEOPEN_WHATSAPP_ACCESS_TOKEN;
-      const dineopenPhoneNumberId = process.env.DINEOPEN_WHATSAPP_PHONE_NUMBER_ID;
+      // Use hardcoded phone number ID for now
+      const dineopenPhoneNumberId = '879916941871710';
       const dineopenBusinessAccountId = process.env.DINEOPEN_WHATSAPP_BUSINESS_ACCOUNT_ID;
 
-      if (!dineopenAccessToken || !dineopenPhoneNumberId || !dineopenBusinessAccountId) {
+      if (!dineopenAccessToken) {
         return res.status(500).json({ 
-          error: 'DineOpen WhatsApp service not configured. Please contact support or use your own WhatsApp number.' 
+          error: 'DineOpen WhatsApp access token not configured. Please set DINEOOPEN_WHATSAPP_ACCESS_TOKEN environment variable or use your own WhatsApp number.' 
         });
       }
 
@@ -12645,8 +12637,8 @@ app.post('/api/automation/:restaurantId/whatsapp/connect', authenticateToken, as
         mode: 'dineopen',
         connected: true,
         accessToken: dineopenAccessToken, // Store reference, not actual token for security
-        phoneNumberId: dineopenPhoneNumberId,
-        businessAccountId: dineopenBusinessAccountId,
+        phoneNumberId: dineopenPhoneNumberId, // Hardcoded
+        businessAccountId: dineopenBusinessAccountId || 'N/A',
         phoneNumber: 'DineOpen Shared Number',
         createdAt: new Date(),
         updatedAt: new Date()
@@ -12676,6 +12668,102 @@ app.post('/api/automation/:restaurantId/whatsapp/connect', authenticateToken, as
   } catch (error) {
     console.error('Connect WhatsApp error:', error);
     res.status(500).json({ error: 'Failed to connect WhatsApp' });
+  }
+});
+
+// Send test WhatsApp message
+app.post('/api/automation/:restaurantId/whatsapp/test', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+    const { phoneNumber, message, templateName, templateLanguage } = req.body;
+
+    if (!phoneNumber) {
+      return res.status(400).json({ error: 'Phone number is required' });
+    }
+
+    // Get WhatsApp settings
+    const snapshot = await db.collection(collections.automationSettings)
+      .where('restaurantId', '==', restaurantId)
+      .where('type', '==', 'whatsapp')
+      .limit(1)
+      .get();
+
+    if (snapshot.empty) {
+      return res.status(400).json({ error: 'WhatsApp not connected. Please connect WhatsApp first.' });
+    }
+
+    const whatsappSettings = snapshot.docs[0].data();
+
+    if (!whatsappSettings.connected) {
+      return res.status(400).json({ error: 'WhatsApp not connected. Please connect WhatsApp first.' });
+    }
+
+    // Initialize WhatsApp service based on mode
+    let credentials;
+    if (whatsappSettings.mode === 'dineopen') {
+      credentials = {
+        accessToken: process.env.DINEOPEN_WHATSAPP_ACCESS_TOKEN,
+        phoneNumberId: '879916941871710', // Hardcoded
+        businessAccountId: process.env.DINEOPEN_WHATSAPP_BUSINESS_ACCOUNT_ID
+      };
+    } else {
+      credentials = {
+        accessToken: whatsappSettings.accessToken,
+        phoneNumberId: '879916941871710', // Hardcoded
+        businessAccountId: whatsappSettings.businessAccountId
+      };
+    }
+
+    if (!credentials.accessToken) {
+      return res.status(400).json({ error: 'WhatsApp access token not configured' });
+    }
+
+    // Initialize WhatsApp service
+    await whatsappService.initialize(restaurantId, credentials);
+
+    // Send message
+    let sendResult;
+    if (templateName && message) {
+      // Send as template message
+      sendResult = await whatsappService.sendTemplateMessage(
+        phoneNumber,
+        templateName,
+        templateLanguage || 'en_US',
+        [message] // Use message as template parameter
+      );
+    } else if (message) {
+      // Send as text message
+      sendResult = await whatsappService.sendTextMessage(phoneNumber, message);
+    } else {
+      return res.status(400).json({ error: 'Message or template name is required' });
+    }
+
+    if (sendResult.success) {
+      // Log test message
+      await db.collection(collections.automationLogs).add({
+        restaurantId,
+        type: 'test_message',
+        phone: phoneNumber,
+        message: message || `Template: ${templateName}`,
+        messageId: sendResult.messageId,
+        status: 'sent',
+        timestamp: new Date()
+      });
+
+      res.json({
+        success: true,
+        messageId: sendResult.messageId,
+        message: 'Test message sent successfully!'
+      });
+    } else {
+      res.status(500).json({
+        success: false,
+        error: sendResult.error || 'Failed to send test message'
+      });
+    }
+  } catch (error) {
+    console.error('Send test message error:', error);
+    res.status(500).json({ error: 'Failed to send test message: ' + error.message });
   }
 });
 
@@ -12964,6 +13052,32 @@ app.post('/api/automation/:restaurantId/sync-customer', authenticateToken, async
 });
 
 // ==================== END AUTOMATION & LOYALTY APIs ====================
+
+// 404 handler - must be last (after all routes)
+app.use((req, res) => {
+  res.status(404).json({ 
+    error: 'Not Found', 
+    message: `Endpoint ${req.originalUrl} not found`,
+    requestId: req.id,
+    available_endpoints: [
+      '/',
+      '/health', 
+      '/api/auth/*',
+      '/api/restaurants/*',
+      '/api/menus/*',
+      '/api/orders/*',
+      '/api/payments/*',
+      '/api/analytics/*',
+      '/api/kot/*',
+      '/api/admin/settings/*',
+      '/api/categories/*',
+      '/api/email/*',
+      '/api/dinebot/*',
+      '/api/hotel/*',
+      '/api/automation/*'
+    ]
+  });
+});
 
 // Start server for both local development and production
 const server = app.listen(PORT, '0.0.0.0', async () => {

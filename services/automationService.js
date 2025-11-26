@@ -123,19 +123,19 @@ class AutomationService {
         // Use DineOpen's shared WhatsApp credentials
         credentials = {
           accessToken: process.env.DINEOPEN_WHATSAPP_ACCESS_TOKEN,
-          phoneNumberId: process.env.DINEOPEN_WHATSAPP_PHONE_NUMBER_ID,
+          phoneNumberId: '879916941871710', // Hardcoded for now
           businessAccountId: process.env.DINEOPEN_WHATSAPP_BUSINESS_ACCOUNT_ID
         };
       } else {
         // Use restaurant's own WhatsApp credentials
         credentials = {
           accessToken: whatsappSettings.accessToken,
-          phoneNumberId: whatsappSettings.phoneNumberId,
+          phoneNumberId: '879916941871710', // Hardcoded for now
           businessAccountId: whatsappSettings.businessAccountId
         };
       }
 
-      if (!credentials.accessToken || !credentials.phoneNumberId || !credentials.businessAccountId) {
+      if (!credentials.accessToken) {
         result.error = 'WhatsApp credentials not configured';
         return result;
       }
@@ -323,12 +323,13 @@ class AutomationService {
    */
   async syncCustomerFromOrder(order) {
     try {
-      if (!order.customerDisplay?.phone && !order.customer?.phone) {
+      // Check customerInfo first (new structure), then fallback to old structures
+      const phone = order.customerInfo?.phone || order.customerDisplay?.phone || order.customer?.phone;
+      if (!phone) {
         return null;
       }
 
-      const phone = order.customerDisplay?.phone || order.customer?.phone;
-      const name = order.customerDisplay?.name || order.customer?.name || 'Walk-in Customer';
+      const name = order.customerInfo?.name || order.customerDisplay?.name || order.customer?.name || 'Walk-in Customer';
 
       // Check if customer exists
       const customersRef = db.collection(collections.customers)
@@ -342,7 +343,7 @@ class AutomationService {
         restaurantId: order.restaurantId,
         phone: phone,
         name: name,
-        email: order.customer?.email || order.customerDisplay?.email || null,
+        email: order.customerInfo?.email || order.customer?.email || order.customerDisplay?.email || null,
         lastVisit: order.createdAt || new Date(),
         visitCount: 1,
         totalSpend: order.totalAmount || 0,
@@ -381,6 +382,141 @@ class AutomationService {
     } catch (error) {
       console.error('Error syncing customer from order:', error);
       return null;
+    }
+  }
+
+  /**
+   * Send order confirmation WhatsApp message
+   * Sends welcome message with order details to customer
+   */
+  async sendOrderConfirmationMessage(restaurantId, order) {
+    try {
+      // Get customer phone from order
+      const phone = order.customerInfo?.phone || order.customerDisplay?.phone || order.customer?.phone;
+      if (!phone) {
+        console.log('📱 No phone number in order, skipping WhatsApp message');
+        return { success: false, error: 'No phone number provided' };
+      }
+
+      // Get WhatsApp settings
+      const whatsappSettings = await this.getWhatsAppSettings(restaurantId);
+      if (!whatsappSettings || !whatsappSettings.connected) {
+        console.log('📱 WhatsApp not connected for restaurant:', restaurantId);
+        return { success: false, error: 'WhatsApp not connected' };
+      }
+
+      // Initialize WhatsApp service based on mode
+      let credentials;
+      if (whatsappSettings.mode === 'dineopen') {
+        credentials = {
+          accessToken: process.env.DINEOPEN_WHATSAPP_ACCESS_TOKEN,
+          phoneNumberId: '879916941871710', // Hardcoded for now
+          businessAccountId: process.env.DINEOPEN_WHATSAPP_BUSINESS_ACCOUNT_ID
+        };
+      } else {
+        credentials = {
+          accessToken: whatsappSettings.accessToken,
+          phoneNumberId: '879916941871710', // Hardcoded for now
+          businessAccountId: whatsappSettings.businessAccountId
+        };
+      }
+
+      if (!credentials.accessToken) {
+        console.log('📱 WhatsApp credentials not configured');
+        return { success: false, error: 'WhatsApp credentials not configured' };
+      }
+
+      // Initialize WhatsApp service
+      await whatsappService.initialize(restaurantId, credentials);
+
+      // Get restaurant name
+      const restaurantDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
+      const restaurantName = restaurantDoc.exists ? (restaurantDoc.data().name || 'Restaurant') : 'Restaurant';
+
+      // Format customer name
+      const customerName = order.customerInfo?.name || order.customerDisplay?.name || order.customer?.name || 'Valued Customer';
+
+      // Format order details
+      const orderNumber = order.dailyOrderId || order.orderNumber || order.id?.slice(-6) || 'N/A';
+      const orderItems = order.items || [];
+      const totalAmount = order.totalAmount || 0;
+      const tableNumber = order.tableNumber || null;
+
+      // Build order details text
+      let orderDetailsText = '';
+      orderItems.forEach((item, index) => {
+        const itemName = item.name || 'Item';
+        const quantity = item.quantity || 1;
+        const price = item.price || 0;
+        const itemTotal = price * quantity;
+        orderDetailsText += `${index + 1}. ${itemName} x${quantity} - ₹${itemTotal}\n`;
+      });
+
+      // Build welcome message with order details
+      const welcomeMessage = `🎉 Welcome to ${restaurantName}!\n\n` +
+        `Thank you for your order, ${customerName}!\n\n` +
+        `📋 Order Details:\n` +
+        `Order #: ${orderNumber}\n` +
+        (tableNumber ? `Table: ${tableNumber}\n` : '') +
+        `\nItems:\n${orderDetailsText}\n` +
+        `💰 Total: ₹${totalAmount}\n\n` +
+        `Your order has been confirmed and is being prepared. We'll notify you once it's ready!\n\n` +
+        `Thank you for choosing ${restaurantName}! 🙏`;
+
+      // Try to send as template first (if template name is configured), otherwise send as text
+      let sendResult;
+      const templateName = whatsappSettings.orderConfirmationTemplate || 'jaspers_market_plain_text_v1';
+      
+      // For now, send as text message since template requires pre-approval
+      // You can switch to template by uncommenting the template code below
+      sendResult = await whatsappService.sendTextMessage(phone, welcomeMessage);
+
+      // Alternative: Use template message (requires template to be approved by Meta)
+      // const templateParams = [
+      //   customerName,
+      //   orderNumber,
+      //   orderDetailsText,
+      //   `₹${totalAmount}`
+      // ];
+      // sendResult = await whatsappService.sendTemplateMessage(
+      //   phone,
+      //   templateName,
+      //   'en_US',
+      //   templateParams
+      // );
+
+      if (sendResult.success) {
+        console.log('✅ WhatsApp order confirmation sent successfully:', sendResult.messageId);
+        
+        // Log message
+        await this.logMessage(restaurantId, {
+          type: 'order_confirmation',
+          customerPhone: phone,
+          customerName: customerName,
+          orderId: order.id || orderNumber,
+          message: welcomeMessage,
+          messageId: sendResult.messageId,
+          status: 'sent',
+          timestamp: new Date()
+        });
+
+        return {
+          success: true,
+          messageId: sendResult.messageId
+        };
+      } else {
+        console.error('❌ Failed to send WhatsApp message:', sendResult.error);
+        return {
+          success: false,
+          error: sendResult.error
+        };
+      }
+    } catch (error) {
+      console.error('❌ Error sending order confirmation WhatsApp:', error);
+      return {
+        success: false,
+        error: error.message
+      };
     }
   }
 }

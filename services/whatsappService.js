@@ -7,9 +7,10 @@ const axios = require('axios');
 
 class WhatsAppService {
   constructor() {
-    this.baseURL = 'https://graph.facebook.com/v18.0';
+    this.baseURL = 'https://graph.facebook.com/v22.0';
     this.accessToken = null;
-    this.phoneNumberId = null;
+    // Hardcoded phone number ID for now
+    this.phoneNumberId = '879916941871710';
     this.businessAccountId = null;
   }
 
@@ -18,7 +19,8 @@ class WhatsAppService {
    */
   async initialize(restaurantId, credentials) {
     this.accessToken = credentials.accessToken;
-    this.phoneNumberId = credentials.phoneNumberId;
+    // Use hardcoded phone number ID, or override if provided
+    this.phoneNumberId = credentials.phoneNumberId || '879916941871710';
     this.businessAccountId = credentials.businessAccountId;
     this.restaurantId = restaurantId;
   }
@@ -28,12 +30,15 @@ class WhatsAppService {
    */
   async sendTextMessage(to, message) {
     try {
+      // Format phone number: remove +, spaces, and dashes
+      const formattedPhone = to.replace(/[\s\+\-\(\)]/g, '');
+      
       const response = await axios.post(
         `${this.baseURL}/${this.phoneNumberId}/messages`,
         {
           messaging_product: 'whatsapp',
           recipient_type: 'individual',
-          to: to,
+          to: formattedPhone,
           type: 'text',
           text: {
             preview_url: false,
@@ -67,12 +72,15 @@ class WhatsAppService {
    */
   async sendTemplateMessage(to, templateName, languageCode = 'en', parameters = []) {
     try {
+      // Format phone number: remove +, spaces, and dashes
+      const formattedPhone = to.replace(/[\s\+\-\(\)]/g, '');
+      
       const response = await axios.post(
         `${this.baseURL}/${this.phoneNumberId}/messages`,
         {
           messaging_product: 'whatsapp',
           recipient_type: 'individual',
-          to: to,
+          to: formattedPhone,
           type: 'template',
           template: {
             name: templateName,
@@ -115,12 +123,15 @@ class WhatsAppService {
    */
   async sendInteractiveMessage(to, message, buttons) {
     try {
+      // Format phone number: remove +, spaces, and dashes
+      const formattedPhone = to.replace(/[\s\+\-\(\)]/g, '');
+      
       const response = await axios.post(
         `${this.baseURL}/${this.phoneNumberId}/messages`,
         {
           messaging_product: 'whatsapp',
           recipient_type: 'individual',
-          to: to,
+          to: formattedPhone,
           type: 'interactive',
           interactive: {
             type: 'button',
