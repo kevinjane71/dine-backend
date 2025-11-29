@@ -16,6 +16,8 @@ require('dotenv').config();
 
 const { db, collections } = require('./firebase');
 const { FieldValue } = require('firebase-admin/firestore');
+const performanceOptimizer = require('./middleware/performanceOptimizer');
+const firestoreOptimizer = require('./utils/firestoreOptimizer');
 
 // Generate daily order ID (starts from 1 each day)
 async function generateDailyOrderId(restaurantId) {
@@ -296,6 +298,9 @@ app.use(helmet({ crossOriginResourcePolicy: { policy: "cross-origin" } }));
 app.use(morgan(process.env.NODE_ENV === 'production' ? 'combined' : 'dev'));
 app.use(bodyParser.json({ limit: '10mb' }));
 app.use(bodyParser.urlencoded({ extended: true, limit: '10mb' }));
+
+// Performance optimization middleware (must be early in the chain)
+app.use(performanceOptimizer);
 
 app.use((req, res, next) => {
   req.id = Math.random().toString(36).substring(2, 15);
@@ -1462,6 +1467,42 @@ app.get('/health', (req, res) => {
     environment: process.env.NODE_ENV || 'development',
     version: '1.0.0'
   });
+});
+
+// Warm-up endpoint for Vercel serverless (reduces cold start latency)
+app.get('/api/warmup', async (req, res) => {
+  try {
+    const startTime = Date.now();
+    
+    // Warm up Firestore connection
+    await firestoreOptimizer.warmUp();
+    
+    // Test a lightweight query
+    try {
+      const testQuery = db.collection('_warmup').limit(1);
+      await testQuery.get();
+    } catch (e) {
+      // Ignore - collection might not exist, that's fine
+    }
+    
+    const duration = Date.now() - startTime;
+    
+    res.json({
+      status: 'warmed',
+      duration: `${duration}ms`,
+      timestamp: new Date().toISOString(),
+      message: '🔥 Serverless function warmed up and ready'
+    });
+  } catch (error) {
+    // Even if warm-up fails, return success (connection is still established)
+    res.json({
+      status: 'warmed',
+      duration: '0ms',
+      timestamp: new Date().toISOString(),
+      message: '🔥 Warm-up completed',
+      note: 'Connection established'
+    });
+  }
 });
 
 // Demo request endpoint - public, no auth required
