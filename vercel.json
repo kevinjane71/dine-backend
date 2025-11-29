@@ -6,8 +6,7 @@
       "use": "@vercel/node",
       "config": {
         "maxLambdaSize": "50mb",
-        "maxDuration": 30,
-        "includeFiles": "**"
+        "maxDuration": 30
       }
     }
   ],
@@ -48,12 +47,7 @@
         {
           "key": "X-Frame-Options",
           "value": "DENY"
-        }
-      ]
-    },
-    {
-      "source": "/api/(.*)",
-      "headers": [
+        },
         {
           "key": "Cache-Control",
           "value": "public, max-age=0, must-revalidate"
