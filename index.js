@@ -2833,6 +2833,128 @@ app.patch('/api/menus/item/:id', authenticateToken, async (req, res) => {
   }
 });
 
+// Mark menu item as favorite
+app.post('/api/menus/:restaurantId/item/:itemId/favorite', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId, itemId } = req.params;
+    const { userId } = req.user;
+
+    // Validate restaurant access
+    const hasAccess = await validateRestaurantAccess(userId, restaurantId);
+    if (!hasAccess) {
+      return res.status(403).json({ error: 'Access denied' });
+    }
+
+    // Get restaurant document
+    const restaurantDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
+    if (!restaurantDoc.exists) {
+      return res.status(404).json({ error: 'Restaurant not found' });
+    }
+
+    const restaurantData = restaurantDoc.data();
+    const currentMenu = restaurantData.menu || { categories: [], items: [] };
+    
+    // Find and update the menu item
+    const updatedItems = currentMenu.items.map(item => {
+      if (item.id === itemId) {
+        return { ...item, isFavorite: true, updatedAt: new Date() };
+      }
+      return item;
+    });
+
+    // Update categories as well
+    const updatedCategories = currentMenu.categories.map(category => ({
+      ...category,
+      items: (category.items || []).map(item => {
+        if (item.id === itemId) {
+          return { ...item, isFavorite: true, updatedAt: new Date() };
+        }
+        return item;
+      })
+    }));
+
+    // Update restaurant document
+    await db.collection(collections.restaurants).doc(restaurantId).update({
+      menu: {
+        categories: updatedCategories,
+        items: updatedItems,
+        lastUpdated: new Date()
+      }
+    });
+
+    res.json({ 
+      message: 'Menu item marked as favorite',
+      itemId,
+      isFavorite: true
+    });
+
+  } catch (error) {
+    console.error('Mark favorite error:', error);
+    res.status(500).json({ error: 'Failed to mark menu item as favorite' });
+  }
+});
+
+// Unmark menu item as favorite
+app.delete('/api/menus/:restaurantId/item/:itemId/favorite', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId, itemId } = req.params;
+    const { userId } = req.user;
+
+    // Validate restaurant access
+    const hasAccess = await validateRestaurantAccess(userId, restaurantId);
+    if (!hasAccess) {
+      return res.status(403).json({ error: 'Access denied' });
+    }
+
+    // Get restaurant document
+    const restaurantDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
+    if (!restaurantDoc.exists) {
+      return res.status(404).json({ error: 'Restaurant not found' });
+    }
+
+    const restaurantData = restaurantDoc.data();
+    const currentMenu = restaurantData.menu || { categories: [], items: [] };
+    
+    // Find and update the menu item
+    const updatedItems = currentMenu.items.map(item => {
+      if (item.id === itemId) {
+        return { ...item, isFavorite: false, updatedAt: new Date() };
+      }
+      return item;
+    });
+
+    // Update categories as well
+    const updatedCategories = currentMenu.categories.map(category => ({
+      ...category,
+      items: (category.items || []).map(item => {
+        if (item.id === itemId) {
+          return { ...item, isFavorite: false, updatedAt: new Date() };
+        }
+        return item;
+      })
+    }));
+
+    // Update restaurant document
+    await db.collection(collections.restaurants).doc(restaurantId).update({
+      menu: {
+        categories: updatedCategories,
+        items: updatedItems,
+        lastUpdated: new Date()
+      }
+    });
+
+    res.json({ 
+      message: 'Menu item unmarked as favorite',
+      itemId,
+      isFavorite: false
+    });
+
+  } catch (error) {
+    console.error('Unmark favorite error:', error);
+    res.status(500).json({ error: 'Failed to unmark menu item as favorite' });
+  }
+});
+
 // Delete menu item (soft delete)
 app.delete('/api/menus/item/:id', authenticateToken, async (req, res) => {
   try {
