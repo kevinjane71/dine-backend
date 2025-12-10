@@ -2576,6 +2576,116 @@ app.get('/api/public/menu/:restaurantId', vercelSecurityMiddleware.publicAPI, as
   }
 });
 
+// Menu Theme Management - Authenticated endpoints
+app.get('/api/menu-theme/:restaurantId', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+    const restaurantDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
+    
+    if (!restaurantDoc.exists) {
+      return res.status(404).json({ success: false, error: 'Restaurant not found' });
+    }
+
+    const restaurantData = restaurantDoc.data();
+    
+    // Check ownership - use userId from JWT token (matches other endpoints)
+    const userId = req.user.userId || req.user.uid || req.user.id;
+    if (!restaurantData.ownerId || restaurantData.ownerId !== userId) {
+      console.log('Ownership check failed:', {
+        restaurantOwnerId: restaurantData.ownerId,
+        userUserId: req.user.userId,
+        userUid: req.user.uid,
+        userId: req.user.id,
+        computedUserId: userId,
+      });
+      return res.status(403).json({ success: false, error: 'Access denied' });
+    }
+
+    const menuTheme = restaurantData.menuTheme || {};
+    
+    res.json({
+      success: true,
+      themeId: menuTheme.themeId || 'default',
+      layoutId: menuTheme.layoutId || 'default',
+      ...menuTheme,
+    });
+  } catch (error) {
+    console.error('Error fetching menu theme:', error);
+    res.status(500).json({ success: false, error: 'Failed to fetch menu theme' });
+  }
+});
+
+app.post('/api/menu-theme/:restaurantId', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+    const { themeId, layoutId } = req.body || {};
+    
+    const restaurantDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
+    
+    if (!restaurantDoc.exists) {
+      return res.status(404).json({ success: false, error: 'Restaurant not found' });
+    }
+
+    const restaurantData = restaurantDoc.data();
+    
+    // Check ownership - use userId from JWT token (matches other endpoints)
+    const userId = req.user.userId || req.user.uid || req.user.id;
+    if (!restaurantData.ownerId || restaurantData.ownerId !== userId) {
+      console.log('Ownership check failed:', {
+        restaurantOwnerId: restaurantData.ownerId,
+        userUserId: req.user.userId,
+        userUid: req.user.uid,
+        userId: req.user.id,
+        computedUserId: userId,
+      });
+      return res.status(403).json({ success: false, error: 'Access denied' });
+    }
+
+    // Update menu theme
+    await db.collection(collections.restaurants).doc(restaurantId).update({
+      menuTheme: {
+        themeId: themeId || 'default',
+        layoutId: layoutId || themeId || 'default',
+        updatedAt: FieldValue.serverTimestamp(),
+      },
+    });
+
+    res.json({
+      success: true,
+      message: 'Menu theme saved successfully',
+      themeId: themeId || 'default',
+      layoutId: layoutId || themeId || 'default',
+    });
+  } catch (error) {
+    console.error('Error saving menu theme:', error);
+    res.status(500).json({ success: false, error: 'Failed to save menu theme' });
+  }
+});
+
+// Public endpoint to get menu theme (for redirect logic)
+app.get('/api/public/menu-theme/:restaurantId', vercelSecurityMiddleware.publicAPI, async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+    const restaurantDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
+    
+    if (!restaurantDoc.exists) {
+      return res.status(404).json({ success: false, error: 'Restaurant not found' });
+    }
+
+    const restaurantData = restaurantDoc.data();
+    const menuTheme = restaurantData.menuTheme || {};
+    
+    res.json({
+      success: true,
+      themeId: menuTheme.themeId || 'default',
+      layoutId: menuTheme.layoutId || 'default',
+    });
+  } catch (error) {
+    console.error('Error fetching public menu theme:', error);
+    res.status(500).json({ success: false, error: 'Failed to fetch menu theme' });
+  }
+});
+
 app.get('/api/menus/:restaurantId', async (req, res) => {
   try {
     const { restaurantId } = req.params;
