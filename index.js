@@ -2662,6 +2662,52 @@ app.post('/api/menu-theme/:restaurantId', authenticateToken, async (req, res) =>
   }
 });
 
+// Public redirect helper: decides the themed placeorder URL before FE renders
+app.get('/public/placeorder', vercelSecurityMiddleware.publicAPI, async (req, res) => {
+  try {
+    const restaurantId = (req.query.restaurant || '').trim();
+    const seatRaw = (req.query.seat || '').trim();
+
+    // Basic input validation to avoid abuse/injection
+    const idRegex = /^[A-Za-z0-9_-]{6,128}$/;
+    if (!restaurantId || !idRegex.test(restaurantId)) {
+      return res.status(400).json({ success: false, error: 'Invalid restaurant id' });
+    }
+
+    // Sanitize seat to alnum/underscore/hyphen/space and truncate
+    const seat = seatRaw ? seatRaw.replace(/[^\w\- ]/g, '').slice(0, 50) : '';
+
+    const restaurantDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
+    if (!restaurantDoc.exists) {
+      return res.status(404).json({ success: false, error: 'Restaurant not found' });
+    }
+
+    const restaurantData = restaurantDoc.data() || {};
+    const menuTheme = restaurantData.menuTheme || {};
+    const themeId = menuTheme.themeId || 'default';
+
+    const themeRoutes = {
+      bistro: '/placeorder/bistro',
+      cube: '/placeorder/cube',
+      book: '/placeorder/book',
+      carousel: '/placeorder/carousel',
+    };
+
+    const baseRoute = themeRoutes[themeId] || '/placeorder';
+    const params = new URLSearchParams();
+    params.set('restaurant', restaurantId);
+    if (seat) params.set('seat', seat);
+
+    const redirectUrl = `${baseRoute}?${params.toString()}`;
+
+    // Issue redirect so the client never renders the default first
+    return res.redirect(302, redirectUrl);
+  } catch (error) {
+    console.error('Error in public placeorder redirect:', error);
+    return res.status(500).json({ success: false, error: 'Failed to resolve menu theme' });
+  }
+});
+
 // Public endpoint to get menu theme (for redirect logic)
 app.get('/api/public/menu-theme/:restaurantId', vercelSecurityMiddleware.publicAPI, async (req, res) => {
   try {
