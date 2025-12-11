@@ -2662,7 +2662,7 @@ app.post('/api/menu-theme/:restaurantId', authenticateToken, async (req, res) =>
   }
 });
 
-// Public redirect helper: decides the themed placeorder URL before FE renders
+// Public resolver/proxy: decides the themed placeorder URL before FE renders and streams the themed page
 app.get('/public/placeorder', vercelSecurityMiddleware.publicAPI, async (req, res) => {
   try {
     const restaurantId = (req.query.restaurant || '').trim();
@@ -2698,10 +2698,35 @@ app.get('/public/placeorder', vercelSecurityMiddleware.publicAPI, async (req, re
     params.set('restaurant', restaurantId);
     if (seat) params.set('seat', seat);
 
-    const redirectUrl = `${baseRoute}?${params.toString()}`;
+    const targetPath = `${baseRoute}?${params.toString()}`;
 
-    // Issue redirect so the client never renders the default first
-    return res.redirect(302, redirectUrl);
+    // Proxy the themed page so the URL stays as /public/placeorder?... and there is no extra round-trip
+    const frontendOrigin = process.env.FRONTEND_ORIGIN || 'http://localhost:3002';
+    const targetUrl = `${frontendOrigin}${targetPath}`;
+
+    const upstream = await fetch(targetUrl, {
+      method: 'GET',
+      headers: {
+        // Forward minimal headers; avoid cookies for safety
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'User-Agent': 'dine-proxy'
+      },
+    });
+
+    // Propagate status and content-type; stream body
+    res.status(upstream.status);
+    const contentType = upstream.headers.get('content-type');
+    if (contentType) {
+      res.setHeader('content-type', contentType);
+    }
+
+    // Stream the body
+    if (upstream.body) {
+      upstream.body.pipe(res);
+    } else {
+      res.end();
+    }
+    return;
   } catch (error) {
     console.error('Error in public placeorder redirect:', error);
     return res.status(500).json({ success: false, error: 'Failed to resolve menu theme' });
