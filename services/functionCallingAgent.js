@@ -2,6 +2,7 @@ const OpenAI = require('openai');
 const { db, collections } = require('../firebase');
 const admin = require('firebase-admin');
 const { FieldValue } = require('firebase-admin/firestore');
+const inventoryService = require('./inventoryService');
 
 /**
  * DineAgent - OpenAI Function Calling Agent
@@ -875,7 +876,7 @@ class FunctionCallingAgent {
         
         // Menu Management
         case 'add_menu_item':
-          return await this.addMenuItem(restaurantId, arguments_);
+          return await this.addMenuItem(restaurantId, arguments_, userId);
         
         case 'update_menu_item':
           return await this.updateMenuItem(restaurantId, arguments_);
@@ -1547,6 +1548,10 @@ class FunctionCallingAgent {
       // Create order in database
       const orderRef = await db.collection(collections.orders).add(orderData);
       
+      // AUTO-DEDUCT INVENTORY (Asynchronous - Fire and Forget)
+      inventoryService.deductInventoryForOrder(restaurantId, orderRef.id, orderData.items)
+        .catch(err => console.error('Agent BG Inventory Deduction Error:', err));
+
       // Update table status to "occupied" if table number is provided
       if (tableId && tableFloorId) {
         try {
@@ -1651,7 +1656,7 @@ class FunctionCallingAgent {
   /**
    * Menu Management Functions
    */
-  async addMenuItem(restaurantId, args) {
+  async addMenuItem(restaurantId, args, userId) {
     console.log(`🍽️ Adding menu item: ${args.name} to restaurant: ${restaurantId}`);
     
     // Get restaurant document
@@ -1705,6 +1710,15 @@ class FunctionCallingAgent {
         lastUpdated: new Date()
       }
     });
+
+    // Generate recipe asynchronously
+    inventoryService.createDefaultRecipe(
+      restaurantId, 
+      newMenuItem.id, 
+      newMenuItem.name, 
+      newMenuItem.description,
+      userId
+    ).catch(err => console.error('Agent BG Recipe Gen Error:', err));
 
     return {
       success: true,

@@ -18,6 +18,7 @@ const { db, collections } = require('./firebase');
 const { FieldValue } = require('firebase-admin/firestore');
 const performanceOptimizer = require('./middleware/performanceOptimizer');
 const firestoreOptimizer = require('./utils/firestoreOptimizer');
+const inventoryService = require('./services/inventoryService');
 
 // Generate daily order ID (starts from 1 each day)
 async function generateDailyOrderId(restaurantId) {
@@ -2691,6 +2692,7 @@ app.get('/public/placeorder', vercelSecurityMiddleware.publicAPI, async (req, re
       cube: '/placeorder/cube',
       book: '/placeorder/book',
       carousel: '/placeorder/carousel',
+      classic: '/placeorder/classic',
     };
 
     const baseRoute = themeRoutes[themeId] || '/placeorder';
@@ -2886,6 +2888,18 @@ app.post('/api/menus/:restaurantId', authenticateToken, async (req, res) => {
         lastUpdated: new Date()
       }
     });
+
+    // AUTO-GENERATE RECIPE (Asynchronous - Fire and Forget)
+    // We don't await this so the user response is instant.
+    if (req.body.generateRecipe) {
+      inventoryService.createDefaultRecipe(
+        restaurantId, 
+        newMenuItem.id, 
+        newMenuItem.name, 
+        newMenuItem.description,
+        req.user.uid
+      ).catch(err => console.error('BG Recipe Gen Error:', err));
+    }
 
     res.status(201).json({
       message: 'Menu item created successfully',
@@ -3418,6 +3432,10 @@ app.post('/api/public/orders/:restaurantId', vercelSecurityMiddleware.publicAPI,
     console.log(`🏪 Restaurant: ${orderData.restaurantId}`);
     console.log(`👤 Customer: ${customerPhone}`);
 
+    // SMART INVENTORY: Deduct stock asynchronously
+    inventoryService.deductInventoryForOrder(restaurantId, orderRef.id, orderItems)
+        .catch(err => console.error('Inventory Deduction Error:', err));
+
     res.status(201).json({
       message: 'Order placed successfully',
       order: {
@@ -3709,6 +3727,10 @@ app.post('/api/orders', async (req, res) => {
     if (customerId) {
       console.log(`👤 Customer ID: ${customerId}`);
     }
+
+    // SMART INVENTORY: Deduct stock asynchronously
+    inventoryService.deductInventoryForOrder(restaurantId, orderRef.id, orderItems)
+        .catch(err => console.error('Inventory Deduction Error:', err));
 
     // Update table status to "occupied" if table number is provided
     if (tableNumber && tableNumber.trim()) {
