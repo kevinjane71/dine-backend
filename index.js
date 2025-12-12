@@ -2307,6 +2307,49 @@ app.post('/api/auth/phone/verify-otp', async (req, res) => {
   }
 });
 
+// Public endpoint to get all restaurants for directory
+app.get('/api/public/restaurants', vercelSecurityMiddleware.publicAPI, async (req, res) => {
+  try {
+    const { city, search } = req.query;
+    
+    let query = db.collection(collections.restaurants)
+      .where('status', '==', 'active'); // Only show active restaurants
+
+    if (city) {
+      // Note: Case-sensitive match. For better search, we'd use Algolia/Typesense or normalize fields.
+      query = query.where('city', '==', city);
+    }
+
+    const snapshot = await query.get();
+    let restaurants = [];
+
+    snapshot.forEach(doc => {
+      const data = doc.data();
+      // Filter out sensitive data, only send public profile info
+      const { ownerId, menu, staff, settings, ...publicData } = data;
+      
+      // Basic client-side search filter if query param provided (since Firestore has limited search)
+      if (search) {
+        const searchLower = search.toLowerCase();
+        const nameMatch = publicData.name?.toLowerCase().includes(searchLower);
+        const cuisineMatch = Array.isArray(publicData.cuisine) && publicData.cuisine.some(c => c.toLowerCase().includes(searchLower));
+        if (!nameMatch && !cuisineMatch) return;
+      }
+
+      restaurants.push({
+        id: doc.id,
+        ...publicData,
+        menuTheme: data.menuTheme || { themeId: 'default' } // Include theme info for linking
+      });
+    });
+
+    res.json({ success: true, restaurants });
+  } catch (error) {
+    console.error('Error fetching public restaurants:', error);
+    res.status(500).json({ success: false, error: 'Failed to fetch directory' });
+  }
+});
+
 app.get('/api/restaurants', authenticateToken, async (req, res) => {
   try {
     const { userId, role, restaurantId } = req.user;

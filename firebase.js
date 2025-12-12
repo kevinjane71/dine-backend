@@ -26,19 +26,19 @@ function initializeFirebase() {
       // Not initialized yet, continue
     }
 
-    // Initialize Firebase Admin using your pattern
-    initializeApp({
-      credential: cert({
-        projectId: process.env.FIREBASE_PROJECT_ID,
-        privateKey: process.env.FIREBASE_PRIVATE_KEY?.replace(/\\n/g, '\n'),
-        clientEmail: process.env.FIREBASE_CLIENT_EMAIL
-      })
-    });
-    
-    console.log('✅ Firebase Admin initialized successfully');
-    
-    // Use named database "dine" like your "esigntap" pattern
-    db = getFirestore(undefined, 'dine');
+  // Initialize Firebase Admin using your pattern
+  initializeApp({
+    credential: cert({
+      projectId: process.env.FIREBASE_PROJECT_ID,
+      privateKey: process.env.FIREBASE_PRIVATE_KEY?.replace(/\\n/g, '\n'),
+      clientEmail: process.env.FIREBASE_CLIENT_EMAIL
+    })
+  });
+  
+  console.log('✅ Firebase Admin initialized successfully');
+  
+  // Use named database "dine" like your "esigntap" pattern
+  db = getFirestore(undefined, 'dine');
     
     // Optimize Firestore settings for better performance
     // These settings help reduce latency, especially from India to US regions
@@ -48,10 +48,10 @@ function initializeFirebase() {
     });
     
     isInitialized = true;
-    console.log('🎯 Using Firestore database: "dine"');
+  console.log('🎯 Using Firestore database: "dine"');
     
     return db;
-  } catch (error) {
+} catch (error) {
     // If already initialized, return existing instance
     if (error.code === 'app/duplicate-app') {
       db = getFirestore(undefined, 'dine');
@@ -60,8 +60,8 @@ function initializeFirebase() {
       return db;
     }
     
-    console.error('❌ Firebase initialization error:', error.message);
-    console.error('Please check your Firebase environment variables');
+  console.error('❌ Firebase initialization error:', error.message);
+  console.error('Please check your Firebase environment variables');
     throw error;
   }
 }
