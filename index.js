@@ -2662,7 +2662,7 @@ app.get('/api/menu-theme/:restaurantId', authenticateToken, async (req, res) => 
 app.post('/api/menu-theme/:restaurantId', authenticateToken, async (req, res) => {
   try {
     const { restaurantId } = req.params;
-    const { themeId, layoutId } = req.body || {};
+    const { themeId, layoutId, headerImage } = req.body || {};
     
     const restaurantDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
     
@@ -2690,6 +2690,7 @@ app.post('/api/menu-theme/:restaurantId', authenticateToken, async (req, res) =>
       menuTheme: {
         themeId: themeId || 'default',
         layoutId: layoutId || themeId || 'default',
+        headerImage: headerImage || null,
         updatedAt: FieldValue.serverTimestamp(),
       },
     });
