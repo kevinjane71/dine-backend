@@ -2695,12 +2695,22 @@ app.get('/public/placeorder', vercelSecurityMiddleware.publicAPI, async (req, re
       classic: '/placeorder/classic',
     };
 
-    const baseRoute = themeRoutes[themeId] || '/placeorder';
+    // If themeId is not in routes, fallback to 'default' which maps to /placeorder
+    let frontendPath = '/placeorder';
+    if (themeRoutes[themeId]) {
+      frontendPath = themeRoutes[themeId];
+    } else if (themeId === 'default') {
+      frontendPath = '/placeorder';
+    } else {
+      // If unknown theme, fallback to default
+      frontendPath = '/placeorder';
+    }
+
     const params = new URLSearchParams();
     params.set('restaurant', restaurantId);
     if (seat) params.set('seat', seat);
 
-    const targetPath = `${baseRoute}?${params.toString()}`;
+    const targetPath = `${frontendPath}?${params.toString()}`;
 
     // Proxy the themed page so the URL stays as /public/placeorder?... and there is no extra round-trip
     const frontendOrigin = process.env.FRONTEND_ORIGIN || 'http://localhost:3002';
