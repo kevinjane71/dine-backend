@@ -1350,25 +1350,62 @@ class FunctionCallingAgent {
     const endOfDay = new Date(targetDate);
     endOfDay.setHours(23, 59, 59, 999);
 
-    // Convert to Firestore Timestamps for proper querying
-    const startTimestamp = admin.firestore.Timestamp.fromDate(startOfDay);
-    const endTimestamp = admin.firestore.Timestamp.fromDate(endOfDay);
-
-    console.log(`📊 Fetching sales summary for restaurant ${restaurantId} from ${startTimestamp.toDate()} to ${endTimestamp.toDate()}`);
+    console.log(`📊 Fetching sales summary for restaurant ${restaurantId} from ${startOfDay.toISOString()} to ${endOfDay.toISOString()}`);
 
     // Get all orders for today (excluding cancelled orders)
+    // Use the same approach as the order history API - use Date objects directly
     // Include all statuses: pending, preparing, ready, completed
-    const snapshot = await db.collection('orders')
-      .where('restaurantId', '==', restaurantId)
-      .where('createdAt', '>=', startTimestamp)
-      .where('createdAt', '<=', endTimestamp)
-      .get();
-
-    console.log(`📊 Found ${snapshot.size} orders in date range`);
+    let snapshot;
+    try {
+      snapshot = await db.collection('orders')
+        .where('restaurantId', '==', restaurantId)
+        .where('createdAt', '>=', startOfDay)
+        .where('createdAt', '<=', endOfDay)
+        .get();
+      
+      console.log(`📊 Found ${snapshot.size} orders in date range`);
+      
+      // If no orders found, try without date filter to see if there are any orders at all
+      if (snapshot.size === 0) {
+        const allOrdersSnapshot = await db.collection('orders')
+          .where('restaurantId', '==', restaurantId)
+          .limit(5)
+          .get();
+        console.log(`📊 Total orders for restaurant (any date): ${allOrdersSnapshot.size}`);
+        if (allOrdersSnapshot.size > 0) {
+          allOrdersSnapshot.forEach(doc => {
+            const data = doc.data();
+            const createdAt = data.createdAt;
+            console.log(`📊 Sample order createdAt:`, createdAt, typeof createdAt, createdAt?.toDate?.());
+          });
+        }
+      }
+    } catch (error) {
+      console.error('Error querying orders:', error);
+      // Try alternative query without date filter to see if restaurantId is correct
+      const testSnapshot = await db.collection('orders')
+        .where('restaurantId', '==', restaurantId)
+        .limit(1)
+        .get();
+      console.log(`📊 Test query (no date filter) found ${testSnapshot.size} orders`);
+      throw error;
+    }
 
     let totalRevenue = 0;
     let orderCount = 0;
     const statusBreakdown = {};
+
+    // Get restaurant tax settings for proper calculation
+    let taxSettings = null;
+    try {
+      const restaurantDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
+      if (restaurantDoc.exists) {
+        const restaurantData = restaurantDoc.data();
+        taxSettings = restaurantData.settings?.taxSettings || null;
+      }
+    } catch (error) {
+      console.error('Error fetching tax settings:', error);
+    }
 
     snapshot.forEach(doc => {
       const data = doc.data();
@@ -1378,19 +1415,57 @@ class FunctionCallingAgent {
         return;
       }
 
-      // Use totalAmount (primary field) or total (fallback) or calculate from items
+      // Calculate order total using the same logic as order history page
       let orderTotal = 0;
-      if (data.totalAmount !== undefined) {
+      
+      // First try finalAmount (includes tax)
+      if (data.finalAmount && data.finalAmount > 0) {
+        orderTotal = parseFloat(data.finalAmount.toFixed(2));
+      }
+      // Then try totalAmount + taxAmount
+      else if (data.totalAmount && data.taxAmount) {
+        orderTotal = parseFloat((data.totalAmount + data.taxAmount).toFixed(2));
+      }
+      // Then try totalAmount alone
+      else if (data.totalAmount && data.totalAmount > 0) {
         orderTotal = data.totalAmount;
-      } else if (data.total !== undefined) {
-        orderTotal = data.total;
-      } else if (data.finalAmount !== undefined) {
-        orderTotal = data.finalAmount;
-      } else if (data.items && Array.isArray(data.items)) {
-        // Calculate from items if total not available
-        orderTotal = data.items.reduce((sum, item) => {
-          return sum + ((item.total || 0) + ((item.price || 0) * (item.quantity || 0)));
+        // Apply tax if tax settings are enabled
+        if (taxSettings?.enabled && orderTotal > 0) {
+          let totalTax = 0;
+          if (taxSettings.taxes && taxSettings.taxes.length > 0) {
+            taxSettings.taxes.forEach(tax => {
+              if (tax.enabled) totalTax += orderTotal * (tax.rate / 100);
+            });
+          } else if (taxSettings.defaultTaxRate) {
+            totalTax = orderTotal * (taxSettings.defaultTaxRate / 100);
+          }
+          orderTotal = parseFloat((orderTotal + totalTax).toFixed(2));
+        }
+      }
+      // Fallback: calculate from items
+      else if (data.items && Array.isArray(data.items)) {
+        const subtotal = data.items.reduce((sum, item) => {
+          return sum + (item.total || (item.price || 0) * (item.quantity || 0) || 0);
         }, 0);
+        
+        // Apply tax if enabled
+        if (taxSettings?.enabled && subtotal > 0) {
+          let totalTax = 0;
+          if (taxSettings.taxes && taxSettings.taxes.length > 0) {
+            taxSettings.taxes.forEach(tax => {
+              if (tax.enabled) totalTax += subtotal * (tax.rate / 100);
+            });
+          } else if (taxSettings.defaultTaxRate) {
+            totalTax = subtotal * (taxSettings.defaultTaxRate / 100);
+          }
+          orderTotal = parseFloat((subtotal + totalTax).toFixed(2));
+        } else {
+          orderTotal = parseFloat(subtotal.toFixed(2));
+        }
+      }
+      // Last resort: use total field
+      else if (data.total !== undefined) {
+        orderTotal = data.total;
       }
 
       totalRevenue += orderTotal;
