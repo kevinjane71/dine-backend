@@ -185,13 +185,13 @@ class FunctionCallingAgent {
         type: 'function',
         function: {
           name: 'get_sales_summary',
-          description: 'Get sales summary for a specific date. Returns total revenue, order count, and breakdown.',
+          description: 'Get sales summary for a specific date or time period. Use this when user asks about orders, revenue, sales, or earnings for a specific date (today, yesterday, last week, specific date like "January 15", etc.). Extract the date from the user query and convert to YYYY-MM-DD format. If user says "today" or doesn\'t specify a date, use today\'s date. If user says "yesterday", calculate yesterday\'s date. If user mentions a specific date, convert it to YYYY-MM-DD format.',
           parameters: {
             type: 'object',
             properties: {
               date: {
                 type: 'string',
-                description: 'Date in YYYY-MM-DD format. Defaults to today if not provided.'
+                description: 'Date in YYYY-MM-DD format. Extract from user query: "today" = current date, "yesterday" = previous day, "last week" = 7 days ago, specific dates like "January 15" or "15th January" should be converted to YYYY-MM-DD. Always use the current year unless specified. If no date mentioned, use today.'
               }
             }
           }
@@ -1344,50 +1344,93 @@ class FunctionCallingAgent {
   }
 
   async getSalesSummary(restaurantId, date) {
-    const targetDate = date ? new Date(date) : new Date();
+    // Parse the date parameter intelligently - GPT will extract date from user query
+    let targetDate = new Date();
+    
+    if (date) {
+      // Try to parse the date string (could be YYYY-MM-DD or natural language)
+      const dateLower = date.toLowerCase().trim();
+      
+      if (dateLower === 'today' || dateLower === '' || !date) {
+        targetDate = new Date();
+      } else if (dateLower === 'yesterday' || dateLower.includes('yesterday')) {
+        targetDate = new Date();
+        targetDate.setDate(targetDate.getDate() - 1);
+      } else if (dateLower.includes('last week') || dateLower.includes('week ago')) {
+        targetDate = new Date();
+        targetDate.setDate(targetDate.getDate() - 7);
+      } else if (dateLower.includes('last month') || dateLower.includes('month ago')) {
+        targetDate = new Date();
+        targetDate.setMonth(targetDate.getMonth() - 1);
+      } else {
+        // Try to parse as YYYY-MM-DD or other date formats
+        const parsedDate = new Date(date);
+        if (!isNaN(parsedDate.getTime())) {
+          targetDate = parsedDate;
+        } else {
+          console.warn(`⚠️ Could not parse date "${date}", using today's date`);
+          targetDate = new Date();
+        }
+      }
+    }
+    
     const startOfDay = new Date(targetDate);
     startOfDay.setHours(0, 0, 0, 0);
     const endOfDay = new Date(targetDate);
     endOfDay.setHours(23, 59, 59, 999);
 
-    console.log(`📊 Fetching sales summary for restaurant ${restaurantId} from ${startOfDay.toISOString()} to ${endOfDay.toISOString()}`);
+    console.log(`📊 Fetching sales summary for restaurant ${restaurantId}`);
+    console.log(`📊 Date parameter: "${date || 'today'}"`);
+    console.log(`📊 Target date: ${targetDate.toISOString().split('T')[0]}`);
+    console.log(`📊 Date range: ${startOfDay.toISOString()} to ${endOfDay.toISOString()}`);
 
-    // Get all orders for today (excluding cancelled orders)
-    // Use the same approach as the order history API - use Date objects directly
-    // Include all statuses: pending, preparing, ready, completed
-    let snapshot;
+    // Get all orders for the restaurant and filter in memory (more reliable)
+    // This matches the approach used by the working orders API
+    let allOrders = [];
     try {
-      snapshot = await db.collection('orders')
+      const allSnapshot = await db.collection('orders')
         .where('restaurantId', '==', restaurantId)
-        .where('createdAt', '>=', startOfDay)
-        .where('createdAt', '<=', endOfDay)
+        .limit(500) // Get more orders to cover different dates
         .get();
       
-      console.log(`📊 Found ${snapshot.size} orders in date range`);
+      console.log(`📊 Found ${allSnapshot.size} total orders, filtering for target date...`);
       
-      // If no orders found, try without date filter to see if there are any orders at all
-      if (snapshot.size === 0) {
-        const allOrdersSnapshot = await db.collection('orders')
-          .where('restaurantId', '==', restaurantId)
-          .limit(5)
-          .get();
-        console.log(`📊 Total orders for restaurant (any date): ${allOrdersSnapshot.size}`);
-        if (allOrdersSnapshot.size > 0) {
-          allOrdersSnapshot.forEach(doc => {
-            const data = doc.data();
-            const createdAt = data.createdAt;
-            console.log(`📊 Sample order createdAt:`, createdAt, typeof createdAt, createdAt?.toDate?.());
-          });
+      // Filter orders in memory for the target date
+      allSnapshot.forEach(doc => {
+        const data = doc.data();
+        const createdAt = data.createdAt;
+        
+        // Handle different timestamp formats (Firestore Timestamp, Date, or serialized format)
+        let orderDate = null;
+        if (createdAt && typeof createdAt.toDate === 'function') {
+          // Firestore Timestamp object (has toDate method)
+          orderDate = createdAt.toDate();
+        } else if (createdAt && createdAt._seconds) {
+          // Firestore Timestamp serialized format (from API response)
+          orderDate = new Date(createdAt._seconds * 1000);
+        } else if (createdAt instanceof Date) {
+          orderDate = createdAt;
+        } else if (createdAt) {
+          orderDate = new Date(createdAt);
         }
-      }
+        
+        // Check if order is from the target date
+        if (orderDate) {
+          const orderTime = orderDate.getTime();
+          const startTime = startOfDay.getTime();
+          const endTime = endOfDay.getTime();
+          
+          if (orderTime >= startTime && orderTime <= endTime) {
+            allOrders.push({ id: doc.id, ...data });
+            console.log(`✅ Order ${doc.id} added - date: ${orderDate.toISOString()}, totalAmount: ${data.totalAmount}`);
+          }
+        }
+      });
+      
+      console.log(`📊 Filtered to ${allOrders.length} orders for ${targetDate.toISOString().split('T')[0]}`);
+      
     } catch (error) {
       console.error('Error querying orders:', error);
-      // Try alternative query without date filter to see if restaurantId is correct
-      const testSnapshot = await db.collection('orders')
-        .where('restaurantId', '==', restaurantId)
-        .limit(1)
-        .get();
-      console.log(`📊 Test query (no date filter) found ${testSnapshot.size} orders`);
       throw error;
     }
 
@@ -1407,8 +1450,9 @@ class FunctionCallingAgent {
       console.error('Error fetching tax settings:', error);
     }
 
-    snapshot.forEach(doc => {
-      const data = doc.data();
+    // Process the filtered orders
+    allOrders.forEach(orderData => {
+      const data = orderData;
       
       // Skip cancelled orders
       if (data.status === 'cancelled') {
@@ -1426,7 +1470,7 @@ class FunctionCallingAgent {
       else if (data.totalAmount && data.taxAmount) {
         orderTotal = parseFloat((data.totalAmount + data.taxAmount).toFixed(2));
       }
-      // Then try totalAmount alone
+      // Then try totalAmount alone (this is what the API shows)
       else if (data.totalAmount && data.totalAmount > 0) {
         orderTotal = data.totalAmount;
         // Apply tax if tax settings are enabled
@@ -1468,6 +1512,7 @@ class FunctionCallingAgent {
         orderTotal = data.total;
       }
 
+      console.log(`📊 Processing order ${data.id || 'unknown'}: totalAmount=${data.totalAmount}, calculatedTotal=${orderTotal}, status=${data.status}`);
       totalRevenue += orderTotal;
       orderCount++;
       
@@ -1476,9 +1521,11 @@ class FunctionCallingAgent {
       statusBreakdown[status] = (statusBreakdown[status] || 0) + 1;
     });
 
+    console.log(`📊 Final summary: ${orderCount} orders, ₹${totalRevenue} revenue, date: ${targetDate.toISOString().split('T')[0]}`);
+
     return {
       success: true,
-      date: targetDate.toISOString().split('T')[0],
+      date: targetDate.toISOString().split('T')[0], // Use the target date (today, yesterday, or specified date)
       totalRevenue: Math.round(totalRevenue * 100) / 100, // Round to 2 decimal places
       orderCount,
       averageOrderValue: orderCount > 0 ? Math.round((totalRevenue / orderCount) * 100) / 100 : 0,
