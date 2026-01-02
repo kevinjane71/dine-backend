@@ -1350,28 +1350,64 @@ class FunctionCallingAgent {
     const endOfDay = new Date(targetDate);
     endOfDay.setHours(23, 59, 59, 999);
 
+    // Convert to Firestore Timestamps for proper querying
+    const startTimestamp = admin.firestore.Timestamp.fromDate(startOfDay);
+    const endTimestamp = admin.firestore.Timestamp.fromDate(endOfDay);
+
+    console.log(`📊 Fetching sales summary for restaurant ${restaurantId} from ${startTimestamp.toDate()} to ${endTimestamp.toDate()}`);
+
+    // Get all orders for today (excluding cancelled orders)
+    // Include all statuses: pending, preparing, ready, completed
     const snapshot = await db.collection('orders')
       .where('restaurantId', '==', restaurantId)
-      .where('status', '==', 'completed')
-      .where('createdAt', '>=', startOfDay)
-      .where('createdAt', '<=', endOfDay)
+      .where('createdAt', '>=', startTimestamp)
+      .where('createdAt', '<=', endTimestamp)
       .get();
+
+    console.log(`📊 Found ${snapshot.size} orders in date range`);
 
     let totalRevenue = 0;
     let orderCount = 0;
+    const statusBreakdown = {};
 
     snapshot.forEach(doc => {
       const data = doc.data();
-      totalRevenue += data.total || 0;
+      
+      // Skip cancelled orders
+      if (data.status === 'cancelled') {
+        return;
+      }
+
+      // Use totalAmount (primary field) or total (fallback) or calculate from items
+      let orderTotal = 0;
+      if (data.totalAmount !== undefined) {
+        orderTotal = data.totalAmount;
+      } else if (data.total !== undefined) {
+        orderTotal = data.total;
+      } else if (data.finalAmount !== undefined) {
+        orderTotal = data.finalAmount;
+      } else if (data.items && Array.isArray(data.items)) {
+        // Calculate from items if total not available
+        orderTotal = data.items.reduce((sum, item) => {
+          return sum + ((item.total || 0) + ((item.price || 0) * (item.quantity || 0)));
+        }, 0);
+      }
+
+      totalRevenue += orderTotal;
       orderCount++;
+      
+      // Track status breakdown
+      const status = data.status || 'unknown';
+      statusBreakdown[status] = (statusBreakdown[status] || 0) + 1;
     });
 
     return {
       success: true,
       date: targetDate.toISOString().split('T')[0],
-      totalRevenue,
+      totalRevenue: Math.round(totalRevenue * 100) / 100, // Round to 2 decimal places
       orderCount,
-      averageOrderValue: orderCount > 0 ? totalRevenue / orderCount : 0
+      averageOrderValue: orderCount > 0 ? Math.round((totalRevenue / orderCount) * 100) / 100 : 0,
+      statusBreakdown
     };
   }
 
