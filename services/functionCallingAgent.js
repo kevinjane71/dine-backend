@@ -275,11 +275,23 @@ class FunctionCallingAgent {
                     },
                     selectedVariant: {
                       type: 'object',
-                      description: 'Selected variant (e.g., Half/Full) with name and price'
+                      description: 'Selected variant (e.g., Half/Full) with name and price',
+                      properties: {
+                        name: { type: 'string' },
+                        price: { type: 'number' }
+                      }
                     },
                     selectedCustomizations: {
                       type: 'array',
-                      description: 'Selected customizations/toppings with name and price'
+                      description: 'Selected customizations/toppings with name and price',
+                      items: {
+                        type: 'object',
+                        properties: {
+                          id: { type: 'string' },
+                          name: { type: 'string' },
+                          price: { type: 'number' }
+                        }
+                      }
                     },
                     notes: {
                       type: 'string',
@@ -698,6 +710,28 @@ class FunctionCallingAgent {
   }
 
   /**
+   * Verify user has access to restaurant (Security check)
+   */
+  async verifyRestaurantAccess(restaurantId, userId) {
+    try {
+      const userRestaurantDoc = await db.collection('userRestaurants')
+        .where('userId', '==', userId)
+        .where('restaurantId', '==', restaurantId)
+        .limit(1)
+        .get();
+
+      if (userRestaurantDoc.empty) {
+        throw new Error('Access denied: You do not have permission to access this restaurant');
+      }
+
+      return true;
+    } catch (error) {
+      console.error(`🚫 Access denied: User ${userId} attempted to access restaurant ${restaurantId}`);
+      throw error;
+    }
+  }
+
+  /**
    * Get Session Summary from Firestore (user preferences, recent activity)
    */
   async getSessionSummary(userId, restaurantId) {
@@ -843,6 +877,9 @@ class FunctionCallingAgent {
     console.log(`🔧 Executing function: ${functionName}`, arguments_);
 
     try {
+      // Verify user has access to this restaurant
+      await this.verifyRestaurantAccess(restaurantId, userId);
+
       switch (functionName) {
         case 'get_orders':
           return await this.getOrders(restaurantId, arguments_.status || 'all', arguments_.limit || 10);
@@ -2614,10 +2651,24 @@ For follow-up queries like "check again", "what about X", always call the releva
       }
     } catch (error) {
       console.error('Function calling agent error:', error);
+      
+      // Provide more helpful error messages
+      let errorMessage = 'Sorry, I encountered an error. Please try again.';
+      
+      if (error.message.includes('Access denied')) {
+        errorMessage = 'Access denied: You do not have permission to perform this action.';
+      } else if (error.message.includes('not found')) {
+        errorMessage = error.message;
+      } else if (error.message.includes('Invalid schema')) {
+        errorMessage = 'There was an issue with the request format. Please try rephrasing your request.';
+      } else if (error.message.includes('rate limit') || error.message.includes('quota')) {
+        errorMessage = 'Service temporarily unavailable. Please try again in a moment.';
+      }
+      
       return {
         success: false,
         error: error.message,
-        response: 'Sorry, I encountered an error. Please try again.'
+        response: errorMessage
       };
     }
   }
