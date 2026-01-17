@@ -154,6 +154,9 @@ const chatbotRoutes = require('./routes/chatbot');
 // Hotel PMS routes
 const hotelRoutes = require('./routes/hotel');
 
+// Hotel Management routes (for restaurant-hotel integration)
+const hotelManagementRoutes = require('./routes/hotelManagement');
+
 // Shift Scheduling routes
 const shiftSchedulingRoutes = require('./routes/shiftScheduling');
 
@@ -3698,11 +3701,12 @@ app.post('/api/orders', async (req, res) => {
       paymentMethod: req.body.paymentMethod
     });
 
-    const { 
-      restaurantId, 
-      tableNumber, 
-      items, 
-      customerInfo, 
+    const {
+      restaurantId,
+      tableNumber,
+      roomNumber, // NEW: Support for hotel room orders
+      items,
+      customerInfo,
       orderType = 'dine-in',
       paymentMethod = 'cash',
       staffInfo,
@@ -3873,6 +3877,7 @@ app.post('/api/orders', async (req, res) => {
       orderNumber,
       dailyOrderId,
       tableNumber: tableNumber || seatNumber || null,
+      roomNumber: roomNumber || null, // NEW: Hotel room number
       orderType,
       items: orderItems,
       totalAmount,
@@ -3893,7 +3898,7 @@ app.post('/api/orders', async (req, res) => {
       notes: notes || (orderType === 'customer_self_order' ? `Customer self-order from seat ${seatNumber || 'Walk-in'}` : ''),
       status: req.body.status || 'confirmed',
       kotSent: false,
-      paymentStatus: 'pending',
+      paymentStatus: roomNumber ? 'hotel-billing' : 'pending', // NEW: Mark as hotel billing if room number provided
       createdAt: new Date(),
       updatedAt: new Date()
     };
@@ -3968,17 +3973,66 @@ app.post('/api/orders', async (req, res) => {
     inventoryService.deductInventoryForOrder(restaurantId, orderRef.id, orderItems)
         .catch(err => console.error('Inventory Deduction Error:', err));
 
+    // NEW: Link order to hotel check-in if room number is provided
+    if (roomNumber && roomNumber.trim()) {
+      try {
+        console.log('🏨 Linking order to hotel room:', roomNumber);
+
+        // Find active check-in for this room
+        const checkInSnapshot = await db.collection('hotel_checkins')
+          .where('restaurantId', '==', restaurantId)
+          .where('roomNumber', '==', roomNumber.trim())
+          .where('status', '==', 'checked-in')
+          .limit(1)
+          .get();
+
+        if (!checkInSnapshot.empty) {
+          const checkInDoc = checkInSnapshot.docs[0];
+          const checkInData = checkInDoc.data();
+
+          // Add order to foodOrders array
+          const foodOrders = checkInData.foodOrders || [];
+          foodOrders.push({
+            orderId: orderRef.id,
+            orderNumber: orderNumber,
+            amount: totalAmount,
+            linkedAt: new Date()
+          });
+
+          // Update totals
+          const totalFoodCharges = (checkInData.totalFoodCharges || 0) + totalAmount;
+          const totalCharges = checkInData.totalRoomCharges + totalFoodCharges;
+          const balanceAmount = totalCharges - (checkInData.advancePayment || 0);
+
+          await checkInDoc.ref.update({
+            foodOrders,
+            totalFoodCharges,
+            totalCharges,
+            balanceAmount,
+            lastUpdated: FieldValue.serverTimestamp()
+          });
+
+          console.log('✅ Order linked to hotel check-in:', checkInDoc.id);
+        } else {
+          console.log('⚠️ No active check-in found for room:', roomNumber);
+        }
+      } catch (hotelLinkError) {
+        console.error('❌ Failed to link order to hotel check-in:', hotelLinkError);
+        // Don't fail the order if hotel linking fails
+      }
+    }
+
     // Update table status to "occupied" if table number is provided
     if (tableNumber && tableNumber.trim()) {
       try {
         console.log('🔄 Updating table status to occupied:', tableNumber);
-        
+
         // Find the table in the new restaurant-centric structure
         const floorsSnapshot = await db.collection('restaurants')
           .doc(restaurantId)
           .collection('floors')
           .get();
-        
+
         let tableUpdated = false;
         for (const floorDoc of floorsSnapshot.docs) {
           const tablesSnapshot = await db.collection('restaurants')
@@ -3988,7 +4042,7 @@ app.post('/api/orders', async (req, res) => {
             .collection('tables')
             .where('name', '==', tableNumber.trim())
             .get();
-          
+
           if (!tablesSnapshot.empty) {
             const tableDoc = tablesSnapshot.docs[0];
             await tableDoc.ref.update({
@@ -4002,7 +4056,7 @@ app.post('/api/orders', async (req, res) => {
             break;
           }
         }
-        
+
         if (!tableUpdated) {
           console.log('⚠️ Table not found for status update:', tableNumber);
         }
@@ -4898,6 +4952,9 @@ app.use('/api', chatbotRoutes);
 
 // Initialize hotel PMS routes
 app.use('/api/hotel', hotelRoutes);
+
+// Initialize hotel management routes (restaurant-hotel integration)
+app.use('/api', hotelManagementRoutes);
 
 // Initialize shift scheduling routes
 app.use('/api/shift-scheduling', shiftSchedulingRoutes);

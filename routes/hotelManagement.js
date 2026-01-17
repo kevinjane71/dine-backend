@@ -1,0 +1,596 @@
+const express = require('express');
+const router = express.Router();
+const { db } = require('../firebase');
+const { FieldValue } = require('firebase-admin/firestore');
+const { authenticateToken } = require('../middleware/auth');
+
+/**
+ * Hotel Management Routes
+ *
+ * This module provides complete hotel check-in/check-out functionality
+ * including guest management, room assignments, and billing integration.
+ *
+ * Feature flag: ENABLE_HOTEL_MODE
+ */
+
+// Collection names
+const COLLECTIONS = {
+  guests: 'hotel_guests',
+  checkIns: 'hotel_checkins',
+  rooms: 'hotel_rooms',
+  restaurants: 'restaurants'
+};
+
+// ==================== GUEST CHECK-IN ====================
+
+/**
+ * POST /api/hotel/checkin
+ * Create a new hotel check-in
+ */
+router.post('/hotel/checkin', authenticateToken, async (req, res) => {
+  try {
+    const { userId } = req.user;
+    const {
+      restaurantId,
+      guestInfo,
+      roomNumber,
+      checkInDate,
+      checkOutDate,
+      numberOfGuests,
+      roomTariff,
+      advancePayment,
+      paymentMode,
+      idProof,
+      gstInfo,
+      specialRequests
+    } = req.body;
+
+    // Validate required fields
+    if (!restaurantId || !guestInfo?.name || !guestInfo?.phone || !roomNumber || !checkInDate || !checkOutDate) {
+      return res.status(400).json({
+        success: false,
+        error: 'Missing required fields: restaurantId, guest name, phone, roomNumber, checkInDate, checkOutDate'
+      });
+    }
+
+    // Check if room is already occupied
+    const existingCheckIn = await db.collection(COLLECTIONS.checkIns)
+      .where('restaurantId', '==', restaurantId)
+      .where('roomNumber', '==', roomNumber)
+      .where('status', '==', 'checked-in')
+      .limit(1)
+      .get();
+
+    if (!existingCheckIn.empty) {
+      return res.status(400).json({
+        success: false,
+        error: `Room ${roomNumber} is already occupied`
+      });
+    }
+
+    // Create guest record
+    const guestData = {
+      name: guestInfo.name,
+      phone: guestInfo.phone,
+      email: guestInfo.email || null,
+      address: guestInfo.address || null,
+      city: guestInfo.city || null,
+      state: guestInfo.state || null,
+      country: guestInfo.country || null,
+      zipCode: guestInfo.zipCode || null,
+      idProofType: idProof?.type || null,
+      idProofNumber: idProof?.number || null,
+      idProofImageUrl: idProof?.imageUrl || null,
+      gstNumber: gstInfo?.gstNumber || null,
+      gstCompanyName: gstInfo?.companyName || null,
+      restaurantId,
+      createdAt: FieldValue.serverTimestamp(),
+      createdBy: userId
+    };
+
+    const guestRef = await db.collection(COLLECTIONS.guests).add(guestData);
+
+    // Calculate stay duration in days
+    const checkIn = new Date(checkInDate);
+    const checkOut = new Date(checkOutDate);
+    const stayDuration = Math.ceil((checkOut - checkIn) / (1000 * 60 * 60 * 24));
+
+    // Create check-in record
+    const checkInData = {
+      restaurantId,
+      guestId: guestRef.id,
+      guestName: guestInfo.name,
+      guestPhone: guestInfo.phone,
+      guestEmail: guestInfo.email || null,
+      roomNumber,
+      checkInDate: new Date(checkInDate),
+      checkOutDate: new Date(checkOutDate),
+      stayDuration,
+      numberOfGuests: numberOfGuests || 1,
+      roomTariff: roomTariff || 0,
+      totalRoomCharges: (roomTariff || 0) * stayDuration,
+      advancePayment: advancePayment || 0,
+      paymentMode: paymentMode || 'cash',
+      specialRequests: specialRequests || null,
+      status: 'checked-in',
+      foodOrders: [], // Will be populated when orders are placed
+      totalFoodCharges: 0,
+      totalCharges: (roomTariff || 0) * stayDuration,
+      balanceAmount: ((roomTariff || 0) * stayDuration) - (advancePayment || 0),
+      checkInBy: userId,
+      checkInAt: FieldValue.serverTimestamp(),
+      lastUpdated: FieldValue.serverTimestamp()
+    };
+
+    const checkInRef = await db.collection(COLLECTIONS.checkIns).add(checkInData);
+
+    res.status(201).json({
+      success: true,
+      message: `Guest checked in to Room ${roomNumber} successfully`,
+      checkIn: {
+        id: checkInRef.id,
+        ...checkInData,
+        guestId: guestRef.id
+      }
+    });
+
+  } catch (error) {
+    console.error('Hotel check-in error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to process check-in'
+    });
+  }
+});
+
+// ==================== GET CHECK-INS ====================
+
+/**
+ * GET /api/hotel/checkins/:restaurantId
+ * Get all check-ins for a restaurant
+ */
+router.get('/hotel/checkins/:restaurantId', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+    const { status } = req.query; // active, checked-out, all
+
+    let query = db.collection(COLLECTIONS.checkIns)
+      .where('restaurantId', '==', restaurantId);
+
+    if (status && status !== 'all') {
+      if (status === 'active') {
+        query = query.where('status', '==', 'checked-in');
+      } else {
+        query = query.where('status', '==', status);
+      }
+    }
+
+    const snapshot = await query.orderBy('checkInAt', 'desc').get();
+
+    const checkIns = [];
+    snapshot.forEach(doc => {
+      const data = doc.data();
+      checkIns.push({
+        id: doc.id,
+        ...data,
+        checkInDate: data.checkInDate?.toDate?.() || data.checkInDate,
+        checkOutDate: data.checkOutDate?.toDate?.() || data.checkOutDate,
+        checkInAt: data.checkInAt?.toDate?.() || data.checkInAt,
+        actualCheckOutAt: data.actualCheckOutAt?.toDate?.() || data.actualCheckOutAt
+      });
+    });
+
+    res.json({
+      success: true,
+      checkIns,
+      total: checkIns.length
+    });
+
+  } catch (error) {
+    console.error('Get check-ins error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to fetch check-ins'
+    });
+  }
+});
+
+// ==================== GET CHECK-IN BY ROOM ====================
+
+/**
+ * GET /api/hotel/checkin/room/:restaurantId/:roomNumber
+ * Get active check-in for a specific room
+ */
+router.get('/hotel/checkin/room/:restaurantId/:roomNumber', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId, roomNumber } = req.params;
+
+    const snapshot = await db.collection(COLLECTIONS.checkIns)
+      .where('restaurantId', '==', restaurantId)
+      .where('roomNumber', '==', roomNumber)
+      .where('status', '==', 'checked-in')
+      .limit(1)
+      .get();
+
+    if (snapshot.empty) {
+      return res.status(404).json({
+        success: false,
+        error: `No active check-in found for Room ${roomNumber}`
+      });
+    }
+
+    const doc = snapshot.docs[0];
+    const data = doc.data();
+
+    res.json({
+      success: true,
+      checkIn: {
+        id: doc.id,
+        ...data,
+        checkInDate: data.checkInDate?.toDate?.() || data.checkInDate,
+        checkOutDate: data.checkOutDate?.toDate?.() || data.checkOutDate,
+        checkInAt: data.checkInAt?.toDate?.() || data.checkInAt
+      }
+    });
+
+  } catch (error) {
+    console.error('Get check-in by room error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to fetch check-in'
+    });
+  }
+});
+
+// ==================== LINK ORDER TO CHECK-IN ====================
+
+/**
+ * POST /api/hotel/link-order
+ * Link a food order to a hotel check-in (room)
+ */
+router.post('/hotel/link-order', authenticateToken, async (req, res) => {
+  try {
+    const { checkInId, orderId, orderAmount } = req.body;
+
+    if (!checkInId || !orderId || !orderAmount) {
+      return res.status(400).json({
+        success: false,
+        error: 'Missing required fields: checkInId, orderId, orderAmount'
+      });
+    }
+
+    const checkInRef = db.collection(COLLECTIONS.checkIns).doc(checkInId);
+    const checkInDoc = await checkInRef.get();
+
+    if (!checkInDoc.exists) {
+      return res.status(404).json({
+        success: false,
+        error: 'Check-in not found'
+      });
+    }
+
+    const checkInData = checkInDoc.data();
+
+    // Add order to foodOrders array
+    const foodOrders = checkInData.foodOrders || [];
+    foodOrders.push({
+      orderId,
+      amount: orderAmount,
+      linkedAt: new Date()
+    });
+
+    // Update totals
+    const totalFoodCharges = (checkInData.totalFoodCharges || 0) + orderAmount;
+    const totalCharges = checkInData.totalRoomCharges + totalFoodCharges;
+    const balanceAmount = totalCharges - (checkInData.advancePayment || 0);
+
+    await checkInRef.update({
+      foodOrders,
+      totalFoodCharges,
+      totalCharges,
+      balanceAmount,
+      lastUpdated: FieldValue.serverTimestamp()
+    });
+
+    res.json({
+      success: true,
+      message: 'Order linked to room successfully',
+      totalFoodCharges,
+      totalCharges,
+      balanceAmount
+    });
+
+  } catch (error) {
+    console.error('Link order error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to link order'
+    });
+  }
+});
+
+// ==================== CHECKOUT ====================
+
+/**
+ * POST /api/hotel/checkout/:checkInId
+ * Process hotel checkout and generate final invoice
+ */
+router.post('/hotel/checkout/:checkInId', authenticateToken, async (req, res) => {
+  try {
+    const { checkInId } = req.params;
+    const { userId } = req.user;
+    const {
+      finalPayment,
+      paymentMode,
+      discounts,
+      additionalCharges,
+      notes
+    } = req.body;
+
+    const checkInRef = db.collection(COLLECTIONS.checkIns).doc(checkInId);
+    const checkInDoc = await checkInRef.get();
+
+    if (!checkInDoc.exists) {
+      return res.status(404).json({
+        success: false,
+        error: 'Check-in not found'
+      });
+    }
+
+    const checkInData = checkInDoc.data();
+
+    if (checkInData.status === 'checked-out') {
+      return res.status(400).json({
+        success: false,
+        error: 'Guest has already checked out'
+      });
+    }
+
+    // Calculate final bill
+    let totalCharges = checkInData.totalCharges || 0;
+
+    // Add additional charges if any
+    if (additionalCharges && Array.isArray(additionalCharges)) {
+      const additionalTotal = additionalCharges.reduce((sum, charge) => sum + (charge.amount || 0), 0);
+      totalCharges += additionalTotal;
+    }
+
+    // Apply discounts if any
+    let discountAmount = 0;
+    if (discounts && Array.isArray(discounts)) {
+      discountAmount = discounts.reduce((sum, discount) => sum + (discount.amount || 0), 0);
+      totalCharges -= discountAmount;
+    }
+
+    const totalPaid = (checkInData.advancePayment || 0) + (finalPayment || 0);
+    const balanceAmount = totalCharges - totalPaid;
+
+    // Update check-in record
+    const checkoutData = {
+      status: 'checked-out',
+      actualCheckOutAt: FieldValue.serverTimestamp(),
+      finalPayment: finalPayment || 0,
+      finalPaymentMode: paymentMode || 'cash',
+      totalCharges,
+      discounts: discounts || [],
+      discountAmount,
+      additionalCharges: additionalCharges || [],
+      totalPaid,
+      balanceAmount,
+      checkoutNotes: notes || null,
+      checkOutBy: userId,
+      billingComplete: balanceAmount <= 0,
+      lastUpdated: FieldValue.serverTimestamp()
+    };
+
+    await checkInRef.update(checkoutData);
+
+    // If there are linked food orders, mark them as billed
+    if (checkInData.foodOrders && checkInData.foodOrders.length > 0) {
+      const batch = db.batch();
+
+      for (const foodOrder of checkInData.foodOrders) {
+        const orderRef = db.collection('orders').doc(foodOrder.orderId);
+        batch.update(orderRef, {
+          paymentStatus: 'paid',
+          paidAt: FieldValue.serverTimestamp(),
+          paidVia: 'hotel-checkout'
+        });
+      }
+
+      await batch.commit();
+    }
+
+    // Generate invoice data
+    const invoice = {
+      checkInId,
+      guestName: checkInData.guestName,
+      guestPhone: checkInData.guestPhone,
+      roomNumber: checkInData.roomNumber,
+      checkInDate: checkInData.checkInDate,
+      checkOutDate: checkInData.checkOutDate,
+      actualCheckOutDate: new Date(),
+      stayDuration: checkInData.stayDuration,
+      roomCharges: checkInData.totalRoomCharges,
+      foodCharges: checkInData.totalFoodCharges,
+      additionalCharges: additionalCharges || [],
+      discounts: discounts || [],
+      subtotal: checkInData.totalCharges,
+      discountAmount,
+      totalAmount: totalCharges,
+      advancePayment: checkInData.advancePayment || 0,
+      finalPayment: finalPayment || 0,
+      totalPaid,
+      balanceAmount,
+      foodOrders: checkInData.foodOrders || []
+    };
+
+    res.json({
+      success: true,
+      message: 'Checkout completed successfully',
+      invoice,
+      checkOut: {
+        id: checkInId,
+        ...checkoutData
+      }
+    });
+
+  } catch (error) {
+    console.error('Checkout error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to process checkout'
+    });
+  }
+});
+
+// ==================== GET INVOICE ====================
+
+/**
+ * GET /api/hotel/invoice/:checkInId
+ * Get invoice for a check-in
+ */
+router.get('/hotel/invoice/:checkInId', authenticateToken, async (req, res) => {
+  try {
+    const { checkInId } = req.params;
+
+    const checkInDoc = await db.collection(COLLECTIONS.checkIns).doc(checkInId).get();
+
+    if (!checkInDoc.exists) {
+      return res.status(404).json({
+        success: false,
+        error: 'Check-in not found'
+      });
+    }
+
+    const data = checkInDoc.data();
+
+    const invoice = {
+      checkInId,
+      guestName: data.guestName,
+      guestPhone: data.guestPhone,
+      guestEmail: data.guestEmail,
+      roomNumber: data.roomNumber,
+      checkInDate: data.checkInDate?.toDate?.() || data.checkInDate,
+      checkOutDate: data.checkOutDate?.toDate?.() || data.checkOutDate,
+      actualCheckOutDate: data.actualCheckOutAt?.toDate?.() || null,
+      stayDuration: data.stayDuration,
+      roomTariff: data.roomTariff,
+      roomCharges: data.totalRoomCharges,
+      foodCharges: data.totalFoodCharges || 0,
+      additionalCharges: data.additionalCharges || [],
+      discounts: data.discounts || [],
+      subtotal: data.totalRoomCharges + (data.totalFoodCharges || 0),
+      discountAmount: data.discountAmount || 0,
+      totalAmount: data.totalCharges,
+      advancePayment: data.advancePayment || 0,
+      finalPayment: data.finalPayment || 0,
+      totalPaid: data.totalPaid || data.advancePayment || 0,
+      balanceAmount: data.balanceAmount || 0,
+      status: data.status,
+      billingComplete: data.billingComplete || false,
+      foodOrders: data.foodOrders || []
+    };
+
+    res.json({
+      success: true,
+      invoice
+    });
+
+  } catch (error) {
+    console.error('Get invoice error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to fetch invoice'
+    });
+  }
+});
+
+// ==================== UPDATE CHECK-IN ====================
+
+/**
+ * PATCH /api/hotel/checkin/:checkInId
+ * Update check-in details
+ */
+router.patch('/hotel/checkin/:checkInId', authenticateToken, async (req, res) => {
+  try {
+    const { checkInId } = req.params;
+    const updates = req.body;
+
+    // Remove fields that shouldn't be updated directly
+    delete updates.restaurantId;
+    delete updates.guestId;
+    delete updates.status;
+    delete updates.checkInAt;
+    delete updates.checkOutBy;
+
+    updates.lastUpdated = FieldValue.serverTimestamp();
+
+    await db.collection(COLLECTIONS.checkIns).doc(checkInId).update(updates);
+
+    res.json({
+      success: true,
+      message: 'Check-in updated successfully'
+    });
+
+  } catch (error) {
+    console.error('Update check-in error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to update check-in'
+    });
+  }
+});
+
+// ==================== GUEST SEARCH ====================
+
+/**
+ * GET /api/hotel/guests/:restaurantId
+ * Search guests by phone or name
+ */
+router.get('/hotel/guests/:restaurantId', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+    const { phone, name } = req.query;
+
+    let query = db.collection(COLLECTIONS.guests)
+      .where('restaurantId', '==', restaurantId);
+
+    if (phone) {
+      query = query.where('phone', '==', phone);
+    }
+
+    const snapshot = await query.limit(50).get();
+
+    let guests = [];
+    snapshot.forEach(doc => {
+      guests.push({
+        id: doc.id,
+        ...doc.data()
+      });
+    });
+
+    // Filter by name if provided (Firestore doesn't support case-insensitive search)
+    if (name) {
+      const searchName = name.toLowerCase();
+      guests = guests.filter(guest =>
+        guest.name?.toLowerCase().includes(searchName)
+      );
+    }
+
+    res.json({
+      success: true,
+      guests,
+      total: guests.length
+    });
+
+  } catch (error) {
+    console.error('Guest search error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to search guests'
+    });
+  }
+});
+
+module.exports = router;
