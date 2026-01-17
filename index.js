@@ -294,6 +294,40 @@ const corsOptions = {
 };
 
 app.use(cors(corsOptions));
+
+// Explicitly set CORS header to match request origin (ensures dynamic subdomains work)
+// This middleware runs after CORS to ensure the correct origin is always set
+app.use((req, res, next) => {
+  const origin = req.headers.origin;
+  
+  // Handle OPTIONS preflight requests
+  if (req.method === 'OPTIONS') {
+    if (origin) {
+      // Allow all dineopen.com subdomains
+      if (origin.match(/^https:\/\/([a-zA-Z0-9-]+\.)*dineopen\.com$/) || 
+          allowedOrigins.includes(origin)) {
+        res.setHeader('Access-Control-Allow-Origin', origin);
+        res.setHeader('Access-Control-Allow-Credentials', 'true');
+        res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS, PATCH');
+        res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With, Accept, Origin');
+        return res.status(200).end();
+      }
+    }
+  }
+  
+  // For all other requests, ensure CORS header matches request origin
+  if (origin) {
+    // Allow all dineopen.com subdomains
+    if (origin.match(/^https:\/\/([a-zA-Z0-9-]+\.)*dineopen\.com$/) || 
+        allowedOrigins.includes(origin)) {
+      res.setHeader('Access-Control-Allow-Origin', origin);
+      res.setHeader('Access-Control-Allow-Credentials', 'true');
+    }
+  }
+  
+  next();
+});
+
 app.use(helmet({ crossOriginResourcePolicy: { policy: "cross-origin" } }));
 
 
