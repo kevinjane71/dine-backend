@@ -1219,9 +1219,10 @@ const extractMenuFromPDF = async (pdfUrl) => {
           content: [
             {
               type: "text",
-              text: `Analyze this document. If it is a restaurant menu: 1) List section headers (Starters, Main Course, Beverages, etc.) in "categories" as [{"name":"SectionName","order":1}]. Use EXACT names from the document. If no sections, use "categories":[].
-2) Extract ALL menu items. For each, set "category" to the section name it appears under, or "Other" if no sections.
-Return JSON: {"categories":[...],"menuItems":[{"name":"","description":"","price":0,"category":"SectionName or Other","isVeg":true,"shortCode":"1"}]}
+              text: `Analyze this document. If it is a restaurant menu: 1) List section headers in "categories" as [{"name":"SectionName","order":1}]. Use EXACT names. If no sections, use "categories":[].
+2) Extract ALL menu items. Set "category" to section name or "Other".
+3) VARIANTS: If item shows multiple sizes/prices (e.g., "Half ₹110/Full ₹180", "110/180"), extract as "variants":[{"name":"Half","price":110},{"name":"Full","price":180}]. Otherwise use "variants":[].
+Return JSON: {"categories":[...],"menuItems":[{"name":"","description":"","price":0,"category":"...","isVeg":true,"shortCode":"1","variants":[]}]}
 shortCode: 1,2,3... If NOT a menu: {"categories":[],"menuItems":[]}`
             },
             { type: "image_url", image_url: { url: pdfUrl, detail: "high" } }
@@ -1258,7 +1259,8 @@ const extractMenuFromCSV = async (csvUrl) => {
               type: "text",
               text: `This may be a menu in CSV/Excel. 1) If there is a Category/Type column, collect unique values as "categories":[{"name":"X","order":1},...]. If no category column, use "categories":[].
 2) Extract ALL rows as menu items. For "category" use the row's Category/Type value if present, else "Other".
-Return JSON: {"categories":[...],"menuItems":[{"name":"","description":"","price":0,"category":"...","isVeg":true,"shortCode":"1"}]}
+3) VARIANTS: If price column shows multiple values (e.g., "110/180", "Half/Full"), extract as "variants":[{"name":"Half","price":110},{"name":"Full","price":180}]. Otherwise use "variants":[].
+Return JSON: {"categories":[...],"menuItems":[{"name":"","description":"","price":0,"category":"...","isVeg":true,"shortCode":"1","variants":[]}]}
 shortCode: 1,2,3... If NOT a menu: {"categories":[],"menuItems":[]}`
             },
             { type: "image_url", image_url: { url: csvUrl, detail: "high" } }
@@ -1295,7 +1297,8 @@ const extractMenuFromDocument = async (docUrl) => {
               type: "text",
               text: `Analyze this document. If it is a menu: 1) List section headers as "categories":[{"name":"SectionName","order":1}]. If no sections, "categories":[].
 2) Extract ALL items; "category" = section name or "Other".
-Return JSON: {"categories":[...],"menuItems":[{"name":"","description":"","price":0,"category":"...","isVeg":true,"shortCode":"1"}]}
+3) VARIANTS: If item shows multiple sizes/prices (e.g., "Half ₹110/Full ₹180", "110/180"), extract as "variants":[{"name":"Half","price":110},{"name":"Full","price":180}]. Otherwise use "variants":[].
+Return JSON: {"categories":[...],"menuItems":[{"name":"","description":"","price":0,"category":"...","isVeg":true,"shortCode":"1","variants":[]}]}
 shortCode: 1,2,3... If NOT a menu: {"categories":[],"menuItems":[]}`
             },
             { type: "image_url", image_url: { url: docUrl, detail: "high" } }
@@ -1347,9 +1350,19 @@ STEP 1 – CATEGORIES FROM THE MENU (PRIORITY):
 - If the menu has NO section headers at all, use: "categories": []
 - DO NOT use a fixed list – use ONLY the category/section names that appear in THIS menu.
 
-STEP 2 – MENU ITEMS:
+STEP 2 – MENU ITEMS WITH VARIANTS:
 - Extract EVERY menu item. For each item, set "category" to the EXACT section name under which it appears (must match one of the names in "categories").
 - If the menu has no sections (categories: []), set each item’s "category" to "Other".
+
+IMPORTANT – VARIANTS DETECTION:
+- Many items have SIZE/PORTION variants with different prices (e.g., "Half ₹110 / Full ₹180", "Dal Half/Dal Full ₹110/₹180", "Small/Medium/Large", "110/180").
+- When you see such patterns, extract them as VARIANTS:
+  * If item shows "Half ₹110 / Full ₹180" → create ONE item with name "Item Name" and variants: [{"name":"Half","price":110},{"name":"Full","price":180}]
+  * If item shows "Dal Half/Dal Full" or "Dal 110/180" → create ONE item "Dal" with variants: [{"name":"Half","price":110},{"name":"Full","price":180}]
+  * If item shows multiple sizes like "Small ₹50 / Medium ₹80 / Large ₹120" → variants: [{"name":"Small","price":50},{"name":"Medium","price":80},{"name":"Large","price":120}]
+  * If prices are shown as "110/180" or "₹110/₹180" → typically means Half/Full variants
+- For items WITH variants: set "price" to the LOWEST variant price (or 0 if unclear), and include "variants" array.
+- For items WITHOUT variants: set "price" normally and use "variants": [] or omit it.
 
 Return ONLY valid JSON in this exact format:
 {
@@ -1367,7 +1380,20 @@ Return ONLY valid JSON in this exact format:
       "isVeg": true,
       "spiceLevel": "mild|medium|hot",
       "allergens": ["dairy", "gluten", "nuts"],
-      "shortCode": "1"
+      "shortCode": "1",
+      "variants": []
+    },
+    {
+      "name": "Dal",
+      "description": "Lentil curry",
+      "price": 110,
+      "category": "Main Course",
+      "isVeg": true,
+      "shortCode": "2",
+      "variants": [
+        { "name": "Half", "price": 110, "description": "" },
+        { "name": "Full", "price": 180, "description": "" }
+      ]
     }
   ]
 }
@@ -1381,7 +1407,8 @@ RULES:
 3. Prices: numbers only (remove ₹, $, etc.)
 4. isVeg: true/false based on dish. shortCode: sequential 1, 2, 3...
 5. description: "" if missing. allergens: only if mentioned.
-6. Be thorough – do not skip items.`
+6. VARIANTS: Look for patterns like "Half/Full", "Small/Medium/Large", "110/180", "₹110/₹180", or any item showing multiple prices. Extract as variants array.
+7. Be thorough – do not skip items.`
             },
             {
               type: "image_url",
@@ -1417,8 +1444,8 @@ RULES:
               {
                 type: "text",
                 text: `Extract menu from this image. Return JSON:
-{"categories": [{"name":"SectionName","order":1}], "menuItems": [{"name":"","price":0,"category":"SectionName","isVeg":true,"shortCode":"1"}]}
-Use EXACT section names from the menu for "categories" and each item’s "category". If no sections, use "categories":[] and item "category":"Other". shortCode: 1,2,3...`
+{"categories": [{"name":"SectionName","order":1}], "menuItems": [{"name":"","price":0,"category":"SectionName","isVeg":true,"shortCode":"1","variants":[]}]}
+Use EXACT section names. If item shows variants (e.g., "Half ₹110/Full ₹180"), use "variants":[{"name":"Half","price":110},{"name":"Full","price":180}]. If no sections, use "categories":[] and item "category":"Other". shortCode: 1,2,3...`
               },
               { type: "image_url", image_url: { url: imageUrl, detail: "high" } }
             ]
@@ -5408,12 +5435,32 @@ app.post('/api/menus/bulk-save/:restaurantId', authenticateToken, async (req, re
         const resolvedId = rawCat ? categoryNameToId(rawCat) : '';
         const categoryId = (resolvedId && validCategoryIds.has(resolvedId)) ? resolvedId : 'other';
 
+        // Process variants if present
+        let variants = [];
+        if (item.variants && Array.isArray(item.variants) && item.variants.length > 0) {
+          variants = item.variants
+            .filter(v => v && v.name && (v.price != null))
+            .map(v => ({
+              name: String(v.name).trim(),
+              price: parseFloat(v.price) || 0,
+              description: (v.description || '').trim()
+            }));
+          if (variants.length > 0) {
+            console.log(`📦 Item "${item.name}" has ${variants.length} variants:`, variants.map(v => `${v.name} ₹${v.price}`).join(', '));
+          }
+        }
+
+        // If item has variants, use the lowest variant price as base price, or 0
+        const basePrice = variants.length > 0 
+          ? Math.min(...variants.map(v => v.price))
+          : (parseFloat(item.price) || 0);
+
         const menuItem = {
           id: `item_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
           restaurantId,
           name: item.name || 'Unnamed Item',
           description: item.description || '',
-          price: parseFloat(item.price) || 0,
+          price: basePrice,
           category: categoryId,
           isVeg: Boolean(item.isVeg),
           spiceLevel: item.spiceLevel || 'medium',
@@ -5427,6 +5474,8 @@ app.post('/api/menus/bulk-save/:restaurantId', authenticateToken, async (req, re
           isStockManaged: false,
           availableFrom: null,
           availableUntil: null,
+          variants: variants,
+          customizations: [],
           createdAt: new Date(),
           updatedAt: new Date(),
           source: 'ai_upload',
@@ -5435,7 +5484,8 @@ app.post('/api/menus/bulk-save/:restaurantId', authenticateToken, async (req, re
 
         existingItems.push(menuItem);
         savedItems.push(menuItem);
-        console.log(`✅ Processed: ${menuItem.name} (${menuItem.category})`);
+        const variantInfo = variants.length > 0 ? ` [${variants.length} variants]` : '';
+        console.log(`✅ Processed: ${menuItem.name} (${menuItem.category})${variantInfo}`);
       } catch (error) {
         console.error(`Error processing ${item.name}:`, error);
         errors.push(`Failed to process ${item.name}: ${error.message}`);
