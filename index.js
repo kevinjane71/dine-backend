@@ -267,20 +267,20 @@ const corsOptions = {
     
     // Check if origin is in allowed origins list
     if (allowedOrigins.includes(origin)) {
-      callback(null, true);
+      callback(null, origin); // Return the actual origin, not just true
       return;
     }
     
     // Check if origin is any subdomain of dineopen.com (allows all user-created subdomains)
     // Matches: dineopen.com, www.dineopen.com, dineopen1.dineopen.com, any-subdomain.dineopen.com, etc.
     if (origin.match(/^https:\/\/([a-zA-Z0-9-]+\.)*dineopen\.com$/)) {
-      callback(null, true);
+      callback(null, origin); // Return the actual origin, not just true
       return;
     }
     
     // Check if origin is a localhost subdomain (for development)
     if (origin.match(/^http:\/\/[a-zA-Z0-9-]+\.localhost:(3001|3002)$/)) {
-      callback(null, true);
+      callback(null, origin); // Return the actual origin, not just true
       return;
     }
     
