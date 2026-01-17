@@ -265,22 +265,22 @@ const corsOptions = {
       return;
     }
     
-    // Check if origin is in allowed origins list
-    if (allowedOrigins.includes(origin)) {
-      callback(null, origin); // Return the actual origin, not just true
+    // SIMPLE: Allow ALL dineopen.com domains and subdomains
+    // This includes: dineopen.com, www.dineopen.com, *.dineopen.com (any subdomain)
+    if (origin.includes('dineopen.com')) {
+      callback(null, origin); // Return the actual origin
       return;
     }
     
-    // Check if origin is any subdomain of dineopen.com (allows all user-created subdomains)
-    // Matches: dineopen.com, www.dineopen.com, dineopen1.dineopen.com, any-subdomain.dineopen.com, etc.
-    if (origin.match(/^https:\/\/([a-zA-Z0-9-]+\.)*dineopen\.com$/)) {
-      callback(null, origin); // Return the actual origin, not just true
+    // Check if origin is in allowed origins list
+    if (allowedOrigins.includes(origin)) {
+      callback(null, origin);
       return;
     }
     
     // Check if origin is a localhost subdomain (for development)
     if (origin.match(/^http:\/\/[a-zA-Z0-9-]+\.localhost:(3001|3002)$/)) {
-      callback(null, origin); // Return the actual origin, not just true
+      callback(null, origin);
       return;
     }
     
@@ -295,17 +295,52 @@ const corsOptions = {
 
 app.use(cors(corsOptions));
 
-// Explicitly set CORS header to match request origin (ensures dynamic subdomains work)
-// This middleware runs after CORS to ensure the correct origin is always set
+// CRITICAL: Override response methods to ALWAYS set correct CORS header
+// This ensures the CORS header is set correctly even if other code tries to override it
 app.use((req, res, next) => {
   const origin = req.headers.origin;
+  
+  // Store original methods
+  const originalJson = res.json.bind(res);
+  const originalSend = res.send.bind(res);
+  const originalEnd = res.end.bind(res);
+  
+  // Helper to set CORS headers - ALWAYS uses the request origin
+  const setCorsHeaders = () => {
+    if (origin) {
+      // SIMPLE: Allow ALL dineopen.com domains and subdomains
+      if (origin.includes('dineopen.com') || allowedOrigins.includes(origin)) {
+        // CRITICAL: Always use the request origin, never a cached or restaurant-specific value
+        res.removeHeader('Access-Control-Allow-Origin'); // Remove any existing incorrect header
+        res.setHeader('Access-Control-Allow-Origin', origin);
+        res.setHeader('Access-Control-Allow-Credentials', 'true');
+      }
+    }
+  };
+  
+  // Override res.json to set CORS before sending
+  res.json = function(data) {
+    setCorsHeaders();
+    return originalJson(data);
+  };
+  
+  // Override res.send to set CORS before sending
+  res.send = function(data) {
+    setCorsHeaders();
+    return originalSend(data);
+  };
+  
+  // Override res.end to set CORS before ending
+  res.end = function(data, encoding) {
+    setCorsHeaders();
+    return originalEnd(data, encoding);
+  };
   
   // Handle OPTIONS preflight requests
   if (req.method === 'OPTIONS') {
     if (origin) {
-      // Allow all dineopen.com subdomains
-      if (origin.match(/^https:\/\/([a-zA-Z0-9-]+\.)*dineopen\.com$/) || 
-          allowedOrigins.includes(origin)) {
+      // SIMPLE: Allow ALL dineopen.com domains and subdomains
+      if (origin.includes('dineopen.com') || allowedOrigins.includes(origin)) {
         res.setHeader('Access-Control-Allow-Origin', origin);
         res.setHeader('Access-Control-Allow-Credentials', 'true');
         res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS, PATCH');
@@ -315,15 +350,8 @@ app.use((req, res, next) => {
     }
   }
   
-  // For all other requests, ensure CORS header matches request origin
-  if (origin) {
-    // Allow all dineopen.com subdomains
-    if (origin.match(/^https:\/\/([a-zA-Z0-9-]+\.)*dineopen\.com$/) || 
-        allowedOrigins.includes(origin)) {
-      res.setHeader('Access-Control-Allow-Origin', origin);
-      res.setHeader('Access-Control-Allow-Credentials', 'true');
-    }
-  }
+  // Set CORS headers for all requests
+  setCorsHeaders();
   
   next();
 });
