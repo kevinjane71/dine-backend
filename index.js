@@ -3276,14 +3276,90 @@ app.delete('/api/menus/item/:id', authenticateToken, async (req, res) => {
       }
     });
     
-    res.json({ 
+    res.json({
       message: 'Menu item deleted successfully',
       note: 'Item has been soft deleted and can be restored if needed'
     });
-    
+
   } catch (error) {
     console.error('Delete menu item error:', error);
     res.status(500).json({ error: 'Failed to delete menu item' });
+  }
+});
+
+// Bulk delete all menu items for a restaurant
+app.delete('/api/menus/:restaurantId/bulk-delete', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+    const { userId } = req.user;
+
+    // Get the restaurant
+    const restaurantDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
+
+    if (!restaurantDoc.exists) {
+      return res.status(404).json({ error: 'Restaurant not found' });
+    }
+
+    const restaurantData = restaurantDoc.data();
+
+    // Check if user owns the restaurant
+    if (restaurantData.ownerId !== userId) {
+      return res.status(403).json({ error: 'Access denied. You can only delete menu items for your own restaurant.' });
+    }
+
+    // Get current menu
+    const currentMenu = restaurantData.menu || { categories: [], items: [] };
+
+    // Count active items before deletion
+    const activeItemsCount = currentMenu.items.filter(item => item.status !== 'deleted').length;
+
+    if (activeItemsCount === 0) {
+      return res.status(400).json({
+        error: 'No active menu items to delete',
+        deletedCount: 0
+      });
+    }
+
+    // Soft delete all items by setting status to 'deleted'
+    const deletedTimestamp = new Date();
+    const updatedItems = currentMenu.items.map(item => ({
+      ...item,
+      status: 'deleted',
+      deletedAt: deletedTimestamp,
+      updatedAt: deletedTimestamp
+    }));
+
+    // Update categories as well
+    const updatedCategories = currentMenu.categories.map(category => ({
+      ...category,
+      items: (category.items || []).map(item => ({
+        ...item,
+        status: 'deleted',
+        deletedAt: deletedTimestamp,
+        updatedAt: deletedTimestamp
+      }))
+    }));
+
+    // Update the restaurant document
+    await db.collection(collections.restaurants).doc(restaurantId).update({
+      menu: {
+        categories: updatedCategories,
+        items: updatedItems,
+        lastUpdated: deletedTimestamp
+      }
+    });
+
+    console.log(`✅ Bulk deleted ${activeItemsCount} menu items for restaurant ${restaurantId}`);
+
+    res.json({
+      message: `Successfully deleted all ${activeItemsCount} menu items`,
+      deletedCount: activeItemsCount,
+      note: 'All items have been soft deleted and can be restored if needed'
+    });
+
+  } catch (error) {
+    console.error('Bulk delete menu items error:', error);
+    res.status(500).json({ error: 'Failed to delete menu items' });
   }
 });
 
