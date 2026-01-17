@@ -1181,37 +1181,36 @@ const uploadToFirebase = async (file, restaurantId) => {
 };
 
 // Enhanced function to extract menu from any file type (images, PDFs, docs, CSV, etc.)
+// All extractors return { categories: [{ name, order }], menuItems: [...] }
 const extractMenuFromAnyFile = async (fileUrl, fileType, fileName) => {
   try {
     console.log(`🔍 Starting enhanced menu extraction for ${fileType} file: ${fileName}`);
-    
-    // Determine the appropriate extraction method based on file type
+    let result;
     if (fileType.startsWith('image/')) {
-      return await extractMenuFromImage(fileUrl);
+      result = await extractMenuFromImage(fileUrl);
     } else if (fileType === 'application/pdf') {
-      return await extractMenuFromPDF(fileUrl);
+      result = await extractMenuFromPDF(fileUrl);
     } else if (fileType.includes('csv') || fileType.includes('excel') || fileType.includes('spreadsheet')) {
-      return await extractMenuFromCSV(fileUrl);
+      result = await extractMenuFromCSV(fileUrl);
     } else if (fileType.includes('document') || fileType.includes('text')) {
-      return await extractMenuFromDocument(fileUrl);
+      result = await extractMenuFromDocument(fileUrl);
     } else {
-      // For unknown file types, try image extraction as fallback
       console.log('⚠️ Unknown file type, attempting image extraction as fallback...');
-      return await extractMenuFromImage(fileUrl);
+      result = await extractMenuFromImage(fileUrl);
     }
-    
+    if (!Array.isArray(result.categories)) result.categories = [];
+    if (!Array.isArray(result.menuItems)) result.menuItems = [];
+    return result;
   } catch (error) {
     console.error('❌ Enhanced extraction failed:', error);
-    // Return empty result instead of throwing error
-    return { menuItems: [] };
+    return { categories: [], menuItems: [] };
   }
 };
 
-// Extract menu from PDF files
+// Extract menu from PDF files. Returns { categories, menuItems }. Prefer section headers from document as categories.
 const extractMenuFromPDF = async (pdfUrl) => {
   try {
     console.log('📄 Extracting menu from PDF...');
-    
     const response = await openai.chat.completions.create({
       model: "gpt-4o",
       messages: [
@@ -1220,68 +1219,35 @@ const extractMenuFromPDF = async (pdfUrl) => {
           content: [
             {
               type: "text",
-              text: `This is a PDF document that may contain a restaurant menu. Please analyze the content and extract any menu items you can find.
-
-IMPORTANT: 
-- This might be a PDF, document, or any text-based file
-- Look for menu items, prices, and descriptions
-- If this is NOT a menu or contains no menu data, return empty array
-- Extract ALL visible menu items with their prices
-
-Return JSON:
-{
-  "menuItems": [
-    {
-      "name": "Item Name",
-      "description": "Item description",
-      "price": 100,
-      "category": "main-course",
-      "isVeg": true,
-      "shortCode": "1"
-    }
-  ]
-}
-
-Categories: appetizer, main-course, dessert, beverages, rice, bread, dal, fast-food, chinese, pizza, south-indian, north-indian
-
-RULES:
-- Generate shortCode: sequential numbers starting from 1 (1, 2, 3, 4, etc.)
-- If no menu items are found, return: {"menuItems": []}`
+              text: `Analyze this document. If it is a restaurant menu: 1) List section headers (Starters, Main Course, Beverages, etc.) in "categories" as [{"name":"SectionName","order":1}]. Use EXACT names from the document. If no sections, use "categories":[].
+2) Extract ALL menu items. For each, set "category" to the section name it appears under, or "Other" if no sections.
+Return JSON: {"categories":[...],"menuItems":[{"name":"","description":"","price":0,"category":"SectionName or Other","isVeg":true,"shortCode":"1"}]}
+shortCode: 1,2,3... If NOT a menu: {"categories":[],"menuItems":[]}`
             },
-            {
-              type: "image_url",
-              image_url: {
-                url: pdfUrl,
-                detail: "high"
-              }
-            }
+            { type: "image_url", image_url: { url: pdfUrl, detail: "high" } }
           ]
         }
       ],
       max_tokens: 8000,
       temperature: 0.1
     });
-    
     const content = response.choices[0].message.content;
     const jsonMatch = content.match(/\{[\s\S]*\}/);
     if (jsonMatch) {
-      const extractedData = JSON.parse(jsonMatch[0]);
-      console.log('✅ PDF extraction successful:', extractedData.menuItems?.length || 0, 'items');
-      return extractedData;
+      const d = JSON.parse(jsonMatch[0]);
+      return { categories: Array.isArray(d.categories) ? d.categories : [], menuItems: Array.isArray(d.menuItems) ? d.menuItems : [] };
     }
-    
-    return { menuItems: [] };
+    return { categories: [], menuItems: [] };
   } catch (error) {
     console.error('❌ PDF extraction failed:', error);
-    return { menuItems: [] };
+    return { categories: [], menuItems: [] };
   }
 };
 
-// Extract menu from CSV/Excel files
+// Extract menu from CSV/Excel. Use Category column if present as categories; else categories:[] and item.category="Other".
 const extractMenuFromCSV = async (csvUrl) => {
   try {
     console.log('📊 Extracting menu from CSV/Excel...');
-    
     const response = await openai.chat.completions.create({
       model: "gpt-4o",
       messages: [
@@ -1290,67 +1256,80 @@ const extractMenuFromCSV = async (csvUrl) => {
           content: [
             {
               type: "text",
-              text: `This is a CSV, Excel, or spreadsheet file that may contain restaurant menu data. Please analyze the content and extract any menu items.
-
-IMPORTANT: 
-- Look for columns with item names, prices, descriptions, categories
-- Common column names: Name, Item, Price, Cost, Description, Category, Type
-- If this is NOT a menu or contains no menu data, return empty array
-- Extract ALL menu items with their prices
-
-Return JSON:
-{
-  "menuItems": [
-    {
-      "name": "Item Name",
-      "description": "Item description",
-      "price": 100,
-      "category": "main-course",
-      "isVeg": true,
-      "shortCode": "1"
-    }
-  ]
-}
-
-Categories: appetizer, main-course, dessert, beverages, rice, bread, dal, fast-food, chinese, pizza, south-indian, north-indian
-
-RULES:
-- Generate shortCode: sequential numbers starting from 1 (1, 2, 3, 4, etc.)
-- If no menu items are found, return: {"menuItems": []}`
+              text: `This may be a menu in CSV/Excel. 1) If there is a Category/Type column, collect unique values as "categories":[{"name":"X","order":1},...]. If no category column, use "categories":[].
+2) Extract ALL rows as menu items. For "category" use the row's Category/Type value if present, else "Other".
+Return JSON: {"categories":[...],"menuItems":[{"name":"","description":"","price":0,"category":"...","isVeg":true,"shortCode":"1"}]}
+shortCode: 1,2,3... If NOT a menu: {"categories":[],"menuItems":[]}`
             },
-            {
-              type: "image_url",
-              image_url: {
-                url: csvUrl,
-                detail: "high"
-              }
-            }
+            { type: "image_url", image_url: { url: csvUrl, detail: "high" } }
           ]
         }
       ],
       max_tokens: 8000,
       temperature: 0.1
     });
-    
     const content = response.choices[0].message.content;
     const jsonMatch = content.match(/\{[\s\S]*\}/);
     if (jsonMatch) {
-      const extractedData = JSON.parse(jsonMatch[0]);
-      console.log('✅ CSV extraction successful:', extractedData.menuItems?.length || 0, 'items');
-      return extractedData;
+      const d = JSON.parse(jsonMatch[0]);
+      return { categories: Array.isArray(d.categories) ? d.categories : [], menuItems: Array.isArray(d.menuItems) ? d.menuItems : [] };
     }
-    
-    return { menuItems: [] };
+    return { categories: [], menuItems: [] };
   } catch (error) {
     console.error('❌ CSV extraction failed:', error);
-    return { menuItems: [] };
+    return { categories: [], menuItems: [] };
   }
 };
 
-// Extract menu from document files
+// Extract menu from document files. Use section headers as categories when present.
 const extractMenuFromDocument = async (docUrl) => {
   try {
     console.log('📝 Extracting menu from document...');
+    const response = await openai.chat.completions.create({
+      model: "gpt-4o",
+      messages: [
+        {
+          role: "user",
+          content: [
+            {
+              type: "text",
+              text: `Analyze this document. If it is a menu: 1) List section headers as "categories":[{"name":"SectionName","order":1}]. If no sections, "categories":[].
+2) Extract ALL items; "category" = section name or "Other".
+Return JSON: {"categories":[...],"menuItems":[{"name":"","description":"","price":0,"category":"...","isVeg":true,"shortCode":"1"}]}
+shortCode: 1,2,3... If NOT a menu: {"categories":[],"menuItems":[]}`
+            },
+            { type: "image_url", image_url: { url: docUrl, detail: "high" } }
+          ]
+        }
+      ],
+      max_tokens: 8000,
+      temperature: 0.1
+    });
+    const content = response.choices[0].message.content;
+    const jsonMatch = content.match(/\{[\s\S]*\}/);
+    if (jsonMatch) {
+      const d = JSON.parse(jsonMatch[0]);
+      return { categories: Array.isArray(d.categories) ? d.categories : [], menuItems: Array.isArray(d.menuItems) ? d.menuItems : [] };
+    }
+    return { categories: [], menuItems: [] };
+  } catch (error) {
+    console.error('❌ Document extraction failed:', error);
+    return { categories: [], menuItems: [] };
+  }
+};
+
+// Helper: normalize category name to id (used for storage and matching)
+const categoryNameToId = (name) => {
+  if (!name || typeof name !== 'string') return 'other';
+  return name.toLowerCase().trim().replace(/\s+/g, '-').replace(/[^a-z0-9-]/g, '');
+};
+
+// Helper function to extract menu from image using OpenAI Vision
+// Returns { categories: [{ name, order }], menuItems: [...] }
+// PREFERENCE: Use categories FROM THE MENU PHOTO first. Only if menu has no sections, use fallback.
+const extractMenuFromImage = async (imageUrl) => {
+  try {
+    console.log('🔍 Starting menu extraction – categories from menu first...');
     
     const response = await openai.chat.completions.create({
       model: "gpt-4o",
@@ -1360,92 +1339,31 @@ const extractMenuFromDocument = async (docUrl) => {
           content: [
             {
               type: "text",
-              text: `This is a document file (Word, text, or other format) that may contain restaurant menu data. Please analyze the content and extract any menu items.
+              text: `You are an expert menu extraction AI. Analyze this image and extract menu items ONLY if it is a restaurant menu.
 
-IMPORTANT: 
-- Look for menu items, prices, descriptions, categories
-- This could be a Word document, text file, or any document format
-- If this is NOT a menu or contains no menu data, return empty array
-- Extract ALL menu items with their prices
+STEP 1 – CATEGORIES FROM THE MENU (PRIORITY):
+- Menus are usually organized by SECTION HEADERS (e.g. "Starters", "Main Course", "Beverages", "Desserts", "Rice", "Breads", "Curries", "Chinese", "Pizza", custom names like "Chef Specials", "Today’s Special", etc.).
+- FIRST list ALL section/section headers you see in the menu, in the ORDER they appear. Use the EXACT name as written (e.g. "Starters", "Main Course", "Tandoor", "Indian Breads").
+- If the menu has NO section headers at all, use: "categories": []
+- DO NOT use a fixed list – use ONLY the category/section names that appear in THIS menu.
 
-Return JSON:
-{
-  "menuItems": [
-    {
-      "name": "Item Name",
-      "description": "Item description",
-      "price": 100,
-      "category": "main-course",
-      "isVeg": true,
-      "shortCode": "1"
-    }
-  ]
-}
-
-Categories: appetizer, main-course, dessert, beverages, rice, bread, dal, fast-food, chinese, pizza, south-indian, north-indian
-
-RULES:
-- Generate shortCode: sequential numbers starting from 1 (1, 2, 3, 4, etc.)
-- If no menu items are found, return: {"menuItems": []}`
-            },
-            {
-              type: "image_url",
-              image_url: {
-                url: docUrl,
-                detail: "high"
-              }
-            }
-          ]
-        }
-      ],
-      max_tokens: 8000,
-      temperature: 0.1
-    });
-    
-    const content = response.choices[0].message.content;
-    const jsonMatch = content.match(/\{[\s\S]*\}/);
-    if (jsonMatch) {
-      const extractedData = JSON.parse(jsonMatch[0]);
-      console.log('✅ Document extraction successful:', extractedData.menuItems?.length || 0, 'items');
-      return extractedData;
-    }
-    
-    return { menuItems: [] };
-  } catch (error) {
-    console.error('❌ Document extraction failed:', error);
-    return { menuItems: [] };
-  }
-};
-
-// Helper function to extract menu from image using OpenAI Vision
-const extractMenuFromImage = async (imageUrl) => {
-  try {
-    console.log('🔍 Starting menu extraction with enhanced prompt...');
-    
-    const response = await openai.chat.completions.create({
-      model: "gpt-4o", // Updated to latest model
-      messages: [
-        {
-          role: "user",
-          content: [
-            {
-              type: "text",
-              text: `You are an expert menu extraction AI. Analyze this image and extract menu items if this is a restaurant menu.
-
-IMPORTANT: 
-- This could be ANY type of file: image, PDF, document, CSV, live photo, etc.
-- If this is NOT a restaurant menu or contains no menu data, return empty array
-- If this IS a menu, extract EVERY SINGLE menu item visible
-- Scan the entire content systematically
+STEP 2 – MENU ITEMS:
+- Extract EVERY menu item. For each item, set "category" to the EXACT section name under which it appears (must match one of the names in "categories").
+- If the menu has no sections (categories: []), set each item’s "category" to "Other".
 
 Return ONLY valid JSON in this exact format:
 {
+  "categories": [
+    { "name": "Starters", "order": 1 },
+    { "name": "Main Course", "order": 2 },
+    { "name": "Beverages", "order": 3 }
+  ],
   "menuItems": [
     {
       "name": "Item Name",
       "description": "Item description",
       "price": 100,
-      "category": "appetizer|main-course|dessert|beverages|bread|rice|dal|fast-food|chinese|pizza|south-indian|north-indian",
+      "category": "Starters",
       "isVeg": true,
       "spiceLevel": "mild|medium|hot",
       "allergens": ["dairy", "gluten", "nuts"],
@@ -1454,66 +1372,42 @@ Return ONLY valid JSON in this exact format:
   ]
 }
 
-Categories:
-- appetizer: Starters, snacks, small plates
-- main-course: Main dishes, entrees
-- dessert: Sweet dishes, ice cream, cakes
-- beverages: Drinks, juices, tea, coffee
-- rice: Rice dishes, biryani, pulao
-- bread: Roti, naan, paratha
-- dal: Dal, curry, gravy dishes
-- fast-food: Burgers, sandwiches
-- chinese: Chinese cuisine
-- pizza: Pizza varieties
-- south-indian: Dosa, idli, sambar
-- north-indian: North Indian curries
+FALLBACK (only when the menu has NO section headers):
+- If categories: [], then set every menuItem.category to "Other".
 
 RULES:
-1. If this is NOT a menu, return: {"menuItems": []}
-2. If this IS a menu, extract ALL visible menu items
-3. Convert prices to numbers only (remove ₹, $, etc.)
-4. Set isVeg: true for vegetarian, false for non-vegetarian
-5. Generate shortCode: sequential numbers starting from 1 (1, 2, 3, 4, etc.)
-6. Include allergens only if mentioned
-7. If no description, use empty string ""
-8. Be thorough - don't skip any items`
+1. If this is NOT a menu, return: {"categories": [], "menuItems": []}
+2. If it IS a menu, extract ALL visible items; category must match a "categories[].name" or "Other".
+3. Prices: numbers only (remove ₹, $, etc.)
+4. isVeg: true/false based on dish. shortCode: sequential 1, 2, 3...
+5. description: "" if missing. allergens: only if mentioned.
+6. Be thorough – do not skip items.`
             },
             {
               type: "image_url",
-              image_url: {
-                url: imageUrl,
-                detail: "high" // Enhanced detail for better text recognition
-              }
+              image_url: { url: imageUrl, detail: "high" }
             }
           ]
         }
       ],
-      max_tokens: 8000, // Increased token limit
-      temperature: 0.1 // Lower temperature for more consistent results
+      max_tokens: 8000,
+      temperature: 0.1
     });
 
     const content = response.choices[0].message.content;
-    console.log('📄 Raw ChatGPT response length:', content.length);
-    console.log('📄 Raw ChatGPT response preview:', content.substring(0, 200) + '...');
-    
-    // Extract JSON from the response with better error handling
     const jsonMatch = content.match(/\{[\s\S]*\}/);
     if (jsonMatch) {
-      const extractedData = JSON.parse(jsonMatch[0]);
-      console.log('✅ Successfully extracted menu items:', extractedData.menuItems?.length || 0);
-      return extractedData;
+      const parsed = JSON.parse(jsonMatch[0]);
+      const categories = Array.isArray(parsed.categories) ? parsed.categories : [];
+      const menuItems = Array.isArray(parsed.menuItems) ? parsed.menuItems : [];
+      console.log('✅ Extracted categories from menu:', categories.length, '| items:', menuItems.length);
+      return { categories, menuItems };
     }
-    
-    // If no JSON found, try to extract any structured data
-    console.log('⚠️ No JSON found, attempting to parse response...');
     throw new Error('No valid JSON found in response');
-    
   } catch (error) {
     console.error('❌ Error extracting menu from image:', error);
-    
-    // Retry with a simpler prompt
     try {
-      console.log('🔄 Retrying with simplified prompt...');
+      console.log('🔄 Retry with simplified prompt...');
       const retryResponse = await openai.chat.completions.create({
         model: "gpt-4o",
         messages: [
@@ -1522,49 +1416,27 @@ RULES:
             content: [
               {
                 type: "text",
-                text: `Extract all menu items from this image. Return JSON format:
-{
-  "menuItems": [
-    {
-      "name": "Item Name",
-      "price": 100,
-      "category": "main-course",
-      "isVeg": true,
-      "shortCode": "1"
-    }
-  ]
-}
-
-Extract EVERY item visible. Categories: appetizer, main-course, dessert, beverages, rice, bread, dal, fast-food, chinese, pizza, south-indian, north-indian.
-
-RULES:
-- Generate shortCode: sequential numbers starting from 1 (1, 2, 3, 4, etc.)`
+                text: `Extract menu from this image. Return JSON:
+{"categories": [{"name":"SectionName","order":1}], "menuItems": [{"name":"","price":0,"category":"SectionName","isVeg":true,"shortCode":"1"}]}
+Use EXACT section names from the menu for "categories" and each item’s "category". If no sections, use "categories":[] and item "category":"Other". shortCode: 1,2,3...`
               },
-              {
-                type: "image_url",
-                image_url: {
-                  url: imageUrl,
-                  detail: "high"
-                }
-              }
+              { type: "image_url", image_url: { url: imageUrl, detail: "high" } }
             ]
           }
         ],
         max_tokens: 6000,
         temperature: 0.1
       });
-      
       const retryContent = retryResponse.choices[0].message.content;
-      const retryJsonMatch = retryContent.match(/\{[\s\S]*\}/);
-      if (retryJsonMatch) {
-        const retryData = JSON.parse(retryJsonMatch[0]);
-        console.log('✅ Retry successful, extracted items:', retryData.menuItems?.length || 0);
-        return retryData;
+      const retryMatch = retryContent.match(/\{[\s\S]*\}/);
+      if (retryMatch) {
+        const data = JSON.parse(retryMatch[0]);
+        return {
+          categories: Array.isArray(data.categories) ? data.categories : [],
+          menuItems: Array.isArray(data.menuItems) ? data.menuItems : []
+        };
       }
-    } catch (retryError) {
-      console.error('❌ Retry also failed:', retryError);
-    }
-    
+    } catch (e) { console.error('Retry failed:', e); }
     throw error;
   }
 };
@@ -5375,6 +5247,7 @@ app.post('/api/menus/bulk-upload/:restaurantId', authenticateToken, chatgptUsage
           file: uploadedFile.originalName,
           fileType: uploadedFile.mimetype,
           menuItems: menuItemsWithFile,
+          categories: menuData.categories || [],
           extractionStatus: menuItemsWithFile.length > 0 ? 'success' : 'no_menu_data',
           message: menuItemsWithFile.length > 0 ? 'Menu items extracted successfully' : 'No menu data found in this file'
         });
@@ -5391,6 +5264,7 @@ app.post('/api/menus/bulk-upload/:restaurantId', authenticateToken, chatgptUsage
           file: uploadedFile.originalName,
           fileType: uploadedFile.mimetype,
           menuItems: [],
+          categories: [],
           extractionStatus: 'failed',
           message: `Failed to extract menu: ${error.message}`,
           error: error.message
@@ -5403,6 +5277,24 @@ app.post('/api/menus/bulk-upload/:restaurantId', authenticateToken, chatgptUsage
     console.log('Menus extracted:', extractedMenus.length);
     console.log('Extraction errors:', errors.length);
 
+    // Merge unique categories from all extractions (by id) for bulk-save
+    const seenIds = new Set();
+    const extractedCategories = [];
+    for (const m of extractedMenus) {
+      for (const c of (m.categories || [])) {
+        const id = categoryNameToId(c.name);
+        if (id && !seenIds.has(id)) {
+          seenIds.add(id);
+          extractedCategories.push({ name: (c.name || '').trim() || 'Other', order: extractedCategories.length + 1 });
+        }
+      }
+    }
+    // Also ensure "other" exists if any item used it
+    const hasOther = extractedMenus.some(m => (m.menuItems || []).some(i => /^other$/i.test((i.category || '').trim())));
+    if (hasOther && !seenIds.has('other')) {
+      extractedCategories.push({ name: 'Other', order: extractedCategories.length + 1 });
+    }
+
     // Prepare response with detailed status
     const response = {
       success: errors.length === 0,
@@ -5413,6 +5305,7 @@ app.post('/api/menus/bulk-upload/:restaurantId', authenticateToken, chatgptUsage
       extractedMenus: extractedMenus.length,
       errors: errors,
       data: extractedMenus,
+      extractedCategories,
       summary: {
         totalFiles: files.length,
         uploadedSuccessfully: uploadedFiles.length,
@@ -5462,193 +5355,110 @@ app.post('/api/menus/bulk-upload/:restaurantId', authenticateToken, chatgptUsage
   }
 });
 
-// Save extracted menu items to database
+// Save extracted menu items to database. Accepts { menuItems, categories? }.
+// Categories from extraction (menu photo) are merged into restaurant.categories. Item category uses dynamic id; fallback only when missing.
 app.post('/api/menus/bulk-save/:restaurantId', authenticateToken, async (req, res) => {
   try {
     const { restaurantId } = req.params;
     const { userId } = req.user;
-    const { menuItems } = req.body;
+    const { menuItems, categories: extractedCategories = [] } = req.body;
 
     console.log(`\n=== BULK SAVE REQUEST ===`);
     console.log('Restaurant ID:', restaurantId);
-    console.log('User ID:', userId);
-    console.log('Menu items received:', menuItems ? menuItems.length : 'No items');
-    
-    if (menuItems && menuItems.length > 0) {
-      console.log('First item sample:', JSON.stringify(menuItems[0], null, 2));
-    }
+    console.log('Menu items:', menuItems?.length || 0, '| Extracted categories:', extractedCategories?.length || 0);
 
     if (!menuItems || !Array.isArray(menuItems)) {
       return res.status(400).json({ error: 'Menu items array is required' });
     }
 
-    // Check if user owns the restaurant
-    const restaurant = await db.collection(collections.restaurants).doc(restaurantId).get();
-    if (!restaurant.exists || restaurant.data().ownerId !== userId) {
+    const restaurantDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
+    if (!restaurantDoc.exists || restaurantDoc.data().ownerId !== userId) {
       return res.status(403).json({ error: 'Access denied' });
+    }
+
+    const restaurantData = restaurantDoc.data();
+    const existingMenu = restaurantData.menu || { items: [] };
+    const existingItems = [...(existingMenu.items || [])];
+    // Use restaurant.categories (what getCategories returns), not menu.categories
+    let existingCategories = [...(restaurantData.categories || [])];
+
+    // Merge extracted categories into restaurant.categories (by unique id)
+    for (const c of extractedCategories) {
+      const name = (c && c.name) ? String(c.name).trim() : '';
+      if (!name) continue;
+      const id = categoryNameToId(name);
+      if (!id) continue;
+      if (!existingCategories.some(cat => (cat.id || '').toLowerCase() === id)) {
+        existingCategories.push({ id, name, emoji: '🍽️', description: '' });
+        console.log('📂 Merged extracted category:', id, name);
+      }
+    }
+    // Ensure 'other' exists for items without a matching category
+    if (!existingCategories.some(c => (c.id || '').toLowerCase() === 'other')) {
+      existingCategories.push({ id: 'other', name: 'Other', emoji: '🍽️', description: '' });
     }
 
     const savedItems = [];
     const errors = [];
+    const validCategoryIds = new Set(existingCategories.map(c => (c.id || '').toLowerCase()));
 
-    // Get the restaurant document to update its menu
-    const restaurantDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
-    if (!restaurantDoc.exists) {
-      return res.status(404).json({ error: 'Restaurant not found' });
-    }
-
-    const restaurantData = restaurantDoc.data();
-    const existingMenu = restaurantData.menu || { categories: [], items: [] };
-    const existingItems = existingMenu.items || [];
-    const existingCategories = existingMenu.categories || [];
-
-    console.log('📋 Existing menu structure:', {
-      hasMenu: !!restaurantData.menu,
-      existingItemsCount: existingItems.length,
-      existingCategoriesCount: existingCategories.length,
-      firstExistingItem: existingItems[0] ? existingItems[0].name : 'No items'
-    });
-
-    // Process each menu item
     for (const item of menuItems) {
       try {
-        // Map AI category to our category system
-        const mapAICategory = (aiCategory) => {
-          if (!aiCategory) return 'main-course';
-          
-          const categoryMap = {
-            'appetizer': 'appetizer',
-            'appetizers': 'appetizer',
-            'starter': 'appetizer',
-            'starters': 'appetizer',
-            'main course': 'main-course',
-            'main': 'main-course',
-            'mains': 'main-course',
-            'entree': 'main-course',
-            'entrees': 'main-course',
-            'dessert': 'dessert',
-            'desserts': 'dessert',
-            'sweet': 'dessert',
-            'beverage': 'beverages',
-            'beverages': 'beverages',
-            'drink': 'beverages',
-            'drinks': 'beverages',
-            'rice': 'rice',
-            'biryani': 'rice',
-            'bread': 'bread',
-            'roti': 'bread',
-            'naan': 'bread',
-            'dal': 'dal',
-            'curry': 'dal',
-            'curries': 'dal',
-            'fast food': 'fast-food',
-            'fastfood': 'fast-food',
-            'burger': 'fast-food',
-            'pizza': 'pizza',
-            'chinese': 'chinese',
-            'south indian': 'south-indian',
-            'north indian': 'north-indian'
-          };
-          
-          const normalizedCategory = aiCategory.toLowerCase().trim();
-          return categoryMap[normalizedCategory] || 'main-course';
-        };
+        const rawCat = (item.category != null && item.category !== '') ? String(item.category).trim() : '';
+        const resolvedId = rawCat ? categoryNameToId(rawCat) : '';
+        const categoryId = (resolvedId && validCategoryIds.has(resolvedId)) ? resolvedId : 'other';
 
-        // Convert AI extracted data to match manual menu item format
         const menuItem = {
-          id: `item_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`, // Generate unique ID
-        restaurantId,
+          id: `item_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+          restaurantId,
           name: item.name || 'Unnamed Item',
           description: item.description || '',
           price: parseFloat(item.price) || 0,
-          category: mapAICategory(item.category),
+          category: categoryId,
           isVeg: Boolean(item.isVeg),
           spiceLevel: item.spiceLevel || 'medium',
           allergens: Array.isArray(item.allergens) ? item.allergens : [],
-          shortCode: item.shortCode || item.name.substring(0, 3).toUpperCase(),
+          shortCode: item.shortCode || (item.name ? String(item.name).substring(0, 3).toUpperCase() : 'X'),
           status: 'active',
-          order: existingItems.length, // Set order based on existing items
-        isAvailable: true,
-        stockQuantity: null,
-        lowStockThreshold: 5,
-        isStockManaged: false,
-        availableFrom: null,
-        availableUntil: null,
-        createdAt: new Date(),
+          order: existingItems.length,
+          isAvailable: true,
+          stockQuantity: null,
+          lowStockThreshold: 5,
+          isStockManaged: false,
+          availableFrom: null,
+          availableUntil: null,
+          createdAt: new Date(),
           updatedAt: new Date(),
-          // Add source tracking
           source: 'ai_upload',
           originalFile: item.originalFile || null
         };
 
-        // Add to existing items
         existingItems.push(menuItem);
         savedItems.push(menuItem);
-
-        console.log(`✅ Processed item: ${menuItem.name} (${menuItem.category})`);
-        console.log(`📊 Current items count: ${existingItems.length}`);
-
-        // Add category if it doesn't exist
-        const categoryExists = existingCategories.some(cat => cat.id === menuItem.category);
-        if (!categoryExists) {
-          existingCategories.push({
-            id: menuItem.category,
-            name: menuItem.category.charAt(0).toUpperCase() + menuItem.category.slice(1).replace('-', ' '),
-            order: existingCategories.length,
-        createdAt: new Date(),
-        updatedAt: new Date()
-          });
-          console.log(`📂 Added new category: ${menuItem.category}`);
-        }
+        console.log(`✅ Processed: ${menuItem.name} (${menuItem.category})`);
       } catch (error) {
-        console.error(`Error processing menu item ${item.name}:`, error);
+        console.error(`Error processing ${item.name}:`, error);
         errors.push(`Failed to process ${item.name}: ${error.message}`);
       }
     }
 
-    // Update the restaurant document with the new menu items
     if (savedItems.length > 0) {
-      console.log(`\n=== UPDATING RESTAURANT DOCUMENT ===`);
-      console.log('Restaurant ID:', restaurantId);
-      console.log('Total items to save:', savedItems.length);
-      console.log('Total categories:', existingCategories.length);
-      console.log('Existing items before update:', existingItems.length);
-      
       const updateData = {
-        menu: {
-          categories: existingCategories,
-          items: existingItems,
-          lastUpdated: new Date()
-        },
+        categories: existingCategories,
+        menu: { ...(existingMenu || {}), items: existingItems, lastUpdated: new Date() },
         updatedAt: new Date()
       };
-      
-      console.log('Update data structure:', {
-        categoriesCount: updateData.menu.categories.length,
-        itemsCount: updateData.menu.items.length,
-        lastUpdated: updateData.menu.lastUpdated
-      });
-      
       await db.collection(collections.restaurants).doc(restaurantId).update(updateData);
-      console.log('✅ Restaurant document updated successfully');
-      
-      // Verify the update by reading the document back
-      const verifyDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
-      const verifyData = verifyDoc.data();
-      console.log('🔍 Verification - Menu items after update:', verifyData.menu?.items?.length || 0);
-      console.log('🔍 Verification - Menu categories after update:', verifyData.menu?.categories?.length || 0);
-    } else {
-      console.log('❌ No items to save, skipping database update');
+      console.log('✅ Bulk save: categories=', existingCategories.length, 'items=', existingItems.length);
     }
 
     res.json({
       message: 'Menu items saved successfully',
       savedCount: savedItems.length,
       errorCount: errors.length,
-      savedItems: savedItems,
-      errors: errors
+      savedItems,
+      errors
     });
-
   } catch (error) {
     console.error('Bulk save error:', error);
     res.status(500).json({ error: 'Bulk save failed', details: error.message });
@@ -12268,9 +12078,12 @@ app.post('/api/categories/:restaurantId', authenticateToken, async (req, res) =>
     const restaurantData = restaurantDoc.data();
     const existingCategories = restaurantData.categories || [];
 
-    // Check if category already exists
-    const categoryId = name.toLowerCase().replace(/\s+/g, '-');
-    if (existingCategories.find(cat => cat.id === categoryId)) {
+    // Check if category already exists (use same ID generation as bulk-save)
+    const categoryId = categoryNameToId(name);
+    if (!categoryId || categoryId === 'other') {
+      return res.status(400).json({ error: 'Invalid category name' });
+    }
+    if (existingCategories.find(cat => (cat.id || '').toLowerCase() === categoryId)) {
       return res.status(400).json({ error: 'Category already exists' });
     }
 
