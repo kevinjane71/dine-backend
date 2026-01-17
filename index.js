@@ -245,17 +245,39 @@ const upload = multer({
     }
   }
 });
-//hello ddd
-    const allowedOrigins = [
-      'http://localhost:3001',
-      'http://localhost:3002',
-      'http://localhost:3003',
-      'https://dine-frontend-ecru.vercel.app',
-      'https://www.dineopen.com',
-      'https://dineopen.com',
-      'https://pms-hotel.vercel.app',
-      'https://hotel.dineopen.com'
+// Feature flag for subdomain functionality
+const SUBDOMAIN_FEATURE_ENABLED = process.env.ENABLE_SUBDOMAIN === 'true'; // Default: false (disabled)
+console.log(`🌐 Subdomain feature: ${SUBDOMAIN_FEATURE_ENABLED ? 'ENABLED' : 'DISABLED'}`);
+
+// Specific allowed origins (non-dineopen.com domains)
+const allowedOrigins = [
+  'http://localhost:3001',
+  'http://localhost:3002',
+  'http://localhost:3003',
+  'https://dine-frontend-ecru.vercel.app',
+  'https://pms-hotel.vercel.app'
 ];
+
+// Helper function to check if origin is a valid dineopen.com domain or subdomain
+function isValidDineopenOrigin(origin) {
+  if (!origin) return false;
+
+  // Match exact domain and all subdomains
+  // Valid: https://dineopen.com, https://www.dineopen.com, https://dummy.dineopen.com, https://any-name.dineopen.com
+  // Invalid: https://dineopen.com.evil.com, https://fakeDINEOPEN.com
+  const dineopenRegex = /^https:\/\/([a-zA-Z0-9-]+\.)?dineopen\.com$/;
+  return dineopenRegex.test(origin);
+}
+
+// Helper function to check if origin is a valid localhost subdomain (for development)
+function isValidLocalhostOrigin(origin) {
+  if (!origin) return false;
+
+  // Match localhost with optional subdomain on ports 3001, 3002, 3003
+  // Valid: http://localhost:3001, http://dummy.localhost:3002
+  const localhostRegex = /^http:\/\/([a-zA-Z0-9-]+\.)?localhost:(3001|3002|3003)$/;
+  return localhostRegex.test(origin);
+}
 
 const corsOptions = {
   origin: (origin, callback) => {
@@ -264,33 +286,38 @@ const corsOptions = {
       callback(null, true);
       return;
     }
-    
-    // SIMPLE: Allow ALL dineopen.com domains and subdomains
-    // This includes: dineopen.com, www.dineopen.com, *.dineopen.com (any subdomain)
-    if (origin.includes('dineopen.com')) {
-      callback(null, origin); // Return the actual origin
+
+    // ✅ Allow ALL dineopen.com domains and subdomains (*.dineopen.com)
+    // Examples: dineopen.com, www.dineopen.com, dummy.dineopen.com, restaurant1.dineopen.com
+    if (isValidDineopenOrigin(origin)) {
+      console.log(`✅ CORS allowed for dineopen.com origin: ${origin}`);
+      callback(null, origin);
       return;
     }
-    
-    // Check if origin is in allowed origins list
+
+    // ✅ Check if origin is in specific allowed origins list
     if (allowedOrigins.includes(origin)) {
+      console.log(`✅ CORS allowed for whitelisted origin: ${origin}`);
       callback(null, origin);
       return;
     }
-    
-    // Check if origin is a localhost subdomain (for development)
-    if (origin.match(/^http:\/\/[a-zA-Z0-9-]+\.localhost:(3001|3002)$/)) {
+
+    // ✅ Allow localhost subdomains for development (*.localhost:3001|3002|3003)
+    if (isValidLocalhostOrigin(origin)) {
+      console.log(`✅ CORS allowed for localhost origin: ${origin}`);
       callback(null, origin);
       return;
     }
-    
-    // Reject all other origins
+
+    // ❌ Reject all other origins
+    console.log(`❌ CORS blocked for origin: ${origin}`);
     callback(new Error("CORS not allowed"));
   },
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS', 'PATCH'],
   allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'Accept', 'Origin'],
-  optionsSuccessStatus: 200
+  optionsSuccessStatus: 200,
+  preflightContinue: false
 };
 
 app.use(cors(corsOptions));
@@ -299,60 +326,76 @@ app.use(cors(corsOptions));
 // This ensures the CORS header is set correctly even if other code tries to override it
 app.use((req, res, next) => {
   const origin = req.headers.origin;
-  
+
+  // CRITICAL: Add no-cache headers for CORS to prevent caching issues
+  res.setHeader('Vary', 'Origin');
+  res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, private');
+  res.setHeader('Pragma', 'no-cache');
+  res.setHeader('Expires', '0');
+
   // Store original methods
   const originalJson = res.json.bind(res);
   const originalSend = res.send.bind(res);
   const originalEnd = res.end.bind(res);
-  
+
   // Helper to set CORS headers - ALWAYS uses the request origin
   const setCorsHeaders = () => {
     if (origin) {
-      // SIMPLE: Allow ALL dineopen.com domains and subdomains
-      if (origin.includes('dineopen.com') || allowedOrigins.includes(origin)) {
+      // ✅ Allow ALL dineopen.com domains and subdomains (*.dineopen.com)
+      // ✅ Allow whitelisted origins
+      // ✅ Allow localhost subdomains for development
+      if (isValidDineopenOrigin(origin) || allowedOrigins.includes(origin) || isValidLocalhostOrigin(origin)) {
         // CRITICAL: Always use the request origin, never a cached or restaurant-specific value
         res.removeHeader('Access-Control-Allow-Origin'); // Remove any existing incorrect header
         res.setHeader('Access-Control-Allow-Origin', origin);
         res.setHeader('Access-Control-Allow-Credentials', 'true');
+        res.setHeader('Vary', 'Origin'); // Ensure CDN doesn't cache CORS headers
       }
     }
   };
-  
+
   // Override res.json to set CORS before sending
   res.json = function(data) {
     setCorsHeaders();
     return originalJson(data);
   };
-  
+
   // Override res.send to set CORS before sending
   res.send = function(data) {
     setCorsHeaders();
     return originalSend(data);
   };
-  
+
   // Override res.end to set CORS before ending
   res.end = function(data, encoding) {
     setCorsHeaders();
     return originalEnd(data, encoding);
   };
-  
+
   // Handle OPTIONS preflight requests
   if (req.method === 'OPTIONS') {
     if (origin) {
-      // SIMPLE: Allow ALL dineopen.com domains and subdomains
-      if (origin.includes('dineopen.com') || allowedOrigins.includes(origin)) {
+      // ✅ Allow ALL dineopen.com domains and subdomains (*.dineopen.com)
+      // ✅ Allow whitelisted origins
+      // ✅ Allow localhost subdomains for development
+      if (isValidDineopenOrigin(origin) || allowedOrigins.includes(origin) || isValidLocalhostOrigin(origin)) {
         res.setHeader('Access-Control-Allow-Origin', origin);
         res.setHeader('Access-Control-Allow-Credentials', 'true');
         res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS, PATCH');
         res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With, Accept, Origin');
-        return res.status(200).end();
+        res.setHeader('Vary', 'Origin');
+        res.setHeader('Cache-Control', 'no-store, max-age=0');
+        console.log(`✅ CORS preflight allowed for origin: ${origin}`);
+        return res.status(204).end();
+      } else {
+        console.log(`❌ CORS preflight blocked for origin: ${origin}`);
       }
     }
   }
-  
+
   // Set CORS headers for all requests
   setCorsHeaders();
-  
+
   next();
 });
 
@@ -2191,9 +2234,9 @@ app.post('/api/auth/firebase/verify', async (req, res) => {
         ...doc.data()
       }));
       
-      // Check if subdomain is enabled for the first restaurant
+      // Check if subdomain is enabled for the first restaurant (only if feature is enabled)
       const firstRestaurant = userRestaurants[0];
-      if (firstRestaurant && firstRestaurant.subdomainEnabled && firstRestaurant.subdomain) {
+      if (SUBDOMAIN_FEATURE_ENABLED && firstRestaurant && firstRestaurant.subdomainEnabled && firstRestaurant.subdomain) {
         subdomainUrl = getSubdomainUrl(firstRestaurant.subdomain, '/dashboard');
       }
     }
@@ -2326,14 +2369,14 @@ app.post('/api/auth/phone/verify-otp', async (req, res) => {
       { expiresIn: '7d' }
     );
 
-    // Get user's restaurants for subdomain check
+    // Get user's restaurants for subdomain check (only if feature is enabled)
     let subdomainUrl = null;
-    if (hasRestaurants) {
+    if (SUBDOMAIN_FEATURE_ENABLED && hasRestaurants) {
       const restaurantsQuery = await db.collection(collections.restaurants)
         .where('ownerId', '==', userId)
         .limit(1)
         .get();
-      
+
       if (!restaurantsQuery.empty) {
         const restaurant = restaurantsQuery.docs[0].data();
         if (restaurant.subdomainEnabled && restaurant.subdomain) {
@@ -2533,7 +2576,7 @@ app.post('/api/restaurants', authenticateToken, async (req, res) => {
         id: restaurantRef.id,
         ...restaurantData,
         subdomain: finalSubdomain, // Include the final subdomain
-        subdomainUrl: getSubdomainUrl(finalSubdomain),
+        subdomainUrl: SUBDOMAIN_FEATURE_ENABLED ? getSubdomainUrl(finalSubdomain) : null,
         qrData // Include qrData but not qrCode (large base64 string)
       }
     });
