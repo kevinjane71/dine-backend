@@ -5571,6 +5571,145 @@ app.post('/api/tables/:restaurantId', authenticateToken, async (req, res) => {
   }
 });
 
+// Bulk create tables
+app.post('/api/tables/:restaurantId/bulk', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+    const { floor, fromNumber, toNumber, capacity, section } = req.body;
+
+    // Validate inputs
+    if (!floor) {
+      return res.status(400).json({ error: 'Floor is required' });
+    }
+
+    if (fromNumber === undefined || fromNumber === null || fromNumber === '') {
+      return res.status(400).json({ error: 'From number is required' });
+    }
+
+    if (toNumber === undefined || toNumber === null || toNumber === '') {
+      return res.status(400).json({ error: 'To number is required' });
+    }
+
+    const from = parseInt(fromNumber);
+    const to = parseInt(toNumber);
+
+    if (isNaN(from) || isNaN(to)) {
+      return res.status(400).json({ error: 'From and to must be valid numbers' });
+    }
+
+    if (from > to) {
+      return res.status(400).json({ error: 'From number must be less than or equal to to number' });
+    }
+
+    if (to - from > 100) {
+      return res.status(400).json({ error: 'Cannot create more than 100 tables at once' });
+    }
+
+    // Find the floor document, create it if it doesn't exist
+    const floorId = `floor_${floor.toLowerCase().replace(/\s+/g, '_')}`;
+    let floorDoc = await db.collection('restaurants')
+      .doc(restaurantId)
+      .collection('floors')
+      .doc(floorId)
+      .get();
+
+    // If floor doesn't exist, create it automatically
+    if (!floorDoc.exists) {
+      console.log(`🔄 Auto-creating floor "${floor}" for restaurant ${restaurantId}`);
+      const floorData = {
+        name: floor,
+        description: `Auto-created floor: ${floor}`,
+        restaurantId,
+        createdAt: new Date(),
+        updatedAt: new Date()
+      };
+
+      await db.collection('restaurants')
+        .doc(restaurantId)
+        .collection('floors')
+        .doc(floorId)
+        .set(floorData);
+    }
+
+    // Get all existing table names in this floor to check for duplicates
+    const existingTablesSnapshot = await db.collection('restaurants')
+      .doc(restaurantId)
+      .collection('floors')
+      .doc(floorId)
+      .collection('tables')
+      .get();
+
+    const existingTableNames = new Set();
+    existingTablesSnapshot.forEach(doc => {
+      existingTableNames.add(doc.data().name);
+    });
+
+    // Prepare tables to create
+    const tablesToCreate = [];
+    const skippedTables = [];
+
+    for (let i = from; i <= to; i++) {
+      const tableName = String(i);
+
+      // Check if table already exists
+      if (existingTableNames.has(tableName)) {
+        skippedTables.push(tableName);
+        continue;
+      }
+
+      tablesToCreate.push({
+        name: tableName,
+        floor: floor,
+        capacity: capacity || 4,
+        section: section || 'Main',
+        status: 'available',
+        currentOrderId: null,
+        lastOrderTime: null,
+        createdAt: new Date(),
+        updatedAt: new Date()
+      });
+    }
+
+    // Create all tables
+    const createdTables = [];
+    const batch = db.batch();
+    const tablesCollectionRef = db.collection('restaurants')
+      .doc(restaurantId)
+      .collection('floors')
+      .doc(floorId)
+      .collection('tables');
+
+    for (const tableData of tablesToCreate) {
+      const tableRef = tablesCollectionRef.doc(); // Auto-generate ID
+      batch.set(tableRef, tableData);
+      createdTables.push({
+        id: tableRef.id,
+        ...tableData
+      });
+    }
+
+    // Commit the batch
+    await batch.commit();
+
+    console.log(`✅ Created ${createdTables.length} tables (${from}-${to}) on floor "${floor}" for restaurant ${restaurantId}`);
+    if (skippedTables.length > 0) {
+      console.log(`⚠️  Skipped ${skippedTables.length} duplicate tables: ${skippedTables.join(', ')}`);
+    }
+
+    res.status(201).json({
+      message: `Successfully created ${createdTables.length} tables`,
+      created: createdTables.length,
+      skipped: skippedTables.length,
+      skippedTables: skippedTables,
+      tables: createdTables
+    });
+
+  } catch (error) {
+    console.error('Bulk create tables error:', error);
+    res.status(500).json({ error: 'Failed to create tables' });
+  }
+});
+
 app.patch('/api/tables/:tableId/status', authenticateToken, async (req, res) => {
   try {
     const { tableId } = req.params;
