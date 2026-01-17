@@ -271,8 +271,9 @@ const corsOptions = {
       return;
     }
     
-    // Check if origin is a subdomain of dineopen.com (including www)
-    if (origin.match(/^https:\/\/([a-zA-Z0-9-]+\.)?dineopen\.com$/)) {
+    // Check if origin is any subdomain of dineopen.com (allows all user-created subdomains)
+    // Matches: dineopen.com, www.dineopen.com, dineopen1.dineopen.com, any-subdomain.dineopen.com, etc.
+    if (origin.match(/^https:\/\/([a-zA-Z0-9-]+\.)*dineopen\.com$/)) {
       callback(null, true);
       return;
     }
