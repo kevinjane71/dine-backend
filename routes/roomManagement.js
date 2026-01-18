@@ -1,9 +1,8 @@
 const express = require('express');
 const router = express.Router();
-const { db, admin } = require('../firebase');
+const { db } = require('../firebase');
+const { FieldValue } = require('firebase-admin/firestore');
 const authenticateToken = require('../middleware/auth');
-
-const FieldValue = admin.firestore.FieldValue;
 
 // Room statuses: available, occupied, cleaning, maintenance, reserved, out-of-service
 
