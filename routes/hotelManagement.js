@@ -124,6 +124,23 @@ router.post('/hotel/checkin', authenticateToken, async (req, res) => {
 
     const checkInRef = await db.collection(COLLECTIONS.checkIns).add(checkInData);
 
+    // Update room status to occupied
+    const roomSnapshot = await db.collection('rooms')
+      .where('restaurantId', '==', restaurantId)
+      .where('roomNumber', '==', roomNumber)
+      .limit(1)
+      .get();
+
+    if (!roomSnapshot.empty) {
+      const roomDoc = roomSnapshot.docs[0];
+      await db.collection('rooms').doc(roomDoc.id).update({
+        status: 'occupied',
+        currentGuest: guestInfo.name,
+        checkInId: checkInRef.id,
+        updatedAt: FieldValue.serverTimestamp()
+      });
+    }
+
     res.status(201).json({
       success: true,
       message: `Guest checked in to Room ${roomNumber} successfully`,
@@ -401,16 +418,35 @@ router.post('/hotel/checkout/:checkInId', authenticateToken, async (req, res) =>
       await batch.commit();
     }
 
+    // Update room status to cleaning/available
+    const roomSnapshot = await db.collection('rooms')
+      .where('restaurantId', '==', checkInData.restaurantId)
+      .where('roomNumber', '==', checkInData.roomNumber)
+      .limit(1)
+      .get();
+
+    if (!roomSnapshot.empty) {
+      const roomDoc = roomSnapshot.docs[0];
+      await db.collection('rooms').doc(roomDoc.id).update({
+        status: 'cleaning', // Set to cleaning, staff can manually change to available
+        currentGuest: null,
+        checkInId: null,
+        updatedAt: FieldValue.serverTimestamp()
+      });
+    }
+
     // Generate invoice data
     const invoice = {
       checkInId,
       guestName: checkInData.guestName,
       guestPhone: checkInData.guestPhone,
+      guestEmail: checkInData.guestEmail,
       roomNumber: checkInData.roomNumber,
       checkInDate: checkInData.checkInDate,
       checkOutDate: checkInData.checkOutDate,
       actualCheckOutDate: new Date(),
       stayDuration: checkInData.stayDuration,
+      roomTariff: checkInData.roomTariff,
       roomCharges: checkInData.totalRoomCharges,
       foodCharges: checkInData.totalFoodCharges,
       additionalCharges: additionalCharges || [],
@@ -422,7 +458,9 @@ router.post('/hotel/checkout/:checkInId', authenticateToken, async (req, res) =>
       finalPayment: finalPayment || 0,
       totalPaid,
       balanceAmount,
-      foodOrders: checkInData.foodOrders || []
+      foodOrders: checkInData.foodOrders || [],
+      idProof: checkInData.idProof || null,
+      gstInfo: checkInData.gstInfo || null
     };
 
     res.json({

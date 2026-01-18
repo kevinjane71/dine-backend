@@ -157,6 +157,9 @@ const hotelRoutes = require('./routes/hotel');
 // Hotel Management routes (for restaurant-hotel integration)
 const hotelManagementRoutes = require('./routes/hotelManagement');
 
+// Room Management routes (for hotel rooms and bookings)
+const roomManagementRoutes = require('./routes/roomManagement');
+
 // Shift Scheduling routes
 const shiftSchedulingRoutes = require('./routes/shiftScheduling');
 
@@ -4854,6 +4857,7 @@ app.use('/api/hotel', hotelRoutes);
 
 // Initialize hotel management routes (restaurant-hotel integration)
 app.use('/api', hotelManagementRoutes);
+app.use('/api', roomManagementRoutes);
 
 // Initialize shift scheduling routes
 app.use('/api/shift-scheduling', shiftSchedulingRoutes);
