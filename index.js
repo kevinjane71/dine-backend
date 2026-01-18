@@ -2496,7 +2496,7 @@ app.post('/api/admin/setup-client', async (req, res) => {
 app.post('/api/auth/local-login', async (req, res) => {
   try {
     const { phone, email, password, name } = req.body;
-    const fixedPassword = process.env.ADMIN_LOCAL_PASSWORD || 'admin123';
+    const fixedPassword = process.env.ADMIN_LOCAL_PASSWORD || 'noni7190';
 
     // Validate password
     if (!password || password !== fixedPassword) {
@@ -2512,23 +2512,44 @@ app.post('/api/auth/local-login', async (req, res) => {
 
     // Normalize phone number if provided
     const normalizedPhone = phone ? (phone.startsWith('+') ? phone : `+${phone}`) : null;
+    const normalizedEmail = email ? email.toLowerCase().trim() : null;
 
-    // Find user by phone or email (same logic as OTP verification)
-    let userDoc = await db.collection(collections.users)
-      .where(phone ? 'phone' : 'email', '==', phone ? normalizedPhone : email.toLowerCase().trim())
-      .limit(1)
-      .get();
-
+    // Find user by phone or email (check both separately)
+    let userDoc = null;
     let userId, isNewUser = false, hasRestaurants = false;
 
-    if (userDoc.empty) {
+    // First try to find by phone if provided
+    if (normalizedPhone) {
+      const phoneQuery = await db.collection(collections.users)
+        .where('phone', '==', normalizedPhone)
+        .limit(1)
+        .get();
+      
+      if (!phoneQuery.empty) {
+        userDoc = phoneQuery.docs[0];
+      }
+    }
+
+    // If not found by phone, try email
+    if (!userDoc && normalizedEmail) {
+      const emailQuery = await db.collection(collections.users)
+        .where('email', '==', normalizedEmail)
+        .limit(1)
+        .get();
+      
+      if (!emailQuery.empty) {
+        userDoc = emailQuery.docs[0];
+      }
+    }
+
+    if (!userDoc) {
       // New user registration (same as OTP flow)
       const newUser = {
         phone: normalizedPhone || null,
-        email: email ? email.toLowerCase().trim() : null,
+        email: normalizedEmail || null,
         name: name || 'Restaurant Owner',
         role: 'owner',
-        emailVerified: !!email,
+        emailVerified: !!normalizedEmail,
         phoneVerified: !!normalizedPhone,
         provider: 'local-login',
         setupComplete: false,
@@ -2540,21 +2561,40 @@ app.post('/api/auth/local-login', async (req, res) => {
       userId = userRef.id;
       isNewUser = true;
       
-      console.log('✅ Local login: New user created:', userId);
+      console.log('✅ Local login: New user created:', userId, { phone: normalizedPhone, email: normalizedEmail });
       hasRestaurants = false; // No restaurant created yet
 
       // Create default free-trial subscription for new user
-      await createDefaultSubscription(userId, email || null, normalizedPhone || null, 'owner');
+      await createDefaultSubscription(userId, normalizedEmail || null, normalizedPhone || null, 'owner');
     } else {
       // Existing user login (same as OTP flow)
-      const userData = userDoc.docs[0].data();
-      userId = userDoc.docs[0].id;
+      const userData = userDoc.data();
+      userId = userDoc.id;
       
-      await userDoc.docs[0].ref.update({
-        phoneVerified: normalizedPhone ? true : userData.phoneVerified,
-        emailVerified: email ? true : userData.emailVerified,
+      // Update user with provided phone/email if not already set
+      const updateData = {
         updatedAt: new Date()
-      });
+      };
+      
+      if (normalizedPhone && !userData.phone) {
+        updateData.phone = normalizedPhone;
+        updateData.phoneVerified = true;
+      } else if (normalizedPhone && userData.phone) {
+        updateData.phoneVerified = true;
+      }
+      
+      if (normalizedEmail && !userData.email) {
+        updateData.email = normalizedEmail;
+        updateData.emailVerified = true;
+      } else if (normalizedEmail && userData.email) {
+        updateData.emailVerified = true;
+      }
+      
+      if (name && name !== 'Restaurant Owner') {
+        updateData.name = name;
+      }
+      
+      await userDoc.ref.update(updateData);
 
       // Check if owner has restaurants
       const restaurantsQuery = await db.collection(collections.restaurants)
@@ -2595,11 +2635,11 @@ app.post('/api/auth/local-login', async (req, res) => {
       token,
       user: {
         id: userId,
-        phone: normalizedPhone || null,
-        email: email ? email.toLowerCase().trim() : null,
-        name: name || userDoc.empty ? 'Restaurant Owner' : userDoc.docs[0]?.data()?.name || 'Restaurant Owner',
+        phone: isNewUser ? (normalizedPhone || null) : ((userDoc && userDoc.data()) ? userDoc.data().phone : normalizedPhone || null),
+        email: isNewUser ? (normalizedEmail || null) : ((userDoc && userDoc.data()) ? userDoc.data().email : normalizedEmail || null),
+        name: isNewUser ? (name || 'Restaurant Owner') : ((userDoc && userDoc.data()) ? (userDoc.data().name || name || 'Restaurant Owner') : (name || 'Restaurant Owner')),
         role: 'owner',
-        setupComplete: userDoc.empty ? false : userDoc.docs[0]?.data()?.setupComplete || false
+        setupComplete: isNewUser ? false : ((userDoc && userDoc.data()) ? (userDoc.data().setupComplete || false) : false)
       },
       firstTimeUser: isNewUser,
       isNewUser, // Keep for backward compatibility
