@@ -3815,6 +3815,53 @@ app.post('/api/orders', async (req, res) => {
     console.log('🛒 Backend Order Creation - Order saved to DB with ID:', orderRef.id);
     console.log('🛒 Backend Order Creation - Order data saved:', orderData);
     
+    // NEW: Auto-link order to hotel check-in if room number is provided
+    if (roomNumber) {
+      try {
+        console.log(`🏨 Attempting to link order to room ${roomNumber}...`);
+        const checkInSnapshot = await db.collection('hotel_checkins')
+          .where('restaurantId', '==', restaurantId)
+          .where('roomNumber', '==', roomNumber)
+          .where('status', '==', 'checked-in')
+          .limit(1)
+          .get();
+        
+        if (!checkInSnapshot.empty) {
+          const checkInDoc = checkInSnapshot.docs[0];
+          const checkInData = checkInDoc.data();
+          const checkInId = checkInDoc.id;
+          
+          // Add order to foodOrders array
+          const foodOrders = checkInData.foodOrders || [];
+          foodOrders.push({
+            orderId: orderRef.id,
+            amount: totalAmount,
+            linkedAt: new Date()
+          });
+          
+          // Update totals
+          const totalFoodCharges = (checkInData.totalFoodCharges || 0) + totalAmount;
+          const totalCharges = (checkInData.totalRoomCharges || 0) + totalFoodCharges;
+          const balanceAmount = totalCharges - (checkInData.advancePayment || 0);
+          
+          await db.collection('hotel_checkins').doc(checkInId).update({
+            foodOrders,
+            totalFoodCharges,
+            totalCharges,
+            balanceAmount,
+            lastUpdated: FieldValue.serverTimestamp()
+          });
+          
+          console.log(`✅ Order ${orderRef.id} linked to check-in ${checkInId} for Room ${roomNumber}`);
+        } else {
+          console.log(`⚠️ No active check-in found for Room ${roomNumber} - order created but not linked`);
+        }
+      } catch (linkError) {
+        console.error('❌ Error linking order to check-in:', linkError);
+        // Don't fail order creation if linking fails
+      }
+    }
+    
     // Create/update customer if customer info is provided
     let customerId = null;
     if (customerInfo && (customerInfo.name || customerInfo.phone)) {
