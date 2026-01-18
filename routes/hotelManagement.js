@@ -363,31 +363,47 @@ router.post('/hotel/checkout/:checkInId', authenticateToken, async (req, res) =>
       });
     }
 
-    // Calculate final bill
-    let totalCharges = checkInData.totalCharges || 0;
+    // Recalculate totals from actual data (don't rely on stored values which might be 0)
+    // 1. Recalculate room charges
+    const roomTariff = checkInData.roomTariff || 0;
+    const stayDuration = checkInData.stayDuration || 1;
+    const totalRoomCharges = roomTariff * stayDuration;
 
-    // Add additional charges if any
+    // 2. Recalculate food charges from foodOrders array
+    const foodOrders = checkInData.foodOrders || [];
+    const totalFoodCharges = foodOrders.reduce((sum, order) => sum + (order.amount || 0), 0);
+
+    // 3. Calculate subtotal (room + food)
+    let subtotal = totalRoomCharges + totalFoodCharges;
+
+    // 4. Add additional charges if any
+    let additionalChargesTotal = 0;
     if (additionalCharges && Array.isArray(additionalCharges)) {
-      const additionalTotal = additionalCharges.reduce((sum, charge) => sum + (charge.amount || 0), 0);
-      totalCharges += additionalTotal;
+      additionalChargesTotal = additionalCharges.reduce((sum, charge) => sum + (charge.amount || 0), 0);
+      subtotal += additionalChargesTotal;
     }
 
-    // Apply discounts if any
+    // 5. Apply discounts if any
     let discountAmount = 0;
     if (discounts && Array.isArray(discounts)) {
       discountAmount = discounts.reduce((sum, discount) => sum + (discount.amount || 0), 0);
-      totalCharges -= discountAmount;
+      subtotal -= discountAmount;
     }
+
+    // 6. Final total charges
+    const totalCharges = subtotal;
 
     const totalPaid = (checkInData.advancePayment || 0) + (finalPayment || 0);
     const balanceAmount = totalCharges - totalPaid;
 
-    // Update check-in record
+    // Update check-in record with recalculated values
     const checkoutData = {
       status: 'checked-out',
       actualCheckOutAt: FieldValue.serverTimestamp(),
       finalPayment: finalPayment || 0,
       finalPaymentMode: paymentMode || 'cash',
+      totalRoomCharges, // Update with recalculated value
+      totalFoodCharges, // Update with recalculated value
       totalCharges,
       discounts: discounts || [],
       discountAmount,
@@ -435,7 +451,7 @@ router.post('/hotel/checkout/:checkInId', authenticateToken, async (req, res) =>
       });
     }
 
-    // Generate invoice data
+    // Generate invoice data with recalculated values
     const invoice = {
       checkInId,
       guestName: checkInData.guestName,
@@ -447,11 +463,11 @@ router.post('/hotel/checkout/:checkInId', authenticateToken, async (req, res) =>
       actualCheckOutDate: new Date(),
       stayDuration: checkInData.stayDuration,
       roomTariff: checkInData.roomTariff,
-      roomCharges: checkInData.totalRoomCharges,
-      foodCharges: checkInData.totalFoodCharges,
+      roomCharges: totalRoomCharges, // Use recalculated value
+      foodCharges: totalFoodCharges, // Use recalculated value
       additionalCharges: additionalCharges || [],
       discounts: discounts || [],
-      subtotal: checkInData.totalCharges,
+      subtotal: totalRoomCharges + totalFoodCharges + additionalChargesTotal,
       discountAmount,
       totalAmount: totalCharges,
       advancePayment: checkInData.advancePayment || 0,
@@ -503,6 +519,41 @@ router.get('/hotel/invoice/:checkInId', authenticateToken, async (req, res) => {
 
     const data = checkInDoc.data();
 
+    // Recalculate totals from actual data (don't rely on stored values which might be 0)
+    // 1. Recalculate room charges
+    const roomTariff = data.roomTariff || 0;
+    const stayDuration = data.stayDuration || 1;
+    const totalRoomCharges = roomTariff * stayDuration;
+
+    // 2. Recalculate food charges from foodOrders array
+    const foodOrders = data.foodOrders || [];
+    const totalFoodCharges = foodOrders.reduce((sum, order) => sum + (order.amount || 0), 0);
+
+    // 3. Calculate subtotal (room + food)
+    let subtotal = totalRoomCharges + totalFoodCharges;
+
+    // 4. Add additional charges if any
+    const additionalCharges = data.additionalCharges || [];
+    let additionalChargesTotal = 0;
+    if (additionalCharges.length > 0) {
+      additionalChargesTotal = additionalCharges.reduce((sum, charge) => sum + (charge.amount || 0), 0);
+      subtotal += additionalChargesTotal;
+    }
+
+    // 5. Apply discounts if any
+    const discounts = data.discounts || [];
+    const discountAmount = discounts.reduce((sum, discount) => sum + (discount.amount || 0), 0);
+    subtotal -= discountAmount;
+
+    // 6. Final total charges
+    const totalCharges = subtotal;
+
+    // 7. Calculate payments
+    const advancePayment = data.advancePayment || 0;
+    const finalPayment = data.finalPayment || 0;
+    const totalPaid = advancePayment + finalPayment;
+    const balanceAmount = totalCharges - totalPaid;
+
     const invoice = {
       checkInId,
       guestName: data.guestName,
@@ -514,20 +565,22 @@ router.get('/hotel/invoice/:checkInId', authenticateToken, async (req, res) => {
       actualCheckOutDate: data.actualCheckOutAt?.toDate?.() || null,
       stayDuration: data.stayDuration,
       roomTariff: data.roomTariff,
-      roomCharges: data.totalRoomCharges,
-      foodCharges: data.totalFoodCharges || 0,
-      additionalCharges: data.additionalCharges || [],
-      discounts: data.discounts || [],
-      subtotal: data.totalRoomCharges + (data.totalFoodCharges || 0),
-      discountAmount: data.discountAmount || 0,
-      totalAmount: data.totalCharges,
-      advancePayment: data.advancePayment || 0,
-      finalPayment: data.finalPayment || 0,
-      totalPaid: data.totalPaid || data.advancePayment || 0,
-      balanceAmount: data.balanceAmount || 0,
+      roomCharges: totalRoomCharges, // Use recalculated value
+      foodCharges: totalFoodCharges, // Use recalculated value
+      additionalCharges: additionalCharges,
+      discounts: discounts,
+      subtotal: totalRoomCharges + totalFoodCharges + additionalChargesTotal,
+      discountAmount: discountAmount,
+      totalAmount: totalCharges, // Use recalculated value
+      advancePayment: advancePayment,
+      finalPayment: finalPayment,
+      totalPaid: totalPaid, // Use recalculated value
+      balanceAmount: balanceAmount, // Use recalculated value
       status: data.status,
       billingComplete: data.billingComplete || false,
-      foodOrders: data.foodOrders || []
+      foodOrders: foodOrders,
+      idProof: data.idProof || null,
+      gstInfo: data.gstInfo || null
     };
 
     res.json({
