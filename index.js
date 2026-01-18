@@ -2318,6 +2318,306 @@ app.post('/api/auth/phone/verify-otp', async (req, res) => {
   }
 });
 
+// Admin Setup Endpoint - Bypass OTP for client setup
+// POST /api/admin/setup-client
+// Requires: ADMIN_SETUP_KEY in environment variable
+// Body: { phone, name, restaurantName, restaurantData }
+app.post('/api/admin/setup-client', async (req, res) => {
+  try {
+    const adminKey = req.headers['x-admin-setup-key'] || req.body.adminKey;
+    const expectedKey = process.env.ADMIN_SETUP_KEY || 'dine-admin-setup-key-change-in-production';
+    
+    if (!adminKey || adminKey !== expectedKey) {
+      return res.status(401).json({ 
+        error: 'Unauthorized',
+        message: 'Invalid admin setup key'
+      });
+    }
+
+    const { phone, name, restaurantName, restaurantData } = req.body;
+
+    if (!phone) {
+      return res.status(400).json({ error: 'Phone number is required' });
+    }
+
+    // Normalize phone number
+    const normalizedPhone = phone.startsWith('+') ? phone : `+${phone}`;
+
+    // Check if user exists
+    let userDoc = await db.collection(collections.users)
+      .where('phone', '==', normalizedPhone)
+      .limit(1)
+      .get();
+
+    let userId, isNewUser = false;
+
+    if (userDoc.empty) {
+      // Create new user
+      const newUser = {
+        phone: normalizedPhone,
+        name: name || 'Restaurant Owner',
+        role: 'owner',
+        emailVerified: false,
+        phoneVerified: true, // Skip OTP verification for admin setup
+        provider: 'admin-setup',
+        setupComplete: false,
+        createdAt: new Date(),
+        updatedAt: new Date()
+      };
+
+      const userRef = await db.collection(collections.users).add(newUser);
+      userId = userRef.id;
+      isNewUser = true;
+      
+      console.log('✅ Admin setup: New user created:', userId);
+      
+      // Create default subscription
+      await createDefaultSubscription(userId, null, normalizedPhone, 'owner');
+    } else {
+      // Existing user
+      userId = userDoc.docs[0].id;
+      const userData = userDoc.docs[0].data();
+      
+      // Update user to mark phone as verified
+      await userDoc.docs[0].ref.update({
+        phoneVerified: true,
+        name: name || userData.name,
+        updatedAt: new Date()
+      });
+      
+      console.log('✅ Admin setup: Existing user found:', userId);
+    }
+
+    // Generate JWT token
+    const token = jwt.sign(
+      { userId, phone: normalizedPhone, role: 'owner' },
+      process.env.JWT_SECRET,
+      { expiresIn: '7d' }
+    );
+
+    // Check if user already has restaurants
+    const existingRestaurants = await db.collection(collections.restaurants)
+      .where('ownerId', '==', userId)
+      .get();
+
+    let restaurant = null;
+    let restaurantId = null;
+
+    // Create restaurant if restaurantName is provided
+    if (restaurantName) {
+      // Check if restaurant with same name already exists for this user
+      const existingRestaurant = existingRestaurants.docs.find(
+        doc => doc.data().name === restaurantName
+      );
+
+      if (existingRestaurant) {
+        restaurantId = existingRestaurant.id;
+        restaurant = { id: restaurantId, ...existingRestaurant.data() };
+        console.log('✅ Admin setup: Using existing restaurant:', restaurantId);
+      } else {
+        // Create new restaurant
+        const restaurantInfo = {
+          name: restaurantName,
+          address: restaurantData?.address || null,
+          city: restaurantData?.city || null,
+          phone: restaurantData?.phone || normalizedPhone,
+          email: restaurantData?.email || null,
+          cuisine: restaurantData?.cuisine || [],
+          description: restaurantData?.description || '',
+          operatingHours: restaurantData?.operatingHours || {},
+          features: restaurantData?.features || {},
+          ownerId: userId,
+          subdomain: null, // Subdomain generation disabled
+          subdomainEnabled: false,
+          status: 'active',
+          createdAt: new Date(),
+          updatedAt: new Date()
+        };
+
+        const restaurantRef = await db.collection(collections.restaurants).add(restaurantInfo);
+        restaurantId = restaurantRef.id;
+        restaurant = { id: restaurantId, ...restaurantInfo };
+
+        // Create user-restaurant relationship
+        await db.collection(collections.userRestaurants).add({
+          userId: userId,
+          restaurantId: restaurantId,
+          role: 'owner',
+          createdAt: new Date(),
+          updatedAt: new Date()
+        });
+
+        // Generate QR data
+        const qrData = `${process.env.FRONTEND_URL || 'https://www.dineopen.com'}/placeorder?restaurant=${restaurantId}`;
+        await restaurantRef.update({ qrData });
+
+        console.log('✅ Admin setup: New restaurant created:', restaurantId);
+      }
+    }
+
+    res.json({
+      success: true,
+      message: isNewUser 
+        ? 'Client setup completed successfully' 
+        : 'Client login successful',
+      token,
+      user: {
+        id: userId,
+        phone: normalizedPhone,
+        name: name || 'Restaurant Owner',
+        role: 'owner',
+        setupComplete: restaurant ? true : false
+      },
+      restaurant: restaurant ? {
+        id: restaurant.id,
+        name: restaurant.name,
+        address: restaurant.address,
+        city: restaurant.city,
+        phone: restaurant.phone,
+        email: restaurant.email
+      } : null,
+      hasRestaurants: existingRestaurants.size > 0 || !!restaurant,
+      redirectTo: restaurant ? '/dashboard' : '/admin'
+    });
+
+  } catch (error) {
+    console.error('Admin setup error:', error);
+    res.status(500).json({ 
+      error: 'Setup failed',
+      details: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
+  }
+});
+
+// Local Admin Login - Simple password-based login (bypasses OTP, same flow as OTP verification)
+// POST /api/auth/local-login
+// Body: { phone: '...' OR email: '...', password: '...' }
+// Returns: Same response structure as /api/auth/phone/verify-otp
+app.post('/api/auth/local-login', async (req, res) => {
+  try {
+    const { phone, email, password, name } = req.body;
+    const fixedPassword = process.env.ADMIN_LOCAL_PASSWORD || 'admin123';
+
+    // Validate password
+    if (!password || password !== fixedPassword) {
+      return res.status(401).json({ 
+        error: 'Invalid password',
+        message: 'Incorrect password'
+      });
+    }
+
+    if (!phone && !email) {
+      return res.status(400).json({ error: 'Phone or email is required' });
+    }
+
+    // Normalize phone number if provided
+    const normalizedPhone = phone ? (phone.startsWith('+') ? phone : `+${phone}`) : null;
+
+    // Find user by phone or email (same logic as OTP verification)
+    let userDoc = await db.collection(collections.users)
+      .where(phone ? 'phone' : 'email', '==', phone ? normalizedPhone : email.toLowerCase().trim())
+      .limit(1)
+      .get();
+
+    let userId, isNewUser = false, hasRestaurants = false;
+
+    if (userDoc.empty) {
+      // New user registration (same as OTP flow)
+      const newUser = {
+        phone: normalizedPhone || null,
+        email: email ? email.toLowerCase().trim() : null,
+        name: name || 'Restaurant Owner',
+        role: 'owner',
+        emailVerified: !!email,
+        phoneVerified: !!normalizedPhone,
+        provider: 'local-login',
+        setupComplete: false,
+        createdAt: new Date(),
+        updatedAt: new Date()
+      };
+
+      const userRef = await db.collection(collections.users).add(newUser);
+      userId = userRef.id;
+      isNewUser = true;
+      
+      console.log('✅ Local login: New user created:', userId);
+      hasRestaurants = false; // No restaurant created yet
+
+      // Create default free-trial subscription for new user
+      await createDefaultSubscription(userId, email || null, normalizedPhone || null, 'owner');
+    } else {
+      // Existing user login (same as OTP flow)
+      const userData = userDoc.docs[0].data();
+      userId = userDoc.docs[0].id;
+      
+      await userDoc.docs[0].ref.update({
+        phoneVerified: normalizedPhone ? true : userData.phoneVerified,
+        emailVerified: email ? true : userData.emailVerified,
+        updatedAt: new Date()
+      });
+
+      // Check if owner has restaurants
+      const restaurantsQuery = await db.collection(collections.restaurants)
+        .where('ownerId', '==', userId)
+        .limit(1)
+        .get();
+      
+      hasRestaurants = !restaurantsQuery.empty;
+    }
+
+    // Generate JWT token (same as OTP flow)
+    const token = jwt.sign(
+      { userId, phone: normalizedPhone || null, role: 'owner' },
+      process.env.JWT_SECRET,
+      { expiresIn: '7d' }
+    );
+
+    // Get user's restaurants for subdomain check (same as OTP flow)
+    let subdomainUrl = null;
+    if (SUBDOMAIN_FEATURE_ENABLED && hasRestaurants) {
+      const restaurantsQuery = await db.collection(collections.restaurants)
+        .where('ownerId', '==', userId)
+        .limit(1)
+        .get();
+
+      if (!restaurantsQuery.empty) {
+        const restaurant = restaurantsQuery.docs[0].data();
+        if (restaurant.subdomainEnabled && restaurant.subdomain) {
+          subdomainUrl = getSubdomainUrl(restaurant.subdomain, '/dashboard');
+        }
+      }
+    }
+
+    // Return same response structure as /api/auth/phone/verify-otp
+    res.json({
+      success: true,
+      message: isNewUser ? 'Welcome! Account created successfully.' : 'Login successful',
+      token,
+      user: {
+        id: userId,
+        phone: normalizedPhone || null,
+        email: email ? email.toLowerCase().trim() : null,
+        name: name || userDoc.empty ? 'Restaurant Owner' : userDoc.docs[0]?.data()?.name || 'Restaurant Owner',
+        role: 'owner',
+        setupComplete: userDoc.empty ? false : userDoc.docs[0]?.data()?.setupComplete || false
+      },
+      firstTimeUser: isNewUser,
+      isNewUser, // Keep for backward compatibility
+      hasRestaurants,
+      subdomainUrl, // Include subdomain URL if enabled
+      redirectTo: subdomainUrl || (hasRestaurants ? '/dashboard' : '/admin')
+    });
+
+  } catch (error) {
+    console.error('Local login error:', error.message);
+    console.error('Stack trace:', error.stack);
+    res.status(500).json({ 
+      error: 'Login failed',
+      details: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
+  }
+});
+
 // Public endpoint to get all restaurants for directory
 app.get('/api/public/restaurants', vercelSecurityMiddleware.publicAPI, async (req, res) => {
   try {
