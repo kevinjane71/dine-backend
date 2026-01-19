@@ -276,6 +276,24 @@ router.post('/hotel/link-order', authenticateToken, async (req, res) => {
       });
     }
 
+    // Check if order exists and is not already billed/checked-out
+    const orderDoc = await db.collection('orders').doc(orderId).get();
+    if (!orderDoc.exists) {
+      return res.status(404).json({
+        success: false,
+        error: 'Order not found'
+      });
+    }
+
+    const orderData = orderDoc.data();
+    if (orderData.hotelBilledAndCheckedOut || orderData.hotelCheckoutId) {
+      return res.status(400).json({
+        success: false,
+        error: 'Order has already been billed and checked-out',
+        message: `Order ${orderId} was already processed in a previous checkout`
+      });
+    }
+
     const checkInRef = db.collection(COLLECTIONS.checkIns).doc(checkInId);
     const checkInDoc = await checkInRef.get();
 
@@ -304,7 +322,10 @@ router.post('/hotel/link-order', authenticateToken, async (req, res) => {
     foodOrders.push({
       orderId,
       amount: orderAmount,
-      linkedAt: new Date()
+      linkedAt: new Date(),
+      status: orderData.status || 'pending',
+      paymentStatus: orderData.paymentStatus || 'pending',
+      createdAt: orderData.createdAt || new Date()
     });
 
     // Update totals
@@ -312,12 +333,20 @@ router.post('/hotel/link-order', authenticateToken, async (req, res) => {
     const totalCharges = checkInData.totalRoomCharges + totalFoodCharges;
     const balanceAmount = totalCharges - (checkInData.advancePayment || 0);
 
+    // Update check-in with linked order
     await checkInRef.update({
       foodOrders,
       totalFoodCharges,
       totalCharges,
       balanceAmount,
       lastUpdated: FieldValue.serverTimestamp()
+    });
+
+    // IMPORTANT: Mark order as linked to this check-in to prevent re-linking
+    await db.collection('orders').doc(orderId).update({
+      hotelCheckInId: checkInId,
+      linkedToHotel: true,
+      hotelLinkTimestamp: FieldValue.serverTimestamp()
     });
 
     res.json({
@@ -429,7 +458,7 @@ router.post('/hotel/checkout/:checkInId', authenticateToken, async (req, res) =>
 
     await checkInRef.update(checkoutData);
 
-    // If there are linked food orders, mark them as billed
+    // If there are linked food orders, mark them as billed and checked-out
     if (checkInData.foodOrders && checkInData.foodOrders.length > 0) {
       const batch = db.batch();
 
@@ -438,11 +467,16 @@ router.post('/hotel/checkout/:checkInId', authenticateToken, async (req, res) =>
         batch.update(orderRef, {
           paymentStatus: 'paid',
           paidAt: FieldValue.serverTimestamp(),
-          paidVia: 'hotel-checkout'
+          paidVia: 'hotel-checkout',
+          // IMPORTANT: Mark as checked-out to prevent re-linking to future check-ins
+          hotelCheckoutId: checkInId,
+          hotelCheckoutAt: FieldValue.serverTimestamp(),
+          hotelBilledAndCheckedOut: true
         });
       }
 
       await batch.commit();
+      console.log(`✅ Marked ${checkInData.foodOrders.length} orders as billed and checked-out`);
     }
 
     // Update room status to cleaning/available

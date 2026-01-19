@@ -4159,17 +4159,25 @@ app.post('/api/orders', async (req, res) => {
     if (roomNumber) {
       try {
         console.log(`🏨 Attempting to link order to room ${roomNumber}...`);
-        const checkInSnapshot = await db.collection('hotel_checkins')
-          .where('restaurantId', '==', restaurantId)
-          .where('roomNumber', '==', roomNumber)
-          .where('status', '==', 'checked-in')
-          .limit(1)
-          .get();
-        
-        if (!checkInSnapshot.empty) {
-          const checkInDoc = checkInSnapshot.docs[0];
-          const checkInData = checkInDoc.data();
-          const checkInId = checkInDoc.id;
+
+        // First check if order is already linked to a check-in or has been checked-out
+        const orderDoc = await orderRef.get();
+        const orderData = orderDoc.data();
+        if (orderData.linkedToHotel || orderData.hotelCheckInId || orderData.hotelBilledAndCheckedOut) {
+          console.log(`⚠️ Order ${orderRef.id} is already linked/billed (checkIn: ${orderData.hotelCheckInId}) - skipping`);
+        } else {
+          // Find active check-in for this room
+          const checkInSnapshot = await db.collection('hotel_checkins')
+            .where('restaurantId', '==', restaurantId)
+            .where('roomNumber', '==', roomNumber)
+            .where('status', '==', 'checked-in')
+            .limit(1)
+            .get();
+
+          if (!checkInSnapshot.empty) {
+            const checkInDoc = checkInSnapshot.docs[0];
+            const checkInData = checkInDoc.data();
+            const checkInId = checkInDoc.id;
 
           // Add order to foodOrders array (with duplicate prevention)
           const foodOrders = checkInData.foodOrders || [];
@@ -4182,7 +4190,10 @@ app.post('/api/orders', async (req, res) => {
             foodOrders.push({
               orderId: orderRef.id,
               amount: totalAmount,
-              linkedAt: new Date()
+              linkedAt: new Date(),
+              status: orderData.status || 'pending',
+              paymentStatus: orderData.paymentStatus || 'pending',
+              createdAt: orderData.createdAt || new Date()
             });
 
             // Update totals
@@ -4190,6 +4201,7 @@ app.post('/api/orders', async (req, res) => {
             const totalCharges = (checkInData.totalRoomCharges || 0) + totalFoodCharges;
             const balanceAmount = totalCharges - (checkInData.advancePayment || 0);
 
+            // Update check-in with linked order
             await db.collection('hotel_checkins').doc(checkInId).update({
               foodOrders,
               totalFoodCharges,
@@ -4198,10 +4210,18 @@ app.post('/api/orders', async (req, res) => {
               lastUpdated: FieldValue.serverTimestamp()
             });
 
+            // IMPORTANT: Mark order as linked to this check-in to prevent re-linking
+            await orderRef.update({
+              hotelCheckInId: checkInId,
+              linkedToHotel: true,
+              hotelLinkTimestamp: FieldValue.serverTimestamp()
+            });
+
             console.log(`✅ Order ${orderRef.id} linked to check-in ${checkInId} for Room ${roomNumber}`);
           }
-        } else {
-          console.log(`⚠️ No active check-in found for Room ${roomNumber} - order created but not linked`);
+          } else {
+            console.log(`⚠️ No active check-in found for Room ${roomNumber} - order created but not linked`);
+          }
         }
       } catch (linkError) {
         console.error('❌ Error linking order to check-in:', linkError);
@@ -4274,17 +4294,23 @@ app.post('/api/orders', async (req, res) => {
       try {
         console.log('🏨 Linking order to hotel room:', roomNumber);
 
-        // Find active check-in for this room
-        const checkInSnapshot = await db.collection('hotel_checkins')
-          .where('restaurantId', '==', restaurantId)
-          .where('roomNumber', '==', roomNumber.trim())
-          .where('status', '==', 'checked-in')
-          .limit(1)
-          .get();
+        // First check if order is already linked to a check-in or has been checked-out
+        const orderDoc = await orderRef.get();
+        const currentOrderData = orderDoc.data();
+        if (currentOrderData.linkedToHotel || currentOrderData.hotelCheckInId || currentOrderData.hotelBilledAndCheckedOut) {
+          console.log(`⚠️ Order ${orderRef.id} is already linked/billed (checkIn: ${currentOrderData.hotelCheckInId}) - skipping`);
+        } else {
+          // Find active check-in for this room
+          const checkInSnapshot = await db.collection('hotel_checkins')
+            .where('restaurantId', '==', restaurantId)
+            .where('roomNumber', '==', roomNumber.trim())
+            .where('status', '==', 'checked-in')
+            .limit(1)
+            .get();
 
-        if (!checkInSnapshot.empty) {
-          const checkInDoc = checkInSnapshot.docs[0];
-          const checkInData = checkInDoc.data();
+          if (!checkInSnapshot.empty) {
+            const checkInDoc = checkInSnapshot.docs[0];
+            const checkInData = checkInDoc.data();
 
           // Add order to foodOrders array (with duplicate prevention)
           const foodOrders = checkInData.foodOrders || [];
@@ -4298,7 +4324,10 @@ app.post('/api/orders', async (req, res) => {
               orderId: orderRef.id,
               orderNumber: orderNumber,
               amount: totalAmount,
-              linkedAt: new Date()
+              linkedAt: new Date(),
+              status: currentOrderData.status || 'pending',
+              paymentStatus: currentOrderData.paymentStatus || 'pending',
+              createdAt: currentOrderData.createdAt || new Date()
             });
 
             // Update totals
@@ -4306,6 +4335,7 @@ app.post('/api/orders', async (req, res) => {
             const totalCharges = checkInData.totalRoomCharges + totalFoodCharges;
             const balanceAmount = totalCharges - (checkInData.advancePayment || 0);
 
+            // Update check-in with linked order
             await checkInDoc.ref.update({
               foodOrders,
               totalFoodCharges,
@@ -4314,10 +4344,18 @@ app.post('/api/orders', async (req, res) => {
               lastUpdated: FieldValue.serverTimestamp()
             });
 
+            // IMPORTANT: Mark order as linked to this check-in to prevent re-linking
+            await orderRef.update({
+              hotelCheckInId: checkInDoc.id,
+              linkedToHotel: true,
+              hotelLinkTimestamp: FieldValue.serverTimestamp()
+            });
+
             console.log('✅ Order linked to hotel check-in:', checkInDoc.id);
           }
-        } else {
-          console.log('⚠️ No active check-in found for room:', roomNumber);
+          } else {
+            console.log('⚠️ No active check-in found for room:', roomNumber);
+          }
         }
       } catch (hotelLinkError) {
         console.error('❌ Failed to link order to hotel check-in:', hotelLinkError);
