@@ -1,4 +1,4 @@
-const db = require('../firebase');
+const { db } = require('../firebase');
 const aiRecipeService = require('./aiRecipeService');
 
 class InventoryService {
@@ -68,6 +68,7 @@ class InventoryService {
     try {
       if (!orderItems || orderItems.length === 0) return;
 
+      // Create batch using the db instance
       const batch = db.batch();
       let hasUpdates = false;
 
