@@ -4170,29 +4170,36 @@ app.post('/api/orders', async (req, res) => {
           const checkInDoc = checkInSnapshot.docs[0];
           const checkInData = checkInDoc.data();
           const checkInId = checkInDoc.id;
-          
-          // Add order to foodOrders array
+
+          // Add order to foodOrders array (with duplicate prevention)
           const foodOrders = checkInData.foodOrders || [];
-          foodOrders.push({
-            orderId: orderRef.id,
-            amount: totalAmount,
-            linkedAt: new Date()
-          });
-          
-          // Update totals
-          const totalFoodCharges = (checkInData.totalFoodCharges || 0) + totalAmount;
-          const totalCharges = (checkInData.totalRoomCharges || 0) + totalFoodCharges;
-          const balanceAmount = totalCharges - (checkInData.advancePayment || 0);
-          
-          await db.collection('hotel_checkins').doc(checkInId).update({
-            foodOrders,
-            totalFoodCharges,
-            totalCharges,
-            balanceAmount,
-            lastUpdated: FieldValue.serverTimestamp()
-          });
-          
-          console.log(`✅ Order ${orderRef.id} linked to check-in ${checkInId} for Room ${roomNumber}`);
+
+          // Check if order is already linked to prevent duplicates
+          const existingOrder = foodOrders.find(order => order.orderId === orderRef.id);
+          if (existingOrder) {
+            console.log(`⚠️ Order ${orderRef.id} is already linked to check-in ${checkInId} - skipping duplicate`);
+          } else {
+            foodOrders.push({
+              orderId: orderRef.id,
+              amount: totalAmount,
+              linkedAt: new Date()
+            });
+
+            // Update totals
+            const totalFoodCharges = (checkInData.totalFoodCharges || 0) + totalAmount;
+            const totalCharges = (checkInData.totalRoomCharges || 0) + totalFoodCharges;
+            const balanceAmount = totalCharges - (checkInData.advancePayment || 0);
+
+            await db.collection('hotel_checkins').doc(checkInId).update({
+              foodOrders,
+              totalFoodCharges,
+              totalCharges,
+              balanceAmount,
+              lastUpdated: FieldValue.serverTimestamp()
+            });
+
+            console.log(`✅ Order ${orderRef.id} linked to check-in ${checkInId} for Room ${roomNumber}`);
+          }
         } else {
           console.log(`⚠️ No active check-in found for Room ${roomNumber} - order created but not linked`);
         }
@@ -4279,29 +4286,36 @@ app.post('/api/orders', async (req, res) => {
           const checkInDoc = checkInSnapshot.docs[0];
           const checkInData = checkInDoc.data();
 
-          // Add order to foodOrders array
+          // Add order to foodOrders array (with duplicate prevention)
           const foodOrders = checkInData.foodOrders || [];
-          foodOrders.push({
-            orderId: orderRef.id,
-            orderNumber: orderNumber,
-            amount: totalAmount,
-            linkedAt: new Date()
-          });
 
-          // Update totals
-          const totalFoodCharges = (checkInData.totalFoodCharges || 0) + totalAmount;
-          const totalCharges = checkInData.totalRoomCharges + totalFoodCharges;
-          const balanceAmount = totalCharges - (checkInData.advancePayment || 0);
+          // Check if order is already linked to prevent duplicates
+          const existingOrder = foodOrders.find(order => order.orderId === orderRef.id);
+          if (existingOrder) {
+            console.log(`⚠️ Order ${orderRef.id} is already linked to check-in ${checkInDoc.id} - skipping duplicate`);
+          } else {
+            foodOrders.push({
+              orderId: orderRef.id,
+              orderNumber: orderNumber,
+              amount: totalAmount,
+              linkedAt: new Date()
+            });
 
-          await checkInDoc.ref.update({
-            foodOrders,
-            totalFoodCharges,
-            totalCharges,
-            balanceAmount,
-            lastUpdated: FieldValue.serverTimestamp()
-          });
+            // Update totals
+            const totalFoodCharges = (checkInData.totalFoodCharges || 0) + totalAmount;
+            const totalCharges = checkInData.totalRoomCharges + totalFoodCharges;
+            const balanceAmount = totalCharges - (checkInData.advancePayment || 0);
 
-          console.log('✅ Order linked to hotel check-in:', checkInDoc.id);
+            await checkInDoc.ref.update({
+              foodOrders,
+              totalFoodCharges,
+              totalCharges,
+              balanceAmount,
+              lastUpdated: FieldValue.serverTimestamp()
+            });
+
+            console.log('✅ Order linked to hotel check-in:', checkInDoc.id);
+          }
         } else {
           console.log('⚠️ No active check-in found for room:', roomNumber);
         }

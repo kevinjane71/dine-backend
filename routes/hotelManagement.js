@@ -288,8 +288,19 @@ router.post('/hotel/link-order', authenticateToken, async (req, res) => {
 
     const checkInData = checkInDoc.data();
 
-    // Add order to foodOrders array
+    // Add order to foodOrders array (with duplicate prevention)
     const foodOrders = checkInData.foodOrders || [];
+
+    // Check if order is already linked to prevent duplicates
+    const existingOrder = foodOrders.find(order => order.orderId === orderId);
+    if (existingOrder) {
+      return res.status(400).json({
+        success: false,
+        error: 'Order already linked to this check-in',
+        message: `Order ${orderId} is already linked to room ${checkInData.roomNumber}`
+      });
+    }
+
     foodOrders.push({
       orderId,
       amount: orderAmount,
