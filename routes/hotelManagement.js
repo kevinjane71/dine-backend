@@ -45,11 +45,11 @@ router.post('/hotel/checkin', authenticateToken, async (req, res) => {
       specialRequests
     } = req.body;
 
-    // Validate required fields
-    if (!restaurantId || !guestInfo?.name || !guestInfo?.phone || !roomNumber || !checkInDate || !checkOutDate) {
+    // Validate required fields (phone number is now optional)
+    if (!restaurantId || !guestInfo?.name || !roomNumber || !checkInDate || !checkOutDate) {
       return res.status(400).json({
         success: false,
-        error: 'Missing required fields: restaurantId, guest name, phone, roomNumber, checkInDate, checkOutDate'
+        error: 'Missing required fields: restaurantId, guest name, roomNumber, checkInDate, checkOutDate'
       });
     }
 
@@ -71,7 +71,7 @@ router.post('/hotel/checkin', authenticateToken, async (req, res) => {
     // Create guest record
     const guestData = {
       name: guestInfo.name,
-      phone: guestInfo.phone,
+      phone: guestInfo.phone || null, // Phone is now optional
       email: guestInfo.email || null,
       address: guestInfo.address || null,
       city: guestInfo.city || null,
@@ -100,7 +100,7 @@ router.post('/hotel/checkin', authenticateToken, async (req, res) => {
       restaurantId,
       guestId: guestRef.id,
       guestName: guestInfo.name,
-      guestPhone: guestInfo.phone,
+      guestPhone: guestInfo.phone || null, // Phone is now optional
       guestEmail: guestInfo.email || null,
       roomNumber,
       checkInDate: new Date(checkInDate),
@@ -730,6 +730,481 @@ router.get('/hotel/guests/:restaurantId', authenticateToken, async (req, res) =>
     res.status(500).json({
       success: false,
       error: 'Failed to search guests'
+    });
+  }
+});
+
+// ==================== ROOM AVAILABILITY ====================
+
+/**
+ * GET /api/hotel/rooms/availability
+ * Get room availability for a specific date
+ * Query params: date (YYYY-MM-DD), restaurantId
+ */
+router.get('/hotel/rooms/availability', authenticateToken, async (req, res) => {
+  try {
+    const { date, restaurantId } = req.query;
+
+    if (!date || !restaurantId) {
+      return res.status(400).json({
+        success: false,
+        error: 'Missing required query params: date, restaurantId'
+      });
+    }
+
+    // Parse the date and create date range for the query
+    const queryDate = new Date(date);
+    queryDate.setHours(0, 0, 0, 0);
+
+    const nextDay = new Date(queryDate);
+    nextDay.setDate(nextDay.getDate() + 1);
+
+    // Get all rooms for the restaurant
+    const roomsSnapshot = await db.collection('rooms')
+      .where('restaurantId', '==', restaurantId)
+      .get();
+
+    const rooms = [];
+    roomsSnapshot.forEach(doc => {
+      rooms.push({
+        id: doc.id,
+        ...doc.data()
+      });
+    });
+
+    // Get all bookings that overlap with the query date
+    const bookingsSnapshot = await db.collection('hotel_bookings')
+      .where('restaurantId', '==', restaurantId)
+      .where('status', 'in', ['confirmed', 'checked-in'])
+      .get();
+
+    const bookings = [];
+    bookingsSnapshot.forEach(doc => {
+      const data = doc.data();
+      const checkIn = new Date(data.checkInDate);
+      const checkOut = new Date(data.checkOutDate);
+
+      // Check if booking overlaps with query date
+      if (checkIn <= queryDate && checkOut > queryDate) {
+        bookings.push({
+          id: doc.id,
+          ...data,
+          roomId: data.roomId || null,
+          roomNumber: data.roomNumber || null
+        });
+      }
+    });
+
+    // Get all active check-ins that overlap with the query date
+    const checkInsSnapshot = await db.collection(COLLECTIONS.checkIns)
+      .where('restaurantId', '==', restaurantId)
+      .where('status', '==', 'checked-in')
+      .get();
+
+    const checkIns = [];
+    checkInsSnapshot.forEach(doc => {
+      const data = doc.data();
+      const checkIn = new Date(data.checkInDate);
+      const checkOut = new Date(data.checkOutDate);
+
+      // Check if check-in overlaps with query date
+      if (checkIn <= queryDate && checkOut > queryDate) {
+        checkIns.push({
+          id: doc.id,
+          ...data
+        });
+      }
+    });
+
+    // Build room availability map
+    const roomAvailability = rooms.map(room => {
+      // Check if room has an active check-in
+      const activeCheckIn = checkIns.find(ci => ci.roomNumber === room.roomNumber);
+
+      // Check if room has a booking
+      const booking = bookings.find(b =>
+        b.roomNumber === room.roomNumber || b.roomId === room.id
+      );
+
+      let currentStatus = room.status || 'available';
+      let scheduledStatus = room.status || 'available';
+      let bookingInfo = null;
+
+      // Determine current status (real-time)
+      if (activeCheckIn) {
+        currentStatus = 'occupied';
+      } else if (room.status === 'cleaning' || room.status === 'maintenance' || room.status === 'out-of-service') {
+        currentStatus = room.status;
+      } else {
+        currentStatus = 'available';
+      }
+
+      // Determine scheduled status (based on bookings)
+      if (booking) {
+        scheduledStatus = 'booked';
+        bookingInfo = {
+          id: booking.id,
+          guestName: booking.guestName,
+          checkInDate: booking.checkInDate,
+          checkOutDate: booking.checkOutDate,
+          status: booking.status
+        };
+      } else if (activeCheckIn) {
+        scheduledStatus = 'occupied';
+        bookingInfo = {
+          id: activeCheckIn.id,
+          guestName: activeCheckIn.guestName,
+          checkInDate: activeCheckIn.checkInDate,
+          checkOutDate: activeCheckIn.checkOutDate,
+          status: 'checked-in'
+        };
+      } else if (room.status === 'cleaning' || room.status === 'maintenance' || room.status === 'out-of-service') {
+        scheduledStatus = room.status;
+      } else {
+        scheduledStatus = 'available';
+      }
+
+      return {
+        id: room.id,
+        roomNumber: room.roomNumber,
+        roomType: room.roomType || null,
+        floor: room.floor || null,
+        currentStatus,
+        scheduledStatus,
+        booking: bookingInfo
+      };
+    });
+
+    // Calculate summary
+    const summary = {
+      total: rooms.length,
+      available: roomAvailability.filter(r => r.scheduledStatus === 'available').length,
+      occupied: roomAvailability.filter(r => r.scheduledStatus === 'occupied').length,
+      booked: roomAvailability.filter(r => r.scheduledStatus === 'booked').length,
+      cleaning: roomAvailability.filter(r => r.scheduledStatus === 'cleaning').length,
+      maintenance: roomAvailability.filter(r => r.scheduledStatus === 'maintenance').length,
+      outOfService: roomAvailability.filter(r => r.scheduledStatus === 'out-of-service').length
+    };
+
+    res.json({
+      success: true,
+      date: date,
+      rooms: roomAvailability,
+      summary
+    });
+
+  } catch (error) {
+    console.error('Room availability error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to fetch room availability'
+    });
+  }
+});
+
+// ==================== BOOKING OVERLAP VALIDATION ====================
+
+/**
+ * POST /api/hotel/bookings/validate
+ * Validate if a booking has date overlaps
+ */
+router.post('/hotel/bookings/validate', authenticateToken, async (req, res) => {
+  try {
+    const { roomId, roomNumber, checkInDate, checkOutDate, excludeBookingId, restaurantId } = req.body;
+
+    if ((!roomId && !roomNumber) || !checkInDate || !checkOutDate || !restaurantId) {
+      return res.status(400).json({
+        success: false,
+        error: 'Missing required fields: (roomId or roomNumber), checkInDate, checkOutDate, restaurantId'
+      });
+    }
+
+    const newStart = new Date(checkInDate);
+    const newEnd = new Date(checkOutDate);
+
+    // Get all bookings for this room
+    let bookingsQuery = db.collection('hotel_bookings')
+      .where('restaurantId', '==', restaurantId)
+      .where('status', 'in', ['confirmed', 'checked-in']);
+
+    if (roomId) {
+      bookingsQuery = bookingsQuery.where('roomId', '==', roomId);
+    }
+
+    const bookingsSnapshot = await bookingsQuery.get();
+
+    // Filter by roomNumber if roomId not provided
+    let bookings = [];
+    bookingsSnapshot.forEach(doc => {
+      const data = doc.data();
+      if (!roomId && data.roomNumber !== roomNumber) {
+        return; // Skip if roomNumber doesn't match
+      }
+      if (excludeBookingId && doc.id === excludeBookingId) {
+        return; // Skip the booking being edited
+      }
+      bookings.push({
+        id: doc.id,
+        ...data
+      });
+    });
+
+    // Check for overlaps in bookings
+    const bookingConflicts = bookings.filter(booking => {
+      const existingStart = new Date(booking.checkInDate);
+      const existingEnd = new Date(booking.checkOutDate);
+
+      // Overlap check: existingStart < newEnd AND existingEnd > newStart
+      return existingStart < newEnd && existingEnd > newStart;
+    });
+
+    // Also check check-ins
+    let checkInsQuery = db.collection(COLLECTIONS.checkIns)
+      .where('restaurantId', '==', restaurantId)
+      .where('status', '==', 'checked-in');
+
+    if (roomNumber) {
+      checkInsQuery = checkInsQuery.where('roomNumber', '==', roomNumber);
+    }
+
+    const checkInsSnapshot = await checkInsQuery.get();
+
+    const checkInConflicts = [];
+    checkInsSnapshot.forEach(doc => {
+      const data = doc.data();
+      const existingStart = new Date(data.checkInDate);
+      const existingEnd = new Date(data.checkOutDate);
+
+      // Overlap check
+      if (existingStart < newEnd && existingEnd > newStart) {
+        checkInConflicts.push({
+          id: doc.id,
+          ...data,
+          type: 'check-in'
+        });
+      }
+    });
+
+    const allConflicts = [...bookingConflicts, ...checkInConflicts];
+    const hasConflict = allConflicts.length > 0;
+
+    res.json({
+      success: true,
+      hasConflict,
+      conflicts: allConflicts
+    });
+
+  } catch (error) {
+    console.error('Booking validation error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to validate booking'
+    });
+  }
+});
+
+// ==================== CALENDAR SUMMARY ====================
+
+/**
+ * GET /api/hotel/calendar/summary
+ * Get booking summary for a month
+ * Query params: month (1-12), year (YYYY), restaurantId
+ */
+router.get('/hotel/calendar/summary', authenticateToken, async (req, res) => {
+  try {
+    const { month, year, restaurantId } = req.query;
+
+    if (!month || !year || !restaurantId) {
+      return res.status(400).json({
+        success: false,
+        error: 'Missing required query params: month, year, restaurantId'
+      });
+    }
+
+    const monthNum = parseInt(month);
+    const yearNum = parseInt(year);
+
+    // Get first and last day of month
+    const startDate = new Date(yearNum, monthNum - 1, 1);
+    startDate.setHours(0, 0, 0, 0);
+
+    const endDate = new Date(yearNum, monthNum, 0);
+    endDate.setHours(23, 59, 59, 999);
+
+    // Get total number of rooms
+    const roomsSnapshot = await db.collection('rooms')
+      .where('restaurantId', '==', restaurantId)
+      .get();
+
+    const totalRooms = roomsSnapshot.size;
+
+    // Get all bookings that overlap with this month
+    const bookingsSnapshot = await db.collection('hotel_bookings')
+      .where('restaurantId', '==', restaurantId)
+      .where('status', 'in', ['confirmed', 'checked-in'])
+      .get();
+
+    const bookings = [];
+    bookingsSnapshot.forEach(doc => {
+      bookings.push({
+        id: doc.id,
+        ...doc.data()
+      });
+    });
+
+    // Get all check-ins that overlap with this month
+    const checkInsSnapshot = await db.collection(COLLECTIONS.checkIns)
+      .where('restaurantId', '==', restaurantId)
+      .get();
+
+    const checkIns = [];
+    checkInsSnapshot.forEach(doc => {
+      checkIns.push({
+        id: doc.id,
+        ...doc.data()
+      });
+    });
+
+    // Build daily summary
+    const dailySummary = {};
+
+    // Iterate through each day of the month
+    for (let date = new Date(startDate); date <= endDate; date.setDate(date.getDate() + 1)) {
+      const dateStr = date.toISOString().split('T')[0];
+      const currentDate = new Date(date);
+      currentDate.setHours(0, 0, 0, 0);
+
+      const nextDay = new Date(currentDate);
+      nextDay.setDate(nextDay.getDate() + 1);
+
+      // Count bookings for this date
+      const bookingsOnDate = bookings.filter(booking => {
+        const checkIn = new Date(booking.checkInDate);
+        const checkOut = new Date(booking.checkOutDate);
+        return checkIn <= currentDate && checkOut > currentDate;
+      });
+
+      // Count check-ins for this date
+      const checkInsOnDate = checkIns.filter(checkIn => {
+        const ciDate = new Date(checkIn.checkInDate);
+        const coDate = new Date(checkIn.checkOutDate);
+        return ciDate <= currentDate && coDate > currentDate;
+      });
+
+      const totalBookings = bookingsOnDate.length + checkInsOnDate.length;
+      const occupancyRate = totalRooms > 0 ? (totalBookings / totalRooms) * 100 : 0;
+      const availableRooms = totalRooms - totalBookings;
+
+      dailySummary[dateStr] = {
+        bookingCount: totalBookings,
+        occupancyRate: Math.round(occupancyRate * 10) / 10, // Round to 1 decimal
+        availableRooms,
+        occupiedRooms: bookingsOnDate.map(b => b.roomNumber || b.roomId).filter(Boolean),
+        checkInCount: checkInsOnDate.length,
+        bookingListCount: bookingsOnDate.length
+      };
+    }
+
+    res.json({
+      success: true,
+      month: monthNum,
+      year: yearNum,
+      totalRooms,
+      summary: dailySummary
+    });
+
+  } catch (error) {
+    console.error('Calendar summary error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to fetch calendar summary'
+    });
+  }
+});
+
+// ==================== ROOM HISTORY ====================
+
+/**
+ * GET /api/hotel/history
+ * Get room history (past check-ins)
+ * Query params: startDate, endDate, roomId, status, restaurantId
+ */
+router.get('/hotel/history', authenticateToken, async (req, res) => {
+  try {
+    const { startDate, endDate, roomId, status, restaurantId } = req.query;
+
+    if (!restaurantId) {
+      return res.status(400).json({
+        success: false,
+        error: 'Missing required query param: restaurantId'
+      });
+    }
+
+    let query = db.collection(COLLECTIONS.checkIns)
+      .where('restaurantId', '==', restaurantId);
+
+    // Filter by status (default to checked-out for history)
+    if (status) {
+      query = query.where('status', '==', status);
+    } else {
+      query = query.where('status', '==', 'checked-out');
+    }
+
+    const snapshot = await query.orderBy('actualCheckOutAt', 'desc').get();
+
+    let history = [];
+    snapshot.forEach(doc => {
+      const data = doc.data();
+      history.push({
+        id: doc.id,
+        ...data,
+        checkInDate: data.checkInDate?.toDate?.() || data.checkInDate,
+        checkOutDate: data.checkOutDate?.toDate?.() || data.checkOutDate,
+        actualCheckOutAt: data.actualCheckOutAt?.toDate?.() || data.actualCheckOutAt,
+        checkInAt: data.checkInAt?.toDate?.() || data.checkInAt
+      });
+    });
+
+    // Filter by date range if provided
+    if (startDate || endDate) {
+      history = history.filter(record => {
+        const checkOutDate = new Date(record.checkOutDate);
+
+        if (startDate && endDate) {
+          return checkOutDate >= new Date(startDate) && checkOutDate <= new Date(endDate);
+        } else if (startDate) {
+          return checkOutDate >= new Date(startDate);
+        } else if (endDate) {
+          return checkOutDate <= new Date(endDate);
+        }
+
+        return true;
+      });
+    }
+
+    // Filter by roomId if provided
+    if (roomId) {
+      // Get room number from roomId
+      const roomDoc = await db.collection('rooms').doc(roomId).get();
+      if (roomDoc.exists) {
+        const roomNumber = roomDoc.data().roomNumber;
+        history = history.filter(record => record.roomNumber === roomNumber);
+      } else {
+        history = [];
+      }
+    }
+
+    res.json({
+      success: true,
+      history,
+      total: history.length
+    });
+
+  } catch (error) {
+    console.error('Room history error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to fetch room history'
     });
   }
 });

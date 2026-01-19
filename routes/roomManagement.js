@@ -221,20 +221,40 @@ router.post('/booking', authenticateToken, async (req, res) => {
       numberOfGuests,
       estimatedTariff,
       specialRequests,
-      bookingSource
+      bookingSource,
+      overrideUnavailable
     } = req.body;
 
-    if (!restaurantId || !roomNumber || !checkInDate || !checkOutDate || !guestInfo) {
-      return res.status(400).json({ success: false, message: 'Missing required fields' });
+    // Validate required fields (phone number is now optional)
+    if (!restaurantId || !roomNumber || !checkInDate || !checkOutDate || !guestInfo || !guestInfo.name) {
+      return res.status(400).json({ success: false, message: 'Missing required fields: restaurantId, roomNumber, checkInDate, checkOutDate, guestInfo.name' });
     }
 
     // Validate dates
     const checkIn = new Date(checkInDate);
     const checkOut = new Date(checkOutDate);
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+
     const stayDuration = Math.ceil((checkOut - checkIn) / (1000 * 60 * 60 * 24));
 
     if (stayDuration < 1) {
       return res.status(400).json({ success: false, message: 'Check-out must be after check-in' });
+    }
+
+    // Check if check-in date is in the past
+    if (checkIn < today) {
+      return res.status(400).json({ success: false, message: 'Check-in date cannot be in the past' });
+    }
+
+    // Check 120-day advance booking limit
+    const daysInFuture = Math.floor((checkIn - today) / (1000 * 60 * 60 * 24));
+    if (daysInFuture > 120) {
+      return res.status(400).json({
+        success: false,
+        message: 'Cannot book more than 120 days in advance',
+        code: 'BOOKING_TOO_FAR_AHEAD'
+      });
     }
 
     // Check room availability
@@ -251,6 +271,17 @@ router.post('/booking', authenticateToken, async (req, res) => {
     const roomDoc = roomSnapshot.docs[0];
     const roomData = roomDoc.data();
 
+    // Check if room is unavailable (out-of-service or maintenance)
+    if ((roomData.status === 'out-of-service' || roomData.status === 'maintenance') && !overrideUnavailable) {
+      return res.status(400).json({
+        success: false,
+        message: `Room is currently marked as ${roomData.status}. Set overrideUnavailable=true to book anyway.`,
+        code: 'ROOM_UNAVAILABLE',
+        roomStatus: roomData.status
+      });
+    }
+
+    // STRICT DOUBLE-BOOKING VALIDATION
     // Check for conflicting bookings
     const conflictingBookings = await db.collection('hotel_bookings')
       .where('restaurantId', '==', restaurantId)
@@ -258,22 +289,57 @@ router.post('/booking', authenticateToken, async (req, res) => {
       .where('status', 'in', ['confirmed', 'checked-in'])
       .get();
 
+    const bookingConflicts = [];
     for (const booking of conflictingBookings.docs) {
       const bookingData = booking.data();
       const existingCheckIn = new Date(bookingData.checkInDate);
       const existingCheckOut = new Date(bookingData.checkOutDate);
 
-      // Check if dates overlap
-      if (
-        (checkIn >= existingCheckIn && checkIn < existingCheckOut) ||
-        (checkOut > existingCheckIn && checkOut <= existingCheckOut) ||
-        (checkIn <= existingCheckIn && checkOut >= existingCheckOut)
-      ) {
-        return res.status(400).json({
-          success: false,
-          message: 'Room is already booked for these dates'
+      // Overlap check: existingStart < newEnd AND existingEnd > newStart
+      if (existingCheckIn < checkOut && existingCheckOut > checkIn) {
+        bookingConflicts.push({
+          id: booking.id,
+          guestName: bookingData.guestName,
+          checkInDate: bookingData.checkInDate,
+          checkOutDate: bookingData.checkOutDate
         });
       }
+    }
+
+    // Also check for active check-ins
+    const conflictingCheckIns = await db.collection('hotel_checkins')
+      .where('restaurantId', '==', restaurantId)
+      .where('roomNumber', '==', roomNumber)
+      .where('status', '==', 'checked-in')
+      .get();
+
+    const checkInConflicts = [];
+    for (const checkIn of conflictingCheckIns.docs) {
+      const checkInData = checkIn.data();
+      const existingCheckIn = new Date(checkInData.checkInDate);
+      const existingCheckOut = new Date(checkInData.checkOutDate);
+
+      // Overlap check
+      if (existingCheckIn < checkOut && existingCheckOut > checkIn) {
+        checkInConflicts.push({
+          id: checkIn.id,
+          guestName: checkInData.guestName,
+          checkInDate: checkInData.checkInDate,
+          checkOutDate: checkInData.checkOutDate,
+          type: 'check-in'
+        });
+      }
+    }
+
+    const allConflicts = [...bookingConflicts, ...checkInConflicts];
+
+    if (allConflicts.length > 0) {
+      return res.status(400).json({
+        success: false,
+        message: 'Room is already booked for these dates',
+        code: 'BOOKING_CONFLICT',
+        conflicts: allConflicts
+      });
     }
 
     const bookingData = {
@@ -281,16 +347,18 @@ router.post('/booking', authenticateToken, async (req, res) => {
       roomId: roomDoc.id,
       roomNumber,
       guestName: guestInfo.name,
-      guestPhone: guestInfo.phone,
+      guestPhone: guestInfo.phone || null, // Phone is now optional
       guestEmail: guestInfo.email || null,
       checkInDate,
       checkOutDate,
       numberOfGuests: numberOfGuests || 1,
       stayDuration,
       estimatedTariff: estimatedTariff || roomData.tariff || 0,
+      totalAmount: (estimatedTariff || roomData.tariff || 0) * stayDuration,
       specialRequests: specialRequests || null,
       bookingSource: bookingSource || 'front-desk',
       status: 'confirmed',
+      unavailableOverride: overrideUnavailable || false, // Track if unavailable room was overridden
       createdAt: FieldValue.serverTimestamp(),
       updatedAt: FieldValue.serverTimestamp()
     };
