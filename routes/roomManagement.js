@@ -366,8 +366,8 @@ router.post('/booking', authenticateToken, async (req, res) => {
     const bookingRef = await db.collection('hotel_bookings').add(bookingData);
 
     // Update room status to reserved if booking is for today
-    const today = new Date().toISOString().split('T')[0];
-    if (checkInDate === today) {
+    const todayStr = new Date().toISOString().split('T')[0];
+    if (checkInDate === todayStr) {
       await db.collection('rooms').doc(roomDoc.id).update({
         status: 'reserved',
         currentGuest: guestInfo.name
