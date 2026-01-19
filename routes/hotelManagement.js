@@ -319,13 +319,18 @@ router.post('/hotel/link-order', authenticateToken, async (req, res) => {
       });
     }
 
+    // Use finalAmount (with tax) if available, otherwise use provided orderAmount
+    const finalOrderAmount = orderData.finalAmount || (orderData.totalAmount + (orderData.taxAmount || 0)) || orderAmount;
+    
     foodOrders.push({
       orderId,
-      amount: orderAmount,
+      amount: Math.round(finalOrderAmount * 100) / 100, // Use final amount with tax
       linkedAt: new Date(),
       status: orderData.status || 'pending',
       paymentStatus: orderData.paymentStatus || 'pending',
-      createdAt: orderData.createdAt || new Date()
+      createdAt: orderData.createdAt || new Date(),
+      dailyOrderId: orderData.dailyOrderId || null,
+      orderNumber: orderData.orderNumber || null
     });
 
     // Update totals

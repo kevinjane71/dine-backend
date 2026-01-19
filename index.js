@@ -4110,6 +4110,22 @@ app.post('/api/orders', async (req, res) => {
       });
     }
 
+    // Calculate tax if tax settings are enabled
+    let taxAmount = 0;
+    let finalAmount = totalAmount;
+    const taxSettings = restaurantData.taxSettings || {};
+    
+    if (taxSettings.enabled && totalAmount > 0) {
+      if (taxSettings.taxes && Array.isArray(taxSettings.taxes) && taxSettings.taxes.length > 0) {
+        taxAmount = taxSettings.taxes
+          .filter(tax => tax.enabled)
+          .reduce((sum, tax) => sum + (totalAmount * (tax.rate || 0) / 100), 0);
+      } else if (taxSettings.defaultTaxRate) {
+        taxAmount = totalAmount * (taxSettings.defaultTaxRate / 100);
+      }
+      finalAmount = totalAmount + taxAmount;
+    }
+
     // Generate order number and daily order ID
     const orderNumber = `ORD-${Date.now()}-${Math.random().toString(36).substr(2, 4).toUpperCase()}`;
     const dailyOrderId = await generateDailyOrderId(restaurantId);
@@ -4123,6 +4139,8 @@ app.post('/api/orders', async (req, res) => {
       orderType,
       items: orderItems,
       totalAmount,
+      taxAmount: Math.round(taxAmount * 100) / 100,
+      finalAmount: Math.round(finalAmount * 100) / 100,
           customerInfo: customerInfo || {
             phone: customerPhone,
             name: customerName || 'Customer',
@@ -4187,17 +4205,21 @@ app.post('/api/orders', async (req, res) => {
           if (existingOrder) {
             console.log(`⚠️ Order ${orderRef.id} is already linked to check-in ${checkInId} - skipping duplicate`);
           } else {
+            // Use finalAmount (with tax) instead of totalAmount for hotel billing
+            const orderFinalAmount = orderData.finalAmount || (orderData.totalAmount + (orderData.taxAmount || 0));
             foodOrders.push({
               orderId: orderRef.id,
-              amount: totalAmount,
+              amount: Math.round(orderFinalAmount * 100) / 100, // Use final amount with tax
               linkedAt: new Date(),
               status: orderData.status || 'pending',
               paymentStatus: orderData.paymentStatus || 'pending',
-              createdAt: orderData.createdAt || new Date()
+              createdAt: orderData.createdAt || new Date(),
+              dailyOrderId: orderData.dailyOrderId || null,
+              orderNumber: orderData.orderNumber || null
             });
 
-            // Update totals
-            const totalFoodCharges = (checkInData.totalFoodCharges || 0) + totalAmount;
+            // Update totals - use orderFinalAmount (with tax) instead of totalAmount
+            const totalFoodCharges = (checkInData.totalFoodCharges || 0) + orderFinalAmount;
             const totalCharges = (checkInData.totalRoomCharges || 0) + totalFoodCharges;
             const balanceAmount = totalCharges - (checkInData.advancePayment || 0);
 
@@ -4320,18 +4342,21 @@ app.post('/api/orders', async (req, res) => {
           if (existingOrder) {
             console.log(`⚠️ Order ${orderRef.id} is already linked to check-in ${checkInDoc.id} - skipping duplicate`);
           } else {
+            // Use finalAmount (with tax) instead of totalAmount for hotel billing
+            const orderFinalAmount = currentOrderData.finalAmount || (currentOrderData.totalAmount + (currentOrderData.taxAmount || 0));
             foodOrders.push({
               orderId: orderRef.id,
               orderNumber: orderNumber,
-              amount: totalAmount,
+              amount: Math.round(orderFinalAmount * 100) / 100, // Use final amount with tax
               linkedAt: new Date(),
               status: currentOrderData.status || 'pending',
               paymentStatus: currentOrderData.paymentStatus || 'pending',
-              createdAt: currentOrderData.createdAt || new Date()
+              createdAt: currentOrderData.createdAt || new Date(),
+              dailyOrderId: currentOrderData.dailyOrderId || null
             });
 
-            // Update totals
-            const totalFoodCharges = (checkInData.totalFoodCharges || 0) + totalAmount;
+            // Update totals - use orderFinalAmount (with tax) instead of totalAmount
+            const totalFoodCharges = (checkInData.totalFoodCharges || 0) + orderFinalAmount;
             const totalCharges = checkInData.totalRoomCharges + totalFoodCharges;
             const balanceAmount = totalCharges - (checkInData.advancePayment || 0);
 
@@ -5027,9 +5052,39 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
         updateData.totalAmount = processedItems.reduce((sum, item) => sum + (item.total || 0), 0);
       }
       
+      // Calculate tax if tax settings are enabled
+      const restaurantDoc = await db.collection(collections.restaurants).doc(currentOrder.restaurantId).get();
+      if (restaurantDoc.exists) {
+        const restaurantData = restaurantDoc.data();
+        const taxSettings = restaurantData.taxSettings || {};
+        
+        if (taxSettings.enabled && updateData.totalAmount > 0) {
+          let taxAmount = 0;
+          if (taxSettings.taxes && Array.isArray(taxSettings.taxes) && taxSettings.taxes.length > 0) {
+            taxAmount = taxSettings.taxes
+              .filter(tax => tax.enabled)
+              .reduce((sum, tax) => sum + (updateData.totalAmount * (tax.rate || 0) / 100), 0);
+          } else if (taxSettings.defaultTaxRate) {
+            taxAmount = updateData.totalAmount * (taxSettings.defaultTaxRate / 100);
+          }
+          updateData.taxAmount = Math.round(taxAmount * 100) / 100;
+          updateData.finalAmount = Math.round((updateData.totalAmount + taxAmount) * 100) / 100;
+        } else {
+          // Tax disabled - set taxAmount to 0 and finalAmount = totalAmount
+          updateData.taxAmount = 0;
+          updateData.finalAmount = updateData.totalAmount;
+        }
+      } else {
+        // Restaurant doc doesn't exist - preserve existing values for backward compatibility
+        updateData.taxAmount = currentOrder.taxAmount || 0;
+        updateData.finalAmount = updateData.totalAmount || currentOrder.finalAmount || currentOrder.totalAmount || 0;
+      }
+      
       console.log('🔄 Updated order totals:', {
         itemCount: updateData.itemCount,
         totalAmount: updateData.totalAmount,
+        taxAmount: updateData.taxAmount,
+        finalAmount: updateData.finalAmount,
         items: processedItems.map(item => ({
           name: item.name,
           price: item.price,
@@ -5067,6 +5122,59 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
 
     console.log('🔄 Backend - Updating order:', orderId, 'with data:', updateData);
     await db.collection(collections.orders).doc(orderId).update(updateData);
+
+    // NEW: If order is linked to hotel check-in, update the check-in's foodOrders array
+    // This ensures the checkbox auto-checks when order status changes to completed
+    if (currentOrder.hotelCheckInId && (status || paymentStatus)) {
+      try {
+        const checkInRef = db.collection('hotel_checkins').doc(currentOrder.hotelCheckInId);
+        const checkInDoc = await checkInRef.get();
+        
+        if (checkInDoc.exists) {
+          const checkInData = checkInDoc.data();
+          const foodOrders = checkInData.foodOrders || [];
+          
+          // Find and update the order in foodOrders array
+          const orderIndex = foodOrders.findIndex(fo => fo.orderId === orderId || fo.id === orderId);
+          if (orderIndex !== -1) {
+            // Calculate final amount for the order (with tax)
+            let updatedFinalAmount = foodOrders[orderIndex].amount; // Default to existing amount
+            if (updateData.finalAmount) {
+              updatedFinalAmount = Math.round(updateData.finalAmount * 100) / 100;
+            } else if (updateData.totalAmount) {
+              // Calculate from totalAmount + taxAmount if finalAmount not available
+              updatedFinalAmount = Math.round((updateData.totalAmount + (updateData.taxAmount || 0)) * 100) / 100;
+            }
+            
+            foodOrders[orderIndex] = {
+              ...foodOrders[orderIndex],
+              status: status || foodOrders[orderIndex].status || currentOrder.status,
+              paymentStatus: paymentStatus || foodOrders[orderIndex].paymentStatus || currentOrder.paymentStatus,
+              // Update amount to final amount (with tax)
+              amount: updatedFinalAmount
+            };
+            
+            // Recalculate totals
+            const totalFoodCharges = foodOrders.reduce((sum, fo) => sum + (fo.amount || 0), 0);
+            const totalCharges = (checkInData.totalRoomCharges || 0) + totalFoodCharges;
+            const balanceAmount = totalCharges - (checkInData.advancePayment || 0);
+            
+            await checkInRef.update({
+              foodOrders,
+              totalFoodCharges,
+              totalCharges,
+              balanceAmount,
+              lastUpdated: FieldValue.serverTimestamp()
+            });
+            
+            console.log(`✅ Updated check-in ${currentOrder.hotelCheckInId} foodOrders for order ${orderId}`);
+          }
+        }
+      } catch (checkInUpdateError) {
+        console.error('❌ Failed to update check-in foodOrders:', checkInUpdateError);
+        // Don't fail the order update if check-in update fails
+      }
+    }
 
     // Release table if order is being completed (Complete Billing in edit mode)
     if (status === 'completed' && currentOrder.tableNumber && currentOrder.tableNumber.trim()) {
