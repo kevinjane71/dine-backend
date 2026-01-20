@@ -90,9 +90,22 @@ router.post('/hotel/checkin', authenticateToken, async (req, res) => {
 
     const guestRef = await db.collection(COLLECTIONS.guests).add(guestData);
 
-    // Calculate stay duration in days
+    // Validate dates
     const checkIn = new Date(checkInDate);
     const checkOut = new Date(checkOutDate);
+    
+    // Normalize dates to start of day for comparison
+    checkIn.setHours(0, 0, 0, 0);
+    checkOut.setHours(0, 0, 0, 0);
+    
+    // Validate: Check-out date must be same as or after check-in date
+    if (checkOut < checkIn) {
+      return res.status(400).json({
+        success: false,
+        error: 'Check-out date cannot be before check-in date'
+      });
+    }
+    
     const stayDuration = Math.ceil((checkOut - checkIn) / (1000 * 60 * 60 * 24));
 
     // Create check-in record
@@ -781,11 +794,41 @@ router.get('/hotel/rooms/availability', authenticateToken, async (req, res) => {
     const bookings = [];
     bookingsSnapshot.forEach(doc => {
       const data = doc.data();
-      const checkIn = new Date(data.checkInDate);
-      const checkOut = new Date(data.checkOutDate);
+      
+      // Parse dates - handle both string dates and Firestore Timestamps
+      let checkIn;
+      let checkOut;
+      
+      if (data.checkInDate instanceof Date) {
+        checkIn = new Date(data.checkInDate);
+      } else if (data.checkInDate && data.checkInDate._seconds) {
+        checkIn = new Date(data.checkInDate._seconds * 1000);
+      } else if (data.checkInDate) {
+        checkIn = new Date(data.checkInDate);
+      } else {
+        return; // Skip if no valid check-in date
+      }
+      
+      if (data.checkOutDate instanceof Date) {
+        checkOut = new Date(data.checkOutDate);
+      } else if (data.checkOutDate && data.checkOutDate._seconds) {
+        checkOut = new Date(data.checkOutDate._seconds * 1000);
+      } else if (data.checkOutDate) {
+        checkOut = new Date(data.checkOutDate);
+      } else {
+        return; // Skip if no valid check-out date
+      }
+      
+      // Normalize dates to start of day for comparison
+      checkIn.setHours(0, 0, 0, 0);
+      checkOut.setHours(0, 0, 0, 0);
+      const normalizedQueryDate = new Date(queryDate);
+      normalizedQueryDate.setHours(0, 0, 0, 0);
 
-      // Check if booking overlaps with query date
-      if (checkIn <= queryDate && checkOut > queryDate) {
+      // Hotel industry standard: Check-in date is booked, check-out date is available
+      // Booking overlaps if: checkIn <= queryDate < checkOut
+      // This means: Room is booked on check-in date, but available on check-out date
+      if (checkIn <= normalizedQueryDate && normalizedQueryDate < checkOut) {
         bookings.push({
           id: doc.id,
           ...data,
@@ -804,11 +847,40 @@ router.get('/hotel/rooms/availability', authenticateToken, async (req, res) => {
     const checkIns = [];
     checkInsSnapshot.forEach(doc => {
       const data = doc.data();
-      const checkIn = new Date(data.checkInDate);
-      const checkOut = new Date(data.checkOutDate);
+      
+      // Parse dates - handle both string dates and Firestore Timestamps
+      let checkIn;
+      let checkOut;
+      
+      if (data.checkInDate instanceof Date) {
+        checkIn = new Date(data.checkInDate);
+      } else if (data.checkInDate && data.checkInDate._seconds) {
+        checkIn = new Date(data.checkInDate._seconds * 1000);
+      } else if (data.checkInDate) {
+        checkIn = new Date(data.checkInDate);
+      } else {
+        return; // Skip if no valid check-in date
+      }
+      
+      if (data.checkOutDate instanceof Date) {
+        checkOut = new Date(data.checkOutDate);
+      } else if (data.checkOutDate && data.checkOutDate._seconds) {
+        checkOut = new Date(data.checkOutDate._seconds * 1000);
+      } else if (data.checkOutDate) {
+        checkOut = new Date(data.checkOutDate);
+      } else {
+        return; // Skip if no valid check-out date
+      }
+      
+      // Normalize dates to start of day for comparison
+      checkIn.setHours(0, 0, 0, 0);
+      checkOut.setHours(0, 0, 0, 0);
+      const normalizedQueryDate = new Date(queryDate);
+      normalizedQueryDate.setHours(0, 0, 0, 0);
 
-      // Check if check-in overlaps with query date
-      if (checkIn <= queryDate && checkOut > queryDate) {
+      // Hotel industry standard: Check-in date is occupied, check-out date is available
+      // Check-in overlaps if: checkIn <= queryDate < checkOut
+      if (checkIn <= normalizedQueryDate && normalizedQueryDate < checkOut) {
         checkIns.push({
           id: doc.id,
           ...data
@@ -886,9 +958,12 @@ router.get('/hotel/rooms/availability', authenticateToken, async (req, res) => {
       let scheduledStatus = room.status || 'available';
       let bookingInfo = null;
 
-      // Determine current status (real-time) - prioritize check-ins, then maintenance schedules, then room status
+      // Determine current status (real-time) - prioritize check-ins, then bookings, then maintenance schedules, then room status
       if (activeCheckIn) {
         currentStatus = 'occupied';
+      } else if (booking) {
+        // If there's a booking for this specific date, show as booked
+        currentStatus = 'booked';
       } else if (maintenanceSchedule) {
         // If there's a maintenance schedule for this date, show maintenance
         currentStatus = 'maintenance';
@@ -896,6 +971,8 @@ router.get('/hotel/rooms/availability', authenticateToken, async (req, res) => {
         // Only use room.status if there's no date-specific maintenance
         currentStatus = room.status;
       } else {
+        // Default to available - don't use room.status 'reserved' as it's date-agnostic
+        // Only show booked if there's an actual booking for this specific date
         currentStatus = 'available';
       }
 
@@ -925,6 +1002,8 @@ router.get('/hotel/rooms/availability', authenticateToken, async (req, res) => {
         // Only use room.status if there's no date-specific maintenance
         scheduledStatus = room.status;
       } else {
+        // Default to available - don't use room.status 'reserved' as it's date-agnostic
+        // Only show booked if there's an actual booking for this specific date
         scheduledStatus = 'available';
       }
 
@@ -1014,11 +1093,19 @@ router.post('/hotel/bookings/validate', authenticateToken, async (req, res) => {
     });
 
     // Check for overlaps in bookings
+    // Hotel industry standard: Check-out date is available for next booking
+    // Overlap check: existingStart < newEnd AND existingEnd > newStart
+    // This means: New booking can start on the same day as existing checkout
     const bookingConflicts = bookings.filter(booking => {
       const existingStart = new Date(booking.checkInDate);
       const existingEnd = new Date(booking.checkOutDate);
+      existingStart.setHours(0, 0, 0, 0);
+      existingEnd.setHours(0, 0, 0, 0);
+      newStart.setHours(0, 0, 0, 0);
+      newEnd.setHours(0, 0, 0, 0);
 
-      // Overlap check: existingStart < newEnd AND existingEnd > newStart
+      // Overlap: existing booking overlaps if existingStart < newEnd AND existingEnd > newStart
+      // This allows new booking to start on existing checkout date (same day checkout/checkin)
       return existingStart < newEnd && existingEnd > newStart;
     });
 
@@ -1036,10 +1123,39 @@ router.post('/hotel/bookings/validate', authenticateToken, async (req, res) => {
     const checkInConflicts = [];
     checkInsSnapshot.forEach(doc => {
       const data = doc.data();
-      const existingStart = new Date(data.checkInDate);
-      const existingEnd = new Date(data.checkOutDate);
+      
+      // Parse dates - handle both string dates and Firestore Timestamps
+      let existingStart;
+      let existingEnd;
+      
+      if (data.checkInDate instanceof Date) {
+        existingStart = new Date(data.checkInDate);
+      } else if (data.checkInDate && data.checkInDate._seconds) {
+        existingStart = new Date(data.checkInDate._seconds * 1000);
+      } else if (data.checkInDate) {
+        existingStart = new Date(data.checkInDate);
+      } else {
+        return; // Skip if no valid check-in date
+      }
+      
+      if (data.checkOutDate instanceof Date) {
+        existingEnd = new Date(data.checkOutDate);
+      } else if (data.checkOutDate && data.checkOutDate._seconds) {
+        existingEnd = new Date(data.checkOutDate._seconds * 1000);
+      } else if (data.checkOutDate) {
+        existingEnd = new Date(data.checkOutDate);
+      } else {
+        return; // Skip if no valid check-out date
+      }
+      
+      // Normalize dates to start of day
+      existingStart.setHours(0, 0, 0, 0);
+      existingEnd.setHours(0, 0, 0, 0);
+      newStart.setHours(0, 0, 0, 0);
+      newEnd.setHours(0, 0, 0, 0);
 
-      // Overlap check
+      // Hotel industry standard: Check-out date is available for next booking
+      // Overlap check: existingStart < newEnd AND existingEnd > newStart
       if (existingStart < newEnd && existingEnd > newStart) {
         checkInConflicts.push({
           id: doc.id,
@@ -1229,17 +1345,41 @@ router.get('/hotel/history', authenticateToken, async (req, res) => {
       });
     });
 
+    // Validate date range if both provided
+    if (startDate && endDate) {
+      const start = new Date(startDate);
+      const end = new Date(endDate);
+      start.setHours(0, 0, 0, 0);
+      end.setHours(0, 0, 0, 0);
+      
+      if (end < start) {
+        return res.status(400).json({
+          success: false,
+          error: 'End date cannot be before start date'
+        });
+      }
+    }
+    
     // Filter by date range if provided
     if (startDate || endDate) {
       history = history.filter(record => {
         const checkOutDate = new Date(record.checkOutDate);
+        checkOutDate.setHours(0, 0, 0, 0);
 
         if (startDate && endDate) {
-          return checkOutDate >= new Date(startDate) && checkOutDate <= new Date(endDate);
+          const start = new Date(startDate);
+          const end = new Date(endDate);
+          start.setHours(0, 0, 0, 0);
+          end.setHours(0, 0, 0, 0);
+          return checkOutDate >= start && checkOutDate <= end;
         } else if (startDate) {
-          return checkOutDate >= new Date(startDate);
+          const start = new Date(startDate);
+          start.setHours(0, 0, 0, 0);
+          return checkOutDate >= start;
         } else if (endDate) {
-          return checkOutDate <= new Date(endDate);
+          const end = new Date(endDate);
+          end.setHours(0, 0, 0, 0);
+          return checkOutDate <= end;
         }
 
         return true;

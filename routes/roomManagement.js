@@ -209,10 +209,15 @@ router.post('/room/:roomId/maintenance', authenticateToken, async (req, res) => 
       });
     }
 
+    // Normalize dates to start of day for comparison
+    start.setHours(0, 0, 0, 0);
+    end.setHours(0, 0, 0, 0);
+    
+    // Validate: End date must be same as or after start date
     if (end < start) {
       return res.status(400).json({ 
         success: false, 
-        message: 'End date must be after start date' 
+        message: 'End date cannot be before start date' 
       });
     }
 
@@ -250,6 +255,136 @@ router.post('/room/:roomId/maintenance', authenticateToken, async (req, res) => 
     res.status(500).json({ 
       success: false, 
       message: 'Failed to create maintenance schedule', 
+      error: error.message 
+    });
+  }
+});
+
+// Get maintenance schedules for a room
+router.get('/room/:roomId/maintenance', authenticateToken, async (req, res) => {
+  try {
+    const { roomId } = req.params;
+    const { restaurantId } = req.query;
+
+    if (!restaurantId) {
+      return res.status(400).json({ 
+        success: false, 
+        message: 'Missing required field: restaurantId' 
+      });
+    }
+
+    const query = db.collection('room_maintenance_schedules')
+      .where('restaurantId', '==', restaurantId)
+      .where('roomId', '==', roomId)
+      .where('status', '==', 'active');
+
+    const maintenanceSnapshot = await query.get();
+
+    const schedules = [];
+    maintenanceSnapshot.forEach(doc => {
+      const data = doc.data();
+      schedules.push({
+        id: doc.id,
+        startDate: data.startDate?._seconds ? new Date(data.startDate._seconds * 1000).toISOString().split('T')[0] : (data.startDate instanceof Date ? data.startDate.toISOString().split('T')[0] : data.startDate),
+        endDate: data.endDate?._seconds ? new Date(data.endDate._seconds * 1000).toISOString().split('T')[0] : (data.endDate instanceof Date ? data.endDate.toISOString().split('T')[0] : data.endDate),
+        reason: data.reason,
+        roomNumber: data.roomNumber
+      });
+    });
+
+    res.json({ 
+      success: true, 
+      schedules 
+    });
+  } catch (error) {
+    console.error('Error fetching maintenance schedules:', error);
+    res.status(500).json({ 
+      success: false, 
+      message: 'Failed to fetch maintenance schedules', 
+      error: error.message 
+    });
+  }
+});
+
+// Cancel/delete maintenance schedules for a room
+// Supports canceling all schedules or schedules within a date range
+router.delete('/room/:roomId/maintenance', authenticateToken, async (req, res) => {
+  try {
+    const { roomId } = req.params;
+    const { restaurantId, startDate, endDate } = req.query;
+
+    if (!restaurantId) {
+      return res.status(400).json({ 
+        success: false, 
+        message: 'Missing required field: restaurantId' 
+      });
+    }
+
+    // Get all active maintenance schedules for this room
+    const query = db.collection('room_maintenance_schedules')
+      .where('restaurantId', '==', restaurantId)
+      .where('roomId', '==', roomId)
+      .where('status', '==', 'active');
+
+    const maintenanceSnapshot = await query.get();
+
+    if (maintenanceSnapshot.empty) {
+      return res.json({ 
+        success: true, 
+        message: 'No active maintenance schedules found',
+        cancelledCount: 0
+      });
+    }
+
+    const batch = db.batch();
+    let cancelledCount = 0;
+
+    // If date range provided, only cancel schedules that overlap with the range
+    if (startDate && endDate) {
+      const cancelStart = new Date(startDate);
+      const cancelEnd = new Date(endDate);
+      cancelStart.setHours(0, 0, 0, 0);
+      cancelEnd.setHours(23, 59, 59, 999);
+
+      maintenanceSnapshot.forEach(doc => {
+        const data = doc.data();
+        let scheduleStart = data.startDate?._seconds ? new Date(data.startDate._seconds * 1000) : new Date(data.startDate);
+        let scheduleEnd = data.endDate?._seconds ? new Date(data.endDate._seconds * 1000) : new Date(data.endDate);
+        scheduleStart.setHours(0, 0, 0, 0);
+        scheduleEnd.setHours(23, 59, 59, 999);
+
+        // Check if schedules overlap
+        if (scheduleStart <= cancelEnd && scheduleEnd >= cancelStart) {
+          batch.update(doc.ref, {
+            status: 'cancelled',
+            updatedAt: FieldValue.serverTimestamp()
+          });
+          cancelledCount++;
+        }
+      });
+    } else {
+      // Cancel ALL active maintenance schedules for this room
+      maintenanceSnapshot.forEach(doc => {
+        batch.update(doc.ref, {
+          status: 'cancelled',
+          updatedAt: FieldValue.serverTimestamp()
+        });
+        cancelledCount++;
+      });
+    }
+
+    await batch.commit();
+
+    res.json({ 
+      success: true, 
+      message: `Cancelled ${cancelledCount} maintenance schedule(s)`,
+      cancelledCount
+    });
+  } catch (error) {
+    console.error('Error cancelling maintenance schedules:', error);
+    res.status(500).json({ 
+      success: false, 
+      message: 'Failed to cancel maintenance schedules', 
       error: error.message 
     });
   }
@@ -308,11 +443,20 @@ router.post('/booking', authenticateToken, async (req, res) => {
     const checkOut = new Date(checkOutDate);
     const today = new Date();
     today.setHours(0, 0, 0, 0);
+    
+    // Normalize dates to start of day for comparison
+    checkIn.setHours(0, 0, 0, 0);
+    checkOut.setHours(0, 0, 0, 0);
+
+    // Validate: Check-out date must be same as or after check-in date
+    if (checkOut < checkIn) {
+      return res.status(400).json({ success: false, message: 'Check-out date cannot be before check-in date' });
+    }
 
     const stayDuration = Math.ceil((checkOut - checkIn) / (1000 * 60 * 60 * 24));
 
     if (stayDuration < 1) {
-      return res.status(400).json({ success: false, message: 'Check-out must be after check-in' });
+      return res.status(400).json({ success: false, message: 'Check-out must be on or after check-in date' });
     }
 
     // Check if check-in date is in the past
@@ -365,10 +509,40 @@ router.post('/booking', authenticateToken, async (req, res) => {
     const bookingConflicts = [];
     for (const booking of conflictingBookings.docs) {
       const bookingData = booking.data();
-      const existingCheckIn = new Date(bookingData.checkInDate);
-      const existingCheckOut = new Date(bookingData.checkOutDate);
+      
+      // Parse dates - handle both string dates and Firestore Timestamps
+      let existingCheckIn;
+      let existingCheckOut;
+      
+      if (bookingData.checkInDate instanceof Date) {
+        existingCheckIn = new Date(bookingData.checkInDate);
+      } else if (bookingData.checkInDate && bookingData.checkInDate._seconds) {
+        existingCheckIn = new Date(bookingData.checkInDate._seconds * 1000);
+      } else if (bookingData.checkInDate) {
+        existingCheckIn = new Date(bookingData.checkInDate);
+      } else {
+        continue; // Skip if no valid check-in date
+      }
+      
+      if (bookingData.checkOutDate instanceof Date) {
+        existingCheckOut = new Date(bookingData.checkOutDate);
+      } else if (bookingData.checkOutDate && bookingData.checkOutDate._seconds) {
+        existingCheckOut = new Date(bookingData.checkOutDate._seconds * 1000);
+      } else if (bookingData.checkOutDate) {
+        existingCheckOut = new Date(bookingData.checkOutDate);
+      } else {
+        continue; // Skip if no valid check-out date
+      }
+      
+      // Normalize dates to start of day
+      existingCheckIn.setHours(0, 0, 0, 0);
+      existingCheckOut.setHours(0, 0, 0, 0);
+      checkIn.setHours(0, 0, 0, 0);
+      checkOut.setHours(0, 0, 0, 0);
 
+      // Hotel industry standard: Check-out date is available for next booking
       // Overlap check: existingStart < newEnd AND existingEnd > newStart
+      // This means: New booking can start on the same day as existing checkout
       if (existingCheckIn < checkOut && existingCheckOut > checkIn) {
         bookingConflicts.push({
           id: booking.id,
@@ -492,6 +666,11 @@ router.get('/bookings/:restaurantId', authenticateToken, async (req, res) => {
 router.patch('/booking/:bookingId/cancel', authenticateToken, async (req, res) => {
   try {
     const { bookingId } = req.params;
+    const { reason } = req.body;
+
+    if (!reason || !reason.trim()) {
+      return res.status(400).json({ success: false, message: 'Cancellation reason is required' });
+    }
 
     const bookingDoc = await db.collection('hotel_bookings').doc(bookingId).get();
 
@@ -501,24 +680,62 @@ router.patch('/booking/:bookingId/cancel', authenticateToken, async (req, res) =
 
     const bookingData = bookingDoc.data();
 
+    // Don't allow canceling already cancelled or checked-in bookings
+    if (bookingData.status === 'cancelled') {
+      return res.status(400).json({ success: false, message: 'Booking is already cancelled' });
+    }
+
+    if (bookingData.status === 'checked-in') {
+      return res.status(400).json({ success: false, message: 'Cannot cancel a booking that is already checked in' });
+    }
+
+    // Update booking status
     await db.collection('hotel_bookings').doc(bookingId).update({
       status: 'cancelled',
+      cancellationReason: reason.trim(),
       cancelledAt: FieldValue.serverTimestamp(),
+      cancelledBy: req.user.userId,
       updatedAt: FieldValue.serverTimestamp()
     });
 
-    // Update room status if it was reserved
+    // Update room status if it was reserved for this booking
     if (bookingData.roomId) {
       const roomDoc = await db.collection('rooms').doc(bookingData.roomId).get();
-      if (roomDoc.exists && roomDoc.data().status === 'reserved') {
-        await db.collection('rooms').doc(bookingData.roomId).update({
-          status: 'available',
-          currentGuest: null
-        });
+      if (roomDoc.exists) {
+        const roomData = roomDoc.data();
+        
+        // Only update room status if it's currently reserved and the current guest matches this booking
+        // This ensures we don't accidentally free a room that was reserved for a different booking
+        if (roomData.status === 'reserved' && roomData.currentGuest === bookingData.guestName) {
+          // Check if there are any other active bookings for this room
+          const otherBookings = await db.collection('hotel_bookings')
+            .where('roomId', '==', bookingData.roomId)
+            .where('status', 'in', ['confirmed', 'checked-in'])
+            .where('restaurantId', '==', bookingData.restaurantId)
+            .get();
+
+          // If no other active bookings, mark room as available
+          if (otherBookings.empty) {
+            await db.collection('rooms').doc(bookingData.roomId).update({
+              status: 'available',
+              currentGuest: null,
+              updatedAt: FieldValue.serverTimestamp()
+            });
+          }
+        }
       }
     }
 
-    res.json({ success: true, message: 'Booking cancelled successfully' });
+    res.json({ 
+      success: true, 
+      message: 'Booking cancelled successfully',
+      booking: {
+        id: bookingId,
+        roomNumber: bookingData.roomNumber,
+        checkInDate: bookingData.checkInDate,
+        checkOutDate: bookingData.checkOutDate
+      }
+    });
   } catch (error) {
     console.error('Error cancelling booking:', error);
     res.status(500).json({ success: false, message: 'Failed to cancel booking', error: error.message });
