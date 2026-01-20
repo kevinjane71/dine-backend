@@ -455,8 +455,9 @@ router.post('/booking', authenticateToken, async (req, res) => {
 
     const stayDuration = Math.ceil((checkOut - checkIn) / (1000 * 60 * 60 * 24));
 
-    if (stayDuration < 1) {
-      return res.status(400).json({ success: false, message: 'Check-out must be on or after check-in date' });
+    // Allow same-day check-in/check-out (stayDuration >= 0)
+    if (stayDuration < 0) {
+      return res.status(400).json({ success: false, message: 'Check-out date cannot be before check-in date' });
     }
 
     // Check if check-in date is in the past

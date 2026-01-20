@@ -1064,6 +1064,16 @@ router.post('/hotel/bookings/validate', authenticateToken, async (req, res) => {
 
     const newStart = new Date(checkInDate);
     const newEnd = new Date(checkOutDate);
+    newStart.setHours(0, 0, 0, 0);
+    newEnd.setHours(0, 0, 0, 0);
+
+    // Validate: Check-out date must be same as or after check-in date (same day is allowed)
+    if (newEnd < newStart) {
+      return res.status(400).json({
+        success: false,
+        error: 'Check-out date cannot be before check-in date'
+      });
+    }
 
     // Get all bookings for this room
     let bookingsQuery = db.collection('hotel_bookings')
