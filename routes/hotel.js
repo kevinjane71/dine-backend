@@ -6,16 +6,12 @@ const admin = require('firebase-admin');
 // All hotel routes require authentication
 router.use(authenticateToken);
 
-// Hotel permission check middleware
+// Hotel permission check middleware - REMOVED: Using standard login authentication only
+// Simple pass-through middleware (no permission check, just authentication)
 const checkHotelPermission = (requiredPermission) => {
   return (req, res, next) => {
-    const user = req.user;
-    if (!user.permissions?.hotel) {
-      return res.status(403).json({ error: 'Hotel access denied' });
-    }
-    if (requiredPermission && !user.permissions.hotel[requiredPermission]) {
-      return res.status(403).json({ error: 'Insufficient permissions' });
-    }
+    // Authentication already handled by authenticateToken middleware
+    // No additional permission checks needed - user is already authenticated
     next();
   };
 };
