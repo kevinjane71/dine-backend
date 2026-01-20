@@ -514,6 +514,199 @@ router.post('/hotel/checkout/:checkInId', authenticateToken, async (req, res) =>
       });
     }
 
+    // ==================== RELEASE RELATED BOOKING ====================
+    // When checkout happens, check if the actual checkout date is today
+    // If checkout is today, it means the booking was only valid until yesterday (or earlier)
+    // Also handle same-day check-in/check-out scenarios
+    // Release the related booking to free up the room status
+    
+    try {
+      const today = new Date();
+      today.setHours(0, 0, 0, 0);
+
+      // Actual checkout is happening today (when this function is called)
+      const actualCheckoutDate = today;
+
+      // Parse planned checkout date from check-in data (for matching bookings)
+      let plannedCheckoutDate = null;
+      if (checkInData.checkOutDate) {
+        if (checkInData.checkOutDate instanceof Date) {
+          plannedCheckoutDate = new Date(checkInData.checkOutDate);
+        } else if (checkInData.checkOutDate._seconds) {
+          plannedCheckoutDate = new Date(checkInData.checkOutDate._seconds * 1000);
+        } else if (typeof checkInData.checkOutDate === 'string') {
+          plannedCheckoutDate = new Date(checkInData.checkOutDate);
+        }
+      }
+      
+      // Normalize planned checkout date to start of day
+      if (plannedCheckoutDate) {
+        plannedCheckoutDate.setHours(0, 0, 0, 0);
+      }
+
+      // Parse check-in date for matching
+      let checkInDate = null;
+      if (checkInData.checkInDate) {
+        if (checkInData.checkInDate instanceof Date) {
+          checkInDate = new Date(checkInData.checkInDate);
+        } else if (checkInData.checkInDate._seconds) {
+          checkInDate = new Date(checkInData.checkInDate._seconds * 1000);
+        } else if (typeof checkInData.checkInDate === 'string') {
+          checkInDate = new Date(checkInData.checkInDate);
+        }
+      }
+      
+      // Normalize check-in date to start of day
+      if (checkInDate) {
+        checkInDate.setHours(0, 0, 0, 0);
+      }
+
+      // Determine if we should release the booking
+      let shouldReleaseBooking = false;
+      
+      // Case 1: Actual checkout is happening today
+      // This means the booking was only valid until yesterday (or earlier)
+      // OR it's a same-day check-in/check-out scenario
+      if (actualCheckoutDate.getTime() === today.getTime()) {
+        shouldReleaseBooking = true;
+        console.log('📅 Actual checkout is today - releasing booking');
+      }
+      
+      // Case 2: Same-day check-in and check-out (both dates are today)
+      // This is a special case where guest checks in and checks out on the same day
+      if (checkInDate && plannedCheckoutDate && 
+          checkInDate.getTime() === today.getTime() && 
+          plannedCheckoutDate.getTime() === today.getTime()) {
+        shouldReleaseBooking = true;
+        console.log('📅 Same-day check-in/check-out - releasing booking');
+      }
+
+      if (shouldReleaseBooking) {
+        let bookingToRelease = null;
+
+        // First, try to find booking by bookingId (if check-in was converted from booking)
+        if (checkInData.bookingId) {
+          const bookingDoc = await db.collection('hotel_bookings').doc(checkInData.bookingId).get();
+          if (bookingDoc.exists) {
+            const bookingData = bookingDoc.data();
+            // Only release if booking is still in 'confirmed' or 'checked-in' status
+            if (bookingData.status === 'confirmed' || bookingData.status === 'checked-in') {
+              bookingToRelease = { id: bookingDoc.id, ...bookingData };
+              console.log('✅ Found booking by bookingId:', bookingToRelease.id);
+            }
+          }
+        }
+
+        // If not found by bookingId, try to find by matching criteria:
+        // - Same room number
+        // - Same guest name
+        // - Same check-in date
+        // - Same check-out date (planned checkout date)
+        if (!bookingToRelease && checkInData.roomNumber && checkInData.guestName && checkInDate && plannedCheckoutDate) {
+          const bookingsSnapshot = await db.collection('hotel_bookings')
+            .where('restaurantId', '==', checkInData.restaurantId)
+            .where('roomNumber', '==', checkInData.roomNumber)
+            .where('status', 'in', ['confirmed', 'checked-in'])
+            .get();
+
+          for (const bookingDoc of bookingsSnapshot.docs) {
+            const bookingData = bookingDoc.data();
+            
+            // Parse booking dates
+            let bookingCheckIn = null;
+            let bookingCheckOut = null;
+            
+            if (bookingData.checkInDate) {
+              if (bookingData.checkInDate instanceof Date) {
+                bookingCheckIn = new Date(bookingData.checkInDate);
+              } else if (bookingData.checkInDate._seconds) {
+                bookingCheckIn = new Date(bookingData.checkInDate._seconds * 1000);
+              } else if (typeof bookingData.checkInDate === 'string') {
+                bookingCheckIn = new Date(bookingData.checkInDate);
+              }
+            }
+            
+            if (bookingData.checkOutDate) {
+              if (bookingData.checkOutDate instanceof Date) {
+                bookingCheckOut = new Date(bookingData.checkOutDate);
+              } else if (bookingData.checkOutDate._seconds) {
+                bookingCheckOut = new Date(bookingData.checkOutDate._seconds * 1000);
+              } else if (typeof bookingData.checkOutDate === 'string') {
+                bookingCheckOut = new Date(bookingData.checkOutDate);
+              }
+            }
+            
+            // Normalize booking dates
+            if (bookingCheckIn) bookingCheckIn.setHours(0, 0, 0, 0);
+            if (bookingCheckOut) bookingCheckOut.setHours(0, 0, 0, 0);
+            
+            // Match by dates and guest name
+            const datesMatch = bookingCheckIn && bookingCheckOut && checkInDate && plannedCheckoutDate &&
+              bookingCheckIn.getTime() === checkInDate.getTime() &&
+              bookingCheckOut.getTime() === plannedCheckoutDate.getTime();
+            
+            const guestNameMatch = bookingData.guestName && checkInData.guestName &&
+              bookingData.guestName.trim().toLowerCase() === checkInData.guestName.trim().toLowerCase();
+            
+            if (datesMatch && guestNameMatch) {
+              bookingToRelease = { id: bookingDoc.id, ...bookingData };
+              console.log('✅ Found booking by matching criteria:', bookingToRelease.id);
+              break;
+            }
+          }
+        }
+
+        // Release the booking if found
+        if (bookingToRelease) {
+          await db.collection('hotel_bookings').doc(bookingToRelease.id).update({
+            status: 'checked-out',
+            checkedOutAt: FieldValue.serverTimestamp(),
+            updatedAt: FieldValue.serverTimestamp()
+          });
+          
+          console.log(`✅ Released booking ${bookingToRelease.id} after checkout`);
+          
+          // Update room status if it was reserved due to this booking
+          if (bookingToRelease.roomId) {
+            const roomDoc = await db.collection('rooms').doc(bookingToRelease.roomId).get();
+            if (roomDoc.exists) {
+              const roomData = roomDoc.data();
+              // Only update if room is still in 'reserved' status (from booking)
+              if (roomData.status === 'reserved') {
+                // Check if there are other active bookings for this room
+                const allActiveBookings = await db.collection('hotel_bookings')
+                  .where('roomId', '==', bookingToRelease.roomId)
+                  .where('status', 'in', ['confirmed', 'checked-in'])
+                  .get();
+                
+                // Filter out the current booking (Firestore doesn't support != in where clause)
+                const otherActiveBookings = allActiveBookings.docs.filter(
+                  doc => doc.id !== bookingToRelease.id
+                );
+                
+                if (otherActiveBookings.empty) {
+                  // No other active bookings, set room to available
+                  await db.collection('rooms').doc(bookingToRelease.roomId).update({
+                    status: 'available',
+                    currentGuest: null,
+                    updatedAt: FieldValue.serverTimestamp()
+                  });
+                  console.log(`✅ Updated room ${bookingToRelease.roomNumber} to available after booking release`);
+                } else {
+                  console.log(`ℹ️ Room ${bookingToRelease.roomNumber} has other active bookings, keeping reserved status`);
+                }
+              }
+            }
+          }
+        } else {
+          console.log('ℹ️ No matching booking found to release');
+        }
+      }
+    } catch (bookingReleaseError) {
+      // Don't fail checkout if booking release fails
+      console.error('⚠️ Error releasing booking after checkout:', bookingReleaseError);
+    }
+
     // Generate invoice data with recalculated values
     const invoice = {
       checkInId,
