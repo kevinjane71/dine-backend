@@ -2,6 +2,7 @@ const express = require('express');
 const router = express.Router();
 const { authenticateToken } = require('../middleware/auth');
 const admin = require('firebase-admin');
+const { db } = require('../firebase');
 
 // All hotel routes require authentication
 router.use(authenticateToken);

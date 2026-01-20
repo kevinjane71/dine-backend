@@ -5399,11 +5399,13 @@ app.use('/api/payments', paymentRoutes);
 // Initialize chatbot RAG routes
 app.use('/api', chatbotRoutes);
 
-// Initialize hotel PMS routes
-app.use('/api/hotel', hotelRoutes);
-
 // Initialize hotel management routes (restaurant-hotel integration)
+// NOTE: hotelManagementRoutes must be registered BEFORE hotelRoutes to handle
+// routes like /api/hotel/rooms/availability correctly
 app.use('/api', hotelManagementRoutes);
+
+// Initialize hotel PMS routes (deprecated - kept for backward compatibility)
+app.use('/api/hotel', hotelRoutes);
 app.use('/api', roomManagementRoutes);
 
 // Initialize shift scheduling routes
