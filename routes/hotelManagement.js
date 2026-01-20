@@ -816,6 +816,57 @@ router.get('/hotel/rooms/availability', authenticateToken, async (req, res) => {
       }
     });
 
+    // Get all active maintenance schedules that overlap with the query date
+    const maintenanceSnapshot = await db.collection('room_maintenance_schedules')
+      .where('restaurantId', '==', restaurantId)
+      .where('status', '==', 'active')
+      .get();
+
+    const maintenanceSchedules = [];
+    maintenanceSnapshot.forEach(doc => {
+      const data = doc.data();
+      
+      // Parse dates - handle both Firestore Timestamp and Date objects
+      let startDate;
+      let endDate;
+      
+      if (data.startDate instanceof Date) {
+        startDate = new Date(data.startDate);
+      } else if (data.startDate && data.startDate._seconds) {
+        startDate = new Date(data.startDate._seconds * 1000);
+      } else if (data.startDate) {
+        startDate = new Date(data.startDate);
+      } else {
+        return; // Skip if no valid start date
+      }
+      
+      if (data.endDate instanceof Date) {
+        endDate = new Date(data.endDate);
+      } else if (data.endDate && data.endDate._seconds) {
+        endDate = new Date(data.endDate._seconds * 1000);
+      } else if (data.endDate) {
+        endDate = new Date(data.endDate);
+      } else {
+        return; // Skip if no valid end date
+      }
+      
+      // Normalize dates to start of day for comparison
+      startDate.setHours(0, 0, 0, 0);
+      endDate.setHours(23, 59, 59, 999); // End of day
+
+      // Check if maintenance schedule overlaps with query date
+      if (startDate <= queryDate && endDate >= queryDate) {
+        maintenanceSchedules.push({
+          id: doc.id,
+          roomId: data.roomId,
+          roomNumber: data.roomNumber,
+          startDate,
+          endDate,
+          reason: data.reason
+        });
+      }
+    });
+
     // Build room availability map
     const roomAvailability = rooms.map(room => {
       // Check if room has an active check-in
@@ -826,20 +877,29 @@ router.get('/hotel/rooms/availability', authenticateToken, async (req, res) => {
         b.roomNumber === room.roomNumber || b.roomId === room.id
       );
 
+      // Check if room has an active maintenance schedule for this date
+      const maintenanceSchedule = maintenanceSchedules.find(ms => 
+        ms.roomId === room.id || ms.roomNumber === room.roomNumber
+      );
+
       let currentStatus = room.status || 'available';
       let scheduledStatus = room.status || 'available';
       let bookingInfo = null;
 
-      // Determine current status (real-time)
+      // Determine current status (real-time) - prioritize check-ins, then maintenance schedules, then room status
       if (activeCheckIn) {
         currentStatus = 'occupied';
+      } else if (maintenanceSchedule) {
+        // If there's a maintenance schedule for this date, show maintenance
+        currentStatus = 'maintenance';
       } else if (room.status === 'cleaning' || room.status === 'maintenance' || room.status === 'out-of-service') {
+        // Only use room.status if there's no date-specific maintenance
         currentStatus = room.status;
       } else {
         currentStatus = 'available';
       }
 
-      // Determine scheduled status (based on bookings)
+      // Determine scheduled status (based on bookings and maintenance schedules)
       if (booking) {
         scheduledStatus = 'booked';
         bookingInfo = {
@@ -858,7 +918,11 @@ router.get('/hotel/rooms/availability', authenticateToken, async (req, res) => {
           checkOutDate: activeCheckIn.checkOutDate,
           status: 'checked-in'
         };
+      } else if (maintenanceSchedule) {
+        // If there's a maintenance schedule for this date, show maintenance
+        scheduledStatus = 'maintenance';
       } else if (room.status === 'cleaning' || room.status === 'maintenance' || room.status === 'out-of-service') {
+        // Only use room.status if there's no date-specific maintenance
         scheduledStatus = room.status;
       } else {
         scheduledStatus = 'available';

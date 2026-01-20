@@ -182,6 +182,79 @@ router.patch('/room/:roomId/status', authenticateToken, async (req, res) => {
   }
 });
 
+// Set room maintenance schedule (date-specific)
+router.post('/room/:roomId/maintenance', authenticateToken, async (req, res) => {
+  try {
+    const { roomId } = req.params;
+    const { userId } = req.user;
+    const { restaurantId, roomNumber, startDate, endDate, reason } = req.body;
+
+    if (!restaurantId || !roomNumber || !startDate || !endDate) {
+      return res.status(400).json({ 
+        success: false, 
+        message: 'Missing required fields: restaurantId, roomNumber, startDate, endDate' 
+      });
+    }
+
+    // Validate dates
+    const start = new Date(startDate);
+    const end = new Date(endDate);
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+
+    if (start < today) {
+      return res.status(400).json({ 
+        success: false, 
+        message: 'Start date cannot be in the past' 
+      });
+    }
+
+    if (end < start) {
+      return res.status(400).json({ 
+        success: false, 
+        message: 'End date must be after start date' 
+      });
+    }
+
+    // Create maintenance schedule document
+    const maintenanceData = {
+      restaurantId,
+      roomId,
+      roomNumber,
+      startDate: new Date(startDate),
+      endDate: new Date(endDate),
+      reason: reason || 'Maintenance required',
+      status: 'active',
+      createdBy: userId,
+      createdAt: FieldValue.serverTimestamp(),
+      updatedAt: FieldValue.serverTimestamp()
+    };
+
+    const maintenanceRef = await db.collection('room_maintenance_schedules').add(maintenanceData);
+
+    // Update room status to maintenance if the schedule includes today
+    if (start <= today && end >= today) {
+      await db.collection('rooms').doc(roomId).update({
+        status: 'maintenance',
+        updatedAt: FieldValue.serverTimestamp()
+      });
+    }
+
+    res.json({ 
+      success: true, 
+      message: 'Maintenance schedule created successfully',
+      maintenanceId: maintenanceRef.id
+    });
+  } catch (error) {
+    console.error('Error creating maintenance schedule:', error);
+    res.status(500).json({ 
+      success: false, 
+      message: 'Failed to create maintenance schedule', 
+      error: error.message 
+    });
+  }
+});
+
 // Delete room
 router.delete('/room/:roomId', authenticateToken, async (req, res) => {
   try {
