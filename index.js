@@ -8474,6 +8474,162 @@ app.get('/api/kot/:restaurantId/:orderId', async (req, res) => {
   }
 });
 
+// ============================================
+// KOT PRINTING APIs (for thermal printer integration)
+// ============================================
+
+// Get pending KOT orders for printing (orders not yet printed)
+// This endpoint is PUBLIC for easy kiosk setup - use restaurantId for identification
+app.get('/api/kot/pending-print/:restaurantId', async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+    const { lastPrintedAt } = req.query; // Optional: to get orders after a specific time
+
+    console.log(`🖨️ KOT Print API - Getting pending print orders for restaurant: ${restaurantId}`);
+
+    // Get orders that need to be printed:
+    // - Status is 'confirmed' or 'preparing' (sent to kitchen)
+    // - kotPrinted is false or doesn't exist
+    // - Created in the last 24 hours
+    const twentyFourHoursAgo = new Date();
+    twentyFourHoursAgo.setHours(twentyFourHoursAgo.getHours() - 24);
+
+    let query = db.collection(collections.orders)
+      .where('restaurantId', '==', restaurantId)
+      .where('status', 'in', ['confirmed', 'preparing'])
+      .where('createdAt', '>=', twentyFourHoursAgo)
+      .orderBy('createdAt', 'asc');
+
+    const ordersSnapshot = await query.get();
+
+    const pendingOrders = [];
+
+    for (const doc of ordersSnapshot.docs) {
+      const orderData = doc.data();
+
+      // Skip already printed orders
+      if (orderData.kotPrinted === true) {
+        continue;
+      }
+
+      // If lastPrintedAt provided, only get orders after that time
+      if (lastPrintedAt) {
+        const lastTime = new Date(lastPrintedAt);
+        const orderTime = orderData.createdAt?.toDate() || new Date();
+        if (orderTime <= lastTime) {
+          continue;
+        }
+      }
+
+      // Format order for printing
+      const kotId = `KOT-${doc.id.slice(-6).toUpperCase()}`;
+      const createdAt = orderData.createdAt?.toDate() || new Date();
+
+      pendingOrders.push({
+        id: doc.id,
+        kotId,
+        dailyOrderId: orderData.dailyOrderId || kotId,
+        orderNumber: orderData.orderNumber,
+        tableNumber: orderData.tableNumber || '',
+        roomNumber: orderData.roomNumber || '',
+        items: orderData.items || [],
+        notes: orderData.notes || '',
+        staffInfo: orderData.staffInfo || {},
+        orderType: orderData.orderType || 'dine-in',
+        createdAt: createdAt.toISOString(),
+        formattedTime: createdAt.toLocaleTimeString('en-IN', {
+          hour: '2-digit',
+          minute: '2-digit',
+          hour12: true
+        }),
+        formattedDate: createdAt.toLocaleDateString('en-IN', {
+          day: '2-digit',
+          month: 'short',
+          year: 'numeric'
+        })
+      });
+    }
+
+    console.log(`🖨️ Found ${pendingOrders.length} orders pending print`);
+
+    res.json({
+      success: true,
+      orders: pendingOrders,
+      count: pendingOrders.length,
+      timestamp: new Date().toISOString()
+    });
+
+  } catch (error) {
+    console.error('Get pending KOT print orders error:', error);
+    res.status(500).json({ error: 'Failed to fetch pending print orders' });
+  }
+});
+
+// Mark KOT as printed
+app.patch('/api/kot/:orderId/printed', async (req, res) => {
+  try {
+    const { orderId } = req.params;
+    const { printedAt, printedBy } = req.body;
+
+    console.log(`🖨️ Marking order ${orderId} as printed`);
+
+    const orderRef = db.collection(collections.orders).doc(orderId);
+    const orderDoc = await orderRef.get();
+
+    if (!orderDoc.exists) {
+      return res.status(404).json({ error: 'Order not found' });
+    }
+
+    await orderRef.update({
+      kotPrinted: true,
+      kotPrintedAt: printedAt ? new Date(printedAt) : new Date(),
+      kotPrintedBy: printedBy || 'kiosk',
+      updatedAt: new Date()
+    });
+
+    console.log(`✅ Order ${orderId} marked as printed`);
+
+    res.json({
+      success: true,
+      message: 'KOT marked as printed',
+      orderId
+    });
+
+  } catch (error) {
+    console.error('Mark KOT printed error:', error);
+    res.status(500).json({ error: 'Failed to mark KOT as printed' });
+  }
+});
+
+// Get restaurant info for print page (public endpoint)
+app.get('/api/restaurant/info/:restaurantId', async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+
+    const restaurantDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
+
+    if (!restaurantDoc.exists) {
+      return res.status(404).json({ error: 'Restaurant not found' });
+    }
+
+    const data = restaurantDoc.data();
+
+    res.json({
+      success: true,
+      restaurant: {
+        id: restaurantDoc.id,
+        name: data.name || 'Restaurant',
+        address: data.address || '',
+        phone: data.phone || ''
+      }
+    });
+
+  } catch (error) {
+    console.error('Get restaurant info error:', error);
+    res.status(500).json({ error: 'Failed to fetch restaurant info' });
+  }
+});
+
 // Cancel Order API
 app.patch('/api/orders/:orderId/cancel', authenticateToken, async (req, res) => {
   try {
