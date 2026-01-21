@@ -8414,68 +8414,9 @@ app.patch('/api/kot/:orderId/status', async (req, res) => {
   }
 });
 
-// Get single KOT details
-app.get('/api/kot/:restaurantId/:orderId', async (req, res) => {
-  try {
-    const { restaurantId, orderId } = req.params;
-
-    const orderDoc = await db.collection(collections.orders).doc(orderId).get();
-
-    if (!orderDoc.exists) {
-      return res.status(404).json({ error: 'KOT not found' });
-    }
-
-    const orderData = { id: orderDoc.id, ...orderDoc.data() };
-
-    if (orderData.restaurantId !== restaurantId) {
-      return res.status(403).json({ error: 'Access denied to this KOT' });
-    }
-
-    // Get table information if exists
-    let tableInfo = null;
-    if (orderData.tableNumber) {
-      try {
-        const tablesSnapshot = await db.collection(collections.tables)
-          .where('restaurantId', '==', restaurantId)
-          .where('number', '==', orderData.tableNumber)
-          .limit(1)
-          .get();
-        
-        if (!tablesSnapshot.empty) {
-          const tableData = tablesSnapshot.docs[0].data();
-          tableInfo = {
-            id: tablesSnapshot.docs[0].id,
-            number: tableData.number,
-            floor: tableData.floor,
-            capacity: tableData.capacity
-          };
-        }
-      } catch (error) {
-        console.log('Table info fetch error:', error);
-      }
-    }
-
-    const kotId = `KOT-${orderDoc.id.slice(-6).toUpperCase()}`;
-    
-    res.json({
-      ...orderData,
-      kotId,
-      tableInfo,
-      createdAt: orderData.createdAt?.toDate()?.toISOString() || new Date().toISOString(),
-      updatedAt: orderData.updatedAt?.toDate()?.toISOString() || new Date().toISOString(),
-      kotTime: orderData.kotTime?.toDate()?.toISOString() || orderData.createdAt?.toDate()?.toISOString(),
-      cookingStartTime: orderData.cookingStartTime?.toDate()?.toISOString() || null,
-      cookingEndTime: orderData.cookingEndTime?.toDate()?.toISOString() || null
-    });
-
-  } catch (error) {
-    console.error('Get KOT details error:', error);
-    res.status(500).json({ error: 'Failed to fetch KOT details' });
-  }
-});
-
 // ============================================
 // KOT PRINTING APIs (for thermal printer integration)
+// These must be defined BEFORE the generic /api/kot/:restaurantId/:orderId route
 // ============================================
 
 // Get pending KOT orders for printing (orders not yet printed)
@@ -8627,6 +8568,66 @@ app.get('/api/restaurant/info/:restaurantId', async (req, res) => {
   } catch (error) {
     console.error('Get restaurant info error:', error);
     res.status(500).json({ error: 'Failed to fetch restaurant info' });
+  }
+});
+
+// Get single KOT details
+app.get('/api/kot/:restaurantId/:orderId', async (req, res) => {
+  try {
+    const { restaurantId, orderId } = req.params;
+
+    const orderDoc = await db.collection(collections.orders).doc(orderId).get();
+
+    if (!orderDoc.exists) {
+      return res.status(404).json({ error: 'KOT not found' });
+    }
+
+    const orderData = { id: orderDoc.id, ...orderDoc.data() };
+
+    if (orderData.restaurantId !== restaurantId) {
+      return res.status(403).json({ error: 'Access denied to this KOT' });
+    }
+
+    // Get table information if exists
+    let tableInfo = null;
+    if (orderData.tableNumber) {
+      try {
+        const tablesSnapshot = await db.collection(collections.tables)
+          .where('restaurantId', '==', restaurantId)
+          .where('number', '==', orderData.tableNumber)
+          .limit(1)
+          .get();
+        
+        if (!tablesSnapshot.empty) {
+          const tableData = tablesSnapshot.docs[0].data();
+          tableInfo = {
+            id: tablesSnapshot.docs[0].id,
+            number: tableData.number,
+            floor: tableData.floor,
+            capacity: tableData.capacity
+          };
+        }
+      } catch (error) {
+        console.log('Table info fetch error:', error);
+      }
+    }
+
+    const kotId = `KOT-${orderDoc.id.slice(-6).toUpperCase()}`;
+    
+    res.json({
+      ...orderData,
+      kotId,
+      tableInfo,
+      createdAt: orderData.createdAt?.toDate()?.toISOString() || new Date().toISOString(),
+      updatedAt: orderData.updatedAt?.toDate()?.toISOString() || new Date().toISOString(),
+      kotTime: orderData.kotTime?.toDate()?.toISOString() || orderData.createdAt?.toDate()?.toISOString(),
+      cookingStartTime: orderData.cookingStartTime?.toDate()?.toISOString() || null,
+      cookingEndTime: orderData.cookingEndTime?.toDate()?.toISOString() || null
+    });
+
+  } catch (error) {
+    console.error('Get KOT details error:', error);
+    res.status(500).json({ error: 'Failed to fetch KOT details' });
   }
 });
 
