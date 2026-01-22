@@ -2532,6 +2532,105 @@ app.post('/api/user/change-password', authenticateToken, async (req, res) => {
   }
 });
 
+// Change password for staff members (loginId-based)
+app.post('/api/staff/change-password', authenticateToken, async (req, res) => {
+  try {
+    const { loginId, currentPassword, newPassword, confirmPassword } = req.body;
+    const userId = req.user.userId;
+
+    // Validate input
+    if (!currentPassword || !newPassword || !confirmPassword) {
+      return res.status(400).json({ error: 'All password fields are required' });
+    }
+
+    // Check if new password matches confirmation
+    if (newPassword !== confirmPassword) {
+      return res.status(400).json({ error: 'New password and confirmation do not match' });
+    }
+
+    // Validate new password length
+    if (newPassword.length < 6) {
+      return res.status(400).json({ error: 'New password must be at least 6 characters long' });
+    }
+
+    // Get user document
+    const userDoc = await db.collection(collections.users).doc(userId).get();
+    if (!userDoc.exists) {
+      return res.status(404).json({ error: 'Staff member not found' });
+    }
+
+    const userData = userDoc.data();
+
+    // Verify this is a staff member (has loginId and is staff role)
+    if (!userData.loginId || !['waiter', 'manager', 'employee'].includes(userData.role?.toLowerCase())) {
+      return res.status(403).json({ 
+        error: 'Password change is only available for staff members',
+        notStaff: true
+      });
+    }
+
+    // If loginId is provided, verify it matches
+    if (loginId && loginId !== userData.loginId) {
+      return res.status(400).json({ error: 'Login ID does not match' });
+    }
+
+    // Check if user has a password set
+    if (!userData.password) {
+      return res.status(400).json({ 
+        error: 'Password not set. Please contact your administrator.',
+        noPasswordSet: true
+      });
+    }
+
+    // Verify current password
+    const isValidPassword = await bcrypt.compare(currentPassword, userData.password);
+    if (!isValidPassword) {
+      return res.status(401).json({ error: 'Current password is incorrect' });
+    }
+
+    // Check if new password is different from current password
+    const isSamePassword = await bcrypt.compare(newPassword, userData.password);
+    if (isSamePassword) {
+      return res.status(400).json({ error: 'New password must be different from current password' });
+    }
+
+    // Hash new password
+    const hashedPassword = await bcrypt.hash(newPassword, 10);
+
+    // Update password and clear temporary password flag if it exists
+    const updateData = {
+      password: hashedPassword,
+      updatedAt: new Date()
+    };
+
+    // If this was a temporary password, mark it as changed
+    if (userData.temporaryPassword) {
+      updateData.temporaryPassword = false;
+      // Also delete from staffCredentials collection if exists
+      try {
+        const credentialsDoc = await db.collection('staffCredentials').doc(userId).get();
+        if (credentialsDoc.exists) {
+          await credentialsDoc.ref.delete();
+        }
+      } catch (err) {
+        console.error('Error deleting staff credentials:', err);
+        // Don't fail the request if this fails
+      }
+    }
+
+    await userDoc.ref.update(updateData);
+
+    res.json({
+      success: true,
+      message: 'Password changed successfully'
+    });
+
+  } catch (error) {
+    console.error('Staff change password error:', error);
+    res.status(500).json({ error: 'Failed to change password' });
+  }
+});
+
 app.post('/api/auth/google', async (req, res) => {
   try {
     const { uid, email, name, picture } = req.body;
