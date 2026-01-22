@@ -261,6 +261,7 @@ const allowedOrigins = [
   'http://localhost:3002',
   'http://localhost:3003',
   'https://dine-frontend-ecru.vercel.app',
+  'https://dine-frontend-git-staging-kapils-projects-bfc8fbae.vercel.app', // STAGING FRONTEND
   'https://pms-hotel.vercel.app'
 ];
 

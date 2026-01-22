@@ -16,7 +16,7 @@ function initializeFirebase() {
   try {
     // Check if already initialized (for Vercel serverless reuse)
     try {
-      db = getFirestore(undefined, 'dine');
+      db = getFirestore(undefined, 'dine-staging');
       if (db) {
         isInitialized = true;
         console.log('✅ Firebase Admin reused (serverless optimization)');
@@ -37,8 +37,8 @@ function initializeFirebase() {
   
   console.log('✅ Firebase Admin initialized successfully');
   
-  // Use named database "dine" like your "esigntap" pattern
-  db = getFirestore(undefined, 'dine');
+  // STAGING BRANCH: Use dine-staging database
+  db = getFirestore(undefined, 'dine-staging');
     
     // Optimize Firestore settings for better performance
     // These settings help reduce latency, especially from India to US regions
@@ -48,13 +48,13 @@ function initializeFirebase() {
     });
     
     isInitialized = true;
-  console.log('🎯 Using Firestore database: "dine"');
+  console.log('🎯 Using Firestore database: "dine-staging"');
     
     return db;
 } catch (error) {
     // If already initialized, return existing instance
     if (error.code === 'app/duplicate-app') {
-      db = getFirestore(undefined, 'dine');
+      db = getFirestore(undefined, 'dine-staging');
       isInitialized = true;
       console.log('✅ Firebase Admin reused (duplicate app detected)');
       return db;
