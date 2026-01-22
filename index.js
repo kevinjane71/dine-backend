@@ -1183,179 +1183,35 @@ const uploadToFirebase = async (file, restaurantId) => {
   }
 };
 
-// Enhanced function to extract menu from any file type (images, PDFs, docs, CSV, etc.)
+// Unified function to extract menu from any file type
+// Uses GPT-4.1 for best document + image understanding
+// GPT-4.1: Smartest non-reasoning model, excels at instruction following, 1M token context, supports text + image input
 // All extractors return { categories: [{ name, order }], menuItems: [...] }
 const extractMenuFromAnyFile = async (fileUrl, fileType, fileName) => {
   try {
-    console.log(`🔍 Starting enhanced menu extraction for ${fileType} file: ${fileName}`);
-    let result;
-    if (fileType.startsWith('image/')) {
-      result = await extractMenuFromImage(fileUrl);
-    } else if (fileType === 'application/pdf') {
-      result = await extractMenuFromPDF(fileUrl);
-    } else if (fileType.includes('csv') || fileType.includes('excel') || fileType.includes('spreadsheet')) {
-      result = await extractMenuFromCSV(fileUrl);
-    } else if (fileType.includes('document') || fileType.includes('text')) {
-      result = await extractMenuFromDocument(fileUrl);
-    } else {
-      console.log('⚠️ Unknown file type, attempting image extraction as fallback...');
-      result = await extractMenuFromImage(fileUrl);
-    }
-    if (!Array.isArray(result.categories)) result.categories = [];
-    if (!Array.isArray(result.menuItems)) result.menuItems = [];
-    return result;
-  } catch (error) {
-    console.error('❌ Enhanced extraction failed:', error);
-    return { categories: [], menuItems: [] };
-  }
-};
-
-// Extract menu from PDF files. Returns { categories, menuItems }. Prefer section headers from document as categories.
-const extractMenuFromPDF = async (pdfUrl) => {
-  try {
-    console.log('📄 Extracting menu from PDF...');
-    const response = await openai.chat.completions.create({
-      model: "gpt-4o",
-      messages: [
-        {
-          role: "user",
-          content: [
-            {
-              type: "text",
-              text: `Analyze this document. If it is a restaurant menu: 1) List section headers in "categories" as [{"name":"SectionName","order":1}]. Use EXACT names. If no sections, use "categories":[].
-2) Extract ALL menu items. Set "category" to section name or "Other".
-3) VARIANTS: If item shows multiple sizes/prices (e.g., "Half ₹110/Full ₹180", "110/180"), extract as "variants":[{"name":"Half","price":110},{"name":"Full","price":180}]. Otherwise use "variants":[].
-Return JSON: {"categories":[...],"menuItems":[{"name":"","description":"","price":0,"category":"...","isVeg":true,"shortCode":"1","variants":[]}]}
-shortCode: 1,2,3... If NOT a menu: {"categories":[],"menuItems":[]}`
-            },
-            { type: "image_url", image_url: { url: pdfUrl, detail: "high" } }
-          ]
-        }
-      ],
-      max_tokens: 8000,
-      temperature: 0.1
-    });
-    const content = response.choices[0].message.content;
-    const jsonMatch = content.match(/\{[\s\S]*\}/);
-    if (jsonMatch) {
-      const d = JSON.parse(jsonMatch[0]);
-      return { categories: Array.isArray(d.categories) ? d.categories : [], menuItems: Array.isArray(d.menuItems) ? d.menuItems : [] };
-    }
-    return { categories: [], menuItems: [] };
-  } catch (error) {
-    console.error('❌ PDF extraction failed:', error);
-    return { categories: [], menuItems: [] };
-  }
-};
-
-// Extract menu from CSV/Excel. Use Category column if present as categories; else categories:[] and item.category="Other".
-const extractMenuFromCSV = async (csvUrl) => {
-  try {
-    console.log('📊 Extracting menu from CSV/Excel...');
-    const response = await openai.chat.completions.create({
-      model: "gpt-4o",
-      messages: [
-        {
-          role: "user",
-          content: [
-            {
-              type: "text",
-              text: `This may be a menu in CSV/Excel. 1) If there is a Category/Type column, collect unique values as "categories":[{"name":"X","order":1},...]. If no category column, use "categories":[].
-2) Extract ALL rows as menu items. For "category" use the row's Category/Type value if present, else "Other".
-3) VARIANTS: If price column shows multiple values (e.g., "110/180", "Half/Full"), extract as "variants":[{"name":"Half","price":110},{"name":"Full","price":180}]. Otherwise use "variants":[].
-Return JSON: {"categories":[...],"menuItems":[{"name":"","description":"","price":0,"category":"...","isVeg":true,"shortCode":"1","variants":[]}]}
-shortCode: 1,2,3... If NOT a menu: {"categories":[],"menuItems":[]}`
-            },
-            { type: "image_url", image_url: { url: csvUrl, detail: "high" } }
-          ]
-        }
-      ],
-      max_tokens: 8000,
-      temperature: 0.1
-    });
-    const content = response.choices[0].message.content;
-    const jsonMatch = content.match(/\{[\s\S]*\}/);
-    if (jsonMatch) {
-      const d = JSON.parse(jsonMatch[0]);
-      return { categories: Array.isArray(d.categories) ? d.categories : [], menuItems: Array.isArray(d.menuItems) ? d.menuItems : [] };
-    }
-    return { categories: [], menuItems: [] };
-  } catch (error) {
-    console.error('❌ CSV extraction failed:', error);
-    return { categories: [], menuItems: [] };
-  }
-};
-
-// Extract menu from document files. Use section headers as categories when present.
-const extractMenuFromDocument = async (docUrl) => {
-  try {
-    console.log('📝 Extracting menu from document...');
-    const response = await openai.chat.completions.create({
-      model: "gpt-4o",
-      messages: [
-        {
-          role: "user",
-          content: [
-            {
-              type: "text",
-              text: `Analyze this document. If it is a menu: 1) List section headers as "categories":[{"name":"SectionName","order":1}]. If no sections, "categories":[].
-2) Extract ALL items; "category" = section name or "Other".
-3) VARIANTS: If item shows multiple sizes/prices (e.g., "Half ₹110/Full ₹180", "110/180"), extract as "variants":[{"name":"Half","price":110},{"name":"Full","price":180}]. Otherwise use "variants":[].
-Return JSON: {"categories":[...],"menuItems":[{"name":"","description":"","price":0,"category":"...","isVeg":true,"shortCode":"1","variants":[]}]}
-shortCode: 1,2,3... If NOT a menu: {"categories":[],"menuItems":[]}`
-            },
-            { type: "image_url", image_url: { url: docUrl, detail: "high" } }
-          ]
-        }
-      ],
-      max_tokens: 8000,
-      temperature: 0.1
-    });
-    const content = response.choices[0].message.content;
-    const jsonMatch = content.match(/\{[\s\S]*\}/);
-    if (jsonMatch) {
-      const d = JSON.parse(jsonMatch[0]);
-      return { categories: Array.isArray(d.categories) ? d.categories : [], menuItems: Array.isArray(d.menuItems) ? d.menuItems : [] };
-    }
-    return { categories: [], menuItems: [] };
-  } catch (error) {
-    console.error('❌ Document extraction failed:', error);
-    return { categories: [], menuItems: [] };
-  }
-};
-
-// Helper: normalize category name to id (used for storage and matching)
-const categoryNameToId = (name) => {
-  if (!name || typeof name !== 'string') return 'other';
-  return name.toLowerCase().trim().replace(/\s+/g, '-').replace(/[^a-z0-9-]/g, '');
-};
-
-// Helper function to extract menu from image using OpenAI Vision
-// Returns { categories: [{ name, order }], menuItems: [...] }
-// PREFERENCE: Use categories FROM THE MENU PHOTO first. Only if menu has no sections, use fallback.
-const extractMenuFromImage = async (imageUrl) => {
-  try {
-    console.log('🔍 Starting menu extraction – categories from menu first...');
+    console.log(`🔍 Starting menu extraction for ${fileType} file: ${fileName} using gpt-4.1`);
     
     const response = await openai.chat.completions.create({
-      model: "gpt-4o",
+      model: "gpt-4.1",
       messages: [
         {
           role: "user",
           content: [
             {
               type: "text",
-              text: `You are an expert menu extraction AI. Analyze this image and extract menu items ONLY if it is a restaurant menu.
+              text: `You are an expert menu extraction AI. Analyze this file (which may be an image, PDF, document, CSV, Excel, or any other format) and extract menu items ONLY if it is a restaurant menu.
 
 STEP 1 – CATEGORIES FROM THE MENU (PRIORITY):
-- Menus are usually organized by SECTION HEADERS (e.g. "Starters", "Main Course", "Beverages", "Desserts", "Rice", "Breads", "Curries", "Chinese", "Pizza", custom names like "Chef Specials", "Today’s Special", etc.).
+- Menus are usually organized by SECTION HEADERS (e.g. "Starters", "Main Course", "Beverages", "Desserts", "Rice", "Breads", "Curries", "Chinese", "Pizza", custom names like "Chef Specials", "Today's Special", etc.).
 - FIRST list ALL section/section headers you see in the menu, in the ORDER they appear. Use the EXACT name as written (e.g. "Starters", "Main Course", "Tandoor", "Indian Breads").
 - If the menu has NO section headers at all, use: "categories": []
 - DO NOT use a fixed list – use ONLY the category/section names that appear in THIS menu.
+- For CSV/Excel files: If there is a Category/Type column, collect unique values as categories. If no category column, use "categories":[].
 
 STEP 2 – MENU ITEMS WITH VARIANTS:
 - Extract EVERY menu item. For each item, set "category" to the EXACT section name under which it appears (must match one of the names in "categories").
-- If the menu has no sections (categories: []), set each item’s "category" to "Other".
+- If the menu has no sections (categories: []), set each item's "category" to "Other".
+- For CSV/Excel files: Extract ALL rows as menu items. For "category" use the row's Category/Type value if present, else "Other".
 
 IMPORTANT – VARIANTS DETECTION:
 - Many items have SIZE/PORTION variants with different prices (e.g., "Half ₹110 / Full ₹180", "Dal Half/Dal Full ₹110/₹180", "Small/Medium/Large", "110/180").
@@ -1364,6 +1220,7 @@ IMPORTANT – VARIANTS DETECTION:
   * If item shows "Dal Half/Dal Full" or "Dal 110/180" → create ONE item "Dal" with variants: [{"name":"Half","price":110},{"name":"Full","price":180}]
   * If item shows multiple sizes like "Small ₹50 / Medium ₹80 / Large ₹120" → variants: [{"name":"Small","price":50},{"name":"Medium","price":80},{"name":"Large","price":120}]
   * If prices are shown as "110/180" or "₹110/₹180" → typically means Half/Full variants
+  * For CSV/Excel: If price column shows multiple values (e.g., "110/180", "Half/Full"), extract as variants
 - For items WITH variants: set "price" to the LOWEST variant price (or 0 if unclear), and include "variants" array.
 - For items WITHOUT variants: set "price" normally and use "variants": [] or omit it.
 
@@ -1411,11 +1268,12 @@ RULES:
 4. isVeg: true/false based on dish. shortCode: sequential 1, 2, 3...
 5. description: "" if missing. allergens: only if mentioned.
 6. VARIANTS: Look for patterns like "Half/Full", "Small/Medium/Large", "110/180", "₹110/₹180", or any item showing multiple prices. Extract as variants array.
-7. Be thorough – do not skip items.`
+7. Be thorough – do not skip items.
+8. Handle all file types automatically (images, PDFs, documents, CSV, Excel, etc.)`
             },
             {
               type: "image_url",
-              image_url: { url: imageUrl, detail: "high" }
+              image_url: { url: fileUrl, detail: "high" }
             }
           ]
         }
@@ -1430,46 +1288,58 @@ RULES:
       const parsed = JSON.parse(jsonMatch[0]);
       const categories = Array.isArray(parsed.categories) ? parsed.categories : [];
       const menuItems = Array.isArray(parsed.menuItems) ? parsed.menuItems : [];
-      console.log('✅ Extracted categories from menu:', categories.length, '| items:', menuItems.length);
+      console.log(`✅ Extracted ${categories.length} categories and ${menuItems.length} menu items from ${fileName}`);
       return { categories, menuItems };
     }
-    throw new Error('No valid JSON found in response');
-  } catch (error) {
-    console.error('❌ Error extracting menu from image:', error);
-    try {
-      console.log('🔄 Retry with simplified prompt...');
-      const retryResponse = await openai.chat.completions.create({
-        model: "gpt-4o",
-        messages: [
-          {
-            role: "user",
-            content: [
-              {
-                type: "text",
-                text: `Extract menu from this image. Return JSON:
+    
+    // Retry with simplified prompt if first attempt fails
+    console.log('🔄 Retry with simplified prompt...');
+    const retryResponse = await openai.chat.completions.create({
+      model: "gpt-4.1",
+      messages: [
+        {
+          role: "user",
+          content: [
+            {
+              type: "text",
+              text: `Extract menu from this file. Return JSON:
 {"categories": [{"name":"SectionName","order":1}], "menuItems": [{"name":"","price":0,"category":"SectionName","isVeg":true,"shortCode":"1","variants":[]}]}
 Use EXACT section names. If item shows variants (e.g., "Half ₹110/Full ₹180"), use "variants":[{"name":"Half","price":110},{"name":"Full","price":180}]. If no sections, use "categories":[] and item "category":"Other". shortCode: 1,2,3...`
-              },
-              { type: "image_url", image_url: { url: imageUrl, detail: "high" } }
-            ]
-          }
-        ],
-        max_tokens: 6000,
-        temperature: 0.1
-      });
-      const retryContent = retryResponse.choices[0].message.content;
-      const retryMatch = retryContent.match(/\{[\s\S]*\}/);
-      if (retryMatch) {
-        const data = JSON.parse(retryMatch[0]);
-        return {
-          categories: Array.isArray(data.categories) ? data.categories : [],
-          menuItems: Array.isArray(data.menuItems) ? data.menuItems : []
-        };
-      }
-    } catch (e) { console.error('Retry failed:', e); }
-    throw error;
+            },
+            { type: "image_url", image_url: { url: fileUrl, detail: "high" } }
+          ]
+        }
+      ],
+      max_tokens: 6000,
+      temperature: 0.1
+    });
+    
+    const retryContent = retryResponse.choices[0].message.content;
+    const retryMatch = retryContent.match(/\{[\s\S]*\}/);
+    if (retryMatch) {
+      const data = JSON.parse(retryMatch[0]);
+      return {
+        categories: Array.isArray(data.categories) ? data.categories : [],
+        menuItems: Array.isArray(data.menuItems) ? data.menuItems : []
+      };
+    }
+    
+    return { categories: [], menuItems: [] };
+  } catch (error) {
+    console.error(`❌ Error extracting menu from ${fileName}:`, error);
+    return { categories: [], menuItems: [] };
   }
 };
+
+// Old separate extraction functions removed - now using unified extractMenuFromAnyFile() with GPT-4o
+
+// Helper: normalize category name to id (used for storage and matching)
+const categoryNameToId = (name) => {
+  if (!name || typeof name !== 'string') return 'other';
+  return name.toLowerCase().trim().replace(/\s+/g, '-').replace(/[^a-z0-9-]/g, '');
+};
+
+// Old extractMenuFromImage function removed - now using unified extractMenuFromAnyFile() with GPT-4o
 
 app.get('/health', (req, res) => {
   res.json({ 
@@ -3028,7 +2898,7 @@ app.post('/api/auth/firebase/verify', async (req, res) => {
 
       // Only update if there are changes (more than just updatedAt)
       if (Object.keys(updateData).length > 1) {
-        await userDoc.ref.update(updateData);
+      await userDoc.ref.update(updateData);
       }
     }
 
