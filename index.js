@@ -1777,6 +1777,692 @@ app.post('/api/auth/login', async (req, res) => {
   }
 });
 
+// ==================== EMAIL/PASSWORD AUTHENTICATION ====================
+
+// Send email OTP for registration or linking
+app.post('/api/auth/email/send-otp', async (req, res) => {
+  try {
+    const { email, purpose = 'registration' } = req.body; // purpose: 'registration' or 'linking'
+
+    if (!email) {
+      return res.status(400).json({ error: 'Email is required' });
+    }
+
+    const normalizedEmail = email.toLowerCase().trim();
+    const emailOTP = generateOTP('email');
+    const emailOTPExpiry = new Date(Date.now() + 10 * 60 * 1000); // 10 minutes
+
+    // Check if user exists
+    const existingUserQuery = await db.collection(collections.users)
+      .where('email', '==', normalizedEmail)
+      .limit(1)
+      .get();
+
+    if (purpose === 'registration' && !existingUserQuery.empty) {
+      return res.status(400).json({ error: 'Email already registered. Please login instead.' });
+    }
+
+    // For linking: reject if email already exists (we only link NEW emails)
+    if (purpose === 'linking' && !existingUserQuery.empty) {
+      return res.status(400).json({ 
+        error: 'This email is already registered. Please use a different email or login with this email instead.',
+        emailExists: true
+      });
+    }
+
+    // Store OTP in temporary collection for linking (email doesn't exist yet)
+    // For registration, also store in temp if user doesn't exist
+    if (purpose === 'linking' || existingUserQuery.empty) {
+      // Store in temporary collection
+      await db.collection('email_otp_temp').add({
+        email: normalizedEmail,
+        otp: emailOTP,
+        otpExpiry: emailOTPExpiry,
+        purpose,
+        createdAt: new Date()
+      });
+    } else {
+      // Existing user (registration case where user exists) - update OTP in user document
+      await existingUserQuery.docs[0].ref.update({
+        emailOTP,
+        emailOTPExpiry,
+        updatedAt: new Date()
+      });
+    }
+
+    // Send email with OTP
+    try {
+      await emailService.sendEmail({
+        to: normalizedEmail,
+        subject: 'Your DineOpen Verification Code',
+        text: `Your DineOpen verification code is: ${emailOTP}. This code is valid for 10 minutes.`,
+        html: `
+          <!DOCTYPE html>
+          <html>
+          <body style="font-family: Arial, sans-serif; line-height: 1.6; color: #333; max-width: 600px; margin: 0 auto; padding: 20px;">
+            <div style="background: linear-gradient(135deg, #ef4444 0%, #dc2626 100%); padding: 30px; text-align: center; border-radius: 8px 8px 0 0;">
+              <h1 style="color: white; margin: 0;">DineOpen Verification</h1>
+            </div>
+            <div style="background: #f9f9f9; padding: 30px; border-radius: 0 0 8px 8px;">
+              <p style="font-size: 16px;">Your verification code is:</p>
+              <div style="background: white; padding: 20px; text-align: center; border-radius: 8px; margin: 20px 0;">
+                <h2 style="color: #ef4444; font-size: 32px; margin: 0; letter-spacing: 5px;">${emailOTP}</h2>
+              </div>
+              <p style="font-size: 14px; color: #666;">This code is valid for 10 minutes.</p>
+              <p style="font-size: 14px; color: #666;">If you didn't request this code, please ignore this email.</p>
+            </div>
+          </body>
+          </html>
+        `
+      });
+    } catch (emailError) {
+      console.error('Email send error:', emailError);
+      // Still return success but log the OTP for development
+      console.log(`📧 Email OTP for ${normalizedEmail}: ${emailOTP} (Email service failed)`);
+    }
+
+    res.json({
+      success: true,
+      message: 'OTP sent successfully to your email',
+      email: normalizedEmail
+    });
+
+  } catch (error) {
+    console.error('Send email OTP error:', error);
+    res.status(500).json({ error: 'Failed to send OTP' });
+  }
+});
+
+// Email/Password Registration with OTP verification
+app.post('/api/auth/email/register', async (req, res) => {
+  try {
+    const { email, password, confirmPassword, name, otp } = req.body;
+
+    if (!email || !password || !confirmPassword || !name) {
+      return res.status(400).json({ error: 'Email, password, confirm password, and name are required' });
+    }
+
+    if (password !== confirmPassword) {
+      return res.status(400).json({ error: 'Passwords do not match' });
+    }
+
+    if (password.length < 6) {
+      return res.status(400).json({ error: 'Password must be at least 6 characters' });
+    }
+
+    const normalizedEmail = email.toLowerCase().trim();
+
+    // Check if user already exists
+    const existingUserQuery = await db.collection(collections.users)
+      .where('email', '==', normalizedEmail)
+      .limit(1)
+      .get();
+
+    if (!existingUserQuery.empty) {
+      return res.status(400).json({ error: 'Email already registered. Please login instead.' });
+    }
+
+    // Verify OTP if provided (for registration flow)
+    if (otp) {
+      // Check temporary OTP or user document
+      const tempOtpQuery = await db.collection('email_otp_temp')
+        .where('email', '==', normalizedEmail)
+        .orderBy('createdAt', 'desc')
+        .limit(1)
+        .get();
+
+      if (tempOtpQuery.empty) {
+        return res.status(400).json({ error: 'OTP not found. Please request a new OTP.' });
+      }
+
+      const tempOtpData = tempOtpQuery.docs[0].data();
+      if (tempOtpData.otp !== otp) {
+        return res.status(400).json({ error: 'Invalid OTP' });
+      }
+
+      if (new Date() > tempOtpData.otpExpiry.toDate()) {
+        return res.status(400).json({ error: 'OTP expired. Please request a new OTP.' });
+      }
+
+      // Delete temporary OTP
+      await tempOtpQuery.docs[0].ref.delete();
+    }
+
+    // Hash password
+    const hashedPassword = await bcrypt.hash(password, 10);
+
+    // Check if user exists with phone (for linking)
+    // This will be handled in the linking logic
+
+    // Create new user
+    const newUser = {
+      email: normalizedEmail,
+      password: hashedPassword,
+      name: name.trim(),
+      role: 'owner',
+      emailVerified: !!otp, // Verified if OTP was provided
+      phoneVerified: false,
+      provider: 'email',
+      setupComplete: false,
+      createdAt: new Date(),
+      updatedAt: new Date()
+    };
+
+    const userRef = await db.collection(collections.users).add(newUser);
+    const userId = userRef.id;
+
+    // Create default subscription
+    await createDefaultSubscription(userId, normalizedEmail, null, 'owner');
+
+    // Generate JWT token
+    const token = jwt.sign(
+      { userId, email: normalizedEmail, role: 'owner' },
+      process.env.JWT_SECRET,
+      { expiresIn: '7d' }
+    );
+
+    // Check if user has restaurants
+    const restaurantsQuery = await db.collection(collections.restaurants)
+      .where('ownerId', '==', userId)
+      .limit(1)
+      .get();
+    
+    const hasRestaurants = !restaurantsQuery.empty;
+
+    res.json({
+      success: true,
+      message: otp ? 'Registration successful! Email verified.' : 'Registration successful! Please verify your email.',
+      token: otp ? token : null,
+      user: {
+        id: userId,
+        email: normalizedEmail,
+        name: name.trim(),
+        role: 'owner',
+        emailVerified: !!otp,
+        setupComplete: false
+      },
+      firstTimeUser: true,
+      isNewUser: true,
+      hasRestaurants,
+      verificationRequired: !otp,
+      redirectTo: hasRestaurants ? '/dashboard' : '/admin'
+    });
+
+  } catch (error) {
+    console.error('Email registration error:', error);
+    res.status(500).json({ 
+      error: 'Registration failed',
+      details: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
+  }
+});
+
+// Verify Email OTP (for registration completion or linking)
+app.post('/api/auth/email/verify-otp', async (req, res) => {
+  try {
+    const { email, otp, purpose = 'registration' } = req.body; // purpose: 'registration' or 'linking'
+
+    if (!email || !otp) {
+      return res.status(400).json({ error: 'Email and OTP are required' });
+    }
+
+    const normalizedEmail = email.toLowerCase().trim();
+
+    // Find user by email
+    const userQuery = await db.collection(collections.users)
+      .where('email', '==', normalizedEmail)
+      .limit(1)
+      .get();
+
+    let userDoc = null;
+    let userId = null;
+
+    if (!userQuery.empty) {
+      userDoc = userQuery.docs[0];
+      userId = userDoc.id;
+    } else if (purpose === 'registration') {
+      // Check temporary OTP for new registration
+      const tempOtpQuery = await db.collection('email_otp_temp')
+        .where('email', '==', normalizedEmail)
+        .orderBy('createdAt', 'desc')
+        .limit(1)
+        .get();
+
+      if (tempOtpQuery.empty) {
+        return res.status(404).json({ error: 'OTP not found. Please complete registration first.' });
+      }
+
+      const tempOtpData = tempOtpQuery.docs[0].data();
+      if (tempOtpData.otp !== otp) {
+        return res.status(400).json({ error: 'Invalid OTP' });
+      }
+
+      if (new Date() > tempOtpData.otpExpiry.toDate()) {
+        return res.status(400).json({ error: 'OTP expired. Please request a new OTP.' });
+      }
+
+      return res.json({
+        success: true,
+        message: 'OTP verified. Please complete registration with password.',
+        email: normalizedEmail,
+        otpVerified: true
+      });
+    } else {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    // For existing users (linking or verification)
+    const userData = userDoc.data();
+
+    // Check OTP from user document or temp collection
+    let isValidOtp = false;
+    let otpExpiry = null;
+
+    if (userData.emailOTP) {
+      isValidOtp = userData.emailOTP === otp;
+      otpExpiry = userData.emailOTPExpiry;
+    } else {
+      // Check temp collection
+      const tempOtpQuery = await db.collection('email_otp_temp')
+        .where('email', '==', normalizedEmail)
+        .orderBy('createdAt', 'desc')
+        .limit(1)
+        .get();
+
+      if (!tempOtpQuery.empty) {
+        const tempOtpData = tempOtpQuery.docs[0].data();
+        isValidOtp = tempOtpData.otp === otp;
+        otpExpiry = tempOtpData.otpExpiry;
+      }
+    }
+
+    if (!isValidOtp) {
+      return res.status(400).json({ error: 'Invalid OTP' });
+    }
+
+    if (otpExpiry && new Date() > otpExpiry.toDate()) {
+      return res.status(400).json({ error: 'OTP expired' });
+    }
+
+    // Update user - verify email
+    await userDoc.ref.update({
+      emailVerified: true,
+      emailOTP: null,
+      emailOTPExpiry: null,
+      updatedAt: new Date()
+    });
+
+    // Delete temp OTP if exists
+    const tempOtpQuery = await db.collection('email_otp_temp')
+      .where('email', '==', normalizedEmail)
+      .get();
+    
+    const batch = db.batch();
+    tempOtpQuery.docs.forEach(doc => batch.delete(doc.ref));
+    await batch.commit();
+
+    // Generate JWT token
+    const token = jwt.sign(
+      { userId, email: normalizedEmail, role: userData.role },
+      process.env.JWT_SECRET,
+      { expiresIn: '7d' }
+    );
+
+    // Check if user has restaurants
+    const restaurantsQuery = await db.collection(collections.restaurants)
+      .where('ownerId', '==', userId)
+      .limit(1)
+      .get();
+    
+    const hasRestaurants = !restaurantsQuery.empty;
+
+    res.json({
+      success: true,
+      message: purpose === 'linking' ? 'Email linked successfully!' : 'Email verified successfully!',
+      token,
+      user: {
+        id: userId,
+        email: normalizedEmail,
+        name: userData.name,
+        phone: userData.phone,
+        role: userData.role,
+        emailVerified: true,
+        phoneVerified: userData.phoneVerified || false,
+        setupComplete: userData.setupComplete || false
+      },
+      hasRestaurants,
+      redirectTo: hasRestaurants ? '/dashboard' : '/admin'
+    });
+
+  } catch (error) {
+    console.error('Email OTP verification error:', error);
+    res.status(500).json({ error: 'OTP verification failed' });
+  }
+});
+
+// Email/Password Login
+app.post('/api/auth/email/login', async (req, res) => {
+  try {
+    const { email, password } = req.body;
+
+    if (!email || !password) {
+      return res.status(400).json({ error: 'Email and password are required' });
+    }
+
+    const normalizedEmail = email.toLowerCase().trim();
+
+    // Find user by email
+    const userQuery = await db.collection(collections.users)
+      .where('email', '==', normalizedEmail)
+      .limit(1)
+      .get();
+
+    if (userQuery.empty) {
+      return res.status(401).json({ error: 'Invalid credentials' });
+    }
+
+    const userDoc = userQuery.docs[0];
+    const userData = userDoc.data();
+    const userId = userDoc.id;
+
+    // Check if user has password (email-based login)
+    if (!userData.password) {
+      return res.status(401).json({ 
+        error: 'Password not set. Please use the login method you used to register (Gmail or Phone).',
+        alternativeLogin: true
+      });
+    }
+
+    // Verify password
+    const isValidPassword = await bcrypt.compare(password, userData.password);
+    if (!isValidPassword) {
+      return res.status(401).json({ error: 'Invalid credentials' });
+    }
+
+    // Check if email is verified
+    if (!userData.emailVerified) {
+      return res.status(403).json({ 
+        error: 'Email not verified. Please verify your email first.',
+        verificationRequired: true,
+        email: normalizedEmail
+      });
+    }
+
+    // Update last login
+    await userDoc.ref.update({
+      lastLogin: new Date(),
+      updatedAt: new Date()
+    });
+
+    // Generate JWT token
+    const token = jwt.sign(
+      { userId, email: normalizedEmail, role: userData.role },
+      process.env.JWT_SECRET,
+      { expiresIn: '7d' }
+    );
+
+    // Check if user has restaurants
+    const restaurantsQuery = await db.collection(collections.restaurants)
+      .where('ownerId', '==', userId)
+      .limit(1)
+      .get();
+    
+    const hasRestaurants = !restaurantsQuery.empty;
+
+    // Get subdomain URL if enabled
+    let subdomainUrl = null;
+    if (SUBDOMAIN_FEATURE_ENABLED && hasRestaurants) {
+      const restaurantsQueryForSubdomain = await db.collection(collections.restaurants)
+        .where('ownerId', '==', userId)
+        .limit(1)
+        .get();
+
+      if (!restaurantsQueryForSubdomain.empty) {
+        const restaurant = restaurantsQueryForSubdomain.docs[0].data();
+        if (restaurant.subdomainEnabled && restaurant.subdomain) {
+          subdomainUrl = getSubdomainUrl(restaurant.subdomain, '/dashboard');
+        }
+      }
+    }
+
+    res.json({
+      success: true,
+      message: 'Login successful',
+      token,
+      user: {
+        id: userId,
+        email: normalizedEmail,
+        name: userData.name,
+        phone: userData.phone || null,
+        role: userData.role,
+        emailVerified: true,
+        phoneVerified: userData.phoneVerified || false,
+        setupComplete: userData.setupComplete || false
+      },
+      hasRestaurants,
+      subdomainUrl,
+      redirectTo: subdomainUrl || (hasRestaurants ? '/dashboard' : '/admin')
+    });
+
+  } catch (error) {
+    console.error('Email login error:', error);
+    res.status(500).json({ error: 'Login failed' });
+  }
+});
+
+// Link email to existing phone-based user
+app.post('/api/user/link-email', authenticateToken, async (req, res) => {
+  try {
+    const { email, password, confirmPassword, otp } = req.body;
+    const userId = req.user.userId;
+
+    if (!email) {
+      return res.status(400).json({ error: 'Email is required' });
+    }
+
+    const normalizedEmail = email.toLowerCase().trim();
+
+    // Get current user
+    const userDoc = await db.collection(collections.users).doc(userId).get();
+    if (!userDoc.exists) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    const userData = userDoc.data();
+
+    // Check if email already exists in database (any user)
+    const emailQuery = await db.collection(collections.users)
+      .where('email', '==', normalizedEmail)
+      .limit(1)
+      .get();
+
+    // Reject if email exists for ANY user (including current user)
+    if (!emailQuery.empty) {
+      return res.status(400).json({ 
+        error: 'This email is already registered. Please use a different email or login with this email instead.',
+        emailExists: true
+      });
+    }
+
+    // If OTP provided, verify it
+    if (otp) {
+      let isValidOtp = false;
+      
+      if (userData.emailOTP && userData.emailOTP === otp) {
+        if (userData.emailOTPExpiry && new Date() <= userData.emailOTPExpiry.toDate()) {
+          isValidOtp = true;
+        }
+      }
+
+      // Check temp collection
+      if (!isValidOtp) {
+        const tempOtpQuery = await db.collection('email_otp_temp')
+          .where('email', '==', normalizedEmail)
+          .orderBy('createdAt', 'desc')
+          .limit(1)
+          .get();
+
+        if (!tempOtpQuery.empty) {
+          const tempOtpData = tempOtpQuery.docs[0].data();
+          if (tempOtpData.otp === otp && new Date() <= tempOtpData.otpExpiry.toDate()) {
+            isValidOtp = true;
+            await tempOtpQuery.docs[0].ref.delete();
+          }
+        }
+      }
+
+      if (!isValidOtp) {
+        return res.status(400).json({ error: 'Invalid or expired OTP' });
+      }
+
+      // Update user with email and password
+      const updateData = {
+        email: normalizedEmail,
+        emailVerified: true,
+        emailOTP: null,
+        emailOTPExpiry: null,
+        updatedAt: new Date()
+      };
+
+      // Add password if provided
+      if (password) {
+        if (!confirmPassword || password !== confirmPassword) {
+          return res.status(400).json({ error: 'Passwords do not match' });
+        }
+        if (password.length < 6) {
+          return res.status(400).json({ error: 'Password must be at least 6 characters' });
+        }
+        updateData.password = await bcrypt.hash(password, 10);
+      }
+
+      await userDoc.ref.update(updateData);
+
+      res.json({
+        success: true,
+        message: 'Email linked successfully!',
+        user: {
+          id: userId,
+          email: normalizedEmail,
+          phone: userData.phone,
+          name: userData.name,
+          emailVerified: true,
+          phoneVerified: userData.phoneVerified || false
+        }
+      });
+    } else {
+      // OTP not provided - return that OTP is required
+      return res.status(400).json({ 
+        error: 'OTP verification required',
+        otpRequired: true,
+        email: normalizedEmail
+      });
+    }
+
+  } catch (error) {
+    console.error('Link email error:', error);
+    res.status(500).json({ error: 'Failed to link email' });
+  }
+});
+
+// Link phone to existing email-based user
+app.post('/api/user/link-phone', authenticateToken, async (req, res) => {
+  try {
+    const { phone, otp } = req.body;
+    const userId = req.user.userId;
+
+    if (!phone) {
+      return res.status(400).json({ error: 'Phone number is required' });
+    }
+
+    const normalizedPhone = phone.startsWith('+') ? phone : `+${phone}`;
+
+    // Get current user
+    const userDoc = await db.collection(collections.users).doc(userId).get();
+    if (!userDoc.exists) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    const userData = userDoc.data();
+
+    // Check if phone already exists in database (any user)
+    const phoneQuery = await db.collection(collections.users)
+      .where('phone', '==', normalizedPhone)
+      .limit(1)
+      .get();
+
+    // Reject if phone exists for ANY user (including current user)
+    if (!phoneQuery.empty) {
+      return res.status(400).json({ 
+        error: 'This phone number is already registered. Please use a different phone number or login with this phone instead.',
+        phoneExists: true
+      });
+    }
+
+    // If OTP provided, verify it using the same OTP verification as login
+    if (otp) {
+      // Check if this is a demo account
+      const isDemoAccount = normalizedPhone === '+919000000000' && otp === '1234';
+      let otpValid = false;
+
+      if (isDemoAccount) {
+        console.log('🎭 Demo account phone linking detected:', normalizedPhone);
+        otpValid = true;
+      } else {
+        // Regular OTP verification (same as login)
+        const otpQuery = await db.collection('otp_verification')
+          .where('phone', '==', normalizedPhone)
+          .where('otp', '==', otp)
+          .limit(1)
+          .get();
+
+        if (!otpQuery.empty) {
+          const otpData = otpQuery.docs[0].data();
+          if (new Date() <= otpData.otpExpiry.toDate()) {
+            otpValid = true;
+            // Delete used OTP
+            await otpQuery.docs[0].ref.delete();
+          }
+        }
+      }
+
+      if (!otpValid) {
+        return res.status(400).json({ error: 'Invalid or expired OTP' });
+      }
+
+      // Update user with phone (verified via OTP)
+      await userDoc.ref.update({
+        phone: normalizedPhone,
+        phoneVerified: true, // Verified via OTP
+        updatedAt: new Date()
+      });
+
+      res.json({
+        success: true,
+        message: 'Phone number linked successfully!',
+        user: {
+          id: userId,
+          email: userData.email,
+          phone: normalizedPhone,
+          name: userData.name,
+          emailVerified: userData.emailVerified || false,
+          phoneVerified: true
+        }
+      });
+    } else {
+      // OTP not provided - return that OTP is required
+      return res.status(400).json({ 
+        error: 'OTP verification required. Please send OTP first using /api/auth/phone/send-otp',
+        otpRequired: true,
+        phone: normalizedPhone
+      });
+    }
+
+  } catch (error) {
+    console.error('Link phone error:', error);
+    res.status(500).json({ error: 'Failed to link phone' });
+  }
+});
+
 app.post('/api/auth/google', async (req, res) => {
   try {
     const { uid, email, name, picture } = req.body;
@@ -1793,18 +2479,22 @@ app.post('/api/auth/google', async (req, res) => {
     // Trust Firebase Auth - no need to verify Google token
     // Firebase already verified the user is legitimate
 
+    // Smart linking: Check by email first, then by phone if email not found
     let userDoc = await db.collection(collections.users)
       .where('email', '==', email)
       .get();
 
     let userId;
-
     let isNewUser = false;
     let hasRestaurants = false;
+    let linkedPhone = false;
 
-    console.log('🔍 Gmail login debug - User exists:', !userDoc.empty);
+    console.log('🔍 Gmail login debug - User exists by email:', !userDoc.empty);
     console.log('🔍 Gmail login debug - Email:', email);
-    console.log('🔍 Gmail login debug - Name:', name);
+
+    // If not found by email, check if there's a user with this email as phone (unlikely but handle edge case)
+    // Actually, let's check if user exists with phone that matches email pattern (very rare)
+    // For now, just handle email-based lookup
 
     if (userDoc.empty) {
       console.log('🆕 NEW Gmail user detected - will send welcome email');
@@ -1871,15 +2561,32 @@ app.post('/api/auth/google', async (req, res) => {
         // Don't fail the login if email sending fails
       }
     } else {
-      // Existing user login
+      // Existing user login - smart linking
       userId = userDoc.docs[0].id;
       const userData = userDoc.docs[0].data();
       
-      await userDoc.docs[0].ref.update({
+      // Update user with Google info - smart linking
+      const updateData = {
         updatedAt: new Date(),
         picture: picture || userData.picture,
         googleUid: uid // Store Google UID for future reference
-      });
+      };
+
+      // Ensure email is set (should already be set, but just in case)
+      if (!userData.email) {
+        updateData.email = email.toLowerCase().trim();
+        updateData.emailVerified = true; // Gmail login verifies email
+      } else if (userData.email.toLowerCase().trim() === email.toLowerCase().trim()) {
+        // Email matches - verify if not already verified (Gmail login verifies email)
+        if (!userData.emailVerified) {
+          updateData.emailVerified = true;
+        }
+      }
+
+      // Keep phone if it exists (don't overwrite)
+      // Phone linking will be done separately via profile page
+
+      await userDoc.docs[0].ref.update(updateData);
 
       // Check if owner has restaurants
       const restaurantsQuery = await db.collection(collections.restaurants)
@@ -2029,33 +2736,57 @@ app.post('/api/auth/firebase/verify', async (req, res) => {
       }
 
       if (phoneQuery && !phoneQuery.empty) {
-        // User exists with this phone number
+        // User exists with this phone number - smart linking
         userDoc = phoneQuery.docs[0];
         userId = userDoc.id;
         isNewUser = false;
+        const userData = userDoc.data();
         
-        // Update existing user with Firebase UID
-        await db.collection(collections.users).doc(userId).update({
+        // Update existing user with Firebase UID and link email if provided
+        const updateData = {
           firebaseUid: uid,
           phoneVerified: true,
           updatedAt: new Date()
-        });
+        };
+
+        // Link email if provided and not already set
+        if (email && !userData.email) {
+          updateData.email = email.toLowerCase().trim();
+          updateData.emailVerified = true; // Verified via Firebase
+        } else if (email && userData.email && userData.email !== email.toLowerCase().trim()) {
+          // Email exists but different - don't overwrite, just log
+          console.log('⚠️ User has different email, keeping existing:', userData.email);
+        }
+
+        await db.collection(collections.users).doc(userId).update(updateData);
         
-        console.log('✅ User found by phone number, updated with Firebase UID:', userId);
+        console.log('✅ User found by phone number, updated with Firebase UID and linked email:', userId);
       } else if (emailQuery && !emailQuery.empty) {
-        // User exists with this email
+        // User exists with this email - smart linking
         userDoc = emailQuery.docs[0];
         userId = userDoc.id;
         isNewUser = false;
+        const userData = userDoc.data();
         
-        // Update existing user with Firebase UID
-        await db.collection(collections.users).doc(userId).update({
+        // Update existing user with Firebase UID and link phone if provided
+        const updateData = {
           firebaseUid: uid,
           emailVerified: true,
           updatedAt: new Date()
-        });
+        };
+
+        // Link phone if provided and not already set
+        if (phoneNumber && !userData.phone) {
+          updateData.phone = phoneNumber;
+          updateData.phoneVerified = true; // Verified via Firebase
+        } else if (phoneNumber && userData.phone && userData.phone !== phoneNumber) {
+          // Phone exists but different - don't overwrite, just log
+          console.log('⚠️ User has different phone, keeping existing:', userData.phone);
+        }
+
+        await db.collection(collections.users).doc(userId).update(updateData);
         
-        console.log('✅ User found by email, updated with Firebase UID:', userId);
+        console.log('✅ User found by email, updated with Firebase UID and linked phone:', userId);
       } else {
         // Completely new user - create new account
         console.log('🆕 Creating new user account');
@@ -2088,27 +2819,49 @@ app.post('/api/auth/firebase/verify', async (req, res) => {
       }
     }
 
-    // For existing users, update their info
+    // For existing users, update their info and handle smart linking
     if (!isNewUser) {
       const userData = userDoc.data();
       
-      // Update user info if needed
+      // Update user info if needed - smart linking (preserve existing verification status)
       const updateData = {
-        updatedAt: new Date(),
-        phoneVerified: !!phoneNumber,
-        emailVerified: !!email
+        updatedAt: new Date()
       };
 
-      if (email && !userData.email) updateData.email = email;
+      // Link email if provided and not already set
+      if (email && !userData.email) {
+        updateData.email = email.toLowerCase().trim();
+        updateData.emailVerified = true; // Verified via Firebase
+      } else if (email && userData.email && userData.email.toLowerCase().trim() === email.toLowerCase().trim()) {
+        // Email matches - only verify if not already verified (don't overwrite if already verified)
+        if (!userData.emailVerified) {
+          updateData.emailVerified = true;
+        }
+      }
+
+      // Link phone if provided and not already set
+      if (phoneNumber && !userData.phone) {
+        updateData.phone = phoneNumber;
+        updateData.phoneVerified = true; // Verified via Firebase
+      } else if (phoneNumber && userData.phone && userData.phone === phoneNumber) {
+        // Phone matches - only verify if not already verified (don't overwrite if already verified)
+        if (!userData.phoneVerified) {
+          updateData.phoneVerified = true;
+        }
+      }
+
       if (displayName && !userData.name) updateData.name = displayName;
       if (photoURL && !userData.photoURL) updateData.photoURL = photoURL;
       
-      // Update provider if logging in with Google
+      // Update provider if logging in with Google (only if email provided)
       if (email && userData.provider !== 'google') {
         updateData.provider = 'google';
       }
 
-      await userDoc.ref.update(updateData);
+      // Only update if there are changes (more than just updatedAt)
+      if (Object.keys(updateData).length > 1) {
+        await userDoc.ref.update(updateData);
+      }
     }
 
     // Check if user has restaurants (for both new and existing users)
