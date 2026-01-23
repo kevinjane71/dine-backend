@@ -4639,15 +4639,22 @@ app.delete('/api/menus/:restaurantId/bulk-delete', authenticateToken, async (req
 app.post('/api/public/orders/:restaurantId', vercelSecurityMiddleware.publicAPI, async (req, res) => {
   try {
     const { restaurantId } = req.params;
-    const { 
-      customerPhone, 
-      customerName, 
-      seatNumber, 
-      items, 
-      totalAmount, 
+    const {
+      customerPhone,
+      customerName,
+      customerEmail,
+      seatNumber,
+      tableNumber: requestedTable,
+      items,
+      totalAmount,
       notes,
       otp,
-      verificationId
+      verificationId,
+      // New fields for Crave app integration
+      orderType = 'dine_in', // dine_in, takeaway, delivery
+      offerId, // Optional offer to apply
+      deliveryAddress, // For delivery orders
+      redeemLoyaltyPoints = 0 // Loyalty points to redeem
     } = req.body;
 
     if (!restaurantId || !items || items.length === 0) {
@@ -4672,12 +4679,27 @@ app.post('/api/public/orders/:restaurantId', vercelSecurityMiddleware.publicAPI,
       return res.status(404).json({ error: 'Restaurant not found' });
     }
 
+    const restaurantData = restaurantDoc.data();
+    const customerAppSettings = restaurantData.customerAppSettings || {};
+    const loyaltySettings = customerAppSettings.loyaltySettings || {};
+
+    // Validate order type based on restaurant settings
+    if (orderType === 'dine_in' && customerAppSettings.allowDineIn === false) {
+      return res.status(400).json({ error: 'Dine-in orders are not available' });
+    }
+    if (orderType === 'takeaway' && customerAppSettings.allowTakeaway === false) {
+      return res.status(400).json({ error: 'Takeaway orders are not available' });
+    }
+    if (orderType === 'delivery' && customerAppSettings.allowDelivery === false) {
+      return res.status(400).json({ error: 'Delivery orders are not available' });
+    }
+
     // Helper function to normalize phone number
     const normalizePhone = (phone) => {
       if (!phone) return null;
       // Remove all non-digit characters
       const digits = phone.replace(/\D/g, '');
-      
+
       // Handle Indian phone numbers
       if (digits.length === 12 && digits.startsWith('91')) {
         // Remove country code for Indian numbers
@@ -4689,7 +4711,7 @@ app.post('/api/public/orders/:restaurantId', vercelSecurityMiddleware.publicAPI,
         // Remove leading zero
         return digits.substring(1);
       }
-      
+
       // Return as-is for other formats
       return digits;
     };
@@ -4697,7 +4719,9 @@ app.post('/api/public/orders/:restaurantId', vercelSecurityMiddleware.publicAPI,
     // Create or get customer record with phone normalization
     let customerId;
     let existingCustomer = null;
-    
+    let customerData = null;
+    let isFirstOrder = false;
+
     // First try exact match
     const customerQuery = await db.collection('customers')
       .where('restaurantId', '==', restaurantId)
@@ -4713,10 +4737,10 @@ app.post('/api/public/orders/:restaurantId', vercelSecurityMiddleware.publicAPI,
         const allCustomers = await db.collection('customers')
           .where('restaurantId', '==', restaurantId)
           .get();
-        
+
         existingCustomer = allCustomers.docs.find(doc => {
-          const customerPhone = normalizePhone(doc.data().phone);
-          return customerPhone === normalizedPhone;
+          const custPhone = normalizePhone(doc.data().phone);
+          return custPhone === normalizedPhone;
         });
       }
     }
@@ -4725,29 +4749,38 @@ app.post('/api/public/orders/:restaurantId', vercelSecurityMiddleware.publicAPI,
       // Update existing customer
       console.log(`🔄 Found existing customer for public order: ${existingCustomer.id} with phone: ${existingCustomer.data().phone}`);
       customerId = existingCustomer.id;
-      
+      customerData = existingCustomer.data();
+
       const updateData = {
         updatedAt: new Date(),
-        lastOrderDate: new Date()
+        lastOrderDate: new Date(),
+        source: customerData.source || 'customer_app' // Mark source if not set
       };
 
-      if (customerName && !existingCustomer.data().name) {
+      if (customerName && !customerData.name) {
         updateData.name = customerName;
+      }
+      if (customerEmail && !customerData.email) {
+        updateData.email = customerEmail;
       }
 
       await existingCustomer.ref.update(updateData);
     } else {
       // Create new customer
+      isFirstOrder = true;
       console.log(`🆕 Creating new customer for public order with phone: ${customerPhone}, name: ${customerName}`);
-      const customerData = {
+      customerData = {
         restaurantId,
         phone: customerPhone,
         name: customerName || 'Customer',
-        email: null,
+        email: customerEmail || null,
         customerId: `CUST-${Date.now()}-${Math.random().toString(36).substr(2, 4).toUpperCase()}`,
         totalOrders: 0,
         totalSpent: 0,
+        loyaltyPoints: 0,
+        orderHistory: [],
         lastOrderDate: null,
+        source: 'customer_app', // Mark as from Crave app
         createdAt: new Date(),
         updatedAt: new Date()
       };
@@ -4757,24 +4790,23 @@ app.post('/api/public/orders/:restaurantId', vercelSecurityMiddleware.publicAPI,
       console.log(`✅ New customer created for public order: ${customerRef.id} with phone: ${customerPhone}`);
     }
 
-    // Validate menu items and calculate total
-    let calculatedTotal = 0;
+    // Validate menu items and calculate subtotal
+    let subtotal = 0;
     const orderItems = [];
 
     // Get restaurant menu items from embedded structure
-    const restaurantData = restaurantDoc.data();
     const menuItems = restaurantData.menu?.items || [];
 
     for (const item of items) {
       // Find menu item in the embedded menu structure
       const menuItem = menuItems.find(menuItem => menuItem.id === item.menuItemId);
-      
+
       if (!menuItem) {
         return res.status(400).json({ error: `Menu item ${item.menuItemId} not found` });
       }
 
       const itemTotal = menuItem.price * item.quantity;
-      calculatedTotal += itemTotal;
+      subtotal += itemTotal;
 
       orderItems.push({
         menuItemId: item.menuItemId,
@@ -4787,31 +4819,153 @@ app.post('/api/public/orders/:restaurantId', vercelSecurityMiddleware.publicAPI,
       });
     }
 
+    // Check minimum order value
+    if (customerAppSettings.minimumOrder && subtotal < customerAppSettings.minimumOrder) {
+      return res.status(400).json({
+        error: `Minimum order value is ₹${customerAppSettings.minimumOrder}`
+      });
+    }
+
+    // Calculate discount if offer is provided
+    let discountAmount = 0;
+    let appliedOffer = null;
+
+    if (offerId) {
+      const offerDoc = await db.collection('offers').doc(offerId).get();
+
+      if (offerDoc.exists) {
+        const offer = offerDoc.data();
+        const now = new Date();
+
+        // Validate offer
+        const validFrom = offer.validFrom ? new Date(offer.validFrom) : null;
+        const validUntil = offer.validUntil ? new Date(offer.validUntil) : null;
+        const isValidDate = (!validFrom || now >= validFrom) && (!validUntil || now <= validUntil);
+        const isUnderUsageLimit = !offer.usageLimit || (offer.usageCount || 0) < offer.usageLimit;
+        const meetsMinOrder = subtotal >= (offer.minOrderValue || 0);
+        const isValidFirstOrder = !offer.isFirstOrderOnly || isFirstOrder;
+
+        if (offer.isActive && offer.restaurantId === restaurantId && isValidDate && isUnderUsageLimit && meetsMinOrder && isValidFirstOrder) {
+          // Calculate discount
+          if (offer.discountType === 'percentage') {
+            discountAmount = (subtotal * offer.discountValue) / 100;
+            if (offer.maxDiscount && discountAmount > offer.maxDiscount) {
+              discountAmount = offer.maxDiscount;
+            }
+          } else {
+            discountAmount = offer.discountValue;
+          }
+
+          // Cap discount at subtotal
+          if (discountAmount > subtotal) {
+            discountAmount = subtotal;
+          }
+
+          appliedOffer = {
+            id: offerId,
+            name: offer.name,
+            discountType: offer.discountType,
+            discountValue: offer.discountValue,
+            discountApplied: discountAmount
+          };
+
+          // Increment offer usage count
+          await offerDoc.ref.update({
+            usageCount: FieldValue.increment(1),
+            updatedAt: new Date()
+          });
+
+          console.log(`🎁 Offer applied: ${offer.name}, Discount: ₹${discountAmount}`);
+        } else {
+          console.log(`⚠️ Offer ${offerId} not valid for this order`);
+        }
+      }
+    }
+
+    // Calculate loyalty points redemption
+    let loyaltyDiscount = 0;
+    let loyaltyPointsRedeemed = 0;
+
+    if (redeemLoyaltyPoints > 0 && loyaltySettings.enabled && customerData) {
+      const availablePoints = customerData.loyaltyPoints || 0;
+      const pointsToRedeem = Math.min(redeemLoyaltyPoints, availablePoints);
+
+      if (pointsToRedeem > 0) {
+        // Calculate discount value from points
+        const redemptionRate = loyaltySettings.redemptionRate || 100; // 100 points = Rs 1
+        loyaltyDiscount = pointsToRedeem / redemptionRate;
+
+        // Cap at max redemption percent of subtotal
+        const maxRedemptionPercent = loyaltySettings.maxRedemptionPercent || 20;
+        const maxLoyaltyDiscount = (subtotal * maxRedemptionPercent) / 100;
+
+        if (loyaltyDiscount > maxLoyaltyDiscount) {
+          loyaltyDiscount = maxLoyaltyDiscount;
+          loyaltyPointsRedeemed = Math.floor(loyaltyDiscount * redemptionRate);
+        } else {
+          loyaltyPointsRedeemed = pointsToRedeem;
+        }
+
+        console.log(`💎 Loyalty points redeemed: ${loyaltyPointsRedeemed} = ₹${loyaltyDiscount}`);
+      }
+    }
+
+    // Calculate final total
+    const finalTotal = Math.max(0, subtotal - discountAmount - loyaltyDiscount);
+
+    // Calculate loyalty points earned
+    let loyaltyPointsEarned = 0;
+    if (loyaltySettings.enabled) {
+      const pointsPerRupee = loyaltySettings.pointsPerRupee || 1;
+      loyaltyPointsEarned = Math.floor(finalTotal * pointsPerRupee);
+    }
+
     // Generate order number and daily order ID
     const orderNumber = `ORD-${Date.now()}-${Math.random().toString(36).substr(2, 4).toUpperCase()}`;
     const dailyOrderId = await generateDailyOrderId(restaurantId);
+
+    // Determine table number
+    const tableNum = requestedTable || seatNumber || null;
+
+    // Build order type label for display
+    const orderTypeLabels = {
+      'dine_in': 'Dine In',
+      'takeaway': 'Takeaway',
+      'delivery': 'Delivery'
+    };
 
     const orderData = {
       restaurantId,
       orderNumber,
       dailyOrderId,
       customerId,
-      tableNumber: seatNumber || null,
-      orderType: 'customer_self_order',
+      tableNumber: tableNum,
+      orderType: orderType,
+      orderTypeLabel: orderTypeLabels[orderType] || 'Customer Order',
+      orderSource: 'crave_app', // Clear tag for order source
       items: orderItems,
-      totalAmount: calculatedTotal,
+      subtotal: subtotal,
+      discountAmount: discountAmount,
+      loyaltyDiscount: loyaltyDiscount,
+      totalAmount: finalTotal,
+      appliedOffer: appliedOffer,
+      loyaltyPointsRedeemed: loyaltyPointsRedeemed,
+      loyaltyPointsEarned: loyaltyPointsEarned,
       customerInfo: {
         phone: customerPhone,
         name: customerName || 'Customer',
-        seatNumber: seatNumber || 'Walk-in'
+        email: customerEmail || null,
+        seatNumber: seatNumber || null,
+        tableNumber: tableNum
       },
+      deliveryAddress: orderType === 'delivery' ? deliveryAddress : null,
       paymentMethod: 'cash',
       staffInfo: {
         waiterId: null,
         waiterName: 'Customer Self-Order',
-        kitchenNotes: 'Direct customer order - OTP verified'
+        kitchenNotes: `${orderTypeLabels[orderType] || 'Customer order'} via Crave App - OTP verified`
       },
-      notes: notes || `Customer self-order from seat ${seatNumber || 'Walk-in'}`,
+      notes: notes || `${orderTypeLabels[orderType]} order via Crave App`,
       status: 'pending',
       kotSent: false,
       paymentStatus: 'pending',
@@ -4823,16 +4977,55 @@ app.post('/api/public/orders/:restaurantId', vercelSecurityMiddleware.publicAPI,
 
     const orderRef = await db.collection(collections.orders).add(orderData);
 
-    // Update customer stats
-    await db.collection('customers').doc(customerId).update({
+    // Prepare order history entry
+    const orderHistoryEntry = {
+      orderId: orderRef.id,
+      orderNumber: orderNumber,
+      orderDate: new Date(),
+      totalAmount: finalTotal,
+      subtotal: subtotal,
+      discountAmount: discountAmount,
+      loyaltyDiscount: loyaltyDiscount,
+      tableNumber: tableNum,
+      orderType: orderType,
+      orderTypeLabel: orderTypeLabels[orderType] || 'Customer Order',
+      orderSource: 'crave_app',
+      status: 'pending',
+      itemsCount: orderItems.length,
+      appliedOffer: appliedOffer ? appliedOffer.name : null,
+      loyaltyPointsEarned: loyaltyPointsEarned,
+      loyaltyPointsRedeemed: loyaltyPointsRedeemed
+    };
+
+    // Update customer stats, order history, and loyalty points
+    const customerUpdateData = {
       totalOrders: FieldValue.increment(1),
-      totalSpent: FieldValue.increment(calculatedTotal)
+      totalSpent: FieldValue.increment(finalTotal),
+      lastOrderDate: new Date(),
+      updatedAt: new Date()
+    };
+
+    // Update loyalty points
+    if (loyaltySettings.enabled) {
+      const netPointsChange = loyaltyPointsEarned - loyaltyPointsRedeemed;
+      if (netPointsChange !== 0) {
+        customerUpdateData.loyaltyPoints = FieldValue.increment(netPointsChange);
+      }
+    }
+
+    await db.collection('customers').doc(customerId).update(customerUpdateData);
+
+    // Add to order history (using array union)
+    await db.collection('customers').doc(customerId).update({
+      orderHistory: FieldValue.arrayUnion(orderHistoryEntry)
     });
-    
+
     console.log(`🛒 Customer order created successfully: ${orderRef.id}`);
     console.log(`📋 Order items: ${orderData.items.length} items`);
     console.log(`🏪 Restaurant: ${orderData.restaurantId}`);
     console.log(`👤 Customer: ${customerPhone}`);
+    console.log(`🏷️ Order Type: ${orderType}`);
+    console.log(`💰 Total: ₹${finalTotal} (Subtotal: ₹${subtotal}, Discount: ₹${discountAmount}, Loyalty: ₹${loyaltyDiscount})`);
 
     // SMART INVENTORY: Deduct stock asynchronously
     inventoryService.deductInventoryForOrder(restaurantId, orderRef.id, orderItems)
@@ -4843,7 +5036,15 @@ app.post('/api/public/orders/:restaurantId', vercelSecurityMiddleware.publicAPI,
       order: {
         id: orderRef.id,
         orderNumber: orderData.orderNumber,
-        totalAmount: orderData.totalAmount,
+        dailyOrderId: orderData.dailyOrderId,
+        subtotal: subtotal,
+        discountAmount: discountAmount,
+        loyaltyDiscount: loyaltyDiscount,
+        totalAmount: finalTotal,
+        appliedOffer: appliedOffer,
+        loyaltyPointsEarned: loyaltyPointsEarned,
+        loyaltyPointsRedeemed: loyaltyPointsRedeemed,
+        orderType: orderType,
         status: orderData.status
       }
     });
@@ -13712,6 +13913,581 @@ function getNextOpenTime(operatingHours, currentTime) {
   
   return null;
 }
+
+// ==================== OFFERS MANAGEMENT APIs ====================
+
+// Get all offers for a restaurant
+app.get('/api/offers/:restaurantId', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+    const { userId } = req.user;
+
+    // Verify user has access to this restaurant
+    const restaurant = await db.collection(collections.restaurants).doc(restaurantId).get();
+    if (!restaurant.exists || restaurant.data().ownerId !== userId) {
+      return res.status(403).json({ error: 'Access denied' });
+    }
+
+    const offersSnapshot = await db.collection('offers')
+      .where('restaurantId', '==', restaurantId)
+      .orderBy('createdAt', 'desc')
+      .get();
+
+    const offers = [];
+    offersSnapshot.forEach(doc => {
+      offers.push({
+        id: doc.id,
+        ...doc.data()
+      });
+    });
+
+    res.json({ offers });
+  } catch (error) {
+    console.error('Get offers error:', error);
+    res.status(500).json({ error: 'Failed to fetch offers' });
+  }
+});
+
+// Get customer loyalty data by phone (public endpoint for Crave app)
+app.post('/api/public/customer/lookup', vercelSecurityMiddleware.publicAPI, async (req, res) => {
+  try {
+    const { restaurantId, phone } = req.body;
+
+    if (!restaurantId || !phone) {
+      return res.status(400).json({ error: 'Restaurant ID and phone are required' });
+    }
+
+    // Helper function to normalize phone number
+    const normalizePhone = (phoneNum) => {
+      if (!phoneNum) return null;
+      const digits = phoneNum.replace(/\D/g, '');
+      if (digits.length === 12 && digits.startsWith('91')) {
+        return digits.substring(2);
+      } else if (digits.length === 10) {
+        return digits;
+      } else if (digits.length === 11 && digits.startsWith('0')) {
+        return digits.substring(1);
+      }
+      return digits;
+    };
+
+    const normalizedPhone = normalizePhone(phone);
+
+    // Try exact match first
+    let customerQuery = await db.collection('customers')
+      .where('restaurantId', '==', restaurantId)
+      .where('phone', '==', phone)
+      .limit(1)
+      .get();
+
+    let existingCustomer = null;
+    if (!customerQuery.empty) {
+      existingCustomer = customerQuery.docs[0];
+    } else if (normalizedPhone) {
+      // Try normalized phone match
+      const allCustomers = await db.collection('customers')
+        .where('restaurantId', '==', restaurantId)
+        .get();
+
+      existingCustomer = allCustomers.docs.find(doc => {
+        const custPhone = normalizePhone(doc.data().phone);
+        return custPhone === normalizedPhone;
+      });
+    }
+
+    if (existingCustomer) {
+      const customerData = existingCustomer.data();
+      res.json({
+        found: true,
+        customer: {
+          id: existingCustomer.id,
+          name: customerData.name || 'Customer',
+          loyaltyPoints: customerData.loyaltyPoints || 0,
+          totalOrders: customerData.totalOrders || 0,
+          totalSpent: customerData.totalSpent || 0,
+          isFirstOrder: false
+        }
+      });
+    } else {
+      res.json({
+        found: false,
+        customer: {
+          loyaltyPoints: 0,
+          totalOrders: 0,
+          isFirstOrder: true
+        }
+      });
+    }
+  } catch (error) {
+    console.error('Customer lookup error:', error);
+    res.status(500).json({ error: 'Failed to lookup customer' });
+  }
+});
+
+// Get customer app settings (public endpoint for Crave app)
+app.get('/api/public/customer-app-settings/:restaurantId', vercelSecurityMiddleware.publicAPI, async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+
+    const restaurantDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
+    if (!restaurantDoc.exists) {
+      return res.status(404).json({ error: 'Restaurant not found' });
+    }
+
+    const restaurantData = restaurantDoc.data();
+    const customerAppSettings = restaurantData.customerAppSettings || {};
+
+    // Only return settings that are relevant to customers
+    res.json({
+      settings: {
+        enabled: customerAppSettings.enabled ?? false,
+        allowDineIn: customerAppSettings.allowDineIn ?? true,
+        allowTakeaway: customerAppSettings.allowTakeaway ?? true,
+        allowDelivery: customerAppSettings.allowDelivery ?? false,
+        requireTableSelection: customerAppSettings.requireTableSelection ?? true,
+        minimumOrder: customerAppSettings.minimumOrder || 0,
+        loyaltySettings: customerAppSettings.loyaltySettings?.enabled ? {
+          enabled: true,
+          pointsPerRupee: customerAppSettings.loyaltySettings.pointsPerRupee || 1,
+          redemptionRate: customerAppSettings.loyaltySettings.redemptionRate || 100,
+          maxRedemptionPercent: customerAppSettings.loyaltySettings.maxRedemptionPercent || 20
+        } : {
+          enabled: false
+        },
+        branding: {
+          primaryColor: customerAppSettings.branding?.primaryColor || '#dc2626'
+        }
+      }
+    });
+  } catch (error) {
+    console.error('Get public customer app settings error:', error);
+    res.status(500).json({ error: 'Failed to fetch settings' });
+  }
+});
+
+// Get active offers for a restaurant (public endpoint for Crave app)
+app.get('/api/public/offers/:restaurantId', vercelSecurityMiddleware.publicAPI, async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+    const now = new Date();
+
+    const offersSnapshot = await db.collection('offers')
+      .where('restaurantId', '==', restaurantId)
+      .where('isActive', '==', true)
+      .get();
+
+    const offers = [];
+    offersSnapshot.forEach(doc => {
+      const offer = doc.data();
+      // Filter by date range
+      const validFrom = offer.validFrom ? new Date(offer.validFrom) : null;
+      const validUntil = offer.validUntil ? new Date(offer.validUntil) : null;
+
+      const isValidDate = (!validFrom || now >= validFrom) && (!validUntil || now <= validUntil);
+      const isUnderUsageLimit = !offer.usageLimit || (offer.usageCount || 0) < offer.usageLimit;
+
+      if (isValidDate && isUnderUsageLimit) {
+        offers.push({
+          id: doc.id,
+          name: offer.name,
+          description: offer.description,
+          discountType: offer.discountType,
+          discountValue: offer.discountValue,
+          minOrderValue: offer.minOrderValue || 0,
+          maxDiscount: offer.maxDiscount,
+          isFirstOrderOnly: offer.isFirstOrderOnly || false,
+          autoApply: offer.autoApply || false
+        });
+      }
+    });
+
+    res.json({ offers });
+  } catch (error) {
+    console.error('Get public offers error:', error);
+    res.status(500).json({ error: 'Failed to fetch offers' });
+  }
+});
+
+// Create a new offer
+app.post('/api/offers/:restaurantId', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+    const { userId } = req.user;
+    const {
+      name,
+      description,
+      discountType = 'percentage',
+      discountValue,
+      minOrderValue = 0,
+      maxDiscount = null,
+      validFrom,
+      validUntil,
+      isActive = true,
+      usageLimit = null,
+      isFirstOrderOnly = false,
+      autoApply = false
+    } = req.body;
+
+    // Verify user has access to this restaurant
+    const restaurant = await db.collection(collections.restaurants).doc(restaurantId).get();
+    if (!restaurant.exists || restaurant.data().ownerId !== userId) {
+      return res.status(403).json({ error: 'Access denied' });
+    }
+
+    if (!name) {
+      return res.status(400).json({ error: 'Offer name is required' });
+    }
+
+    if (!discountValue || discountValue <= 0) {
+      return res.status(400).json({ error: 'Valid discount value is required' });
+    }
+
+    if (discountType === 'percentage' && discountValue > 100) {
+      return res.status(400).json({ error: 'Percentage discount cannot exceed 100%' });
+    }
+
+    const offerData = {
+      restaurantId,
+      name,
+      description: description || '',
+      discountType,
+      discountValue: Number(discountValue),
+      minOrderValue: Number(minOrderValue) || 0,
+      maxDiscount: maxDiscount ? Number(maxDiscount) : null,
+      validFrom: validFrom || null,
+      validUntil: validUntil || null,
+      isActive,
+      usageLimit: usageLimit ? Number(usageLimit) : null,
+      usageCount: 0,
+      isFirstOrderOnly,
+      autoApply,
+      createdAt: new Date(),
+      updatedAt: new Date()
+    };
+
+    const offerRef = await db.collection('offers').add(offerData);
+
+    res.status(201).json({
+      message: 'Offer created successfully',
+      offer: {
+        id: offerRef.id,
+        ...offerData
+      }
+    });
+  } catch (error) {
+    console.error('Create offer error:', error);
+    res.status(500).json({ error: 'Failed to create offer' });
+  }
+});
+
+// Update an offer
+app.put('/api/offers/:restaurantId/:offerId', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId, offerId } = req.params;
+    const { userId } = req.user;
+    const updateData = req.body;
+
+    // Verify user has access to this restaurant
+    const restaurant = await db.collection(collections.restaurants).doc(restaurantId).get();
+    if (!restaurant.exists || restaurant.data().ownerId !== userId) {
+      return res.status(403).json({ error: 'Access denied' });
+    }
+
+    // Get offer and verify it belongs to this restaurant
+    const offerDoc = await db.collection('offers').doc(offerId).get();
+    if (!offerDoc.exists) {
+      return res.status(404).json({ error: 'Offer not found' });
+    }
+
+    if (offerDoc.data().restaurantId !== restaurantId) {
+      return res.status(403).json({ error: 'Offer does not belong to this restaurant' });
+    }
+
+    // Validate discount value
+    if (updateData.discountValue !== undefined) {
+      if (updateData.discountValue <= 0) {
+        return res.status(400).json({ error: 'Valid discount value is required' });
+      }
+      if (updateData.discountType === 'percentage' && updateData.discountValue > 100) {
+        return res.status(400).json({ error: 'Percentage discount cannot exceed 100%' });
+      }
+    }
+
+    const updatedData = {
+      ...updateData,
+      discountValue: updateData.discountValue ? Number(updateData.discountValue) : offerDoc.data().discountValue,
+      minOrderValue: updateData.minOrderValue !== undefined ? Number(updateData.minOrderValue) : offerDoc.data().minOrderValue,
+      maxDiscount: updateData.maxDiscount !== undefined ? (updateData.maxDiscount ? Number(updateData.maxDiscount) : null) : offerDoc.data().maxDiscount,
+      usageLimit: updateData.usageLimit !== undefined ? (updateData.usageLimit ? Number(updateData.usageLimit) : null) : offerDoc.data().usageLimit,
+      updatedAt: new Date()
+    };
+
+    // Remove fields that shouldn't be updated
+    delete updatedData.restaurantId;
+    delete updatedData.createdAt;
+    delete updatedData.id;
+
+    await offerDoc.ref.update(updatedData);
+
+    res.json({
+      message: 'Offer updated successfully',
+      offer: {
+        id: offerId,
+        ...offerDoc.data(),
+        ...updatedData
+      }
+    });
+  } catch (error) {
+    console.error('Update offer error:', error);
+    res.status(500).json({ error: 'Failed to update offer' });
+  }
+});
+
+// Delete an offer
+app.delete('/api/offers/:restaurantId/:offerId', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId, offerId } = req.params;
+    const { userId } = req.user;
+
+    // Verify user has access to this restaurant
+    const restaurant = await db.collection(collections.restaurants).doc(restaurantId).get();
+    if (!restaurant.exists || restaurant.data().ownerId !== userId) {
+      return res.status(403).json({ error: 'Access denied' });
+    }
+
+    // Get offer and verify it belongs to this restaurant
+    const offerDoc = await db.collection('offers').doc(offerId).get();
+    if (!offerDoc.exists) {
+      return res.status(404).json({ error: 'Offer not found' });
+    }
+
+    if (offerDoc.data().restaurantId !== restaurantId) {
+      return res.status(403).json({ error: 'Offer does not belong to this restaurant' });
+    }
+
+    await offerDoc.ref.delete();
+
+    res.json({
+      message: 'Offer deleted successfully'
+    });
+  } catch (error) {
+    console.error('Delete offer error:', error);
+    res.status(500).json({ error: 'Failed to delete offer' });
+  }
+});
+
+// ==================== CUSTOMER APP SETTINGS APIs ====================
+
+// Get customer app settings for a restaurant
+app.get('/api/restaurants/:restaurantId/customer-app-settings', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+    const { userId } = req.user;
+
+    // Verify user has access to this restaurant
+    const restaurantDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
+    if (!restaurantDoc.exists) {
+      return res.status(404).json({ error: 'Restaurant not found' });
+    }
+
+    if (restaurantDoc.data().ownerId !== userId) {
+      return res.status(403).json({ error: 'Access denied' });
+    }
+
+    const restaurantData = restaurantDoc.data();
+
+    // Return existing settings or defaults
+    const customerAppSettings = restaurantData.customerAppSettings || {
+      enabled: false,
+      restaurantCode: '',
+      allowDineIn: true,
+      allowTakeaway: true,
+      allowDelivery: false,
+      requireTableSelection: true,
+      minimumOrder: 0,
+      loyaltySettings: {
+        enabled: false,
+        pointsPerRupee: 1,
+        redemptionRate: 100, // 100 points = Rs 1
+        maxRedemptionPercent: 20
+      },
+      branding: {
+        primaryColor: '#dc2626',
+        logoUrl: restaurantData.logoUrl || ''
+      }
+    };
+
+    res.json({ settings: customerAppSettings });
+  } catch (error) {
+    console.error('Get customer app settings error:', error);
+    res.status(500).json({ error: 'Failed to fetch customer app settings' });
+  }
+});
+
+// Update customer app settings for a restaurant
+app.put('/api/restaurants/:restaurantId/customer-app-settings', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+    const { userId } = req.user;
+    const settings = req.body;
+
+    // Verify user has access to this restaurant
+    const restaurantDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
+    if (!restaurantDoc.exists) {
+      return res.status(404).json({ error: 'Restaurant not found' });
+    }
+
+    if (restaurantDoc.data().ownerId !== userId) {
+      return res.status(403).json({ error: 'Access denied' });
+    }
+
+    // If restaurant code is being set, validate it's unique
+    if (settings.restaurantCode) {
+      const codeRegex = /^[A-Za-z0-9]{3,10}$/;
+      if (!codeRegex.test(settings.restaurantCode)) {
+        return res.status(400).json({ error: 'Restaurant code must be 3-10 alphanumeric characters' });
+      }
+
+      // Check if code is already used by another restaurant
+      const existingRestaurant = await db.collection(collections.restaurants)
+        .where('customerAppSettings.restaurantCode', '==', settings.restaurantCode.toUpperCase())
+        .limit(1)
+        .get();
+
+      if (!existingRestaurant.empty && existingRestaurant.docs[0].id !== restaurantId) {
+        return res.status(400).json({ error: 'This restaurant code is already in use' });
+      }
+
+      settings.restaurantCode = settings.restaurantCode.toUpperCase();
+    }
+
+    // Build the update object
+    const customerAppSettings = {
+      enabled: settings.enabled ?? false,
+      restaurantCode: settings.restaurantCode || '',
+      allowDineIn: settings.allowDineIn ?? true,
+      allowTakeaway: settings.allowTakeaway ?? true,
+      allowDelivery: settings.allowDelivery ?? false,
+      requireTableSelection: settings.requireTableSelection ?? true,
+      minimumOrder: Number(settings.minimumOrder) || 0,
+      loyaltySettings: {
+        enabled: settings.loyaltySettings?.enabled ?? false,
+        pointsPerRupee: Number(settings.loyaltySettings?.pointsPerRupee) || 1,
+        redemptionRate: Number(settings.loyaltySettings?.redemptionRate) || 100,
+        maxRedemptionPercent: Number(settings.loyaltySettings?.maxRedemptionPercent) || 20
+      },
+      branding: {
+        primaryColor: settings.branding?.primaryColor || '#dc2626',
+        logoUrl: settings.branding?.logoUrl || ''
+      },
+      updatedAt: new Date()
+    };
+
+    await restaurantDoc.ref.update({
+      customerAppSettings: customerAppSettings
+    });
+
+    res.json({
+      message: 'Customer app settings updated successfully',
+      settings: customerAppSettings
+    });
+  } catch (error) {
+    console.error('Update customer app settings error:', error);
+    res.status(500).json({ error: 'Failed to update customer app settings' });
+  }
+});
+
+// Get restaurant by code (public endpoint for Crave app QR scanning)
+app.get('/api/public/restaurant/code/:code', vercelSecurityMiddleware.publicAPI, async (req, res) => {
+  try {
+    const { code } = req.params;
+
+    if (!code) {
+      return res.status(400).json({ error: 'Restaurant code is required' });
+    }
+
+    const restaurantsSnapshot = await db.collection(collections.restaurants)
+      .where('customerAppSettings.restaurantCode', '==', code.toUpperCase())
+      .where('customerAppSettings.enabled', '==', true)
+      .limit(1)
+      .get();
+
+    if (restaurantsSnapshot.empty) {
+      return res.status(404).json({ error: 'Restaurant not found or app not enabled' });
+    }
+
+    const restaurantDoc = restaurantsSnapshot.docs[0];
+    const restaurantData = restaurantDoc.data();
+
+    res.json({
+      restaurant: {
+        id: restaurantDoc.id,
+        name: restaurantData.name,
+        logoUrl: restaurantData.logoUrl || restaurantData.customerAppSettings?.branding?.logoUrl || '',
+        primaryColor: restaurantData.customerAppSettings?.branding?.primaryColor || '#dc2626',
+        allowDineIn: restaurantData.customerAppSettings?.allowDineIn ?? true,
+        allowTakeaway: restaurantData.customerAppSettings?.allowTakeaway ?? true,
+        allowDelivery: restaurantData.customerAppSettings?.allowDelivery ?? false,
+        requireTableSelection: restaurantData.customerAppSettings?.requireTableSelection ?? true,
+        minimumOrder: restaurantData.customerAppSettings?.minimumOrder || 0,
+        loyaltyEnabled: restaurantData.customerAppSettings?.loyaltySettings?.enabled ?? false
+      }
+    });
+  } catch (error) {
+    console.error('Get restaurant by code error:', error);
+    res.status(500).json({ error: 'Failed to fetch restaurant' });
+  }
+});
+
+// Generate or get QR code for customer app
+app.get('/api/restaurants/:restaurantId/qr-code', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+    const { userId } = req.user;
+
+    // Verify user has access to this restaurant
+    const restaurantDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
+    if (!restaurantDoc.exists) {
+      return res.status(404).json({ error: 'Restaurant not found' });
+    }
+
+    if (restaurantDoc.data().ownerId !== userId) {
+      return res.status(403).json({ error: 'Access denied' });
+    }
+
+    const restaurantData = restaurantDoc.data();
+    const customerAppSettings = restaurantData.customerAppSettings || {};
+    const restaurantCode = customerAppSettings.restaurantCode;
+
+    if (!restaurantCode) {
+      return res.status(400).json({ error: 'Restaurant code not set. Please set a restaurant code first.' });
+    }
+
+    // Generate QR code URL that links to the Crave app
+    // Format: crave://restaurant/{code} or https://crave.dineopen.com/{code}
+    const qrContent = `https://crave.dineopen.com/${restaurantCode}`;
+
+    // Generate QR code as data URL
+    const qrCodeDataUrl = await QRCode.toDataURL(qrContent, {
+      width: 400,
+      margin: 2,
+      color: {
+        dark: '#000000',
+        light: '#ffffff'
+      },
+      errorCorrectionLevel: 'M'
+    });
+
+    res.json({
+      qrCode: qrCodeDataUrl,
+      restaurantCode: restaurantCode,
+      qrContent: qrContent
+    });
+  } catch (error) {
+    console.error('Generate QR code error:', error);
+    res.status(500).json({ error: 'Failed to generate QR code' });
+  }
+});
 
 // Mount payment routes
 const paymentRouter = initializePaymentRoutes(db, razorpay);
