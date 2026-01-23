@@ -265,10 +265,7 @@ const allowedOrigins = [
   'http://localhost:3003',
   'https://dine-frontend-ecru.vercel.app',
   'https://dine-frontend-git-staging-kapils-projects-bfc8fbae.vercel.app', // STAGING FRONTEND
-  'https://pms-hotel.vercel.app',
-  // Staging environments
-  'https://dine-frontend-git-staging-kapils-projects-bfc8fbae.vercel.app',
-  'https://dine-backend-git-staging-kapils-projects-bfc8fbae.vercel.app'
+  'https://pms-hotel.vercel.app'
 ];
 
 // Helper function to check if origin is a valid dineopen.com domain or subdomain
@@ -387,6 +384,12 @@ app.use((req, res, next) => {
 
   // Handle OPTIONS preflight requests
   if (req.method === 'OPTIONS') {
+    console.log('🔍 OPTIONS preflight request - Origin:', origin);
+    console.log('🔍 Allowed origins:', allowedOrigins);
+    console.log('🔍 Is valid dineopen origin:', isValidDineopenOrigin(origin));
+    console.log('🔍 Is in allowed origins:', allowedOrigins.includes(origin));
+    console.log('🔍 Is valid localhost origin:', isValidLocalhostOrigin(origin));
+    
     if (origin) {
       // ✅ Allow ALL dineopen.com domains and subdomains (*.dineopen.com)
       // ✅ Allow whitelisted origins
@@ -402,7 +405,14 @@ app.use((req, res, next) => {
         return res.status(204).end();
       } else {
         console.log(`❌ CORS preflight blocked for origin: ${origin}`);
+        // Still return 204 to prevent browser errors, but without Access-Control-Allow-Origin
+        // The actual request will be blocked by the main CORS middleware
+        return res.status(204).end();
       }
+    } else {
+      // No origin header (e.g., same-origin request or mobile app)
+      console.log('⚠️ OPTIONS request with no origin header');
+      return res.status(204).end();
     }
   }
 
