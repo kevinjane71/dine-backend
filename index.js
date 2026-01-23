@@ -166,6 +166,9 @@ const shiftSchedulingRoutes = require('./routes/shiftScheduling');
 // Google Reviews routes
 const googleReviewsRoutes = require('./routes/googleReviews');
 
+// Customer App routes (Crave - B2C ordering)
+const customerRoutes = require('./routes/customer');
+
 // Debug email service initialization
 console.log('📧 Email service loaded:', !!emailService);
 if (emailService) {
@@ -262,7 +265,10 @@ const allowedOrigins = [
   'http://localhost:3003',
   'https://dine-frontend-ecru.vercel.app',
   'https://dine-frontend-git-staging-kapils-projects-bfc8fbae.vercel.app', // STAGING FRONTEND
-  'https://pms-hotel.vercel.app'
+  'https://pms-hotel.vercel.app',
+  // Staging environments
+  'https://dine-frontend-git-staging-kapils-projects-bfc8fbae.vercel.app',
+  'https://dine-backend-git-staging-kapils-projects-bfc8fbae.vercel.app'
 ];
 
 // Helper function to check if origin is a valid dineopen.com domain or subdomain
@@ -6205,6 +6211,9 @@ app.use('/api/shift-scheduling', shiftSchedulingRoutes);
 
 // Initialize Google Reviews routes
 app.use('/api/google-reviews', googleReviewsRoutes);
+
+// Initialize Customer App routes (Crave - B2C ordering)
+app.use('/api', customerRoutes);
 
 
 // Generic image upload API
@@ -15215,6 +15224,343 @@ app.post('/api/automation/:restaurantId/sync-customer', authenticateToken, async
 });
 
 // ==================== END AUTOMATION & LOYALTY APIs ====================
+
+// ==================== OFFERS & CUSTOMER APP APIs ====================
+
+// Get all offers for a restaurant
+app.get('/api/offers/:restaurantId', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+    const { userId } = req.user;
+
+    // Verify access
+    const hasAccess = await validateRestaurantAccess(userId, restaurantId);
+    if (!hasAccess) {
+      return res.status(403).json({ error: 'Access denied' });
+    }
+
+    const snapshot = await db.collection('offers')
+      .where('restaurantId', '==', restaurantId)
+      .orderBy('createdAt', 'desc')
+      .get();
+
+    const offers = snapshot.docs.map(doc => ({
+      id: doc.id,
+      ...doc.data(),
+      validFrom: doc.data().validFrom?.toDate?.() || doc.data().validFrom,
+      validUntil: doc.data().validUntil?.toDate?.() || doc.data().validUntil,
+      createdAt: doc.data().createdAt?.toDate?.() || doc.data().createdAt
+    }));
+
+    res.json({ success: true, offers });
+  } catch (error) {
+    console.error('Get offers error:', error);
+    res.status(500).json({ error: 'Failed to get offers' });
+  }
+});
+
+// Create offer
+app.post('/api/offers/:restaurantId', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+    const { userId } = req.user;
+
+    // Verify access
+    const hasAccess = await validateRestaurantAccess(userId, restaurantId);
+    if (!hasAccess) {
+      return res.status(403).json({ error: 'Access denied' });
+    }
+
+    const {
+      name,
+      description,
+      type, // 'percentage', 'flat', 'freeItem', 'pointsMultiplier'
+      value,
+      minOrderValue,
+      maxDiscount,
+      applicableOn, // 'all', 'firstOrder', 'specificItems', 'category'
+      applicableItems,
+      applicableCategories,
+      code,
+      autoApply,
+      usageLimit,
+      totalUsageLimit,
+      validFrom,
+      validUntil
+    } = req.body;
+
+    if (!name || !type || value === undefined) {
+      return res.status(400).json({ error: 'Name, type, and value are required' });
+    }
+
+    const offer = {
+      restaurantId,
+      name,
+      description: description || '',
+      type,
+      value,
+      minOrderValue: minOrderValue || 0,
+      maxDiscount: maxDiscount || null,
+      applicableOn: applicableOn || 'all',
+      applicableItems: applicableItems || [],
+      applicableCategories: applicableCategories || [],
+      code: code || null,
+      autoApply: autoApply !== false,
+      usageLimit: usageLimit || null, // Per customer
+      totalUsageLimit: totalUsageLimit || null,
+      currentUsage: 0,
+      validFrom: validFrom ? new Date(validFrom) : new Date(),
+      validUntil: validUntil ? new Date(validUntil) : new Date(Date.now() + 30 * 24 * 60 * 60 * 1000), // Default 30 days
+      isActive: true,
+      createdAt: new Date(),
+      updatedAt: new Date()
+    };
+
+    const docRef = await db.collection('offers').add(offer);
+
+    res.json({
+      success: true,
+      offer: {
+        id: docRef.id,
+        ...offer,
+        validFrom: offer.validFrom.toISOString(),
+        validUntil: offer.validUntil.toISOString(),
+        createdAt: offer.createdAt.toISOString()
+      }
+    });
+  } catch (error) {
+    console.error('Create offer error:', error);
+    res.status(500).json({ error: 'Failed to create offer' });
+  }
+});
+
+// Update offer
+app.put('/api/offers/:restaurantId/:offerId', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId, offerId } = req.params;
+    const { userId } = req.user;
+
+    // Verify access
+    const hasAccess = await validateRestaurantAccess(userId, restaurantId);
+    if (!hasAccess) {
+      return res.status(403).json({ error: 'Access denied' });
+    }
+
+    const updateData = { ...req.body, updatedAt: new Date() };
+
+    // Convert date strings to Date objects
+    if (updateData.validFrom) {
+      updateData.validFrom = new Date(updateData.validFrom);
+    }
+    if (updateData.validUntil) {
+      updateData.validUntil = new Date(updateData.validUntil);
+    }
+
+    // Remove fields that shouldn't be updated directly
+    delete updateData.restaurantId;
+    delete updateData.currentUsage;
+    delete updateData.createdAt;
+
+    await db.collection('offers').doc(offerId).update(updateData);
+
+    res.json({ success: true, message: 'Offer updated' });
+  } catch (error) {
+    console.error('Update offer error:', error);
+    res.status(500).json({ error: 'Failed to update offer' });
+  }
+});
+
+// Delete offer
+app.delete('/api/offers/:restaurantId/:offerId', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId, offerId } = req.params;
+    const { userId } = req.user;
+
+    // Verify access
+    const hasAccess = await validateRestaurantAccess(userId, restaurantId);
+    if (!hasAccess) {
+      return res.status(403).json({ error: 'Access denied' });
+    }
+
+    await db.collection('offers').doc(offerId).delete();
+
+    res.json({ success: true, message: 'Offer deleted' });
+  } catch (error) {
+    console.error('Delete offer error:', error);
+    res.status(500).json({ error: 'Failed to delete offer' });
+  }
+});
+
+// Toggle offer active status
+app.patch('/api/offers/:restaurantId/:offerId/toggle', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId, offerId } = req.params;
+    const { userId } = req.user;
+
+    // Verify access
+    const hasAccess = await validateRestaurantAccess(userId, restaurantId);
+    if (!hasAccess) {
+      return res.status(403).json({ error: 'Access denied' });
+    }
+
+    const offerDoc = await db.collection('offers').doc(offerId).get();
+    if (!offerDoc.exists) {
+      return res.status(404).json({ error: 'Offer not found' });
+    }
+
+    const currentStatus = offerDoc.data().isActive;
+    await db.collection('offers').doc(offerId).update({
+      isActive: !currentStatus,
+      updatedAt: new Date()
+    });
+
+    res.json({ success: true, isActive: !currentStatus });
+  } catch (error) {
+    console.error('Toggle offer error:', error);
+    res.status(500).json({ error: 'Failed to toggle offer' });
+  }
+});
+
+// Get customer app settings
+app.get('/api/restaurants/:restaurantId/customer-app-settings', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+    const { userId } = req.user;
+
+    // Verify access
+    const hasAccess = await validateRestaurantAccess(userId, restaurantId);
+    if (!hasAccess) {
+      return res.status(403).json({ error: 'Access denied' });
+    }
+
+    const restaurantDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
+    if (!restaurantDoc.exists) {
+      return res.status(404).json({ error: 'Restaurant not found' });
+    }
+
+    const settings = restaurantDoc.data().customerAppSettings || {
+      enabled: false,
+      requireTableSelection: false,
+      allowDineIn: true,
+      allowTakeaway: true,
+      allowDelivery: false,
+      deliveryRadius: 5,
+      minimumOrder: 0,
+      branding: {
+        primaryColor: '#ef4444',
+        logo: '',
+        bannerImage: '',
+        welcomeMessage: ''
+      },
+      loyaltySettings: {
+        enabled: false,
+        pointsPerRupee: 1,
+        redemptionRate: 100,
+        maxRedemptionPercent: 20
+      }
+    };
+
+    // Generate restaurant code if not exists
+    let restaurantCode = restaurantDoc.data().restaurantCode;
+    if (!restaurantCode) {
+      restaurantCode = restaurantDoc.id.substring(0, 8).toUpperCase();
+      await db.collection(collections.restaurants).doc(restaurantId).update({
+        restaurantCode
+      });
+    }
+
+    res.json({
+      success: true,
+      settings,
+      restaurantCode
+    });
+  } catch (error) {
+    console.error('Get customer app settings error:', error);
+    res.status(500).json({ error: 'Failed to get settings' });
+  }
+});
+
+// Update customer app settings
+app.put('/api/restaurants/:restaurantId/customer-app-settings', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+    const { userId } = req.user;
+
+    // Verify access
+    const hasAccess = await validateRestaurantAccess(userId, restaurantId);
+    if (!hasAccess) {
+      return res.status(403).json({ error: 'Access denied' });
+    }
+
+    const settings = req.body;
+
+    await db.collection(collections.restaurants).doc(restaurantId).update({
+      customerAppSettings: settings,
+      updatedAt: new Date()
+    });
+
+    res.json({ success: true, message: 'Settings updated' });
+  } catch (error) {
+    console.error('Update customer app settings error:', error);
+    res.status(500).json({ error: 'Failed to update settings' });
+  }
+});
+
+// Generate QR code for restaurant
+app.get('/api/restaurants/:restaurantId/qr-code', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+    const { userId } = req.user;
+    const { tableNumber } = req.query;
+
+    // Verify access
+    const hasAccess = await validateRestaurantAccess(userId, restaurantId);
+    if (!hasAccess) {
+      return res.status(403).json({ error: 'Access denied' });
+    }
+
+    const restaurantDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
+    if (!restaurantDoc.exists) {
+      return res.status(404).json({ error: 'Restaurant not found' });
+    }
+
+    let restaurantCode = restaurantDoc.data().restaurantCode;
+    if (!restaurantCode) {
+      restaurantCode = restaurantId.substring(0, 8).toUpperCase();
+      await db.collection(collections.restaurants).doc(restaurantId).update({
+        restaurantCode
+      });
+    }
+
+    // Generate QR code data
+    const qrData = tableNumber
+      ? `crave://restaurant/${restaurantCode}?table=${tableNumber}`
+      : `crave://restaurant/${restaurantCode}`;
+
+    // Generate QR code as base64
+    const QRCode = require('qrcode');
+    const qrCodeBase64 = await QRCode.toDataURL(qrData, {
+      width: 300,
+      margin: 2,
+      color: {
+        dark: '#000000',
+        light: '#ffffff'
+      }
+    });
+
+    res.json({
+      success: true,
+      qrCode: qrCodeBase64,
+      qrData,
+      restaurantCode
+    });
+  } catch (error) {
+    console.error('Generate QR code error:', error);
+    res.status(500).json({ error: 'Failed to generate QR code' });
+  }
+});
+
+// ==================== END OFFERS & CUSTOMER APP APIs ====================
 
 // 404 handler - must be last (after all routes)
 app.use((req, res) => {
