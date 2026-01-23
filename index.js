@@ -1569,6 +1569,24 @@ app.post('/api/demo-request', async (req, res) => {
       });
     }
 
+    // Extract restaurant name from comment (format: "Restaurant: {name}\n{additional comments}")
+    let restaurantName = '';
+    let additionalComment = comment || '';
+    if (comment) {
+      const restaurantMatch = comment.match(/^Restaurant:\s*(.+?)(?:\n|$)/i);
+      if (restaurantMatch) {
+        restaurantName = restaurantMatch[1].trim();
+        // Remove the restaurant line from additional comment
+        additionalComment = comment.replace(/^Restaurant:\s*.+?(\n|$)/i, '').trim();
+      } else {
+        // If no "Restaurant:" prefix, use the whole comment as restaurant name if it's short
+        if (comment.length < 100) {
+          restaurantName = comment.trim();
+          additionalComment = '';
+        }
+      }
+    }
+
     // Create demo request document
     const demoRequestRef = db.collection('demoRequests').doc();
     const demoRequestData = {
@@ -1576,7 +1594,8 @@ app.post('/api/demo-request', async (req, res) => {
       contactType,
       phone: phone || null,
       email: email || null,
-      comment: comment || '',
+      restaurantName: restaurantName || null,
+      comment: additionalComment,
       status: 'pending',
       createdAt: new Date(),
       updatedAt: new Date(),
@@ -1587,6 +1606,20 @@ app.post('/api/demo-request', async (req, res) => {
     await demoRequestRef.set(demoRequestData);
 
     console.log('✅ Demo request saved:', demoRequestData.id);
+
+    // Send email notification to admin
+    try {
+      const emailResult = await emailService.sendDemoRequestNotification(demoRequestData);
+      if (emailResult.success) {
+        console.log('✅ Demo request notification email sent:', emailResult.emailId);
+      } else {
+        console.warn('⚠️ Failed to send demo request notification email:', emailResult.error);
+        // Don't fail the request if email fails
+      }
+    } catch (emailError) {
+      console.error('❌ Error sending demo request notification email:', emailError);
+      // Don't fail the request if email fails
+    }
 
     res.status(201).json({
       success: true,
