@@ -180,6 +180,47 @@ if (emailService) {
 
 const app = express();
 
+// CRITICAL: Handle OPTIONS requests IMMEDIATELY after app creation
+// This MUST be the absolute first middleware to catch all OPTIONS requests
+app.use((req, res, next) => {
+  if (req.method === 'OPTIONS') {
+    const origin = req.headers.origin;
+    console.log('🚨 OPTIONS preflight (ABSOLUTE FIRST) - Origin:', origin);
+    
+    // Set all required CORS headers
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS, PATCH');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With, Accept, Origin');
+    res.setHeader('Access-Control-Max-Age', '86400');
+    res.setHeader('Vary', 'Origin');
+    res.setHeader('Cache-Control', 'no-store, max-age=0');
+    
+    // Check allowed origins (defined later, but we'll check inline for now)
+    const stagingFrontend = 'https://dine-frontend-git-staging-kapils-projects-bfc8fbae.vercel.app';
+    const allowed = [
+      'http://localhost:3001',
+      'http://localhost:3002',
+      'http://localhost:3003',
+      'https://dine-frontend-ecru.vercel.app',
+      stagingFrontend,
+      'https://pms-hotel.vercel.app'
+    ];
+    
+    if (origin && (allowed.includes(origin) || /^https:\/\/([a-zA-Z0-9-]+\.)?dineopen\.com$/.test(origin))) {
+      res.setHeader('Access-Control-Allow-Origin', origin);
+      res.setHeader('Access-Control-Allow-Credentials', 'true');
+      console.log(`✅ CORS preflight ALLOWED (FIRST) for: ${origin}`);
+      return res.status(204).end();
+    } else if (origin) {
+      console.log(`❌ CORS preflight BLOCKED (FIRST) for: ${origin}`);
+      return res.status(204).end();
+    } else {
+      console.log('⚠️ OPTIONS with no origin (FIRST)');
+      return res.status(204).end();
+    }
+  }
+  next();
+});
+
 const PORT = process.env.PORT || 3003;
 
 const googleClient = new OAuth2Client(process.env.GOOGLE_CLIENT_ID);
