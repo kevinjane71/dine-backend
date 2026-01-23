@@ -14412,6 +14412,7 @@ app.put('/api/restaurants/:restaurantId/customer-app-settings', authenticateToke
 });
 
 // Get restaurant by code (public endpoint for Crave app QR scanning)
+// Returns restaurant data + menu in single response for better performance
 app.get('/api/public/restaurant/code/:code', vercelSecurityMiddleware.publicAPI, async (req, res) => {
   try {
     const { code } = req.params;
@@ -14420,6 +14421,7 @@ app.get('/api/public/restaurant/code/:code', vercelSecurityMiddleware.publicAPI,
       return res.status(400).json({ error: 'Restaurant code is required' });
     }
 
+    // Find restaurant by code
     const restaurantsSnapshot = await db.collection(collections.restaurants)
       .where('customerAppSettings.restaurantCode', '==', code.toUpperCase())
       .where('customerAppSettings.enabled', '==', true)
@@ -14432,10 +14434,81 @@ app.get('/api/public/restaurant/code/:code', vercelSecurityMiddleware.publicAPI,
 
     const restaurantDoc = restaurantsSnapshot.docs[0];
     const restaurantData = restaurantDoc.data();
+    const restaurantId = restaurantDoc.id;
+
+    // Get menu data from restaurant document
+    const embeddedMenu = restaurantData.menu || { categories: [], items: [] };
+    
+    // Get categories
+    const categories = (embeddedMenu.categories || [])
+      .filter(cat => cat.status === 'active')
+      .map(cat => ({
+        id: cat.id,
+        name: cat.name,
+        description: cat.description || '',
+        image: cat.image || null,
+        displayOrder: cat.displayOrder || 0
+      }))
+      .sort((a, b) => (a.displayOrder || 0) - (b.displayOrder || 0));
+    
+    // Filter active and available menu items
+    const menuItems = (embeddedMenu.items || [])
+      .filter(item => item.status === 'active' && item.isAvailable !== false)
+      .map(item => ({
+        id: item.id,
+        name: item.name,
+        description: item.description || '',
+        price: item.price,
+        category: item.category,
+        isVeg: item.isVeg !== false,
+        spiceLevel: item.spiceLevel || 'medium',
+        shortCode: item.shortCode || item.name.substring(0, 3).toUpperCase(),
+        image: item.image || null,
+        images: item.images || [],
+        allergens: item.allergens || []
+      }));
+
+    // Get active offers (async - can be loaded separately by app if needed)
+    let offers = [];
+    try {
+      const offersSnapshot = await db.collection('offers')
+        .where('restaurantId', '==', restaurantId)
+        .where('isActive', '==', true)
+        .get();
+
+      const now = new Date();
+      offers = offersSnapshot.docs
+        .map(doc => {
+          const offer = doc.data();
+          const validFrom = offer.validFrom ? new Date(offer.validFrom) : null;
+          const validUntil = offer.validUntil ? new Date(offer.validUntil) : null;
+          const isValidDate = (!validFrom || now >= validFrom) && (!validUntil || now <= validUntil);
+          const isUnderUsageLimit = !offer.usageLimit || (offer.usageCount || 0) < offer.usageLimit;
+
+          if (isValidDate && isUnderUsageLimit) {
+            return {
+              id: doc.id,
+              name: offer.name,
+              description: offer.description,
+              discountType: offer.discountType,
+              discountValue: offer.discountValue,
+              minOrderValue: offer.minOrderValue || 0,
+              maxDiscount: offer.maxDiscount,
+              isFirstOrderOnly: offer.isFirstOrderOnly || false,
+              autoApply: offer.autoApply || false
+            };
+          }
+          return null;
+        })
+        .filter(offer => offer !== null);
+    } catch (offersError) {
+      console.warn('Error loading offers:', offersError);
+      // Continue without offers - app can fetch separately if needed
+    }
 
     res.json({
       restaurant: {
-        id: restaurantDoc.id,
+        id: restaurantId,
         name: restaurantData.name,
         logoUrl: restaurantData.logoUrl || restaurantData.customerAppSettings?.branding?.logoUrl || '',
         primaryColor: restaurantData.customerAppSettings?.branding?.primaryColor || '#dc2626',
@@ -14445,7 +14518,12 @@ app.get('/api/public/restaurant/code/:code', vercelSecurityMiddleware.publicAPI,
         requireTableSelection: restaurantData.customerAppSettings?.requireTableSelection ?? true,
         minimumOrder: restaurantData.customerAppSettings?.minimumOrder || 0,
         loyaltyEnabled: restaurantData.customerAppSettings?.loyaltySettings?.enabled ?? false
-      }
+      },
+      menu: {
+        categories: categories,
+        items: menuItems
+      },
+      offers: offers
     });
   } catch (error) {
     console.error('Get restaurant by code error:', error);
