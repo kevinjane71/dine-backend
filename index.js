@@ -14439,8 +14439,42 @@ app.get('/api/public/restaurant/code/:code', vercelSecurityMiddleware.publicAPI,
   }
 });
 
-// Generate or get QR code for customer app
-app.get('/api/restaurants/:restaurantId/qr-code', authenticateToken, async (req, res) => {
+// Helper function to generate unique restaurant code
+async function generateUniqueRestaurantCode() {
+  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // Excluding confusing chars like 0,O,1,I
+  let attempts = 0;
+  const maxAttempts = 10;
+
+  while (attempts < maxAttempts) {
+    // Generate 6-character alphanumeric code
+    let code = '';
+    for (let i = 0; i < 6; i++) {
+      code += chars.charAt(Math.floor(Math.random() * chars.length));
+    }
+
+    // Check if code already exists
+    const existingRestaurant = await db.collection(collections.restaurants)
+      .where('customerAppSettings.restaurantCode', '==', code)
+      .limit(1)
+      .get();
+
+    if (existingRestaurant.empty) {
+      return code;
+    }
+    attempts++;
+  }
+
+  // Fallback: add timestamp suffix
+  const timestamp = Date.now().toString(36).toUpperCase().slice(-3);
+  let code = '';
+  for (let i = 0; i < 3; i++) {
+    code += chars.charAt(Math.floor(Math.random() * chars.length));
+  }
+  return code + timestamp;
+}
+
+// Generate restaurant code
+app.post('/api/restaurants/:restaurantId/generate-code', authenticateToken, async (req, res) => {
   try {
     const { restaurantId } = req.params;
     const { userId } = req.user;
@@ -14455,16 +14489,72 @@ app.get('/api/restaurants/:restaurantId/qr-code', authenticateToken, async (req,
       return res.status(403).json({ error: 'Access denied' });
     }
 
+    // Generate unique code
+    const newCode = await generateUniqueRestaurantCode();
+
+    // Update restaurant with new code
     const restaurantData = restaurantDoc.data();
     const customerAppSettings = restaurantData.customerAppSettings || {};
-    const restaurantCode = customerAppSettings.restaurantCode;
+
+    await restaurantDoc.ref.update({
+      'customerAppSettings.restaurantCode': newCode,
+      'customerAppSettings.enabled': customerAppSettings.enabled ?? true,
+      updatedAt: new Date()
+    });
+
+    res.json({
+      success: true,
+      restaurantCode: newCode,
+      message: 'Restaurant code generated successfully'
+    });
+  } catch (error) {
+    console.error('Generate restaurant code error:', error);
+    res.status(500).json({ error: 'Failed to generate restaurant code' });
+  }
+});
+
+// Generate or get QR code for customer app
+app.get('/api/restaurants/:restaurantId/qr-code', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+    const { userId } = req.user;
+    const { autoGenerate } = req.query; // Allow auto-generation via query param
+
+    // Verify user has access to this restaurant
+    const restaurantDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
+    if (!restaurantDoc.exists) {
+      return res.status(404).json({ error: 'Restaurant not found' });
+    }
+
+    if (restaurantDoc.data().ownerId !== userId) {
+      return res.status(403).json({ error: 'Access denied' });
+    }
+
+    const restaurantData = restaurantDoc.data();
+    let customerAppSettings = restaurantData.customerAppSettings || {};
+    let restaurantCode = customerAppSettings.restaurantCode;
+
+    // Auto-generate code if requested and not set
+    if (!restaurantCode && autoGenerate === 'true') {
+      restaurantCode = await generateUniqueRestaurantCode();
+
+      // Update restaurant with new code
+      await restaurantDoc.ref.update({
+        'customerAppSettings.restaurantCode': restaurantCode,
+        'customerAppSettings.enabled': customerAppSettings.enabled ?? true,
+        updatedAt: new Date()
+      });
+    }
 
     if (!restaurantCode) {
-      return res.status(400).json({ error: 'Restaurant code not set. Please set a restaurant code first.' });
+      return res.status(400).json({
+        error: 'Restaurant code not set',
+        needsCode: true,
+        message: 'Please generate a restaurant code first'
+      });
     }
 
     // Generate QR code URL that links to the Crave app
-    // Format: crave://restaurant/{code} or https://crave.dineopen.com/{code}
     const qrContent = `https://crave.dineopen.com/${restaurantCode}`;
 
     // Generate QR code as data URL
