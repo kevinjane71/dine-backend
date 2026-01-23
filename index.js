@@ -1472,13 +1472,27 @@ Use EXACT section names. If item shows variants (e.g., "Half ₹110/Full ₹180"
 };
 
 app.get('/health', (req, res) => {
-  res.json({ 
-    status: 'healthy', 
+  res.json({
+    status: 'healthy',
     timestamp: new Date().toISOString(),
     message: '🍽️ Dine Restaurant Management System is running!',
     environment: process.env.NODE_ENV || 'development',
     version: '1.0.0'
   });
+});
+
+// Admin endpoint to clear all blocked IPs (for emergency use)
+app.post('/api/admin/clear-blocked-ips', async (req, res) => {
+  try {
+    const snapshot = await db.collection('blockedIPs').get();
+    const batch = db.batch();
+    snapshot.docs.forEach(doc => batch.delete(doc.ref));
+    await batch.commit();
+    res.json({ success: true, message: `Cleared ${snapshot.docs.length} blocked IPs` });
+  } catch (error) {
+    console.error('Error clearing blocked IPs:', error);
+    res.status(500).json({ error: 'Failed to clear blocked IPs' });
+  }
 });
 
 // Warm-up endpoint for Vercel serverless (reduces cold start latency)

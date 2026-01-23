@@ -15,18 +15,17 @@ const vercelSecurityMiddleware = {
     /powershell/i, // PowerShell injection
   ],
 
-  // Suspicious user agents
+  // Suspicious user agents (NOTE: okhttp removed - it's used by legitimate Android/React Native apps)
   suspiciousUserAgents: [
     /bot/i,
     /crawler/i,
     /spider/i,
     /scraper/i,
-    /curl/i,
+    // /curl/i,  // Disabled - causes issues with testing
     /wget/i,
-    /python/i,
-    /java/i,
+    // /python/i,  // Disabled - too many false positives
+    // /java/i,    // Disabled - too many false positives
     /go-http/i,
-    /okhttp/i,
   ],
 
   // Get blocked IPs from Firestore
