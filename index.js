@@ -2694,15 +2694,8 @@ app.get('/api/health', (req, res) => {
   });
 });
 
-// Handle OPTIONS requests for CORS preflight - Middleware approach
-app.use((req, res, next) => {
-  if (req.method === 'OPTIONS') {
-    console.log('🔄 OPTIONS request received for:', req.path);
-    res.status(200).end();
-    return;
-  }
-  next();
-});
+// NOTE: OPTIONS requests are handled by the CORS middleware above (line 386-417)
+// Do not add another OPTIONS handler here as it will override the CORS headers
 
 app.post('/api/auth/phone/send-otp', async (req, res) => {
   try {
