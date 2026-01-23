@@ -326,9 +326,44 @@ const corsOptions = {
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS', 'PATCH'],
   allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'Accept', 'Origin'],
-  optionsSuccessStatus: 200,
-  preflightContinue: false
+  optionsSuccessStatus: 204,
+  preflightContinue: true // Allow our custom OPTIONS handler to run
 };
+
+// CRITICAL: Handle OPTIONS requests FIRST, before cors middleware
+// This ensures OPTIONS requests always get proper CORS headers
+app.use((req, res, next) => {
+  if (req.method === 'OPTIONS') {
+    const origin = req.headers.origin;
+    console.log('🔍 OPTIONS preflight request (EARLY HANDLER) - Origin:', origin);
+    console.log('🔍 Allowed origins:', allowedOrigins);
+    
+    // Always set CORS headers for preflight
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS, PATCH');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With, Accept, Origin');
+    res.setHeader('Access-Control-Max-Age', '86400');
+    res.setHeader('Vary', 'Origin');
+    res.setHeader('Cache-Control', 'no-store, max-age=0');
+    
+    if (origin) {
+      // Check if origin should be allowed
+      if (isValidDineopenOrigin(origin) || allowedOrigins.includes(origin) || isValidLocalhostOrigin(origin)) {
+        res.setHeader('Access-Control-Allow-Origin', origin);
+        res.setHeader('Access-Control-Allow-Credentials', 'true');
+        console.log(`✅ CORS preflight allowed (EARLY) for origin: ${origin}`);
+        return res.status(204).end();
+      } else {
+        console.log(`❌ CORS preflight blocked (EARLY) for origin: ${origin}`);
+        // Still return 204 but without Access-Control-Allow-Origin
+        return res.status(204).end();
+      }
+    } else {
+      console.log('⚠️ OPTIONS request with no origin header (EARLY)');
+      return res.status(204).end();
+    }
+  }
+  next();
+});
 
 app.use(cors(corsOptions));
 
