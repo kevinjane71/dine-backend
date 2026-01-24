@@ -14071,6 +14071,291 @@ app.post('/api/public/customer/lookup', vercelSecurityMiddleware.publicAPI, asyn
   }
 });
 
+// Firebase auth verification for Crave customer app
+// Verifies Firebase ID token and creates/links customer with tier-based loyalty
+app.post('/api/crave-app/auth/firebase/verify', vercelSecurityMiddleware.publicAPI, async (req, res) => {
+  try {
+    const { firebaseIdToken, restaurantId, name } = req.body;
+
+    if (!firebaseIdToken || !restaurantId) {
+      return res.status(400).json({ error: 'Firebase ID token and restaurant ID are required' });
+    }
+
+    // Verify Firebase ID token
+    const admin = require('firebase-admin');
+    let decodedToken;
+    try {
+      decodedToken = await admin.auth().verifyIdToken(firebaseIdToken);
+    } catch (error) {
+      console.error('Firebase token verification error:', error);
+      return res.status(401).json({ error: 'Invalid or expired Firebase token' });
+    }
+
+    const { uid, phone_number: phoneNumber } = decodedToken;
+    console.log('🔐 Crave app Firebase auth - UID:', uid, 'Phone:', phoneNumber);
+
+    // Normalize phone number
+    const normalizePhone = (phoneNum) => {
+      if (!phoneNum) return null;
+      const digits = phoneNum.replace(/\D/g, '');
+      if (digits.length === 12 && digits.startsWith('91')) {
+        return digits.substring(2);
+      } else if (digits.length === 10) {
+        return digits;
+      } else if (digits.length === 11 && digits.startsWith('0')) {
+        return digits.substring(1);
+      }
+      return digits;
+    };
+
+    const normalizedPhone = normalizePhone(phoneNumber);
+
+    // Try to find existing customer by Firebase UID first
+    let customerDoc = null;
+    let existingCustomerQuery = await db.collection('customers')
+      .where('restaurantId', '==', restaurantId)
+      .where('firebaseUid', '==', uid)
+      .limit(1)
+      .get();
+
+    if (!existingCustomerQuery.empty) {
+      customerDoc = existingCustomerQuery.docs[0];
+      console.log('✅ Customer found by Firebase UID:', customerDoc.id);
+    } else if (normalizedPhone) {
+      // Try to find by phone number
+      const phoneQuery = await db.collection('customers')
+        .where('restaurantId', '==', restaurantId)
+        .where('phone', '==', normalizedPhone)
+        .limit(1)
+        .get();
+
+      if (!phoneQuery.empty) {
+        customerDoc = phoneQuery.docs[0];
+        // Link Firebase UID to existing customer
+        await db.collection('customers').doc(customerDoc.id).update({
+          firebaseUid: uid,
+          updatedAt: new Date()
+        });
+        console.log('✅ Customer found by phone, linked Firebase UID:', customerDoc.id);
+      }
+    }
+
+    // Tier calculation function
+    const calculateTier = (lifetimePoints) => {
+      if (lifetimePoints >= 5000) return 'platinum';
+      if (lifetimePoints >= 2000) return 'gold';
+      if (lifetimePoints >= 500) return 'silver';
+      return 'bronze';
+    };
+
+    let customer;
+    let isNewCustomer = false;
+
+    if (customerDoc) {
+      // Existing customer - update if name provided
+      const customerData = customerDoc.data();
+      const lifetimePoints = customerData.lifetimePoints || customerData.loyaltyPoints || 0;
+      const loyaltyTier = calculateTier(lifetimePoints);
+
+      if (name && (!customerData.name || customerData.name === 'Customer')) {
+        await db.collection('customers').doc(customerDoc.id).update({
+          name: name,
+          loyaltyTier: loyaltyTier,
+          updatedAt: new Date()
+        });
+      } else if (customerData.loyaltyTier !== loyaltyTier) {
+        // Update tier if changed
+        await db.collection('customers').doc(customerDoc.id).update({
+          loyaltyTier: loyaltyTier,
+          updatedAt: new Date()
+        });
+      }
+
+      customer = {
+        id: customerDoc.id,
+        name: name || customerData.name || 'Customer',
+        phone: normalizedPhone || customerData.phone,
+        loyaltyPoints: customerData.loyaltyPoints || 0,
+        lifetimePoints: lifetimePoints,
+        loyaltyTier: loyaltyTier,
+        totalOrders: customerData.totalOrders || 0,
+        totalSpent: customerData.totalSpent || 0
+      };
+    } else {
+      // Create new customer
+      isNewCustomer = true;
+      const newCustomer = {
+        restaurantId: restaurantId,
+        firebaseUid: uid,
+        phone: normalizedPhone,
+        name: name || 'Customer',
+        customerId: `CUST-${Date.now()}-${Math.random().toString(36).substr(2, 6)}`,
+        loyaltyPoints: 0,
+        lifetimePoints: 0,
+        loyaltyTier: 'bronze',
+        totalOrders: 0,
+        totalSpent: 0,
+        lastOrderDate: null,
+        orderHistory: [],
+        loyaltyTransactions: [],
+        source: 'crave_app_firebase',
+        createdAt: new Date(),
+        updatedAt: new Date()
+      };
+
+      const customerRef = await db.collection('customers').add(newCustomer);
+      console.log('✅ New Crave customer created:', customerRef.id);
+
+      customer = {
+        id: customerRef.id,
+        name: newCustomer.name,
+        phone: newCustomer.phone,
+        loyaltyPoints: 0,
+        lifetimePoints: 0,
+        loyaltyTier: 'bronze',
+        totalOrders: 0,
+        totalSpent: 0
+      };
+    }
+
+    // Generate JWT token for customer
+    const token = jwt.sign(
+      {
+        customerId: customer.id,
+        restaurantId: restaurantId,
+        phone: customer.phone,
+        type: 'customer'
+      },
+      process.env.JWT_SECRET,
+      { expiresIn: '30d' }
+    );
+
+    res.json({
+      token: token,
+      customer: customer,
+      isNewCustomer: isNewCustomer
+    });
+
+  } catch (error) {
+    console.error('Crave Firebase auth error:', error);
+    res.status(500).json({ error: 'Authentication failed' });
+  }
+});
+
+// Get customer loyalty history with tier info (public endpoint for Crave app)
+app.get('/api/public/customer/:customerId/loyalty-history', vercelSecurityMiddleware.publicAPI, async (req, res) => {
+  try {
+    const { customerId } = req.params;
+    const { page = 1, limit = 20, type = 'all' } = req.query;
+
+    const customerDoc = await db.collection('customers').doc(customerId).get();
+    if (!customerDoc.exists) {
+      return res.status(404).json({ error: 'Customer not found' });
+    }
+
+    const customerData = customerDoc.data();
+    const loyaltyTransactions = customerData.loyaltyTransactions || [];
+    const orderHistory = customerData.orderHistory || [];
+
+    // Build transaction history from order history if loyaltyTransactions is empty
+    let history = loyaltyTransactions.length > 0 ? loyaltyTransactions : [];
+
+    if (history.length === 0 && orderHistory.length > 0) {
+      // Build from order history
+      orderHistory.forEach(order => {
+        if (order.loyaltyPointsEarned > 0) {
+          history.push({
+            id: `earned-${order.orderId}`,
+            type: 'earned',
+            points: order.loyaltyPointsEarned,
+            orderId: order.orderId,
+            orderNumber: order.orderNumber,
+            date: order.orderDate,
+            description: `Earned from order #${order.orderNumber || order.orderId?.slice(-6)}`,
+            tierAtTime: order.tierAtTime || 'bronze',
+            tierMultiplier: order.tierMultiplier || 1
+          });
+        }
+        if (order.loyaltyPointsRedeemed > 0) {
+          history.push({
+            id: `redeemed-${order.orderId}`,
+            type: 'redeemed',
+            points: order.loyaltyPointsRedeemed,
+            orderId: order.orderId,
+            orderNumber: order.orderNumber,
+            date: order.orderDate,
+            description: `Redeemed on order #${order.orderNumber || order.orderId?.slice(-6)}`,
+            tierAtTime: order.tierAtTime || 'bronze'
+          });
+        }
+      });
+    }
+
+    // Filter by type
+    if (type !== 'all') {
+      history = history.filter(t => t.type === type);
+    }
+
+    // Sort by date descending
+    history.sort((a, b) => {
+      const dateA = a.date ? new Date(a.date) : new Date(0);
+      const dateB = b.date ? new Date(b.date) : new Date(0);
+      return dateB - dateA;
+    });
+
+    // Pagination
+    const startIndex = (parseInt(page) - 1) * parseInt(limit);
+    const paginatedHistory = history.slice(startIndex, startIndex + parseInt(limit));
+
+    // Calculate summary
+    const totalEarned = history
+      .filter(t => t.type === 'earned')
+      .reduce((sum, t) => sum + (t.points || 0), 0);
+    const totalRedeemed = history
+      .filter(t => t.type === 'redeemed')
+      .reduce((sum, t) => sum + (t.points || 0), 0);
+
+    // Tier calculation
+    const lifetimePoints = customerData.lifetimePoints || totalEarned;
+    const currentTier = customerData.loyaltyTier || (() => {
+      if (lifetimePoints >= 5000) return 'platinum';
+      if (lifetimePoints >= 2000) return 'gold';
+      if (lifetimePoints >= 500) return 'silver';
+      return 'bronze';
+    })();
+
+    // Points to next tier
+    const tierThresholds = { bronze: 0, silver: 500, gold: 2000, platinum: 5000 };
+    const tiers = ['bronze', 'silver', 'gold', 'platinum'];
+    const currentTierIndex = tiers.indexOf(currentTier);
+    const nextTier = currentTierIndex < 3 ? tiers[currentTierIndex + 1] : null;
+    const pointsToNextTier = nextTier ? tierThresholds[nextTier] - lifetimePoints : 0;
+
+    res.json({
+      history: paginatedHistory,
+      summary: {
+        totalEarned: lifetimePoints,
+        totalRedeemed: totalRedeemed,
+        currentBalance: customerData.loyaltyPoints || 0,
+        currentTier: currentTier,
+        lifetimePoints: lifetimePoints,
+        pointsToNextTier: Math.max(0, pointsToNextTier),
+        nextTier: nextTier
+      },
+      pagination: {
+        page: parseInt(page),
+        limit: parseInt(limit),
+        total: history.length,
+        hasMore: startIndex + parseInt(limit) < history.length
+      }
+    });
+
+  } catch (error) {
+    console.error('Get loyalty history error:', error);
+    res.status(500).json({ error: 'Failed to fetch loyalty history' });
+  }
+});
+
 // Get customer app settings (public endpoint for Crave app)
 app.get('/api/public/customer-app-settings/:restaurantId', vercelSecurityMiddleware.publicAPI, async (req, res) => {
   try {
