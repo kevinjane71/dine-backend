@@ -3813,13 +3813,49 @@ app.patch('/api/restaurants/:restaurantId', authenticateToken, async (req, res) 
       return res.status(403).json({ error: 'Access denied' });
     }
 
-    // Update allowed fields
-    const allowedFields = ['name', 'address', 'city', 'phone', 'email', 'cuisine', 'description'];
+    // Update allowed basic fields
+    const allowedFields = ['name', 'address', 'city', 'phone', 'email', 'cuisine', 'description', 'logo', 'coverImage', 'openingHours', 'isActive'];
     allowedFields.forEach(field => {
       if (req.body[field] !== undefined) {
         updateData[field] = req.body[field];
       }
     });
+
+    // Handle customerAppSettings updates (can update individual fields or entire object)
+    if (req.body.customerAppSettings !== undefined) {
+      const existingSettings = restaurant.data().customerAppSettings || {};
+      // Merge new settings with existing
+      updateData.customerAppSettings = {
+        ...existingSettings,
+        ...req.body.customerAppSettings,
+        updatedAt: new Date()
+      };
+      // Handle nested loyaltySettings merge
+      if (req.body.customerAppSettings.loyaltySettings) {
+        updateData.customerAppSettings.loyaltySettings = {
+          ...(existingSettings.loyaltySettings || {}),
+          ...req.body.customerAppSettings.loyaltySettings
+        };
+      }
+      // Handle nested branding merge
+      if (req.body.customerAppSettings.branding) {
+        updateData.customerAppSettings.branding = {
+          ...(existingSettings.branding || {}),
+          ...req.body.customerAppSettings.branding
+        };
+      }
+    }
+
+    // Handle restaurantCode update directly (shorthand for customerAppSettings.restaurantCode)
+    if (req.body.restaurantCode !== undefined) {
+      const existingSettings = restaurant.data().customerAppSettings || {};
+      updateData.customerAppSettings = {
+        ...existingSettings,
+        ...(updateData.customerAppSettings || {}),
+        restaurantCode: req.body.restaurantCode,
+        updatedAt: new Date()
+      };
+    }
 
     if (Object.keys(updateData).length === 0) {
       return res.status(400).json({ error: 'No valid fields to update' });
@@ -3829,7 +3865,7 @@ app.patch('/api/restaurants/:restaurantId', authenticateToken, async (req, res) 
 
     await db.collection(collections.restaurants).doc(restaurantId).update(updateData);
 
-    res.json({ message: 'Restaurant updated successfully' });
+    res.json({ message: 'Restaurant updated successfully', updatedFields: Object.keys(updateData) });
 
   } catch (error) {
     console.error('Update restaurant error:', error);
@@ -14387,7 +14423,10 @@ app.get('/api/public/customer-app-settings/:restaurantId', vercelSecurityMiddlew
           enabled: false
         },
         branding: {
-          primaryColor: customerAppSettings.branding?.primaryColor || '#dc2626'
+          primaryColor: customerAppSettings.branding?.primaryColor || '#ef4444',
+          logoUrl: customerAppSettings.branding?.logoUrl || restaurantData.logo || '',
+          tagline: customerAppSettings.branding?.tagline || '',
+          headerStyle: customerAppSettings.branding?.headerStyle || 'modern'
         }
       }
     });
@@ -14629,23 +14668,26 @@ app.get('/api/restaurants/:restaurantId/customer-app-settings', authenticateToke
     const restaurantData = restaurantDoc.data();
 
     // Return existing settings or defaults
-    const customerAppSettings = restaurantData.customerAppSettings || {
-      enabled: false,
-      restaurantCode: '',
-      allowDineIn: true,
-      allowTakeaway: true,
-      allowDelivery: false,
-      requireTableSelection: true,
-      minimumOrder: 0,
+    const existingSettings = restaurantData.customerAppSettings || {};
+    const customerAppSettings = {
+      enabled: existingSettings.enabled ?? false,
+      restaurantCode: existingSettings.restaurantCode || '',
+      allowDineIn: existingSettings.allowDineIn ?? true,
+      allowTakeaway: existingSettings.allowTakeaway ?? true,
+      allowDelivery: existingSettings.allowDelivery ?? false,
+      requireTableSelection: existingSettings.requireTableSelection ?? true,
+      minimumOrder: existingSettings.minimumOrder || 0,
       loyaltySettings: {
-        enabled: false,
-        pointsPerRupee: 1,
-        redemptionRate: 100, // 100 points = Rs 1
-        maxRedemptionPercent: 20
+        enabled: existingSettings.loyaltySettings?.enabled ?? false,
+        pointsPerRupee: existingSettings.loyaltySettings?.pointsPerRupee || 1,
+        redemptionRate: existingSettings.loyaltySettings?.redemptionRate || 100,
+        maxRedemptionPercent: existingSettings.loyaltySettings?.maxRedemptionPercent || 20
       },
       branding: {
-        primaryColor: '#dc2626',
-        logoUrl: restaurantData.logoUrl || ''
+        primaryColor: existingSettings.branding?.primaryColor || '#ef4444',
+        logoUrl: existingSettings.branding?.logoUrl || restaurantData.logo || '',
+        tagline: existingSettings.branding?.tagline || '',
+        headerStyle: existingSettings.branding?.headerStyle || 'modern'
       }
     };
 
@@ -14709,8 +14751,10 @@ app.put('/api/restaurants/:restaurantId/customer-app-settings', authenticateToke
         maxRedemptionPercent: Number(settings.loyaltySettings?.maxRedemptionPercent) || 20
       },
       branding: {
-        primaryColor: settings.branding?.primaryColor || '#dc2626',
-        logoUrl: settings.branding?.logoUrl || ''
+        primaryColor: settings.branding?.primaryColor || '#ef4444',
+        logoUrl: settings.branding?.logoUrl || '',
+        tagline: settings.branding?.tagline || '',
+        headerStyle: settings.branding?.headerStyle || 'modern'
       },
       updatedAt: new Date()
     };
