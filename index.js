@@ -14450,10 +14450,20 @@ app.get('/api/public/offers/:restaurantId', vercelSecurityMiddleware.publicAPI, 
     const offers = [];
     offersSnapshot.forEach(doc => {
       const offer = doc.data();
-      // Filter by date range
-      const validFrom = offer.validFrom ? new Date(offer.validFrom) : null;
-      const validUntil = offer.validUntil ? new Date(offer.validUntil) : null;
 
+      // Handle Firestore Timestamps - convert to JS Date
+      let validFrom = null;
+      let validUntil = null;
+
+      if (offer.validFrom) {
+        // Check if it's a Firestore Timestamp
+        validFrom = offer.validFrom.toDate ? offer.validFrom.toDate() : new Date(offer.validFrom);
+      }
+      if (offer.validUntil) {
+        validUntil = offer.validUntil.toDate ? offer.validUntil.toDate() : new Date(offer.validUntil);
+      }
+
+      // Filter by date range
       const isValidDate = (!validFrom || now >= validFrom) && (!validUntil || now <= validUntil);
       const isUnderUsageLimit = !offer.usageLimit || (offer.usageCount || 0) < offer.usageLimit;
 
@@ -14466,12 +14476,18 @@ app.get('/api/public/offers/:restaurantId', vercelSecurityMiddleware.publicAPI, 
           discountValue: offer.discountValue,
           minOrderValue: offer.minOrderValue || 0,
           maxDiscount: offer.maxDiscount,
+          validFrom: validFrom ? validFrom.toISOString() : null,
+          validUntil: validUntil ? validUntil.toISOString() : null,
+          isActive: offer.isActive ?? true,
+          usageLimit: offer.usageLimit || null,
+          usageCount: offer.usageCount || 0,
           isFirstOrderOnly: offer.isFirstOrderOnly || false,
           autoApply: offer.autoApply || false
         });
       }
     });
 
+    console.log(`Found ${offers.length} valid offers for restaurant ${restaurantId}`);
     res.json({ offers });
   } catch (error) {
     console.error('Get public offers error:', error);
