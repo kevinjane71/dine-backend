@@ -8868,7 +8868,7 @@ app.post('/api/auth/staff/login', async (req, res) => {
     // Find staff member by loginId (User ID)
     const staffQuery = await db.collection(collections.users)
       .where('loginId', '==', loginId)
-      .where('role', 'in', ['waiter', 'manager', 'employee'])
+      .where('role', 'in', ['waiter', 'manager', 'employee','cashier', 'sales'])
       .where('status', '==', 'active')
       .get();
 
