@@ -4958,11 +4958,11 @@ app.post('/api/public/orders/:restaurantId', vercelSecurityMiddleware.publicAPI,
             discountApplied: discountAmount
           };
 
-          // Increment offer usage count
-          await offerDoc.ref.update({
-            usageCount: FieldValue.increment(1),
-            updatedAt: new Date()
-          });
+          // Increment offer usage count - DEFERRED TO ORDER COMPLETION
+          // await offerDoc.ref.update({
+          //   usageCount: FieldValue.increment(1),
+          //   updatedAt: new Date()
+          // });
 
           console.log(`🎁 Offer applied: ${offer.name}, Discount: ₹${discountAmount}`);
         } else {
@@ -5094,28 +5094,28 @@ app.post('/api/public/orders/:restaurantId', vercelSecurityMiddleware.publicAPI,
       loyaltyPointsRedeemed: loyaltyPointsRedeemed
     };
 
-    // Update customer stats, order history, and loyalty points
-    const customerUpdateData = {
-      totalOrders: FieldValue.increment(1),
-      totalSpent: FieldValue.increment(finalTotal),
-      lastOrderDate: new Date(),
-      updatedAt: new Date()
-    };
+    // Update customer stats, order history, and loyalty points - DEFERRED TO ORDER COMPLETION
+    // const customerUpdateData = {
+    //   totalOrders: FieldValue.increment(1),
+    //   totalSpent: FieldValue.increment(finalTotal),
+    //   lastOrderDate: new Date(),
+    //   updatedAt: new Date()
+    // };
 
     // Update loyalty points
-    if (loyaltySettings.enabled) {
-      const netPointsChange = loyaltyPointsEarned - loyaltyPointsRedeemed;
-      if (netPointsChange !== 0) {
-        customerUpdateData.loyaltyPoints = FieldValue.increment(netPointsChange);
-      }
-    }
+    // if (loyaltySettings.enabled) {
+    //   const netPointsChange = loyaltyPointsEarned - loyaltyPointsRedeemed;
+    //   if (netPointsChange !== 0) {
+    //     customerUpdateData.loyaltyPoints = FieldValue.increment(netPointsChange);
+    //   }
+    // }
 
-    await db.collection('customers').doc(customerId).update(customerUpdateData);
+    // await db.collection('customers').doc(customerId).update(customerUpdateData);
 
     // Add to order history (using array union)
-    await db.collection('customers').doc(customerId).update({
-      orderHistory: FieldValue.arrayUnion(orderHistoryEntry)
-    });
+    // await db.collection('customers').doc(customerId).update({
+    //   orderHistory: FieldValue.arrayUnion(orderHistoryEntry)
+    // });
 
     console.log(`🛒 Customer order created successfully: ${orderRef.id}`);
     console.log(`📋 Order items: ${orderData.items.length} items`);
@@ -6088,6 +6088,77 @@ app.patch('/api/orders/:orderId/status', authenticateToken, async (req, res) => 
     // Validate that the order belongs to the user's restaurant
     if (orderData.restaurantId !== userRestaurantId) {
       return res.status(403).json({ error: 'Access denied: Order does not belong to your restaurant' });
+    }
+
+    // NEW: Handle deferred loyalty/stats updates on completion
+    if (status === 'completed' && orderData.status !== 'completed') {
+      console.log(`✅ Order ${orderId} marked as completed. Processing deferred updates...`);
+      
+      const customerId = orderData.customerId;
+      
+      // Update Offer Usage if one was applied
+      if (orderData.appliedOffer && orderData.appliedOffer.id) {
+        try {
+          await db.collection('offers').doc(orderData.appliedOffer.id).update({
+            usageCount: FieldValue.increment(1),
+            updatedAt: new Date()
+          });
+          console.log(`🎁 Offer usage incremented for ${orderData.appliedOffer.id}`);
+        } catch (err) {
+          console.error('Error updating offer usage:', err);
+        }
+      }
+
+      // Update Customer Stats and Loyalty
+      if (customerId) {
+        try {
+          const customerUpdateData = {
+            totalOrders: FieldValue.increment(1),
+            totalSpent: FieldValue.increment(orderData.totalAmount || 0),
+            lastOrderDate: new Date(),
+            updatedAt: new Date()
+          };
+          
+          const pointsEarned = orderData.loyaltyPointsEarned || 0;
+          const pointsRedeemed = orderData.loyaltyPointsRedeemed || 0;
+          const netPointsChange = pointsEarned - pointsRedeemed;
+          
+          if (netPointsChange !== 0) {
+            customerUpdateData.loyaltyPoints = FieldValue.increment(netPointsChange);
+          }
+          
+          await db.collection('customers').doc(customerId).update(customerUpdateData);
+          console.log(`👤 Customer stats updated for ${customerId}. Points: ${netPointsChange > 0 ? '+' : ''}${netPointsChange}`);
+          
+          // Add to order history
+          const orderHistoryEntry = {
+            orderId: orderId,
+            orderNumber: orderData.orderNumber,
+            orderDate: new Date(), // Completion date
+            totalAmount: orderData.totalAmount,
+            subtotal: orderData.subtotal,
+            discountAmount: orderData.discountAmount,
+            loyaltyDiscount: orderData.loyaltyDiscount,
+            tableNumber: orderData.tableNumber,
+            orderType: orderData.orderType,
+            orderTypeLabel: orderData.orderTypeLabel,
+            orderSource: orderData.orderSource,
+            status: 'completed',
+            itemsCount: orderData.items?.length || 0,
+            appliedOffer: orderData.appliedOffer?.name || null,
+            loyaltyPointsEarned: pointsEarned,
+            loyaltyPointsRedeemed: pointsRedeemed
+          };
+
+          await db.collection('customers').doc(customerId).update({
+            orderHistory: FieldValue.arrayUnion(orderHistoryEntry)
+          });
+          console.log('📜 Order added to customer history');
+
+        } catch (err) {
+          console.error('Error updating customer stats:', err);
+        }
+      }
     }
 
     await db.collection(collections.orders).doc(orderId).update({
