@@ -4834,6 +4834,12 @@ app.post('/api/public/orders/:restaurantId', vercelSecurityMiddleware.publicAPI,
       customerId = existingCustomer.id;
       customerData = existingCustomer.data();
 
+      // Check if this is their first order (existing customer but no orders placed yet)
+      if ((customerData.totalOrders || 0) === 0) {
+        isFirstOrder = true;
+        console.log(`🎁 First order for existing customer: ${customerId}`);
+      }
+
       const updateData = {
         updatedAt: new Date(),
         lastOrderDate: new Date(),
@@ -14089,15 +14095,17 @@ app.post('/api/public/customer/lookup', vercelSecurityMiddleware.publicAPI, asyn
 
     if (existingCustomer) {
       const customerData = existingCustomer.data();
+      const totalOrders = customerData.totalOrders || 0;
       res.json({
         found: true,
         customer: {
           id: existingCustomer.id,
           name: customerData.name || 'Customer',
           loyaltyPoints: customerData.loyaltyPoints || 0,
-          totalOrders: customerData.totalOrders || 0,
+          totalOrders: totalOrders,
           totalSpent: customerData.totalSpent || 0,
-          isFirstOrder: false
+          // First order if customer exists but has never placed an order
+          isFirstOrder: totalOrders === 0
         }
       });
     } else {
@@ -15063,8 +15071,8 @@ app.get('/api/restaurants/:restaurantId/qr-code', authenticateToken, async (req,
       });
     }
 
-    // Generate QR code URL that links to the Crave app
-    const qrContent = `https://crave.dineopen.com/${restaurantCode}`;
+    // Generate QR code URL that links to the public online order page
+    const qrContent = `https://www.dineopen.com/onlineorder?restaurant=${restaurantId}`;
 
     // Generate QR code as data URL
     const qrCodeDataUrl = await QRCode.toDataURL(qrContent, {
@@ -15080,7 +15088,8 @@ app.get('/api/restaurants/:restaurantId/qr-code', authenticateToken, async (req,
     res.json({
       qrCode: qrCodeDataUrl,
       restaurantCode: restaurantCode,
-      qrContent: qrContent
+      qrContent: qrContent,
+      onlineOrderUrl: qrContent
     });
   } catch (error) {
     console.error('Generate QR code error:', error);
