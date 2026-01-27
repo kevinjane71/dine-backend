@@ -14442,6 +14442,10 @@ app.get('/api/public/customer-app-settings/:restaurantId', vercelSecurityMiddlew
         },
         branding: {
           primaryColor: customerAppSettings.branding?.primaryColor || '#ef4444',
+          textColor: customerAppSettings.branding?.textColor || '#ffffff',
+          pageBackgroundColor: customerAppSettings.branding?.pageBackgroundColor || '#f8fafc',
+          offerGradientStart: customerAppSettings.branding?.offerGradientStart || '#fef3c7',
+          offerGradientEnd: customerAppSettings.branding?.offerGradientEnd || '#fde68a',
           logoUrl: customerAppSettings.branding?.logoUrl || restaurantData.logo || '',
           tagline: customerAppSettings.branding?.tagline || '',
           headerStyle: customerAppSettings.branding?.headerStyle || 'modern'
@@ -14720,6 +14724,10 @@ app.get('/api/restaurants/:restaurantId/customer-app-settings', authenticateToke
       },
       branding: {
         primaryColor: existingSettings.branding?.primaryColor || '#ef4444',
+        textColor: existingSettings.branding?.textColor || '#ffffff',
+        pageBackgroundColor: existingSettings.branding?.pageBackgroundColor || '#f8fafc',
+        offerGradientStart: existingSettings.branding?.offerGradientStart || '#fef3c7',
+        offerGradientEnd: existingSettings.branding?.offerGradientEnd || '#fde68a',
         logoUrl: existingSettings.branding?.logoUrl || restaurantData.logo || '',
         tagline: existingSettings.branding?.tagline || '',
         headerStyle: existingSettings.branding?.headerStyle || 'modern'
@@ -14815,6 +14823,10 @@ app.put('/api/restaurants/:restaurantId/customer-app-settings', authenticateToke
       },
       branding: {
         primaryColor: settings.branding?.primaryColor || '#ef4444',
+        textColor: settings.branding?.textColor || '#ffffff',
+        pageBackgroundColor: settings.branding?.pageBackgroundColor || '#f8fafc',
+        offerGradientStart: settings.branding?.offerGradientStart || '#fef3c7',
+        offerGradientEnd: settings.branding?.offerGradientEnd || '#fde68a',
         logoUrl: settings.branding?.logoUrl || '',
         tagline: settings.branding?.tagline || '',
         headerStyle: settings.branding?.headerStyle || 'modern'
@@ -14937,6 +14949,12 @@ app.get('/api/public/restaurant/code/:code', vercelSecurityMiddleware.publicAPI,
         name: restaurantData.name,
         logoUrl: restaurantData.logoUrl || restaurantData.customerAppSettings?.branding?.logoUrl || '',
         primaryColor: restaurantData.customerAppSettings?.branding?.primaryColor || '#dc2626',
+        textColor: restaurantData.customerAppSettings?.branding?.textColor || '#ffffff',
+        pageBackgroundColor: restaurantData.customerAppSettings?.branding?.pageBackgroundColor || '#f8fafc',
+        offerGradientStart: restaurantData.customerAppSettings?.branding?.offerGradientStart || '#fef3c7',
+        offerGradientEnd: restaurantData.customerAppSettings?.branding?.offerGradientEnd || '#fde68a',
+        tagline: restaurantData.customerAppSettings?.branding?.tagline || '',
+        headerStyle: restaurantData.customerAppSettings?.branding?.headerStyle || 'modern',
         allowDineIn: restaurantData.customerAppSettings?.allowDineIn ?? true,
         allowTakeaway: restaurantData.customerAppSettings?.allowTakeaway ?? true,
         allowDelivery: restaurantData.customerAppSettings?.allowDelivery ?? false,
