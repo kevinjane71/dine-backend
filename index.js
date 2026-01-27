@@ -8737,7 +8737,8 @@ app.get('/api/user/page-access', authenticateToken, async (req, res) => {
         admin: false
       },
       role: userData.role,
-      restaurantId: userData.restaurantId
+      restaurantId: userData.restaurantId,
+      notAllowedPages: userData.notAllowedPages || [] // Array of page IDs to hide (e.g., ['billing', 'inventory'])
     });
   } catch (error) {
     console.error('Get page access error:', error);
