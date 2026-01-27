@@ -4999,8 +4999,16 @@ app.post('/api/public/orders/:restaurantId', vercelSecurityMiddleware.publicAPI,
     // Calculate loyalty points earned
     let loyaltyPointsEarned = 0;
     if (loyaltySettings.enabled) {
-      const pointsPerRupee = loyaltySettings.pointsPerRupee || 1;
-      loyaltyPointsEarned = Math.floor(finalTotal * pointsPerRupee);
+      // Support new format (earnPerAmount/pointsEarned) and legacy format (pointsPerRupee)
+      if (loyaltySettings.earnPerAmount && loyaltySettings.pointsEarned) {
+        const earnPerAmount = loyaltySettings.earnPerAmount || 100;
+        const pointsEarned = loyaltySettings.pointsEarned || 4;
+        loyaltyPointsEarned = Math.floor(finalTotal / earnPerAmount) * pointsEarned;
+      } else {
+        // Legacy support for pointsPerRupee
+        const pointsPerRupee = loyaltySettings.pointsPerRupee || 1;
+        loyaltyPointsEarned = Math.floor(finalTotal * pointsPerRupee);
+      }
     }
 
     // Generate order number and daily order ID
@@ -14417,7 +14425,8 @@ app.get('/api/public/customer-app-settings/:restaurantId', vercelSecurityMiddlew
         minimumOrder: customerAppSettings.minimumOrder || 0,
         loyaltySettings: customerAppSettings.loyaltySettings?.enabled ? {
           enabled: true,
-          pointsPerRupee: customerAppSettings.loyaltySettings.pointsPerRupee || 1,
+          earnPerAmount: customerAppSettings.loyaltySettings.earnPerAmount || 100,
+          pointsEarned: customerAppSettings.loyaltySettings.pointsEarned || 4,
           redemptionRate: customerAppSettings.loyaltySettings.redemptionRate || 100,
           maxRedemptionPercent: customerAppSettings.loyaltySettings.maxRedemptionPercent || 20
         } : {
@@ -14696,7 +14705,8 @@ app.get('/api/restaurants/:restaurantId/customer-app-settings', authenticateToke
       minimumOrder: existingSettings.minimumOrder || 0,
       loyaltySettings: {
         enabled: existingSettings.loyaltySettings?.enabled ?? false,
-        pointsPerRupee: existingSettings.loyaltySettings?.pointsPerRupee || 1,
+        earnPerAmount: existingSettings.loyaltySettings?.earnPerAmount || 100,
+        pointsEarned: existingSettings.loyaltySettings?.pointsEarned || 4,
         redemptionRate: existingSettings.loyaltySettings?.redemptionRate || 100,
         maxRedemptionPercent: existingSettings.loyaltySettings?.maxRedemptionPercent || 20
       },
@@ -14790,7 +14800,8 @@ app.put('/api/restaurants/:restaurantId/customer-app-settings', authenticateToke
       minimumOrder: Number(settings.minimumOrder) || 0,
       loyaltySettings: {
         enabled: settings.loyaltySettings?.enabled ?? false,
-        pointsPerRupee: Number(settings.loyaltySettings?.pointsPerRupee) || 1,
+        earnPerAmount: Number(settings.loyaltySettings?.earnPerAmount) || 100,
+        pointsEarned: Number(settings.loyaltySettings?.pointsEarned) || 4,
         redemptionRate: Number(settings.loyaltySettings?.redemptionRate) || 100,
         maxRedemptionPercent: Number(settings.loyaltySettings?.maxRedemptionPercent) || 20
       },
