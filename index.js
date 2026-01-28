@@ -59,6 +59,41 @@ async function generateDailyOrderId(restaurantId) {
   }
 }
 
+// Generate sequential order ID (never resets; increments forever per restaurant). Uses transaction to avoid race conditions.
+async function generateSequentialOrderId(restaurantId) {
+  try {
+    const counterRef = db.collection('order_id_counters').doc(restaurantId);
+    const result = await db.runTransaction(async (transaction) => {
+      const snap = await transaction.get(counterRef);
+      const nextId = snap.exists ? ((snap.data().lastOrderId || 0) + 1) : 1;
+      transaction.set(counterRef, {
+        restaurantId,
+        lastOrderId: nextId,
+        updatedAt: new Date()
+      }, { merge: true });
+      return nextId;
+    });
+    return result;
+  } catch (error) {
+    console.error('Error generating sequential order ID:', error);
+    return Date.now() % 100000;
+  }
+}
+
+// Resolves next display order ID: daily (reset each day) or sequential (never reset) based on restaurant.orderSettings.sequentialOrderIdEnabled
+async function getNextOrderId(restaurantId, restaurantDataOrNull) {
+  let restaurantData = restaurantDataOrNull;
+  if (!restaurantData) {
+    const restaurantDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
+    restaurantData = restaurantDoc.exists ? restaurantDoc.data() : {};
+  }
+  const useSequential = !!(restaurantData.orderSettings && restaurantData.orderSettings.sequentialOrderIdEnabled);
+  if (useSequential) {
+    return await generateSequentialOrderId(restaurantId);
+  }
+  return await generateDailyOrderId(restaurantId);
+}
+
 // Helper function to create default free-trial subscription for new users
 async function createDefaultSubscription(userId, email, phone, role) {
   try {
@@ -3857,6 +3892,12 @@ app.patch('/api/restaurants/:restaurantId', authenticateToken, async (req, res) 
       };
     }
 
+    // Order management settings (e.g. sequential order ID never reset)
+    if (req.body.orderSettings !== undefined) {
+      const existing = restaurant.data().orderSettings || {};
+      updateData.orderSettings = { ...existing, ...req.body.orderSettings };
+    }
+
     if (Object.keys(updateData).length === 0) {
       return res.status(400).json({ error: 'No valid fields to update' });
     }
@@ -5044,9 +5085,9 @@ app.post('/api/public/orders/:restaurantId', vercelSecurityMiddleware.publicAPI,
       console.log(`💎 Loyalty points calculation: ₹${finalTotal} / ₹${earnPerAmount} * ${pointsEarned} = ${loyaltyPointsEarned} points`);
     }
 
-    // Generate order number and daily order ID
+    // Generate order number and daily/sequential order ID (based on restaurant orderSettings.sequentialOrderIdEnabled)
     const orderNumber = `ORD-${Date.now()}-${Math.random().toString(36).substr(2, 4).toUpperCase()}`;
-    const dailyOrderId = await generateDailyOrderId(restaurantId);
+    const dailyOrderId = await getNextOrderId(restaurantId, restaurantData);
 
     // Determine table number
     const tableNum = requestedTable || seatNumber || null;
@@ -5377,9 +5418,9 @@ app.post('/api/orders', async (req, res) => {
       finalAmount = totalAmount + taxAmount;
     }
 
-    // Generate order number and daily order ID
+    // Generate order number and daily/sequential order ID (based on restaurant orderSettings.sequentialOrderIdEnabled)
     const orderNumber = `ORD-${Date.now()}-${Math.random().toString(36).substr(2, 4).toUpperCase()}`;
-    const dailyOrderId = await generateDailyOrderId(restaurantId);
+    const dailyOrderId = await getNextOrderId(restaurantId);
 
     const orderData = {
       restaurantId,
@@ -5843,13 +5884,18 @@ app.get('/api/orders/:restaurantId', authenticateToken, async (req, res) => {
       console.log(`🔎 Searching orders for: "${searchValue}"`);
       
       allOrders = allOrders.filter(order => {
-        // Search by order ID
-        if (order.id.toLowerCase().includes(searchValue)) {
+        // Search by Firestore order ID (document id)
+        if (order.id && order.id.toLowerCase().includes(searchValue)) {
           return true;
         }
         
-        // Search by order number
+        // Search by order number (e.g. ORD-...)
         if (order.orderNumber && order.orderNumber.toLowerCase().includes(searchValue)) {
+          return true;
+        }
+        
+        // Search by display order # (dailyOrderId: 1, 2, 3,...) – works for both daily-reset and sequential modes
+        if (order.dailyOrderId != null && String(order.dailyOrderId) === searchValue) {
           return true;
         }
         
