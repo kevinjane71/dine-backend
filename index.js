@@ -4735,7 +4735,8 @@ app.post('/api/public/orders/:restaurantId', vercelSecurityMiddleware.publicAPI,
       verificationId,
       // New fields for Crave app integration
       orderType = 'dine_in', // dine_in, takeaway, delivery
-      offerId, // Optional offer to apply
+      offerId, // Optional single offer to apply (backward compatible)
+      offerIds = [], // Optional multiple offers to apply
       deliveryAddress, // For delivery orders
       redeemLoyaltyPoints = 0 // Loyalty points to redeem
     } = req.body;
@@ -4915,12 +4916,27 @@ app.post('/api/public/orders/:restaurantId', vercelSecurityMiddleware.publicAPI,
       });
     }
 
-    // Calculate discount if offer is provided
+    // Calculate discount if offers are provided
+    // Support both single offerId (backward compatible) and multiple offerIds
     let discountAmount = 0;
     let appliedOffer = null;
+    let appliedOffers = [];
 
-    if (offerId) {
-      const offerDoc = await db.collection('offers').doc(offerId).get();
+    // Merge offerId into offerIds for backward compatibility
+    const allOfferIds = offerIds && offerIds.length > 0 ? offerIds : (offerId ? [offerId] : []);
+
+    // Get offer settings for validation
+    const offerSettings = customerAppSettings.offerSettings || {};
+    const allowMultipleOffers = offerSettings.allowMultipleOffers ?? false;
+    const maxOffersAllowed = offerSettings.maxOffersAllowed ?? 1;
+
+    // Limit offers based on settings
+    const limitedOfferIds = allowMultipleOffers
+      ? allOfferIds.slice(0, maxOffersAllowed)
+      : allOfferIds.slice(0, 1);
+
+    for (const currentOfferId of limitedOfferIds) {
+      const offerDoc = await db.collection('offers').doc(currentOfferId).get();
 
       if (offerDoc.exists) {
         const offer = offerDoc.data();
@@ -4935,40 +4951,43 @@ app.post('/api/public/orders/:restaurantId', vercelSecurityMiddleware.publicAPI,
         const isValidFirstOrder = !offer.isFirstOrderOnly || isFirstOrder;
 
         if (offer.isActive && offer.restaurantId === restaurantId && isValidDate && isUnderUsageLimit && meetsMinOrder && isValidFirstOrder) {
-          // Calculate discount
+          // Calculate discount for this offer
+          let offerDiscount = 0;
           if (offer.discountType === 'percentage') {
-            discountAmount = (subtotal * offer.discountValue) / 100;
-            if (offer.maxDiscount && discountAmount > offer.maxDiscount) {
-              discountAmount = offer.maxDiscount;
+            offerDiscount = (subtotal * offer.discountValue) / 100;
+            if (offer.maxDiscount && offerDiscount > offer.maxDiscount) {
+              offerDiscount = offer.maxDiscount;
             }
           } else {
-            discountAmount = offer.discountValue;
+            offerDiscount = offer.discountValue;
           }
 
-          // Cap discount at subtotal
-          if (discountAmount > subtotal) {
-            discountAmount = subtotal;
-          }
-
-          appliedOffer = {
-            id: offerId,
+          const appliedOfferData = {
+            id: currentOfferId,
             name: offer.name,
             discountType: offer.discountType,
             discountValue: offer.discountValue,
-            discountApplied: discountAmount
+            discountApplied: offerDiscount
           };
 
-          // Increment offer usage count - DEFERRED TO ORDER COMPLETION
-          // await offerDoc.ref.update({
-          //   usageCount: FieldValue.increment(1),
-          //   updatedAt: new Date()
-          // });
+          appliedOffers.push(appliedOfferData);
+          discountAmount += offerDiscount;
 
-          console.log(`🎁 Offer applied: ${offer.name}, Discount: ₹${discountAmount}`);
+          console.log(`🎁 Offer applied: ${offer.name}, Discount: ₹${offerDiscount}`);
         } else {
-          console.log(`⚠️ Offer ${offerId} not valid for this order`);
+          console.log(`⚠️ Offer ${currentOfferId} not valid for this order`);
         }
       }
+    }
+
+    // Cap total discount at subtotal
+    if (discountAmount > subtotal) {
+      discountAmount = subtotal;
+    }
+
+    // For backward compatibility, set appliedOffer to first applied offer
+    if (appliedOffers.length > 0) {
+      appliedOffer = appliedOffers[0];
     }
 
     // Calculate loyalty points redemption
@@ -5053,6 +5072,7 @@ app.post('/api/public/orders/:restaurantId', vercelSecurityMiddleware.publicAPI,
       loyaltyDiscount: loyaltyDiscount,
       totalAmount: finalTotal,
       appliedOffer: appliedOffer,
+      appliedOffers: appliedOffers,
       loyaltyPointsRedeemed: loyaltyPointsRedeemed,
       loyaltyPointsEarned: loyaltyPointsEarned,
       customerInfo: {
@@ -5097,6 +5117,7 @@ app.post('/api/public/orders/:restaurantId', vercelSecurityMiddleware.publicAPI,
       status: 'pending',
       itemsCount: orderItems.length,
       appliedOffer: appliedOffer ? appliedOffer.name : null,
+      appliedOffers: appliedOffers.map(o => o.name),
       loyaltyPointsEarned: loyaltyPointsEarned,
       loyaltyPointsRedeemed: loyaltyPointsRedeemed
     };
@@ -6103,16 +6124,22 @@ app.patch('/api/orders/:orderId/status', authenticateToken, async (req, res) => 
       
       const customerId = orderData.customerId;
       
-      // Update Offer Usage if one was applied
-      if (orderData.appliedOffer && orderData.appliedOffer.id) {
-        try {
-          await db.collection('offers').doc(orderData.appliedOffer.id).update({
-            usageCount: FieldValue.increment(1),
-            updatedAt: new Date()
-          });
-          console.log(`🎁 Offer usage incremented for ${orderData.appliedOffer.id}`);
-        } catch (err) {
-          console.error('Error updating offer usage:', err);
+      // Update Offer Usage for all applied offers
+      const offersToUpdate = orderData.appliedOffers && orderData.appliedOffers.length > 0
+        ? orderData.appliedOffers
+        : (orderData.appliedOffer && orderData.appliedOffer.id ? [orderData.appliedOffer] : []);
+
+      for (const appliedOfferItem of offersToUpdate) {
+        if (appliedOfferItem && appliedOfferItem.id) {
+          try {
+            await db.collection('offers').doc(appliedOfferItem.id).update({
+              usageCount: FieldValue.increment(1),
+              updatedAt: new Date()
+            });
+            console.log(`🎁 Offer usage incremented for ${appliedOfferItem.id}`);
+          } catch (err) {
+            console.error('Error updating offer usage:', err);
+          }
         }
       }
 
@@ -14527,6 +14554,11 @@ app.get('/api/public/customer-app-settings/:restaurantId', vercelSecurityMiddlew
           logoUrl: customerAppSettings.branding?.logoUrl || restaurantData.logo || '',
           tagline: customerAppSettings.branding?.tagline || '',
           headerStyle: customerAppSettings.branding?.headerStyle || 'modern'
+        },
+        offerSettings: {
+          autoApplyBestOffer: customerAppSettings.offerSettings?.autoApplyBestOffer ?? false,
+          allowMultipleOffers: customerAppSettings.offerSettings?.allowMultipleOffers ?? false,
+          maxOffersAllowed: customerAppSettings.offerSettings?.maxOffersAllowed ?? 1
         }
       }
     });
