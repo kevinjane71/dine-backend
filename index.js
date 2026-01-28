@@ -5005,16 +5005,23 @@ app.post('/api/public/orders/:restaurantId', vercelSecurityMiddleware.publicAPI,
     // Calculate loyalty points earned
     let loyaltyPointsEarned = 0;
     if (loyaltySettings.enabled) {
-      // Support new format (earnPerAmount/pointsEarned) and legacy format (pointsPerRupee)
-      if (loyaltySettings.earnPerAmount && loyaltySettings.pointsEarned) {
-        const earnPerAmount = loyaltySettings.earnPerAmount || 100;
-        const pointsEarned = loyaltySettings.pointsEarned || 4;
-        loyaltyPointsEarned = Math.floor(finalTotal / earnPerAmount) * pointsEarned;
-      } else {
-        // Legacy support for pointsPerRupee
-        const pointsPerRupee = loyaltySettings.pointsPerRupee || 1;
-        loyaltyPointsEarned = Math.floor(finalTotal * pointsPerRupee);
-      }
+      // Normalize loyalty settings with defaults (same as GET endpoint)
+      const normalizedLoyalty = {
+        earnPerAmount: Number(loyaltySettings.earnPerAmount) || 100,
+        pointsEarned: Number(loyaltySettings.pointsEarned) || 4,
+        redemptionRate: Number(loyaltySettings.redemptionRate) || 100,
+        maxRedemptionPercent: Number(loyaltySettings.maxRedemptionPercent) || 20
+      };
+
+      // Use new format with normalized values
+      // Formula: For every X rupees spent, earn Y points
+      // Example: earnPerAmount=100, pointsEarned=4 means for every ₹100 spent, earn 4 points
+      // For ₹571.5: Math.floor(571.5 / 100) * 4 = 5 * 4 = 20 points
+      const earnPerAmount = normalizedLoyalty.earnPerAmount;
+      const pointsEarned = normalizedLoyalty.pointsEarned;
+      loyaltyPointsEarned = Math.floor(finalTotal / earnPerAmount) * pointsEarned;
+
+      console.log(`💎 Loyalty points calculation: ₹${finalTotal} / ₹${earnPerAmount} * ${pointsEarned} = ${loyaltyPointsEarned} points`);
     }
 
     // Generate order number and daily order ID
@@ -14530,10 +14537,16 @@ app.get('/api/public/customer-app-settings/:restaurantId', vercelSecurityMiddlew
 });
 
 // Get active offers for a restaurant (public endpoint for Crave app)
+// Query params:
+// - isFirstOrder=true/false - Filter first-order-only offers based on customer status
 app.get('/api/public/offers/:restaurantId', vercelSecurityMiddleware.publicAPI, async (req, res) => {
   try {
     const { restaurantId } = req.params;
+    const { isFirstOrder } = req.query;
     const now = new Date();
+
+    // Parse isFirstOrder query param (default to undefined if not provided)
+    const customerIsFirstOrder = isFirstOrder === 'true' ? true : isFirstOrder === 'false' ? false : undefined;
 
     const offersSnapshot = await db.collection('offers')
       .where('restaurantId', '==', restaurantId)
@@ -14560,7 +14573,12 @@ app.get('/api/public/offers/:restaurantId', vercelSecurityMiddleware.publicAPI, 
       const isValidDate = (!validFrom || now >= validFrom) && (!validUntil || now <= validUntil);
       const isUnderUsageLimit = !offer.usageLimit || (offer.usageCount || 0) < offer.usageLimit;
 
-      if (isValidDate && isUnderUsageLimit) {
+      // Filter first-order-only offers if customer status is provided
+      // If isFirstOrder is false, exclude first-order-only offers
+      // If isFirstOrder is true or not provided, include all offers
+      const isEligibleForFirstOrderOffer = !offer.isFirstOrderOnly || customerIsFirstOrder !== false;
+
+      if (isValidDate && isUnderUsageLimit && isEligibleForFirstOrderOffer) {
         offers.push({
           id: doc.id,
           name: offer.name,
@@ -14580,7 +14598,7 @@ app.get('/api/public/offers/:restaurantId', vercelSecurityMiddleware.publicAPI, 
       }
     });
 
-    console.log(`Found ${offers.length} valid offers for restaurant ${restaurantId}`);
+    console.log(`Found ${offers.length} valid offers for restaurant ${restaurantId} (isFirstOrder: ${customerIsFirstOrder})`);
     res.json({ offers });
   } catch (error) {
     console.error('Get public offers error:', error);
@@ -14793,6 +14811,11 @@ app.get('/api/restaurants/:restaurantId/customer-app-settings', authenticateToke
         redemptionRate: existingSettings.loyaltySettings?.redemptionRate || 100,
         maxRedemptionPercent: existingSettings.loyaltySettings?.maxRedemptionPercent || 20
       },
+      offerSettings: {
+        autoApplyBestOffer: existingSettings.offerSettings?.autoApplyBestOffer ?? false,
+        allowMultipleOffers: existingSettings.offerSettings?.allowMultipleOffers ?? false,
+        maxOffersAllowed: existingSettings.offerSettings?.maxOffersAllowed || 1
+      },
       branding: {
         primaryColor: existingSettings.branding?.primaryColor || '#ef4444',
         textColor: existingSettings.branding?.textColor || '#ffffff',
@@ -14891,6 +14914,11 @@ app.put('/api/restaurants/:restaurantId/customer-app-settings', authenticateToke
         pointsEarned: Number(settings.loyaltySettings?.pointsEarned) || 4,
         redemptionRate: Number(settings.loyaltySettings?.redemptionRate) || 100,
         maxRedemptionPercent: Number(settings.loyaltySettings?.maxRedemptionPercent) || 20
+      },
+      offerSettings: {
+        autoApplyBestOffer: settings.offerSettings?.autoApplyBestOffer ?? false,
+        allowMultipleOffers: settings.offerSettings?.allowMultipleOffers ?? false,
+        maxOffersAllowed: Number(settings.offerSettings?.maxOffersAllowed) || 1
       },
       branding: {
         primaryColor: settings.branding?.primaryColor || '#ef4444',
