@@ -5202,6 +5202,18 @@ app.post('/api/public/orders/:restaurantId', vercelSecurityMiddleware.publicAPI,
     inventoryService.deductInventoryForOrder(restaurantId, orderRef.id, orderItems)
         .catch(err => console.error('Inventory Deduction Error:', err));
 
+    // Trigger Pusher notification for real-time updates (public/online orders)
+    pusherService.notifyOrderCreated(restaurantId, {
+      id: orderRef.id,
+      orderNumber: orderData.orderNumber,
+      dailyOrderId: orderData.dailyOrderId,
+      status: orderData.status,
+      totalAmount: finalTotal,
+      tableNumber: tableNum,
+      orderType: orderType,
+      orderSource: resolvedOrderSource
+    }).catch(err => console.error('Pusher notification error (non-blocking):', err));
+
     res.status(201).json({
       message: 'Order placed successfully',
       order: {
