@@ -4738,7 +4738,8 @@ app.post('/api/public/orders/:restaurantId', vercelSecurityMiddleware.publicAPI,
       offerId, // Optional single offer to apply (backward compatible)
       offerIds = [], // Optional multiple offers to apply
       deliveryAddress, // For delivery orders
-      redeemLoyaltyPoints = 0 // Loyalty points to redeem
+      redeemLoyaltyPoints = 0, // Loyalty points to redeem
+      orderSource = 'crave_app' // 'crave_app' | 'online_order' – source of the order for order history
     } = req.body;
 
     if (!restaurantId || !items || items.length === 0) {
@@ -5057,6 +5058,7 @@ app.post('/api/public/orders/:restaurantId', vercelSecurityMiddleware.publicAPI,
       'delivery': 'Delivery'
     };
 
+    const resolvedOrderSource = (orderSource === 'online_order' ? 'online_order' : 'crave_app');
     const orderData = {
       restaurantId,
       orderNumber,
@@ -5065,7 +5067,7 @@ app.post('/api/public/orders/:restaurantId', vercelSecurityMiddleware.publicAPI,
       tableNumber: tableNum,
       orderType: orderType,
       orderTypeLabel: orderTypeLabels[orderType] || 'Customer Order',
-      orderSource: 'crave_app', // Clear tag for order source
+      orderSource: resolvedOrderSource,
       items: orderItems,
       subtotal: subtotal,
       discountAmount: discountAmount,
@@ -5087,9 +5089,11 @@ app.post('/api/public/orders/:restaurantId', vercelSecurityMiddleware.publicAPI,
       staffInfo: {
         waiterId: null,
         waiterName: 'Customer Self-Order',
-        kitchenNotes: `${orderTypeLabels[orderType] || 'Customer order'} via Crave App - OTP verified`
+        kitchenNotes: resolvedOrderSource === 'online_order'
+          ? `${orderTypeLabels[orderType] || 'Customer order'} via public online order - OTP verified`
+          : `${orderTypeLabels[orderType] || 'Customer order'} via Crave App - OTP verified`
       },
-      notes: notes || `${orderTypeLabels[orderType]} order via Crave App`,
+      notes: notes || (resolvedOrderSource === 'online_order' ? `${orderTypeLabels[orderType] || 'Customer order'} order via public online order` : `${orderTypeLabels[orderType] || 'Customer order'} order via Crave App`),
       status: 'pending',
       kotSent: false,
       paymentStatus: 'pending',
@@ -5113,7 +5117,7 @@ app.post('/api/public/orders/:restaurantId', vercelSecurityMiddleware.publicAPI,
       tableNumber: tableNum,
       orderType: orderType,
       orderTypeLabel: orderTypeLabels[orderType] || 'Customer Order',
-      orderSource: 'crave_app',
+      orderSource: resolvedOrderSource,
       status: 'pending',
       itemsCount: orderItems.length,
       appliedOffer: appliedOffer ? appliedOffer.name : null,
