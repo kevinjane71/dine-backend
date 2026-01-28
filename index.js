@@ -14514,6 +14514,94 @@ app.get('/api/public/customer/:customerId/loyalty-history', vercelSecurityMiddle
   }
 });
 
+// Get customer order history with full details (public endpoint for Crave app)
+app.get('/api/public/customer/:customerId/orders', vercelSecurityMiddleware.publicAPI, async (req, res) => {
+  try {
+    const { customerId } = req.params;
+    const { page = 1, limit = 20, status = 'all' } = req.query;
+
+    // Verify customer exists
+    const customerDoc = await db.collection('customers').doc(customerId).get();
+    if (!customerDoc.exists) {
+      return res.status(404).json({ error: 'Customer not found' });
+    }
+
+    const customerData = customerDoc.data();
+    const restaurantId = customerData.restaurantId;
+
+    // Fetch orders for this customer from the orders collection
+    let ordersQuery = db.collection(collections.orders)
+      .where('customerId', '==', customerId)
+      .orderBy('createdAt', 'desc');
+
+    const ordersSnapshot = await ordersQuery.get();
+
+    let orders = [];
+    ordersSnapshot.forEach(doc => {
+      const orderData = doc.data();
+
+      // Filter by status if specified
+      if (status !== 'all' && orderData.status !== status) {
+        return;
+      }
+
+      orders.push({
+        id: doc.id,
+        orderNumber: orderData.orderNumber,
+        status: orderData.status || 'pending',
+        orderType: orderData.orderType,
+        orderTypeLabel: orderData.orderTypeLabel,
+        items: (orderData.items || []).map(item => ({
+          name: item.name,
+          quantity: item.quantity,
+          price: item.price,
+          total: item.quantity * item.price
+        })),
+        subtotal: orderData.subtotal || 0,
+        discountAmount: orderData.discountAmount || 0,
+        loyaltyDiscount: orderData.loyaltyDiscount || 0,
+        totalAmount: orderData.totalAmount || 0,
+        appliedOffer: orderData.appliedOffer ? {
+          name: orderData.appliedOffer.name,
+          discountApplied: orderData.appliedOffer.discountApplied
+        } : null,
+        appliedOffers: (orderData.appliedOffers || []).map(o => ({
+          name: o.name,
+          discountApplied: o.discountApplied
+        })),
+        loyaltyPointsEarned: orderData.loyaltyPointsEarned || 0,
+        loyaltyPointsRedeemed: orderData.loyaltyPointsRedeemed || 0,
+        tableNumber: orderData.tableNumber,
+        createdAt: orderData.createdAt?.toDate ? orderData.createdAt.toDate().toISOString() : orderData.createdAt,
+        completedAt: orderData.completedAt?.toDate ? orderData.completedAt.toDate().toISOString() : orderData.completedAt
+      });
+    });
+
+    // Pagination
+    const startIndex = (parseInt(page) - 1) * parseInt(limit);
+    const paginatedOrders = orders.slice(startIndex, startIndex + parseInt(limit));
+
+    res.json({
+      orders: paginatedOrders,
+      pagination: {
+        page: parseInt(page),
+        limit: parseInt(limit),
+        total: orders.length,
+        hasMore: startIndex + parseInt(limit) < orders.length
+      },
+      summary: {
+        totalOrders: orders.length,
+        pendingOrders: orders.filter(o => o.status === 'pending').length,
+        completedOrders: orders.filter(o => o.status === 'completed').length
+      }
+    });
+
+  } catch (error) {
+    console.error('Get customer orders error:', error);
+    res.status(500).json({ error: 'Failed to fetch order history' });
+  }
+});
+
 // Get customer app settings (public endpoint for Crave app)
 app.get('/api/public/customer-app-settings/:restaurantId', vercelSecurityMiddleware.publicAPI, async (req, res) => {
   try {
