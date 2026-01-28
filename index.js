@@ -19,6 +19,7 @@ const { FieldValue } = require('firebase-admin/firestore');
 const performanceOptimizer = require('./middleware/performanceOptimizer');
 const firestoreOptimizer = require('./utils/firestoreOptimizer');
 const inventoryService = require('./services/inventoryService');
+const pusherService = require('./services/pusherService');
 
 // Generate daily order ID (starts from 1 each day)
 async function generateDailyOrderId(restaurantId) {
@@ -5758,6 +5759,17 @@ app.post('/api/orders', async (req, res) => {
       // Don't fail order creation if automation fails
     }
 
+    // Trigger Pusher notification for real-time updates
+    pusherService.notifyOrderCreated(restaurantId, {
+      id: orderRef.id,
+      orderNumber: orderNumber,
+      dailyOrderId: dailyOrderId,
+      status: orderData.status,
+      totalAmount: totalAmount,
+      tableNumber: tableNumber,
+      orderType: orderType
+    }).catch(err => console.error('Pusher notification error (non-blocking):', err));
+
     res.status(201).json({
       message: 'Order created successfully',
       order: {
@@ -6250,6 +6262,13 @@ app.patch('/api/orders/:orderId/status', authenticateToken, async (req, res) => 
       updatedAt: new Date()
     });
 
+    // Trigger Pusher notification for real-time updates
+    pusherService.notifyOrderStatusUpdated(orderData.restaurantId, orderId, status, {
+      orderNumber: orderData.orderNumber,
+      dailyOrderId: orderData.dailyOrderId,
+      totalAmount: orderData.totalAmount
+    }).catch(err => console.error('Pusher notification error (non-blocking):', err));
+
     res.json({ message: 'Order status updated successfully' });
 
   } catch (error) {
@@ -6678,7 +6697,16 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
       }
     }
 
-    res.json({ 
+    // Trigger Pusher notification for real-time updates
+    pusherService.notifyOrderUpdated(currentOrder.restaurantId, orderId, {
+      status: status || currentOrder.status,
+      orderNumber: currentOrder.orderNumber,
+      dailyOrderId: currentOrder.dailyOrderId,
+      totalAmount: updateData.totalAmount || currentOrder.totalAmount,
+      items: updateData.items || currentOrder.items
+    }).catch(err => console.error('Pusher notification error (non-blocking):', err));
+
+    res.json({
       message: 'Order updated successfully',
       data: { orderId }
     });
@@ -6723,7 +6751,11 @@ app.delete('/api/orders/:orderId', authenticateToken, async (req, res) => {
     
     // Delete the order
     await db.collection(collections.orders).doc(orderId).delete();
-    
+
+    // Trigger Pusher notification for real-time updates
+    pusherService.notifyOrderDeleted(order.restaurantId, orderId)
+      .catch(err => console.error('Pusher notification error (non-blocking):', err));
+
     res.json({ message: 'Order deleted successfully' });
   } catch (error) {
     console.error('Delete order error:', error);
