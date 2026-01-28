@@ -14598,6 +14598,7 @@ app.get('/api/public/customer/:customerId/orders', vercelSecurityMiddleware.publ
       orders.push({
         id: doc.id,
         orderNumber: orderData.orderNumber,
+        dailyOrderId: orderData.dailyOrderId ?? null,
         status: orderData.status || 'pending',
         orderType: orderData.orderType,
         orderTypeLabel: orderData.orderTypeLabel,
