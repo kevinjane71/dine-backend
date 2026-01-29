@@ -496,30 +496,47 @@ const authenticateToken = (req, res, next) => {
     return res.status(401).json({ error: 'Access token required' });
   }
 
-  jwt.verify(token, process.env.JWT_SECRET, (err, user) => {
+  jwt.verify(token, process.env.JWT_SECRET, async (err, user) => {
     if (err) {
       console.log('Token verification failed:', err.message);
       return res.status(403).json({ error: 'Invalid or expired token' });
     }
     console.log('Token verified successfully for user:', user.userId);
     req.user = user;
-    
+
+    // Staff/employee: if marked inactive, reject all requests (revoke access)
+    const staffRoles = ['waiter', 'manager', 'employee', 'cashier', 'sales'];
+    if (user.userId) {
+      try {
+        const userDoc = await db.collection(collections.users).doc(user.userId).get();
+        if (userDoc.exists) {
+          const userData = userDoc.data();
+          const role = (userData.role || '').toLowerCase();
+          if (staffRoles.includes(role) && userData.status === 'inactive') {
+            return res.status(401).json({
+              error: 'Account deactivated',
+              message: 'Your account has been deactivated. Please contact your manager.',
+              inactive: true
+            });
+          }
+        }
+      } catch (dbErr) {
+        console.error('Auth staff status check error:', dbErr);
+        // On DB error, allow request (don't block on transient errors)
+      }
+    }
+
     // Demo account restrictions with whitelist
     if (user.phone === '+919000000000') {
-      // Whitelist of endpoints that demo accounts can access (any method)
       const demoAllowedEndpoints = [
         '/api/auth/phone/verify-otp',
         '/api/auth/logout',
         '/api/auth/refresh-token'
       ];
-      
-      // Allow GET requests and whitelisted endpoints
       if (req.method === 'GET' || demoAllowedEndpoints.includes(req.path)) {
         console.log(`🎭 Demo account accessing allowed endpoint: ${req.method} ${req.path}`);
         return next();
       }
-      
-      // Block all other non-GET requests
       if (req.method === 'POST' || req.method === 'PATCH' || req.method === 'DELETE') {
         console.log(`🎭 Demo account detected: ${req.method} ${req.path} - Blocking request`);
         return res.status(403).json({
@@ -530,7 +547,7 @@ const authenticateToken = (req, res, next) => {
         });
       }
     }
-    
+
     next();
   });
 };
