@@ -4506,15 +4506,15 @@ app.patch('/api/menus/item/:id', authenticateToken, async (req, res) => {
     
     // Update the menu item in the restaurant document
     const currentMenu = restaurantData.menu || { categories: [], items: [] };
-    const updatedItems = currentMenu.items.map(item => {
+    const updatedItems = (currentMenu.items || []).map(item => {
       if (item.id === id) {
         return { ...item, ...updateData };
       }
       return item;
     });
-    
+
     // Update categories as well
-    const updatedCategories = currentMenu.categories.map(category => ({
+    const updatedCategories = (currentMenu.categories || []).map(category => ({
       ...category,
       items: (category.items || []).map(item => {
         if (item.id === id) {
@@ -4701,10 +4701,10 @@ app.delete('/api/menus/item/:id', authenticateToken, async (req, res) => {
     
     // Soft delete by setting status to 'deleted'
     const currentMenu = restaurantData.menu || { categories: [], items: [] };
-    const updatedItems = currentMenu.items.map(item => {
+    const updatedItems = (currentMenu.items || []).map(item => {
       if (item.id === id) {
-        return { 
-          ...item, 
+        return {
+          ...item,
       status: 'deleted',
       deletedAt: new Date(),
       updatedAt: new Date()
@@ -4712,9 +4712,9 @@ app.delete('/api/menus/item/:id', authenticateToken, async (req, res) => {
       }
       return item;
     });
-    
+
     // Update categories as well
-    const updatedCategories = currentMenu.categories.map(category => ({
+    const updatedCategories = (currentMenu.categories || []).map(category => ({
       ...category,
       items: (category.items || []).map(item => {
         if (item.id === id) {
@@ -4772,7 +4772,7 @@ app.delete('/api/menus/:restaurantId/bulk-delete', authenticateToken, async (req
     const currentMenu = restaurantData.menu || { categories: [], items: [] };
 
     // Count active items before deletion
-    const activeItemsCount = currentMenu.items.filter(item => item.status !== 'deleted').length;
+    const activeItemsCount = (currentMenu.items || []).filter(item => item.status !== 'deleted').length;
 
     if (activeItemsCount === 0) {
       return res.status(400).json({
@@ -4783,7 +4783,7 @@ app.delete('/api/menus/:restaurantId/bulk-delete', authenticateToken, async (req
 
     // Soft delete all items by setting status to 'deleted'
     const deletedTimestamp = new Date();
-    const updatedItems = currentMenu.items.map(item => ({
+    const updatedItems = (currentMenu.items || []).map(item => ({
       ...item,
       status: 'deleted',
       deletedAt: deletedTimestamp,
@@ -4791,7 +4791,7 @@ app.delete('/api/menus/:restaurantId/bulk-delete', authenticateToken, async (req
     }));
 
     // Update categories as well
-    const updatedCategories = currentMenu.categories.map(category => ({
+    const updatedCategories = (currentMenu.categories || []).map(category => ({
       ...category,
       items: (category.items || []).map(item => ({
         ...item,
@@ -15566,7 +15566,7 @@ app.use('/api/payments', paymentRouter);
 app.get('/api/categories/:restaurantId', authenticateToken, async (req, res) => {
   try {
     const { restaurantId } = req.params;
-    
+
     // Get restaurant document to access embedded categories
     const restaurantDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
     if (!restaurantDoc.exists) {
@@ -15574,7 +15574,41 @@ app.get('/api/categories/:restaurantId', authenticateToken, async (req, res) => 
     }
 
     const restaurantData = restaurantDoc.data();
-    const categories = restaurantData.categories || [];
+    let categories = restaurantData.categories || [];
+
+    // If no categories defined, extract them dynamically from menu items
+    if (categories.length === 0) {
+      const menuItems = restaurantData.menu?.items || [];
+      const categoryMap = new Map();
+
+      // Extract unique categories from menu items
+      for (const item of menuItems) {
+        if (item.category && item.status !== 'deleted') {
+          const categoryId = item.category.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
+          if (categoryId && !categoryMap.has(categoryId)) {
+            categoryMap.set(categoryId, {
+              id: categoryId,
+              name: item.category,
+              emoji: '🍽️',
+              description: '',
+              createdAt: new Date(),
+              updatedAt: new Date()
+            });
+          }
+        }
+      }
+
+      categories = Array.from(categoryMap.values());
+
+      // Optionally save these extracted categories back to the restaurant
+      if (categories.length > 0) {
+        await db.collection(collections.restaurants).doc(restaurantId).update({
+          categories: categories,
+          updatedAt: new Date()
+        });
+        console.log(`✅ Auto-extracted ${categories.length} categories for restaurant ${restaurantId}`);
+      }
+    }
 
     res.json({ categories });
   } catch (error) {
