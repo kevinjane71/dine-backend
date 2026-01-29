@@ -3628,13 +3628,43 @@ app.post('/api/auth/local-login', async (req, res) => {
         .where('ownerId', '==', userId)
         .limit(1)
         .get();
-      
+
       hasRestaurants = !restaurantsQuery.empty;
     }
 
-    // Generate JWT token (same as OTP flow)
+    // Get actual user data for token generation
+    const actualUserData = userDoc ? userDoc.data() : null;
+    const actualRole = actualUserData?.role || 'owner';
+    const staffRoles = ['waiter', 'manager', 'employee', 'cashier', 'sales'];
+    const isStaff = staffRoles.includes(actualRole.toLowerCase());
+
+    // For staff, get their restaurantId
+    let staffRestaurantId = actualUserData?.restaurantId || null;
+    if (isStaff && !staffRestaurantId) {
+      // Try to find from userRestaurants collection
+      const userRestSnapshot = await db.collection(collections.userRestaurants)
+        .where('userId', '==', userId)
+        .limit(1)
+        .get();
+      if (!userRestSnapshot.empty) {
+        staffRestaurantId = userRestSnapshot.docs[0].data().restaurantId;
+      }
+    }
+
+    // Generate JWT token with actual role and restaurantId
+    const tokenPayload = {
+      userId,
+      phone: actualUserData?.phone || normalizedPhone || null,
+      email: actualUserData?.email || normalizedEmail || null,
+      role: actualRole
+    };
+    // Add restaurantId for staff members
+    if (isStaff && staffRestaurantId) {
+      tokenPayload.restaurantId = staffRestaurantId;
+    }
+
     const token = jwt.sign(
-      { userId, phone: normalizedPhone || null, role: 'owner' },
+      tokenPayload,
       process.env.JWT_SECRET,
       { expiresIn: '7d' }
     );
@@ -3655,23 +3685,34 @@ app.post('/api/auth/local-login', async (req, res) => {
       }
     }
 
-    // Return same response structure as /api/auth/phone/verify-otp
+    // Build user response object
+    const userResponse = {
+      id: userId,
+      phone: actualUserData?.phone || normalizedPhone || null,
+      email: actualUserData?.email || normalizedEmail || null,
+      name: actualUserData?.name || name || (isNewUser ? 'Restaurant Owner' : 'User'),
+      role: actualRole,
+      setupComplete: actualUserData?.setupComplete || false
+    };
+
+    // Add staff-specific fields
+    if (isStaff) {
+      userResponse.restaurantId = staffRestaurantId;
+      userResponse.pageAccess = actualUserData?.pageAccess || null;
+      userResponse.loginId = actualUserData?.loginId || null;
+      userResponse.username = actualUserData?.username || null;
+    }
+
+    // Return response (works for both owner and staff)
     res.json({
       success: true,
       message: isNewUser ? 'Welcome! Account created successfully.' : 'Login successful',
       token,
-      user: {
-        id: userId,
-        phone: isNewUser ? (normalizedPhone || null) : ((userDoc && userDoc.data()) ? userDoc.data().phone : normalizedPhone || null),
-        email: isNewUser ? (normalizedEmail || null) : ((userDoc && userDoc.data()) ? userDoc.data().email : normalizedEmail || null),
-        name: isNewUser ? (name || 'Restaurant Owner') : ((userDoc && userDoc.data()) ? (userDoc.data().name || name || 'Restaurant Owner') : (name || 'Restaurant Owner')),
-        role: 'owner',
-        setupComplete: isNewUser ? false : ((userDoc && userDoc.data()) ? (userDoc.data().setupComplete || false) : false)
-      },
+      user: userResponse,
       firstTimeUser: isNewUser,
-      isNewUser, // Keep for backward compatibility
-      hasRestaurants,
-      subdomainUrl, // Include subdomain URL if enabled
+      isNewUser,
+      hasRestaurants: isStaff ? !!staffRestaurantId : hasRestaurants,
+      subdomainUrl,
       redirectTo: subdomainUrl || (hasRestaurants ? '/dashboard' : '/admin')
     });
 
