@@ -8719,6 +8719,7 @@ app.get('/api/staff/:restaurantId', authenticateToken, requireOwnerRole, async (
         createdAt: userData.createdAt,
         updatedAt: userData.updatedAt,
         loginId: userData.loginId,
+        username: userData.username || null,
         tempPassword: tempPassword, // Include actual temporary password
         hasTemporaryPassword: hasTemporaryPassword
       });
@@ -8747,7 +8748,7 @@ app.get('/api/staff/:staffId/credentials', authenticateToken, requireOwnerRole, 
     // Check if temporary credentials exist
     const credentialsDoc = await db.collection('staffCredentials').doc(staffId).get();
     
-    if (credentialsDoc.exists) {
+      if (credentialsDoc.exists) {
       const credentialsData = credentialsDoc.data();
       
       // Check if credentials have expired
@@ -8757,12 +8758,14 @@ app.get('/api/staff/:staffId/credentials', authenticateToken, requireOwnerRole, 
         
         res.json({
           loginId: staffData.loginId,
+          username: staffData.username || null,
           hasTemporaryPassword: false,
           message: 'Temporary password has expired. Staff member should use their current password.'
         });
       } else {
         res.json({
           loginId: credentialsData.loginId,
+          username: staffData.username || null,
           temporaryPassword: credentialsData.temporaryPassword,
           hasTemporaryPassword: true,
           message: 'This staff member has a temporary password.'
@@ -8771,6 +8774,7 @@ app.get('/api/staff/:staffId/credentials', authenticateToken, requireOwnerRole, 
     } else {
       res.json({
         loginId: staffData.loginId,
+        username: staffData.username || null,
         hasTemporaryPassword: false,
         message: 'This staff member has already changed their password.'
       });
@@ -8824,11 +8828,31 @@ app.delete('/api/staff/:staffId', authenticateToken, requireOwnerRole, async (re
 app.post('/api/staff/:restaurantId', authenticateToken, requireOwnerRole, async (req, res) => {
   try {
     const { restaurantId } = req.params;
-    const { name, phone, email, role = 'waiter', startDate, address } = req.body;
+    const { name, phone, email, role = 'waiter', startDate, address, username: usernameInput } = req.body;
 
     if (!name || !phone) {
       return res.status(400).json({ error: 'Name and phone are required' });
     }
+
+    // Optional username: validate format and uniqueness (case-insensitive)
+    let username = null;
+    let usernameLower = null;
+    if (usernameInput != null && String(usernameInput).trim() !== '') {
+      const raw = String(usernameInput).trim();
+      if (raw.length < 3 || raw.length > 50) {
+        return res.status(400).json({ error: 'Username must be 3–50 characters' });
+      }
+      if (!/^[a-zA-Z0-9_]+$/.test(raw)) {
+        return res.status(400).json({ error: 'Username can only contain letters, numbers and underscore' });
+      }
+      usernameLower = raw.toLowerCase();
+      const existingByUsername = await db.collection(collections.users).where('usernameLower', '==', usernameLower).get();
+      if (!existingByUsername.empty) {
+        return res.status(400).json({ error: 'Username already exists. Choose a different username.' });
+      }
+      username = raw;
+    }
+
 
     // Check if email already exists (only if email is provided)
     if (email) {
@@ -8874,6 +8898,7 @@ app.post('/api/staff/:restaurantId', authenticateToken, requireOwnerRole, async 
       lastLogin: null,
       temporaryPassword: true, // Flag to indicate password needs to be changed
       loginId: userId, // Use the generated 5-digit numeric ID
+      ...(username != null && { username, usernameLower }),
       pageAccess: {
         dashboard: true,
         history: true,
@@ -8915,11 +8940,13 @@ app.post('/api/staff/:restaurantId', authenticateToken, requireOwnerRole, async 
         address,
         status: 'active',
         startDate: staffData.startDate,
-        createdAt: staffData.createdAt
+        createdAt: staffData.createdAt,
+        username: username || null
       },
       // For demo purposes, return credentials (remove in production)
       credentials: {
         loginId: userId,
+        username: username || null,
         password: temporaryPassword
       }
     });
@@ -9117,21 +9144,31 @@ app.get('/api/user/profile', authenticateToken, async (req, res) => {
   }
 });
 
-// Staff login with User ID and password
+// Staff login with User ID or username and password
 app.post('/api/auth/staff/login', async (req, res) => {
   try {
     const { loginId, password } = req.body;
+    const identifier = (loginId != null && loginId !== '') ? String(loginId).trim() : '';
 
-    if (!loginId || !password) {
-      return res.status(400).json({ error: 'Login ID and password are required' });
+    if (!identifier || !password) {
+      return res.status(400).json({ error: 'User ID/username and password are required' });
     }
 
-    // Find staff member by loginId (User ID)
-    const staffQuery = await db.collection(collections.users)
-      .where('loginId', '==', loginId)
-      .where('role', 'in', ['waiter', 'manager', 'employee','cashier', 'sales'])
+    // Find staff: first by loginId (User ID), then by username (case-insensitive)
+    let staffQuery = await db.collection(collections.users)
+      .where('loginId', '==', identifier)
+      .where('role', 'in', ['waiter', 'manager', 'employee', 'cashier', 'sales'])
       .where('status', '==', 'active')
       .get();
+
+    if (staffQuery.empty) {
+      const usernameLower = identifier.toLowerCase();
+      staffQuery = await db.collection(collections.users)
+        .where('usernameLower', '==', usernameLower)
+        .where('role', 'in', ['waiter', 'manager', 'employee', 'cashier', 'sales'])
+        .where('status', '==', 'active')
+        .get();
+    }
 
     if (staffQuery.empty) {
       return res.status(404).json({ error: 'Staff member not found or inactive' });
@@ -9185,7 +9222,9 @@ app.post('/api/auth/staff/login', async (req, res) => {
         role: staffData.role,
         restaurantId: staffData.restaurantId,
         phone: staffData.phone,
-        pageAccess: staffData.pageAccess
+        pageAccess: staffData.pageAccess,
+        loginId: staffData.loginId,
+        username: staffData.username || null
       },
       restaurant: restaurantData ? {
         id: staffData.restaurantId, // Use the restaurantId from staff data
