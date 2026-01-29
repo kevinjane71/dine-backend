@@ -202,6 +202,9 @@ const shiftSchedulingRoutes = require('./routes/shiftScheduling');
 // Google Reviews routes
 const googleReviewsRoutes = require('./routes/googleReviews');
 
+// Custom URL (slug) routes for short restaurant URLs
+const customUrlRoutes = require('./routes/customUrlRoutes');
+
 // Debug email service initialization
 console.log('📧 Email service loaded:', !!emailService);
 if (emailService) {
@@ -6849,6 +6852,9 @@ app.use('/api/shift-scheduling', shiftSchedulingRoutes);
 
 // Initialize Google Reviews routes
 app.use('/api/google-reviews', googleReviewsRoutes);
+
+// Initialize Custom URL (slug) routes
+app.use('/api', customUrlRoutes);
 
 
 // Generic image upload API
