@@ -2667,9 +2667,10 @@ app.post('/api/staff/change-password', authenticateToken, async (req, res) => {
 
     const userData = userDoc.data();
 
-    // Verify this is a staff member (has loginId and is staff role)
-    if (!userData.loginId || !['waiter', 'manager', 'employee'].includes(userData.role?.toLowerCase())) {
-      return res.status(403).json({ 
+    // Verify this is a staff member (has loginId and is not owner/customer)
+    const userRole = (userData.role || '').toLowerCase();
+    if (!userData.loginId || userRole === 'owner' || userRole === 'customer') {
+      return res.status(403).json({
         error: 'Password change is only available for staff members',
         notStaff: true
       });
@@ -8674,20 +8675,24 @@ const requireOwnerRole = (req, res, next) => {
   next();
 };
 
-// Get all waiters for a restaurant (for filtering purposes)
+// Get all waiters/staff for a restaurant (for filtering purposes)
 app.get('/api/waiters/:restaurantId', authenticateToken, async (req, res) => {
   try {
     const { restaurantId } = req.params;
 
+    // Get all active staff (any role except owner/customer)
     const snapshot = await db.collection(collections.users)
       .where('restaurantId', '==', restaurantId)
-      .where('role', 'in', ['waiter', 'manager', 'employee'])
       .where('status', '==', 'active')
       .get();
 
     const waiters = [];
     snapshot.forEach(doc => {
       const userData = doc.data();
+      // Skip owners and customers
+      const role = (userData.role || '').toLowerCase();
+      if (role === 'owner' || role === 'customer') return;
+
       waiters.push({
         id: doc.id,
         name: userData.name,
@@ -8714,18 +8719,25 @@ app.get('/api/staff/:restaurantId', authenticateToken, requireOwnerRole, async (
   try {
     const { restaurantId } = req.params;
 
+    // Get all users with this restaurantId (staff members)
+    // Don't filter by specific roles - show all staff regardless of role
     const snapshot = await db.collection(collections.users)
       .where('restaurantId', '==', restaurantId)
-      .where('role', 'in', ['waiter', 'manager', 'employee'])
       .get();
 
     const staff = [];
-    
+
     // Process each staff member and fetch their credentials
     for (const doc of snapshot.docs) {
       const userData = doc.data();
       const staffId = doc.id;
-      
+
+      // Skip owners and customers - only show actual staff
+      const userRole = (userData.role || '').toLowerCase();
+      if (userRole === 'owner' || userRole === 'customer') {
+        continue;
+      }
+
       // Check if temporary credentials exist
       let tempPassword = null;
       let hasTemporaryPassword = false;
@@ -9196,26 +9208,36 @@ app.post('/api/auth/staff/login', async (req, res) => {
     }
 
     // Find staff: first by loginId (User ID), then by username (case-insensitive)
+    // Don't filter by specific roles - allow any role except owner/customer
     let staffQuery = await db.collection(collections.users)
       .where('loginId', '==', identifier)
-      .where('role', 'in', ['waiter', 'manager', 'employee', 'cashier', 'sales'])
       .where('status', '==', 'active')
       .get();
 
-    if (staffQuery.empty) {
+    // Filter out owners and customers
+    let staffDocs = staffQuery.docs.filter(doc => {
+      const role = (doc.data().role || '').toLowerCase();
+      return role !== 'owner' && role !== 'customer';
+    });
+
+    if (staffDocs.length === 0) {
       const usernameLower = identifier.toLowerCase();
       staffQuery = await db.collection(collections.users)
         .where('usernameLower', '==', usernameLower)
-        .where('role', 'in', ['waiter', 'manager', 'employee', 'cashier', 'sales'])
         .where('status', '==', 'active')
         .get();
+
+      staffDocs = staffQuery.docs.filter(doc => {
+        const role = (doc.data().role || '').toLowerCase();
+        return role !== 'owner' && role !== 'customer';
+      });
     }
 
-    if (staffQuery.empty) {
+    if (staffDocs.length === 0) {
       return res.status(404).json({ error: 'Staff member not found or inactive' });
     }
 
-    const staffDoc = staffQuery.docs[0];
+    const staffDoc = staffDocs[0];
     const staffData = staffDoc.data();
 
     // Check password
