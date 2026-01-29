@@ -4311,13 +4311,14 @@ app.get('/api/menus/:restaurantId', async (req, res) => {
 app.post('/api/menus/:restaurantId', authenticateToken, async (req, res) => {
   try {
     const { restaurantId } = req.params;
-    const { 
-      name, 
-      description, 
-      price, 
-      category, 
-      isVeg, 
-      spiceLevel, 
+    const { userId } = req.user;
+    const {
+      name,
+      description,
+      price,
+      category,
+      isVeg,
+      spiceLevel,
       allergens,
       image,
       shortCode,
@@ -4329,9 +4330,15 @@ app.post('/api/menus/:restaurantId', authenticateToken, async (req, res) => {
       return res.status(400).json({ error: 'Name, price, and category are required' });
     }
 
+    // Check if user has access (owner or staff with restaurant access)
+    const hasAccess = await validateRestaurantAccess(userId, restaurantId);
+    if (!hasAccess) {
+      return res.status(403).json({ error: 'Access denied' });
+    }
+
     // Get current restaurant data
     const restaurantDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
-    
+
     if (!restaurantDoc.exists) {
       return res.status(404).json({ error: 'Restaurant not found' });
     }
@@ -4468,14 +4475,14 @@ app.patch('/api/menus/item/:id', authenticateToken, async (req, res) => {
     if (!foundRestaurant || !foundItem) {
       return res.status(404).json({ error: 'Menu item not found' });
     }
-    
-    const restaurantData = foundRestaurant.data();
-    
-    // Check if user owns the restaurant
-    if (restaurantData.ownerId !== userId) {
+
+    // Check if user has access (owner or staff with restaurant access)
+    const hasAccess = await validateRestaurantAccess(userId, foundRestaurant.id);
+    if (!hasAccess) {
       return res.status(403).json({ error: 'Access denied' });
     }
-    
+
+    const restaurantData = foundRestaurant.data();
     const updateData = { updatedAt: new Date() };
     
     // Update allowed fields
@@ -4706,14 +4713,15 @@ app.delete('/api/menus/item/:id', authenticateToken, async (req, res) => {
     if (!foundRestaurant || !foundItem) {
       return res.status(404).json({ error: 'Menu item not found' });
     }
-    
-    const restaurantData = foundRestaurant.data();
-    
-    // Check if user owns the restaurant
-    if (restaurantData.ownerId !== userId) {
+
+    // Check if user has access (owner or staff with restaurant access)
+    const hasAccess = await validateRestaurantAccess(userId, foundRestaurant.id);
+    if (!hasAccess) {
       return res.status(403).json({ error: 'Access denied' });
     }
-    
+
+    const restaurantData = foundRestaurant.data();
+
     // Soft delete by setting status to 'deleted'
     const currentMenu = restaurantData.menu || { categories: [], items: [] };
     const updatedItems = (currentMenu.items || []).map(item => {
@@ -4778,9 +4786,10 @@ app.delete('/api/menus/:restaurantId/bulk-delete', authenticateToken, async (req
 
     const restaurantData = restaurantDoc.data();
 
-    // Check if user owns the restaurant
-    if (restaurantData.ownerId !== userId) {
-      return res.status(403).json({ error: 'Access denied. You can only delete menu items for your own restaurant.' });
+    // Check if user has access (owner or staff)
+    const hasAccess = await validateRestaurantAccess(userId, restaurantId);
+    if (!hasAccess) {
+      return res.status(403).json({ error: 'Access denied' });
     }
 
     // Get current menu
@@ -7050,32 +7059,42 @@ app.post('/api/menu-items/:itemId/images', authenticateToken, upload.array('imag
 
     // Find the menu item in the restaurant's menu structure
     console.log('🔍 Looking up menu item with ID:', itemId);
-    
-    // We need to find which restaurant this menu item belongs to
-    // Since we don't have restaurantId in the URL, we'll need to search through restaurants
+
+    // Get all restaurants user has access to (via userRestaurants)
+    const userRestaurantSnapshot = await db.collection(collections.userRestaurants)
+      .where('userId', '==', userId)
+      .get();
+    const accessibleRestaurantIds = new Set();
+    userRestaurantSnapshot.forEach(doc => accessibleRestaurantIds.add(doc.data().restaurantId));
+
+    // Search through restaurants for the menu item
     const restaurantsSnapshot = await db.collection('restaurants').get();
     let menuItem = null;
     let restaurantId = null;
     let restaurantDoc = null;
-    
+
     for (const restaurantDocSnapshot of restaurantsSnapshot.docs) {
       const restaurantData = restaurantDocSnapshot.data();
-      if (restaurantData.ownerId === userId && restaurantData.menu && restaurantData.menu.items) {
+      const restId = restaurantDocSnapshot.id;
+      // Check if user is owner OR has staff access
+      const hasAccess = restaurantData.ownerId === userId || accessibleRestaurantIds.has(restId);
+
+      if (hasAccess && restaurantData.menu && restaurantData.menu.items) {
         const foundItem = restaurantData.menu.items.find(item => item.id === itemId);
         if (foundItem) {
           menuItem = foundItem;
-          restaurantId = restaurantDocSnapshot.id;
+          restaurantId = restId;
           restaurantDoc = restaurantDocSnapshot;
           break;
         }
       }
     }
-    
+
     if (!menuItem) {
       console.log('❌ Menu item not found in any restaurant');
-      return res.status(404).json({ error: 'Menu item not found' });
+      return res.status(404).json({ error: 'Menu item not found or access denied' });
     }
-    
+
     console.log('✅ Found menu item:', { name: menuItem.name, restaurantId });
 
     const uploadedImages = [];
@@ -7155,27 +7174,38 @@ app.delete('/api/menu-items/:itemId/images/:imageIndex', authenticateToken, asyn
     const { itemId, imageIndex } = req.params;
     const { userId } = req.user;
 
+    // Get all restaurants user has access to (via userRestaurants)
+    const userRestaurantSnapshot = await db.collection(collections.userRestaurants)
+      .where('userId', '==', userId)
+      .get();
+    const accessibleRestaurantIds = new Set();
+    userRestaurantSnapshot.forEach(doc => accessibleRestaurantIds.add(doc.data().restaurantId));
+
     // Find the menu item in the restaurant's menu structure
     const restaurantsSnapshot = await db.collection('restaurants').get();
     let menuItem = null;
     let restaurantId = null;
     let restaurantDoc = null;
-    
+
     for (const restaurantDocSnapshot of restaurantsSnapshot.docs) {
       const restaurantData = restaurantDocSnapshot.data();
-      if (restaurantData.ownerId === userId && restaurantData.menu && restaurantData.menu.items) {
+      const restId = restaurantDocSnapshot.id;
+      // Check if user is owner OR has staff access
+      const hasAccess = restaurantData.ownerId === userId || accessibleRestaurantIds.has(restId);
+
+      if (hasAccess && restaurantData.menu && restaurantData.menu.items) {
         const foundItem = restaurantData.menu.items.find(item => item.id === itemId);
         if (foundItem) {
           menuItem = foundItem;
-          restaurantId = restaurantDocSnapshot.id;
+          restaurantId = restId;
           restaurantDoc = restaurantDocSnapshot;
           break;
         }
       }
     }
-    
+
     if (!menuItem) {
-      return res.status(404).json({ error: 'Menu item not found' });
+      return res.status(404).json({ error: 'Menu item not found or access denied' });
     }
 
     const images = menuItem.images || [];
@@ -7279,10 +7309,15 @@ app.post('/api/menus/bulk-upload/:restaurantId', authenticateToken, chatgptUsage
       console.log('⚠️ Some files have unsupported types, but will attempt extraction anyway:', invalidFiles.map(f => f.originalname));
     }
 
-    // Check if user owns the restaurant
-    const restaurant = await db.collection(collections.restaurants).doc(restaurantId).get();
-    if (!restaurant.exists || restaurant.data().ownerId !== userId) {
+    // Check if user has access (owner or staff with restaurant access)
+    const hasAccess = await validateRestaurantAccess(userId, restaurantId);
+    if (!hasAccess) {
       return res.status(403).json({ error: 'Access denied' });
+    }
+
+    const restaurant = await db.collection(collections.restaurants).doc(restaurantId).get();
+    if (!restaurant.exists) {
+      return res.status(404).json({ error: 'Restaurant not found' });
     }
 
     const uploadedFiles = [];
@@ -7469,9 +7504,15 @@ app.post('/api/menus/bulk-save/:restaurantId', authenticateToken, async (req, re
       return res.status(400).json({ error: 'Menu items array is required' });
     }
 
-    const restaurantDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
-    if (!restaurantDoc.exists || restaurantDoc.data().ownerId !== userId) {
+    // Check if user has access (owner or staff with restaurant access)
+    const hasAccess = await validateRestaurantAccess(userId, restaurantId);
+    if (!hasAccess) {
       return res.status(403).json({ error: 'Access denied' });
+    }
+
+    const restaurantDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
+    if (!restaurantDoc.exists) {
+      return res.status(404).json({ error: 'Restaurant not found' });
     }
 
     const restaurantData = restaurantDoc.data();
@@ -8912,7 +8953,7 @@ app.delete('/api/staff/:staffId', authenticateToken, requireOwnerRole, async (re
 app.post('/api/staff/:restaurantId', authenticateToken, requireOwnerRole, async (req, res) => {
   try {
     const { restaurantId } = req.params;
-    const { name, phone, email, role = 'waiter', startDate, address, username: usernameInput } = req.body;
+    const { name, phone, email, role = 'waiter', startDate, address, username: usernameInput, pageAccess: requestedPageAccess } = req.body;
 
     if (!name || !phone) {
       return res.status(400).json({ error: 'Name and phone are required' });
@@ -8983,7 +9024,8 @@ app.post('/api/staff/:restaurantId', authenticateToken, requireOwnerRole, async 
       temporaryPassword: true, // Flag to indicate password needs to be changed
       loginId: userId, // Use the generated 5-digit numeric ID
       ...(username != null && { username, usernameLower }),
-      pageAccess: {
+      // Use pageAccess from request if provided, otherwise use defaults
+      pageAccess: requestedPageAccess || {
         dashboard: true,
         history: true,
         tables: true,
@@ -8996,6 +9038,16 @@ app.post('/api/staff/:restaurantId', authenticateToken, requireOwnerRole, async 
     };
 
     const staffRef = await db.collection(collections.users).add(staffData);
+
+    // Add to userRestaurants collection for access control
+    await db.collection(collections.userRestaurants).add({
+      userId: staffRef.id,
+      restaurantId,
+      role: role,
+      pageAccess: staffData.pageAccess,
+      createdAt: new Date(),
+      updatedAt: new Date()
+    });
 
     // Store temporary password for admin display (will be deleted after first login)
     await db.collection('staffCredentials').doc(staffRef.id).set({
