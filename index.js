@@ -205,6 +205,9 @@ const googleReviewsRoutes = require('./routes/googleReviews');
 // Custom URL (slug) routes for short restaurant URLs
 const customUrlRoutes = require('./routes/customUrlRoutes');
 
+// Staff reset password (owner only)
+const staffResetPasswordRoutes = require('./routes/staffResetPassword');
+
 // Debug email service initialization
 console.log('📧 Email service loaded:', !!emailService);
 if (emailService) {
@@ -8661,6 +8664,9 @@ app.get('/api/waiters/:restaurantId', authenticateToken, async (req, res) => {
     res.status(500).json({ error: 'Failed to fetch waiters' });
   }
 });
+
+// Staff reset password (mount before other /api/staff routes so POST /:staffId/reset-password is matched)
+app.use('/api/staff', staffResetPasswordRoutes);
 
 // Get all staff for a restaurant
 app.get('/api/staff/:restaurantId', authenticateToken, requireOwnerRole, async (req, res) => {
