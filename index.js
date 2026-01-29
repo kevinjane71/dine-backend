@@ -5072,18 +5072,36 @@ app.post('/api/public/orders/:restaurantId', vercelSecurityMiddleware.publicAPI,
         earnPerAmount: Number(loyaltySettings.earnPerAmount) || 100,
         pointsEarned: Number(loyaltySettings.pointsEarned) || 4,
         redemptionRate: Number(loyaltySettings.redemptionRate) || 100,
-        maxRedemptionPercent: Number(loyaltySettings.maxRedemptionPercent) || 20
+        maxRedemptionPercent: Number(loyaltySettings.maxRedemptionPercent) || 20,
+        earnPointsOnRedemption: loyaltySettings.earnPointsOnRedemption === true,
+        earnOnFullAmount: loyaltySettings.earnOnFullAmount === true // default false
       };
 
-      // Use new format with normalized values
-      // Formula: For every X rupees spent, earn Y points
-      // Example: earnPerAmount=100, pointsEarned=4 means for every ₹100 spent, earn 4 points
-      // For ₹571.5: Math.floor(571.5 / 100) * 4 = 5 * 4 = 20 points
       const earnPerAmount = normalizedLoyalty.earnPerAmount;
       const pointsEarned = normalizedLoyalty.pointsEarned;
-      loyaltyPointsEarned = Math.floor(finalTotal / earnPerAmount) * pointsEarned;
 
-      console.log(`💎 Loyalty points calculation: ₹${finalTotal} / ₹${earnPerAmount} * ${pointsEarned} = ${loyaltyPointsEarned} points`);
+      // Check if customer is redeeming points
+      if (loyaltyPointsRedeemed > 0) {
+        // Customer is redeeming points
+        if (!normalizedLoyalty.earnPointsOnRedemption) {
+          // Don't earn any points when redeeming
+          loyaltyPointsEarned = 0;
+          console.log(`💎 Loyalty points: 0 (earning disabled when redeeming)`);
+        } else if (normalizedLoyalty.earnOnFullAmount) {
+          // Earn points on full amount (before redemption discount)
+          const amountBeforeRedemption = subtotal - discountAmount;
+          loyaltyPointsEarned = Math.floor(amountBeforeRedemption / earnPerAmount) * pointsEarned;
+          console.log(`💎 Loyalty points (on full ₹${amountBeforeRedemption}): ${loyaltyPointsEarned} points`);
+        } else {
+          // Default: Earn points only on the remaining amount after redemption
+          loyaltyPointsEarned = Math.floor(finalTotal / earnPerAmount) * pointsEarned;
+          console.log(`💎 Loyalty points (on remaining ₹${finalTotal}): ${loyaltyPointsEarned} points`);
+        }
+      } else {
+        // No redemption - earn points normally on final total
+        loyaltyPointsEarned = Math.floor(finalTotal / earnPerAmount) * pointsEarned;
+        console.log(`💎 Loyalty points calculation: ₹${finalTotal} / ₹${earnPerAmount} * ${pointsEarned} = ${loyaltyPointsEarned} points`);
+      }
     }
 
     // Generate order number and daily/sequential order ID (based on restaurant orderSettings.sequentialOrderIdEnabled)
