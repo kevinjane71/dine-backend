@@ -4339,6 +4339,20 @@ app.post('/api/menus/:restaurantId', authenticateToken, async (req, res) => {
     const restaurantData = restaurantDoc.data();
     const currentMenu = restaurantData.menu || { categories: [], items: [] };
 
+    // Calculate next shortCode if not provided
+    let finalShortCode = shortCode;
+    if (!finalShortCode) {
+      // Find max numeric shortCode in existing items
+      let maxShortCode = 0;
+      for (const item of (currentMenu.items || [])) {
+        const sc = parseInt(item.shortCode, 10);
+        if (!isNaN(sc) && sc > maxShortCode) {
+          maxShortCode = sc;
+        }
+      }
+      finalShortCode = String(maxShortCode + 1);
+    }
+
     // Create new menu item
     const newMenuItem = {
       id: `item_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`, // Generate unique ID
@@ -4350,7 +4364,7 @@ app.post('/api/menus/:restaurantId', authenticateToken, async (req, res) => {
       spiceLevel: spiceLevel || 'medium',
       allergens: allergens || [],
       image: image || null,
-      shortCode: shortCode || name.substring(0, 3).toUpperCase(),
+      shortCode: finalShortCode,
       status: 'active',
       order: 0,
       // Availability/Stock management fields
@@ -7466,6 +7480,16 @@ app.post('/api/menus/bulk-save/:restaurantId', authenticateToken, async (req, re
     // Use restaurant.categories (what getCategories returns), not menu.categories
     let existingCategories = [...(restaurantData.categories || [])];
 
+    // Find the max numeric shortCode in existing items to ensure uniqueness
+    let maxShortCode = 0;
+    for (const item of existingItems) {
+      const sc = parseInt(item.shortCode, 10);
+      if (!isNaN(sc) && sc > maxShortCode) {
+        maxShortCode = sc;
+      }
+    }
+    console.log(`📊 Current max shortCode: ${maxShortCode}`);
+
     // Merge extracted categories into restaurant.categories (by unique id)
     for (const c of extractedCategories) {
       const name = (c && c.name) ? String(c.name).trim() : '';
@@ -7485,6 +7509,9 @@ app.post('/api/menus/bulk-save/:restaurantId', authenticateToken, async (req, re
     const savedItems = [];
     const errors = [];
     const validCategoryIds = new Set(existingCategories.map(c => (c.id || '').toLowerCase()));
+
+    // Counter for unique shortCodes starting from max + 1
+    let shortCodeCounter = maxShortCode;
 
     for (const item of menuItems) {
       try {
@@ -7508,9 +7535,13 @@ app.post('/api/menus/bulk-save/:restaurantId', authenticateToken, async (req, re
         }
 
         // If item has variants, use the lowest variant price as base price, or 0
-        const basePrice = variants.length > 0 
+        const basePrice = variants.length > 0
           ? Math.min(...variants.map(v => v.price))
           : (parseFloat(item.price) || 0);
+
+        // Assign unique shortCode by incrementing counter
+        shortCodeCounter++;
+        const uniqueShortCode = String(shortCodeCounter);
 
         const menuItem = {
           id: `item_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
@@ -7522,7 +7553,7 @@ app.post('/api/menus/bulk-save/:restaurantId', authenticateToken, async (req, re
           isVeg: Boolean(item.isVeg),
           spiceLevel: item.spiceLevel || 'medium',
           allergens: Array.isArray(item.allergens) ? item.allergens : [],
-          shortCode: item.shortCode || (item.name ? String(item.name).substring(0, 3).toUpperCase() : 'X'),
+          shortCode: uniqueShortCode,
           status: 'active',
           order: existingItems.length,
           isAvailable: true,
