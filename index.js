@@ -9868,11 +9868,22 @@ app.get('/api/admin/print-settings/:restaurantId', authenticateToken, async (req
 
     // Default print settings
     const defaultSettings = {
+      // Dashboard UI settings
       kotPrinterEnabled: true,           // Enable dine-kot-printer app auto-printing
       manualPrintEnabled: true,          // Enable manual print button on dashboard
       showKOTSummaryAfterOrder: true,    // Show KOT summary after placing order to kitchen
       showBillSummaryAfterBilling: true, // Show bill summary after completing billing
-      usePusherForKOT: false             // Use Pusher instead of polling
+      usePusherForKOT: false,            // Use Pusher instead of polling
+
+      // Auto-print triggers (for dine-kot-printer app)
+      autoPrintOnKOT: true,              // Auto-print when order is sent to kitchen
+      autoPrintOnBilling: false,         // Auto-print when billing is completed
+
+      // Future reserved flags (for future use)
+      autoPrintOnOnlineOrder: false,     // Reserved: Auto-print for online orders
+      autoPrintOnTableCall: false,       // Reserved: Auto-print when customer calls waiter
+      printKOTCopy: 1,                   // Number of KOT copies to print
+      printBillCopy: 1                   // Number of bill copies to print
     };
 
     const printSettings = { ...defaultSettings, ...(restaurantData.printSettings || {}) };
@@ -9898,19 +9909,35 @@ app.put('/api/admin/print-settings/:restaurantId', authenticateToken, async (req
       return res.status(400).json({ error: 'Invalid print settings' });
     }
 
-    // Validate allowed fields
-    const allowedFields = [
+    // Validate allowed fields (boolean fields)
+    const booleanFields = [
       'kotPrinterEnabled',
       'manualPrintEnabled',
       'showKOTSummaryAfterOrder',
       'showBillSummaryAfterBilling',
-      'usePusherForKOT'
+      'usePusherForKOT',
+      'autoPrintOnKOT',
+      'autoPrintOnBilling',
+      'autoPrintOnOnlineOrder',
+      'autoPrintOnTableCall'
+    ];
+
+    // Numeric fields
+    const numericFields = [
+      'printKOTCopy',
+      'printBillCopy'
     ];
 
     const sanitizedSettings = {};
-    for (const field of allowedFields) {
+    for (const field of booleanFields) {
       if (printSettings[field] !== undefined) {
         sanitizedSettings[field] = Boolean(printSettings[field]);
+      }
+    }
+    for (const field of numericFields) {
+      if (printSettings[field] !== undefined) {
+        const val = parseInt(printSettings[field]);
+        sanitizedSettings[field] = isNaN(val) ? 1 : Math.max(1, Math.min(val, 5)); // 1-5 copies
       }
     }
 
@@ -10352,9 +10379,15 @@ app.get('/api/kot/pending-print/:restaurantId', async (req, res) => {
     const restaurantDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
     const printSettings = restaurantDoc.exists ? (restaurantDoc.data().printSettings || {}) : {};
 
-    // Default values
+    // Default values (backward compatible - all defaults enable existing behavior)
     const kotPrinterEnabled = printSettings.kotPrinterEnabled !== false; // Default true
     const usePusherForKOT = printSettings.usePusherForKOT === true; // Default false
+    const autoPrintOnKOT = printSettings.autoPrintOnKOT !== false; // Default true
+    const autoPrintOnBilling = printSettings.autoPrintOnBilling === true; // Default false
+    const autoPrintOnOnlineOrder = printSettings.autoPrintOnOnlineOrder === true; // Default false
+    const autoPrintOnTableCall = printSettings.autoPrintOnTableCall === true; // Default false
+    const printKOTCopy = printSettings.printKOTCopy || 1;
+    const printBillCopy = printSettings.printBillCopy || 1;
 
     // Get orders that need to be printed:
     // - Status is 'confirmed' or 'preparing' (sent to kitchen)
@@ -10426,9 +10459,18 @@ app.get('/api/kot/pending-print/:restaurantId', async (req, res) => {
       orders: pendingOrders,
       count: pendingOrders.length,
       timestamp: new Date().toISOString(),
-      // Print control flags for dine-kot-printer app
-      shouldPrint: kotPrinterEnabled,  // If false, printer app should skip printing
-      usePusher: usePusherForKOT       // If true, prefer Pusher over polling
+      // Print control flags for dine-kot-printer app (backward compatible)
+      shouldPrint: kotPrinterEnabled,  // If false, printer app should skip all printing
+      usePusher: usePusherForKOT,      // If true, prefer Pusher over polling
+      // Granular print triggers
+      printSettings: {
+        autoPrintOnKOT,                // Auto-print when order sent to kitchen
+        autoPrintOnBilling,            // Auto-print when billing completed
+        autoPrintOnOnlineOrder,        // Reserved: Auto-print for online orders
+        autoPrintOnTableCall,          // Reserved: Auto-print on customer call
+        printKOTCopy,                  // Number of KOT copies
+        printBillCopy                  // Number of bill copies
+      }
     });
 
   } catch (error) {
@@ -10470,6 +10512,135 @@ app.patch('/api/kot/:orderId/printed', async (req, res) => {
   } catch (error) {
     console.error('Mark KOT printed error:', error);
     res.status(500).json({ error: 'Failed to mark KOT as printed' });
+  }
+});
+
+// Get pending billing/invoice orders for printing (orders billed but not printed)
+// This endpoint is PUBLIC for easy kiosk setup - use restaurantId for identification
+app.get('/api/billing/pending-print/:restaurantId', async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+
+    console.log(`🧾 Billing Print API - Getting pending billing prints for restaurant: ${restaurantId}`);
+
+    // Fetch restaurant's print settings
+    const restaurantDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
+    const printSettings = restaurantDoc.exists ? (restaurantDoc.data().printSettings || {}) : {};
+
+    // Default values (backward compatible)
+    const kotPrinterEnabled = printSettings.kotPrinterEnabled !== false;
+    const autoPrintOnBilling = printSettings.autoPrintOnBilling === true; // Default false
+    const printBillCopy = printSettings.printBillCopy || 1;
+
+    // Get orders that need billing printed:
+    // - Status is 'completed' (billing done)
+    // - billPrinted is false or doesn't exist
+    // - Created in the last 24 hours
+    const twentyFourHoursAgo = new Date();
+    twentyFourHoursAgo.setHours(twentyFourHoursAgo.getHours() - 24);
+
+    const ordersSnapshot = await db.collection(collections.orders)
+      .where('restaurantId', '==', restaurantId)
+      .where('status', '==', 'completed')
+      .where('createdAt', '>=', twentyFourHoursAgo)
+      .orderBy('createdAt', 'asc')
+      .get();
+
+    const pendingBills = [];
+
+    for (const doc of ordersSnapshot.docs) {
+      const orderData = doc.data();
+
+      // Skip already printed bills
+      if (orderData.billPrinted === true) {
+        continue;
+      }
+
+      // Format order for billing print
+      const createdAt = orderData.createdAt?.toDate() || new Date();
+      const completedAt = orderData.completedAt?.toDate() || createdAt;
+
+      pendingBills.push({
+        id: doc.id,
+        orderId: doc.id,
+        dailyOrderId: orderData.dailyOrderId,
+        orderNumber: orderData.orderNumber,
+        tableNumber: orderData.tableNumber || '',
+        roomNumber: orderData.roomNumber || '',
+        customerName: orderData.customerName || '',
+        customerMobile: orderData.customerMobile || '',
+        items: orderData.items || [],
+        subtotal: orderData.totalAmount || 0,
+        taxAmount: orderData.taxAmount || 0,
+        taxBreakdown: orderData.taxBreakdown || [],
+        totalAmount: orderData.finalAmount || orderData.totalAmount || 0,
+        paymentMethod: orderData.paymentMethod || 'cash',
+        orderType: orderData.orderType || 'dine-in',
+        createdAt: createdAt.toISOString(),
+        completedAt: completedAt.toISOString(),
+        formattedTime: completedAt.toLocaleTimeString('en-IN', {
+          hour: '2-digit',
+          minute: '2-digit',
+          hour12: true
+        }),
+        formattedDate: completedAt.toLocaleDateString('en-IN', {
+          day: '2-digit',
+          month: 'short',
+          year: 'numeric'
+        })
+      });
+    }
+
+    console.log(`🧾 Found ${pendingBills.length} bills pending print (autoPrintOnBilling: ${autoPrintOnBilling})`);
+
+    res.json({
+      success: true,
+      orders: pendingBills,
+      count: pendingBills.length,
+      timestamp: new Date().toISOString(),
+      shouldPrint: kotPrinterEnabled && autoPrintOnBilling,
+      printCopies: printBillCopy
+    });
+
+  } catch (error) {
+    console.error('Get pending billing print error:', error);
+    res.status(500).json({ error: 'Failed to fetch pending billing prints' });
+  }
+});
+
+// Mark bill as printed
+app.patch('/api/billing/:orderId/printed', async (req, res) => {
+  try {
+    const { orderId } = req.params;
+    const { printedAt, printedBy } = req.body;
+
+    console.log(`🧾 Marking bill ${orderId} as printed`);
+
+    const orderRef = db.collection(collections.orders).doc(orderId);
+    const orderDoc = await orderRef.get();
+
+    if (!orderDoc.exists) {
+      return res.status(404).json({ error: 'Order not found' });
+    }
+
+    await orderRef.update({
+      billPrinted: true,
+      billPrintedAt: printedAt ? new Date(printedAt) : new Date(),
+      billPrintedBy: printedBy || 'kiosk',
+      updatedAt: new Date()
+    });
+
+    console.log(`✅ Bill ${orderId} marked as printed`);
+
+    res.json({
+      success: true,
+      message: 'Bill marked as printed',
+      orderId
+    });
+
+  } catch (error) {
+    console.error('Mark bill printed error:', error);
+    res.status(500).json({ error: 'Failed to mark bill as printed' });
   }
 });
 
