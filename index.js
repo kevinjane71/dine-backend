@@ -5920,7 +5920,7 @@ app.get('/api/orders/:restaurantId', authenticateToken, async (req, res) => {
     let query = db.collection(collections.orders)
       .where('restaurantId', '==', restaurantId);
 
-    // Apply status filter
+    // Apply status filter (including 'deleted' to show only deleted orders)
     if (status && status !== 'all') {
       query = query.where('status', '==', status);
     }
@@ -5986,6 +5986,11 @@ app.get('/api/orders/:restaurantId', authenticateToken, async (req, res) => {
       };
       allOrders.push(order);
     });
+
+    // When status is 'all' or not set, exclude soft-deleted orders so they only appear when filter is "Deleted"
+    if (!status || status === 'all') {
+      allOrders = allOrders.filter(o => o.status !== 'deleted');
+    }
 
     console.log(`📋 Order History - Total orders before filtering: ${allOrders.length}`);
 
@@ -6824,7 +6829,7 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
   }
 });
 
-// Delete order (admin/owner only)
+// Delete order (admin/owner only) – soft delete: set status to 'deleted' so order appears under "Deleted" filter
 app.delete('/api/orders/:orderId', authenticateToken, async (req, res) => {
   try {
     const { orderId } = req.params;
@@ -6836,7 +6841,8 @@ app.delete('/api/orders/:orderId', authenticateToken, async (req, res) => {
     }
     
     // Get the order to check if it exists and get restaurant info
-    const orderDoc = await db.collection(collections.orders).doc(orderId).get();
+    const orderRef = db.collection(collections.orders).doc(orderId);
+    const orderDoc = await orderRef.get();
     if (!orderDoc.exists) {
       return res.status(404).json({ error: 'Order not found' });
     }
@@ -6851,13 +6857,19 @@ app.delete('/api/orders/:orderId', authenticateToken, async (req, res) => {
       }
     }
     
-    // Don't allow deletion of completed orders (optional business rule)
-    if (order.status === 'completed') {
-      return res.status(400).json({ error: 'Cannot delete completed orders' });
+    // Already soft-deleted
+    if (order.status === 'deleted') {
+      return res.json({ message: 'Order already deleted' });
     }
     
-    // Delete the order
-    await db.collection(collections.orders).doc(orderId).delete();
+    // Soft delete: set status to 'deleted' and preserve the state it was in (lastStatus) so we can show "Deleted (was: Completed)" etc.
+    const lastStatus = order.status || 'pending';
+    await orderRef.update({
+      status: 'deleted',
+      lastStatus,
+      deletedAt: FieldValue.serverTimestamp(),
+      updatedAt: FieldValue.serverTimestamp()
+    });
 
     // Trigger Pusher notification for real-time updates
     pusherService.notifyOrderDeleted(order.restaurantId, orderId)
