@@ -3953,6 +3953,12 @@ app.patch('/api/restaurants/:restaurantId', authenticateToken, async (req, res) 
       updateData.orderSettings = { ...existing, ...req.body.orderSettings };
     }
 
+    // Print settings (KOT printer, manual print, order summary display)
+    if (req.body.printSettings !== undefined) {
+      const existing = restaurant.data().printSettings || {};
+      updateData.printSettings = { ...existing, ...req.body.printSettings };
+    }
+
     if (Object.keys(updateData).length === 0) {
       return res.status(400).json({ error: 'No valid fields to update' });
     }
@@ -5344,6 +5350,23 @@ app.post('/api/public/orders/:restaurantId', vercelSecurityMiddleware.publicAPI,
       orderSource: resolvedOrderSource
     }).catch(err => console.error('Pusher notification error (non-blocking):', err));
 
+    // Trigger KOT print notification if Pusher printing is enabled
+    const printSettings = restaurantData.printSettings || {};
+    if (printSettings.kotPrinterEnabled !== false && printSettings.usePusherForKOT === true) {
+      pusherService.notifyKOTPrintRequest(restaurantId, {
+        id: orderRef.id,
+        dailyOrderId: orderData.dailyOrderId,
+        orderNumber: orderData.orderNumber,
+        tableNumber: tableNum,
+        roomNumber: orderData.roomNumber,
+        items: orderItems,
+        notes: orderData.notes,
+        staffInfo: orderData.staffInfo,
+        orderType: orderType,
+        createdAt: orderData.createdAt?.toISOString() || new Date().toISOString()
+      }).catch(err => console.error('KOT print Pusher notification error (non-blocking):', err));
+    }
+
     res.status(201).json({
       message: 'Order placed successfully',
       order: {
@@ -5929,6 +5952,23 @@ app.post('/api/orders', async (req, res) => {
       orderType: orderType
     }).catch(err => console.error('Pusher notification error (non-blocking):', err));
 
+    // Trigger KOT print notification if order is confirmed and Pusher printing is enabled
+    const printSettings = restaurantData.printSettings || {};
+    if (orderData.status === 'confirmed' && printSettings.kotPrinterEnabled !== false && printSettings.usePusherForKOT === true) {
+      pusherService.notifyKOTPrintRequest(restaurantId, {
+        id: orderRef.id,
+        dailyOrderId: dailyOrderId,
+        orderNumber: orderNumber,
+        tableNumber: tableNumber,
+        roomNumber: roomNumber,
+        items: orderItems,
+        notes: notes,
+        staffInfo: orderData.staffInfo,
+        orderType: orderType,
+        createdAt: orderData.createdAt?.toISOString() || new Date().toISOString()
+      }).catch(err => console.error('KOT print Pusher notification error (non-blocking):', err));
+    }
+
     res.status(201).json({
       message: 'Order created successfully',
       order: {
@@ -6432,6 +6472,28 @@ app.patch('/api/orders/:orderId/status', authenticateToken, async (req, res) => 
       dailyOrderId: orderData.dailyOrderId,
       totalAmount: orderData.totalAmount
     }).catch(err => console.error('Pusher notification error (non-blocking):', err));
+
+    // Trigger KOT print notification when order is confirmed (sent to kitchen)
+    if (status === 'confirmed') {
+      // Check if Pusher KOT printing is enabled
+      const restaurantDoc = await db.collection(collections.restaurants).doc(orderData.restaurantId).get();
+      const printSettings = restaurantDoc.exists ? (restaurantDoc.data().printSettings || {}) : {};
+
+      if (printSettings.kotPrinterEnabled !== false && printSettings.usePusherForKOT === true) {
+        pusherService.notifyKOTPrintRequest(orderData.restaurantId, {
+          id: orderId,
+          dailyOrderId: orderData.dailyOrderId,
+          orderNumber: orderData.orderNumber,
+          tableNumber: orderData.tableNumber,
+          roomNumber: orderData.roomNumber,
+          items: orderData.items,
+          notes: orderData.notes,
+          staffInfo: orderData.staffInfo,
+          orderType: orderData.orderType,
+          createdAt: orderData.createdAt?.toDate?.()?.toISOString() || new Date().toISOString()
+        }).catch(err => console.error('KOT print Pusher notification error (non-blocking):', err));
+      }
+    }
 
     res.json({ message: 'Order status updated successfully' });
 
@@ -9788,6 +9850,95 @@ app.post('/api/tax/calculate/:restaurantId', authenticateToken, async (req, res)
   }
 });
 
+// ============================================
+// PRINT SETTINGS ENDPOINTS
+// ============================================
+
+// Get print settings for a restaurant
+app.get('/api/admin/print-settings/:restaurantId', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+
+    const restaurantDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
+    if (!restaurantDoc.exists) {
+      return res.status(404).json({ error: 'Restaurant not found' });
+    }
+
+    const restaurantData = restaurantDoc.data();
+
+    // Default print settings
+    const defaultSettings = {
+      kotPrinterEnabled: true,           // Enable dine-kot-printer app auto-printing
+      manualPrintEnabled: true,          // Enable manual print button on dashboard
+      showKOTSummaryAfterOrder: true,    // Show KOT summary after placing order to kitchen
+      showBillSummaryAfterBilling: true, // Show bill summary after completing billing
+      usePusherForKOT: false             // Use Pusher instead of polling
+    };
+
+    const printSettings = { ...defaultSettings, ...(restaurantData.printSettings || {}) };
+
+    res.json({
+      success: true,
+      printSettings
+    });
+
+  } catch (error) {
+    console.error('Get print settings error:', error);
+    res.status(500).json({ error: 'Failed to fetch print settings' });
+  }
+});
+
+// Update print settings for a restaurant
+app.put('/api/admin/print-settings/:restaurantId', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+    const { printSettings } = req.body;
+
+    if (!printSettings || typeof printSettings !== 'object') {
+      return res.status(400).json({ error: 'Invalid print settings' });
+    }
+
+    // Validate allowed fields
+    const allowedFields = [
+      'kotPrinterEnabled',
+      'manualPrintEnabled',
+      'showKOTSummaryAfterOrder',
+      'showBillSummaryAfterBilling',
+      'usePusherForKOT'
+    ];
+
+    const sanitizedSettings = {};
+    for (const field of allowedFields) {
+      if (printSettings[field] !== undefined) {
+        sanitizedSettings[field] = Boolean(printSettings[field]);
+      }
+    }
+
+    const restaurantDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
+    if (!restaurantDoc.exists) {
+      return res.status(404).json({ error: 'Restaurant not found' });
+    }
+
+    const existingSettings = restaurantDoc.data().printSettings || {};
+    const updatedSettings = { ...existingSettings, ...sanitizedSettings };
+
+    await db.collection(collections.restaurants).doc(restaurantId).update({
+      printSettings: updatedSettings,
+      updatedAt: new Date()
+    });
+
+    res.json({
+      success: true,
+      message: 'Print settings updated successfully',
+      printSettings: updatedSettings
+    });
+
+  } catch (error) {
+    console.error('Update print settings error:', error);
+    res.status(500).json({ error: 'Failed to update print settings' });
+  }
+});
+
 // Generate invoice for an order
 app.post('/api/invoice/generate/:orderId', authenticateToken, async (req, res) => {
   try {
@@ -10197,6 +10348,14 @@ app.get('/api/kot/pending-print/:restaurantId', async (req, res) => {
 
     console.log(`🖨️ KOT Print API - Getting pending print orders for restaurant: ${restaurantId}`);
 
+    // Fetch restaurant's print settings
+    const restaurantDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
+    const printSettings = restaurantDoc.exists ? (restaurantDoc.data().printSettings || {}) : {};
+
+    // Default values
+    const kotPrinterEnabled = printSettings.kotPrinterEnabled !== false; // Default true
+    const usePusherForKOT = printSettings.usePusherForKOT === true; // Default false
+
     // Get orders that need to be printed:
     // - Status is 'confirmed' or 'preparing' (sent to kitchen)
     // - kotPrinted is false or doesn't exist
@@ -10260,13 +10419,16 @@ app.get('/api/kot/pending-print/:restaurantId', async (req, res) => {
       });
     }
 
-    console.log(`🖨️ Found ${pendingOrders.length} orders pending print`);
+    console.log(`🖨️ Found ${pendingOrders.length} orders pending print (kotPrinterEnabled: ${kotPrinterEnabled})`);
 
     res.json({
       success: true,
       orders: pendingOrders,
       count: pendingOrders.length,
-      timestamp: new Date().toISOString()
+      timestamp: new Date().toISOString(),
+      // Print control flags for dine-kot-printer app
+      shouldPrint: kotPrinterEnabled,  // If false, printer app should skip printing
+      usePusher: usePusherForKOT       // If true, prefer Pusher over polling
     });
 
   } catch (error) {

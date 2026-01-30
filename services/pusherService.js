@@ -77,11 +77,42 @@ const notifyOrderDeleted = async (restaurantId, orderId) => {
   });
 };
 
+/**
+ * Trigger KOT print request for dine-kot-printer app
+ * Used when an order is confirmed/sent to kitchen
+ */
+const notifyKOTPrintRequest = async (restaurantId, orderData) => {
+  await triggerOrderEvent(restaurantId, 'kot-print-request', {
+    id: orderData.id,
+    kotId: `KOT-${orderData.id.slice(-6).toUpperCase()}`,
+    dailyOrderId: orderData.dailyOrderId,
+    orderNumber: orderData.orderNumber,
+    tableNumber: orderData.tableNumber || '',
+    roomNumber: orderData.roomNumber || '',
+    items: orderData.items || [],
+    notes: orderData.notes || '',
+    staffInfo: orderData.staffInfo || {},
+    orderType: orderData.orderType || 'dine-in',
+    createdAt: orderData.createdAt || new Date().toISOString(),
+    formattedTime: new Date().toLocaleTimeString('en-IN', {
+      hour: '2-digit',
+      minute: '2-digit',
+      hour12: true
+    }),
+    formattedDate: new Date().toLocaleDateString('en-IN', {
+      day: '2-digit',
+      month: 'short',
+      year: 'numeric'
+    })
+  });
+};
+
 module.exports = {
   pusher,
   triggerOrderEvent,
   notifyOrderCreated,
   notifyOrderStatusUpdated,
   notifyOrderUpdated,
-  notifyOrderDeleted
+  notifyOrderDeleted,
+  notifyKOTPrintRequest
 };
