@@ -587,7 +587,7 @@ function sanitizeInput(input) {
 // Security: Validate restaurant access
 async function validateRestaurantAccess(userId, restaurantId) {
   try {
-    // Check if user has access to this restaurant
+    // Check 1: userRestaurants collection (new staff)
     const userRestaurantSnapshot = await db.collection(collections.userRestaurants)
       .where('userId', '==', userId)
       .where('restaurantId', '==', restaurantId)
@@ -597,11 +597,22 @@ async function validateRestaurantAccess(userId, restaurantId) {
       return true;
     }
 
-    // Fallback: Check if user is the owner directly
+    // Check 2: Owner in restaurants collection
     const restaurantDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
     if (restaurantDoc.exists) {
       const restaurant = restaurantDoc.data();
-      return restaurant.ownerId === userId;
+      if (restaurant.ownerId === userId) {
+        return true;
+      }
+    }
+
+    // Check 3: Staff in users collection (fallback for existing staff)
+    const userDoc = await db.collection(collections.users).doc(userId).get();
+    if (userDoc.exists) {
+      const userData = userDoc.data();
+      if (userData.restaurantId === restaurantId) {
+        return true;
+      }
     }
 
     return false;
