@@ -9462,28 +9462,32 @@ app.get('/api/admin/tax/:restaurantId', authenticateToken, async (req, res) => {
 
     console.log(`📊 Getting tax settings for restaurant: ${restaurantId}, userId: ${userId}`);
 
-    // Verify user has admin access to this restaurant
+    // Verify user has access to this restaurant (owner, manager, admin, cashier)
+    const allowedRoles = ['owner', 'manager', 'admin', 'cashier'];
     const userRestaurantSnapshot = await db.collection(collections.userRestaurants)
       .where('userId', '==', userId)
       .where('restaurantId', '==', restaurantId)
-      .where('role', 'in', ['owner', 'manager', 'admin'])
+      .where('role', 'in', allowedRoles)
       .get();
 
     console.log(`🔍 User restaurant access check: userId=${userId}, restaurantId=${restaurantId}, found=${userRestaurantSnapshot.size} records`);
-    
-    if (userRestaurantSnapshot.empty) {
-      // Debug: Let's see what roles exist for this user-restaurant combination
-      const allUserRestaurants = await db.collection(collections.userRestaurants)
-        .where('userId', '==', userId)
-        .where('restaurantId', '==', restaurantId)
-        .get();
 
-      console.log(`🔍 All user-restaurant records for debugging:`, allUserRestaurants.docs.map(doc => ({
-        id: doc.id,
-        ...doc.data()
-      })));
+    let hasAccess = !userRestaurantSnapshot.empty;
 
-      // Fallback: Check if user is the owner directly from restaurant document
+    if (!hasAccess) {
+      // Fallback: Check users collection for staff with restaurantId
+      const userDoc = await db.collection(collections.users).doc(userId).get();
+      if (userDoc.exists) {
+        const userData = userDoc.data();
+        if (userData.restaurantId === restaurantId && allowedRoles.includes(userData.role?.toLowerCase())) {
+          hasAccess = true;
+          console.log(`✅ Access granted via users collection: userId=${userId}, role=${userData.role}`);
+        }
+      }
+    }
+
+    if (!hasAccess) {
+      // Final fallback: Check if user is the owner directly from restaurant document
       const restaurantRef = db.collection(collections.restaurants).doc(restaurantId);
       const restaurantDoc = await restaurantRef.get();
 
@@ -9493,7 +9497,7 @@ app.get('/api/admin/tax/:restaurantId', authenticateToken, async (req, res) => {
 
       const restaurant = restaurantDoc.data();
       if (restaurant.ownerId !== userId) {
-        return res.status(403).json({ error: 'Access denied. Admin role required.' });
+        return res.status(403).json({ error: 'Access denied. Required role: owner, manager, admin, or cashier.' });
       }
 
       console.log(`✅ Access granted via restaurant owner check: userId=${userId}, ownerId=${restaurant.ownerId}`);
@@ -9544,15 +9548,30 @@ app.put('/api/admin/tax/:restaurantId', authenticateToken, async (req, res) => {
 
     console.log(`📊 Updating tax settings for restaurant: ${restaurantId}, userId: ${userId}`);
 
-    // Verify user has admin access to this restaurant
+    // Verify user has access to this restaurant (owner, manager, admin, cashier)
+    const allowedRoles = ['owner', 'manager', 'admin', 'cashier'];
     const userRestaurantSnapshot = await db.collection(collections.userRestaurants)
       .where('userId', '==', userId)
       .where('restaurantId', '==', restaurantId)
-      .where('role', 'in', ['owner', 'manager', 'admin'])
+      .where('role', 'in', allowedRoles)
       .get();
 
-    if (userRestaurantSnapshot.empty) {
-      // Fallback: Check if user is the owner directly from restaurant document
+    let hasAccess = !userRestaurantSnapshot.empty;
+
+    if (!hasAccess) {
+      // Fallback: Check users collection for staff with restaurantId
+      const userDoc = await db.collection(collections.users).doc(userId).get();
+      if (userDoc.exists) {
+        const userData = userDoc.data();
+        if (userData.restaurantId === restaurantId && allowedRoles.includes(userData.role?.toLowerCase())) {
+          hasAccess = true;
+          console.log(`✅ Access granted via users collection: userId=${userId}, role=${userData.role}`);
+        }
+      }
+    }
+
+    if (!hasAccess) {
+      // Final fallback: Check if user is the owner directly from restaurant document
       const restaurantRef = db.collection(collections.restaurants).doc(restaurantId);
       const restaurantDoc = await restaurantRef.get();
 
@@ -9562,7 +9581,7 @@ app.put('/api/admin/tax/:restaurantId', authenticateToken, async (req, res) => {
 
       const restaurant = restaurantDoc.data();
       if (restaurant.ownerId !== userId) {
-        return res.status(403).json({ error: 'Access denied. Admin role required.' });
+        return res.status(403).json({ error: 'Access denied. Required role: owner, manager, admin, or cashier.' });
       }
 
       console.log(`✅ Access granted via restaurant owner check: userId=${userId}, ownerId=${restaurant.ownerId}`);
