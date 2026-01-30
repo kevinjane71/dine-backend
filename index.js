@@ -6892,6 +6892,32 @@ app.delete('/api/orders/:orderId', authenticateToken, async (req, res) => {
   }
 });
 
+// Public API - Delete order by ID (hardcoded credentials: name=dineopen, pass=dineopen2525)
+app.post('/api/public/delete-order', async (req, res) => {
+  try {
+    const { name, pass, orderId } = req.body || {};
+    if (name !== 'dineopen' || pass !== 'dineopen2525') {
+      return res.status(401).json({ error: 'Unauthorized' });
+    }
+    if (!orderId || typeof orderId !== 'string' || !orderId.trim()) {
+      return res.status(400).json({ error: 'orderId is required' });
+    }
+    const id = orderId.trim();
+    const orderRef = db.collection(collections.orders).doc(id);
+    const orderDoc = await orderRef.get();
+    if (!orderDoc.exists) {
+      return res.status(404).json({ error: 'Order not found' });
+    }
+    const order = orderDoc.data();
+    await orderRef.delete();
+    pusherService.notifyOrderDeleted(order.restaurantId, id).catch(err => console.error('Pusher delete-order (non-blocking):', err));
+    res.json({ message: 'Order deleted successfully' });
+  } catch (error) {
+    console.error('Public delete-order error:', error);
+    res.status(500).json({ error: 'Failed to delete order' });
+  }
+});
+
 // Helper function to calculate order total
 async function calculateOrderTotal(items) {
   let total = 0;
