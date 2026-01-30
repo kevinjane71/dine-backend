@@ -529,28 +529,6 @@ const authenticateToken = (req, res, next) => {
       }
     }
 
-    // Demo account restrictions with whitelist
-    if (user.phone === '+919000000000') {
-      const demoAllowedEndpoints = [
-        '/api/auth/phone/verify-otp',
-        '/api/auth/logout',
-        '/api/auth/refresh-token'
-      ];
-      if (req.method === 'GET' || demoAllowedEndpoints.includes(req.path)) {
-        console.log(`🎭 Demo account accessing allowed endpoint: ${req.method} ${req.path}`);
-        return next();
-      }
-      if (req.method === 'POST' || req.method === 'PATCH' || req.method === 'DELETE') {
-        console.log(`🎭 Demo account detected: ${req.method} ${req.path} - Blocking request`);
-        return res.status(403).json({
-          success: false,
-          error: 'Demo Mode Restriction',
-          message: 'Demo accounts are restricted to read-only access. Please sign up for a full account to perform this action.',
-          demoMode: true
-        });
-      }
-    }
-
     next();
   });
 };
