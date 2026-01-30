@@ -5138,8 +5138,40 @@ app.post('/api/public/orders/:restaurantId', vercelSecurityMiddleware.publicAPI,
       }
     }
 
-    // Calculate final total
-    const finalTotal = Math.max(0, subtotal - discountAmount - loyaltyDiscount);
+    // Calculate pre-tax total (subtotal minus discounts)
+    const preTaxTotal = Math.max(0, subtotal - discountAmount - loyaltyDiscount);
+
+    // Calculate tax if enabled
+    let taxAmount = 0;
+    const taxBreakdown = [];
+    const taxSettings = restaurantData.taxSettings || {};
+
+    if (taxSettings.enabled && preTaxTotal > 0) {
+      if (taxSettings.taxes && Array.isArray(taxSettings.taxes) && taxSettings.taxes.length > 0) {
+        taxSettings.taxes
+          .filter(tax => tax.enabled)
+          .forEach(tax => {
+            const amt = Math.round((preTaxTotal * (tax.rate || 0) / 100) * 100) / 100;
+            taxAmount += amt;
+            taxBreakdown.push({
+              name: tax.name || 'Tax',
+              rate: tax.rate || 0,
+              amount: amt
+            });
+          });
+      } else if (taxSettings.defaultTaxRate) {
+        const amt = Math.round((preTaxTotal * (taxSettings.defaultTaxRate / 100)) * 100) / 100;
+        taxAmount = amt;
+        taxBreakdown.push({
+          name: 'Tax',
+          rate: taxSettings.defaultTaxRate,
+          amount: amt
+        });
+      }
+    }
+
+    // Calculate final total (pre-tax total + tax)
+    const finalTotal = preTaxTotal + taxAmount;
 
     // Calculate loyalty points earned
     let loyaltyPointsEarned = 0;
@@ -5209,7 +5241,10 @@ app.post('/api/public/orders/:restaurantId', vercelSecurityMiddleware.publicAPI,
       subtotal: subtotal,
       discountAmount: discountAmount,
       loyaltyDiscount: loyaltyDiscount,
-      totalAmount: finalTotal,
+      taxAmount: Math.round(taxAmount * 100) / 100,
+      taxBreakdown: taxBreakdown,
+      totalAmount: preTaxTotal,
+      finalAmount: Math.round(finalTotal * 100) / 100,
       appliedOffer: appliedOffer,
       appliedOffers: appliedOffers,
       loyaltyPointsRedeemed: loyaltyPointsRedeemed,
@@ -5511,17 +5546,33 @@ app.post('/api/orders', async (req, res) => {
     }
 
     // Calculate tax if tax settings are enabled
+    // Save tax breakdown so order history shows exact tax at time of order
     let taxAmount = 0;
     let finalAmount = totalAmount;
+    const taxBreakdown = []; // Store individual tax lines for historical accuracy
     const taxSettings = restaurantData.taxSettings || {};
-    
+
     if (taxSettings.enabled && totalAmount > 0) {
       if (taxSettings.taxes && Array.isArray(taxSettings.taxes) && taxSettings.taxes.length > 0) {
-        taxAmount = taxSettings.taxes
+        taxSettings.taxes
           .filter(tax => tax.enabled)
-          .reduce((sum, tax) => sum + (totalAmount * (tax.rate || 0) / 100), 0);
+          .forEach(tax => {
+            const amt = Math.round((totalAmount * (tax.rate || 0) / 100) * 100) / 100;
+            taxAmount += amt;
+            taxBreakdown.push({
+              name: tax.name || 'Tax',
+              rate: tax.rate || 0,
+              amount: amt
+            });
+          });
       } else if (taxSettings.defaultTaxRate) {
-        taxAmount = totalAmount * (taxSettings.defaultTaxRate / 100);
+        const amt = Math.round((totalAmount * (taxSettings.defaultTaxRate / 100)) * 100) / 100;
+        taxAmount = amt;
+        taxBreakdown.push({
+          name: 'Tax',
+          rate: taxSettings.defaultTaxRate,
+          amount: amt
+        });
       }
       finalAmount = totalAmount + taxAmount;
     }
@@ -5540,6 +5591,7 @@ app.post('/api/orders', async (req, res) => {
       items: orderItems,
       totalAmount,
       taxAmount: Math.round(taxAmount * 100) / 100,
+      taxBreakdown: taxBreakdown, // Save individual tax lines for historical accuracy
       finalAmount: Math.round(finalAmount * 100) / 100,
           customerInfo: customerInfo || {
             phone: customerPhone,
@@ -6562,26 +6614,46 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
       if (restaurantDoc.exists) {
         const restaurantData = restaurantDoc.data();
         const taxSettings = restaurantData.taxSettings || {};
-        
+
         if (taxSettings.enabled && updateData.totalAmount > 0) {
           let taxAmount = 0;
+          const taxBreakdown = [];
+
           if (taxSettings.taxes && Array.isArray(taxSettings.taxes) && taxSettings.taxes.length > 0) {
-            taxAmount = taxSettings.taxes
+            taxSettings.taxes
               .filter(tax => tax.enabled)
-              .reduce((sum, tax) => sum + (updateData.totalAmount * (tax.rate || 0) / 100), 0);
+              .forEach(tax => {
+                const amt = Math.round((updateData.totalAmount * (tax.rate || 0) / 100) * 100) / 100;
+                taxAmount += amt;
+                taxBreakdown.push({
+                  name: tax.name || 'Tax',
+                  rate: tax.rate || 0,
+                  amount: amt
+                });
+              });
           } else if (taxSettings.defaultTaxRate) {
-            taxAmount = updateData.totalAmount * (taxSettings.defaultTaxRate / 100);
+            const amt = Math.round((updateData.totalAmount * (taxSettings.defaultTaxRate / 100)) * 100) / 100;
+            taxAmount = amt;
+            taxBreakdown.push({
+              name: 'Tax',
+              rate: taxSettings.defaultTaxRate,
+              amount: amt
+            });
           }
+
           updateData.taxAmount = Math.round(taxAmount * 100) / 100;
+          updateData.taxBreakdown = taxBreakdown;
           updateData.finalAmount = Math.round((updateData.totalAmount + taxAmount) * 100) / 100;
         } else {
           // Tax disabled - set taxAmount to 0 and finalAmount = totalAmount
           updateData.taxAmount = 0;
+          updateData.taxBreakdown = [];
           updateData.finalAmount = updateData.totalAmount;
         }
       } else {
         // Restaurant doc doesn't exist - preserve existing values for backward compatibility
         updateData.taxAmount = currentOrder.taxAmount || 0;
+        updateData.taxBreakdown = currentOrder.taxBreakdown || [];
         updateData.finalAmount = updateData.totalAmount || currentOrder.finalAmount || currentOrder.totalAmount || 0;
       }
       
@@ -14987,6 +15059,23 @@ app.get('/api/public/customer-app-settings/:restaurantId', vercelSecurityMiddlew
 
     const restaurantData = restaurantDoc.data();
     const customerAppSettings = restaurantData.customerAppSettings || {};
+    const taxSettings = restaurantData.taxSettings || {};
+
+    // Build tax breakdown for display (only if enabled)
+    let taxInfo = { enabled: false, taxes: [] };
+    if (taxSettings.enabled) {
+      taxInfo.enabled = true;
+      if (taxSettings.taxes && Array.isArray(taxSettings.taxes) && taxSettings.taxes.length > 0) {
+        taxInfo.taxes = taxSettings.taxes
+          .filter(tax => tax.enabled)
+          .map(tax => ({
+            name: tax.name || 'Tax',
+            rate: tax.rate || 0
+          }));
+      } else if (taxSettings.defaultTaxRate) {
+        taxInfo.taxes = [{ name: 'Tax', rate: taxSettings.defaultTaxRate }];
+      }
+    }
 
     // Only return settings that are relevant to customers
     res.json({
@@ -15006,6 +15095,7 @@ app.get('/api/public/customer-app-settings/:restaurantId', vercelSecurityMiddlew
         } : {
           enabled: false
         },
+        taxSettings: taxInfo, // Include tax settings for cart display
         branding: {
           primaryColor: customerAppSettings.branding?.primaryColor || '#ef4444',
           textColor: customerAppSettings.branding?.textColor || '#ffffff',
