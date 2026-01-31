@@ -208,6 +208,9 @@ const customUrlRoutes = require('./routes/customUrlRoutes');
 // Staff reset password (owner only)
 const staffResetPasswordRoutes = require('./routes/staffResetPassword');
 
+// Print installer upload / download URLs (KOT Printer exe/dmg)
+const printInstallerRoutes = require('./routes/printInstaller');
+
 // Debug email service initialization
 console.log('📧 Email service loaded:', !!emailService);
 if (emailService) {
@@ -7227,6 +7230,9 @@ app.use('/api/google-reviews', googleReviewsRoutes);
 // Initialize Custom URL (slug) routes
 app.use('/api', customUrlRoutes);
 
+// Print installer (KOT Printer exe/dmg) – use same bucket as image/menu uploads
+app.set('printInstallerBucket', bucket);
+app.use('/api/print-installer', printInstallerRoutes);
 
 // Generic image upload API
 app.post('/api/upload/image', authenticateToken, upload.single('image'), async (req, res) => {
