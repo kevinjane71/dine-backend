@@ -7007,19 +7007,19 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
       items: updateData.items || currentOrder.items
     }).catch(err => console.error('Pusher notification error (non-blocking):', err));
 
-    // If items were updated and order is in kitchen status, trigger KOT reprint
+    // If items were updated and order is in kitchen status, trigger KOT reprint (Pusher and/or polling)
     const orderStatus = status || currentOrder.status;
     if (items && items.length > 0 && ['confirmed', 'preparing'].includes(orderStatus)) {
       try {
+        // Always reset kotPrinted so pending-print API returns this order (polling mode) and KOT app can reprint
+        await db.collection(collections.orders).doc(orderId).update({
+          kotPrinted: false
+        });
+
         const restaurantDoc = await db.collection(collections.restaurants).doc(currentOrder.restaurantId).get();
         const printSettings = restaurantDoc.exists ? (restaurantDoc.data().printSettings || {}) : {};
 
         if (printSettings.kotPrinterEnabled !== false && printSettings.usePusherForKOT === true) {
-          // Reset kotPrinted flag so it can be printed again
-          await db.collection(collections.orders).doc(orderId).update({
-            kotPrinted: false
-          });
-
           console.log('🖨️ Order items updated, triggering KOT reprint for order:', orderId);
           pusherService.notifyKOTPrintRequest(currentOrder.restaurantId, {
             id: orderId,
@@ -10553,6 +10553,9 @@ app.get('/api/kot/pending-print/:restaurantId', async (req, res) => {
       const kotId = `KOT-${doc.id.slice(-6).toUpperCase()}`;
       const createdAt = orderData.createdAt?.toDate() || new Date();
 
+      // needsReprint: order was printed before but kotPrinted was reset (e.g. order updated) so KOT app should print again
+      const needsReprint = orderData.kotPrinted === false && !!orderData.kotPrintedAt;
+
       pendingOrders.push({
         id: doc.id,
         kotId,
@@ -10574,7 +10577,8 @@ app.get('/api/kot/pending-print/:restaurantId', async (req, res) => {
           day: '2-digit',
           month: 'short',
           year: 'numeric'
-        })
+        }),
+        needsReprint
       });
     }
 
