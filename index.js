@@ -7010,9 +7010,11 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
       items: updateData.items || currentOrder.items
     }).catch(err => console.error('Pusher notification error (non-blocking):', err));
 
-    // If items were updated and order is in kitchen status, trigger KOT reprint (Pusher and/or polling)
+    // If items were updated and order is NOT completed/cancelled/deleted, trigger KOT reprint (Pusher and/or polling)
+    // This covers: pending, confirmed, preparing, ready, serving statuses
     const orderStatus = status || currentOrder.status;
-    if (items && items.length > 0 && ['confirmed', 'preparing'].includes(orderStatus)) {
+    const nonKitchenStatuses = ['completed', 'cancelled', 'deleted'];
+    if (items && items.length > 0 && !nonKitchenStatuses.includes(orderStatus)) {
       try {
         // Always reset kotPrinted so pending-print API returns this order (polling mode) and KOT app can reprint
         await db.collection(collections.orders).doc(orderId).update({
@@ -7088,6 +7090,127 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
   } catch (error) {
     console.error('Update order error:', error);
     res.status(500).json({ error: 'Failed to update order' });
+  }
+});
+
+// Manual print request endpoint - triggered from Order History page Print button
+// This sends print request to dine-kot-printer app via Pusher
+app.post('/api/orders/:orderId/manual-print', authenticateToken, async (req, res) => {
+  try {
+    const { orderId } = req.params;
+    const { printType } = req.body; // 'kot' or 'bill' - if not provided, auto-detect based on status
+
+    // Get the order
+    const orderDoc = await db.collection(collections.orders).doc(orderId).get();
+    if (!orderDoc.exists) {
+      return res.status(404).json({ error: 'Order not found' });
+    }
+
+    const order = { id: orderId, ...orderDoc.data() };
+
+    // Get user's restaurant context for validation
+    const user = req.user;
+    let userRestaurantId = user.restaurantId || order.restaurantId;
+
+    if (order.restaurantId !== userRestaurantId && user.role !== 'admin' && user.role !== 'owner') {
+      return res.status(403).json({ error: 'Access denied: Order does not belong to your restaurant' });
+    }
+
+    // Determine print type: if status is 'completed', print bill; otherwise print KOT
+    const shouldPrintBill = printType === 'bill' || order.status === 'completed';
+
+    // Get restaurant info for print settings
+    const restaurantDoc = await db.collection(collections.restaurants).doc(order.restaurantId).get();
+    const restaurantData = restaurantDoc.exists ? restaurantDoc.data() : {};
+    const printSettings = restaurantData.printSettings || {};
+
+    // Check if KOT printer is enabled
+    if (printSettings.kotPrinterEnabled === false) {
+      return res.status(400).json({
+        error: 'KOT Printer is disabled for this restaurant',
+        fallbackToBrowser: true
+      });
+    }
+
+    // Format timestamps
+    const createdAt = order.createdAt?.toDate?.() || order.createdAt?._seconds
+      ? new Date(order.createdAt._seconds * 1000)
+      : new Date(order.createdAt || Date.now());
+
+    const formattedTime = new Date().toLocaleTimeString('en-IN', {
+      hour: '2-digit',
+      minute: '2-digit',
+      hour12: true
+    });
+    const formattedDate = new Date().toLocaleDateString('en-IN', {
+      day: '2-digit',
+      month: 'short',
+      year: 'numeric'
+    });
+
+    if (shouldPrintBill) {
+      // Print Bill/Invoice
+      console.log('🖨️ Manual BILL print request for order:', orderId);
+
+      await pusherService.notifyBillingPrintRequest(order.restaurantId, {
+        id: orderId,
+        dailyOrderId: order.dailyOrderId,
+        orderNumber: order.orderNumber,
+        tableNumber: order.tableNumber,
+        roomNumber: order.roomNumber,
+        customerName: order.customerName || order.customerInfo?.name,
+        customerMobile: order.customerMobile || order.customerInfo?.phone,
+        items: order.items || [],
+        totalAmount: order.totalAmount || 0,
+        taxAmount: order.taxAmount || 0,
+        taxBreakdown: order.taxBreakdown || [],
+        finalAmount: order.finalAmount || order.totalAmount || 0,
+        paymentMethod: order.paymentMethod || 'cash',
+        orderType: order.orderType || 'dine-in',
+        createdAt: createdAt.toISOString(),
+        completedAt: order.completedAt?.toDate?.()?.toISOString() || new Date().toISOString(),
+        formattedTime,
+        formattedDate,
+        forcePrint: true  // Force print flag - bypasses local cache check in printer app
+      });
+
+      res.json({
+        success: true,
+        message: 'Bill print request sent to printer app',
+        printType: 'bill'
+      });
+    } else {
+      // Print KOT
+      console.log('🖨️ Manual KOT print request for order:', orderId);
+
+      await pusherService.notifyKOTPrintRequest(order.restaurantId, {
+        id: orderId,
+        kotId: `KOT-${orderId.slice(-6).toUpperCase()}`,
+        dailyOrderId: order.dailyOrderId,
+        orderNumber: order.orderNumber,
+        tableNumber: order.tableNumber,
+        roomNumber: order.roomNumber,
+        items: order.items || [],
+        notes: order.notes || '',
+        staffInfo: order.staffInfo || {},
+        orderType: order.orderType || 'dine-in',
+        createdAt: createdAt.toISOString(),
+        formattedTime,
+        formattedDate,
+        forcePrint: true,  // Force print flag - bypasses local cache check in printer app
+        isReprint: true    // Mark as reprint to bypass duplicate check
+      });
+
+      res.json({
+        success: true,
+        message: 'KOT print request sent to printer app',
+        printType: 'kot'
+      });
+    }
+
+  } catch (error) {
+    console.error('Manual print request error:', error);
+    res.status(500).json({ error: 'Failed to send print request' });
   }
 });
 
