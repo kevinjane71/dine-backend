@@ -5969,6 +5969,28 @@ app.post('/api/orders', async (req, res) => {
       }).catch(err => console.error('KOT print Pusher notification error (non-blocking):', err));
     }
 
+    // Trigger Billing print notification if order is created as completed directly (Complete Billing clicked)
+    if (orderData.status === 'completed' && printSettings.kotPrinterEnabled !== false && printSettings.usePusherForKOT === true) {
+      pusherService.notifyBillingPrintRequest(restaurantId, {
+        id: orderRef.id,
+        dailyOrderId: dailyOrderId,
+        orderNumber: orderNumber,
+        tableNumber: tableNumber,
+        roomNumber: roomNumber,
+        customerName: orderData.customerInfo?.name || '',
+        customerMobile: orderData.customerInfo?.phone || '',
+        items: orderItems,
+        totalAmount: totalAmount,
+        taxAmount: taxAmount,
+        taxBreakdown: taxBreakdown,
+        finalAmount: finalAmount,
+        paymentMethod: paymentMethod,
+        orderType: orderType,
+        createdAt: orderData.createdAt?.toISOString() || new Date().toISOString(),
+        completedAt: new Date()
+      }).catch(err => console.error('Billing print Pusher notification error (non-blocking):', err));
+    }
+
     res.status(201).json({
       message: 'Order created successfully',
       order: {
@@ -6495,6 +6517,39 @@ app.patch('/api/orders/:orderId/status', authenticateToken, async (req, res) => 
       }
     }
 
+    // Trigger Billing print notification when order is completed
+    if (status === 'completed') {
+      // Check if Pusher billing printing is enabled
+      const restaurantDoc = await db.collection(collections.restaurants).doc(orderData.restaurantId).get();
+      const printSettings = restaurantDoc.exists ? (restaurantDoc.data().printSettings || {}) : {};
+
+      if (printSettings.kotPrinterEnabled !== false && printSettings.usePusherForKOT === true) {
+        // Reset billPrinted flag so it can be printed
+        await db.collection(collections.orders).doc(orderId).update({
+          billPrinted: false
+        });
+
+        pusherService.notifyBillingPrintRequest(orderData.restaurantId, {
+          id: orderId,
+          dailyOrderId: orderData.dailyOrderId,
+          orderNumber: orderData.orderNumber,
+          tableNumber: orderData.tableNumber,
+          roomNumber: orderData.roomNumber,
+          customerName: orderData.customerName || orderData.customerInfo?.name,
+          customerMobile: orderData.customerMobile || orderData.customerInfo?.phone,
+          items: orderData.items,
+          totalAmount: orderData.totalAmount,
+          taxAmount: orderData.taxAmount,
+          taxBreakdown: orderData.taxBreakdown,
+          finalAmount: orderData.finalAmount || orderData.totalAmount,
+          paymentMethod: orderData.paymentMethod,
+          orderType: orderData.orderType,
+          createdAt: orderData.createdAt?.toDate?.()?.toISOString() || new Date().toISOString(),
+          completedAt: new Date()
+        }).catch(err => console.error('Billing print Pusher notification error (non-blocking):', err));
+      }
+    }
+
     res.json({ message: 'Order status updated successfully' });
 
   } catch (error) {
@@ -6951,6 +7006,76 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
       totalAmount: updateData.totalAmount || currentOrder.totalAmount,
       items: updateData.items || currentOrder.items
     }).catch(err => console.error('Pusher notification error (non-blocking):', err));
+
+    // If items were updated and order is in kitchen status, trigger KOT reprint
+    const orderStatus = status || currentOrder.status;
+    if (items && items.length > 0 && ['confirmed', 'preparing'].includes(orderStatus)) {
+      try {
+        const restaurantDoc = await db.collection(collections.restaurants).doc(currentOrder.restaurantId).get();
+        const printSettings = restaurantDoc.exists ? (restaurantDoc.data().printSettings || {}) : {};
+
+        if (printSettings.kotPrinterEnabled !== false && printSettings.usePusherForKOT === true) {
+          // Reset kotPrinted flag so it can be printed again
+          await db.collection(collections.orders).doc(orderId).update({
+            kotPrinted: false
+          });
+
+          console.log('🖨️ Order items updated, triggering KOT reprint for order:', orderId);
+          pusherService.notifyKOTPrintRequest(currentOrder.restaurantId, {
+            id: orderId,
+            dailyOrderId: currentOrder.dailyOrderId,
+            orderNumber: currentOrder.orderNumber,
+            tableNumber: tableNumber || currentOrder.tableNumber,
+            roomNumber: currentOrder.roomNumber,
+            items: updateData.items || items,
+            notes: currentOrder.notes,
+            staffInfo: currentOrder.staffInfo,
+            orderType: orderType || currentOrder.orderType,
+            createdAt: currentOrder.createdAt?.toDate?.()?.toISOString() || new Date().toISOString(),
+            isReprint: true  // Flag to tell printer app this is a reprint (items updated)
+          }).catch(err => console.error('KOT reprint Pusher notification error (non-blocking):', err));
+        }
+      } catch (kotError) {
+        console.error('KOT reprint error (non-blocking):', kotError);
+      }
+    }
+
+    // If status changed to completed, trigger billing print
+    if (status === 'completed' && currentOrder.status !== 'completed') {
+      try {
+        const restaurantDoc = await db.collection(collections.restaurants).doc(currentOrder.restaurantId).get();
+        const printSettings = restaurantDoc.exists ? (restaurantDoc.data().printSettings || {}) : {};
+
+        if (printSettings.kotPrinterEnabled !== false && printSettings.usePusherForKOT === true) {
+          // Reset billPrinted flag so it can be printed
+          await db.collection(collections.orders).doc(orderId).update({
+            billPrinted: false
+          });
+
+          console.log('🧾 Order completed, triggering billing print for order:', orderId);
+          pusherService.notifyBillingPrintRequest(currentOrder.restaurantId, {
+            id: orderId,
+            dailyOrderId: currentOrder.dailyOrderId,
+            orderNumber: currentOrder.orderNumber,
+            tableNumber: tableNumber || currentOrder.tableNumber,
+            roomNumber: currentOrder.roomNumber,
+            customerName: customerInfo?.name || currentOrder.customerName || currentOrder.customerInfo?.name,
+            customerMobile: customerInfo?.phone || currentOrder.customerMobile || currentOrder.customerInfo?.phone,
+            items: updateData.items || currentOrder.items,
+            totalAmount: updateData.totalAmount || currentOrder.totalAmount,
+            taxAmount: updateData.taxAmount || currentOrder.taxAmount,
+            taxBreakdown: updateData.taxBreakdown || currentOrder.taxBreakdown,
+            finalAmount: updateData.finalAmount || currentOrder.finalAmount || currentOrder.totalAmount,
+            paymentMethod: paymentMethod || currentOrder.paymentMethod,
+            orderType: orderType || currentOrder.orderType,
+            createdAt: currentOrder.createdAt?.toDate?.()?.toISOString() || new Date().toISOString(),
+            completedAt: new Date()
+          }).catch(err => console.error('Billing print Pusher notification error (non-blocking):', err));
+        }
+      } catch (billingError) {
+        console.error('Billing print error (non-blocking):', billingError);
+      }
+    }
 
     res.json({
       message: 'Order updated successfully',

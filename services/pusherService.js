@@ -107,6 +107,43 @@ const notifyKOTPrintRequest = async (restaurantId, orderData) => {
   });
 };
 
+/**
+ * Trigger Billing/Invoice print request for dine-kot-printer app
+ * Used when billing is completed for an order
+ */
+const notifyBillingPrintRequest = async (restaurantId, orderData) => {
+  const completedAt = orderData.completedAt || new Date();
+  await triggerOrderEvent(restaurantId, 'billing-print-request', {
+    id: orderData.id,
+    orderId: orderData.id,
+    dailyOrderId: orderData.dailyOrderId,
+    orderNumber: orderData.orderNumber,
+    tableNumber: orderData.tableNumber || '',
+    roomNumber: orderData.roomNumber || '',
+    customerName: orderData.customerName || orderData.customerInfo?.name || '',
+    customerMobile: orderData.customerMobile || orderData.customerInfo?.phone || '',
+    items: orderData.items || [],
+    subtotal: orderData.totalAmount || 0,
+    taxAmount: orderData.taxAmount || 0,
+    taxBreakdown: orderData.taxBreakdown || [],
+    totalAmount: orderData.finalAmount || orderData.totalAmount || 0,
+    paymentMethod: orderData.paymentMethod || 'cash',
+    orderType: orderData.orderType || 'dine-in',
+    createdAt: orderData.createdAt || new Date().toISOString(),
+    completedAt: completedAt instanceof Date ? completedAt.toISOString() : completedAt,
+    formattedTime: new Date().toLocaleTimeString('en-IN', {
+      hour: '2-digit',
+      minute: '2-digit',
+      hour12: true
+    }),
+    formattedDate: new Date().toLocaleDateString('en-IN', {
+      day: '2-digit',
+      month: 'short',
+      year: 'numeric'
+    })
+  });
+};
+
 module.exports = {
   pusher,
   triggerOrderEvent,
@@ -114,5 +151,6 @@ module.exports = {
   notifyOrderStatusUpdated,
   notifyOrderUpdated,
   notifyOrderDeleted,
-  notifyKOTPrintRequest
+  notifyKOTPrintRequest,
+  notifyBillingPrintRequest
 };
