@@ -10371,9 +10371,9 @@ app.patch('/api/kot/:orderId/status', async (req, res) => {
 app.get('/api/kot/pending-print/:restaurantId', async (req, res) => {
   try {
     const { restaurantId } = req.params;
-    const { lastPrintedAt } = req.query; // Optional: to get orders after a specific time
+    const { lastPrintedAt, maxHours } = req.query; // Optional: to get orders after a specific time, and limit fetch window
 
-    console.log(`🖨️ KOT Print API - Getting pending print orders for restaurant: ${restaurantId}`);
+    console.log(`🖨️ KOT Print API - Getting pending print orders for restaurant: ${restaurantId}, maxHours: ${maxHours || 4}`);
 
     // Fetch restaurant's print settings
     const restaurantDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
@@ -10392,14 +10392,15 @@ app.get('/api/kot/pending-print/:restaurantId', async (req, res) => {
     // Get orders that need to be printed:
     // - Status is 'confirmed' or 'preparing' (sent to kitchen)
     // - kotPrinted is false or doesn't exist
-    // - Created in the last 24 hours
-    const twentyFourHoursAgo = new Date();
-    twentyFourHoursAgo.setHours(twentyFourHoursAgo.getHours() - 24);
+    // - Created within the maxHours window (default 4 hours, max 24 hours)
+    const hoursLimit = Math.min(Math.max(parseInt(maxHours) || 4, 1), 24);
+    const cutoffTime = new Date();
+    cutoffTime.setHours(cutoffTime.getHours() - hoursLimit);
 
     let query = db.collection(collections.orders)
       .where('restaurantId', '==', restaurantId)
       .where('status', 'in', ['confirmed', 'preparing'])
-      .where('createdAt', '>=', twentyFourHoursAgo)
+      .where('createdAt', '>=', cutoffTime)
       .orderBy('createdAt', 'asc');
 
     const ordersSnapshot = await query.get();
@@ -10520,8 +10521,9 @@ app.patch('/api/kot/:orderId/printed', async (req, res) => {
 app.get('/api/billing/pending-print/:restaurantId', async (req, res) => {
   try {
     const { restaurantId } = req.params;
+    const { maxHours } = req.query; // Optional: limit fetch window
 
-    console.log(`🧾 Billing Print API - Getting pending billing prints for restaurant: ${restaurantId}`);
+    console.log(`🧾 Billing Print API - Getting pending billing prints for restaurant: ${restaurantId}, maxHours: ${maxHours || 4}`);
 
     // Fetch restaurant's print settings
     const restaurantDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
@@ -10535,14 +10537,15 @@ app.get('/api/billing/pending-print/:restaurantId', async (req, res) => {
     // Get orders that need billing printed:
     // - Status is 'completed' (billing done)
     // - billPrinted is false or doesn't exist
-    // - Created in the last 24 hours
-    const twentyFourHoursAgo = new Date();
-    twentyFourHoursAgo.setHours(twentyFourHoursAgo.getHours() - 24);
+    // - Created within the maxHours window (default 4 hours, max 24 hours)
+    const hoursLimit = Math.min(Math.max(parseInt(maxHours) || 4, 1), 24);
+    const cutoffTime = new Date();
+    cutoffTime.setHours(cutoffTime.getHours() - hoursLimit);
 
     const ordersSnapshot = await db.collection(collections.orders)
       .where('restaurantId', '==', restaurantId)
       .where('status', '==', 'completed')
-      .where('createdAt', '>=', twentyFourHoursAgo)
+      .where('createdAt', '>=', cutoffTime)
       .orderBy('createdAt', 'asc')
       .get();
 
