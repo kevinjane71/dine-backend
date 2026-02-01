@@ -8564,12 +8564,29 @@ app.get('/api/floors/:restaurantId', async (req, res) => {
         .get();
 
       const tables = [];
-      tablesSnapshot.forEach(tableDoc => {
+      for (const tableDoc of tablesSnapshot.docs) {
+        const tableData = tableDoc.data();
+        let currentOrderTotal = null;
+
+        // If table has a current order, fetch the order total
+        if (tableData.currentOrderId && tableData.status === 'occupied') {
+          try {
+            const orderDoc = await db.collection(collections.orders).doc(tableData.currentOrderId).get();
+            if (orderDoc.exists) {
+              const orderData = orderDoc.data();
+              currentOrderTotal = orderData.finalAmount || orderData.totalAmount || 0;
+            }
+          } catch (orderErr) {
+            console.log(`Failed to fetch order ${tableData.currentOrderId} for table:`, orderErr.message);
+          }
+        }
+
         tables.push({
           id: tableDoc.id,
-          ...tableDoc.data()
+          ...tableData,
+          currentOrderTotal
         });
-      });
+      }
 
       floors.push({
         id: floorDoc.id,
