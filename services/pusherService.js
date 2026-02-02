@@ -91,6 +91,7 @@ const notifyKOTPrintRequest = async (restaurantId, orderData) => {
     roomNumber: orderData.roomNumber || '',
     items: orderData.items || [],
     notes: orderData.notes || '',
+    specialInstructions: orderData.specialInstructions || '',
     staffInfo: orderData.staffInfo || {},
     orderType: orderData.orderType || 'dine-in',
     createdAt: orderData.createdAt || new Date().toISOString(),
