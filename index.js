@@ -5415,6 +5415,7 @@ app.post('/api/orders', async (req, res) => {
       paymentMethod = 'cash',
       staffInfo,
       notes,
+      specialInstructions, // Kitchen special instructions
       customerPhone,
       customerName,
       seatNumber
@@ -5635,6 +5636,7 @@ app.post('/api/orders', async (req, res) => {
         kitchenNotes: 'Direct customer order'
       } : (staffInfo || null),
       notes: notes || (orderType === 'customer_self_order' ? `Customer self-order from seat ${seatNumber || 'Walk-in'}` : ''),
+      specialInstructions: specialInstructions || null, // Kitchen special instructions
       status: req.body.status || 'confirmed',
       kotSent: false,
       paymentStatus: roomNumber ? 'hotel-billing' : 'pending', // NEW: Mark as hotel billing if room number provided
@@ -6568,17 +6570,18 @@ app.patch('/api/orders/:orderId/status', authenticateToken, async (req, res) => 
 app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
   try {
     const { orderId } = req.params;
-    const { 
-      items, 
-      tableNumber, 
-      orderType, 
-      paymentMethod, 
+    const {
+      items,
+      tableNumber,
+      orderType,
+      paymentMethod,
       status,
       paymentStatus,
       completedAt,
       customerInfo,
-      updatedAt, 
-      lastUpdatedBy 
+      specialInstructions,
+      updatedAt,
+      lastUpdatedBy
     } = req.body;
 
     // Validate items if provided
@@ -6801,6 +6804,7 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
     if (paymentStatus) updateData.paymentStatus = paymentStatus;
     if (completedAt) updateData.completedAt = new Date(completedAt);
     if (customerInfo) updateData.customerInfo = customerInfo;
+    if (specialInstructions !== undefined) updateData.specialInstructions = specialInstructions;
     if (lastUpdatedBy) updateData.lastUpdatedBy = lastUpdatedBy;
 
     // Add update history
