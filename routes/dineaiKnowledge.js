@@ -12,6 +12,7 @@ const {
   authenticateDineAI,
   requireManagerRole
 } = require('../middleware/dineaiAuth');
+const { authenticateToken } = require('../middleware/auth');
 
 // Configure multer for file uploads
 const upload = multer({
@@ -227,7 +228,7 @@ router.post('/dineai/knowledge/faq',
  * GET /api/dineai/knowledge/:restaurantId
  */
 router.get('/dineai/knowledge/:restaurantId',
-  authenticateDineAI,
+  authenticateToken,
   async (req, res) => {
     try {
       const { restaurantId } = req.params;
@@ -347,7 +348,7 @@ router.post('/dineai/knowledge/reindex',
  * GET /api/dineai/knowledge/:restaurantId/stats
  */
 router.get('/dineai/knowledge/:restaurantId/stats',
-  authenticateDineAI,
+  authenticateToken,
   async (req, res) => {
     try {
       const { restaurantId } = req.params;

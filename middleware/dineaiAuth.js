@@ -68,6 +68,7 @@ const authenticateDineAI = async (req, res, next) => {
     }
 
     console.log('🔐 DineAI Auth - restaurantId:', restaurantId);
+    console.log('🔐 DineAI Auth - userId from token:', decoded.userId);
 
     if (!restaurantId) {
       return res.status(400).json({
@@ -90,11 +91,13 @@ const authenticateDineAI = async (req, res, next) => {
 
     let userRestaurantDoc;
     try {
+      console.log('🔐 DineAI Auth - Checking userRestaurants for userId:', decoded.userId, 'restaurantId:', restaurantId);
       userRestaurantDoc = await db.collection('userRestaurants')
         .where('userId', '==', decoded.userId)
         .where('restaurantId', '==', restaurantId)
         .limit(1)
         .get();
+      console.log('🔐 DineAI Auth - userRestaurants found:', !userRestaurantDoc.empty);
     } catch (queryError) {
       console.error('userRestaurants query failed:', queryError.message);
       return res.status(500).json({
@@ -104,7 +107,7 @@ const authenticateDineAI = async (req, res, next) => {
     }
 
     if (userRestaurantDoc.empty) {
-      // Check if user is the owner
+      // Check 2: User is owner via restaurant.ownerId
       let restaurantDoc;
       try {
         restaurantDoc = await db.collection('restaurants').doc(restaurantId).get();
@@ -116,15 +119,63 @@ const authenticateDineAI = async (req, res, next) => {
         });
       }
 
-      if (!restaurantDoc.exists || restaurantDoc.data().ownerId !== decoded.userId) {
+      console.log('🔐 DineAI Auth - Restaurant exists:', restaurantDoc.exists);
+      const restaurantData = restaurantDoc.exists ? restaurantDoc.data() : {};
+      console.log('🔐 DineAI Auth - Restaurant ownerId:', restaurantData.ownerId || 'N/A');
+      console.log('🔐 DineAI Auth - User ID from token:', decoded.userId);
+
+      let hasAccess = false;
+      let accessMethod = '';
+
+      // Check ownerId
+      if (restaurantDoc.exists && restaurantData.ownerId === decoded.userId) {
+        hasAccess = true;
+        accessMethod = 'ownerId';
+      }
+
+      // Check userId field (some restaurants use this)
+      if (!hasAccess && restaurantData.userId === decoded.userId) {
+        hasAccess = true;
+        accessMethod = 'userId';
+      }
+
+      // Check createdBy field
+      if (!hasAccess && restaurantData.createdBy === decoded.userId) {
+        hasAccess = true;
+        accessMethod = 'createdBy';
+      }
+
+      // Check 3: Staff in users collection (fallback for existing staff)
+      if (!hasAccess) {
+        try {
+          const userDoc = await db.collection('users').doc(decoded.userId).get();
+          if (userDoc.exists) {
+            const userData = userDoc.data();
+            if (userData.restaurantId === restaurantId) {
+              hasAccess = true;
+              accessMethod = 'user.restaurantId';
+              req.userRole = userData.role || 'employee';
+              req.userName = userData.name || decoded.name || 'User';
+            }
+          }
+        } catch (userError) {
+          console.error('User check failed:', userError.message);
+        }
+      }
+
+      if (!hasAccess) {
+        console.log('🔐 DineAI Auth - Access denied. No match found.');
         return res.status(403).json({
           success: false,
           error: 'Access denied: You do not have access to this restaurant'
         });
       }
-      // User is owner
-      req.userRole = 'owner';
-      req.userName = decoded.name || 'Owner';
+
+      console.log('🔐 DineAI Auth - Access granted via:', accessMethod);
+      if (!req.userRole) {
+        req.userRole = 'owner';
+        req.userName = decoded.name || 'Owner';
+      }
     } else {
       // Get user role from userRestaurants
       const userData = userRestaurantDoc.docs[0].data();

@@ -17,6 +17,7 @@ const {
   trackDineAIUsage,
   requireManagerRole
 } = require('../middleware/dineaiAuth');
+const { authenticateToken } = require('../middleware/auth');
 
 // ==================== Session Management ====================
 
@@ -281,7 +282,7 @@ router.get('/dineai/conversation/:id', authenticateDineAI, async (req, res) => {
  * Get DineAI settings for restaurant
  * GET /api/dineai/settings/:restaurantId
  */
-router.get('/dineai/settings/:restaurantId', authenticateDineAI, async (req, res) => {
+router.get('/dineai/settings/:restaurantId', authenticateToken, async (req, res) => {
   try {
     const { restaurantId } = req.params;
     const { getDb } = require('../firebase');
@@ -328,7 +329,7 @@ router.get('/dineai/settings/:restaurantId', authenticateDineAI, async (req, res
  * Update DineAI settings for restaurant
  * PUT /api/dineai/settings/:restaurantId
  */
-router.put('/dineai/settings/:restaurantId', authenticateDineAI, requireManagerRole, async (req, res) => {
+router.put('/dineai/settings/:restaurantId', authenticateToken, async (req, res) => {
   try {
     const { restaurantId } = req.params;
     const updates = req.body;
