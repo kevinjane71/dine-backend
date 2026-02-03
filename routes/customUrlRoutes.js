@@ -10,7 +10,7 @@ const RESERVED_SLUGS = [
   'privacy', 'terms', 'blog', 'products', 'for', 'tools', 'restaurants', 'onlineorder',
   'placeorder', 'print-kot', 'setup', 'local-login', 'kot', 'orderhistory', 'customers',
   'offers', 'customer-app', 'tables', 'hotel', 'inventory', 'automation', 'analytics',
-  'www', 'app', 'static', 'assets', 'images', 'public', 'favicon', 'robots'
+  'www', 'app', 'static', 'assets', 'images', 'public', 'favicon', 'robots',"dineai"
 ];
 
 // Validate slug format
