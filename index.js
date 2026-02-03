@@ -11241,9 +11241,163 @@ Example responses:
 
   } catch (error) {
     console.error('Voice processing error:', error);
-    res.status(500).json({ 
+    res.status(500).json({
       error: 'Failed to process voice command',
-      message: error.message 
+      message: error.message
+    });
+  }
+});
+
+// Smart Voice Order Processing - Streaming with Intent Detection
+app.post('/api/voice/smart-process', authenticateToken, aiUsageLimiter.middleware(), async (req, res) => {
+  try {
+    const {
+      transcript,
+      restaurantId,
+      existingCart = [],
+      processedItemIds = [],
+      isStreaming = true
+    } = req.body;
+
+    if (!transcript || !restaurantId) {
+      return res.status(400).json({ error: 'Transcript and restaurantId are required' });
+    }
+
+    console.log('🎤 Smart voice processing:', {
+      transcript: transcript.substring(0, 100),
+      cartItems: existingCart.length,
+      processedCount: processedItemIds.length
+    });
+
+    // Get menu items from restaurant
+    const restaurantDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
+
+    if (!restaurantDoc.exists) {
+      return res.status(404).json({ error: 'Restaurant not found' });
+    }
+
+    const restaurantData = restaurantDoc.data();
+    const menuData = restaurantData.menu || { categories: [], items: [] };
+    let menuItems = menuData.items || [];
+
+    // Filter only active items
+    menuItems = menuItems.filter(item => item.status === 'active' || item.active === true);
+
+    if (menuItems.length === 0) {
+      return res.status(404).json({ error: 'No menu items found' });
+    }
+
+    // Create menu context
+    const menuContext = menuItems.slice(0, 100).map(item =>
+      `${item.name} (₹${item.price}) [ID:${item.id}]`
+    ).join(', ');
+
+    // Create cart context
+    const cartContext = existingCart.length > 0
+      ? `Current cart: ${existingCart.map(i => `${i.quantity}x ${i.name}`).join(', ')}`
+      : 'Cart is empty';
+
+    const openai = new OpenAI({
+      apiKey: process.env.OPENAI_API_KEY
+    });
+
+    const systemPrompt = `You are a smart restaurant voice order assistant. Parse voice commands and detect user intent.
+
+MENU: ${menuContext}
+
+${cartContext}
+
+RESPOND WITH JSON ONLY:
+{
+  "items": [{"id":"item_id", "name":"Item Name", "quantity":1, "action":"add"}],
+  "compiledText": "1 Paneer Tikka, 2 Dosa",
+  "shouldStop": false,
+  "intent": "adding"
+}
+
+RULES:
+1. Parse Indian accents (paneer/panir, chhole/chole, dosa/dhosa)
+2. Match items phonetically with menu
+3. Detect quantities (ek=1, do=2, teen=3, char=4, paanch=5)
+4. "action" can be: "add", "remove", "update"
+5. "shouldStop" = true if user says: "that's all", "bas", "ho gaya", "done", "order kar do", "ye sab", "baki nahi", "complete", "finish"
+6. "compiledText" = human readable summary of recognized items
+7. "intent": "adding" (new items), "modifying" (changing cart), "completing" (ready to place order)
+8. If user says "hata do", "remove", "cancel" for an item, set action="remove"
+9. Only return NEW items not in processedItemIds: [${processedItemIds.join(',')}]`;
+
+    const completion = await openai.chat.completions.create({
+      model: "gpt-4o-mini",
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: transcript }
+      ],
+      temperature: 0.1,
+      max_tokens: 400
+    });
+
+    const responseText = completion.choices[0].message.content.trim();
+    console.log('🤖 Smart response:', responseText);
+
+    // Parse the response
+    let result = { items: [], compiledText: '', shouldStop: false, intent: 'adding' };
+    try {
+      const jsonMatch = responseText.match(/```json\s*([\s\S]*?)\s*```/) ||
+                        responseText.match(/```\s*([\s\S]*?)\s*```/) ||
+                        [null, responseText];
+      result = JSON.parse(jsonMatch[1] || responseText);
+    } catch (parseError) {
+      console.log('Parse error, using defaults');
+    }
+
+    // Helper for fuzzy matching
+    const fuzzyMatch = (name1, name2) => {
+      const n1 = (name1 || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+      const n2 = (name2 || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+      return n1.includes(n2) || n2.includes(n1) ||
+             n1.split('').filter(c => n2.includes(c)).length > Math.min(n1.length, n2.length) * 0.6;
+    };
+
+    // Validate and enrich items
+    const validItems = [];
+    for (const item of (result.items || [])) {
+      let menuItem = menuItems.find(m => m.id === item.id) ||
+                     menuItems.find(m => m.name.toLowerCase() === (item.name || '').toLowerCase()) ||
+                     menuItems.find(m => fuzzyMatch(m.name, item.name));
+
+      if (!menuItem) continue;
+
+      // Skip already processed unless it's a remove/update action
+      if (processedItemIds.includes(menuItem.id) && item.action === 'add') {
+        continue;
+      }
+
+      validItems.push({
+        id: menuItem.id,
+        name: menuItem.name,
+        price: menuItem.price,
+        quantity: item.quantity || 1,
+        action: item.action || 'add',
+        image: menuItem.image || null
+      });
+    }
+
+    console.log(`✅ Smart processed: ${validItems.length} items, shouldStop: ${result.shouldStop}`);
+
+    res.json({
+      success: true,
+      items: validItems,
+      compiledText: result.compiledText || '',
+      shouldStop: result.shouldStop || false,
+      intent: result.intent || 'adding',
+      allProcessedIds: [...processedItemIds, ...validItems.filter(i => i.action === 'add').map(i => i.id)]
+    });
+
+  } catch (error) {
+    console.error('Smart voice processing error:', error);
+    res.status(500).json({
+      error: 'Failed to process voice command',
+      message: error.message
     });
   }
 });
