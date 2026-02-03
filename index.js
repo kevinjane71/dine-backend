@@ -187,6 +187,10 @@ const emailService = require('./emailService');
 // Chatbot RAG routes
 const chatbotRoutes = require('./routes/chatbot');
 
+// DineAI Voice Assistant routes
+const dineaiRoutes = require('./routes/dineai');
+const dineaiKnowledgeRoutes = require('./routes/dineaiKnowledge');
+
 // Hotel PMS routes
 const hotelRoutes = require('./routes/hotel');
 
@@ -7344,6 +7348,10 @@ app.use('/api/payments', paymentRoutes);
 
 // Initialize chatbot RAG routes
 app.use('/api', chatbotRoutes);
+
+// DineAI Voice Assistant routes
+app.use('/api', dineaiRoutes);
+app.use('/api', dineaiKnowledgeRoutes);
 
 // Initialize hotel management routes (restaurant-hotel integration)
 // NOTE: hotelManagementRoutes must be registered BEFORE hotelRoutes to handle
