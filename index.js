@@ -7017,10 +7017,11 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
       items: updateData.items || currentOrder.items
     }).catch(err => console.error('Pusher notification error (non-blocking):', err));
 
-    // If items were updated and order is NOT completed/cancelled/deleted, trigger KOT reprint (Pusher and/or polling)
+    // If items were updated and order is NOT completed/cancelled/deleted/saved, trigger KOT reprint (Pusher and/or polling)
     // This covers: pending, confirmed, preparing, ready, serving statuses
+    // Note: 'saved' orders should NOT trigger KOT print until they are explicitly placed (status changed to confirmed)
     const orderStatus = status || currentOrder.status;
-    const nonKitchenStatuses = ['completed', 'cancelled', 'deleted'];
+    const nonKitchenStatuses = ['completed', 'cancelled', 'deleted', 'saved'];
     if (items && items.length > 0 && !nonKitchenStatuses.includes(orderStatus)) {
       try {
         // Always reset kotPrinted so pending-print API returns this order (polling mode) and KOT app can reprint
