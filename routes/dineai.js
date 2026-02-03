@@ -291,7 +291,7 @@ router.get('/dineai/settings/:restaurantId', authenticateToken, async (req, res)
     const settingsDoc = await db.collection('dineai_settings').doc(restaurantId).get();
 
     const defaultSettings = {
-      enabled: true,
+      enabled: false,
       defaultVoice: 'alloy',
       voiceMode: 'push-to-talk', // 'push-to-talk' or 'realtime' (realtime requires OpenAI Realtime API access)
       responseMode: 'voice', // 'voice', 'text', or 'both'
