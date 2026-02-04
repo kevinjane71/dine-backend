@@ -3911,12 +3911,20 @@ app.patch('/api/restaurants/:restaurantId', authenticateToken, async (req, res) 
     }
 
     // Update allowed basic fields
-    const allowedFields = ['name', 'address', 'city', 'phone', 'email', 'cuisine', 'description', 'logo', 'coverImage', 'openingHours', 'isActive'];
+    const allowedFields = ['name', 'address', 'city', 'phone', 'email', 'cuisine', 'description', 'logo', 'coverImage', 'openingHours', 'isActive', 'legalBusinessName', 'gstin'];
     allowedFields.forEach(field => {
       if (req.body[field] !== undefined) {
         updateData[field] = req.body[field];
       }
     });
+
+    // Validate GSTIN format if provided (15 characters: 2 state code + 10 PAN + 1 entity + 1 Z + 1 checksum)
+    if (req.body.gstin !== undefined && req.body.gstin !== '') {
+      const gstinRegex = /^[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z]{1}[1-9A-Z]{1}Z[0-9A-Z]{1}$/;
+      if (!gstinRegex.test(req.body.gstin)) {
+        return res.status(400).json({ error: 'Invalid GSTIN format. GSTIN should be 15 characters (e.g., 29ABCDE1234F1Z5)' });
+      }
+    }
 
     // Handle customerAppSettings updates (can update individual fields or entire object)
     if (req.body.customerAppSettings !== undefined) {
@@ -10064,6 +10072,159 @@ app.put('/api/admin/tax/:restaurantId', authenticateToken, async (req, res) => {
   } catch (error) {
     console.error('Update tax settings error:', error);
     res.status(500).json({ error: 'Failed to update tax settings' });
+  }
+});
+
+// ==================== BUSINESS SETTINGS (for GST invoices) ====================
+
+// Get business settings (legal name, GSTIN)
+app.get('/api/admin/business/:restaurantId', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+    const userId = req.user.userId;
+
+    console.log(`📊 Getting business settings for restaurant: ${restaurantId}, userId: ${userId}`);
+
+    // Verify user has access to this restaurant (owner, manager, admin, cashier)
+    const allowedRoles = ['owner', 'manager', 'admin', 'cashier'];
+    const userRestaurantSnapshot = await db.collection(collections.userRestaurants)
+      .where('userId', '==', userId)
+      .where('restaurantId', '==', restaurantId)
+      .where('role', 'in', allowedRoles)
+      .get();
+
+    let hasAccess = !userRestaurantSnapshot.empty;
+
+    if (!hasAccess) {
+      // Fallback: Check users collection for staff with restaurantId
+      const userDoc = await db.collection(collections.users).doc(userId).get();
+      if (userDoc.exists) {
+        const userData = userDoc.data();
+        if (userData.restaurantId === restaurantId && allowedRoles.includes(userData.role?.toLowerCase())) {
+          hasAccess = true;
+        }
+      }
+    }
+
+    if (!hasAccess) {
+      // Final fallback: Check if user is the owner directly from restaurant document
+      const restaurantRef = db.collection(collections.restaurants).doc(restaurantId);
+      const restaurantDoc = await restaurantRef.get();
+
+      if (!restaurantDoc.exists) {
+        return res.status(404).json({ error: 'Restaurant not found' });
+      }
+
+      const restaurant = restaurantDoc.data();
+      if (restaurant.ownerId !== userId) {
+        return res.status(403).json({ error: 'Access denied' });
+      }
+    }
+
+    // Get restaurant data
+    const restaurantRef = db.collection(collections.restaurants).doc(restaurantId);
+    const restaurantDoc = await restaurantRef.get();
+
+    if (!restaurantDoc.exists) {
+      return res.status(404).json({ error: 'Restaurant not found' });
+    }
+
+    const restaurant = restaurantDoc.data();
+
+    res.json({
+      businessSettings: {
+        legalBusinessName: restaurant.legalBusinessName || '',
+        gstin: restaurant.gstin || '',
+        address: restaurant.address || '',
+      }
+    });
+
+  } catch (error) {
+    console.error('Get business settings error:', error);
+    res.status(500).json({ error: 'Failed to get business settings' });
+  }
+});
+
+// Update business settings (legal name, GSTIN)
+app.put('/api/admin/business/:restaurantId', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+    const userId = req.user.userId;
+    const { legalBusinessName, gstin } = req.body;
+
+    console.log(`📊 Updating business settings for restaurant: ${restaurantId}, userId: ${userId}`);
+
+    // Verify user has access to this restaurant (owner, manager, admin, cashier)
+    const allowedRoles = ['owner', 'manager', 'admin', 'cashier'];
+    const userRestaurantSnapshot = await db.collection(collections.userRestaurants)
+      .where('userId', '==', userId)
+      .where('restaurantId', '==', restaurantId)
+      .where('role', 'in', allowedRoles)
+      .get();
+
+    let hasAccess = !userRestaurantSnapshot.empty;
+
+    if (!hasAccess) {
+      // Fallback: Check users collection for staff with restaurantId
+      const userDoc = await db.collection(collections.users).doc(userId).get();
+      if (userDoc.exists) {
+        const userData = userDoc.data();
+        if (userData.restaurantId === restaurantId && allowedRoles.includes(userData.role?.toLowerCase())) {
+          hasAccess = true;
+        }
+      }
+    }
+
+    if (!hasAccess) {
+      // Final fallback: Check if user is the owner directly from restaurant document
+      const restaurantRef = db.collection(collections.restaurants).doc(restaurantId);
+      const restaurantDoc = await restaurantRef.get();
+
+      if (!restaurantDoc.exists) {
+        return res.status(404).json({ error: 'Restaurant not found' });
+      }
+
+      const restaurant = restaurantDoc.data();
+      if (restaurant.ownerId !== userId) {
+        return res.status(403).json({ error: 'Access denied' });
+      }
+    }
+
+    // Validate GSTIN format if provided
+    if (gstin && gstin.trim() !== '') {
+      const gstinRegex = /^[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z]{1}[1-9A-Z]{1}Z[0-9A-Z]{1}$/;
+      if (!gstinRegex.test(gstin.toUpperCase())) {
+        return res.status(400).json({ error: 'Invalid GSTIN format. GSTIN should be 15 characters (e.g., 29ABCDE1234F1Z5)' });
+      }
+    }
+
+    // Update restaurant with business settings
+    const restaurantRef = db.collection(collections.restaurants).doc(restaurantId);
+    const updateData = {
+      updatedAt: new Date()
+    };
+
+    if (legalBusinessName !== undefined) {
+      updateData.legalBusinessName = legalBusinessName.trim();
+    }
+    if (gstin !== undefined) {
+      updateData.gstin = gstin.trim().toUpperCase();
+    }
+
+    await restaurantRef.update(updateData);
+
+    res.json({
+      success: true,
+      message: 'Business settings updated successfully',
+      businessSettings: {
+        legalBusinessName: updateData.legalBusinessName || '',
+        gstin: updateData.gstin || '',
+      }
+    });
+
+  } catch (error) {
+    console.error('Update business settings error:', error);
+    res.status(500).json({ error: 'Failed to update business settings' });
   }
 });
 
