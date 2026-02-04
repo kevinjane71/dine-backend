@@ -9857,7 +9857,7 @@ app.post('/api/auth/staff/login', async (req, res) => {
         ownerId: restaurantData.ownerId,
         legalBusinessName: restaurantData.legalBusinessName || '',
         gstin: restaurantData.gstin || '',
-        showGstOnInvoice: restaurantData.showGstOnInvoice !== false, // Default true
+        showGstOnInvoice: restaurantData.showGstOnInvoice === true, // Default false
       } : null,
       owner: ownerData ? {
         id: restaurantData.ownerId,
@@ -10155,7 +10155,7 @@ app.get('/api/admin/business/:restaurantId', authenticateToken, async (req, res)
         legalBusinessName: restaurant.legalBusinessName || '',
         gstin: restaurant.gstin || '',
         address: restaurant.address || '',
-        showGstOnInvoice: restaurant.showGstOnInvoice !== false, // Default true
+        showGstOnInvoice: restaurant.showGstOnInvoice === true, // Default false
       }
     });
 
@@ -10242,7 +10242,7 @@ app.put('/api/admin/business/:restaurantId', authenticateToken, async (req, res)
       businessSettings: {
         legalBusinessName: updateData.legalBusinessName || '',
         gstin: updateData.gstin || '',
-        showGstOnInvoice: updateData.showGstOnInvoice !== false,
+        showGstOnInvoice: updateData.showGstOnInvoice === true,
       }
     });
 
