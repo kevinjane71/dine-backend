@@ -7241,27 +7241,43 @@ app.delete('/api/orders/:orderId', authenticateToken, async (req, res) => {
   try {
     const { orderId } = req.params;
     const { userId, role } = req.user;
-    
-    // Check if user has admin or owner privileges
-    if (role !== 'admin' && role !== 'owner') {
-      return res.status(403).json({ error: 'Access denied. Admin or owner privileges required.' });
-    }
-    
+
     // Get the order to check if it exists and get restaurant info
     const orderRef = db.collection(collections.orders).doc(orderId);
     const orderDoc = await orderRef.get();
     if (!orderDoc.exists) {
       return res.status(404).json({ error: 'Order not found' });
     }
-    
+
     const order = orderDoc.data();
-    
-    // If user is owner, check if they own the restaurant
+
+    // Check if user has permission to delete orders (owner, admin, manager, cashier)
+    const allowedRoles = ['owner', 'admin', 'manager', 'cashier'];
+    let hasAccess = allowedRoles.includes(role?.toLowerCase());
+
+    // For owner role, verify they own the restaurant
     if (role === 'owner') {
       const restaurant = await db.collection(collections.restaurants).doc(order.restaurantId).get();
       if (!restaurant.exists || restaurant.data().ownerId !== userId) {
-        return res.status(403).json({ error: 'Access denied. You can only delete orders from your own restaurant.' });
+        hasAccess = false;
       }
+    }
+
+    // For staff roles (manager, cashier), verify they belong to the restaurant
+    if (['manager', 'cashier'].includes(role?.toLowerCase())) {
+      const userDoc = await db.collection(collections.users).doc(userId).get();
+      if (userDoc.exists) {
+        const userData = userDoc.data();
+        if (userData.restaurantId !== order.restaurantId) {
+          hasAccess = false;
+        }
+      } else {
+        hasAccess = false;
+      }
+    }
+
+    if (!hasAccess) {
+      return res.status(403).json({ error: 'Access denied. You do not have permission to delete this order.' });
     }
     
     // Already soft-deleted
