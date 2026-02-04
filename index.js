@@ -9854,7 +9854,10 @@ app.post('/api/auth/staff/login', async (req, res) => {
         email: restaurantData.email,
         cuisine: restaurantData.cuisine,
         description: restaurantData.description,
-        ownerId: restaurantData.ownerId
+        ownerId: restaurantData.ownerId,
+        legalBusinessName: restaurantData.legalBusinessName || '',
+        gstin: restaurantData.gstin || '',
+        showGstOnInvoice: restaurantData.showGstOnInvoice !== false, // Default true
       } : null,
       owner: ownerData ? {
         id: restaurantData.ownerId,
@@ -10152,6 +10155,7 @@ app.get('/api/admin/business/:restaurantId', authenticateToken, async (req, res)
         legalBusinessName: restaurant.legalBusinessName || '',
         gstin: restaurant.gstin || '',
         address: restaurant.address || '',
+        showGstOnInvoice: restaurant.showGstOnInvoice !== false, // Default true
       }
     });
 
@@ -10166,7 +10170,7 @@ app.put('/api/admin/business/:restaurantId', authenticateToken, async (req, res)
   try {
     const { restaurantId } = req.params;
     const userId = req.user.userId;
-    const { legalBusinessName, gstin } = req.body;
+    const { legalBusinessName, gstin, showGstOnInvoice } = req.body;
 
     console.log(`📊 Updating business settings for restaurant: ${restaurantId}, userId: ${userId}`);
 
@@ -10226,6 +10230,9 @@ app.put('/api/admin/business/:restaurantId', authenticateToken, async (req, res)
     if (gstin !== undefined) {
       updateData.gstin = gstin.trim().toUpperCase();
     }
+    if (showGstOnInvoice !== undefined) {
+      updateData.showGstOnInvoice = showGstOnInvoice === true;
+    }
 
     await restaurantRef.update(updateData);
 
@@ -10235,6 +10242,7 @@ app.put('/api/admin/business/:restaurantId', authenticateToken, async (req, res)
       businessSettings: {
         legalBusinessName: updateData.legalBusinessName || '',
         gstin: updateData.gstin || '',
+        showGstOnInvoice: updateData.showGstOnInvoice !== false,
       }
     });
 
