@@ -65,7 +65,7 @@ class DineAIToolExecutor {
         type: 'function',
         function: {
           name: 'place_order',
-          description: 'Place an order to the kitchen. Creates a new order with proper price calculation, tax, and table status update.',
+          description: 'Place an order to the kitchen. Creates a new order with proper price calculation, tax, and table status update. Validates table availability if table number is provided.',
           parameters: {
             type: 'object',
             properties: {
@@ -93,16 +93,22 @@ class DineAIToolExecutor {
               },
               table_number: {
                 type: 'string',
-                description: 'Table number for dine-in orders'
+                description: 'Table number for dine-in orders (optional - will validate table exists and is available)'
+              },
+              room_number: {
+                type: 'string',
+                description: 'Hotel room number for room service orders (optional)'
               },
               order_type: {
                 type: 'string',
-                enum: ['dine-in', 'takeaway', 'delivery'],
+                enum: ['dine-in', 'takeaway', 'delivery', 'room-service'],
                 description: 'Type of order (default: dine-in)'
               },
-              customer_name: { type: 'string', description: 'Customer name' },
-              customer_phone: { type: 'string', description: 'Customer phone number' },
-              notes: { type: 'string', description: 'Order notes or special instructions' }
+              customer_name: { type: 'string', description: 'Customer name (optional)' },
+              customer_phone: { type: 'string', description: 'Customer phone number (optional)' },
+              notes: { type: 'string', description: 'General order notes (optional)' },
+              special_instructions: { type: 'string', description: 'Special instructions for the kitchen/chef (optional)' },
+              seat_number: { type: 'string', description: 'Seat number for the customer (optional)' }
             },
             required: ['items']
           }
@@ -144,8 +150,53 @@ class DineAIToolExecutor {
       {
         type: 'function',
         function: {
+          name: 'update_order',
+          description: 'Update an existing order - add items, change table, add special instructions, etc. Use this when customer wants to modify their order after placement.',
+          parameters: {
+            type: 'object',
+            properties: {
+              order_id: { type: 'string', description: 'The order ID to update' },
+              items: {
+                type: 'array',
+                items: {
+                  type: 'object',
+                  properties: {
+                    name: { type: 'string', description: 'Menu item name' },
+                    quantity: { type: 'number', description: 'Quantity' },
+                    notes: { type: 'string', description: 'Notes for this item' }
+                  },
+                  required: ['name', 'quantity']
+                },
+                description: 'Updated array of all items (replaces existing items)'
+              },
+              add_items: {
+                type: 'array',
+                items: {
+                  type: 'object',
+                  properties: {
+                    name: { type: 'string', description: 'Menu item name' },
+                    quantity: { type: 'number', description: 'Quantity' },
+                    notes: { type: 'string', description: 'Notes for this item' }
+                  },
+                  required: ['name', 'quantity']
+                },
+                description: 'Items to add to existing order (appends to existing items)'
+              },
+              table_number: { type: 'string', description: 'New table number (optional)' },
+              special_instructions: { type: 'string', description: 'Special instructions for the kitchen (optional - adds to existing)' },
+              customer_name: { type: 'string', description: 'Customer name (optional)' },
+              customer_phone: { type: 'string', description: 'Customer phone (optional)' },
+              notes: { type: 'string', description: 'General order notes (optional)' }
+            },
+            required: ['order_id']
+          }
+        }
+      },
+      {
+        type: 'function',
+        function: {
           name: 'complete_billing',
-          description: 'Process payment and complete an order billing',
+          description: 'Process payment and complete an order billing. Releases the table and triggers billing print if enabled.',
           parameters: {
             type: 'object',
             properties: {
@@ -516,6 +567,9 @@ class DineAIToolExecutor {
         case 'cancel_order':
           result = await this.cancelOrder(restaurantId, args.order_id);
           break;
+        case 'update_order':
+          result = await this.updateOrder(restaurantId, args, userId);
+          break;
         case 'complete_billing':
           result = await this.completeBilling(restaurantId, args);
           break;
@@ -747,6 +801,23 @@ class DineAIToolExecutor {
         return { success: false, error: 'No items provided for order' };
       }
 
+      // Get restaurant data for settings
+      const restaurantDoc = await db.collection('restaurants').doc(restaurantId).get();
+      if (!restaurantDoc.exists) {
+        return { success: false, error: 'Restaurant not found' };
+      }
+      const restaurantData = restaurantDoc.data() || {};
+
+      // Validate table if provided (same as real API)
+      if (args.table_number && args.table_number.trim()) {
+        console.log(`🪑 Validating table number: ${args.table_number}`);
+        const tableValidation = await this.validateTableForOrder(restaurantId, args.table_number.trim());
+        if (!tableValidation.success) {
+          return tableValidation;
+        }
+        console.log(`✅ Table validation passed`);
+      }
+
       // Get menu items to match names to IDs and get prices
       console.log(`🍽️ Fetching menu items...`);
       const menuSnapshot = await db.collection('restaurants')
@@ -776,8 +847,19 @@ class DineAIToolExecutor {
         const menuItem = menuItems[item.name.toLowerCase()];
         if (!menuItem) {
           console.error(`❌ Menu item not found: "${item.name}"`);
-          console.log(`🍽️ Available items:`, Object.keys(menuItems).slice(0, 10));
-          return { success: false, error: `Menu item "${item.name}" not found. Please check the item name and try again.` };
+          // Suggest similar items
+          const suggestions = Object.keys(menuItems)
+            .filter(name => name.includes(item.name.toLowerCase().split(' ')[0]))
+            .slice(0, 3);
+          const suggestionMsg = suggestions.length > 0
+            ? ` Did you mean: ${suggestions.join(', ')}?`
+            : '';
+          return { success: false, error: `Menu item "${item.name}" not found.${suggestionMsg} Please check the item name and try again.` };
+        }
+
+        // Check if item is available
+        if (menuItem.isAvailable === false) {
+          return { success: false, error: `${menuItem.name} is currently unavailable. Please choose another item.` };
         }
 
         const quantity = item.quantity || 1;
@@ -803,6 +885,7 @@ class DineAIToolExecutor {
           price: itemPrice,
           quantity,
           total: itemTotal,
+          shortCode: menuItem.shortCode || null,
           selectedVariant: item.selectedVariant || null,
           notes: item.notes || ''
         });
@@ -812,24 +895,48 @@ class DineAIToolExecutor {
 
       console.log(`🍽️ Subtotal: ₹${subtotal}`);
 
-      // Get restaurant settings for tax
-      const restaurantDoc = await db.collection('restaurants').doc(restaurantId).get();
-      const restaurantData = restaurantDoc.data() || {};
-      const taxRate = restaurantData.taxSettings?.taxRate || 0;
-      const tax = Math.round(subtotal * (taxRate / 100) * 100) / 100;
-      const total = subtotal + tax;
+      // Calculate tax (matching real API logic)
+      let taxAmount = 0;
+      const taxBreakdown = [];
+      const taxSettings = restaurantData.taxSettings || {};
 
-      console.log(`🍽️ Tax (${taxRate}%): ₹${tax}, Total: ₹${total}`);
+      if (taxSettings.enabled && subtotal > 0) {
+        if (taxSettings.taxes && Array.isArray(taxSettings.taxes) && taxSettings.taxes.length > 0) {
+          taxSettings.taxes
+            .filter(tax => tax.enabled)
+            .forEach(tax => {
+              const amt = Math.round((subtotal * (tax.rate || 0) / 100) * 100) / 100;
+              taxAmount += amt;
+              taxBreakdown.push({
+                name: tax.name || 'Tax',
+                rate: tax.rate || 0,
+                amount: amt
+              });
+            });
+        } else if (taxSettings.defaultTaxRate) {
+          const amt = Math.round((subtotal * (taxSettings.defaultTaxRate / 100)) * 100) / 100;
+          taxAmount = amt;
+          taxBreakdown.push({
+            name: 'Tax',
+            rate: taxSettings.defaultTaxRate,
+            amount: amt
+          });
+        }
+      }
 
-      // Generate order ID
+      const finalAmount = Math.round((subtotal + taxAmount) * 100) / 100;
+      console.log(`🍽️ Tax: ₹${taxAmount}, Final Total: ₹${finalAmount}`);
+
+      // Generate order number and daily order ID (same as real API)
+      const orderNumber = `ORD-${Date.now()}-${Math.random().toString(36).substr(2, 4).toUpperCase()}`;
       const todayStr = new Date().toISOString().split('T')[0];
       const counterRef = db.collection('daily_order_counters').doc(`${restaurantId}_${todayStr}`);
       const counterDoc = await counterRef.get();
-      let orderId = 1;
+      let dailyOrderId = 1;
 
       if (counterDoc.exists) {
-        orderId = counterDoc.data().lastOrderId + 1;
-        await counterRef.update({ lastOrderId: orderId, updatedAt: new Date() });
+        dailyOrderId = counterDoc.data().lastOrderId + 1;
+        await counterRef.update({ lastOrderId: dailyOrderId, updatedAt: new Date() });
       } else {
         await counterRef.set({
           restaurantId,
@@ -840,25 +947,39 @@ class DineAIToolExecutor {
         });
       }
 
-      console.log(`🍽️ Generated Order ID: ${orderId}`);
+      console.log(`🍽️ Generated Order ID: ${dailyOrderId}, Number: ${orderNumber}`);
 
-      // Create order
+      // Create order (matching real API structure)
       const orderData = {
         restaurantId,
-        orderId,
+        orderNumber,
+        dailyOrderId,
         items: processedItems,
-        subtotal,
-        tax,
-        taxRate,
-        total,
-        status: 'pending',
+        totalAmount: subtotal,
+        taxAmount: Math.round(taxAmount * 100) / 100,
+        taxBreakdown,
+        finalAmount,
+        status: 'confirmed', // Start as confirmed so it goes to kitchen
         orderType: args.order_type || 'dine-in',
-        tableNumber: args.table_number || null,
-        customerName: args.customer_name || null,
-        customerPhone: args.customer_phone || null,
+        tableNumber: args.table_number || args.seat_number || null,
+        roomNumber: args.room_number || null,
+        customerInfo: {
+          name: args.customer_name || 'Customer',
+          phone: args.customer_phone || null,
+          seatNumber: args.seat_number || 'Walk-in'
+        },
+        paymentMethod: 'cash',
         notes: args.notes || '',
+        specialInstructions: args.special_instructions || null,
+        staffInfo: {
+          waiterId: userId,
+          waiterName: 'DineAI Assistant',
+          kitchenNotes: args.special_instructions || null
+        },
+        kotSent: false,
+        paymentStatus: args.room_number ? 'hotel-billing' : 'pending',
         createdBy: userId,
-        source: 'dineai', // Mark orders created by DineAI
+        source: 'dineai',
         createdAt: FieldValue.serverTimestamp(),
         updatedAt: FieldValue.serverTimestamp()
       };
@@ -867,28 +988,38 @@ class DineAIToolExecutor {
       const orderRef = await db.collection('orders').add(orderData);
       console.log(`✅ Order document created: ${orderRef.id}`);
 
-      // Update table status if table number provided
-      if (args.table_number) {
+      // Update table status to occupied if table number provided
+      if (args.table_number && args.table_number.trim()) {
         console.log(`🍽️ Updating table ${args.table_number} status to occupied...`);
-        await this.updateTableStatus(restaurantId, args.table_number, 'occupied');
+        await this.setTableOccupied(restaurantId, args.table_number.trim(), orderRef.id);
       }
 
       console.log(`🍽️ ========== Order Placed Successfully ==========`);
-      console.log(`🍽️ Order ID: ${orderId}, Doc ID: ${orderRef.id}`);
+      console.log(`🍽️ Order ID: ${dailyOrderId}, Doc ID: ${orderRef.id}`);
+
+      // Build response message
+      let message = `Order #${dailyOrderId} placed successfully`;
+      if (args.table_number) message += ` for table ${args.table_number}`;
+      if (args.room_number) message += ` for room ${args.room_number}`;
+      message += `. Items: ${processedItems.map(i => `${i.quantity}x ${i.name}`).join(', ')}. Total: ₹${finalAmount}`;
+      if (args.special_instructions) message += `. Special instructions noted.`;
 
       return {
         success: true,
         order: {
           id: orderRef.id,
-          orderId,
+          orderId: dailyOrderId,
+          orderNumber,
           items: processedItems,
           subtotal,
-          tax,
-          total,
-          status: 'pending',
-          tableNumber: args.table_number
+          taxAmount,
+          total: finalAmount,
+          status: 'confirmed',
+          tableNumber: args.table_number || null,
+          roomNumber: args.room_number || null,
+          specialInstructions: args.special_instructions || null
         },
-        message: `Order #${orderId} placed successfully${args.table_number ? ` for table ${args.table_number}` : ''}. Total: ₹${total}`
+        message
       };
     } catch (error) {
       console.error(`❌ Error placing order:`, error);
@@ -898,6 +1029,93 @@ class DineAIToolExecutor {
         error: `Failed to place order: ${error.message}`
       };
     }
+  }
+
+  /**
+   * Validate table exists and is available for new order
+   */
+  async validateTableForOrder(restaurantId, tableNumber) {
+    const db = getDb();
+    const floorsSnapshot = await db.collection('restaurants')
+      .doc(restaurantId)
+      .collection('floors')
+      .get();
+
+    let tableFound = false;
+    let tableStatus = null;
+
+    for (const floorDoc of floorsSnapshot.docs) {
+      const tablesSnapshot = await db.collection('restaurants')
+        .doc(restaurantId)
+        .collection('floors')
+        .doc(floorDoc.id)
+        .collection('tables')
+        .get();
+
+      for (const tableDoc of tablesSnapshot.docs) {
+        const tableData = tableDoc.data();
+        const tableName = tableData.name || tableData.number || tableData.tableNumber;
+
+        if (tableName && tableName.toString().toLowerCase() === tableNumber.toLowerCase()) {
+          tableFound = true;
+          tableStatus = tableData.status;
+          break;
+        }
+      }
+      if (tableFound) break;
+    }
+
+    if (!tableFound) {
+      return { success: false, error: `Table "${tableNumber}" not found in this restaurant. Please check the table number.` };
+    }
+
+    if (tableStatus && tableStatus !== 'available') {
+      const statusMessages = {
+        'occupied': 'is currently occupied by another customer',
+        'serving': 'is currently being served',
+        'reserved': 'is reserved for another customer',
+        'out-of-service': 'is out of service',
+        'maintenance': 'is under maintenance',
+        'cleaning': 'is being cleaned'
+      };
+      const msg = statusMessages[tableStatus] || `has status "${tableStatus}" and cannot be used`;
+      return { success: false, error: `Table "${tableNumber}" ${msg}. Please choose another table.` };
+    }
+
+    return { success: true };
+  }
+
+  /**
+   * Set table status to occupied with current order ID
+   */
+  async setTableOccupied(restaurantId, tableNumber, orderId) {
+    const db = getDb();
+    const floorsSnapshot = await db.collection('restaurants')
+      .doc(restaurantId)
+      .collection('floors')
+      .get();
+
+    for (const floorDoc of floorsSnapshot.docs) {
+      const tablesSnapshot = await db.collection('restaurants')
+        .doc(restaurantId)
+        .collection('floors')
+        .doc(floorDoc.id)
+        .collection('tables')
+        .where('name', '==', tableNumber)
+        .get();
+
+      if (!tablesSnapshot.empty) {
+        await tablesSnapshot.docs[0].ref.update({
+          status: 'occupied',
+          currentOrderId: orderId,
+          lastOrderTime: new Date(),
+          updatedAt: new Date()
+        });
+        console.log(`✅ Table ${tableNumber} marked as occupied`);
+        return true;
+      }
+    }
+    return false;
   }
 
   async updateOrderStatus(restaurantId, orderId, status) {
@@ -928,7 +1146,7 @@ class DineAIToolExecutor {
 
     const db = getDb();
     const order = orderResult.order;
-    if (!['pending', 'preparing'].includes(order.status)) {
+    if (!['pending', 'preparing', 'confirmed'].includes(order.status)) {
       return { success: false, error: `Cannot cancel order with status: ${order.status}` };
     }
 
@@ -938,6 +1156,11 @@ class DineAIToolExecutor {
       updatedAt: FieldValue.serverTimestamp()
     });
 
+    // Release table if order had a table
+    if (order.tableNumber) {
+      await this.releaseTable(restaurantId, order.tableNumber);
+    }
+
     return {
       success: true,
       message: `Order #${order.orderId} has been cancelled`,
@@ -945,7 +1168,277 @@ class DineAIToolExecutor {
     };
   }
 
+  /**
+   * Update an existing order - add items, change table, add instructions
+   */
+  async updateOrder(restaurantId, args, userId) {
+    console.log(`🔄 ========== Update Order Request ==========`);
+    console.log(`🔄 Restaurant ID: ${restaurantId}`);
+    console.log(`🔄 Order ID: ${args.order_id}`);
+    console.log(`🔄 Args:`, JSON.stringify(args, null, 2));
+
+    try {
+      const db = getDb();
+
+      // Get current order
+      const orderResult = await this.getOrderById(restaurantId, args.order_id);
+      if (!orderResult.success) {
+        return orderResult;
+      }
+
+      const currentOrder = orderResult.order;
+
+      // Cannot update completed or cancelled orders
+      if (['completed', 'cancelled'].includes(currentOrder.status)) {
+        return { success: false, error: `Cannot update order with status: ${currentOrder.status}` };
+      }
+
+      const updateData = {
+        updatedAt: FieldValue.serverTimestamp(),
+        lastUpdatedBy: { name: 'DineAI Assistant', id: userId }
+      };
+
+      let itemsChanged = false;
+      let processedItems = currentOrder.items || [];
+
+      // Handle adding items to existing order
+      if (args.add_items && Array.isArray(args.add_items) && args.add_items.length > 0) {
+        console.log(`🔄 Adding ${args.add_items.length} new items to order`);
+
+        // Get menu items
+        const menuSnapshot = await db.collection('restaurants')
+          .doc(restaurantId)
+          .collection('menu')
+          .get();
+
+        const menuItems = {};
+        menuSnapshot.forEach(doc => {
+          const data = doc.data();
+          if (data.isDeleted !== true) {
+            menuItems[data.name.toLowerCase()] = { id: doc.id, ...data };
+          }
+        });
+
+        for (const item of args.add_items) {
+          const menuItem = menuItems[item.name.toLowerCase()];
+          if (!menuItem) {
+            return { success: false, error: `Menu item "${item.name}" not found` };
+          }
+
+          const quantity = item.quantity || 1;
+          const itemPrice = menuItem.price;
+          const itemTotal = itemPrice * quantity;
+
+          processedItems.push({
+            menuItemId: menuItem.id,
+            name: menuItem.name,
+            price: itemPrice,
+            quantity,
+            total: itemTotal,
+            notes: item.notes || '',
+            isNew: true,
+            addedAt: new Date().toISOString()
+          });
+
+          console.log(`✅ Added new item: ${menuItem.name} x ${quantity}`);
+        }
+
+        itemsChanged = true;
+      }
+
+      // Handle replacing all items
+      if (args.items && Array.isArray(args.items) && args.items.length > 0) {
+        console.log(`🔄 Replacing all items with ${args.items.length} items`);
+
+        const menuSnapshot = await db.collection('restaurants')
+          .doc(restaurantId)
+          .collection('menu')
+          .get();
+
+        const menuItems = {};
+        menuSnapshot.forEach(doc => {
+          const data = doc.data();
+          if (data.isDeleted !== true) {
+            menuItems[data.name.toLowerCase()] = { id: doc.id, ...data };
+          }
+        });
+
+        processedItems = [];
+        for (const item of args.items) {
+          const menuItem = menuItems[item.name.toLowerCase()];
+          if (!menuItem) {
+            return { success: false, error: `Menu item "${item.name}" not found` };
+          }
+
+          const quantity = item.quantity || 1;
+          const itemPrice = menuItem.price;
+          const itemTotal = itemPrice * quantity;
+
+          processedItems.push({
+            menuItemId: menuItem.id,
+            name: menuItem.name,
+            price: itemPrice,
+            quantity,
+            total: itemTotal,
+            notes: item.notes || ''
+          });
+        }
+
+        itemsChanged = true;
+      }
+
+      // Update items and recalculate totals if items changed
+      if (itemsChanged) {
+        updateData.items = processedItems;
+        updateData.itemCount = processedItems.reduce((sum, item) => sum + item.quantity, 0);
+        updateData.totalAmount = processedItems.reduce((sum, item) => sum + (item.total || 0), 0);
+
+        // Recalculate tax
+        const restaurantDoc = await db.collection('restaurants').doc(restaurantId).get();
+        const restaurantData = restaurantDoc.data() || {};
+        const taxSettings = restaurantData.taxSettings || {};
+
+        let taxAmount = 0;
+        const taxBreakdown = [];
+
+        if (taxSettings.enabled && updateData.totalAmount > 0) {
+          if (taxSettings.taxes && Array.isArray(taxSettings.taxes)) {
+            taxSettings.taxes.filter(tax => tax.enabled).forEach(tax => {
+              const amt = Math.round((updateData.totalAmount * (tax.rate || 0) / 100) * 100) / 100;
+              taxAmount += amt;
+              taxBreakdown.push({ name: tax.name || 'Tax', rate: tax.rate || 0, amount: amt });
+            });
+          } else if (taxSettings.defaultTaxRate) {
+            taxAmount = Math.round((updateData.totalAmount * (taxSettings.defaultTaxRate / 100)) * 100) / 100;
+            taxBreakdown.push({ name: 'Tax', rate: taxSettings.defaultTaxRate, amount: taxAmount });
+          }
+        }
+
+        updateData.taxAmount = taxAmount;
+        updateData.taxBreakdown = taxBreakdown;
+        updateData.finalAmount = Math.round((updateData.totalAmount + taxAmount) * 100) / 100;
+
+        // Reset KOT printed flag so kitchen gets updated order
+        updateData.kotPrinted = false;
+      }
+
+      // Update table number if provided
+      if (args.table_number !== undefined && args.table_number !== currentOrder.tableNumber) {
+        // Validate new table
+        if (args.table_number && args.table_number.trim()) {
+          const validation = await this.validateTableForOrder(restaurantId, args.table_number.trim());
+          if (!validation.success) {
+            return validation;
+          }
+        }
+
+        // Release old table
+        if (currentOrder.tableNumber) {
+          await this.releaseTable(restaurantId, currentOrder.tableNumber);
+        }
+
+        // Occupy new table
+        if (args.table_number && args.table_number.trim()) {
+          await this.setTableOccupied(restaurantId, args.table_number.trim(), currentOrder.id);
+        }
+
+        updateData.tableNumber = args.table_number || null;
+      }
+
+      // Update special instructions
+      if (args.special_instructions !== undefined) {
+        const existingInstructions = currentOrder.specialInstructions || '';
+        const newInstructions = args.special_instructions;
+        updateData.specialInstructions = existingInstructions
+          ? `${existingInstructions}; ${newInstructions}`
+          : newInstructions;
+        updateData.staffInfo = {
+          ...(currentOrder.staffInfo || {}),
+          kitchenNotes: updateData.specialInstructions
+        };
+      }
+
+      // Update notes
+      if (args.notes !== undefined) {
+        updateData.notes = args.notes;
+      }
+
+      // Update customer info
+      if (args.customer_name || args.customer_phone) {
+        updateData.customerInfo = {
+          ...(currentOrder.customerInfo || {}),
+          name: args.customer_name || currentOrder.customerInfo?.name,
+          phone: args.customer_phone || currentOrder.customerInfo?.phone
+        };
+      }
+
+      // Apply update
+      await db.collection('orders').doc(currentOrder.id).update(updateData);
+
+      console.log(`✅ Order #${currentOrder.orderId} updated successfully`);
+
+      // Build response message
+      let changes = [];
+      if (itemsChanged) changes.push(`items updated (${processedItems.length} items, ₹${updateData.finalAmount || updateData.totalAmount})`);
+      if (args.table_number !== undefined) changes.push(`table changed to ${args.table_number || 'none'}`);
+      if (args.special_instructions) changes.push(`special instructions added`);
+
+      return {
+        success: true,
+        message: `Order #${currentOrder.orderId} updated: ${changes.join(', ')}`,
+        order: {
+          id: currentOrder.id,
+          orderId: currentOrder.orderId,
+          items: processedItems,
+          total: updateData.finalAmount || updateData.totalAmount || currentOrder.total,
+          tableNumber: updateData.tableNumber !== undefined ? updateData.tableNumber : currentOrder.tableNumber,
+          specialInstructions: updateData.specialInstructions || currentOrder.specialInstructions
+        }
+      };
+    } catch (error) {
+      console.error(`❌ Error updating order:`, error);
+      return { success: false, error: `Failed to update order: ${error.message}` };
+    }
+  }
+
+  /**
+   * Release a table (set to available)
+   */
+  async releaseTable(restaurantId, tableNumber) {
+    const db = getDb();
+    const floorsSnapshot = await db.collection('restaurants')
+      .doc(restaurantId)
+      .collection('floors')
+      .get();
+
+    for (const floorDoc of floorsSnapshot.docs) {
+      const tablesSnapshot = await db.collection('restaurants')
+        .doc(restaurantId)
+        .collection('floors')
+        .doc(floorDoc.id)
+        .collection('tables')
+        .where('name', '==', tableNumber.trim())
+        .get();
+
+      if (!tablesSnapshot.empty) {
+        await tablesSnapshot.docs[0].ref.update({
+          status: 'available',
+          currentOrderId: null,
+          updatedAt: new Date()
+        });
+        console.log(`✅ Table ${tableNumber} released (available)`);
+        return true;
+      }
+    }
+    return false;
+  }
+
   async completeBilling(restaurantId, args) {
+    console.log(`💳 ========== Complete Billing Request ==========`);
+    console.log(`💳 Order ID: ${args.order_id}`);
+    console.log(`💳 Payment Method: ${args.payment_method}`);
+    console.log(`💳 Discount: ${args.discount || 0}`);
+
     const orderResult = await this.getOrderById(restaurantId, args.order_id);
     if (!orderResult.success) {
       return orderResult;
@@ -953,30 +1446,47 @@ class DineAIToolExecutor {
 
     const db = getDb();
     const order = orderResult.order;
+
+    // Cannot complete billing on already completed or cancelled orders
+    if (order.status === 'completed') {
+      return { success: false, error: `Order #${order.orderId} is already completed` };
+    }
+    if (order.status === 'cancelled') {
+      return { success: false, error: `Cannot bill a cancelled order` };
+    }
+
     const discount = args.discount || 0;
-    const finalTotal = order.total - discount;
+    const finalTotal = (order.total || order.finalAmount || 0) - discount;
 
     await db.collection('orders').doc(order.id).update({
       status: 'completed',
       paymentMethod: args.payment_method,
+      paymentStatus: 'completed',
       discount,
-      finalTotal,
+      discountAmount: discount,
+      finalAmount: finalTotal,
+      completedAt: FieldValue.serverTimestamp(),
       paidAt: FieldValue.serverTimestamp(),
-      updatedAt: FieldValue.serverTimestamp()
+      updatedAt: FieldValue.serverTimestamp(),
+      billPrinted: false // Reset for print trigger
     });
 
-    // Free up the table
+    // Release the table (set to available, not cleaning)
     if (order.tableNumber) {
-      await this.updateTableStatus(restaurantId, order.tableNumber, 'cleaning');
+      console.log(`💳 Releasing table ${order.tableNumber}...`);
+      await this.releaseTable(restaurantId, order.tableNumber);
     }
+
+    console.log(`✅ Order #${order.orderId} billing completed`);
 
     return {
       success: true,
-      message: `Order #${order.orderId} billing completed. Total: ₹${finalTotal}`,
+      message: `Order #${order.orderId} billing completed. Payment: ${args.payment_method}. ${discount > 0 ? `Discount: ₹${discount}. ` : ''}Final Total: ₹${finalTotal}`,
       order: {
         ...order,
         status: 'completed',
         paymentMethod: args.payment_method,
+        paymentStatus: 'completed',
         discount,
         finalTotal
       }

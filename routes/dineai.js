@@ -293,7 +293,7 @@ router.get('/dineai/settings/:restaurantId', authenticateToken, async (req, res)
     const defaultSettings = {
       enabled: false,
       defaultVoice: 'alloy',
-      voiceMode: 'push-to-talk', // 'push-to-talk' or 'realtime' (realtime requires OpenAI Realtime API access)
+      voiceMode: 'cheap-realtime', // 'push-to-talk', 'cheap-realtime' (recommended - 95% cheaper), or 'realtime' (expensive)
       responseMode: 'voice', // 'voice', 'text', or 'both'
       enableKnowledgeBase: true,
       enableGreetings: true,

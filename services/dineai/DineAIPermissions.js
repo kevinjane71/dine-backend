@@ -105,7 +105,7 @@ const ROLE_PERMISSIONS = {
     get_orders: true,
     get_order_by_id: true,
     place_order: true,
-    update_order: false,
+    update_order: true, // Employees can add items/instructions to orders
     cancel_order: false,
     update_order_status: true,
     complete_billing: false,
@@ -153,7 +153,7 @@ const ROLE_PERMISSIONS = {
     get_orders: true,
     get_order_by_id: true,
     place_order: true,
-    update_order: false,
+    update_order: true, // Waiters can add items/instructions to orders
     cancel_order: false,
     update_order_status: false,
     complete_billing: false,
