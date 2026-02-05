@@ -691,7 +691,18 @@ router.post('/dineai/realtime/function', authenticateDineAI, async (req, res) =>
     const userId = req.user?.userId;
     const userRole = req.userRole;
 
+    console.log(`\n📡 ==================== Realtime Function Route ====================`);
+    console.log(`📡 Session ID: ${sessionId}`);
+    console.log(`📡 Function Name: ${functionName}`);
+    console.log(`📡 Body Restaurant ID: ${bodyRestaurantId}`);
+    console.log(`📡 Auth Restaurant ID: ${req.restaurantId}`);
+    console.log(`📡 Final Restaurant ID: ${restaurantId}`);
+    console.log(`📡 User ID: ${userId}`);
+    console.log(`📡 User Role: ${userRole}`);
+    console.log(`📡 Arguments:`, JSON.stringify(args, null, 2));
+
     if (!sessionId || !functionName) {
+      console.error(`❌ Missing required params: sessionId=${sessionId}, functionName=${functionName}`);
       return res.status(400).json({
         success: false,
         error: 'Session ID and function name are required'
@@ -699,13 +710,14 @@ router.post('/dineai/realtime/function', authenticateDineAI, async (req, res) =>
     }
 
     if (!restaurantId) {
+      console.error(`❌ No restaurant ID available`);
       return res.status(400).json({
         success: false,
         error: 'Restaurant ID is required'
       });
     }
 
-    console.log(`🔧 DineAI Realtime function: ${functionName} for restaurant ${restaurantId}`);
+    console.log(`📡 Executing function via RealtimeService...`);
 
     const result = await dineaiRealtimeService.executeFunctionCall(
       sessionId,
@@ -716,12 +728,16 @@ router.post('/dineai/realtime/function', authenticateDineAI, async (req, res) =>
       userRole
     );
 
+    console.log(`📡 Function result success: ${result.success}`);
+    console.log(`📡 ==================== End Route ====================\n`);
+
     res.json(result);
   } catch (error) {
-    console.error('Error executing realtime function:', error);
+    console.error('❌ Error executing realtime function:', error);
+    console.error('❌ Stack:', error.stack);
     res.status(500).json({
       success: false,
-      error: 'Failed to execute function'
+      error: 'Failed to execute function: ' + error.message
     });
   }
 });

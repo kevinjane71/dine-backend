@@ -466,133 +466,210 @@ class DineAIToolExecutor {
    * Execute a tool/function
    */
   async executeFunction(functionName, args, restaurantId, userId, userRole) {
-    console.log(`🔧 DineAI executing: ${functionName}`, args);
+    const startTime = Date.now();
+    console.log(`\n🔧 ==================== DineAI Function Call ====================`);
+    console.log(`🔧 Timestamp: ${new Date().toISOString()}`);
+    console.log(`🔧 Function: ${functionName}`);
+    console.log(`🔧 Restaurant ID: ${restaurantId}`);
+    console.log(`🔧 User ID: ${userId}`);
+    console.log(`🔧 User Role: ${userRole}`);
+    console.log(`🔧 Arguments:`, JSON.stringify(args, null, 2));
+
+    // Validate restaurantId
+    if (!restaurantId) {
+      console.error(`❌ DineAI Error: No restaurant ID provided for ${functionName}`);
+      console.log(`🔧 ==================== End Function Call (FAILED - No Restaurant ID) ====================\n`);
+      return {
+        success: false,
+        error: 'Restaurant ID is required. Please try again.'
+      };
+    }
 
     // Check permission
     if (!dineaiPermissions.hasPermission(userRole, functionName)) {
+      console.warn(`⚠️ DineAI Permission Denied: ${userRole} cannot execute ${functionName}`);
+      console.log(`🔧 ==================== End Function Call (DENIED) ====================\n`);
       return {
         success: false,
         error: `You don't have permission to ${functionName.replace(/_/g, ' ')}. Your role: ${userRole}`
       };
     }
 
+    console.log(`✅ Permission check passed for ${userRole} -> ${functionName}`);
+
+    let result;
     try {
       switch (functionName) {
         // Order Management
         case 'get_orders':
-          return await this.getOrders(restaurantId, args);
+          result = await this.getOrders(restaurantId, args);
+          break;
         case 'get_order_by_id':
-          return await this.getOrderById(restaurantId, args.order_id);
+          result = await this.getOrderById(restaurantId, args.order_id);
+          break;
         case 'place_order':
-          return await this.placeOrder(restaurantId, args, userId);
+          result = await this.placeOrder(restaurantId, args, userId);
+          break;
         case 'update_order_status':
-          return await this.updateOrderStatus(restaurantId, args.order_id, args.status);
+          result = await this.updateOrderStatus(restaurantId, args.order_id, args.status);
+          break;
         case 'cancel_order':
-          return await this.cancelOrder(restaurantId, args.order_id);
+          result = await this.cancelOrder(restaurantId, args.order_id);
+          break;
         case 'complete_billing':
-          return await this.completeBilling(restaurantId, args);
+          result = await this.completeBilling(restaurantId, args);
+          break;
 
         // Table Management
         case 'get_tables':
-          return await this.getTables(restaurantId, args);
+          result = await this.getTables(restaurantId, args);
+          break;
         case 'get_table_status':
-          return await this.getTableStatus(restaurantId, args.table_number);
+          result = await this.getTableStatus(restaurantId, args.table_number);
+          break;
         case 'reserve_table':
-          return await this.reserveTable(restaurantId, args);
+          result = await this.reserveTable(restaurantId, args);
+          break;
         case 'update_table_status':
-          return await this.updateTableStatus(restaurantId, args.table_number, args.status);
+          result = await this.updateTableStatus(restaurantId, args.table_number, args.status);
+          break;
         case 'get_table_order':
-          return await this.getTableOrder(restaurantId, args.table_number);
+          result = await this.getTableOrder(restaurantId, args.table_number);
+          break;
 
         // Menu Operations
         case 'get_menu':
-          return await this.getMenu(restaurantId, args);
+          result = await this.getMenu(restaurantId, args);
+          break;
         case 'search_menu_items':
-          return await this.searchMenuItems(restaurantId, args);
+          result = await this.searchMenuItems(restaurantId, args);
+          break;
         case 'get_item_availability':
-          return await this.getItemAvailability(restaurantId, args.item_name);
+          result = await this.getItemAvailability(restaurantId, args.item_name);
+          break;
         case 'add_menu_item':
-          return await this.addMenuItem(restaurantId, args, userId);
+          result = await this.addMenuItem(restaurantId, args, userId);
+          break;
         case 'update_menu_item':
-          return await this.updateMenuItem(restaurantId, args);
+          result = await this.updateMenuItem(restaurantId, args);
+          break;
         case 'toggle_item_availability':
-          return await this.toggleItemAvailability(restaurantId, args.item_name, args.is_available);
+          result = await this.toggleItemAvailability(restaurantId, args.item_name, args.is_available);
+          break;
 
         // Knowledge Base
         case 'search_knowledge':
-          return await this.searchKnowledge(restaurantId, args.query, args.category);
+          result = await this.searchKnowledge(restaurantId, args.query, args.category);
+          break;
         case 'get_restaurant_info':
-          return await this.getRestaurantInfo(restaurantId);
+          result = await this.getRestaurantInfo(restaurantId);
+          break;
 
         // Analytics
         case 'get_today_summary':
-          return await this.getTodaySummary(restaurantId);
+          result = await this.getTodaySummary(restaurantId);
+          break;
         case 'get_sales_summary':
-          return await this.getSalesSummary(restaurantId, args);
+          result = await this.getSalesSummary(restaurantId, args);
+          break;
 
         // Inventory
         case 'get_inventory_alerts':
-          return await this.getInventoryAlerts(restaurantId);
+          result = await this.getInventoryAlerts(restaurantId);
+          break;
 
         // Customer Management
         case 'get_customers':
-          return await this.getCustomers(restaurantId, args);
+          result = await this.getCustomers(restaurantId, args);
+          break;
         case 'get_customer_by_id':
-          return await this.getCustomerById(restaurantId, args);
+          result = await this.getCustomerById(restaurantId, args);
+          break;
 
         default:
-          return { success: false, error: `Unknown function: ${functionName}` };
+          result = { success: false, error: `Unknown function: ${functionName}` };
       }
     } catch (error) {
-      console.error(`Error executing ${functionName}:`, error);
-      return { success: false, error: error.message };
+      console.error(`❌ DineAI Function Error in ${functionName}:`, error);
+      console.error(`❌ Stack trace:`, error.stack);
+      result = {
+        success: false,
+        error: `Error executing ${functionName}: ${error.message}`
+      };
     }
+
+    const duration = Date.now() - startTime;
+    console.log(`📊 Function Result (${duration}ms):`, JSON.stringify(result, null, 2).substring(0, 500));
+    console.log(`🔧 ==================== End Function Call (${result.success ? 'SUCCESS' : 'FAILED'}) ====================\n`);
+
+    return result;
   }
 
   // ================== Order Management ==================
 
   async getOrders(restaurantId, args) {
-    const db = getDb();
-    let query = db.collection('orders').where('restaurantId', '==', restaurantId);
+    console.log(`📦 Getting orders for restaurant: ${restaurantId}`, args);
 
-    if (args.status && args.status !== 'all') {
-      query = query.where('status', '==', args.status);
-    }
+    try {
+      const db = getDb();
+      let query = db.collection('orders').where('restaurantId', '==', restaurantId);
 
-    if (args.table_number) {
-      query = query.where('tableNumber', '==', args.table_number);
-    }
+      if (args.status && args.status !== 'all') {
+        console.log(`📦 Filtering by status: ${args.status}`);
+        query = query.where('status', '==', args.status);
+      }
 
-    const snapshot = await query
-      .orderBy('createdAt', 'desc')
-      .limit(args.limit || 10)
-      .get();
+      if (args.table_number) {
+        console.log(`📦 Filtering by table: ${args.table_number}`);
+        query = query.where('tableNumber', '==', args.table_number);
+      }
 
-    const orders = [];
-    snapshot.forEach(doc => {
-      const data = doc.data();
-      orders.push({
-        id: doc.id,
-        orderId: data.orderId || doc.id,
-        items: (data.items || []).map(item => ({
-          name: item.name,
-          quantity: item.quantity,
-          price: item.price
-        })),
-        total: data.total || 0,
-        status: data.status,
-        tableNumber: data.tableNumber,
-        orderType: data.orderType || 'dine-in',
-        customerName: data.customerName,
-        createdAt: data.createdAt?.toDate?.()?.toISOString() || data.createdAt
+      const snapshot = await query
+        .orderBy('createdAt', 'desc')
+        .limit(args.limit || 10)
+        .get();
+
+      console.log(`📦 Found ${snapshot.size} orders`);
+
+      const orders = [];
+      snapshot.forEach(doc => {
+        const data = doc.data();
+        orders.push({
+          id: doc.id,
+          orderId: data.orderId || doc.id,
+          items: (data.items || []).map(item => ({
+            name: item.name,
+            quantity: item.quantity,
+            price: item.price
+          })),
+          total: data.total || 0,
+          status: data.status,
+          tableNumber: data.tableNumber,
+          orderType: data.orderType || 'dine-in',
+          customerName: data.customerName,
+          source: data.source, // Include source to see if it's from DineAI
+          createdAt: data.createdAt?.toDate?.()?.toISOString() || data.createdAt
+        });
       });
-    });
 
-    return {
-      success: true,
-      orders,
-      count: orders.length
-    };
+      if (orders.length > 0) {
+        console.log(`📦 Latest order: #${orders[0].orderId} - ${orders[0].status} - ₹${orders[0].total}`);
+      }
+
+      return {
+        success: true,
+        orders,
+        count: orders.length
+      };
+    } catch (error) {
+      console.error(`❌ Error getting orders:`, error);
+      return {
+        success: false,
+        error: `Failed to get orders: ${error.message}`,
+        orders: [],
+        count: 0
+      };
+    }
   }
 
   async getOrderById(restaurantId, orderId) {
@@ -656,123 +733,171 @@ class DineAIToolExecutor {
   }
 
   async placeOrder(restaurantId, args, userId) {
-    const db = getDb();
-    // Get menu items to match names to IDs and get prices
-    const menuSnapshot = await db.collection('restaurants')
-      .doc(restaurantId)
-      .collection('menu')
-      .get();
+    console.log(`🍽️ ========== Place Order Request ==========`);
+    console.log(`🍽️ Restaurant ID: ${restaurantId}`);
+    console.log(`🍽️ User ID: ${userId}`);
+    console.log(`🍽️ Order args:`, JSON.stringify(args, null, 2));
 
-    const menuItems = {};
-    menuSnapshot.forEach(doc => {
-      const data = doc.data();
-      menuItems[data.name.toLowerCase()] = { id: doc.id, ...data };
-    });
+    try {
+      const db = getDb();
 
-    // Process order items
-    const processedItems = [];
-    let subtotal = 0;
-
-    for (const item of args.items) {
-      const menuItem = menuItems[item.name.toLowerCase()];
-      if (!menuItem) {
-        return { success: false, error: `Menu item "${item.name}" not found` };
+      // Validate items array exists
+      if (!args.items || !Array.isArray(args.items) || args.items.length === 0) {
+        console.error(`❌ No items provided for order`);
+        return { success: false, error: 'No items provided for order' };
       }
 
-      const quantity = item.quantity || 1;
-      let itemPrice = menuItem.price;
+      // Get menu items to match names to IDs and get prices
+      console.log(`🍽️ Fetching menu items...`);
+      const menuSnapshot = await db.collection('restaurants')
+        .doc(restaurantId)
+        .collection('menu')
+        .get();
 
-      // Handle variant pricing
-      if (item.selectedVariant && menuItem.variants) {
-        const variant = menuItem.variants.find(v =>
-          v.name.toLowerCase() === item.selectedVariant.name.toLowerCase()
-        );
-        if (variant) {
-          itemPrice = variant.price;
+      console.log(`🍽️ Found ${menuSnapshot.size} menu items`);
+
+      const menuItems = {};
+      menuSnapshot.forEach(doc => {
+        const data = doc.data();
+        if (data.isDeleted !== true) {
+          menuItems[data.name.toLowerCase()] = { id: doc.id, ...data };
         }
+      });
+
+      console.log(`🍽️ Available menu items: ${Object.keys(menuItems).length}`);
+
+      // Process order items
+      const processedItems = [];
+      let subtotal = 0;
+
+      for (const item of args.items) {
+        console.log(`🍽️ Processing item: "${item.name}" x ${item.quantity || 1}`);
+
+        const menuItem = menuItems[item.name.toLowerCase()];
+        if (!menuItem) {
+          console.error(`❌ Menu item not found: "${item.name}"`);
+          console.log(`🍽️ Available items:`, Object.keys(menuItems).slice(0, 10));
+          return { success: false, error: `Menu item "${item.name}" not found. Please check the item name and try again.` };
+        }
+
+        const quantity = item.quantity || 1;
+        let itemPrice = menuItem.price;
+
+        // Handle variant pricing
+        if (item.selectedVariant && menuItem.variants) {
+          const variant = menuItem.variants.find(v =>
+            v.name.toLowerCase() === item.selectedVariant.name.toLowerCase()
+          );
+          if (variant) {
+            itemPrice = variant.price;
+            console.log(`🍽️ Using variant price: ${itemPrice} for ${item.selectedVariant.name}`);
+          }
+        }
+
+        const itemTotal = itemPrice * quantity;
+        subtotal += itemTotal;
+
+        processedItems.push({
+          menuItemId: menuItem.id,
+          name: menuItem.name,
+          price: itemPrice,
+          quantity,
+          total: itemTotal,
+          selectedVariant: item.selectedVariant || null,
+          notes: item.notes || ''
+        });
+
+        console.log(`✅ Added: ${menuItem.name} x ${quantity} = ₹${itemTotal}`);
       }
 
-      const itemTotal = itemPrice * quantity;
-      subtotal += itemTotal;
+      console.log(`🍽️ Subtotal: ₹${subtotal}`);
 
-      processedItems.push({
-        menuItemId: menuItem.id,
-        name: menuItem.name,
-        price: itemPrice,
-        quantity,
-        total: itemTotal,
-        selectedVariant: item.selectedVariant || null,
-        notes: item.notes || ''
-      });
-    }
+      // Get restaurant settings for tax
+      const restaurantDoc = await db.collection('restaurants').doc(restaurantId).get();
+      const restaurantData = restaurantDoc.data() || {};
+      const taxRate = restaurantData.taxSettings?.taxRate || 0;
+      const tax = Math.round(subtotal * (taxRate / 100) * 100) / 100;
+      const total = subtotal + tax;
 
-    // Get restaurant settings for tax
-    const restaurantDoc = await db.collection('restaurants').doc(restaurantId).get();
-    const restaurantData = restaurantDoc.data() || {};
-    const taxRate = restaurantData.taxSettings?.taxRate || 0;
-    const tax = Math.round(subtotal * (taxRate / 100) * 100) / 100;
-    const total = subtotal + tax;
+      console.log(`🍽️ Tax (${taxRate}%): ₹${tax}, Total: ₹${total}`);
 
-    // Generate order ID
-    const todayStr = new Date().toISOString().split('T')[0];
-    const counterRef = db.collection('daily_order_counters').doc(`${restaurantId}_${todayStr}`);
-    const counterDoc = await counterRef.get();
-    let orderId = 1;
+      // Generate order ID
+      const todayStr = new Date().toISOString().split('T')[0];
+      const counterRef = db.collection('daily_order_counters').doc(`${restaurantId}_${todayStr}`);
+      const counterDoc = await counterRef.get();
+      let orderId = 1;
 
-    if (counterDoc.exists) {
-      orderId = counterDoc.data().lastOrderId + 1;
-      await counterRef.update({ lastOrderId: orderId, updatedAt: new Date() });
-    } else {
-      await counterRef.set({
+      if (counterDoc.exists) {
+        orderId = counterDoc.data().lastOrderId + 1;
+        await counterRef.update({ lastOrderId: orderId, updatedAt: new Date() });
+      } else {
+        await counterRef.set({
+          restaurantId,
+          date: todayStr,
+          lastOrderId: 1,
+          createdAt: new Date(),
+          updatedAt: new Date()
+        });
+      }
+
+      console.log(`🍽️ Generated Order ID: ${orderId}`);
+
+      // Create order
+      const orderData = {
         restaurantId,
-        date: todayStr,
-        lastOrderId: 1,
-        createdAt: new Date(),
-        updatedAt: new Date()
-      });
-    }
-
-    // Create order
-    const orderData = {
-      restaurantId,
-      orderId,
-      items: processedItems,
-      subtotal,
-      tax,
-      taxRate,
-      total,
-      status: 'pending',
-      orderType: args.order_type || 'dine-in',
-      tableNumber: args.table_number || null,
-      customerName: args.customer_name || null,
-      customerPhone: args.customer_phone || null,
-      notes: args.notes || '',
-      createdBy: userId,
-      createdAt: FieldValue.serverTimestamp(),
-      updatedAt: FieldValue.serverTimestamp()
-    };
-
-    const orderRef = await db.collection('orders').add(orderData);
-
-    // Update table status if table number provided
-    if (args.table_number) {
-      await this.updateTableStatus(restaurantId, args.table_number, 'occupied');
-    }
-
-    return {
-      success: true,
-      order: {
-        id: orderRef.id,
         orderId,
         items: processedItems,
         subtotal,
         tax,
+        taxRate,
         total,
         status: 'pending',
-        tableNumber: args.table_number
-      },
-      message: `Order #${orderId} placed successfully${args.table_number ? ` for table ${args.table_number}` : ''}`
-    };
+        orderType: args.order_type || 'dine-in',
+        tableNumber: args.table_number || null,
+        customerName: args.customer_name || null,
+        customerPhone: args.customer_phone || null,
+        notes: args.notes || '',
+        createdBy: userId,
+        source: 'dineai', // Mark orders created by DineAI
+        createdAt: FieldValue.serverTimestamp(),
+        updatedAt: FieldValue.serverTimestamp()
+      };
+
+      console.log(`🍽️ Creating order document...`);
+      const orderRef = await db.collection('orders').add(orderData);
+      console.log(`✅ Order document created: ${orderRef.id}`);
+
+      // Update table status if table number provided
+      if (args.table_number) {
+        console.log(`🍽️ Updating table ${args.table_number} status to occupied...`);
+        await this.updateTableStatus(restaurantId, args.table_number, 'occupied');
+      }
+
+      console.log(`🍽️ ========== Order Placed Successfully ==========`);
+      console.log(`🍽️ Order ID: ${orderId}, Doc ID: ${orderRef.id}`);
+
+      return {
+        success: true,
+        order: {
+          id: orderRef.id,
+          orderId,
+          items: processedItems,
+          subtotal,
+          tax,
+          total,
+          status: 'pending',
+          tableNumber: args.table_number
+        },
+        message: `Order #${orderId} placed successfully${args.table_number ? ` for table ${args.table_number}` : ''}. Total: ₹${total}`
+      };
+    } catch (error) {
+      console.error(`❌ Error placing order:`, error);
+      console.error(`❌ Stack:`, error.stack);
+      return {
+        success: false,
+        error: `Failed to place order: ${error.message}`
+      };
+    }
   }
 
   async updateOrderStatus(restaurantId, orderId, status) {
@@ -1057,93 +1182,162 @@ class DineAIToolExecutor {
   // ================== Menu Operations ==================
 
   async getMenu(restaurantId, args) {
-    const db = getDb();
-    let query = db.collection('restaurants')
-      .doc(restaurantId)
-      .collection('menu')
-      .where('isDeleted', '!=', true);
+    console.log(`📋 Getting menu for restaurant: ${restaurantId}`, args);
 
-    const snapshot = await query.get();
-    const items = [];
-    const categories = new Set();
+    try {
+      const db = getDb();
+      // Don't use inequality filter on isDeleted as it fails if field doesn't exist
+      // Instead, get all items and filter in memory
+      const snapshot = await db.collection('restaurants')
+        .doc(restaurantId)
+        .collection('menu')
+        .get();
 
-    snapshot.forEach(doc => {
-      const data = doc.data();
+      console.log(`📋 Found ${snapshot.size} total menu items in database`);
 
-      if (args.category && data.category?.toLowerCase() !== args.category.toLowerCase()) {
-        return;
-      }
+      const items = [];
+      const categories = new Set();
 
-      if (args.is_veg !== undefined && data.isVeg !== args.is_veg) {
-        return;
-      }
+      snapshot.forEach(doc => {
+        const data = doc.data();
 
-      categories.add(data.category);
+        // Skip deleted items (check for true explicitly, default to not deleted)
+        if (data.isDeleted === true) {
+          return;
+        }
 
-      items.push({
-        id: doc.id,
-        name: data.name,
-        price: data.price,
-        category: data.category,
-        description: data.description,
-        isVeg: data.isVeg,
-        isAvailable: data.isAvailable !== false,
-        spiceLevel: data.spiceLevel,
-        variants: data.variants || []
+        if (args.category && data.category?.toLowerCase() !== args.category.toLowerCase()) {
+          return;
+        }
+
+        if (args.is_veg !== undefined && data.isVeg !== args.is_veg) {
+          return;
+        }
+
+        categories.add(data.category);
+
+        items.push({
+          id: doc.id,
+          name: data.name,
+          price: data.price,
+          category: data.category,
+          description: data.description,
+          isVeg: data.isVeg,
+          isAvailable: data.isAvailable !== false,
+          spiceLevel: data.spiceLevel,
+          variants: data.variants || []
+        });
       });
-    });
 
-    return {
-      success: true,
-      items,
-      categories: Array.from(categories),
-      count: items.length
-    };
+      console.log(`📋 Returning ${items.length} menu items (filtered)`);
+
+      return {
+        success: true,
+        items,
+        categories: Array.from(categories),
+        count: items.length
+      };
+    } catch (error) {
+      console.error(`❌ Error getting menu for ${restaurantId}:`, error);
+      return {
+        success: false,
+        error: `Failed to get menu: ${error.message}`,
+        items: [],
+        categories: [],
+        count: 0
+      };
+    }
   }
 
   async searchMenuItems(restaurantId, args) {
-    const menuResult = await this.getMenu(restaurantId, {
-      category: args.category,
-      is_veg: args.is_veg
-    });
+    console.log(`🔍 Searching menu items for: "${args.search_term}" in restaurant ${restaurantId}`);
 
-    if (!menuResult.success) {
-      return menuResult;
+    try {
+      const menuResult = await this.getMenu(restaurantId, {
+        category: args.category,
+        is_veg: args.is_veg
+      });
+
+      if (!menuResult.success) {
+        console.error(`❌ Failed to get menu for search:`, menuResult.error);
+        return menuResult;
+      }
+
+      const searchTerm = args.search_term.toLowerCase();
+      const matchedItems = menuResult.items.filter(item =>
+        item.name.toLowerCase().includes(searchTerm) ||
+        (item.description && item.description.toLowerCase().includes(searchTerm))
+      );
+
+      console.log(`🔍 Found ${matchedItems.length} items matching "${searchTerm}"`);
+
+      if (matchedItems.length > 0) {
+        console.log(`🔍 Top matches:`, matchedItems.slice(0, 3).map(i => `${i.name} (₹${i.price})`));
+      }
+
+      return {
+        success: true,
+        items: matchedItems,
+        count: matchedItems.length
+      };
+    } catch (error) {
+      console.error(`❌ Error searching menu items:`, error);
+      return {
+        success: false,
+        error: `Failed to search menu: ${error.message}`,
+        items: [],
+        count: 0
+      };
     }
-
-    const searchTerm = args.search_term.toLowerCase();
-    const matchedItems = menuResult.items.filter(item =>
-      item.name.toLowerCase().includes(searchTerm) ||
-      (item.description && item.description.toLowerCase().includes(searchTerm))
-    );
-
-    return {
-      success: true,
-      items: matchedItems,
-      count: matchedItems.length
-    };
   }
 
   async getItemAvailability(restaurantId, itemName) {
-    const searchResult = await this.searchMenuItems(restaurantId, { search_term: itemName });
+    console.log(`💰 Checking availability/price for: "${itemName}" in restaurant ${restaurantId}`);
 
-    if (!searchResult.success || searchResult.count === 0) {
-      return { success: false, error: `Item "${itemName}" not found in menu` };
+    try {
+      const searchResult = await this.searchMenuItems(restaurantId, { search_term: itemName });
+
+      if (!searchResult.success) {
+        console.error(`❌ Search failed:`, searchResult.error);
+        return {
+          success: false,
+          error: `Could not search menu: ${searchResult.error}`
+        };
+      }
+
+      if (searchResult.count === 0) {
+        console.log(`❌ Item "${itemName}" not found in menu`);
+        return {
+          success: false,
+          error: `Item "${itemName}" not found in menu. Try searching with a different name.`
+        };
+      }
+
+      const item = searchResult.items[0];
+      console.log(`✅ Found: ${item.name} - ₹${item.price} (${item.isAvailable ? 'Available' : 'Unavailable'})`);
+
+      return {
+        success: true,
+        item: {
+          name: item.name,
+          price: item.price,
+          isAvailable: item.isAvailable,
+          category: item.category,
+          description: item.description,
+          isVeg: item.isVeg,
+          variants: item.variants
+        },
+        message: item.isAvailable
+          ? `${item.name} is available at ₹${item.price}`
+          : `${item.name} (₹${item.price}) is currently unavailable`
+      };
+    } catch (error) {
+      console.error(`❌ Error checking item availability:`, error);
+      return {
+        success: false,
+        error: `Failed to check availability: ${error.message}`
+      };
     }
-
-    const item = searchResult.items[0];
-    return {
-      success: true,
-      item: {
-        name: item.name,
-        price: item.price,
-        isAvailable: item.isAvailable,
-        category: item.category
-      },
-      message: item.isAvailable
-        ? `${item.name} is available (₹${item.price})`
-        : `${item.name} is currently unavailable`
-    };
   }
 
   async addMenuItem(restaurantId, args, userId) {

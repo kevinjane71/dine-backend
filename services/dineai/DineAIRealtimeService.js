@@ -230,7 +230,16 @@ Always check menu for prices when asked. Confirm before placing orders. Be conci
    * @param {string} fallbackUserRole - Fallback user role
    */
   async executeFunctionCall(sessionId, functionName, args, fallbackRestaurantId, fallbackUserId, fallbackUserRole) {
+    console.log(`\n🎙️ ==================== DineAI Realtime Function ====================`);
+    console.log(`🎙️ Session ID: ${sessionId}`);
+    console.log(`🎙️ Function: ${functionName}`);
+    console.log(`🎙️ Arguments:`, JSON.stringify(args, null, 2));
+    console.log(`🎙️ Fallback Restaurant ID: ${fallbackRestaurantId}`);
+    console.log(`🎙️ Fallback User ID: ${fallbackUserId}`);
+    console.log(`🎙️ Fallback User Role: ${fallbackUserRole}`);
+
     const session = this.activeSessions.get(sessionId);
+    console.log(`🎙️ Active session found: ${!!session}`);
 
     // Determine context - prefer session data, fall back to provided values
     let restaurantId, userId, userRole;
@@ -239,8 +248,10 @@ Always check menu for prices when asked. Confirm before placing orders. Be conci
       restaurantId = session.restaurantId;
       userId = session.userId;
       userRole = session.userRole;
+      console.log(`🎙️ Using session context: Restaurant=${restaurantId}, User=${userId}, Role=${userRole}`);
     } else {
       // Try to find session info from Firestore
+      console.log(`🎙️ Session not in memory, checking Firestore...`);
       const db = getDb();
       const sessionDoc = await db.collection('dineai_realtime_sessions').doc(sessionId).get();
 
@@ -249,19 +260,29 @@ Always check menu for prices when asked. Confirm before placing orders. Be conci
         restaurantId = sessionData.restaurantId;
         userId = sessionData.userId;
         userRole = sessionData.userRole;
+        console.log(`🎙️ Found session in Firestore: Restaurant=${restaurantId}, User=${userId}, Role=${userRole}`);
+      } else {
+        console.log(`⚠️ Session not found in Firestore either`);
       }
     }
 
     // Use fallbacks if still not found
+    const prevRestaurantId = restaurantId;
     restaurantId = restaurantId || fallbackRestaurantId;
     userId = userId || fallbackUserId;
     userRole = userRole || fallbackUserRole || 'employee';
 
-    if (!restaurantId) {
-      return { success: false, error: 'Restaurant ID not found for session' };
+    if (!prevRestaurantId && restaurantId) {
+      console.log(`🎙️ Using fallback restaurant ID: ${restaurantId}`);
     }
 
-    console.log(`🔧 Executing ${functionName} for restaurant ${restaurantId}`);
+    console.log(`🎙️ Final context: Restaurant=${restaurantId}, User=${userId}, Role=${userRole}`);
+
+    if (!restaurantId) {
+      console.error(`❌ No restaurant ID available for function call!`);
+      console.log(`🎙️ ==================== End Realtime Function (FAILED - No Restaurant ID) ====================\n`);
+      return { success: false, error: 'Restaurant ID not found for session. Please try reconnecting.' };
+    }
 
     const result = await this.toolExecutor.executeFunction(
       functionName,
@@ -273,6 +294,8 @@ Always check menu for prices when asked. Confirm before placing orders. Be conci
 
     // Log the function call
     await this.logFunctionCall(sessionId, functionName, args, result);
+
+    console.log(`🎙️ ==================== End Realtime Function (${result.success ? 'SUCCESS' : 'FAILED'}) ====================\n`);
 
     return result;
   }
