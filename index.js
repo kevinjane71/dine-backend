@@ -216,6 +216,9 @@ const staffResetPasswordRoutes = require('./routes/staffResetPassword');
 // Print installer upload / download URLs (KOT Printer exe/dmg)
 const printInstallerRoutes = require('./routes/printInstaller');
 
+// Currency settings routes
+const currencyRoutes = require('./routes/currencyRoutes');
+
 // Debug email service initialization
 console.log('📧 Email service loaded:', !!emailService);
 if (emailService) {
@@ -10095,6 +10098,10 @@ app.put('/api/admin/tax/:restaurantId', authenticateToken, async (req, res) => {
     res.status(500).json({ error: 'Failed to update tax settings' });
   }
 });
+
+// ==================== CURRENCY SETTINGS ====================
+// Currency routes moved to ./routes/currencyRoutes.js
+app.use('/api', currencyRoutes);
 
 // ==================== BUSINESS SETTINGS (for GST invoices) ====================
 
