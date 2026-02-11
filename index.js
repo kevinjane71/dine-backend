@@ -2796,7 +2796,8 @@ app.post('/api/auth/google', async (req, res) => {
       hasRestaurants = false; // No restaurant created yet
 
       // Create default free-trial subscription for new user
-      await createDefaultSubscription(userId, email, phone || null, 'owner');
+      // Note: Google login doesn't have phone, so pass null
+      await createDefaultSubscription(userId, email, null, 'owner');
 
       // Send welcome email to new Gmail users
       console.log('📧 === REACHING EMAIL SENDING SECTION ===');
