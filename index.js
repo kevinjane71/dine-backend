@@ -1810,7 +1810,7 @@ app.post('/api/auth/verify-email', async (req, res) => {
     const token = jwt.sign(
       { userId: userDoc.id, email: userData.email, role: userData.role },
       process.env.JWT_SECRET,
-      { expiresIn: '7d' }
+      { expiresIn: '30d' }
     );
 
     res.json({
@@ -1862,7 +1862,7 @@ app.post('/api/auth/login', async (req, res) => {
     const token = jwt.sign(
       { userId: userDoc.id, email: userData.email, role: userData.role },
       process.env.JWT_SECRET,
-      { expiresIn: '7d' }
+      { expiresIn: '30d' }
     );
 
     res.json({
@@ -1880,6 +1880,127 @@ app.post('/api/auth/login', async (req, res) => {
   } catch (error) {
     console.error('Login error:', error);
     res.status(500).json({ error: 'Login failed' });
+  }
+});
+
+// Token refresh endpoint - allows refreshing expired tokens within grace period
+app.post('/api/auth/refresh', async (req, res) => {
+  try {
+    const authHeader = req.headers['authorization'];
+    const token = authHeader && authHeader.split(' ')[1];
+
+    if (!token) {
+      return res.status(401).json({
+        success: false,
+        error: 'Token required for refresh'
+      });
+    }
+
+    // Try to decode the token (even if expired)
+    let decoded;
+    try {
+      // First try normal verification
+      decoded = jwt.verify(token, process.env.JWT_SECRET);
+    } catch (err) {
+      if (err.name === 'TokenExpiredError') {
+        // Token is expired - decode without verification to get payload
+        decoded = jwt.decode(token);
+        if (!decoded) {
+          return res.status(403).json({
+            success: false,
+            error: 'Invalid token format'
+          });
+        }
+
+        // Check if token expired within last 30 days (grace period)
+        const expiredAt = decoded.exp * 1000; // Convert to milliseconds
+        const thirtyDaysAgo = Date.now() - (30 * 24 * 60 * 60 * 1000);
+
+        if (expiredAt < thirtyDaysAgo) {
+          return res.status(403).json({
+            success: false,
+            error: 'Token expired too long ago. Please login again.'
+          });
+        }
+      } else {
+        // Token is invalid (not just expired)
+        return res.status(403).json({
+          success: false,
+          error: 'Invalid token'
+        });
+      }
+    }
+
+    // Verify user still exists and is active
+    const userId = decoded.userId;
+    const userRole = decoded.role;
+
+    // Check in appropriate collection based on role
+    let userDoc;
+    let userData;
+
+    if (userRole === 'staff' || userRole === 'cashier' || userRole === 'sales' || userRole === 'manager' || userRole === 'employee') {
+      // Staff user - check in staff collection
+      userDoc = await db.collection(collections.staff).doc(userId).get();
+      if (!userDoc.exists) {
+        return res.status(403).json({
+          success: false,
+          error: 'User not found. Please login again.'
+        });
+      }
+      userData = userDoc.data();
+
+      // Check if staff is active
+      if (userData.isActive === false) {
+        return res.status(401).json({
+          success: false,
+          error: 'Your account has been deactivated.',
+          inactive: true
+        });
+      }
+    } else {
+      // Regular user - check in users collection
+      userDoc = await db.collection(collections.users).doc(userId).get();
+      if (!userDoc.exists) {
+        return res.status(403).json({
+          success: false,
+          error: 'User not found. Please login again.'
+        });
+      }
+      userData = userDoc.data();
+    }
+
+    // Generate new token with fresh 30-day expiry
+    const newToken = jwt.sign(
+      {
+        userId: userDoc.id,
+        email: decoded.email || userData.email,
+        role: userRole,
+        ...(decoded.restaurantId && { restaurantId: decoded.restaurantId }),
+        ...(decoded.ownerId && { ownerId: decoded.ownerId })
+      },
+      process.env.JWT_SECRET,
+      { expiresIn: '30d' }
+    );
+
+    res.json({
+      success: true,
+      message: 'Token refreshed successfully',
+      token: newToken,
+      user: {
+        id: userDoc.id,
+        email: decoded.email || userData.email,
+        name: userData.name,
+        role: userRole
+      }
+    });
+
+  } catch (error) {
+    console.error('Token refresh error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Token refresh failed'
+    });
   }
 });
 
@@ -2064,7 +2185,7 @@ app.post('/api/auth/email/register', async (req, res) => {
     const token = jwt.sign(
       { userId, email: normalizedEmail, role: 'owner' },
       process.env.JWT_SECRET,
-      { expiresIn: '7d' }
+      { expiresIn: '30d' }
     );
 
     // Check if user has restaurants
@@ -2211,7 +2332,7 @@ app.post('/api/auth/email/verify-otp', async (req, res) => {
     const token = jwt.sign(
       { userId, email: normalizedEmail, role: userData.role },
       process.env.JWT_SECRET,
-      { expiresIn: '7d' }
+      { expiresIn: '30d' }
     );
 
     // Check if user has restaurants
@@ -2304,7 +2425,7 @@ app.post('/api/auth/email/login', async (req, res) => {
     const token = jwt.sign(
       { userId, email: normalizedEmail, role: userData.role },
       process.env.JWT_SECRET,
-      { expiresIn: '7d' }
+      { expiresIn: '30d' }
     );
 
     // Check if user has restaurants
@@ -2878,7 +2999,7 @@ app.post('/api/auth/google', async (req, res) => {
     const jwtToken = jwt.sign(
       { userId, email, role: userRole },
       process.env.JWT_SECRET,
-      { expiresIn: '7d' }
+      { expiresIn: '30d' }
     );
 
     res.json({
@@ -3152,7 +3273,7 @@ app.post('/api/auth/firebase/verify', async (req, res) => {
     const token = jwt.sign(
       { userId, phone: phoneNumber, email, role: 'owner' },
       process.env.JWT_SECRET,
-      { expiresIn: '7d' }
+      { expiresIn: '30d' }
     );
 
     // Get user's restaurants for the response
@@ -3300,7 +3421,7 @@ app.post('/api/auth/phone/verify-otp', async (req, res) => {
     const token = jwt.sign(
       { userId, phone, role: 'owner' },
       process.env.JWT_SECRET,
-      { expiresIn: '7d' }
+      { expiresIn: '30d' }
     );
 
     // Get user's restaurants for subdomain check (only if feature is enabled)
@@ -3421,7 +3542,7 @@ app.post('/api/admin/setup-client', async (req, res) => {
     const token = jwt.sign(
       { userId, phone: normalizedPhone, role: 'owner' },
       process.env.JWT_SECRET,
-      { expiresIn: '7d' }
+      { expiresIn: '30d' }
     );
 
     // Check if user already has restaurants
@@ -3668,7 +3789,7 @@ app.post('/api/auth/local-login', async (req, res) => {
     const token = jwt.sign(
       tokenPayload,
       process.env.JWT_SECRET,
-      { expiresIn: '7d' }
+      { expiresIn: '30d' }
     );
 
     // Get user's restaurants for subdomain check (same as OTP flow)
@@ -9835,7 +9956,7 @@ app.post('/api/auth/staff/login', async (req, res) => {
         ownerId: restaurantData?.ownerId
       },
       process.env.JWT_SECRET,
-      { expiresIn: '7d' }
+      { expiresIn: '30d' }
     );
 
     res.json({
