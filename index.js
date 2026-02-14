@@ -4139,24 +4139,62 @@ app.delete('/api/restaurants/:restaurantId', authenticateToken, async (req, res)
   }
 });
 
+// Demo Menu API - Fetch menu from demo account (phone: 9000000000) for new user preview
+app.get('/api/demo-menu', async (req, res) => {
+  try {
+    const demoPhone = '+919000000000';
+    const userQuery = await db.collection(collections.users)
+      .where('phone', '==', demoPhone)
+      .limit(1)
+      .get();
+
+    if (userQuery.empty) {
+      return res.status(404).json({ success: false, error: 'Demo account not found' });
+    }
+
+    const restaurantQuery = await db.collection(collections.restaurants)
+      .where('ownerId', '==', userQuery.docs[0].id)
+      .limit(1)
+      .get();
+
+    if (restaurantQuery.empty) {
+      return res.status(404).json({ success: false, error: 'Demo restaurant not found' });
+    }
+
+    const restaurantData = restaurantQuery.docs[0].data();
+    const menuItems = (restaurantData.menu?.items || [])
+      .filter(item => item.status === 'active')
+      .map(item => ({ ...item, isDemo: true }));
+
+    res.json({
+      success: true,
+      menuItems,
+      categories: restaurantData.categories || []
+    });
+  } catch (error) {
+    console.error('Demo menu fetch error:', error);
+    res.status(500).json({ success: false, error: 'Failed to fetch demo menu' });
+  }
+});
+
 // Public API - Get menu for customer ordering (no authentication required)
 app.get('/api/public/menu/:restaurantId', vercelSecurityMiddleware.publicAPI, async (req, res) => {
   try {
     const { restaurantId } = req.params;
 
     if (!restaurantId) {
-      return res.status(400).json({ 
+      return res.status(400).json({
         success: false,
-        error: 'Restaurant ID is required' 
+        error: 'Restaurant ID is required'
       });
     }
 
     // Get restaurant info
     const restaurantDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
     if (!restaurantDoc.exists) {
-      return res.status(404).json({ 
+      return res.status(404).json({
         success: false,
-        error: 'Restaurant not found' 
+        error: 'Restaurant not found'
       });
     }
 
