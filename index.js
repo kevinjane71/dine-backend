@@ -219,6 +219,10 @@ const printInstallerRoutes = require('./routes/printInstaller');
 // Currency settings routes
 const currencyRoutes = require('./routes/currencyRoutes');
 
+// Owner chain dashboard routes
+const ownerDashboardRoutes = require('./routes/ownerDashboard');
+const aiInsightsRoutes = require('./routes/aiInsights');
+
 // Debug email service initialization
 console.log('📧 Email service loaded:', !!emailService);
 if (emailService) {
@@ -10262,6 +10266,14 @@ app.put('/api/admin/tax/:restaurantId', authenticateToken, async (req, res) => {
 // ==================== CURRENCY SETTINGS ====================
 // Currency routes moved to ./routes/currencyRoutes.js
 app.use('/api', currencyRoutes);
+
+// ==================== OWNER CHAIN DASHBOARD ====================
+// Owner dashboard routes for multi-restaurant management
+app.use('/api/owner', ownerDashboardRoutes);
+
+// ==================== AI INSIGHTS & DAILY REPORTS ====================
+// AI-powered analytics and automated email reports
+app.use('/api/ai', aiInsightsRoutes);
 
 // ==================== BUSINESS SETTINGS (for GST invoices) ====================
 
