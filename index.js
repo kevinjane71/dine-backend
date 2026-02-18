@@ -3972,6 +3972,12 @@ app.post('/api/restaurants', authenticateToken, async (req, res) => {
     // Generate subdomain for the restaurant
     const subdomain = await generateSubdomain(name, 'temp'); // We'll update with actual ID after creation
     
+    // Validate businessType if provided
+    const validBusinessTypes = ['restaurant', 'cafe', 'bakery', 'bar'];
+    const businessType = req.body.businessType && validBusinessTypes.includes(req.body.businessType)
+      ? req.body.businessType
+      : 'restaurant'; // Default to restaurant
+
     const restaurantData = {
       name,
       address: address || null,
@@ -3982,6 +3988,8 @@ app.post('/api/restaurants', authenticateToken, async (req, res) => {
       description: description || '',
       operatingHours: operatingHours || {},
       features: features || [],
+      businessType: businessType, // Business type: restaurant, cafe, bakery, bar
+      businessConfig: req.body.businessConfig || {}, // Custom business configuration
       ownerId: userId,
       subdomain: subdomain,
       subdomainEnabled: false, // Default: disabled, user can enable later
@@ -4041,12 +4049,20 @@ app.patch('/api/restaurants/:restaurantId', authenticateToken, async (req, res) 
     }
 
     // Update allowed basic fields
-    const allowedFields = ['name', 'address', 'city', 'phone', 'email', 'cuisine', 'description', 'logo', 'coverImage', 'openingHours', 'isActive', 'legalBusinessName', 'gstin'];
+    const allowedFields = ['name', 'address', 'city', 'phone', 'email', 'cuisine', 'description', 'logo', 'coverImage', 'openingHours', 'isActive', 'legalBusinessName', 'gstin', 'businessType', 'businessConfig'];
     allowedFields.forEach(field => {
       if (req.body[field] !== undefined) {
         updateData[field] = req.body[field];
       }
     });
+
+    // Validate businessType if provided
+    if (req.body.businessType !== undefined) {
+      const validBusinessTypes = ['restaurant', 'cafe', 'bakery', 'bar'];
+      if (!validBusinessTypes.includes(req.body.businessType)) {
+        return res.status(400).json({ error: 'Invalid business type. Must be one of: restaurant, cafe, bakery, bar' });
+      }
+    }
 
     // Validate GSTIN format if provided (15 characters: 2 state code + 10 PAN + 1 entity + 1 Z + 1 checksum)
     if (req.body.gstin !== undefined && req.body.gstin !== '') {
@@ -4575,6 +4591,10 @@ app.post('/api/menus/:restaurantId', authenticateToken, async (req, res) => {
             description: c.description || ''
           }))
         : [],
+      // Business-type specific configurations
+      cafeConfig: req.body.cafeConfig || null,
+      bakeryConfig: req.body.bakeryConfig || null,
+      barConfig: req.body.barConfig || null,
       createdAt: new Date(),
       updatedAt: new Date()
     };
@@ -4665,10 +4685,11 @@ app.patch('/api/menus/item/:id', authenticateToken, async (req, res) => {
     
     // Update allowed fields
     const allowedFields = [
-      'name', 'description', 'price', 'category', 'isVeg', 'spiceLevel', 
+      'name', 'description', 'price', 'category', 'isVeg', 'spiceLevel',
       'allergens', 'image', 'shortCode', 'status', 'order',
       'isAvailable', 'stockQuantity', 'lowStockThreshold', 'isStockManaged',
-      'availableFrom', 'availableUntil', 'variants', 'customizations'
+      'availableFrom', 'availableUntil', 'variants', 'customizations',
+      'cafeConfig', 'bakeryConfig', 'barConfig'
     ];
     
     allowedFields.forEach(field => {
