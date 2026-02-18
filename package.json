@@ -15,6 +15,7 @@
   "description": "",
   "dependencies": {
     "@google-cloud/storage": "^7.7.0",
+    "@pinecone-database/pinecone": "^2.2.0",
     "bcryptjs": "^3.0.2",
     "body-parser": "^2.2.0",
     "cors": "^2.8.5",
@@ -24,13 +25,17 @@
     "google-auth-library": "^10.3.0",
     "helmet": "^8.1.0",
     "jsonwebtoken": "^9.0.2",
+    "mammoth": "^1.6.0",
     "micro": "^10.0.1",
     "morgan": "^1.10.1",
     "multer": "^1.4.5-lts.1",
     "nodemailer": "^6.10.1",
     "openai": "^4.20.1",
+    "pdf-parse": "^1.1.1",
+    "pusher": "^5.3.2",
     "qrcode": "^1.5.4",
     "razorpay": "^2.9.6",
-    "twilio": "^5.10.0"
+    "twilio": "^5.10.0",
+    "xlsx": "^0.18.5"
   }
 }

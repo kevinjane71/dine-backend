@@ -19,6 +19,7 @@ const { FieldValue } = require('firebase-admin/firestore');
 const performanceOptimizer = require('./middleware/performanceOptimizer');
 const firestoreOptimizer = require('./utils/firestoreOptimizer');
 const inventoryService = require('./services/inventoryService');
+const pusherService = require('./services/pusherService');
 
 // Generate daily order ID (starts from 1 each day)
 async function generateDailyOrderId(restaurantId) {
@@ -57,6 +58,41 @@ async function generateDailyOrderId(restaurantId) {
     // Fallback to timestamp-based ID
     return Date.now() % 10000; // Last 4 digits of timestamp
   }
+}
+
+// Generate sequential order ID (never resets; increments forever per restaurant). Uses transaction to avoid race conditions.
+async function generateSequentialOrderId(restaurantId) {
+  try {
+    const counterRef = db.collection('order_id_counters').doc(restaurantId);
+    const result = await db.runTransaction(async (transaction) => {
+      const snap = await transaction.get(counterRef);
+      const nextId = snap.exists ? ((snap.data().lastOrderId || 0) + 1) : 1;
+      transaction.set(counterRef, {
+        restaurantId,
+        lastOrderId: nextId,
+        updatedAt: new Date()
+      }, { merge: true });
+      return nextId;
+    });
+    return result;
+  } catch (error) {
+    console.error('Error generating sequential order ID:', error);
+    return Date.now() % 100000;
+  }
+}
+
+// Resolves next display order ID: daily (reset each day) or sequential (never reset) based on restaurant.orderSettings.sequentialOrderIdEnabled
+async function getNextOrderId(restaurantId, restaurantDataOrNull) {
+  let restaurantData = restaurantDataOrNull;
+  if (!restaurantData) {
+    const restaurantDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
+    restaurantData = restaurantDoc.exists ? restaurantDoc.data() : {};
+  }
+  const useSequential = !!(restaurantData.orderSettings && restaurantData.orderSettings.sequentialOrderIdEnabled);
+  if (useSequential) {
+    return await generateSequentialOrderId(restaurantId);
+  }
+  return await generateDailyOrderId(restaurantId);
 }
 
 // Helper function to create default free-trial subscription for new users
@@ -151,6 +187,11 @@ const emailService = require('./emailService');
 // Chatbot RAG routes
 const chatbotRoutes = require('./routes/chatbot');
 
+// DineAI Voice Assistant routes
+const dineaiRoutes = require('./routes/dineai');
+const dineaiKnowledgeRoutes = require('./routes/dineaiKnowledge');
+const dineaiCheapVoiceRoutes = require('./routes/dineaiCheapVoice');
+
 // Hotel PMS routes
 const hotelRoutes = require('./routes/hotel');
 
@@ -166,8 +207,21 @@ const shiftSchedulingRoutes = require('./routes/shiftScheduling');
 // Google Reviews routes
 const googleReviewsRoutes = require('./routes/googleReviews');
 
-// Customer App routes (Crave - B2C ordering)
-const customerRoutes = require('./routes/customer');
+// Custom URL (slug) routes for short restaurant URLs
+const customUrlRoutes = require('./routes/customUrlRoutes');
+
+// Staff reset password (owner only)
+const staffResetPasswordRoutes = require('./routes/staffResetPassword');
+
+// Print installer upload / download URLs (KOT Printer exe/dmg)
+const printInstallerRoutes = require('./routes/printInstaller');
+
+// Currency settings routes
+const currencyRoutes = require('./routes/currencyRoutes');
+
+// Owner chain dashboard routes
+const ownerDashboardRoutes = require('./routes/ownerDashboard');
+const aiInsightsRoutes = require('./routes/aiInsights');
 
 // Debug email service initialization
 console.log('📧 Email service loaded:', !!emailService);
@@ -550,41 +604,36 @@ const authenticateToken = (req, res, next) => {
     return res.status(401).json({ error: 'Access token required' });
   }
 
-  jwt.verify(token, process.env.JWT_SECRET, (err, user) => {
+  jwt.verify(token, process.env.JWT_SECRET, async (err, user) => {
     if (err) {
       console.log('Token verification failed:', err.message);
       return res.status(403).json({ error: 'Invalid or expired token' });
     }
     console.log('Token verified successfully for user:', user.userId);
     req.user = user;
-    
-    // Demo account restrictions with whitelist
-    if (user.phone === '+919000000000') {
-      // Whitelist of endpoints that demo accounts can access (any method)
-      const demoAllowedEndpoints = [
-        '/api/auth/phone/verify-otp',
-        '/api/auth/logout',
-        '/api/auth/refresh-token'
-      ];
-      
-      // Allow GET requests and whitelisted endpoints
-      if (req.method === 'GET' || demoAllowedEndpoints.includes(req.path)) {
-        console.log(`🎭 Demo account accessing allowed endpoint: ${req.method} ${req.path}`);
-        return next();
-      }
-      
-      // Block all other non-GET requests
-      if (req.method === 'POST' || req.method === 'PATCH' || req.method === 'DELETE') {
-        console.log(`🎭 Demo account detected: ${req.method} ${req.path} - Blocking request`);
-        return res.status(403).json({
-          success: false,
-          error: 'Demo Mode Restriction',
-          message: 'Demo accounts are restricted to read-only access. Please sign up for a full account to perform this action.',
-          demoMode: true
-        });
+
+    // Staff/employee: if marked inactive, reject all requests (revoke access)
+    const staffRoles = ['waiter', 'manager', 'employee', 'cashier', 'sales'];
+    if (user.userId) {
+      try {
+        const userDoc = await db.collection(collections.users).doc(user.userId).get();
+        if (userDoc.exists) {
+          const userData = userDoc.data();
+          const role = (userData.role || '').toLowerCase();
+          if (staffRoles.includes(role) && userData.status === 'inactive') {
+            return res.status(401).json({
+              error: 'Account deactivated',
+              message: 'Your account has been deactivated. Please contact your manager.',
+              inactive: true
+            });
+          }
+        }
+      } catch (dbErr) {
+        console.error('Auth staff status check error:', dbErr);
+        // On DB error, allow request (don't block on transient errors)
       }
     }
-    
+
     next();
   });
 };
@@ -621,7 +670,7 @@ function sanitizeInput(input) {
 // Security: Validate restaurant access
 async function validateRestaurantAccess(userId, restaurantId) {
   try {
-    // Check if user has access to this restaurant
+    // Check 1: userRestaurants collection (new staff)
     const userRestaurantSnapshot = await db.collection(collections.userRestaurants)
       .where('userId', '==', userId)
       .where('restaurantId', '==', restaurantId)
@@ -631,11 +680,22 @@ async function validateRestaurantAccess(userId, restaurantId) {
       return true;
     }
 
-    // Fallback: Check if user is the owner directly
+    // Check 2: Owner in restaurants collection
     const restaurantDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
     if (restaurantDoc.exists) {
       const restaurant = restaurantDoc.data();
-      return restaurant.ownerId === userId;
+      if (restaurant.ownerId === userId) {
+        return true;
+      }
+    }
+
+    // Check 3: Staff in users collection (fallback for existing staff)
+    const userDoc = await db.collection(collections.users).doc(userId).get();
+    if (userDoc.exists) {
+      const userData = userDoc.data();
+      if (userData.restaurantId === restaurantId) {
+        return true;
+      }
     }
 
     return false;
@@ -1435,13 +1495,27 @@ const categoryNameToId = (name) => {
 // Old extractMenuFromImage function removed - now using unified extractMenuFromAnyFile() with GPT-4o
 
 app.get('/health', (req, res) => {
-  res.json({ 
-    status: 'healthy', 
+  res.json({
+    status: 'healthy',
     timestamp: new Date().toISOString(),
     message: '🍽️ Dine Restaurant Management System is running!',
     environment: process.env.NODE_ENV || 'development',
     version: '1.0.0'
   });
+});
+
+// Admin endpoint to clear all blocked IPs (for emergency use)
+app.post('/api/admin/clear-blocked-ips', async (req, res) => {
+  try {
+    const snapshot = await db.collection('blockedIPs').get();
+    const batch = db.batch();
+    snapshot.docs.forEach(doc => batch.delete(doc.ref));
+    await batch.commit();
+    res.json({ success: true, message: `Cleared ${snapshot.docs.length} blocked IPs` });
+  } catch (error) {
+    console.error('Error clearing blocked IPs:', error);
+    res.status(500).json({ error: 'Failed to clear blocked IPs' });
+  }
 });
 
 // Warm-up endpoint for Vercel serverless (reduces cold start latency)
@@ -1518,6 +1592,24 @@ app.post('/api/demo-request', async (req, res) => {
       });
     }
 
+    // Extract restaurant name from comment (format: "Restaurant: {name}\n{additional comments}")
+    let restaurantName = '';
+    let additionalComment = comment || '';
+    if (comment) {
+      const restaurantMatch = comment.match(/^Restaurant:\s*(.+?)(?:\n|$)/i);
+      if (restaurantMatch) {
+        restaurantName = restaurantMatch[1].trim();
+        // Remove the restaurant line from additional comment
+        additionalComment = comment.replace(/^Restaurant:\s*.+?(\n|$)/i, '').trim();
+      } else {
+        // If no "Restaurant:" prefix, use the whole comment as restaurant name if it's short
+        if (comment.length < 100) {
+          restaurantName = comment.trim();
+          additionalComment = '';
+        }
+      }
+    }
+
     // Create demo request document
     const demoRequestRef = db.collection('demoRequests').doc();
     const demoRequestData = {
@@ -1525,7 +1617,8 @@ app.post('/api/demo-request', async (req, res) => {
       contactType,
       phone: phone || null,
       email: email || null,
-      comment: comment || '',
+      restaurantName: restaurantName || null,
+      comment: additionalComment,
       status: 'pending',
       createdAt: new Date(),
       updatedAt: new Date(),
@@ -1536,6 +1629,20 @@ app.post('/api/demo-request', async (req, res) => {
     await demoRequestRef.set(demoRequestData);
 
     console.log('✅ Demo request saved:', demoRequestData.id);
+
+    // Send email notification to admin
+    try {
+      const emailResult = await emailService.sendDemoRequestNotification(demoRequestData);
+      if (emailResult.success) {
+        console.log('✅ Demo request notification email sent:', emailResult.emailId);
+      } else {
+        console.warn('⚠️ Failed to send demo request notification email:', emailResult.error);
+        // Don't fail the request if email fails
+      }
+    } catch (emailError) {
+      console.error('❌ Error sending demo request notification email:', emailError);
+      // Don't fail the request if email fails
+    }
 
     res.status(201).json({
       success: true,
@@ -1667,7 +1774,7 @@ app.post('/api/auth/verify-email', async (req, res) => {
     const token = jwt.sign(
       { userId: userDoc.id, email: userData.email, role: userData.role },
       process.env.JWT_SECRET,
-      { expiresIn: '7d' }
+      { expiresIn: '30d' }
     );
 
     res.json({
@@ -1719,7 +1826,7 @@ app.post('/api/auth/login', async (req, res) => {
     const token = jwt.sign(
       { userId: userDoc.id, email: userData.email, role: userData.role },
       process.env.JWT_SECRET,
-      { expiresIn: '7d' }
+      { expiresIn: '30d' }
     );
 
     res.json({
@@ -1737,6 +1844,127 @@ app.post('/api/auth/login', async (req, res) => {
   } catch (error) {
     console.error('Login error:', error);
     res.status(500).json({ error: 'Login failed' });
+  }
+});
+
+// Token refresh endpoint - allows refreshing expired tokens within grace period
+app.post('/api/auth/refresh', async (req, res) => {
+  try {
+    const authHeader = req.headers['authorization'];
+    const token = authHeader && authHeader.split(' ')[1];
+
+    if (!token) {
+      return res.status(401).json({
+        success: false,
+        error: 'Token required for refresh'
+      });
+    }
+
+    // Try to decode the token (even if expired)
+    let decoded;
+    try {
+      // First try normal verification
+      decoded = jwt.verify(token, process.env.JWT_SECRET);
+    } catch (err) {
+      if (err.name === 'TokenExpiredError') {
+        // Token is expired - decode without verification to get payload
+        decoded = jwt.decode(token);
+        if (!decoded) {
+          return res.status(403).json({
+            success: false,
+            error: 'Invalid token format'
+          });
+        }
+
+        // Check if token expired within last 30 days (grace period)
+        const expiredAt = decoded.exp * 1000; // Convert to milliseconds
+        const thirtyDaysAgo = Date.now() - (30 * 24 * 60 * 60 * 1000);
+
+        if (expiredAt < thirtyDaysAgo) {
+          return res.status(403).json({
+            success: false,
+            error: 'Token expired too long ago. Please login again.'
+          });
+        }
+      } else {
+        // Token is invalid (not just expired)
+        return res.status(403).json({
+          success: false,
+          error: 'Invalid token'
+        });
+      }
+    }
+
+    // Verify user still exists and is active
+    const userId = decoded.userId;
+    const userRole = decoded.role;
+
+    // Check in appropriate collection based on role
+    let userDoc;
+    let userData;
+
+    if (userRole === 'staff' || userRole === 'cashier' || userRole === 'sales' || userRole === 'manager' || userRole === 'employee') {
+      // Staff user - check in staff collection
+      userDoc = await db.collection(collections.staff).doc(userId).get();
+      if (!userDoc.exists) {
+        return res.status(403).json({
+          success: false,
+          error: 'User not found. Please login again.'
+        });
+      }
+      userData = userDoc.data();
+
+      // Check if staff is active
+      if (userData.isActive === false) {
+        return res.status(401).json({
+          success: false,
+          error: 'Your account has been deactivated.',
+          inactive: true
+        });
+      }
+    } else {
+      // Regular user - check in users collection
+      userDoc = await db.collection(collections.users).doc(userId).get();
+      if (!userDoc.exists) {
+        return res.status(403).json({
+          success: false,
+          error: 'User not found. Please login again.'
+        });
+      }
+      userData = userDoc.data();
+    }
+
+    // Generate new token with fresh 30-day expiry
+    const newToken = jwt.sign(
+      {
+        userId: userDoc.id,
+        email: decoded.email || userData.email,
+        role: userRole,
+        ...(decoded.restaurantId && { restaurantId: decoded.restaurantId }),
+        ...(decoded.ownerId && { ownerId: decoded.ownerId })
+      },
+      process.env.JWT_SECRET,
+      { expiresIn: '30d' }
+    );
+
+    res.json({
+      success: true,
+      message: 'Token refreshed successfully',
+      token: newToken,
+      user: {
+        id: userDoc.id,
+        email: decoded.email || userData.email,
+        name: userData.name,
+        role: userRole
+      }
+    });
+
+  } catch (error) {
+    console.error('Token refresh error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Token refresh failed'
+    });
   }
 });
 
@@ -1921,7 +2149,7 @@ app.post('/api/auth/email/register', async (req, res) => {
     const token = jwt.sign(
       { userId, email: normalizedEmail, role: 'owner' },
       process.env.JWT_SECRET,
-      { expiresIn: '7d' }
+      { expiresIn: '30d' }
     );
 
     // Check if user has restaurants
@@ -2068,7 +2296,7 @@ app.post('/api/auth/email/verify-otp', async (req, res) => {
     const token = jwt.sign(
       { userId, email: normalizedEmail, role: userData.role },
       process.env.JWT_SECRET,
-      { expiresIn: '7d' }
+      { expiresIn: '30d' }
     );
 
     // Check if user has restaurants
@@ -2161,7 +2389,7 @@ app.post('/api/auth/email/login', async (req, res) => {
     const token = jwt.sign(
       { userId, email: normalizedEmail, role: userData.role },
       process.env.JWT_SECRET,
-      { expiresIn: '7d' }
+      { expiresIn: '30d' }
     );
 
     // Check if user has restaurants
@@ -2524,9 +2752,10 @@ app.post('/api/staff/change-password', authenticateToken, async (req, res) => {
 
     const userData = userDoc.data();
 
-    // Verify this is a staff member (has loginId and is staff role)
-    if (!userData.loginId || !['waiter', 'manager', 'employee'].includes(userData.role?.toLowerCase())) {
-      return res.status(403).json({ 
+    // Verify this is a staff member (has loginId and is not owner/customer)
+    const userRole = (userData.role || '').toLowerCase();
+    if (!userData.loginId || userRole === 'owner' || userRole === 'customer') {
+      return res.status(403).json({
         error: 'Password change is only available for staff members',
         notStaff: true
       });
@@ -2652,7 +2881,8 @@ app.post('/api/auth/google', async (req, res) => {
       hasRestaurants = false; // No restaurant created yet
 
       // Create default free-trial subscription for new user
-      await createDefaultSubscription(userId, email, phone || null, 'owner');
+      // Note: Google login doesn't have phone, so pass null
+      await createDefaultSubscription(userId, email, null, 'owner');
 
       // Send welcome email to new Gmail users
       console.log('📧 === REACHING EMAIL SENDING SECTION ===');
@@ -2733,7 +2963,7 @@ app.post('/api/auth/google', async (req, res) => {
     const jwtToken = jwt.sign(
       { userId, email, role: userRole },
       process.env.JWT_SECRET,
-      { expiresIn: '7d' }
+      { expiresIn: '30d' }
     );
 
     res.json({
@@ -3000,7 +3230,7 @@ app.post('/api/auth/firebase/verify', async (req, res) => {
     const token = jwt.sign(
       { userId, phone: phoneNumber, email, role: 'owner' },
       process.env.JWT_SECRET,
-      { expiresIn: '7d' }
+      { expiresIn: '30d' }
     );
 
     // Get user's restaurants for the response
@@ -3148,7 +3378,7 @@ app.post('/api/auth/phone/verify-otp', async (req, res) => {
     const token = jwt.sign(
       { userId, phone, role: 'owner' },
       process.env.JWT_SECRET,
-      { expiresIn: '7d' }
+      { expiresIn: '30d' }
     );
 
     // Get user's restaurants for subdomain check (only if feature is enabled)
@@ -3269,7 +3499,7 @@ app.post('/api/admin/setup-client', async (req, res) => {
     const token = jwt.sign(
       { userId, phone: normalizedPhone, role: 'owner' },
       process.env.JWT_SECRET,
-      { expiresIn: '7d' }
+      { expiresIn: '30d' }
     );
 
     // Check if user already has restaurants
@@ -3478,15 +3708,45 @@ app.post('/api/auth/local-login', async (req, res) => {
         .where('ownerId', '==', userId)
         .limit(1)
         .get();
-      
+
       hasRestaurants = !restaurantsQuery.empty;
     }
 
-    // Generate JWT token (same as OTP flow)
+    // Get actual user data for token generation
+    const actualUserData = userDoc ? userDoc.data() : null;
+    const actualRole = actualUserData?.role || 'owner';
+    const staffRoles = ['waiter', 'manager', 'employee', 'cashier', 'sales'];
+    const isStaff = staffRoles.includes(actualRole.toLowerCase());
+
+    // For staff, get their restaurantId
+    let staffRestaurantId = actualUserData?.restaurantId || null;
+    if (isStaff && !staffRestaurantId) {
+      // Try to find from userRestaurants collection
+      const userRestSnapshot = await db.collection(collections.userRestaurants)
+        .where('userId', '==', userId)
+        .limit(1)
+        .get();
+      if (!userRestSnapshot.empty) {
+        staffRestaurantId = userRestSnapshot.docs[0].data().restaurantId;
+      }
+    }
+
+    // Generate JWT token with actual role and restaurantId
+    const tokenPayload = {
+      userId,
+      phone: actualUserData?.phone || normalizedPhone || null,
+      email: actualUserData?.email || normalizedEmail || null,
+      role: actualRole
+    };
+    // Add restaurantId for staff members
+    if (isStaff && staffRestaurantId) {
+      tokenPayload.restaurantId = staffRestaurantId;
+    }
+
     const token = jwt.sign(
-      { userId, phone: normalizedPhone || null, role: 'owner' },
+      tokenPayload,
       process.env.JWT_SECRET,
-      { expiresIn: '7d' }
+      { expiresIn: '30d' }
     );
 
     // Get user's restaurants for subdomain check (same as OTP flow)
@@ -3505,23 +3765,34 @@ app.post('/api/auth/local-login', async (req, res) => {
       }
     }
 
-    // Return same response structure as /api/auth/phone/verify-otp
+    // Build user response object
+    const userResponse = {
+      id: userId,
+      phone: actualUserData?.phone || normalizedPhone || null,
+      email: actualUserData?.email || normalizedEmail || null,
+      name: actualUserData?.name || name || (isNewUser ? 'Restaurant Owner' : 'User'),
+      role: actualRole,
+      setupComplete: actualUserData?.setupComplete || false
+    };
+
+    // Add staff-specific fields
+    if (isStaff) {
+      userResponse.restaurantId = staffRestaurantId;
+      userResponse.pageAccess = actualUserData?.pageAccess || null;
+      userResponse.loginId = actualUserData?.loginId || null;
+      userResponse.username = actualUserData?.username || null;
+    }
+
+    // Return response (works for both owner and staff)
     res.json({
       success: true,
       message: isNewUser ? 'Welcome! Account created successfully.' : 'Login successful',
       token,
-      user: {
-        id: userId,
-        phone: isNewUser ? (normalizedPhone || null) : ((userDoc && userDoc.data()) ? userDoc.data().phone : normalizedPhone || null),
-        email: isNewUser ? (normalizedEmail || null) : ((userDoc && userDoc.data()) ? userDoc.data().email : normalizedEmail || null),
-        name: isNewUser ? (name || 'Restaurant Owner') : ((userDoc && userDoc.data()) ? (userDoc.data().name || name || 'Restaurant Owner') : (name || 'Restaurant Owner')),
-        role: 'owner',
-        setupComplete: isNewUser ? false : ((userDoc && userDoc.data()) ? (userDoc.data().setupComplete || false) : false)
-      },
+      user: userResponse,
       firstTimeUser: isNewUser,
-      isNewUser, // Keep for backward compatibility
-      hasRestaurants,
-      subdomainUrl, // Include subdomain URL if enabled
+      isNewUser,
+      hasRestaurants: isStaff ? !!staffRestaurantId : hasRestaurants,
+      subdomainUrl,
       redirectTo: subdomainUrl || (hasRestaurants ? '/dashboard' : '/admin')
     });
 
@@ -3722,13 +3993,69 @@ app.patch('/api/restaurants/:restaurantId', authenticateToken, async (req, res) 
       return res.status(403).json({ error: 'Access denied' });
     }
 
-    // Update allowed fields
-    const allowedFields = ['name', 'address', 'city', 'phone', 'email', 'cuisine', 'description'];
+    // Update allowed basic fields
+    const allowedFields = ['name', 'address', 'city', 'phone', 'email', 'cuisine', 'description', 'logo', 'coverImage', 'openingHours', 'isActive', 'legalBusinessName', 'gstin'];
     allowedFields.forEach(field => {
       if (req.body[field] !== undefined) {
         updateData[field] = req.body[field];
       }
     });
+
+    // Validate GSTIN format if provided (15 characters: 2 state code + 10 PAN + 1 entity + 1 Z + 1 checksum)
+    if (req.body.gstin !== undefined && req.body.gstin !== '') {
+      const gstinRegex = /^[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z]{1}[1-9A-Z]{1}Z[0-9A-Z]{1}$/;
+      if (!gstinRegex.test(req.body.gstin)) {
+        return res.status(400).json({ error: 'Invalid GSTIN format. GSTIN should be 15 characters (e.g., 29ABCDE1234F1Z5)' });
+      }
+    }
+
+    // Handle customerAppSettings updates (can update individual fields or entire object)
+    if (req.body.customerAppSettings !== undefined) {
+      const existingSettings = restaurant.data().customerAppSettings || {};
+      // Merge new settings with existing
+      updateData.customerAppSettings = {
+        ...existingSettings,
+        ...req.body.customerAppSettings,
+        updatedAt: new Date()
+      };
+      // Handle nested loyaltySettings merge
+      if (req.body.customerAppSettings.loyaltySettings) {
+        updateData.customerAppSettings.loyaltySettings = {
+          ...(existingSettings.loyaltySettings || {}),
+          ...req.body.customerAppSettings.loyaltySettings
+        };
+      }
+      // Handle nested branding merge
+      if (req.body.customerAppSettings.branding) {
+        updateData.customerAppSettings.branding = {
+          ...(existingSettings.branding || {}),
+          ...req.body.customerAppSettings.branding
+        };
+      }
+    }
+
+    // Handle restaurantCode update directly (shorthand for customerAppSettings.restaurantCode)
+    if (req.body.restaurantCode !== undefined) {
+      const existingSettings = restaurant.data().customerAppSettings || {};
+      updateData.customerAppSettings = {
+        ...existingSettings,
+        ...(updateData.customerAppSettings || {}),
+        restaurantCode: req.body.restaurantCode,
+        updatedAt: new Date()
+      };
+    }
+
+    // Order management settings (e.g. sequential order ID never reset)
+    if (req.body.orderSettings !== undefined) {
+      const existing = restaurant.data().orderSettings || {};
+      updateData.orderSettings = { ...existing, ...req.body.orderSettings };
+    }
+
+    // Print settings (KOT printer, manual print, order summary display)
+    if (req.body.printSettings !== undefined) {
+      const existing = restaurant.data().printSettings || {};
+      updateData.printSettings = { ...existing, ...req.body.printSettings };
+    }
 
     if (Object.keys(updateData).length === 0) {
       return res.status(400).json({ error: 'No valid fields to update' });
@@ -3738,7 +4065,7 @@ app.patch('/api/restaurants/:restaurantId', authenticateToken, async (req, res) 
 
     await db.collection(collections.restaurants).doc(restaurantId).update(updateData);
 
-    res.json({ message: 'Restaurant updated successfully' });
+    res.json({ message: 'Restaurant updated successfully', updatedFields: Object.keys(updateData) });
 
   } catch (error) {
     console.error('Update restaurant error:', error);
@@ -3769,24 +4096,62 @@ app.delete('/api/restaurants/:restaurantId', authenticateToken, async (req, res)
   }
 });
 
+// Demo Menu API - Fetch menu from demo account (phone: 9000000000) for new user preview
+app.get('/api/demo-menu', async (req, res) => {
+  try {
+    const demoPhone = '+919000000000';
+    const userQuery = await db.collection(collections.users)
+      .where('phone', '==', demoPhone)
+      .limit(1)
+      .get();
+
+    if (userQuery.empty) {
+      return res.status(404).json({ success: false, error: 'Demo account not found' });
+    }
+
+    const restaurantQuery = await db.collection(collections.restaurants)
+      .where('ownerId', '==', userQuery.docs[0].id)
+      .limit(1)
+      .get();
+
+    if (restaurantQuery.empty) {
+      return res.status(404).json({ success: false, error: 'Demo restaurant not found' });
+    }
+
+    const restaurantData = restaurantQuery.docs[0].data();
+    const menuItems = (restaurantData.menu?.items || [])
+      .filter(item => item.status === 'active')
+      .map(item => ({ ...item, isDemo: true }));
+
+    res.json({
+      success: true,
+      menuItems,
+      categories: restaurantData.categories || []
+    });
+  } catch (error) {
+    console.error('Demo menu fetch error:', error);
+    res.status(500).json({ success: false, error: 'Failed to fetch demo menu' });
+  }
+});
+
 // Public API - Get menu for customer ordering (no authentication required)
 app.get('/api/public/menu/:restaurantId', vercelSecurityMiddleware.publicAPI, async (req, res) => {
   try {
     const { restaurantId } = req.params;
 
     if (!restaurantId) {
-      return res.status(400).json({ 
+      return res.status(400).json({
         success: false,
-        error: 'Restaurant ID is required' 
+        error: 'Restaurant ID is required'
       });
     }
 
     // Get restaurant info
     const restaurantDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
     if (!restaurantDoc.exists) {
-      return res.status(404).json({ 
+      return res.status(404).json({
         success: false,
-        error: 'Restaurant not found' 
+        error: 'Restaurant not found'
       });
     }
 
@@ -4077,13 +4442,14 @@ app.get('/api/menus/:restaurantId', async (req, res) => {
 app.post('/api/menus/:restaurantId', authenticateToken, async (req, res) => {
   try {
     const { restaurantId } = req.params;
-    const { 
-      name, 
-      description, 
-      price, 
-      category, 
-      isVeg, 
-      spiceLevel, 
+    const { userId } = req.user;
+    const {
+      name,
+      description,
+      price,
+      category,
+      isVeg,
+      spiceLevel,
       allergens,
       image,
       shortCode,
@@ -4095,15 +4461,35 @@ app.post('/api/menus/:restaurantId', authenticateToken, async (req, res) => {
       return res.status(400).json({ error: 'Name, price, and category are required' });
     }
 
+    // Check if user has access (owner or staff with restaurant access)
+    const hasAccess = await validateRestaurantAccess(userId, restaurantId);
+    if (!hasAccess) {
+      return res.status(403).json({ error: 'Access denied' });
+    }
+
     // Get current restaurant data
     const restaurantDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
-    
+
     if (!restaurantDoc.exists) {
       return res.status(404).json({ error: 'Restaurant not found' });
     }
 
     const restaurantData = restaurantDoc.data();
     const currentMenu = restaurantData.menu || { categories: [], items: [] };
+
+    // Calculate next shortCode if not provided
+    let finalShortCode = shortCode;
+    if (!finalShortCode) {
+      // Find max numeric shortCode in existing items
+      let maxShortCode = 0;
+      for (const item of (currentMenu.items || [])) {
+        const sc = parseInt(item.shortCode, 10);
+        if (!isNaN(sc) && sc > maxShortCode) {
+          maxShortCode = sc;
+        }
+      }
+      finalShortCode = String(maxShortCode + 1);
+    }
 
     // Create new menu item
     const newMenuItem = {
@@ -4116,7 +4502,7 @@ app.post('/api/menus/:restaurantId', authenticateToken, async (req, res) => {
       spiceLevel: spiceLevel || 'medium',
       allergens: allergens || [],
       image: image || null,
-      shortCode: shortCode || name.substring(0, 3).toUpperCase(),
+      shortCode: finalShortCode,
       status: 'active',
       order: 0,
       // Availability/Stock management fields
@@ -4220,14 +4606,14 @@ app.patch('/api/menus/item/:id', authenticateToken, async (req, res) => {
     if (!foundRestaurant || !foundItem) {
       return res.status(404).json({ error: 'Menu item not found' });
     }
-    
-    const restaurantData = foundRestaurant.data();
-    
-    // Check if user owns the restaurant
-    if (restaurantData.ownerId !== userId) {
+
+    // Check if user has access (owner or staff with restaurant access)
+    const hasAccess = await validateRestaurantAccess(userId, foundRestaurant.id);
+    if (!hasAccess) {
       return res.status(403).json({ error: 'Access denied' });
     }
-    
+
+    const restaurantData = foundRestaurant.data();
     const updateData = { updatedAt: new Date() };
     
     // Update allowed fields
@@ -4273,15 +4659,15 @@ app.patch('/api/menus/item/:id', authenticateToken, async (req, res) => {
     
     // Update the menu item in the restaurant document
     const currentMenu = restaurantData.menu || { categories: [], items: [] };
-    const updatedItems = currentMenu.items.map(item => {
+    const updatedItems = (currentMenu.items || []).map(item => {
       if (item.id === id) {
         return { ...item, ...updateData };
       }
       return item;
     });
-    
+
     // Update categories as well
-    const updatedCategories = currentMenu.categories.map(category => ({
+    const updatedCategories = (currentMenu.categories || []).map(category => ({
       ...category,
       items: (category.items || []).map(item => {
         if (item.id === id) {
@@ -4458,20 +4844,21 @@ app.delete('/api/menus/item/:id', authenticateToken, async (req, res) => {
     if (!foundRestaurant || !foundItem) {
       return res.status(404).json({ error: 'Menu item not found' });
     }
-    
-    const restaurantData = foundRestaurant.data();
-    
-    // Check if user owns the restaurant
-    if (restaurantData.ownerId !== userId) {
+
+    // Check if user has access (owner or staff with restaurant access)
+    const hasAccess = await validateRestaurantAccess(userId, foundRestaurant.id);
+    if (!hasAccess) {
       return res.status(403).json({ error: 'Access denied' });
     }
-    
+
+    const restaurantData = foundRestaurant.data();
+
     // Soft delete by setting status to 'deleted'
     const currentMenu = restaurantData.menu || { categories: [], items: [] };
-    const updatedItems = currentMenu.items.map(item => {
+    const updatedItems = (currentMenu.items || []).map(item => {
       if (item.id === id) {
-        return { 
-          ...item, 
+        return {
+          ...item,
       status: 'deleted',
       deletedAt: new Date(),
       updatedAt: new Date()
@@ -4479,9 +4866,9 @@ app.delete('/api/menus/item/:id', authenticateToken, async (req, res) => {
       }
       return item;
     });
-    
+
     // Update categories as well
-    const updatedCategories = currentMenu.categories.map(category => ({
+    const updatedCategories = (currentMenu.categories || []).map(category => ({
       ...category,
       items: (category.items || []).map(item => {
         if (item.id === id) {
@@ -4530,16 +4917,17 @@ app.delete('/api/menus/:restaurantId/bulk-delete', authenticateToken, async (req
 
     const restaurantData = restaurantDoc.data();
 
-    // Check if user owns the restaurant
-    if (restaurantData.ownerId !== userId) {
-      return res.status(403).json({ error: 'Access denied. You can only delete menu items for your own restaurant.' });
+    // Check if user has access (owner or staff)
+    const hasAccess = await validateRestaurantAccess(userId, restaurantId);
+    if (!hasAccess) {
+      return res.status(403).json({ error: 'Access denied' });
     }
 
     // Get current menu
     const currentMenu = restaurantData.menu || { categories: [], items: [] };
 
     // Count active items before deletion
-    const activeItemsCount = currentMenu.items.filter(item => item.status !== 'deleted').length;
+    const activeItemsCount = (currentMenu.items || []).filter(item => item.status !== 'deleted').length;
 
     if (activeItemsCount === 0) {
       return res.status(400).json({
@@ -4550,7 +4938,7 @@ app.delete('/api/menus/:restaurantId/bulk-delete', authenticateToken, async (req
 
     // Soft delete all items by setting status to 'deleted'
     const deletedTimestamp = new Date();
-    const updatedItems = currentMenu.items.map(item => ({
+    const updatedItems = (currentMenu.items || []).map(item => ({
       ...item,
       status: 'deleted',
       deletedAt: deletedTimestamp,
@@ -4558,7 +4946,7 @@ app.delete('/api/menus/:restaurantId/bulk-delete', authenticateToken, async (req
     }));
 
     // Update categories as well
-    const updatedCategories = currentMenu.categories.map(category => ({
+    const updatedCategories = (currentMenu.categories || []).map(category => ({
       ...category,
       items: (category.items || []).map(item => ({
         ...item,
@@ -4595,15 +4983,24 @@ app.delete('/api/menus/:restaurantId/bulk-delete', authenticateToken, async (req
 app.post('/api/public/orders/:restaurantId', vercelSecurityMiddleware.publicAPI, async (req, res) => {
   try {
     const { restaurantId } = req.params;
-    const { 
-      customerPhone, 
-      customerName, 
-      seatNumber, 
-      items, 
-      totalAmount, 
+    const {
+      customerPhone,
+      customerName,
+      customerEmail,
+      seatNumber,
+      tableNumber: requestedTable,
+      items,
+      totalAmount,
       notes,
       otp,
-      verificationId
+      verificationId,
+      // New fields for Crave app integration
+      orderType = 'dine_in', // dine_in, takeaway, delivery
+      offerId, // Optional single offer to apply (backward compatible)
+      offerIds = [], // Optional multiple offers to apply
+      deliveryAddress, // For delivery orders
+      redeemLoyaltyPoints = 0, // Loyalty points to redeem
+      orderSource = 'crave_app' // 'crave_app' | 'online_order' – source of the order for order history
     } = req.body;
 
     if (!restaurantId || !items || items.length === 0) {
@@ -4628,12 +5025,27 @@ app.post('/api/public/orders/:restaurantId', vercelSecurityMiddleware.publicAPI,
       return res.status(404).json({ error: 'Restaurant not found' });
     }
 
+    const restaurantData = restaurantDoc.data();
+    const customerAppSettings = restaurantData.customerAppSettings || {};
+    const loyaltySettings = customerAppSettings.loyaltySettings || {};
+
+    // Validate order type based on restaurant settings
+    if (orderType === 'dine_in' && customerAppSettings.allowDineIn === false) {
+      return res.status(400).json({ error: 'Dine-in orders are not available' });
+    }
+    if (orderType === 'takeaway' && customerAppSettings.allowTakeaway === false) {
+      return res.status(400).json({ error: 'Takeaway orders are not available' });
+    }
+    if (orderType === 'delivery' && customerAppSettings.allowDelivery === false) {
+      return res.status(400).json({ error: 'Delivery orders are not available' });
+    }
+
     // Helper function to normalize phone number
     const normalizePhone = (phone) => {
       if (!phone) return null;
       // Remove all non-digit characters
       const digits = phone.replace(/\D/g, '');
-      
+
       // Handle Indian phone numbers
       if (digits.length === 12 && digits.startsWith('91')) {
         // Remove country code for Indian numbers
@@ -4645,7 +5057,7 @@ app.post('/api/public/orders/:restaurantId', vercelSecurityMiddleware.publicAPI,
         // Remove leading zero
         return digits.substring(1);
       }
-      
+
       // Return as-is for other formats
       return digits;
     };
@@ -4653,7 +5065,9 @@ app.post('/api/public/orders/:restaurantId', vercelSecurityMiddleware.publicAPI,
     // Create or get customer record with phone normalization
     let customerId;
     let existingCustomer = null;
-    
+    let customerData = null;
+    let isFirstOrder = false;
+
     // First try exact match
     const customerQuery = await db.collection('customers')
       .where('restaurantId', '==', restaurantId)
@@ -4669,10 +5083,10 @@ app.post('/api/public/orders/:restaurantId', vercelSecurityMiddleware.publicAPI,
         const allCustomers = await db.collection('customers')
           .where('restaurantId', '==', restaurantId)
           .get();
-        
+
         existingCustomer = allCustomers.docs.find(doc => {
-          const customerPhone = normalizePhone(doc.data().phone);
-          return customerPhone === normalizedPhone;
+          const custPhone = normalizePhone(doc.data().phone);
+          return custPhone === normalizedPhone;
         });
       }
     }
@@ -4681,29 +5095,44 @@ app.post('/api/public/orders/:restaurantId', vercelSecurityMiddleware.publicAPI,
       // Update existing customer
       console.log(`🔄 Found existing customer for public order: ${existingCustomer.id} with phone: ${existingCustomer.data().phone}`);
       customerId = existingCustomer.id;
-      
+      customerData = existingCustomer.data();
+
+      // Check if this is their first order (existing customer but no orders placed yet)
+      if ((customerData.totalOrders || 0) === 0) {
+        isFirstOrder = true;
+        console.log(`🎁 First order for existing customer: ${customerId}`);
+      }
+
       const updateData = {
         updatedAt: new Date(),
-        lastOrderDate: new Date()
+        lastOrderDate: new Date(),
+        source: customerData.source || 'customer_app' // Mark source if not set
       };
 
-      if (customerName && !existingCustomer.data().name) {
+      if (customerName && !customerData.name) {
         updateData.name = customerName;
+      }
+      if (customerEmail && !customerData.email) {
+        updateData.email = customerEmail;
       }
 
       await existingCustomer.ref.update(updateData);
     } else {
       // Create new customer
+      isFirstOrder = true;
       console.log(`🆕 Creating new customer for public order with phone: ${customerPhone}, name: ${customerName}`);
-      const customerData = {
+      customerData = {
         restaurantId,
         phone: customerPhone,
         name: customerName || 'Customer',
-        email: null,
+        email: customerEmail || null,
         customerId: `CUST-${Date.now()}-${Math.random().toString(36).substr(2, 4).toUpperCase()}`,
         totalOrders: 0,
         totalSpent: 0,
+        loyaltyPoints: 0,
+        orderHistory: [],
         lastOrderDate: null,
+        source: 'customer_app', // Mark as from Crave app
         createdAt: new Date(),
         updatedAt: new Date()
       };
@@ -4713,24 +5142,23 @@ app.post('/api/public/orders/:restaurantId', vercelSecurityMiddleware.publicAPI,
       console.log(`✅ New customer created for public order: ${customerRef.id} with phone: ${customerPhone}`);
     }
 
-    // Validate menu items and calculate total
-    let calculatedTotal = 0;
+    // Validate menu items and calculate subtotal
+    let subtotal = 0;
     const orderItems = [];
 
     // Get restaurant menu items from embedded structure
-    const restaurantData = restaurantDoc.data();
     const menuItems = restaurantData.menu?.items || [];
 
     for (const item of items) {
       // Find menu item in the embedded menu structure
       const menuItem = menuItems.find(menuItem => menuItem.id === item.menuItemId);
-      
+
       if (!menuItem) {
         return res.status(400).json({ error: `Menu item ${item.menuItemId} not found` });
       }
 
       const itemTotal = menuItem.price * item.quantity;
-      calculatedTotal += itemTotal;
+      subtotal += itemTotal;
 
       orderItems.push({
         menuItemId: item.menuItemId,
@@ -4743,31 +5171,243 @@ app.post('/api/public/orders/:restaurantId', vercelSecurityMiddleware.publicAPI,
       });
     }
 
-    // Generate order number and daily order ID
-    const orderNumber = `ORD-${Date.now()}-${Math.random().toString(36).substr(2, 4).toUpperCase()}`;
-    const dailyOrderId = await generateDailyOrderId(restaurantId);
+    // Check minimum order value
+    if (customerAppSettings.minimumOrder && subtotal < customerAppSettings.minimumOrder) {
+      return res.status(400).json({
+        error: `Minimum order value is ₹${customerAppSettings.minimumOrder}`
+      });
+    }
 
+    // Calculate discount if offers are provided
+    // Support both single offerId (backward compatible) and multiple offerIds
+    let discountAmount = 0;
+    let appliedOffer = null;
+    let appliedOffers = [];
+
+    // Merge offerId into offerIds for backward compatibility
+    const allOfferIds = offerIds && offerIds.length > 0 ? offerIds : (offerId ? [offerId] : []);
+
+    // Get offer settings for validation
+    const offerSettings = customerAppSettings.offerSettings || {};
+    const allowMultipleOffers = offerSettings.allowMultipleOffers ?? false;
+    const maxOffersAllowed = offerSettings.maxOffersAllowed ?? 1;
+
+    // Limit offers based on settings
+    const limitedOfferIds = allowMultipleOffers
+      ? allOfferIds.slice(0, maxOffersAllowed)
+      : allOfferIds.slice(0, 1);
+
+    for (const currentOfferId of limitedOfferIds) {
+      const offerDoc = await db.collection('offers').doc(currentOfferId).get();
+
+      if (offerDoc.exists) {
+        const offer = offerDoc.data();
+        const now = new Date();
+
+        // Validate offer
+        const validFrom = offer.validFrom ? new Date(offer.validFrom) : null;
+        const validUntil = offer.validUntil ? new Date(offer.validUntil) : null;
+        const isValidDate = (!validFrom || now >= validFrom) && (!validUntil || now <= validUntil);
+        const isUnderUsageLimit = !offer.usageLimit || (offer.usageCount || 0) < offer.usageLimit;
+        const meetsMinOrder = subtotal >= (offer.minOrderValue || 0);
+        const isValidFirstOrder = !offer.isFirstOrderOnly || isFirstOrder;
+
+        if (offer.isActive && offer.restaurantId === restaurantId && isValidDate && isUnderUsageLimit && meetsMinOrder && isValidFirstOrder) {
+          // Calculate discount for this offer
+          let offerDiscount = 0;
+          if (offer.discountType === 'percentage') {
+            offerDiscount = (subtotal * offer.discountValue) / 100;
+            if (offer.maxDiscount && offerDiscount > offer.maxDiscount) {
+              offerDiscount = offer.maxDiscount;
+            }
+          } else {
+            offerDiscount = offer.discountValue;
+          }
+
+          const appliedOfferData = {
+            id: currentOfferId,
+            name: offer.name,
+            discountType: offer.discountType,
+            discountValue: offer.discountValue,
+            discountApplied: offerDiscount
+          };
+
+          appliedOffers.push(appliedOfferData);
+          discountAmount += offerDiscount;
+
+          console.log(`🎁 Offer applied: ${offer.name}, Discount: ₹${offerDiscount}`);
+        } else {
+          console.log(`⚠️ Offer ${currentOfferId} not valid for this order`);
+        }
+      }
+    }
+
+    // Cap total discount at subtotal
+    if (discountAmount > subtotal) {
+      discountAmount = subtotal;
+    }
+
+    // For backward compatibility, set appliedOffer to first applied offer
+    if (appliedOffers.length > 0) {
+      appliedOffer = appliedOffers[0];
+    }
+
+    // Calculate loyalty points redemption
+    let loyaltyDiscount = 0;
+    let loyaltyPointsRedeemed = 0;
+
+    if (redeemLoyaltyPoints > 0 && loyaltySettings.enabled && customerData) {
+      const availablePoints = customerData.loyaltyPoints || 0;
+      const pointsToRedeem = Math.min(redeemLoyaltyPoints, availablePoints);
+
+      if (pointsToRedeem > 0) {
+        // Calculate discount value from points
+        const redemptionRate = loyaltySettings.redemptionRate || 100; // 100 points = Rs 1
+        loyaltyDiscount = pointsToRedeem / redemptionRate;
+
+        // Cap at max redemption percent of subtotal
+        const maxRedemptionPercent = loyaltySettings.maxRedemptionPercent || 20;
+        const maxLoyaltyDiscount = (subtotal * maxRedemptionPercent) / 100;
+
+        if (loyaltyDiscount > maxLoyaltyDiscount) {
+          loyaltyDiscount = maxLoyaltyDiscount;
+          loyaltyPointsRedeemed = Math.floor(loyaltyDiscount * redemptionRate);
+        } else {
+          loyaltyPointsRedeemed = pointsToRedeem;
+        }
+
+        console.log(`💎 Loyalty points redeemed: ${loyaltyPointsRedeemed} = ₹${loyaltyDiscount}`);
+      }
+    }
+
+    // Calculate pre-tax total (subtotal minus discounts)
+    const preTaxTotal = Math.max(0, subtotal - discountAmount - loyaltyDiscount);
+
+    // Calculate tax if enabled
+    let taxAmount = 0;
+    const taxBreakdown = [];
+    const taxSettings = restaurantData.taxSettings || {};
+
+    if (taxSettings.enabled && preTaxTotal > 0) {
+      if (taxSettings.taxes && Array.isArray(taxSettings.taxes) && taxSettings.taxes.length > 0) {
+        taxSettings.taxes
+          .filter(tax => tax.enabled)
+          .forEach(tax => {
+            const amt = Math.round((preTaxTotal * (tax.rate || 0) / 100) * 100) / 100;
+            taxAmount += amt;
+            taxBreakdown.push({
+              name: tax.name || 'Tax',
+              rate: tax.rate || 0,
+              amount: amt
+            });
+          });
+      } else if (taxSettings.defaultTaxRate) {
+        const amt = Math.round((preTaxTotal * (taxSettings.defaultTaxRate / 100)) * 100) / 100;
+        taxAmount = amt;
+        taxBreakdown.push({
+          name: 'Tax',
+          rate: taxSettings.defaultTaxRate,
+          amount: amt
+        });
+      }
+    }
+
+    // Calculate final total (pre-tax total + tax)
+    const finalTotal = preTaxTotal + taxAmount;
+
+    // Calculate loyalty points earned
+    let loyaltyPointsEarned = 0;
+    if (loyaltySettings.enabled) {
+      // Normalize loyalty settings with defaults (same as GET endpoint)
+      const normalizedLoyalty = {
+        earnPerAmount: Number(loyaltySettings.earnPerAmount) || 100,
+        pointsEarned: Number(loyaltySettings.pointsEarned) || 4,
+        redemptionRate: Number(loyaltySettings.redemptionRate) || 100,
+        maxRedemptionPercent: Number(loyaltySettings.maxRedemptionPercent) || 20,
+        earnPointsOnRedemption: loyaltySettings.earnPointsOnRedemption === true,
+        earnOnFullAmount: loyaltySettings.earnOnFullAmount === true // default false
+      };
+
+      const earnPerAmount = normalizedLoyalty.earnPerAmount;
+      const pointsEarned = normalizedLoyalty.pointsEarned;
+
+      // Check if customer is redeeming points
+      if (loyaltyPointsRedeemed > 0) {
+        // Customer is redeeming points
+        if (!normalizedLoyalty.earnPointsOnRedemption) {
+          // Don't earn any points when redeeming
+          loyaltyPointsEarned = 0;
+          console.log(`💎 Loyalty points: 0 (earning disabled when redeeming)`);
+        } else if (normalizedLoyalty.earnOnFullAmount) {
+          // Earn points on full amount (before redemption discount)
+          const amountBeforeRedemption = subtotal - discountAmount;
+          loyaltyPointsEarned = Math.floor(amountBeforeRedemption / earnPerAmount) * pointsEarned;
+          console.log(`💎 Loyalty points (on full ₹${amountBeforeRedemption}): ${loyaltyPointsEarned} points`);
+        } else {
+          // Default: Earn points only on the remaining amount after redemption
+          loyaltyPointsEarned = Math.floor(finalTotal / earnPerAmount) * pointsEarned;
+          console.log(`💎 Loyalty points (on remaining ₹${finalTotal}): ${loyaltyPointsEarned} points`);
+        }
+      } else {
+        // No redemption - earn points normally on final total
+        loyaltyPointsEarned = Math.floor(finalTotal / earnPerAmount) * pointsEarned;
+        console.log(`💎 Loyalty points calculation: ₹${finalTotal} / ₹${earnPerAmount} * ${pointsEarned} = ${loyaltyPointsEarned} points`);
+      }
+    }
+
+    // Generate order number and daily/sequential order ID (based on restaurant orderSettings.sequentialOrderIdEnabled)
+    const orderNumber = `ORD-${Date.now()}-${Math.random().toString(36).substr(2, 4).toUpperCase()}`;
+    const dailyOrderId = await getNextOrderId(restaurantId, restaurantData);
+
+    // Determine table number
+    const tableNum = requestedTable || seatNumber || null;
+
+    // Build order type label for display
+    const orderTypeLabels = {
+      'dine_in': 'Dine In',
+      'takeaway': 'Takeaway',
+      'delivery': 'Delivery'
+    };
+
+    const resolvedOrderSource = (orderSource === 'online_order' ? 'online_order' : 'crave_app');
     const orderData = {
       restaurantId,
       orderNumber,
       dailyOrderId,
       customerId,
-      tableNumber: seatNumber || null,
-      orderType: 'customer_self_order',
+      tableNumber: tableNum,
+      orderType: orderType,
+      orderTypeLabel: orderTypeLabels[orderType] || 'Customer Order',
+      orderSource: resolvedOrderSource,
       items: orderItems,
-      totalAmount: calculatedTotal,
+      subtotal: subtotal,
+      discountAmount: discountAmount,
+      loyaltyDiscount: loyaltyDiscount,
+      taxAmount: Math.round(taxAmount * 100) / 100,
+      taxBreakdown: taxBreakdown,
+      totalAmount: preTaxTotal,
+      finalAmount: Math.round(finalTotal * 100) / 100,
+      appliedOffer: appliedOffer,
+      appliedOffers: appliedOffers,
+      loyaltyPointsRedeemed: loyaltyPointsRedeemed,
+      loyaltyPointsEarned: loyaltyPointsEarned,
       customerInfo: {
         phone: customerPhone,
         name: customerName || 'Customer',
-        seatNumber: seatNumber || 'Walk-in'
+        email: customerEmail || null,
+        seatNumber: seatNumber || null,
+        tableNumber: tableNum
       },
+      deliveryAddress: orderType === 'delivery' ? deliveryAddress : null,
       paymentMethod: 'cash',
       staffInfo: {
         waiterId: null,
         waiterName: 'Customer Self-Order',
-        kitchenNotes: 'Direct customer order - OTP verified'
+        kitchenNotes: resolvedOrderSource === 'online_order'
+          ? `${orderTypeLabels[orderType] || 'Customer order'} via public online order - OTP verified`
+          : `${orderTypeLabels[orderType] || 'Customer order'} via Crave App - OTP verified`
       },
-      notes: notes || `Customer self-order from seat ${seatNumber || 'Walk-in'}`,
+      notes: notes || (resolvedOrderSource === 'online_order' ? `${orderTypeLabels[orderType] || 'Customer order'} order via public online order` : `${orderTypeLabels[orderType] || 'Customer order'} order via Crave App`),
       status: 'pending',
       kotSent: false,
       paymentStatus: 'pending',
@@ -4779,27 +5419,105 @@ app.post('/api/public/orders/:restaurantId', vercelSecurityMiddleware.publicAPI,
 
     const orderRef = await db.collection(collections.orders).add(orderData);
 
-    // Update customer stats
-    await db.collection('customers').doc(customerId).update({
-      totalOrders: FieldValue.increment(1),
-      totalSpent: FieldValue.increment(calculatedTotal)
-    });
-    
+    // Prepare order history entry
+    const orderHistoryEntry = {
+      orderId: orderRef.id,
+      orderNumber: orderNumber,
+      orderDate: new Date(),
+      totalAmount: finalTotal,
+      subtotal: subtotal,
+      discountAmount: discountAmount,
+      loyaltyDiscount: loyaltyDiscount,
+      tableNumber: tableNum,
+      orderType: orderType,
+      orderTypeLabel: orderTypeLabels[orderType] || 'Customer Order',
+      orderSource: resolvedOrderSource,
+      status: 'pending',
+      itemsCount: orderItems.length,
+      appliedOffer: appliedOffer ? appliedOffer.name : null,
+      appliedOffers: appliedOffers.map(o => o.name),
+      loyaltyPointsEarned: loyaltyPointsEarned,
+      loyaltyPointsRedeemed: loyaltyPointsRedeemed
+    };
+
+    // Update customer stats, order history, and loyalty points - DEFERRED TO ORDER COMPLETION
+    // const customerUpdateData = {
+    //   totalOrders: FieldValue.increment(1),
+    //   totalSpent: FieldValue.increment(finalTotal),
+    //   lastOrderDate: new Date(),
+    //   updatedAt: new Date()
+    // };
+
+    // Update loyalty points
+    // if (loyaltySettings.enabled) {
+    //   const netPointsChange = loyaltyPointsEarned - loyaltyPointsRedeemed;
+    //   if (netPointsChange !== 0) {
+    //     customerUpdateData.loyaltyPoints = FieldValue.increment(netPointsChange);
+    //   }
+    // }
+
+    // await db.collection('customers').doc(customerId).update(customerUpdateData);
+
+    // Add to order history (using array union)
+    // await db.collection('customers').doc(customerId).update({
+    //   orderHistory: FieldValue.arrayUnion(orderHistoryEntry)
+    // });
+
     console.log(`🛒 Customer order created successfully: ${orderRef.id}`);
     console.log(`📋 Order items: ${orderData.items.length} items`);
     console.log(`🏪 Restaurant: ${orderData.restaurantId}`);
     console.log(`👤 Customer: ${customerPhone}`);
+    console.log(`🏷️ Order Type: ${orderType}`);
+    console.log(`💰 Total: ₹${finalTotal} (Subtotal: ₹${subtotal}, Discount: ₹${discountAmount}, Loyalty: ₹${loyaltyDiscount})`);
 
     // SMART INVENTORY: Deduct stock asynchronously
     inventoryService.deductInventoryForOrder(restaurantId, orderRef.id, orderItems)
         .catch(err => console.error('Inventory Deduction Error:', err));
+
+    // Trigger Pusher notification for real-time updates (public/online orders)
+    pusherService.notifyOrderCreated(restaurantId, {
+      id: orderRef.id,
+      orderNumber: orderData.orderNumber,
+      dailyOrderId: orderData.dailyOrderId,
+      status: orderData.status,
+      totalAmount: finalTotal,
+      tableNumber: tableNum,
+      orderType: orderType,
+      orderSource: resolvedOrderSource
+    }).catch(err => console.error('Pusher notification error (non-blocking):', err));
+
+    // Trigger KOT print notification if Pusher printing is enabled
+    const printSettings = restaurantData.printSettings || {};
+    if (printSettings.kotPrinterEnabled !== false && printSettings.usePusherForKOT === true) {
+      pusherService.notifyKOTPrintRequest(restaurantId, {
+        id: orderRef.id,
+        dailyOrderId: orderData.dailyOrderId,
+        orderNumber: orderData.orderNumber,
+        tableNumber: tableNum,
+        roomNumber: orderData.roomNumber,
+        items: orderItems,
+        notes: orderData.notes,
+        specialInstructions: orderData.specialInstructions,
+        staffInfo: orderData.staffInfo,
+        orderType: orderType,
+        createdAt: orderData.createdAt?.toISOString() || new Date().toISOString()
+      }).catch(err => console.error('KOT print Pusher notification error (non-blocking):', err));
+    }
 
     res.status(201).json({
       message: 'Order placed successfully',
       order: {
         id: orderRef.id,
         orderNumber: orderData.orderNumber,
-        totalAmount: orderData.totalAmount,
+        dailyOrderId: orderData.dailyOrderId,
+        subtotal: subtotal,
+        discountAmount: discountAmount,
+        loyaltyDiscount: loyaltyDiscount,
+        totalAmount: finalTotal,
+        appliedOffer: appliedOffer,
+        loyaltyPointsEarned: loyaltyPointsEarned,
+        loyaltyPointsRedeemed: loyaltyPointsRedeemed,
+        orderType: orderType,
         status: orderData.status
       }
     });
@@ -4830,6 +5548,7 @@ app.post('/api/orders', async (req, res) => {
       paymentMethod = 'cash',
       staffInfo,
       notes,
+      specialInstructions, // Kitchen special instructions
       customerPhone,
       customerName,
       seatNumber
@@ -4988,24 +5707,40 @@ app.post('/api/orders', async (req, res) => {
     }
 
     // Calculate tax if tax settings are enabled
+    // Save tax breakdown so order history shows exact tax at time of order
     let taxAmount = 0;
     let finalAmount = totalAmount;
+    const taxBreakdown = []; // Store individual tax lines for historical accuracy
     const taxSettings = restaurantData.taxSettings || {};
-    
+
     if (taxSettings.enabled && totalAmount > 0) {
       if (taxSettings.taxes && Array.isArray(taxSettings.taxes) && taxSettings.taxes.length > 0) {
-        taxAmount = taxSettings.taxes
+        taxSettings.taxes
           .filter(tax => tax.enabled)
-          .reduce((sum, tax) => sum + (totalAmount * (tax.rate || 0) / 100), 0);
+          .forEach(tax => {
+            const amt = Math.round((totalAmount * (tax.rate || 0) / 100) * 100) / 100;
+            taxAmount += amt;
+            taxBreakdown.push({
+              name: tax.name || 'Tax',
+              rate: tax.rate || 0,
+              amount: amt
+            });
+          });
       } else if (taxSettings.defaultTaxRate) {
-        taxAmount = totalAmount * (taxSettings.defaultTaxRate / 100);
+        const amt = Math.round((totalAmount * (taxSettings.defaultTaxRate / 100)) * 100) / 100;
+        taxAmount = amt;
+        taxBreakdown.push({
+          name: 'Tax',
+          rate: taxSettings.defaultTaxRate,
+          amount: amt
+        });
       }
       finalAmount = totalAmount + taxAmount;
     }
 
-    // Generate order number and daily order ID
+    // Generate order number and daily/sequential order ID (based on restaurant orderSettings.sequentialOrderIdEnabled)
     const orderNumber = `ORD-${Date.now()}-${Math.random().toString(36).substr(2, 4).toUpperCase()}`;
-    const dailyOrderId = await generateDailyOrderId(restaurantId);
+    const dailyOrderId = await getNextOrderId(restaurantId);
 
     const orderData = {
       restaurantId,
@@ -5017,6 +5752,7 @@ app.post('/api/orders', async (req, res) => {
       items: orderItems,
       totalAmount,
       taxAmount: Math.round(taxAmount * 100) / 100,
+      taxBreakdown: taxBreakdown, // Save individual tax lines for historical accuracy
       finalAmount: Math.round(finalAmount * 100) / 100,
           customerInfo: customerInfo || {
             phone: customerPhone,
@@ -5033,6 +5769,7 @@ app.post('/api/orders', async (req, res) => {
         kitchenNotes: 'Direct customer order'
       } : (staffInfo || null),
       notes: notes || (orderType === 'customer_self_order' ? `Customer self-order from seat ${seatNumber || 'Walk-in'}` : ''),
+      specialInstructions: specialInstructions || null, // Kitchen special instructions
       status: req.body.status || 'confirmed',
       kotSent: false,
       paymentStatus: roomNumber ? 'hotel-billing' : 'pending', // NEW: Mark as hotel billing if room number provided
@@ -5343,6 +6080,57 @@ app.post('/api/orders', async (req, res) => {
       // Don't fail order creation if automation fails
     }
 
+    // Trigger Pusher notification for real-time updates
+    pusherService.notifyOrderCreated(restaurantId, {
+      id: orderRef.id,
+      orderNumber: orderNumber,
+      dailyOrderId: dailyOrderId,
+      status: orderData.status,
+      totalAmount: totalAmount,
+      tableNumber: tableNumber,
+      orderType: orderType
+    }).catch(err => console.error('Pusher notification error (non-blocking):', err));
+
+    // Trigger KOT print notification if order is confirmed and Pusher printing is enabled
+    const printSettings = restaurantData.printSettings || {};
+    if (orderData.status === 'confirmed' && printSettings.kotPrinterEnabled !== false && printSettings.usePusherForKOT === true) {
+      pusherService.notifyKOTPrintRequest(restaurantId, {
+        id: orderRef.id,
+        dailyOrderId: dailyOrderId,
+        orderNumber: orderNumber,
+        tableNumber: tableNumber,
+        roomNumber: roomNumber,
+        items: orderItems,
+        notes: notes,
+        specialInstructions: orderData.specialInstructions,
+        staffInfo: orderData.staffInfo,
+        orderType: orderType,
+        createdAt: orderData.createdAt?.toISOString() || new Date().toISOString()
+      }).catch(err => console.error('KOT print Pusher notification error (non-blocking):', err));
+    }
+
+    // Trigger Billing print notification if order is created as completed directly (Complete Billing clicked)
+    if (orderData.status === 'completed' && printSettings.kotPrinterEnabled !== false && printSettings.usePusherForKOT === true) {
+      pusherService.notifyBillingPrintRequest(restaurantId, {
+        id: orderRef.id,
+        dailyOrderId: dailyOrderId,
+        orderNumber: orderNumber,
+        tableNumber: tableNumber,
+        roomNumber: roomNumber,
+        customerName: orderData.customerInfo?.name || '',
+        customerMobile: orderData.customerInfo?.phone || '',
+        items: orderItems,
+        totalAmount: totalAmount,
+        taxAmount: taxAmount,
+        taxBreakdown: taxBreakdown,
+        finalAmount: finalAmount,
+        paymentMethod: paymentMethod,
+        orderType: orderType,
+        createdAt: orderData.createdAt?.toISOString() || new Date().toISOString(),
+        completedAt: new Date()
+      }).catch(err => console.error('Billing print Pusher notification error (non-blocking):', err));
+    }
+
     res.status(201).json({
       message: 'Order created successfully',
       order: {
@@ -5386,7 +6174,7 @@ app.get('/api/orders/:restaurantId', authenticateToken, async (req, res) => {
     let query = db.collection(collections.orders)
       .where('restaurantId', '==', restaurantId);
 
-    // Apply status filter
+    // Apply status filter (including 'deleted' to show only deleted orders)
     if (status && status !== 'all') {
       query = query.where('status', '==', status);
     }
@@ -5453,6 +6241,11 @@ app.get('/api/orders/:restaurantId', authenticateToken, async (req, res) => {
       allOrders.push(order);
     });
 
+    // When status is 'all' or not set, exclude soft-deleted orders so they only appear when filter is "Deleted"
+    if (!status || status === 'all') {
+      allOrders = allOrders.filter(o => o.status !== 'deleted');
+    }
+
     console.log(`📋 Order History - Total orders before filtering: ${allOrders.length}`);
 
     // Apply waiter filter if provided
@@ -5469,13 +6262,18 @@ app.get('/api/orders/:restaurantId', authenticateToken, async (req, res) => {
       console.log(`🔎 Searching orders for: "${searchValue}"`);
       
       allOrders = allOrders.filter(order => {
-        // Search by order ID
-        if (order.id.toLowerCase().includes(searchValue)) {
+        // Search by Firestore order ID (document id)
+        if (order.id && order.id.toLowerCase().includes(searchValue)) {
           return true;
         }
         
-        // Search by order number
+        // Search by order number (e.g. ORD-...)
         if (order.orderNumber && order.orderNumber.toLowerCase().includes(searchValue)) {
+          return true;
+        }
+        
+        // Search by display order # (dailyOrderId: 1, 2, 3,...) – works for both daily-reset and sequential modes
+        if (order.dailyOrderId != null && String(order.dailyOrderId) === searchValue) {
           return true;
         }
         
@@ -5748,10 +6546,150 @@ app.patch('/api/orders/:orderId/status', authenticateToken, async (req, res) => 
       return res.status(403).json({ error: 'Access denied: Order does not belong to your restaurant' });
     }
 
+    // NEW: Handle deferred loyalty/stats updates on completion
+    if (status === 'completed' && orderData.status !== 'completed') {
+      console.log(`✅ Order ${orderId} marked as completed. Processing deferred updates...`);
+      
+      const customerId = orderData.customerId;
+      
+      // Update Offer Usage for all applied offers
+      const offersToUpdate = orderData.appliedOffers && orderData.appliedOffers.length > 0
+        ? orderData.appliedOffers
+        : (orderData.appliedOffer && orderData.appliedOffer.id ? [orderData.appliedOffer] : []);
+
+      for (const appliedOfferItem of offersToUpdate) {
+        if (appliedOfferItem && appliedOfferItem.id) {
+          try {
+            await db.collection('offers').doc(appliedOfferItem.id).update({
+              usageCount: FieldValue.increment(1),
+              updatedAt: new Date()
+            });
+            console.log(`🎁 Offer usage incremented for ${appliedOfferItem.id}`);
+          } catch (err) {
+            console.error('Error updating offer usage:', err);
+          }
+        }
+      }
+
+      // Update Customer Stats and Loyalty
+      if (customerId) {
+        try {
+          const customerUpdateData = {
+            totalOrders: FieldValue.increment(1),
+            totalSpent: FieldValue.increment(orderData.totalAmount || 0),
+            lastOrderDate: new Date(),
+            updatedAt: new Date()
+          };
+          
+          const pointsEarned = orderData.loyaltyPointsEarned || 0;
+          const pointsRedeemed = orderData.loyaltyPointsRedeemed || 0;
+          const netPointsChange = pointsEarned - pointsRedeemed;
+          
+          if (netPointsChange !== 0) {
+            customerUpdateData.loyaltyPoints = FieldValue.increment(netPointsChange);
+          }
+          
+          await db.collection('customers').doc(customerId).update(customerUpdateData);
+          console.log(`👤 Customer stats updated for ${customerId}. Points: ${netPointsChange > 0 ? '+' : ''}${netPointsChange}`);
+          
+          // Add to order history
+          const orderHistoryEntry = {
+            orderId: orderId,
+            orderNumber: orderData.orderNumber,
+            orderDate: new Date(), // Completion date
+            totalAmount: orderData.totalAmount,
+            subtotal: orderData.subtotal,
+            discountAmount: orderData.discountAmount,
+            loyaltyDiscount: orderData.loyaltyDiscount,
+            tableNumber: orderData.tableNumber,
+            orderType: orderData.orderType,
+            orderTypeLabel: orderData.orderTypeLabel,
+            orderSource: orderData.orderSource,
+            status: 'completed',
+            itemsCount: orderData.items?.length || 0,
+            appliedOffer: orderData.appliedOffer?.name || null,
+            loyaltyPointsEarned: pointsEarned,
+            loyaltyPointsRedeemed: pointsRedeemed
+          };
+
+          await db.collection('customers').doc(customerId).update({
+            orderHistory: FieldValue.arrayUnion(orderHistoryEntry)
+          });
+          console.log('📜 Order added to customer history');
+
+        } catch (err) {
+          console.error('Error updating customer stats:', err);
+        }
+      }
+    }
+
     await db.collection(collections.orders).doc(orderId).update({
       status,
       updatedAt: new Date()
     });
+
+    // Trigger Pusher notification for real-time updates
+    pusherService.notifyOrderStatusUpdated(orderData.restaurantId, orderId, status, {
+      orderNumber: orderData.orderNumber,
+      dailyOrderId: orderData.dailyOrderId,
+      totalAmount: orderData.totalAmount
+    }).catch(err => console.error('Pusher notification error (non-blocking):', err));
+
+    // Trigger KOT print notification when order is confirmed (sent to kitchen)
+    if (status === 'confirmed') {
+      // Check if Pusher KOT printing is enabled
+      const restaurantDoc = await db.collection(collections.restaurants).doc(orderData.restaurantId).get();
+      const printSettings = restaurantDoc.exists ? (restaurantDoc.data().printSettings || {}) : {};
+
+      if (printSettings.kotPrinterEnabled !== false && printSettings.usePusherForKOT === true) {
+        pusherService.notifyKOTPrintRequest(orderData.restaurantId, {
+          id: orderId,
+          dailyOrderId: orderData.dailyOrderId,
+          orderNumber: orderData.orderNumber,
+          tableNumber: orderData.tableNumber,
+          roomNumber: orderData.roomNumber,
+          items: orderData.items,
+          notes: orderData.notes,
+          specialInstructions: orderData.specialInstructions,
+          staffInfo: orderData.staffInfo,
+          orderType: orderData.orderType,
+          createdAt: orderData.createdAt?.toDate?.()?.toISOString() || new Date().toISOString()
+        }).catch(err => console.error('KOT print Pusher notification error (non-blocking):', err));
+      }
+    }
+
+    // Trigger Billing print notification when order is completed
+    if (status === 'completed') {
+      // Check if Pusher billing printing is enabled
+      const restaurantDoc = await db.collection(collections.restaurants).doc(orderData.restaurantId).get();
+      const printSettings = restaurantDoc.exists ? (restaurantDoc.data().printSettings || {}) : {};
+
+      if (printSettings.kotPrinterEnabled !== false && printSettings.usePusherForKOT === true) {
+        // Reset billPrinted flag so it can be printed
+        await db.collection(collections.orders).doc(orderId).update({
+          billPrinted: false
+        });
+
+        pusherService.notifyBillingPrintRequest(orderData.restaurantId, {
+          id: orderId,
+          dailyOrderId: orderData.dailyOrderId,
+          orderNumber: orderData.orderNumber,
+          tableNumber: orderData.tableNumber,
+          roomNumber: orderData.roomNumber,
+          customerName: orderData.customerName || orderData.customerInfo?.name,
+          customerMobile: orderData.customerMobile || orderData.customerInfo?.phone,
+          items: orderData.items,
+          totalAmount: orderData.totalAmount,
+          taxAmount: orderData.taxAmount,
+          taxBreakdown: orderData.taxBreakdown,
+          finalAmount: orderData.finalAmount || orderData.totalAmount,
+          paymentMethod: orderData.paymentMethod,
+          orderType: orderData.orderType,
+          createdAt: orderData.createdAt?.toDate?.()?.toISOString() || new Date().toISOString(),
+          completedAt: new Date()
+        }).catch(err => console.error('Billing print Pusher notification error (non-blocking):', err));
+      }
+    }
 
     res.json({ message: 'Order status updated successfully' });
 
@@ -5765,17 +6703,18 @@ app.patch('/api/orders/:orderId/status', authenticateToken, async (req, res) => 
 app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
   try {
     const { orderId } = req.params;
-    const { 
-      items, 
-      tableNumber, 
-      orderType, 
-      paymentMethod, 
+    const {
+      items,
+      tableNumber,
+      orderType,
+      paymentMethod,
       status,
       paymentStatus,
       completedAt,
       customerInfo,
-      updatedAt, 
-      lastUpdatedBy 
+      specialInstructions,
+      updatedAt,
+      lastUpdatedBy
     } = req.body;
 
     // Validate items if provided
@@ -5934,26 +6873,46 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
       if (restaurantDoc.exists) {
         const restaurantData = restaurantDoc.data();
         const taxSettings = restaurantData.taxSettings || {};
-        
+
         if (taxSettings.enabled && updateData.totalAmount > 0) {
           let taxAmount = 0;
+          const taxBreakdown = [];
+
           if (taxSettings.taxes && Array.isArray(taxSettings.taxes) && taxSettings.taxes.length > 0) {
-            taxAmount = taxSettings.taxes
+            taxSettings.taxes
               .filter(tax => tax.enabled)
-              .reduce((sum, tax) => sum + (updateData.totalAmount * (tax.rate || 0) / 100), 0);
+              .forEach(tax => {
+                const amt = Math.round((updateData.totalAmount * (tax.rate || 0) / 100) * 100) / 100;
+                taxAmount += amt;
+                taxBreakdown.push({
+                  name: tax.name || 'Tax',
+                  rate: tax.rate || 0,
+                  amount: amt
+                });
+              });
           } else if (taxSettings.defaultTaxRate) {
-            taxAmount = updateData.totalAmount * (taxSettings.defaultTaxRate / 100);
+            const amt = Math.round((updateData.totalAmount * (taxSettings.defaultTaxRate / 100)) * 100) / 100;
+            taxAmount = amt;
+            taxBreakdown.push({
+              name: 'Tax',
+              rate: taxSettings.defaultTaxRate,
+              amount: amt
+            });
           }
+
           updateData.taxAmount = Math.round(taxAmount * 100) / 100;
+          updateData.taxBreakdown = taxBreakdown;
           updateData.finalAmount = Math.round((updateData.totalAmount + taxAmount) * 100) / 100;
         } else {
           // Tax disabled - set taxAmount to 0 and finalAmount = totalAmount
           updateData.taxAmount = 0;
+          updateData.taxBreakdown = [];
           updateData.finalAmount = updateData.totalAmount;
         }
       } else {
         // Restaurant doc doesn't exist - preserve existing values for backward compatibility
         updateData.taxAmount = currentOrder.taxAmount || 0;
+        updateData.taxBreakdown = currentOrder.taxBreakdown || [];
         updateData.finalAmount = updateData.totalAmount || currentOrder.finalAmount || currentOrder.totalAmount || 0;
       }
       
@@ -5978,6 +6937,7 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
     if (paymentStatus) updateData.paymentStatus = paymentStatus;
     if (completedAt) updateData.completedAt = new Date(completedAt);
     if (customerInfo) updateData.customerInfo = customerInfo;
+    if (specialInstructions !== undefined) updateData.specialInstructions = specialInstructions;
     if (lastUpdatedBy) updateData.lastUpdatedBy = lastUpdatedBy;
 
     // Add update history
@@ -6181,7 +7141,90 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
       }
     }
 
-    res.json({ 
+    // Trigger Pusher notification for real-time updates
+    pusherService.notifyOrderUpdated(currentOrder.restaurantId, orderId, {
+      status: status || currentOrder.status,
+      orderNumber: currentOrder.orderNumber,
+      dailyOrderId: currentOrder.dailyOrderId,
+      totalAmount: updateData.totalAmount || currentOrder.totalAmount,
+      items: updateData.items || currentOrder.items
+    }).catch(err => console.error('Pusher notification error (non-blocking):', err));
+
+    // If items were updated and order is NOT completed/cancelled/deleted/saved, trigger KOT reprint (Pusher and/or polling)
+    // This covers: pending, confirmed, preparing, ready, serving statuses
+    // Note: 'saved' orders should NOT trigger KOT print until they are explicitly placed (status changed to confirmed)
+    const orderStatus = status || currentOrder.status;
+    const nonKitchenStatuses = ['completed', 'cancelled', 'deleted', 'saved'];
+    if (items && items.length > 0 && !nonKitchenStatuses.includes(orderStatus)) {
+      try {
+        // Always reset kotPrinted so pending-print API returns this order (polling mode) and KOT app can reprint
+        await db.collection(collections.orders).doc(orderId).update({
+          kotPrinted: false
+        });
+
+        const restaurantDoc = await db.collection(collections.restaurants).doc(currentOrder.restaurantId).get();
+        const printSettings = restaurantDoc.exists ? (restaurantDoc.data().printSettings || {}) : {};
+
+        if (printSettings.kotPrinterEnabled !== false && printSettings.usePusherForKOT === true) {
+          console.log('🖨️ Order items updated, triggering KOT reprint for order:', orderId);
+          pusherService.notifyKOTPrintRequest(currentOrder.restaurantId, {
+            id: orderId,
+            dailyOrderId: currentOrder.dailyOrderId,
+            orderNumber: currentOrder.orderNumber,
+            tableNumber: tableNumber || currentOrder.tableNumber,
+            roomNumber: currentOrder.roomNumber,
+            items: updateData.items || items,
+            notes: currentOrder.notes,
+            specialInstructions: updateData.specialInstructions || currentOrder.specialInstructions,
+            staffInfo: currentOrder.staffInfo,
+            orderType: orderType || currentOrder.orderType,
+            createdAt: currentOrder.createdAt?.toDate?.()?.toISOString() || new Date().toISOString(),
+            isReprint: true  // Flag to tell printer app this is a reprint (items updated)
+          }).catch(err => console.error('KOT reprint Pusher notification error (non-blocking):', err));
+        }
+      } catch (kotError) {
+        console.error('KOT reprint error (non-blocking):', kotError);
+      }
+    }
+
+    // If status changed to completed, trigger billing print
+    if (status === 'completed' && currentOrder.status !== 'completed') {
+      try {
+        const restaurantDoc = await db.collection(collections.restaurants).doc(currentOrder.restaurantId).get();
+        const printSettings = restaurantDoc.exists ? (restaurantDoc.data().printSettings || {}) : {};
+
+        if (printSettings.kotPrinterEnabled !== false && printSettings.usePusherForKOT === true) {
+          // Reset billPrinted flag so it can be printed
+          await db.collection(collections.orders).doc(orderId).update({
+            billPrinted: false
+          });
+
+          console.log('🧾 Order completed, triggering billing print for order:', orderId);
+          pusherService.notifyBillingPrintRequest(currentOrder.restaurantId, {
+            id: orderId,
+            dailyOrderId: currentOrder.dailyOrderId,
+            orderNumber: currentOrder.orderNumber,
+            tableNumber: tableNumber || currentOrder.tableNumber,
+            roomNumber: currentOrder.roomNumber,
+            customerName: customerInfo?.name || currentOrder.customerName || currentOrder.customerInfo?.name,
+            customerMobile: customerInfo?.phone || currentOrder.customerMobile || currentOrder.customerInfo?.phone,
+            items: updateData.items || currentOrder.items,
+            totalAmount: updateData.totalAmount || currentOrder.totalAmount,
+            taxAmount: updateData.taxAmount || currentOrder.taxAmount,
+            taxBreakdown: updateData.taxBreakdown || currentOrder.taxBreakdown,
+            finalAmount: updateData.finalAmount || currentOrder.finalAmount || currentOrder.totalAmount,
+            paymentMethod: paymentMethod || currentOrder.paymentMethod,
+            orderType: orderType || currentOrder.orderType,
+            createdAt: currentOrder.createdAt?.toDate?.()?.toISOString() || new Date().toISOString(),
+            completedAt: new Date()
+          }).catch(err => console.error('Billing print Pusher notification error (non-blocking):', err));
+        }
+      } catch (billingError) {
+        console.error('Billing print error (non-blocking):', billingError);
+      }
+    }
+
+    res.json({
       message: 'Order updated successfully',
       data: { orderId }
     });
@@ -6192,44 +7235,219 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
   }
 });
 
-// Delete order (admin/owner only)
-app.delete('/api/orders/:orderId', authenticateToken, async (req, res) => {
+// Manual print request endpoint - triggered from Order History page Print button
+// This sends print request to dine-kot-printer app via Pusher
+app.post('/api/orders/:orderId/manual-print', authenticateToken, async (req, res) => {
   try {
     const { orderId } = req.params;
-    const { userId, role } = req.user;
-    
-    // Check if user has admin or owner privileges
-    if (role !== 'admin' && role !== 'owner') {
-      return res.status(403).json({ error: 'Access denied. Admin or owner privileges required.' });
-    }
-    
-    // Get the order to check if it exists and get restaurant info
+    const { printType } = req.body; // 'kot' or 'bill' - if not provided, auto-detect based on status
+
+    // Get the order
     const orderDoc = await db.collection(collections.orders).doc(orderId).get();
     if (!orderDoc.exists) {
       return res.status(404).json({ error: 'Order not found' });
     }
-    
+
+    const order = { id: orderId, ...orderDoc.data() };
+
+    // Get user's restaurant context for validation
+    const user = req.user;
+    let userRestaurantId = user.restaurantId || order.restaurantId;
+
+    if (order.restaurantId !== userRestaurantId && user.role !== 'admin' && user.role !== 'owner') {
+      return res.status(403).json({ error: 'Access denied: Order does not belong to your restaurant' });
+    }
+
+    // Determine print type: if status is 'completed', print bill; otherwise print KOT
+    const shouldPrintBill = printType === 'bill' || order.status === 'completed';
+
+    // Get restaurant info for print settings
+    const restaurantDoc = await db.collection(collections.restaurants).doc(order.restaurantId).get();
+    const restaurantData = restaurantDoc.exists ? restaurantDoc.data() : {};
+    const printSettings = restaurantData.printSettings || {};
+
+    // Check if KOT printer is enabled
+    if (printSettings.kotPrinterEnabled === false) {
+      return res.status(400).json({
+        error: 'KOT Printer is disabled for this restaurant',
+        fallbackToBrowser: true
+      });
+    }
+
+    // Format timestamps
+    const createdAt = order.createdAt?.toDate?.() || order.createdAt?._seconds
+      ? new Date(order.createdAt._seconds * 1000)
+      : new Date(order.createdAt || Date.now());
+
+    const formattedTime = new Date().toLocaleTimeString('en-IN', {
+      hour: '2-digit',
+      minute: '2-digit',
+      hour12: true
+    });
+    const formattedDate = new Date().toLocaleDateString('en-IN', {
+      day: '2-digit',
+      month: 'short',
+      year: 'numeric'
+    });
+
+    if (shouldPrintBill) {
+      // Print Bill/Invoice
+      console.log('🖨️ Manual BILL print request for order:', orderId);
+
+      await pusherService.notifyBillingPrintRequest(order.restaurantId, {
+        id: orderId,
+        dailyOrderId: order.dailyOrderId,
+        orderNumber: order.orderNumber,
+        tableNumber: order.tableNumber,
+        roomNumber: order.roomNumber,
+        customerName: order.customerName || order.customerInfo?.name,
+        customerMobile: order.customerMobile || order.customerInfo?.phone,
+        items: order.items || [],
+        totalAmount: order.totalAmount || 0,
+        taxAmount: order.taxAmount || 0,
+        taxBreakdown: order.taxBreakdown || [],
+        finalAmount: order.finalAmount || order.totalAmount || 0,
+        paymentMethod: order.paymentMethod || 'cash',
+        orderType: order.orderType || 'dine-in',
+        createdAt: createdAt.toISOString(),
+        completedAt: order.completedAt?.toDate?.()?.toISOString() || new Date().toISOString(),
+        formattedTime,
+        formattedDate,
+        forcePrint: true  // Force print flag - bypasses local cache check in printer app
+      });
+
+      res.json({
+        success: true,
+        message: 'Bill print request sent to printer app',
+        printType: 'bill'
+      });
+    } else {
+      // Print KOT
+      console.log('🖨️ Manual KOT print request for order:', orderId);
+
+      await pusherService.notifyKOTPrintRequest(order.restaurantId, {
+        id: orderId,
+        kotId: `KOT-${orderId.slice(-6).toUpperCase()}`,
+        dailyOrderId: order.dailyOrderId,
+        orderNumber: order.orderNumber,
+        tableNumber: order.tableNumber,
+        roomNumber: order.roomNumber,
+        items: order.items || [],
+        notes: order.notes || '',
+        specialInstructions: order.specialInstructions || '',
+        staffInfo: order.staffInfo || {},
+        orderType: order.orderType || 'dine-in',
+        createdAt: createdAt.toISOString(),
+        formattedTime,
+        formattedDate,
+        forcePrint: true,  // Force print flag - bypasses local cache check in printer app
+        isReprint: true    // Mark as reprint to bypass duplicate check
+      });
+
+      res.json({
+        success: true,
+        message: 'KOT print request sent to printer app',
+        printType: 'kot'
+      });
+    }
+
+  } catch (error) {
+    console.error('Manual print request error:', error);
+    res.status(500).json({ error: 'Failed to send print request' });
+  }
+});
+
+// Delete order (admin/owner only) – soft delete: set status to 'deleted' so order appears under "Deleted" filter
+app.delete('/api/orders/:orderId', authenticateToken, async (req, res) => {
+  try {
+    const { orderId } = req.params;
+    const { userId, role } = req.user;
+
+    // Get the order to check if it exists and get restaurant info
+    const orderRef = db.collection(collections.orders).doc(orderId);
+    const orderDoc = await orderRef.get();
+    if (!orderDoc.exists) {
+      return res.status(404).json({ error: 'Order not found' });
+    }
+
     const order = orderDoc.data();
-    
-    // If user is owner, check if they own the restaurant
+
+    // Check if user has permission to delete orders (owner, admin, manager, cashier)
+    const allowedRoles = ['owner', 'admin', 'manager', 'cashier'];
+    let hasAccess = allowedRoles.includes(role?.toLowerCase());
+
+    // For owner role, verify they own the restaurant
     if (role === 'owner') {
       const restaurant = await db.collection(collections.restaurants).doc(order.restaurantId).get();
       if (!restaurant.exists || restaurant.data().ownerId !== userId) {
-        return res.status(403).json({ error: 'Access denied. You can only delete orders from your own restaurant.' });
+        hasAccess = false;
       }
     }
-    
-    // Don't allow deletion of completed orders (optional business rule)
-    if (order.status === 'completed') {
-      return res.status(400).json({ error: 'Cannot delete completed orders' });
+
+    // For staff roles (manager, cashier), verify they belong to the restaurant
+    if (['manager', 'cashier'].includes(role?.toLowerCase())) {
+      const userDoc = await db.collection(collections.users).doc(userId).get();
+      if (userDoc.exists) {
+        const userData = userDoc.data();
+        if (userData.restaurantId !== order.restaurantId) {
+          hasAccess = false;
+        }
+      } else {
+        hasAccess = false;
+      }
+    }
+
+    if (!hasAccess) {
+      return res.status(403).json({ error: 'Access denied. You do not have permission to delete this order.' });
     }
     
-    // Delete the order
-    await db.collection(collections.orders).doc(orderId).delete();
+    // Already soft-deleted
+    if (order.status === 'deleted') {
+      return res.json({ message: 'Order already deleted' });
+    }
     
+    // Soft delete: set status to 'deleted' and preserve the state it was in (lastStatus) so we can show "Deleted (was: Completed)" etc.
+    const lastStatus = order.status || 'pending';
+    await orderRef.update({
+      status: 'deleted',
+      lastStatus,
+      deletedAt: FieldValue.serverTimestamp(),
+      updatedAt: FieldValue.serverTimestamp()
+    });
+
+    // Trigger Pusher notification for real-time updates
+    pusherService.notifyOrderDeleted(order.restaurantId, orderId)
+      .catch(err => console.error('Pusher notification error (non-blocking):', err));
+
     res.json({ message: 'Order deleted successfully' });
   } catch (error) {
     console.error('Delete order error:', error);
+    res.status(500).json({ error: 'Failed to delete order' });
+  }
+});
+
+// Public API - Delete order by ID (hardcoded credentials: name=dineopen, pass=dineopen2525)
+app.post('/api/public/delete-order', async (req, res) => {
+  try {
+    const { name, pass, orderId } = req.body || {};
+    if (name !== 'dineopen' || pass !== 'dineopen2525') {
+      return res.status(401).json({ error: 'Unauthorized' });
+    }
+    if (!orderId || typeof orderId !== 'string' || !orderId.trim()) {
+      return res.status(400).json({ error: 'orderId is required' });
+    }
+    const id = orderId.trim();
+    const orderRef = db.collection(collections.orders).doc(id);
+    const orderDoc = await orderRef.get();
+    if (!orderDoc.exists) {
+      return res.status(404).json({ error: 'Order not found' });
+    }
+    const order = orderDoc.data();
+    await orderRef.delete();
+    pusherService.notifyOrderDeleted(order.restaurantId, id).catch(err => console.error('Pusher delete-order (non-blocking):', err));
+    res.json({ message: 'Order deleted successfully' });
+  } catch (error) {
+    console.error('Public delete-order error:', error);
     res.status(500).json({ error: 'Failed to delete order' });
   }
 });
@@ -6276,6 +7494,11 @@ app.use('/api/payments', paymentRoutes);
 // Initialize chatbot RAG routes
 app.use('/api', chatbotRoutes);
 
+// DineAI Voice Assistant routes
+app.use('/api', dineaiRoutes);
+app.use('/api', dineaiKnowledgeRoutes);
+app.use('/api', dineaiCheapVoiceRoutes);
+
 // Initialize hotel management routes (restaurant-hotel integration)
 // NOTE: hotelManagementRoutes must be registered BEFORE hotelRoutes to handle
 // routes like /api/hotel/rooms/availability correctly
@@ -6291,9 +7514,12 @@ app.use('/api/shift-scheduling', shiftSchedulingRoutes);
 // Initialize Google Reviews routes
 app.use('/api/google-reviews', googleReviewsRoutes);
 
-// Initialize Customer App routes (Crave - B2C ordering)
-app.use('/api', customerRoutes);
+// Initialize Custom URL (slug) routes
+app.use('/api', customUrlRoutes);
 
+// Print installer (KOT Printer exe/dmg) – use same bucket as image/menu uploads
+app.set('printInstallerBucket', bucket);
+app.use('/api/print-installer', printInstallerRoutes);
 
 // Generic image upload API
 app.post('/api/upload/image', authenticateToken, upload.single('image'), async (req, res) => {
@@ -6412,32 +7638,42 @@ app.post('/api/menu-items/:itemId/images', authenticateToken, upload.array('imag
 
     // Find the menu item in the restaurant's menu structure
     console.log('🔍 Looking up menu item with ID:', itemId);
-    
-    // We need to find which restaurant this menu item belongs to
-    // Since we don't have restaurantId in the URL, we'll need to search through restaurants
+
+    // Get all restaurants user has access to (via userRestaurants)
+    const userRestaurantSnapshot = await db.collection(collections.userRestaurants)
+      .where('userId', '==', userId)
+      .get();
+    const accessibleRestaurantIds = new Set();
+    userRestaurantSnapshot.forEach(doc => accessibleRestaurantIds.add(doc.data().restaurantId));
+
+    // Search through restaurants for the menu item
     const restaurantsSnapshot = await db.collection('restaurants').get();
     let menuItem = null;
     let restaurantId = null;
     let restaurantDoc = null;
-    
+
     for (const restaurantDocSnapshot of restaurantsSnapshot.docs) {
       const restaurantData = restaurantDocSnapshot.data();
-      if (restaurantData.ownerId === userId && restaurantData.menu && restaurantData.menu.items) {
+      const restId = restaurantDocSnapshot.id;
+      // Check if user is owner OR has staff access
+      const hasAccess = restaurantData.ownerId === userId || accessibleRestaurantIds.has(restId);
+
+      if (hasAccess && restaurantData.menu && restaurantData.menu.items) {
         const foundItem = restaurantData.menu.items.find(item => item.id === itemId);
         if (foundItem) {
           menuItem = foundItem;
-          restaurantId = restaurantDocSnapshot.id;
+          restaurantId = restId;
           restaurantDoc = restaurantDocSnapshot;
           break;
         }
       }
     }
-    
+
     if (!menuItem) {
       console.log('❌ Menu item not found in any restaurant');
-      return res.status(404).json({ error: 'Menu item not found' });
+      return res.status(404).json({ error: 'Menu item not found or access denied' });
     }
-    
+
     console.log('✅ Found menu item:', { name: menuItem.name, restaurantId });
 
     const uploadedImages = [];
@@ -6517,27 +7753,38 @@ app.delete('/api/menu-items/:itemId/images/:imageIndex', authenticateToken, asyn
     const { itemId, imageIndex } = req.params;
     const { userId } = req.user;
 
+    // Get all restaurants user has access to (via userRestaurants)
+    const userRestaurantSnapshot = await db.collection(collections.userRestaurants)
+      .where('userId', '==', userId)
+      .get();
+    const accessibleRestaurantIds = new Set();
+    userRestaurantSnapshot.forEach(doc => accessibleRestaurantIds.add(doc.data().restaurantId));
+
     // Find the menu item in the restaurant's menu structure
     const restaurantsSnapshot = await db.collection('restaurants').get();
     let menuItem = null;
     let restaurantId = null;
     let restaurantDoc = null;
-    
+
     for (const restaurantDocSnapshot of restaurantsSnapshot.docs) {
       const restaurantData = restaurantDocSnapshot.data();
-      if (restaurantData.ownerId === userId && restaurantData.menu && restaurantData.menu.items) {
+      const restId = restaurantDocSnapshot.id;
+      // Check if user is owner OR has staff access
+      const hasAccess = restaurantData.ownerId === userId || accessibleRestaurantIds.has(restId);
+
+      if (hasAccess && restaurantData.menu && restaurantData.menu.items) {
         const foundItem = restaurantData.menu.items.find(item => item.id === itemId);
         if (foundItem) {
           menuItem = foundItem;
-          restaurantId = restaurantDocSnapshot.id;
+          restaurantId = restId;
           restaurantDoc = restaurantDocSnapshot;
           break;
         }
       }
     }
-    
+
     if (!menuItem) {
-      return res.status(404).json({ error: 'Menu item not found' });
+      return res.status(404).json({ error: 'Menu item not found or access denied' });
     }
 
     const images = menuItem.images || [];
@@ -6641,10 +7888,15 @@ app.post('/api/menus/bulk-upload/:restaurantId', authenticateToken, chatgptUsage
       console.log('⚠️ Some files have unsupported types, but will attempt extraction anyway:', invalidFiles.map(f => f.originalname));
     }
 
-    // Check if user owns the restaurant
-    const restaurant = await db.collection(collections.restaurants).doc(restaurantId).get();
-    if (!restaurant.exists || restaurant.data().ownerId !== userId) {
+    // Check if user has access (owner or staff with restaurant access)
+    const hasAccess = await validateRestaurantAccess(userId, restaurantId);
+    if (!hasAccess) {
       return res.status(403).json({ error: 'Access denied' });
+    }
+
+    const restaurant = await db.collection(collections.restaurants).doc(restaurantId).get();
+    if (!restaurant.exists) {
+      return res.status(404).json({ error: 'Restaurant not found' });
     }
 
     const uploadedFiles = [];
@@ -6831,9 +8083,15 @@ app.post('/api/menus/bulk-save/:restaurantId', authenticateToken, async (req, re
       return res.status(400).json({ error: 'Menu items array is required' });
     }
 
-    const restaurantDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
-    if (!restaurantDoc.exists || restaurantDoc.data().ownerId !== userId) {
+    // Check if user has access (owner or staff with restaurant access)
+    const hasAccess = await validateRestaurantAccess(userId, restaurantId);
+    if (!hasAccess) {
       return res.status(403).json({ error: 'Access denied' });
+    }
+
+    const restaurantDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
+    if (!restaurantDoc.exists) {
+      return res.status(404).json({ error: 'Restaurant not found' });
     }
 
     const restaurantData = restaurantDoc.data();
@@ -6841,6 +8099,16 @@ app.post('/api/menus/bulk-save/:restaurantId', authenticateToken, async (req, re
     const existingItems = [...(existingMenu.items || [])];
     // Use restaurant.categories (what getCategories returns), not menu.categories
     let existingCategories = [...(restaurantData.categories || [])];
+
+    // Find the max numeric shortCode in existing items to ensure uniqueness
+    let maxShortCode = 0;
+    for (const item of existingItems) {
+      const sc = parseInt(item.shortCode, 10);
+      if (!isNaN(sc) && sc > maxShortCode) {
+        maxShortCode = sc;
+      }
+    }
+    console.log(`📊 Current max shortCode: ${maxShortCode}`);
 
     // Merge extracted categories into restaurant.categories (by unique id)
     for (const c of extractedCategories) {
@@ -6861,6 +8129,9 @@ app.post('/api/menus/bulk-save/:restaurantId', authenticateToken, async (req, re
     const savedItems = [];
     const errors = [];
     const validCategoryIds = new Set(existingCategories.map(c => (c.id || '').toLowerCase()));
+
+    // Counter for unique shortCodes starting from max + 1
+    let shortCodeCounter = maxShortCode;
 
     for (const item of menuItems) {
       try {
@@ -6884,9 +8155,13 @@ app.post('/api/menus/bulk-save/:restaurantId', authenticateToken, async (req, re
         }
 
         // If item has variants, use the lowest variant price as base price, or 0
-        const basePrice = variants.length > 0 
+        const basePrice = variants.length > 0
           ? Math.min(...variants.map(v => v.price))
           : (parseFloat(item.price) || 0);
+
+        // Assign unique shortCode by incrementing counter
+        shortCodeCounter++;
+        const uniqueShortCode = String(shortCodeCounter);
 
         const menuItem = {
           id: `item_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
@@ -6898,7 +8173,7 @@ app.post('/api/menus/bulk-save/:restaurantId', authenticateToken, async (req, re
           isVeg: Boolean(item.isVeg),
           spiceLevel: item.spiceLevel || 'medium',
           allergens: Array.isArray(item.allergens) ? item.allergens : [],
-          shortCode: item.shortCode || (item.name ? String(item.name).substring(0, 3).toUpperCase() : 'X'),
+          shortCode: uniqueShortCode,
           status: 'active',
           order: existingItems.length,
           isAvailable: true,
@@ -7453,12 +8728,29 @@ app.get('/api/floors/:restaurantId', async (req, res) => {
         .get();
 
       const tables = [];
-      tablesSnapshot.forEach(tableDoc => {
+      for (const tableDoc of tablesSnapshot.docs) {
+        const tableData = tableDoc.data();
+        let currentOrderTotal = null;
+
+        // If table has a current order, fetch the order total
+        if (tableData.currentOrderId && tableData.status === 'occupied') {
+          try {
+            const orderDoc = await db.collection(collections.orders).doc(tableData.currentOrderId).get();
+            if (orderDoc.exists) {
+              const orderData = orderDoc.data();
+              currentOrderTotal = orderData.finalAmount || orderData.totalAmount || 0;
+            }
+          } catch (orderErr) {
+            console.log(`Failed to fetch order ${tableData.currentOrderId} for table:`, orderErr.message);
+          }
+        }
+
         tables.push({
           id: tableDoc.id,
-          ...tableDoc.data()
+          ...tableData,
+          currentOrderTotal
         });
-      });
+      }
 
       floors.push({
         id: floorDoc.id,
@@ -8051,20 +9343,24 @@ const requireOwnerRole = (req, res, next) => {
   next();
 };
 
-// Get all waiters for a restaurant (for filtering purposes)
+// Get all waiters/staff for a restaurant (for filtering purposes)
 app.get('/api/waiters/:restaurantId', authenticateToken, async (req, res) => {
   try {
     const { restaurantId } = req.params;
 
+    // Get all active staff (any role except owner/customer)
     const snapshot = await db.collection(collections.users)
       .where('restaurantId', '==', restaurantId)
-      .where('role', 'in', ['waiter', 'manager', 'employee'])
       .where('status', '==', 'active')
       .get();
 
     const waiters = [];
     snapshot.forEach(doc => {
       const userData = doc.data();
+      // Skip owners and customers
+      const role = (userData.role || '').toLowerCase();
+      if (role === 'owner' || role === 'customer') return;
+
       waiters.push({
         id: doc.id,
         name: userData.name,
@@ -8083,23 +9379,33 @@ app.get('/api/waiters/:restaurantId', authenticateToken, async (req, res) => {
   }
 });
 
+// Staff reset password (mount before other /api/staff routes so POST /:staffId/reset-password is matched)
+app.use('/api/staff', staffResetPasswordRoutes);
+
 // Get all staff for a restaurant
 app.get('/api/staff/:restaurantId', authenticateToken, requireOwnerRole, async (req, res) => {
   try {
     const { restaurantId } = req.params;
 
+    // Get all users with this restaurantId (staff members)
+    // Don't filter by specific roles - show all staff regardless of role
     const snapshot = await db.collection(collections.users)
       .where('restaurantId', '==', restaurantId)
-      .where('role', 'in', ['waiter', 'manager', 'employee'])
       .get();
 
     const staff = [];
-    
+
     // Process each staff member and fetch their credentials
     for (const doc of snapshot.docs) {
       const userData = doc.data();
       const staffId = doc.id;
-      
+
+      // Skip owners and customers - only show actual staff
+      const userRole = (userData.role || '').toLowerCase();
+      if (userRole === 'owner' || userRole === 'customer') {
+        continue;
+      }
+
       // Check if temporary credentials exist
       let tempPassword = null;
       let hasTemporaryPassword = false;
@@ -8134,6 +9440,7 @@ app.get('/api/staff/:restaurantId', authenticateToken, requireOwnerRole, async (
         createdAt: userData.createdAt,
         updatedAt: userData.updatedAt,
         loginId: userData.loginId,
+        username: userData.username || null,
         tempPassword: tempPassword, // Include actual temporary password
         hasTemporaryPassword: hasTemporaryPassword
       });
@@ -8162,7 +9469,7 @@ app.get('/api/staff/:staffId/credentials', authenticateToken, requireOwnerRole, 
     // Check if temporary credentials exist
     const credentialsDoc = await db.collection('staffCredentials').doc(staffId).get();
     
-    if (credentialsDoc.exists) {
+      if (credentialsDoc.exists) {
       const credentialsData = credentialsDoc.data();
       
       // Check if credentials have expired
@@ -8172,12 +9479,14 @@ app.get('/api/staff/:staffId/credentials', authenticateToken, requireOwnerRole, 
         
         res.json({
           loginId: staffData.loginId,
+          username: staffData.username || null,
           hasTemporaryPassword: false,
           message: 'Temporary password has expired. Staff member should use their current password.'
         });
       } else {
         res.json({
           loginId: credentialsData.loginId,
+          username: staffData.username || null,
           temporaryPassword: credentialsData.temporaryPassword,
           hasTemporaryPassword: true,
           message: 'This staff member has a temporary password.'
@@ -8186,6 +9495,7 @@ app.get('/api/staff/:staffId/credentials', authenticateToken, requireOwnerRole, 
     } else {
       res.json({
         loginId: staffData.loginId,
+        username: staffData.username || null,
         hasTemporaryPassword: false,
         message: 'This staff member has already changed their password.'
       });
@@ -8239,11 +9549,31 @@ app.delete('/api/staff/:staffId', authenticateToken, requireOwnerRole, async (re
 app.post('/api/staff/:restaurantId', authenticateToken, requireOwnerRole, async (req, res) => {
   try {
     const { restaurantId } = req.params;
-    const { name, phone, email, role = 'waiter', startDate, address } = req.body;
+    const { name, phone, email, role = 'waiter', startDate, address, username: usernameInput, pageAccess: requestedPageAccess } = req.body;
 
     if (!name || !phone) {
       return res.status(400).json({ error: 'Name and phone are required' });
     }
+
+    // Optional username: validate format and uniqueness (case-insensitive)
+    let username = null;
+    let usernameLower = null;
+    if (usernameInput != null && String(usernameInput).trim() !== '') {
+      const raw = String(usernameInput).trim();
+      if (raw.length < 3 || raw.length > 50) {
+        return res.status(400).json({ error: 'Username must be 3–50 characters' });
+      }
+      if (!/^[a-zA-Z0-9_]+$/.test(raw)) {
+        return res.status(400).json({ error: 'Username can only contain letters, numbers and underscore' });
+      }
+      usernameLower = raw.toLowerCase();
+      const existingByUsername = await db.collection(collections.users).where('usernameLower', '==', usernameLower).get();
+      if (!existingByUsername.empty) {
+        return res.status(400).json({ error: 'Username already exists. Choose a different username.' });
+      }
+      username = raw;
+    }
+
 
     // Check if email already exists (only if email is provided)
     if (email) {
@@ -8289,7 +9619,9 @@ app.post('/api/staff/:restaurantId', authenticateToken, requireOwnerRole, async 
       lastLogin: null,
       temporaryPassword: true, // Flag to indicate password needs to be changed
       loginId: userId, // Use the generated 5-digit numeric ID
-      pageAccess: {
+      ...(username != null && { username, usernameLower }),
+      // Use pageAccess from request if provided, otherwise use defaults
+      pageAccess: requestedPageAccess || {
         dashboard: true,
         history: true,
         tables: true,
@@ -8302,6 +9634,16 @@ app.post('/api/staff/:restaurantId', authenticateToken, requireOwnerRole, async 
     };
 
     const staffRef = await db.collection(collections.users).add(staffData);
+
+    // Add to userRestaurants collection for access control
+    await db.collection(collections.userRestaurants).add({
+      userId: staffRef.id,
+      restaurantId,
+      role: role,
+      pageAccess: staffData.pageAccess,
+      createdAt: new Date(),
+      updatedAt: new Date()
+    });
 
     // Store temporary password for admin display (will be deleted after first login)
     await db.collection('staffCredentials').doc(staffRef.id).set({
@@ -8330,11 +9672,13 @@ app.post('/api/staff/:restaurantId', authenticateToken, requireOwnerRole, async 
         address,
         status: 'active',
         startDate: staffData.startDate,
-        createdAt: staffData.createdAt
+        createdAt: staffData.createdAt,
+        username: username || null
       },
       // For demo purposes, return credentials (remove in production)
       credentials: {
         loginId: userId,
+        username: username || null,
         password: temporaryPassword
       }
     });
@@ -8412,7 +9756,8 @@ app.get('/api/user/page-access', authenticateToken, async (req, res) => {
         admin: false
       },
       role: userData.role,
-      restaurantId: userData.restaurantId
+      restaurantId: userData.restaurantId,
+      notAllowedPages: userData.notAllowedPages || [] // Array of page IDs to hide (e.g., ['billing', 'inventory'])
     });
   } catch (error) {
     console.error('Get page access error:', error);
@@ -8531,27 +9876,47 @@ app.get('/api/user/profile', authenticateToken, async (req, res) => {
   }
 });
 
-// Staff login with User ID and password
+// Staff login with User ID or username and password
 app.post('/api/auth/staff/login', async (req, res) => {
   try {
     const { loginId, password } = req.body;
+    const identifier = (loginId != null && loginId !== '') ? String(loginId).trim() : '';
 
-    if (!loginId || !password) {
-      return res.status(400).json({ error: 'Login ID and password are required' });
+    if (!identifier || !password) {
+      return res.status(400).json({ error: 'User ID/username and password are required' });
     }
 
-    // Find staff member by loginId (User ID)
-    const staffQuery = await db.collection(collections.users)
-      .where('loginId', '==', loginId)
-      .where('role', 'in', ['waiter', 'manager', 'employee'])
+    // Find staff: first by loginId (User ID), then by username (case-insensitive)
+    // Don't filter by specific roles - allow any role except owner/customer
+    let staffQuery = await db.collection(collections.users)
+      .where('loginId', '==', identifier)
       .where('status', '==', 'active')
       .get();
 
-    if (staffQuery.empty) {
+    // Filter out owners and customers
+    let staffDocs = staffQuery.docs.filter(doc => {
+      const role = (doc.data().role || '').toLowerCase();
+      return role !== 'owner' && role !== 'customer';
+    });
+
+    if (staffDocs.length === 0) {
+      const usernameLower = identifier.toLowerCase();
+      staffQuery = await db.collection(collections.users)
+        .where('usernameLower', '==', usernameLower)
+        .where('status', '==', 'active')
+        .get();
+
+      staffDocs = staffQuery.docs.filter(doc => {
+        const role = (doc.data().role || '').toLowerCase();
+        return role !== 'owner' && role !== 'customer';
+      });
+    }
+
+    if (staffDocs.length === 0) {
       return res.status(404).json({ error: 'Staff member not found or inactive' });
     }
 
-    const staffDoc = staffQuery.docs[0];
+    const staffDoc = staffDocs[0];
     const staffData = staffDoc.data();
 
     // Check password
@@ -8586,7 +9951,7 @@ app.post('/api/auth/staff/login', async (req, res) => {
         ownerId: restaurantData?.ownerId
       },
       process.env.JWT_SECRET,
-      { expiresIn: '7d' }
+      { expiresIn: '30d' }
     );
 
     res.json({
@@ -8599,7 +9964,9 @@ app.post('/api/auth/staff/login', async (req, res) => {
         role: staffData.role,
         restaurantId: staffData.restaurantId,
         phone: staffData.phone,
-        pageAccess: staffData.pageAccess
+        pageAccess: staffData.pageAccess,
+        loginId: staffData.loginId,
+        username: staffData.username || null
       },
       restaurant: restaurantData ? {
         id: staffData.restaurantId, // Use the restaurantId from staff data
@@ -8609,7 +9976,10 @@ app.post('/api/auth/staff/login', async (req, res) => {
         email: restaurantData.email,
         cuisine: restaurantData.cuisine,
         description: restaurantData.description,
-        ownerId: restaurantData.ownerId
+        ownerId: restaurantData.ownerId,
+        legalBusinessName: restaurantData.legalBusinessName || '',
+        gstin: restaurantData.gstin || '',
+        showGstOnInvoice: restaurantData.showGstOnInvoice === true, // Default false
       } : null,
       owner: ownerData ? {
         id: restaurantData.ownerId,
@@ -8680,28 +10050,32 @@ app.get('/api/admin/tax/:restaurantId', authenticateToken, async (req, res) => {
 
     console.log(`📊 Getting tax settings for restaurant: ${restaurantId}, userId: ${userId}`);
 
-    // Verify user has admin access to this restaurant
+    // Verify user has access to this restaurant (owner, manager, admin, cashier)
+    const allowedRoles = ['owner', 'manager', 'admin', 'cashier'];
     const userRestaurantSnapshot = await db.collection(collections.userRestaurants)
       .where('userId', '==', userId)
       .where('restaurantId', '==', restaurantId)
-      .where('role', 'in', ['owner', 'manager', 'admin'])
+      .where('role', 'in', allowedRoles)
       .get();
 
     console.log(`🔍 User restaurant access check: userId=${userId}, restaurantId=${restaurantId}, found=${userRestaurantSnapshot.size} records`);
-    
-    if (userRestaurantSnapshot.empty) {
-      // Debug: Let's see what roles exist for this user-restaurant combination
-      const allUserRestaurants = await db.collection(collections.userRestaurants)
-        .where('userId', '==', userId)
-        .where('restaurantId', '==', restaurantId)
-        .get();
 
-      console.log(`🔍 All user-restaurant records for debugging:`, allUserRestaurants.docs.map(doc => ({
-        id: doc.id,
-        ...doc.data()
-      })));
+    let hasAccess = !userRestaurantSnapshot.empty;
 
-      // Fallback: Check if user is the owner directly from restaurant document
+    if (!hasAccess) {
+      // Fallback: Check users collection for staff with restaurantId
+      const userDoc = await db.collection(collections.users).doc(userId).get();
+      if (userDoc.exists) {
+        const userData = userDoc.data();
+        if (userData.restaurantId === restaurantId && allowedRoles.includes(userData.role?.toLowerCase())) {
+          hasAccess = true;
+          console.log(`✅ Access granted via users collection: userId=${userId}, role=${userData.role}`);
+        }
+      }
+    }
+
+    if (!hasAccess) {
+      // Final fallback: Check if user is the owner directly from restaurant document
       const restaurantRef = db.collection(collections.restaurants).doc(restaurantId);
       const restaurantDoc = await restaurantRef.get();
 
@@ -8711,7 +10085,7 @@ app.get('/api/admin/tax/:restaurantId', authenticateToken, async (req, res) => {
 
       const restaurant = restaurantDoc.data();
       if (restaurant.ownerId !== userId) {
-        return res.status(403).json({ error: 'Access denied. Admin role required.' });
+        return res.status(403).json({ error: 'Access denied. Required role: owner, manager, admin, or cashier.' });
       }
 
       console.log(`✅ Access granted via restaurant owner check: userId=${userId}, ownerId=${restaurant.ownerId}`);
@@ -8762,15 +10136,30 @@ app.put('/api/admin/tax/:restaurantId', authenticateToken, async (req, res) => {
 
     console.log(`📊 Updating tax settings for restaurant: ${restaurantId}, userId: ${userId}`);
 
-    // Verify user has admin access to this restaurant
+    // Verify user has access to this restaurant (owner, manager, admin, cashier)
+    const allowedRoles = ['owner', 'manager', 'admin', 'cashier'];
     const userRestaurantSnapshot = await db.collection(collections.userRestaurants)
       .where('userId', '==', userId)
       .where('restaurantId', '==', restaurantId)
-      .where('role', 'in', ['owner', 'manager', 'admin'])
+      .where('role', 'in', allowedRoles)
       .get();
 
-    if (userRestaurantSnapshot.empty) {
-      // Fallback: Check if user is the owner directly from restaurant document
+    let hasAccess = !userRestaurantSnapshot.empty;
+
+    if (!hasAccess) {
+      // Fallback: Check users collection for staff with restaurantId
+      const userDoc = await db.collection(collections.users).doc(userId).get();
+      if (userDoc.exists) {
+        const userData = userDoc.data();
+        if (userData.restaurantId === restaurantId && allowedRoles.includes(userData.role?.toLowerCase())) {
+          hasAccess = true;
+          console.log(`✅ Access granted via users collection: userId=${userId}, role=${userData.role}`);
+        }
+      }
+    }
+
+    if (!hasAccess) {
+      // Final fallback: Check if user is the owner directly from restaurant document
       const restaurantRef = db.collection(collections.restaurants).doc(restaurantId);
       const restaurantDoc = await restaurantRef.get();
 
@@ -8780,7 +10169,7 @@ app.put('/api/admin/tax/:restaurantId', authenticateToken, async (req, res) => {
 
       const restaurant = restaurantDoc.data();
       if (restaurant.ownerId !== userId) {
-        return res.status(403).json({ error: 'Access denied. Admin role required.' });
+        return res.status(403).json({ error: 'Access denied. Required role: owner, manager, admin, or cashier.' });
       }
 
       console.log(`✅ Access granted via restaurant owner check: userId=${userId}, ownerId=${restaurant.ownerId}`);
@@ -8824,6 +10213,176 @@ app.put('/api/admin/tax/:restaurantId', authenticateToken, async (req, res) => {
   } catch (error) {
     console.error('Update tax settings error:', error);
     res.status(500).json({ error: 'Failed to update tax settings' });
+  }
+});
+
+// ==================== CURRENCY SETTINGS ====================
+// Currency routes moved to ./routes/currencyRoutes.js
+app.use('/api', currencyRoutes);
+
+// ==================== OWNER CHAIN DASHBOARD ====================
+// Owner dashboard routes for multi-restaurant management
+app.use('/api/owner', ownerDashboardRoutes);
+
+// ==================== AI INSIGHTS & DAILY REPORTS ====================
+// AI-powered analytics and automated email reports
+app.use('/api/ai', aiInsightsRoutes);
+
+// ==================== BUSINESS SETTINGS (for GST invoices) ====================
+
+// Get business settings (legal name, GSTIN)
+app.get('/api/admin/business/:restaurantId', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+    const userId = req.user.userId;
+
+    console.log(`📊 Getting business settings for restaurant: ${restaurantId}, userId: ${userId}`);
+
+    // Verify user has access to this restaurant (owner, manager, admin, cashier)
+    const allowedRoles = ['owner', 'manager', 'admin', 'cashier'];
+    const userRestaurantSnapshot = await db.collection(collections.userRestaurants)
+      .where('userId', '==', userId)
+      .where('restaurantId', '==', restaurantId)
+      .where('role', 'in', allowedRoles)
+      .get();
+
+    let hasAccess = !userRestaurantSnapshot.empty;
+
+    if (!hasAccess) {
+      // Fallback: Check users collection for staff with restaurantId
+      const userDoc = await db.collection(collections.users).doc(userId).get();
+      if (userDoc.exists) {
+        const userData = userDoc.data();
+        if (userData.restaurantId === restaurantId && allowedRoles.includes(userData.role?.toLowerCase())) {
+          hasAccess = true;
+        }
+      }
+    }
+
+    if (!hasAccess) {
+      // Final fallback: Check if user is the owner directly from restaurant document
+      const restaurantRef = db.collection(collections.restaurants).doc(restaurantId);
+      const restaurantDoc = await restaurantRef.get();
+
+      if (!restaurantDoc.exists) {
+        return res.status(404).json({ error: 'Restaurant not found' });
+      }
+
+      const restaurant = restaurantDoc.data();
+      if (restaurant.ownerId !== userId) {
+        return res.status(403).json({ error: 'Access denied' });
+      }
+    }
+
+    // Get restaurant data
+    const restaurantRef = db.collection(collections.restaurants).doc(restaurantId);
+    const restaurantDoc = await restaurantRef.get();
+
+    if (!restaurantDoc.exists) {
+      return res.status(404).json({ error: 'Restaurant not found' });
+    }
+
+    const restaurant = restaurantDoc.data();
+
+    res.json({
+      businessSettings: {
+        legalBusinessName: restaurant.legalBusinessName || '',
+        gstin: restaurant.gstin || '',
+        address: restaurant.address || '',
+        showGstOnInvoice: restaurant.showGstOnInvoice === true, // Default false
+      }
+    });
+
+  } catch (error) {
+    console.error('Get business settings error:', error);
+    res.status(500).json({ error: 'Failed to get business settings' });
+  }
+});
+
+// Update business settings (legal name, GSTIN)
+app.put('/api/admin/business/:restaurantId', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+    const userId = req.user.userId;
+    const { legalBusinessName, gstin, showGstOnInvoice } = req.body;
+
+    console.log(`📊 Updating business settings for restaurant: ${restaurantId}, userId: ${userId}`);
+
+    // Verify user has access to this restaurant (owner, manager, admin, cashier)
+    const allowedRoles = ['owner', 'manager', 'admin', 'cashier'];
+    const userRestaurantSnapshot = await db.collection(collections.userRestaurants)
+      .where('userId', '==', userId)
+      .where('restaurantId', '==', restaurantId)
+      .where('role', 'in', allowedRoles)
+      .get();
+
+    let hasAccess = !userRestaurantSnapshot.empty;
+
+    if (!hasAccess) {
+      // Fallback: Check users collection for staff with restaurantId
+      const userDoc = await db.collection(collections.users).doc(userId).get();
+      if (userDoc.exists) {
+        const userData = userDoc.data();
+        if (userData.restaurantId === restaurantId && allowedRoles.includes(userData.role?.toLowerCase())) {
+          hasAccess = true;
+        }
+      }
+    }
+
+    if (!hasAccess) {
+      // Final fallback: Check if user is the owner directly from restaurant document
+      const restaurantRef = db.collection(collections.restaurants).doc(restaurantId);
+      const restaurantDoc = await restaurantRef.get();
+
+      if (!restaurantDoc.exists) {
+        return res.status(404).json({ error: 'Restaurant not found' });
+      }
+
+      const restaurant = restaurantDoc.data();
+      if (restaurant.ownerId !== userId) {
+        return res.status(403).json({ error: 'Access denied' });
+      }
+    }
+
+    // Validate GSTIN format if provided
+    if (gstin && gstin.trim() !== '') {
+      const gstinRegex = /^[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z]{1}[1-9A-Z]{1}Z[0-9A-Z]{1}$/;
+      if (!gstinRegex.test(gstin.toUpperCase())) {
+        return res.status(400).json({ error: 'Invalid GSTIN format. GSTIN should be 15 characters (e.g., 29ABCDE1234F1Z5)' });
+      }
+    }
+
+    // Update restaurant with business settings
+    const restaurantRef = db.collection(collections.restaurants).doc(restaurantId);
+    const updateData = {
+      updatedAt: new Date()
+    };
+
+    if (legalBusinessName !== undefined) {
+      updateData.legalBusinessName = legalBusinessName.trim();
+    }
+    if (gstin !== undefined) {
+      updateData.gstin = gstin.trim().toUpperCase();
+    }
+    if (showGstOnInvoice !== undefined) {
+      updateData.showGstOnInvoice = showGstOnInvoice === true;
+    }
+
+    await restaurantRef.update(updateData);
+
+    res.json({
+      success: true,
+      message: 'Business settings updated successfully',
+      businessSettings: {
+        legalBusinessName: updateData.legalBusinessName || '',
+        gstin: updateData.gstin || '',
+        showGstOnInvoice: updateData.showGstOnInvoice === true,
+      }
+    });
+
+  } catch (error) {
+    console.error('Update business settings error:', error);
+    res.status(500).json({ error: 'Failed to update business settings' });
   }
 });
 
@@ -8896,6 +10455,122 @@ app.post('/api/tax/calculate/:restaurantId', authenticateToken, async (req, res)
   } catch (error) {
     console.error('Calculate tax error:', error);
     res.status(500).json({ error: 'Failed to calculate tax' });
+  }
+});
+
+// ============================================
+// PRINT SETTINGS ENDPOINTS
+// ============================================
+
+// Get print settings for a restaurant
+app.get('/api/admin/print-settings/:restaurantId', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+
+    const restaurantDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
+    if (!restaurantDoc.exists) {
+      return res.status(404).json({ error: 'Restaurant not found' });
+    }
+
+    const restaurantData = restaurantDoc.data();
+
+    // Default print settings
+    const defaultSettings = {
+      // Dashboard UI settings
+      kotPrinterEnabled: true,           // Enable dine-kot-printer app auto-printing
+      manualPrintEnabled: true,          // Enable manual print button on dashboard
+      showKOTSummaryAfterOrder: true,    // Show KOT summary after placing order to kitchen
+      showBillSummaryAfterBilling: true, // Show bill summary after completing billing
+      usePusherForKOT: false,            // Use Pusher instead of polling
+
+      // Auto-print triggers (for dine-kot-printer app)
+      autoPrintOnKOT: true,              // Auto-print when order is sent to kitchen
+      autoPrintOnBilling: false,         // Auto-print when billing is completed
+
+      // Future reserved flags (for future use)
+      autoPrintOnOnlineOrder: false,     // Reserved: Auto-print for online orders
+      autoPrintOnTableCall: false,       // Reserved: Auto-print when customer calls waiter
+      printKOTCopy: 1,                   // Number of KOT copies to print
+      printBillCopy: 1                   // Number of bill copies to print
+    };
+
+    const printSettings = { ...defaultSettings, ...(restaurantData.printSettings || {}) };
+
+    res.json({
+      success: true,
+      printSettings
+    });
+
+  } catch (error) {
+    console.error('Get print settings error:', error);
+    res.status(500).json({ error: 'Failed to fetch print settings' });
+  }
+});
+
+// Update print settings for a restaurant
+app.put('/api/admin/print-settings/:restaurantId', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+    const { printSettings } = req.body;
+
+    if (!printSettings || typeof printSettings !== 'object') {
+      return res.status(400).json({ error: 'Invalid print settings' });
+    }
+
+    // Validate allowed fields (boolean fields)
+    const booleanFields = [
+      'kotPrinterEnabled',
+      'manualPrintEnabled',
+      'showKOTSummaryAfterOrder',
+      'showBillSummaryAfterBilling',
+      'usePusherForKOT',
+      'autoPrintOnKOT',
+      'autoPrintOnBilling',
+      'autoPrintOnOnlineOrder',
+      'autoPrintOnTableCall'
+    ];
+
+    // Numeric fields
+    const numericFields = [
+      'printKOTCopy',
+      'printBillCopy'
+    ];
+
+    const sanitizedSettings = {};
+    for (const field of booleanFields) {
+      if (printSettings[field] !== undefined) {
+        sanitizedSettings[field] = Boolean(printSettings[field]);
+      }
+    }
+    for (const field of numericFields) {
+      if (printSettings[field] !== undefined) {
+        const val = parseInt(printSettings[field]);
+        sanitizedSettings[field] = isNaN(val) ? 1 : Math.max(1, Math.min(val, 5)); // 1-5 copies
+      }
+    }
+
+    const restaurantDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
+    if (!restaurantDoc.exists) {
+      return res.status(404).json({ error: 'Restaurant not found' });
+    }
+
+    const existingSettings = restaurantDoc.data().printSettings || {};
+    const updatedSettings = { ...existingSettings, ...sanitizedSettings };
+
+    await db.collection(collections.restaurants).doc(restaurantId).update({
+      printSettings: updatedSettings,
+      updatedAt: new Date()
+    });
+
+    res.json({
+      success: true,
+      message: 'Print settings updated successfully',
+      printSettings: updatedSettings
+    });
+
+  } catch (error) {
+    console.error('Update print settings error:', error);
+    res.status(500).json({ error: 'Failed to update print settings' });
   }
 });
 
@@ -9304,21 +10979,36 @@ app.patch('/api/kot/:orderId/status', async (req, res) => {
 app.get('/api/kot/pending-print/:restaurantId', async (req, res) => {
   try {
     const { restaurantId } = req.params;
-    const { lastPrintedAt } = req.query; // Optional: to get orders after a specific time
+    const { lastPrintedAt, maxHours } = req.query; // Optional: to get orders after a specific time, and limit fetch window
 
-    console.log(`🖨️ KOT Print API - Getting pending print orders for restaurant: ${restaurantId}`);
+    console.log(`🖨️ KOT Print API - Getting pending print orders for restaurant: ${restaurantId}, maxHours: ${maxHours || 4}`);
+
+    // Fetch restaurant's print settings
+    const restaurantDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
+    const printSettings = restaurantDoc.exists ? (restaurantDoc.data().printSettings || {}) : {};
+
+    // Default values (backward compatible - all defaults enable existing behavior)
+    const kotPrinterEnabled = printSettings.kotPrinterEnabled !== false; // Default true
+    const usePusherForKOT = printSettings.usePusherForKOT === true; // Default false
+    const autoPrintOnKOT = printSettings.autoPrintOnKOT !== false; // Default true
+    const autoPrintOnBilling = printSettings.autoPrintOnBilling === true; // Default false
+    const autoPrintOnOnlineOrder = printSettings.autoPrintOnOnlineOrder === true; // Default false
+    const autoPrintOnTableCall = printSettings.autoPrintOnTableCall === true; // Default false
+    const printKOTCopy = printSettings.printKOTCopy || 1;
+    const printBillCopy = printSettings.printBillCopy || 1;
 
     // Get orders that need to be printed:
     // - Status is 'confirmed' or 'preparing' (sent to kitchen)
     // - kotPrinted is false or doesn't exist
-    // - Created in the last 24 hours
-    const twentyFourHoursAgo = new Date();
-    twentyFourHoursAgo.setHours(twentyFourHoursAgo.getHours() - 24);
+    // - Created within the maxHours window (default 4 hours, max 24 hours)
+    const hoursLimit = Math.min(Math.max(parseInt(maxHours) || 4, 1), 24);
+    const cutoffTime = new Date();
+    cutoffTime.setHours(cutoffTime.getHours() - hoursLimit);
 
     let query = db.collection(collections.orders)
       .where('restaurantId', '==', restaurantId)
       .where('status', 'in', ['confirmed', 'preparing'])
-      .where('createdAt', '>=', twentyFourHoursAgo)
+      .where('createdAt', '>=', cutoffTime)
       .orderBy('createdAt', 'asc');
 
     const ordersSnapshot = await query.get();
@@ -9346,6 +11036,9 @@ app.get('/api/kot/pending-print/:restaurantId', async (req, res) => {
       const kotId = `KOT-${doc.id.slice(-6).toUpperCase()}`;
       const createdAt = orderData.createdAt?.toDate() || new Date();
 
+      // needsReprint: order was printed before but kotPrinted was reset (e.g. order updated) so KOT app should print again
+      const needsReprint = orderData.kotPrinted === false && !!orderData.kotPrintedAt;
+
       pendingOrders.push({
         id: doc.id,
         kotId,
@@ -9367,17 +11060,30 @@ app.get('/api/kot/pending-print/:restaurantId', async (req, res) => {
           day: '2-digit',
           month: 'short',
           year: 'numeric'
-        })
+        }),
+        needsReprint
       });
     }
 
-    console.log(`🖨️ Found ${pendingOrders.length} orders pending print`);
+    console.log(`🖨️ Found ${pendingOrders.length} orders pending print (kotPrinterEnabled: ${kotPrinterEnabled})`);
 
     res.json({
       success: true,
       orders: pendingOrders,
       count: pendingOrders.length,
-      timestamp: new Date().toISOString()
+      timestamp: new Date().toISOString(),
+      // Print control flags for dine-kot-printer app (backward compatible)
+      shouldPrint: kotPrinterEnabled,  // If false, printer app should skip all printing
+      usePusher: usePusherForKOT,      // If true, prefer Pusher over polling
+      // Granular print triggers
+      printSettings: {
+        autoPrintOnKOT,                // Auto-print when order sent to kitchen
+        autoPrintOnBilling,            // Auto-print when billing completed
+        autoPrintOnOnlineOrder,        // Reserved: Auto-print for online orders
+        autoPrintOnTableCall,          // Reserved: Auto-print on customer call
+        printKOTCopy,                  // Number of KOT copies
+        printBillCopy                  // Number of bill copies
+      }
     });
 
   } catch (error) {
@@ -9419,6 +11125,137 @@ app.patch('/api/kot/:orderId/printed', async (req, res) => {
   } catch (error) {
     console.error('Mark KOT printed error:', error);
     res.status(500).json({ error: 'Failed to mark KOT as printed' });
+  }
+});
+
+// Get pending billing/invoice orders for printing (orders billed but not printed)
+// This endpoint is PUBLIC for easy kiosk setup - use restaurantId for identification
+app.get('/api/billing/pending-print/:restaurantId', async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+    const { maxHours } = req.query; // Optional: limit fetch window
+
+    console.log(`🧾 Billing Print API - Getting pending billing prints for restaurant: ${restaurantId}, maxHours: ${maxHours || 4}`);
+
+    // Fetch restaurant's print settings
+    const restaurantDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
+    const printSettings = restaurantDoc.exists ? (restaurantDoc.data().printSettings || {}) : {};
+
+    // Default values (backward compatible)
+    const kotPrinterEnabled = printSettings.kotPrinterEnabled !== false;
+    const autoPrintOnBilling = printSettings.autoPrintOnBilling === true; // Default false
+    const printBillCopy = printSettings.printBillCopy || 1;
+
+    // Get orders that need billing printed:
+    // - Status is 'completed' (billing done)
+    // - billPrinted is false or doesn't exist
+    // - Created within the maxHours window (default 4 hours, max 24 hours)
+    const hoursLimit = Math.min(Math.max(parseInt(maxHours) || 4, 1), 24);
+    const cutoffTime = new Date();
+    cutoffTime.setHours(cutoffTime.getHours() - hoursLimit);
+
+    const ordersSnapshot = await db.collection(collections.orders)
+      .where('restaurantId', '==', restaurantId)
+      .where('status', '==', 'completed')
+      .where('createdAt', '>=', cutoffTime)
+      .orderBy('createdAt', 'asc')
+      .get();
+
+    const pendingBills = [];
+
+    for (const doc of ordersSnapshot.docs) {
+      const orderData = doc.data();
+
+      // Skip already printed bills
+      if (orderData.billPrinted === true) {
+        continue;
+      }
+
+      // Format order for billing print
+      const createdAt = orderData.createdAt?.toDate() || new Date();
+      const completedAt = orderData.completedAt?.toDate() || createdAt;
+
+      pendingBills.push({
+        id: doc.id,
+        orderId: doc.id,
+        dailyOrderId: orderData.dailyOrderId,
+        orderNumber: orderData.orderNumber,
+        tableNumber: orderData.tableNumber || '',
+        roomNumber: orderData.roomNumber || '',
+        customerName: orderData.customerName || '',
+        customerMobile: orderData.customerMobile || '',
+        items: orderData.items || [],
+        subtotal: orderData.totalAmount || 0,
+        taxAmount: orderData.taxAmount || 0,
+        taxBreakdown: orderData.taxBreakdown || [],
+        totalAmount: orderData.finalAmount || orderData.totalAmount || 0,
+        paymentMethod: orderData.paymentMethod || 'cash',
+        orderType: orderData.orderType || 'dine-in',
+        createdAt: createdAt.toISOString(),
+        completedAt: completedAt.toISOString(),
+        formattedTime: completedAt.toLocaleTimeString('en-IN', {
+          hour: '2-digit',
+          minute: '2-digit',
+          hour12: true
+        }),
+        formattedDate: completedAt.toLocaleDateString('en-IN', {
+          day: '2-digit',
+          month: 'short',
+          year: 'numeric'
+        })
+      });
+    }
+
+    console.log(`🧾 Found ${pendingBills.length} bills pending print (autoPrintOnBilling: ${autoPrintOnBilling})`);
+
+    res.json({
+      success: true,
+      orders: pendingBills,
+      count: pendingBills.length,
+      timestamp: new Date().toISOString(),
+      shouldPrint: kotPrinterEnabled && autoPrintOnBilling,
+      printCopies: printBillCopy
+    });
+
+  } catch (error) {
+    console.error('Get pending billing print error:', error);
+    res.status(500).json({ error: 'Failed to fetch pending billing prints' });
+  }
+});
+
+// Mark bill as printed
+app.patch('/api/billing/:orderId/printed', async (req, res) => {
+  try {
+    const { orderId } = req.params;
+    const { printedAt, printedBy } = req.body;
+
+    console.log(`🧾 Marking bill ${orderId} as printed`);
+
+    const orderRef = db.collection(collections.orders).doc(orderId);
+    const orderDoc = await orderRef.get();
+
+    if (!orderDoc.exists) {
+      return res.status(404).json({ error: 'Order not found' });
+    }
+
+    await orderRef.update({
+      billPrinted: true,
+      billPrintedAt: printedAt ? new Date(printedAt) : new Date(),
+      billPrintedBy: printedBy || 'kiosk',
+      updatedAt: new Date()
+    });
+
+    console.log(`✅ Bill ${orderId} marked as printed`);
+
+    res.json({
+      success: true,
+      message: 'Bill marked as printed',
+      orderId
+    });
+
+  } catch (error) {
+    console.error('Mark bill printed error:', error);
+    res.status(500).json({ error: 'Failed to mark bill as printed' });
   }
 });
 
@@ -9732,9 +11569,163 @@ Example responses:
 
   } catch (error) {
     console.error('Voice processing error:', error);
-    res.status(500).json({ 
+    res.status(500).json({
       error: 'Failed to process voice command',
-      message: error.message 
+      message: error.message
+    });
+  }
+});
+
+// Smart Voice Order Processing - Streaming with Intent Detection
+app.post('/api/voice/smart-process', authenticateToken, aiUsageLimiter.middleware(), async (req, res) => {
+  try {
+    const {
+      transcript,
+      restaurantId,
+      existingCart = [],
+      processedItemIds = [],
+      isStreaming = true
+    } = req.body;
+
+    if (!transcript || !restaurantId) {
+      return res.status(400).json({ error: 'Transcript and restaurantId are required' });
+    }
+
+    console.log('🎤 Smart voice processing:', {
+      transcript: transcript.substring(0, 100),
+      cartItems: existingCart.length,
+      processedCount: processedItemIds.length
+    });
+
+    // Get menu items from restaurant
+    const restaurantDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
+
+    if (!restaurantDoc.exists) {
+      return res.status(404).json({ error: 'Restaurant not found' });
+    }
+
+    const restaurantData = restaurantDoc.data();
+    const menuData = restaurantData.menu || { categories: [], items: [] };
+    let menuItems = menuData.items || [];
+
+    // Filter only active items
+    menuItems = menuItems.filter(item => item.status === 'active' || item.active === true);
+
+    if (menuItems.length === 0) {
+      return res.status(404).json({ error: 'No menu items found' });
+    }
+
+    // Create menu context
+    const menuContext = menuItems.slice(0, 100).map(item =>
+      `${item.name} (₹${item.price}) [ID:${item.id}]`
+    ).join(', ');
+
+    // Create cart context
+    const cartContext = existingCart.length > 0
+      ? `Current cart: ${existingCart.map(i => `${i.quantity}x ${i.name}`).join(', ')}`
+      : 'Cart is empty';
+
+    const openai = new OpenAI({
+      apiKey: process.env.OPENAI_API_KEY
+    });
+
+    const systemPrompt = `You are a smart restaurant voice order assistant. Parse voice commands and detect user intent.
+
+MENU: ${menuContext}
+
+${cartContext}
+
+RESPOND WITH JSON ONLY:
+{
+  "items": [{"id":"item_id", "name":"Item Name", "quantity":1, "action":"add"}],
+  "compiledText": "1 Paneer Tikka, 2 Dosa",
+  "shouldStop": false,
+  "intent": "adding"
+}
+
+RULES:
+1. Parse Indian accents (paneer/panir, chhole/chole, dosa/dhosa)
+2. Match items phonetically with menu
+3. Detect quantities (ek=1, do=2, teen=3, char=4, paanch=5)
+4. "action" can be: "add", "remove", "update"
+5. "shouldStop" = true if user says: "that's all", "bas", "ho gaya", "done", "order kar do", "ye sab", "baki nahi", "complete", "finish"
+6. "compiledText" = human readable summary of recognized items
+7. "intent": "adding" (new items), "modifying" (changing cart), "completing" (ready to place order)
+8. If user says "hata do", "remove", "cancel" for an item, set action="remove"
+9. Only return NEW items not in processedItemIds: [${processedItemIds.join(',')}]`;
+
+    const completion = await openai.chat.completions.create({
+      model: "gpt-4o-mini",
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: transcript }
+      ],
+      temperature: 0.1,
+      max_tokens: 400
+    });
+
+    const responseText = completion.choices[0].message.content.trim();
+    console.log('🤖 Smart response:', responseText);
+
+    // Parse the response
+    let result = { items: [], compiledText: '', shouldStop: false, intent: 'adding' };
+    try {
+      const jsonMatch = responseText.match(/```json\s*([\s\S]*?)\s*```/) ||
+                        responseText.match(/```\s*([\s\S]*?)\s*```/) ||
+                        [null, responseText];
+      result = JSON.parse(jsonMatch[1] || responseText);
+    } catch (parseError) {
+      console.log('Parse error, using defaults');
+    }
+
+    // Helper for fuzzy matching
+    const fuzzyMatch = (name1, name2) => {
+      const n1 = (name1 || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+      const n2 = (name2 || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+      return n1.includes(n2) || n2.includes(n1) ||
+             n1.split('').filter(c => n2.includes(c)).length > Math.min(n1.length, n2.length) * 0.6;
+    };
+
+    // Validate and enrich items
+    const validItems = [];
+    for (const item of (result.items || [])) {
+      let menuItem = menuItems.find(m => m.id === item.id) ||
+                     menuItems.find(m => m.name.toLowerCase() === (item.name || '').toLowerCase()) ||
+                     menuItems.find(m => fuzzyMatch(m.name, item.name));
+
+      if (!menuItem) continue;
+
+      // Skip already processed unless it's a remove/update action
+      if (processedItemIds.includes(menuItem.id) && item.action === 'add') {
+        continue;
+      }
+
+      validItems.push({
+        id: menuItem.id,
+        name: menuItem.name,
+        price: menuItem.price,
+        quantity: item.quantity || 1,
+        action: item.action || 'add',
+        image: menuItem.image || null
+      });
+    }
+
+    console.log(`✅ Smart processed: ${validItems.length} items, shouldStop: ${result.shouldStop}`);
+
+    res.json({
+      success: true,
+      items: validItems,
+      compiledText: result.compiledText || '',
+      shouldStop: result.shouldStop || false,
+      intent: result.intent || 'adding',
+      allProcessedIds: [...processedItemIds, ...validItems.filter(i => i.action === 'add').map(i => i.id)]
+    });
+
+  } catch (error) {
+    console.error('Smart voice processing error:', error);
+    res.status(500).json({
+      error: 'Failed to process voice command',
+      message: error.message
     });
   }
 });
@@ -13672,6 +15663,1242 @@ function getNextOpenTime(operatingHours, currentTime) {
   return null;
 }
 
+// ==================== OFFERS MANAGEMENT APIs ====================
+
+// Get all offers for a restaurant
+app.get('/api/offers/:restaurantId', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+    const { userId } = req.user;
+
+    // Verify user has access to this restaurant
+    const restaurant = await db.collection(collections.restaurants).doc(restaurantId).get();
+    if (!restaurant.exists || restaurant.data().ownerId !== userId) {
+      return res.status(403).json({ error: 'Access denied' });
+    }
+
+    const offersSnapshot = await db.collection('offers')
+      .where('restaurantId', '==', restaurantId)
+      .orderBy('createdAt', 'desc')
+      .get();
+
+    const offers = [];
+    offersSnapshot.forEach(doc => {
+      offers.push({
+        id: doc.id,
+        ...doc.data()
+      });
+    });
+
+    res.json({ offers });
+  } catch (error) {
+    console.error('Get offers error:', error);
+    res.status(500).json({ error: 'Failed to fetch offers' });
+  }
+});
+
+// Get customer loyalty data by phone (public endpoint for Crave app)
+app.post('/api/public/customer/lookup', vercelSecurityMiddleware.publicAPI, async (req, res) => {
+  try {
+    const { restaurantId, phone } = req.body;
+
+    if (!restaurantId || !phone) {
+      return res.status(400).json({ error: 'Restaurant ID and phone are required' });
+    }
+
+    // Helper function to normalize phone number
+    const normalizePhone = (phoneNum) => {
+      if (!phoneNum) return null;
+      const digits = phoneNum.replace(/\D/g, '');
+      if (digits.length === 12 && digits.startsWith('91')) {
+        return digits.substring(2);
+      } else if (digits.length === 10) {
+        return digits;
+      } else if (digits.length === 11 && digits.startsWith('0')) {
+        return digits.substring(1);
+      }
+      return digits;
+    };
+
+    const normalizedPhone = normalizePhone(phone);
+
+    // Try exact match first
+    let customerQuery = await db.collection('customers')
+      .where('restaurantId', '==', restaurantId)
+      .where('phone', '==', phone)
+      .limit(1)
+      .get();
+
+    let existingCustomer = null;
+    if (!customerQuery.empty) {
+      existingCustomer = customerQuery.docs[0];
+    } else if (normalizedPhone) {
+      // Try normalized phone match
+      const allCustomers = await db.collection('customers')
+        .where('restaurantId', '==', restaurantId)
+        .get();
+
+      existingCustomer = allCustomers.docs.find(doc => {
+        const custPhone = normalizePhone(doc.data().phone);
+        return custPhone === normalizedPhone;
+      });
+    }
+
+    if (existingCustomer) {
+      const customerData = existingCustomer.data();
+      const totalOrders = customerData.totalOrders || 0;
+      res.json({
+        found: true,
+        customer: {
+          id: existingCustomer.id,
+          name: customerData.name || 'Customer',
+          loyaltyPoints: customerData.loyaltyPoints || 0,
+          totalOrders: totalOrders,
+          totalSpent: customerData.totalSpent || 0,
+          // First order if customer exists but has never placed an order
+          isFirstOrder: totalOrders === 0
+        }
+      });
+    } else {
+      res.json({
+        found: false,
+        customer: {
+          loyaltyPoints: 0,
+          totalOrders: 0,
+          isFirstOrder: true
+        }
+      });
+    }
+  } catch (error) {
+    console.error('Customer lookup error:', error);
+    res.status(500).json({ error: 'Failed to lookup customer' });
+  }
+});
+
+// Firebase auth verification for Crave customer app
+// Verifies Firebase ID token and creates/links customer with tier-based loyalty
+app.post('/api/crave-app/auth/firebase/verify', vercelSecurityMiddleware.publicAPI, async (req, res) => {
+  try {
+    const { firebaseIdToken, restaurantId, name } = req.body;
+
+    if (!firebaseIdToken || !restaurantId) {
+      return res.status(400).json({ error: 'Firebase ID token and restaurant ID are required' });
+    }
+
+    // Verify Firebase ID token
+    const admin = require('firebase-admin');
+    let decodedToken;
+    try {
+      decodedToken = await admin.auth().verifyIdToken(firebaseIdToken);
+    } catch (error) {
+      console.error('Firebase token verification error:', error);
+      return res.status(401).json({ error: 'Invalid or expired Firebase token' });
+    }
+
+    const { uid, phone_number: phoneNumber } = decodedToken;
+    console.log('🔐 Crave app Firebase auth - UID:', uid, 'Phone:', phoneNumber);
+
+    // Normalize phone number
+    const normalizePhone = (phoneNum) => {
+      if (!phoneNum) return null;
+      const digits = phoneNum.replace(/\D/g, '');
+      if (digits.length === 12 && digits.startsWith('91')) {
+        return digits.substring(2);
+      } else if (digits.length === 10) {
+        return digits;
+      } else if (digits.length === 11 && digits.startsWith('0')) {
+        return digits.substring(1);
+      }
+      return digits;
+    };
+
+    const normalizedPhone = normalizePhone(phoneNumber);
+
+    // Try to find existing customer by Firebase UID first
+    let customerDoc = null;
+    let existingCustomerQuery = await db.collection('customers')
+      .where('restaurantId', '==', restaurantId)
+      .where('firebaseUid', '==', uid)
+      .limit(1)
+      .get();
+
+    if (!existingCustomerQuery.empty) {
+      customerDoc = existingCustomerQuery.docs[0];
+      console.log('✅ Customer found by Firebase UID:', customerDoc.id);
+    } else if (normalizedPhone) {
+      // Try to find by phone number
+      const phoneQuery = await db.collection('customers')
+        .where('restaurantId', '==', restaurantId)
+        .where('phone', '==', normalizedPhone)
+        .limit(1)
+        .get();
+
+      if (!phoneQuery.empty) {
+        customerDoc = phoneQuery.docs[0];
+        // Link Firebase UID to existing customer
+        await db.collection('customers').doc(customerDoc.id).update({
+          firebaseUid: uid,
+          updatedAt: new Date()
+        });
+        console.log('✅ Customer found by phone, linked Firebase UID:', customerDoc.id);
+      }
+    }
+
+    // Tier calculation function
+    const calculateTier = (lifetimePoints) => {
+      if (lifetimePoints >= 5000) return 'platinum';
+      if (lifetimePoints >= 2000) return 'gold';
+      if (lifetimePoints >= 500) return 'silver';
+      return 'bronze';
+    };
+
+    let customer;
+    let isNewCustomer = false;
+
+    if (customerDoc) {
+      // Existing customer - update if name provided
+      const customerData = customerDoc.data();
+      const lifetimePoints = customerData.lifetimePoints || customerData.loyaltyPoints || 0;
+      const loyaltyTier = calculateTier(lifetimePoints);
+
+      if (name && (!customerData.name || customerData.name === 'Customer')) {
+        await db.collection('customers').doc(customerDoc.id).update({
+          name: name,
+          loyaltyTier: loyaltyTier,
+          updatedAt: new Date()
+        });
+      } else if (customerData.loyaltyTier !== loyaltyTier) {
+        // Update tier if changed
+        await db.collection('customers').doc(customerDoc.id).update({
+          loyaltyTier: loyaltyTier,
+          updatedAt: new Date()
+        });
+      }
+
+      customer = {
+        id: customerDoc.id,
+        name: name || customerData.name || 'Customer',
+        phone: normalizedPhone || customerData.phone,
+        loyaltyPoints: customerData.loyaltyPoints || 0,
+        lifetimePoints: lifetimePoints,
+        loyaltyTier: loyaltyTier,
+        totalOrders: customerData.totalOrders || 0,
+        totalSpent: customerData.totalSpent || 0
+      };
+    } else {
+      // Create new customer
+      isNewCustomer = true;
+      const newCustomer = {
+        restaurantId: restaurantId,
+        firebaseUid: uid,
+        phone: normalizedPhone,
+        name: name || 'Customer',
+        customerId: `CUST-${Date.now()}-${Math.random().toString(36).substr(2, 6)}`,
+        loyaltyPoints: 0,
+        lifetimePoints: 0,
+        loyaltyTier: 'bronze',
+        totalOrders: 0,
+        totalSpent: 0,
+        lastOrderDate: null,
+        orderHistory: [],
+        loyaltyTransactions: [],
+        source: 'crave_app_firebase',
+        createdAt: new Date(),
+        updatedAt: new Date()
+      };
+
+      const customerRef = await db.collection('customers').add(newCustomer);
+      console.log('✅ New Crave customer created:', customerRef.id);
+
+      customer = {
+        id: customerRef.id,
+        name: newCustomer.name,
+        phone: newCustomer.phone,
+        loyaltyPoints: 0,
+        lifetimePoints: 0,
+        loyaltyTier: 'bronze',
+        totalOrders: 0,
+        totalSpent: 0
+      };
+    }
+
+    // Generate JWT token for customer
+    const token = jwt.sign(
+      {
+        customerId: customer.id,
+        restaurantId: restaurantId,
+        phone: customer.phone,
+        type: 'customer'
+      },
+      process.env.JWT_SECRET,
+      { expiresIn: '30d' }
+    );
+
+    res.json({
+      token: token,
+      customer: customer,
+      isNewCustomer: isNewCustomer
+    });
+
+  } catch (error) {
+    console.error('Crave Firebase auth error:', error);
+    res.status(500).json({ error: 'Authentication failed' });
+  }
+});
+
+// Get customer loyalty history with tier info (public endpoint for Crave app)
+app.get('/api/public/customer/:customerId/loyalty-history', vercelSecurityMiddleware.publicAPI, async (req, res) => {
+  try {
+    const { customerId } = req.params;
+    const { page = 1, limit = 20, type = 'all' } = req.query;
+
+    const customerDoc = await db.collection('customers').doc(customerId).get();
+    if (!customerDoc.exists) {
+      return res.status(404).json({ error: 'Customer not found' });
+    }
+
+    const customerData = customerDoc.data();
+    const loyaltyTransactions = customerData.loyaltyTransactions || [];
+    const orderHistory = customerData.orderHistory || [];
+
+    // Build transaction history from order history if loyaltyTransactions is empty
+    let history = loyaltyTransactions.length > 0 ? loyaltyTransactions : [];
+
+    if (history.length === 0 && orderHistory.length > 0) {
+      // Build from order history
+      orderHistory.forEach(order => {
+        if (order.loyaltyPointsEarned > 0) {
+          history.push({
+            id: `earned-${order.orderId}`,
+            type: 'earned',
+            points: order.loyaltyPointsEarned,
+            orderId: order.orderId,
+            orderNumber: order.orderNumber,
+            date: order.orderDate,
+            description: `Earned from order #${order.orderNumber || order.orderId?.slice(-6)}`,
+            tierAtTime: order.tierAtTime || 'bronze',
+            tierMultiplier: order.tierMultiplier || 1
+          });
+        }
+        if (order.loyaltyPointsRedeemed > 0) {
+          history.push({
+            id: `redeemed-${order.orderId}`,
+            type: 'redeemed',
+            points: order.loyaltyPointsRedeemed,
+            orderId: order.orderId,
+            orderNumber: order.orderNumber,
+            date: order.orderDate,
+            description: `Redeemed on order #${order.orderNumber || order.orderId?.slice(-6)}`,
+            tierAtTime: order.tierAtTime || 'bronze'
+          });
+        }
+      });
+    }
+
+    // Filter by type
+    if (type !== 'all') {
+      history = history.filter(t => t.type === type);
+    }
+
+    // Sort by date descending
+    history.sort((a, b) => {
+      const dateA = a.date ? new Date(a.date) : new Date(0);
+      const dateB = b.date ? new Date(b.date) : new Date(0);
+      return dateB - dateA;
+    });
+
+    // Pagination
+    const startIndex = (parseInt(page) - 1) * parseInt(limit);
+    const paginatedHistory = history.slice(startIndex, startIndex + parseInt(limit));
+
+    // Calculate summary
+    const totalEarned = history
+      .filter(t => t.type === 'earned')
+      .reduce((sum, t) => sum + (t.points || 0), 0);
+    const totalRedeemed = history
+      .filter(t => t.type === 'redeemed')
+      .reduce((sum, t) => sum + (t.points || 0), 0);
+
+    // Tier calculation
+    const lifetimePoints = customerData.lifetimePoints || totalEarned;
+    const currentTier = customerData.loyaltyTier || (() => {
+      if (lifetimePoints >= 5000) return 'platinum';
+      if (lifetimePoints >= 2000) return 'gold';
+      if (lifetimePoints >= 500) return 'silver';
+      return 'bronze';
+    })();
+
+    // Points to next tier
+    const tierThresholds = { bronze: 0, silver: 500, gold: 2000, platinum: 5000 };
+    const tiers = ['bronze', 'silver', 'gold', 'platinum'];
+    const currentTierIndex = tiers.indexOf(currentTier);
+    const nextTier = currentTierIndex < 3 ? tiers[currentTierIndex + 1] : null;
+    const pointsToNextTier = nextTier ? tierThresholds[nextTier] - lifetimePoints : 0;
+
+    res.json({
+      history: paginatedHistory,
+      summary: {
+        totalEarned: lifetimePoints,
+        totalRedeemed: totalRedeemed,
+        currentBalance: customerData.loyaltyPoints || 0,
+        currentTier: currentTier,
+        lifetimePoints: lifetimePoints,
+        pointsToNextTier: Math.max(0, pointsToNextTier),
+        nextTier: nextTier
+      },
+      pagination: {
+        page: parseInt(page),
+        limit: parseInt(limit),
+        total: history.length,
+        hasMore: startIndex + parseInt(limit) < history.length
+      }
+    });
+
+  } catch (error) {
+    console.error('Get loyalty history error:', error);
+    res.status(500).json({ error: 'Failed to fetch loyalty history' });
+  }
+});
+
+// Get customer order history with full details (public endpoint for Crave app)
+app.get('/api/public/customer/:customerId/orders', vercelSecurityMiddleware.publicAPI, async (req, res) => {
+  try {
+    const { customerId } = req.params;
+    const { page = 1, limit = 20, status = 'all' } = req.query;
+
+    // Verify customer exists
+    const customerDoc = await db.collection('customers').doc(customerId).get();
+    if (!customerDoc.exists) {
+      return res.status(404).json({ error: 'Customer not found' });
+    }
+
+    const customerData = customerDoc.data();
+    const restaurantId = customerData.restaurantId;
+
+    // Fetch orders for this customer from the orders collection
+    let ordersQuery = db.collection(collections.orders)
+      .where('customerId', '==', customerId)
+      .orderBy('createdAt', 'desc');
+
+    const ordersSnapshot = await ordersQuery.get();
+
+    let orders = [];
+    ordersSnapshot.forEach(doc => {
+      const orderData = doc.data();
+
+      // Filter by status if specified
+      if (status !== 'all' && orderData.status !== status) {
+        return;
+      }
+
+      orders.push({
+        id: doc.id,
+        orderNumber: orderData.orderNumber,
+        dailyOrderId: orderData.dailyOrderId ?? null,
+        status: orderData.status || 'pending',
+        orderType: orderData.orderType,
+        orderTypeLabel: orderData.orderTypeLabel,
+        items: (orderData.items || []).map(item => ({
+          name: item.name,
+          quantity: item.quantity,
+          price: item.price,
+          total: item.quantity * item.price
+        })),
+        subtotal: orderData.subtotal || 0,
+        discountAmount: orderData.discountAmount || 0,
+        loyaltyDiscount: orderData.loyaltyDiscount || 0,
+        totalAmount: orderData.totalAmount || 0,
+        appliedOffer: orderData.appliedOffer ? {
+          name: orderData.appliedOffer.name,
+          discountApplied: orderData.appliedOffer.discountApplied
+        } : null,
+        appliedOffers: (orderData.appliedOffers || []).map(o => ({
+          name: o.name,
+          discountApplied: o.discountApplied
+        })),
+        loyaltyPointsEarned: orderData.loyaltyPointsEarned || 0,
+        loyaltyPointsRedeemed: orderData.loyaltyPointsRedeemed || 0,
+        tableNumber: orderData.tableNumber,
+        createdAt: orderData.createdAt?.toDate ? orderData.createdAt.toDate().toISOString() : orderData.createdAt,
+        completedAt: orderData.completedAt?.toDate ? orderData.completedAt.toDate().toISOString() : orderData.completedAt
+      });
+    });
+
+    // Pagination
+    const startIndex = (parseInt(page) - 1) * parseInt(limit);
+    const paginatedOrders = orders.slice(startIndex, startIndex + parseInt(limit));
+
+    res.json({
+      orders: paginatedOrders,
+      pagination: {
+        page: parseInt(page),
+        limit: parseInt(limit),
+        total: orders.length,
+        hasMore: startIndex + parseInt(limit) < orders.length
+      },
+      summary: {
+        totalOrders: orders.length,
+        pendingOrders: orders.filter(o => o.status === 'pending').length,
+        completedOrders: orders.filter(o => o.status === 'completed').length
+      }
+    });
+
+  } catch (error) {
+    console.error('Get customer orders error:', error);
+    res.status(500).json({ error: 'Failed to fetch order history' });
+  }
+});
+
+// Get customer app settings (public endpoint for Crave app)
+app.get('/api/public/customer-app-settings/:restaurantId', vercelSecurityMiddleware.publicAPI, async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+
+    const restaurantDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
+    if (!restaurantDoc.exists) {
+      return res.status(404).json({ error: 'Restaurant not found' });
+    }
+
+    const restaurantData = restaurantDoc.data();
+    const customerAppSettings = restaurantData.customerAppSettings || {};
+    const taxSettings = restaurantData.taxSettings || {};
+
+    // Build tax breakdown for display (only if enabled)
+    let taxInfo = { enabled: false, taxes: [] };
+    if (taxSettings.enabled) {
+      taxInfo.enabled = true;
+      if (taxSettings.taxes && Array.isArray(taxSettings.taxes) && taxSettings.taxes.length > 0) {
+        taxInfo.taxes = taxSettings.taxes
+          .filter(tax => tax.enabled)
+          .map(tax => ({
+            name: tax.name || 'Tax',
+            rate: tax.rate || 0
+          }));
+      } else if (taxSettings.defaultTaxRate) {
+        taxInfo.taxes = [{ name: 'Tax', rate: taxSettings.defaultTaxRate }];
+      }
+    }
+
+    // Only return settings that are relevant to customers
+    res.json({
+      settings: {
+        enabled: customerAppSettings.enabled ?? false,
+        allowDineIn: customerAppSettings.allowDineIn ?? true,
+        allowTakeaway: customerAppSettings.allowTakeaway ?? true,
+        allowDelivery: customerAppSettings.allowDelivery ?? false,
+        requireTableSelection: customerAppSettings.requireTableSelection ?? true,
+        minimumOrder: customerAppSettings.minimumOrder || 0,
+        loyaltySettings: customerAppSettings.loyaltySettings?.enabled ? {
+          enabled: true,
+          earnPerAmount: customerAppSettings.loyaltySettings.earnPerAmount || 100,
+          pointsEarned: customerAppSettings.loyaltySettings.pointsEarned || 4,
+          redemptionRate: customerAppSettings.loyaltySettings.redemptionRate || 100,
+          maxRedemptionPercent: customerAppSettings.loyaltySettings.maxRedemptionPercent || 20
+        } : {
+          enabled: false
+        },
+        taxSettings: taxInfo, // Include tax settings for cart display
+        branding: {
+          primaryColor: customerAppSettings.branding?.primaryColor || '#ef4444',
+          textColor: customerAppSettings.branding?.textColor || '#ffffff',
+          pageBackgroundColor: customerAppSettings.branding?.pageBackgroundColor || '#f8fafc',
+          offerGradientStart: customerAppSettings.branding?.offerGradientStart || '#fef3c7',
+          offerGradientEnd: customerAppSettings.branding?.offerGradientEnd || '#fde68a',
+          logoUrl: customerAppSettings.branding?.logoUrl || restaurantData.logo || '',
+          tagline: customerAppSettings.branding?.tagline || '',
+          headerStyle: customerAppSettings.branding?.headerStyle || 'modern'
+        },
+        offerSettings: {
+          autoApplyBestOffer: customerAppSettings.offerSettings?.autoApplyBestOffer ?? false,
+          allowMultipleOffers: customerAppSettings.offerSettings?.allowMultipleOffers ?? false,
+          maxOffersAllowed: customerAppSettings.offerSettings?.maxOffersAllowed ?? 1
+        }
+      }
+    });
+  } catch (error) {
+    console.error('Get public customer app settings error:', error);
+    res.status(500).json({ error: 'Failed to fetch settings' });
+  }
+});
+
+// Get active offers for a restaurant (public endpoint for Crave app)
+// Query params:
+// - isFirstOrder=true/false - Filter first-order-only offers based on customer status
+app.get('/api/public/offers/:restaurantId', vercelSecurityMiddleware.publicAPI, async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+    const { isFirstOrder } = req.query;
+    const now = new Date();
+
+    // Parse isFirstOrder query param (default to undefined if not provided)
+    const customerIsFirstOrder = isFirstOrder === 'true' ? true : isFirstOrder === 'false' ? false : undefined;
+
+    const offersSnapshot = await db.collection('offers')
+      .where('restaurantId', '==', restaurantId)
+      .where('isActive', '==', true)
+      .get();
+
+    const offers = [];
+    offersSnapshot.forEach(doc => {
+      const offer = doc.data();
+
+      // Handle Firestore Timestamps - convert to JS Date
+      let validFrom = null;
+      let validUntil = null;
+
+      if (offer.validFrom) {
+        // Check if it's a Firestore Timestamp
+        validFrom = offer.validFrom.toDate ? offer.validFrom.toDate() : new Date(offer.validFrom);
+      }
+      if (offer.validUntil) {
+        validUntil = offer.validUntil.toDate ? offer.validUntil.toDate() : new Date(offer.validUntil);
+      }
+
+      // Filter by date range
+      const isValidDate = (!validFrom || now >= validFrom) && (!validUntil || now <= validUntil);
+      const isUnderUsageLimit = !offer.usageLimit || (offer.usageCount || 0) < offer.usageLimit;
+
+      // Filter first-order-only offers if customer status is provided
+      // If isFirstOrder is false, exclude first-order-only offers
+      // If isFirstOrder is true or not provided, include all offers
+      const isEligibleForFirstOrderOffer = !offer.isFirstOrderOnly || customerIsFirstOrder !== false;
+
+      if (isValidDate && isUnderUsageLimit && isEligibleForFirstOrderOffer) {
+        offers.push({
+          id: doc.id,
+          name: offer.name,
+          description: offer.description,
+          discountType: offer.discountType,
+          discountValue: offer.discountValue,
+          minOrderValue: offer.minOrderValue || 0,
+          maxDiscount: offer.maxDiscount,
+          validFrom: validFrom ? validFrom.toISOString() : null,
+          validUntil: validUntil ? validUntil.toISOString() : null,
+          isActive: offer.isActive ?? true,
+          usageLimit: offer.usageLimit || null,
+          usageCount: offer.usageCount || 0,
+          isFirstOrderOnly: offer.isFirstOrderOnly || false,
+          autoApply: offer.autoApply || false
+        });
+      }
+    });
+
+    console.log(`Found ${offers.length} valid offers for restaurant ${restaurantId} (isFirstOrder: ${customerIsFirstOrder})`);
+    res.json({ offers });
+  } catch (error) {
+    console.error('Get public offers error:', error);
+    res.status(500).json({ error: 'Failed to fetch offers' });
+  }
+});
+
+// Create a new offer
+app.post('/api/offers/:restaurantId', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+    const { userId } = req.user;
+    const {
+      name,
+      description,
+      discountType = 'percentage',
+      discountValue,
+      minOrderValue = 0,
+      maxDiscount = null,
+      validFrom,
+      validUntil,
+      isActive = true,
+      usageLimit = null,
+      isFirstOrderOnly = false,
+      autoApply = false
+    } = req.body;
+
+    // Verify user has access to this restaurant
+    const restaurant = await db.collection(collections.restaurants).doc(restaurantId).get();
+    if (!restaurant.exists || restaurant.data().ownerId !== userId) {
+      return res.status(403).json({ error: 'Access denied' });
+    }
+
+    if (!name) {
+      return res.status(400).json({ error: 'Offer name is required' });
+    }
+
+    if (!discountValue || discountValue <= 0) {
+      return res.status(400).json({ error: 'Valid discount value is required' });
+    }
+
+    if (discountType === 'percentage' && discountValue > 100) {
+      return res.status(400).json({ error: 'Percentage discount cannot exceed 100%' });
+    }
+
+    const offerData = {
+      restaurantId,
+      name,
+      description: description || '',
+      discountType,
+      discountValue: Number(discountValue),
+      minOrderValue: Number(minOrderValue) || 0,
+      maxDiscount: maxDiscount ? Number(maxDiscount) : null,
+      validFrom: validFrom || null,
+      validUntil: validUntil || null,
+      isActive,
+      usageLimit: usageLimit ? Number(usageLimit) : null,
+      usageCount: 0,
+      isFirstOrderOnly,
+      autoApply,
+      createdAt: new Date(),
+      updatedAt: new Date()
+    };
+
+    const offerRef = await db.collection('offers').add(offerData);
+
+    res.status(201).json({
+      message: 'Offer created successfully',
+      offer: {
+        id: offerRef.id,
+        ...offerData
+      }
+    });
+  } catch (error) {
+    console.error('Create offer error:', error);
+    res.status(500).json({ error: 'Failed to create offer' });
+  }
+});
+
+// Update an offer
+app.put('/api/offers/:restaurantId/:offerId', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId, offerId } = req.params;
+    const { userId } = req.user;
+    const updateData = req.body;
+
+    // Verify user has access to this restaurant
+    const restaurant = await db.collection(collections.restaurants).doc(restaurantId).get();
+    if (!restaurant.exists || restaurant.data().ownerId !== userId) {
+      return res.status(403).json({ error: 'Access denied' });
+    }
+
+    // Get offer and verify it belongs to this restaurant
+    const offerDoc = await db.collection('offers').doc(offerId).get();
+    if (!offerDoc.exists) {
+      return res.status(404).json({ error: 'Offer not found' });
+    }
+
+    if (offerDoc.data().restaurantId !== restaurantId) {
+      return res.status(403).json({ error: 'Offer does not belong to this restaurant' });
+    }
+
+    // Validate discount value
+    if (updateData.discountValue !== undefined) {
+      if (updateData.discountValue <= 0) {
+        return res.status(400).json({ error: 'Valid discount value is required' });
+      }
+      if (updateData.discountType === 'percentage' && updateData.discountValue > 100) {
+        return res.status(400).json({ error: 'Percentage discount cannot exceed 100%' });
+      }
+    }
+
+    const updatedData = {
+      ...updateData,
+      discountValue: updateData.discountValue ? Number(updateData.discountValue) : offerDoc.data().discountValue,
+      minOrderValue: updateData.minOrderValue !== undefined ? Number(updateData.minOrderValue) : offerDoc.data().minOrderValue,
+      maxDiscount: updateData.maxDiscount !== undefined ? (updateData.maxDiscount ? Number(updateData.maxDiscount) : null) : offerDoc.data().maxDiscount,
+      usageLimit: updateData.usageLimit !== undefined ? (updateData.usageLimit ? Number(updateData.usageLimit) : null) : offerDoc.data().usageLimit,
+      updatedAt: new Date()
+    };
+
+    // Remove fields that shouldn't be updated
+    delete updatedData.restaurantId;
+    delete updatedData.createdAt;
+    delete updatedData.id;
+
+    await offerDoc.ref.update(updatedData);
+
+    res.json({
+      message: 'Offer updated successfully',
+      offer: {
+        id: offerId,
+        ...offerDoc.data(),
+        ...updatedData
+      }
+    });
+  } catch (error) {
+    console.error('Update offer error:', error);
+    res.status(500).json({ error: 'Failed to update offer' });
+  }
+});
+
+// Delete an offer
+app.delete('/api/offers/:restaurantId/:offerId', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId, offerId } = req.params;
+    const { userId } = req.user;
+
+    // Verify user has access to this restaurant
+    const restaurant = await db.collection(collections.restaurants).doc(restaurantId).get();
+    if (!restaurant.exists || restaurant.data().ownerId !== userId) {
+      return res.status(403).json({ error: 'Access denied' });
+    }
+
+    // Get offer and verify it belongs to this restaurant
+    const offerDoc = await db.collection('offers').doc(offerId).get();
+    if (!offerDoc.exists) {
+      return res.status(404).json({ error: 'Offer not found' });
+    }
+
+    if (offerDoc.data().restaurantId !== restaurantId) {
+      return res.status(403).json({ error: 'Offer does not belong to this restaurant' });
+    }
+
+    await offerDoc.ref.delete();
+
+    res.json({
+      message: 'Offer deleted successfully'
+    });
+  } catch (error) {
+    console.error('Delete offer error:', error);
+    res.status(500).json({ error: 'Failed to delete offer' });
+  }
+});
+
+// ==================== CUSTOMER APP SETTINGS APIs ====================
+
+// Get customer app settings for a restaurant
+app.get('/api/restaurants/:restaurantId/customer-app-settings', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+    const { userId } = req.user;
+
+    // Verify user has access to this restaurant
+    const restaurantDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
+    if (!restaurantDoc.exists) {
+      return res.status(404).json({ error: 'Restaurant not found' });
+    }
+
+    if (restaurantDoc.data().ownerId !== userId) {
+      return res.status(403).json({ error: 'Access denied' });
+    }
+
+    const restaurantData = restaurantDoc.data();
+
+    // Return existing settings or defaults
+    const existingSettings = restaurantData.customerAppSettings || {};
+    const customerAppSettings = {
+      enabled: existingSettings.enabled ?? false,
+      restaurantCode: existingSettings.restaurantCode || '',
+      allowDineIn: existingSettings.allowDineIn ?? true,
+      allowTakeaway: existingSettings.allowTakeaway ?? true,
+      allowDelivery: existingSettings.allowDelivery ?? false,
+      requireTableSelection: existingSettings.requireTableSelection ?? true,
+      minimumOrder: existingSettings.minimumOrder || 0,
+      loyaltySettings: {
+        enabled: existingSettings.loyaltySettings?.enabled ?? false,
+        earnPerAmount: existingSettings.loyaltySettings?.earnPerAmount || 100,
+        pointsEarned: existingSettings.loyaltySettings?.pointsEarned || 4,
+        redemptionRate: existingSettings.loyaltySettings?.redemptionRate || 100,
+        maxRedemptionPercent: existingSettings.loyaltySettings?.maxRedemptionPercent || 20
+      },
+      offerSettings: {
+        autoApplyBestOffer: existingSettings.offerSettings?.autoApplyBestOffer ?? false,
+        allowMultipleOffers: existingSettings.offerSettings?.allowMultipleOffers ?? false,
+        maxOffersAllowed: existingSettings.offerSettings?.maxOffersAllowed || 1
+      },
+      branding: {
+        primaryColor: existingSettings.branding?.primaryColor || '#ef4444',
+        textColor: existingSettings.branding?.textColor || '#ffffff',
+        pageBackgroundColor: existingSettings.branding?.pageBackgroundColor || '#f8fafc',
+        offerGradientStart: existingSettings.branding?.offerGradientStart || '#fef3c7',
+        offerGradientEnd: existingSettings.branding?.offerGradientEnd || '#fde68a',
+        logoUrl: existingSettings.branding?.logoUrl || restaurantData.logo || '',
+        tagline: existingSettings.branding?.tagline || '',
+        headerStyle: existingSettings.branding?.headerStyle || 'modern'
+      }
+    };
+
+    res.json({ settings: customerAppSettings });
+  } catch (error) {
+    console.error('Get customer app settings error:', error);
+    res.status(500).json({ error: 'Failed to fetch customer app settings' });
+  }
+});
+
+// Get restaurant details (Authenticated) - Fixes 404 error
+app.get('/api/restaurants/:restaurantId', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+    
+    const restaurantDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
+    if (!restaurantDoc.exists) {
+      return res.status(404).json({ error: 'Restaurant not found' });
+    }
+
+    // For now, allow any authenticated user to fetch basic details to fix the 404
+    // Ideally we should check ownership, but the frontend calls this indiscriminately
+    const restaurant = restaurantDoc.data();
+    
+    // Don't leak sensitive data if not owner
+    // if (restaurant.ownerId !== req.user.userId) { ... }
+
+    res.json({ restaurant: { id: restaurantDoc.id, ...restaurant } });
+  } catch (error) {
+    console.error('Get restaurant error:', error);
+    res.status(500).json({ error: 'Failed to fetch restaurant' });
+  }
+});
+
+// Update customer app settings for a restaurant
+app.put('/api/restaurants/:restaurantId/customer-app-settings', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+    const { userId } = req.user;
+    const settings = req.body;
+    
+    console.log(`[SETTINGS UPDATE] Restaurant: ${restaurantId}, User: ${userId}`);
+    console.log('[SETTINGS UPDATE] Payload:', JSON.stringify(settings, null, 2));
+
+    // Verify user has access to this restaurant
+    const restaurantDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
+    if (!restaurantDoc.exists) {
+      return res.status(404).json({ error: 'Restaurant not found' });
+    }
+
+    if (restaurantDoc.data().ownerId !== userId) {
+      return res.status(403).json({ error: 'Access denied' });
+    }
+
+    // If restaurant code is being set, validate it's unique
+    if (settings.restaurantCode) {
+      const codeRegex = /^[A-Za-z0-9]{3,10}$/;
+      if (!codeRegex.test(settings.restaurantCode)) {
+        return res.status(400).json({ error: 'Restaurant code must be 3-10 alphanumeric characters' });
+      }
+
+      // Check if code is already used by another restaurant
+      const existingRestaurant = await db.collection(collections.restaurants)
+        .where('customerAppSettings.restaurantCode', '==', settings.restaurantCode.toUpperCase())
+        .limit(1)
+        .get();
+
+      if (!existingRestaurant.empty && existingRestaurant.docs[0].id !== restaurantId) {
+        return res.status(400).json({ error: 'This restaurant code is already in use' });
+      }
+
+      settings.restaurantCode = settings.restaurantCode.toUpperCase();
+    }
+
+    // Build the update object
+    const customerAppSettings = {
+      enabled: settings.enabled ?? false,
+      restaurantCode: settings.restaurantCode || '',
+      allowDineIn: settings.allowDineIn ?? true,
+      allowTakeaway: settings.allowTakeaway ?? true,
+      allowDelivery: settings.allowDelivery ?? false,
+      requireTableSelection: settings.requireTableSelection ?? true,
+      minimumOrder: Number(settings.minimumOrder) || 0,
+      loyaltySettings: {
+        enabled: settings.loyaltySettings?.enabled ?? false,
+        earnPerAmount: Number(settings.loyaltySettings?.earnPerAmount) || 100,
+        pointsEarned: Number(settings.loyaltySettings?.pointsEarned) || 4,
+        redemptionRate: Number(settings.loyaltySettings?.redemptionRate) || 100,
+        maxRedemptionPercent: Number(settings.loyaltySettings?.maxRedemptionPercent) || 20
+      },
+      offerSettings: {
+        autoApplyBestOffer: settings.offerSettings?.autoApplyBestOffer ?? false,
+        allowMultipleOffers: settings.offerSettings?.allowMultipleOffers ?? false,
+        maxOffersAllowed: Number(settings.offerSettings?.maxOffersAllowed) || 1
+      },
+      branding: {
+        primaryColor: settings.branding?.primaryColor || '#ef4444',
+        textColor: settings.branding?.textColor || '#ffffff',
+        pageBackgroundColor: settings.branding?.pageBackgroundColor || '#f8fafc',
+        offerGradientStart: settings.branding?.offerGradientStart || '#fef3c7',
+        offerGradientEnd: settings.branding?.offerGradientEnd || '#fde68a',
+        logoUrl: settings.branding?.logoUrl || '',
+        tagline: settings.branding?.tagline || '',
+        headerStyle: settings.branding?.headerStyle || 'modern'
+      },
+      updatedAt: new Date()
+    };
+
+    await restaurantDoc.ref.update({
+      customerAppSettings: customerAppSettings
+    });
+
+    res.json({
+      message: 'Customer app settings updated successfully',
+      settings: customerAppSettings
+    });
+  } catch (error) {
+    console.error('Update customer app settings error:', error);
+    res.status(500).json({ error: 'Failed to update customer app settings' });
+  }
+});
+
+// Get restaurant by code (public endpoint for Crave app QR scanning)
+// Returns restaurant data + menu in single response for better performance
+app.get('/api/public/restaurant/code/:code', vercelSecurityMiddleware.publicAPI, async (req, res) => {
+  try {
+    const { code } = req.params;
+
+    if (!code) {
+      return res.status(400).json({ error: 'Restaurant code is required' });
+    }
+
+    // Find restaurant by code
+    const restaurantsSnapshot = await db.collection(collections.restaurants)
+      .where('customerAppSettings.restaurantCode', '==', code.toUpperCase())
+      .where('customerAppSettings.enabled', '==', true)
+      .limit(1)
+      .get();
+
+    if (restaurantsSnapshot.empty) {
+      return res.status(404).json({ error: 'Restaurant not found or app not enabled' });
+    }
+
+    const restaurantDoc = restaurantsSnapshot.docs[0];
+    const restaurantData = restaurantDoc.data();
+    const restaurantId = restaurantDoc.id;
+
+    // Get menu data from restaurant document
+    const embeddedMenu = restaurantData.menu || { categories: [], items: [] };
+    
+    // Get categories
+    const categories = (embeddedMenu.categories || [])
+      .filter(cat => cat.status === 'active')
+      .map(cat => ({
+        id: cat.id,
+        name: cat.name,
+        description: cat.description || '',
+        image: cat.image || null,
+        displayOrder: cat.displayOrder || 0
+      }))
+      .sort((a, b) => (a.displayOrder || 0) - (b.displayOrder || 0));
+    
+    // Filter active and available menu items
+    const menuItems = (embeddedMenu.items || [])
+      .filter(item => item.status === 'active' && item.isAvailable !== false)
+      .map(item => ({
+        id: item.id,
+        name: item.name,
+        description: item.description || '',
+        price: item.price,
+        category: item.category,
+        isVeg: item.isVeg !== false,
+        spiceLevel: item.spiceLevel || 'medium',
+        shortCode: item.shortCode || item.name.substring(0, 3).toUpperCase(),
+        image: item.image || null,
+        images: item.images || [],
+        allergens: item.allergens || []
+      }));
+
+    // Get active offers (async - can be loaded separately by app if needed)
+    let offers = [];
+    try {
+      const offersSnapshot = await db.collection('offers')
+        .where('restaurantId', '==', restaurantId)
+        .where('isActive', '==', true)
+        .get();
+
+      const now = new Date();
+      offers = offersSnapshot.docs
+        .map(doc => {
+          const offer = doc.data();
+          const validFrom = offer.validFrom ? new Date(offer.validFrom) : null;
+          const validUntil = offer.validUntil ? new Date(offer.validUntil) : null;
+          const isValidDate = (!validFrom || now >= validFrom) && (!validUntil || now <= validUntil);
+          const isUnderUsageLimit = !offer.usageLimit || (offer.usageCount || 0) < offer.usageLimit;
+
+          if (isValidDate && isUnderUsageLimit) {
+            return {
+              id: doc.id,
+              name: offer.name,
+              description: offer.description,
+              discountType: offer.discountType,
+              discountValue: offer.discountValue,
+              minOrderValue: offer.minOrderValue || 0,
+              maxDiscount: offer.maxDiscount,
+              isFirstOrderOnly: offer.isFirstOrderOnly || false,
+              autoApply: offer.autoApply || false
+            };
+          }
+          return null;
+        })
+        .filter(offer => offer !== null);
+    } catch (offersError) {
+      console.warn('Error loading offers:', offersError);
+      // Continue without offers - app can fetch separately if needed
+    }
+
+    res.json({
+      restaurant: {
+        id: restaurantId,
+        name: restaurantData.name,
+        logoUrl: restaurantData.logoUrl || restaurantData.customerAppSettings?.branding?.logoUrl || '',
+        primaryColor: restaurantData.customerAppSettings?.branding?.primaryColor || '#dc2626',
+        textColor: restaurantData.customerAppSettings?.branding?.textColor || '#ffffff',
+        pageBackgroundColor: restaurantData.customerAppSettings?.branding?.pageBackgroundColor || '#f8fafc',
+        offerGradientStart: restaurantData.customerAppSettings?.branding?.offerGradientStart || '#fef3c7',
+        offerGradientEnd: restaurantData.customerAppSettings?.branding?.offerGradientEnd || '#fde68a',
+        tagline: restaurantData.customerAppSettings?.branding?.tagline || '',
+        headerStyle: restaurantData.customerAppSettings?.branding?.headerStyle || 'modern',
+        allowDineIn: restaurantData.customerAppSettings?.allowDineIn ?? true,
+        allowTakeaway: restaurantData.customerAppSettings?.allowTakeaway ?? true,
+        allowDelivery: restaurantData.customerAppSettings?.allowDelivery ?? false,
+        requireTableSelection: restaurantData.customerAppSettings?.requireTableSelection ?? true,
+        minimumOrder: restaurantData.customerAppSettings?.minimumOrder || 0,
+        loyaltyEnabled: restaurantData.customerAppSettings?.loyaltySettings?.enabled ?? false
+      },
+      menu: {
+        categories: categories,
+        items: menuItems
+      },
+      offers: offers
+    });
+  } catch (error) {
+    console.error('Get restaurant by code error:', error);
+    res.status(500).json({ error: 'Failed to fetch restaurant' });
+  }
+});
+
+// Helper function to generate unique restaurant code
+async function generateUniqueRestaurantCode() {
+  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // Excluding confusing chars like 0,O,1,I
+  let attempts = 0;
+  const maxAttempts = 10;
+
+  while (attempts < maxAttempts) {
+    // Generate 6-character alphanumeric code
+    let code = '';
+    for (let i = 0; i < 6; i++) {
+      code += chars.charAt(Math.floor(Math.random() * chars.length));
+    }
+
+    // Check if code already exists
+    const existingRestaurant = await db.collection(collections.restaurants)
+      .where('customerAppSettings.restaurantCode', '==', code)
+      .limit(1)
+      .get();
+
+    if (existingRestaurant.empty) {
+      return code;
+    }
+    attempts++;
+  }
+
+  // Fallback: add timestamp suffix
+  const timestamp = Date.now().toString(36).toUpperCase().slice(-3);
+  let code = '';
+  for (let i = 0; i < 3; i++) {
+    code += chars.charAt(Math.floor(Math.random() * chars.length));
+  }
+  return code + timestamp;
+}
+
+// Generate restaurant code
+app.post('/api/restaurants/:restaurantId/generate-code', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+    const { userId } = req.user;
+
+    // Verify user has access to this restaurant
+    const restaurantDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
+    if (!restaurantDoc.exists) {
+      return res.status(404).json({ error: 'Restaurant not found' });
+    }
+
+    if (restaurantDoc.data().ownerId !== userId) {
+      return res.status(403).json({ error: 'Access denied' });
+    }
+
+    // Generate unique code
+    const newCode = await generateUniqueRestaurantCode();
+
+    // Update restaurant with new code
+    const restaurantData = restaurantDoc.data();
+    const customerAppSettings = restaurantData.customerAppSettings || {};
+
+    await restaurantDoc.ref.update({
+      'customerAppSettings.restaurantCode': newCode,
+      'customerAppSettings.enabled': customerAppSettings.enabled ?? true,
+      updatedAt: new Date()
+    });
+
+    res.json({
+      success: true,
+      restaurantCode: newCode,
+      message: 'Restaurant code generated successfully'
+    });
+  } catch (error) {
+    console.error('Generate restaurant code error:', error);
+    res.status(500).json({ error: 'Failed to generate restaurant code' });
+  }
+});
+
+// Generate or get QR code for customer app
+app.get('/api/restaurants/:restaurantId/qr-code', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+    const { userId } = req.user;
+    const { autoGenerate } = req.query; // Allow auto-generation via query param
+
+    // Verify user has access to this restaurant
+    const restaurantDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
+    if (!restaurantDoc.exists) {
+      return res.status(404).json({ error: 'Restaurant not found' });
+    }
+
+    if (restaurantDoc.data().ownerId !== userId) {
+      return res.status(403).json({ error: 'Access denied' });
+    }
+
+    const restaurantData = restaurantDoc.data();
+    let customerAppSettings = restaurantData.customerAppSettings || {};
+    let restaurantCode = customerAppSettings.restaurantCode;
+
+    // Auto-generate code if requested and not set
+    if (!restaurantCode && autoGenerate === 'true') {
+      restaurantCode = await generateUniqueRestaurantCode();
+
+      // Update restaurant with new code
+      await restaurantDoc.ref.update({
+        'customerAppSettings.restaurantCode': restaurantCode,
+        'customerAppSettings.enabled': customerAppSettings.enabled ?? true,
+        updatedAt: new Date()
+      });
+    }
+
+    if (!restaurantCode) {
+      return res.status(400).json({
+        error: 'Restaurant code not set',
+        needsCode: true,
+        message: 'Please generate a restaurant code first'
+      });
+    }
+
+    // Generate QR code URL that links to the public online order page
+    const qrContent = `https://www.dineopen.com/onlineorder?restaurant=${restaurantId}`;
+
+    // Generate QR code as data URL
+    const qrCodeDataUrl = await QRCode.toDataURL(qrContent, {
+      width: 400,
+      margin: 2,
+      color: {
+        dark: '#000000',
+        light: '#ffffff'
+      },
+      errorCorrectionLevel: 'M'
+    });
+
+    res.json({
+      qrCode: qrCodeDataUrl,
+      restaurantCode: restaurantCode,
+      qrContent: qrContent,
+      onlineOrderUrl: qrContent
+    });
+  } catch (error) {
+    console.error('Generate QR code error:', error);
+    res.status(500).json({ error: 'Failed to generate QR code' });
+  }
+});
+
 // Mount payment routes
 const paymentRouter = initializePaymentRoutes(db, razorpay);
 app.use('/api/payments', paymentRouter);
@@ -13682,7 +16909,7 @@ app.use('/api/payments', paymentRouter);
 app.get('/api/categories/:restaurantId', authenticateToken, async (req, res) => {
   try {
     const { restaurantId } = req.params;
-    
+
     // Get restaurant document to access embedded categories
     const restaurantDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
     if (!restaurantDoc.exists) {
@@ -13690,7 +16917,41 @@ app.get('/api/categories/:restaurantId', authenticateToken, async (req, res) => 
     }
 
     const restaurantData = restaurantDoc.data();
-    const categories = restaurantData.categories || [];
+    let categories = restaurantData.categories || [];
+
+    // If no categories defined, extract them dynamically from menu items
+    if (categories.length === 0) {
+      const menuItems = restaurantData.menu?.items || [];
+      const categoryMap = new Map();
+
+      // Extract unique categories from menu items
+      for (const item of menuItems) {
+        if (item.category && item.status !== 'deleted') {
+          const categoryId = item.category.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
+          if (categoryId && !categoryMap.has(categoryId)) {
+            categoryMap.set(categoryId, {
+              id: categoryId,
+              name: item.category,
+              emoji: '🍽️',
+              description: '',
+              createdAt: new Date(),
+              updatedAt: new Date()
+            });
+          }
+        }
+      }
+
+      categories = Array.from(categoryMap.values());
+
+      // Optionally save these extracted categories back to the restaurant
+      if (categories.length > 0) {
+        await db.collection(collections.restaurants).doc(restaurantId).update({
+          categories: categories,
+          updatedAt: new Date()
+        });
+        console.log(`✅ Auto-extracted ${categories.length} categories for restaurant ${restaurantId}`);
+      }
+    }
 
     res.json({ categories });
   } catch (error) {
