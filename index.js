@@ -182,6 +182,7 @@ const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
 });
 const initializePaymentRoutes = require('./payment');
+const initializeDodoPaymentRoutes = require('./dodoPayment');
 const emailService = require('./emailService');
 
 // Chatbot RAG routes
@@ -466,7 +467,15 @@ app.use(helmet({ crossOriginResourcePolicy: { policy: "cross-origin" } }));
 
 
 app.use(morgan(process.env.NODE_ENV === 'production' ? 'combined' : 'dev'));
-app.use(bodyParser.json({ limit: '10mb' }));
+app.use(bodyParser.json({
+  limit: '10mb',
+  verify: (req, res, buf) => {
+    // Store raw body for webhook signature verification (Dodo, Razorpay)
+    if (req.url && (req.url.includes('/webhook') || req.url.includes('/webhooks'))) {
+      req.rawBody = buf.toString();
+    }
+  }
+}));
 app.use(bodyParser.urlencoded({ extended: true, limit: '10mb' }));
 
 // Performance optimization middleware (must be early in the chain)
@@ -7537,6 +7546,10 @@ async function calculateOrderTotal(items) {
 // Initialize payment routes
 const paymentRoutes = initializePaymentRoutes(db, razorpay);
 app.use('/api/payments', paymentRoutes);
+
+// Initialize Dodo Payments routes (international payments)
+const dodoPaymentRoutes = initializeDodoPaymentRoutes(db);
+app.use('/api/dodo-payments', dodoPaymentRoutes);
 
 // Initialize chatbot RAG routes
 app.use('/api', chatbotRoutes);
@@ -16949,6 +16962,10 @@ app.get('/api/restaurants/:restaurantId/qr-code', authenticateToken, async (req,
 // Mount payment routes
 const paymentRouter = initializePaymentRoutes(db, razorpay);
 app.use('/api/payments', paymentRouter);
+
+// Mount Dodo payment routes (international payments)
+const dodoPaymentRouter = initializeDodoPaymentRoutes(db);
+app.use('/api/dodo-payments', dodoPaymentRouter);
 
 // ==================== CATEGORY MANAGEMENT APIs ====================
 
