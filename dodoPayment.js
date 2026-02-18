@@ -37,6 +37,14 @@ const initializeDodoPaymentRoutes = (db) => {
     }
   };
 
+  // Email validation helper
+  const isValidEmail = (email) => {
+    if (!email || typeof email !== 'string') return false;
+    // Basic email regex - must have @ and domain
+    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    return emailRegex.test(email.trim());
+  };
+
   // 1. Create Checkout Session
   router.post('/create-checkout', async (req, res) => {
     try {
@@ -46,6 +54,15 @@ const initializeDodoPaymentRoutes = (db) => {
         return res.status(400).json({
           success: false,
           error: 'Missing required fields: productId, userId, and email are required'
+        });
+      }
+
+      // Validate email format before sending to Dodo
+      if (!isValidEmail(email)) {
+        return res.status(400).json({
+          success: false,
+          error: 'Invalid email address',
+          details: 'A valid email address is required for international payments. Phone numbers cannot be used as email.'
         });
       }
 
