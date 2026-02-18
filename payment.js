@@ -529,25 +529,62 @@ const initializePaymentRoutes = (db, razorpay) => {
       }
 
       const userData = userDoc.data();
-      const subscription = userData.subscription || {
-        planId: 'free',
-        planName: 'Free Plan',
+      const currentDate = new Date();
+
+      // Default subscription for new users (Free Trial)
+      const defaultSubscription = {
+        planId: 'free-trial',
+        planName: 'Free Trial',
         status: 'active',
-        startDate: new Date().toISOString(),
-        endDate: null,
-        features: getFeaturesByPlan('free'),
+        startDate: currentDate.toISOString(),
+        trialStartDate: currentDate.toISOString(),
+        trialEndDate: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString(),
+        endDate: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString(),
+        trialDays: 30,
+        amount: 0,
+        currency: 'USD',
+        features: getFeaturesByPlan('free-trial'),
         app: 'Dine'
       };
 
+      const subscription = userData.subscription || defaultSubscription;
+
+      // Calculate trial days remaining
+      let trialDaysRemaining = null;
+      let trialIsExpired = false;
+      const isTrial = subscription.planId === 'free-trial' || subscription.planId === 'starter' || subscription.planName === 'Free Trial' || subscription.amount === 0;
+
+      if (isTrial) {
+        const trialStart = subscription.trialStartDate || subscription.startDate;
+        if (trialStart) {
+          const startDate = new Date(trialStart);
+          const now = new Date();
+          const diffTime = now - startDate;
+          const diffDays = Math.floor(diffTime / (1000 * 60 * 60 * 24));
+          trialDaysRemaining = Math.max(0, 30 - diffDays);
+          trialIsExpired = trialDaysRemaining === 0;
+
+          // Update status if trial expired
+          if (trialIsExpired && subscription.status === 'active') {
+            subscription.status = 'expired';
+            // Optionally update in database
+            await db.collection('dine_user_data').doc(userId).update({
+              'subscription.status': 'expired',
+              'subscription.lastUpdated': new Date().toISOString()
+            });
+          }
+        }
+      }
+
       // Calculate days remaining for paid plans
       let daysRemaining = null;
-      if (subscription.endDate && subscription.planId !== 'free') {
+      if (subscription.endDate && !isTrial) {
         const endDate = new Date(subscription.endDate);
         const now = new Date();
         const diffTime = endDate - now;
         const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
         daysRemaining = Math.max(0, diffDays);
-        
+
         // Update status based on expiration
         if (diffDays <= 0 && subscription.status === 'active') {
           subscription.status = 'expired';
@@ -558,9 +595,14 @@ const initializePaymentRoutes = (db, razorpay) => {
         success: true,
         subscription: {
           ...subscription,
-          daysRemaining,
+          // Override plan name for trial users
+          planName: isTrial ? 'Free Trial' : subscription.planName,
+          daysRemaining: isTrial ? trialDaysRemaining : daysRemaining,
+          trialDaysRemaining,
+          trialIsExpired,
           isActive: subscription.status === 'active',
-          isPaid: subscription.planId !== 'free'
+          isTrial,
+          isPaid: !isTrial && subscription.planId !== 'free'
         }
       });
 
@@ -613,6 +655,10 @@ const initializePaymentRoutes = (db, razorpay) => {
       const currentDate = new Date();
       const planDetails = getPlanDetails(planId);
 
+      // For free-trial, set trial end date to 30 days from now
+      const isTrial = planId === 'free-trial' || planId === 'starter';
+      const trialEndDate = isTrial ? new Date(Date.now() + 30 * 24 * 60 * 60 * 1000) : null;
+
       const newUserData = {
         uid: userId,
         email: email || '',
@@ -624,10 +670,15 @@ const initializePaymentRoutes = (db, razorpay) => {
         app: 'Dine',
         subscription: {
           planId,
-          planName: planDetails.name,
+          planName: isTrial ? 'Free Trial' : planDetails.name,
           status: 'active',
           startDate: currentDate.toISOString(),
-          endDate: (planId === 'starter' || planId === 'free-trial') ? null : new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString(),
+          trialStartDate: isTrial ? currentDate.toISOString() : null,
+          trialEndDate: trialEndDate ? trialEndDate.toISOString() : null,
+          endDate: isTrial ? trialEndDate.toISOString() : new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString(),
+          trialDays: isTrial ? 30 : 0,
+          amount: 0,
+          currency: 'USD',
           features: planDetails.features,
           lastUpdated: currentDate.toISOString(),
           app: 'Dine'
