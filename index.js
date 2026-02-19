@@ -7500,6 +7500,7 @@ app.delete('/api/orders/:orderId', authenticateToken, async (req, res) => {
   try {
     const { orderId } = req.params;
     const { userId, role } = req.user;
+    const { reason } = req.body || {};
 
     // Get the order to check if it exists and get restaurant info
     const orderRef = db.collection(collections.orders).doc(orderId);
@@ -7546,12 +7547,17 @@ app.delete('/api/orders/:orderId', authenticateToken, async (req, res) => {
     
     // Soft delete: set status to 'deleted' and preserve the state it was in (lastStatus) so we can show "Deleted (was: Completed)" etc.
     const lastStatus = order.status || 'pending';
-    await orderRef.update({
+    const updateData = {
       status: 'deleted',
       lastStatus,
       deletedAt: FieldValue.serverTimestamp(),
+      deletedBy: userId || null,
       updatedAt: FieldValue.serverTimestamp()
-    });
+    };
+    if (reason && reason.trim()) {
+      updateData.deleteReason = reason.trim();
+    }
+    await orderRef.update(updateData);
 
     // Trigger Pusher notification for real-time updates
     pusherService.notifyOrderDeleted(order.restaurantId, orderId)
