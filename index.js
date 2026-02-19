@@ -4734,24 +4734,31 @@ app.patch('/api/menus/item/:id', authenticateToken, async (req, res) => {
   try {
     const { id } = req.params;
     const { userId } = req.user;
-    
+
     // Find the restaurant that contains this menu item
-    const restaurantsSnapshot = await db.collection(collections.restaurants).get();
     let foundRestaurant = null;
     let foundItem = null;
-    
-    for (const restaurantDoc of restaurantsSnapshot.docs) {
-      const restaurantData = restaurantDoc.data();
-      const menuData = restaurantData.menu || { items: [] };
-      
-      const item = menuData.items.find(item => item.id === id);
-      if (item) {
-        foundRestaurant = restaurantDoc;
-        foundItem = item;
-        break;
+    const hintRestaurantId = req.query.restaurantId || req.body?.restaurantId;
+
+    // Fast path: single doc lookup when restaurantId provided
+    if (hintRestaurantId) {
+      const rDoc = await db.collection(collections.restaurants).doc(hintRestaurantId).get();
+      if (rDoc.exists) {
+        const item = (rDoc.data().menu?.items || []).find(item => item.id === id);
+        if (item) { foundRestaurant = rDoc; foundItem = item; }
       }
     }
-    
+
+    // Fallback: full scan (backward compatible for old clients)
+    if (!foundRestaurant) {
+      const restaurantsSnapshot = await db.collection(collections.restaurants).get();
+      for (const restaurantDoc of restaurantsSnapshot.docs) {
+        const menuData = restaurantDoc.data().menu || { items: [] };
+        const item = menuData.items.find(item => item.id === id);
+        if (item) { foundRestaurant = restaurantDoc; foundItem = item; break; }
+      }
+    }
+
     if (!foundRestaurant || !foundItem) {
       return res.status(404).json({ error: 'Menu item not found' });
     }
@@ -4972,24 +4979,31 @@ app.delete('/api/menus/item/:id', authenticateToken, async (req, res) => {
   try {
     const { id } = req.params;
     const { userId } = req.user;
-    
+
     // Find the restaurant that contains this menu item
-    const restaurantsSnapshot = await db.collection(collections.restaurants).get();
     let foundRestaurant = null;
     let foundItem = null;
-    
-    for (const restaurantDoc of restaurantsSnapshot.docs) {
-      const restaurantData = restaurantDoc.data();
-      const menuData = restaurantData.menu || { items: [] };
-      
-      const item = menuData.items.find(item => item.id === id);
-      if (item) {
-        foundRestaurant = restaurantDoc;
-        foundItem = item;
-        break;
+    const hintRestaurantId = req.query.restaurantId;
+
+    // Fast path: single doc lookup when restaurantId provided
+    if (hintRestaurantId) {
+      const rDoc = await db.collection(collections.restaurants).doc(hintRestaurantId).get();
+      if (rDoc.exists) {
+        const item = (rDoc.data().menu?.items || []).find(item => item.id === id);
+        if (item) { foundRestaurant = rDoc; foundItem = item; }
       }
     }
-    
+
+    // Fallback: full scan (backward compatible for old clients)
+    if (!foundRestaurant) {
+      const restaurantsSnapshot = await db.collection(collections.restaurants).get();
+      for (const restaurantDoc of restaurantsSnapshot.docs) {
+        const menuData = restaurantDoc.data().menu || { items: [] };
+        const item = menuData.items.find(item => item.id === id);
+        if (item) { foundRestaurant = restaurantDoc; foundItem = item; break; }
+      }
+    }
+
     if (!foundRestaurant || !foundItem) {
       return res.status(404).json({ error: 'Menu item not found' });
     }
@@ -8128,25 +8142,35 @@ app.post('/api/menu-items/:itemId/images', authenticateToken, upload.array('imag
     const accessibleRestaurantIds = new Set();
     userRestaurantSnapshot.forEach(doc => accessibleRestaurantIds.add(doc.data().restaurantId));
 
-    // Search through restaurants for the menu item
-    const restaurantsSnapshot = await db.collection('restaurants').get();
+    // Search for the menu item
     let menuItem = null;
     let restaurantId = null;
     let restaurantDoc = null;
+    const hintRestaurantId = req.query.restaurantId || req.body?.restaurantId;
 
-    for (const restaurantDocSnapshot of restaurantsSnapshot.docs) {
-      const restaurantData = restaurantDocSnapshot.data();
-      const restId = restaurantDocSnapshot.id;
-      // Check if user is owner OR has staff access
-      const hasAccess = restaurantData.ownerId === userId || accessibleRestaurantIds.has(restId);
+    // Fast path: single doc lookup when restaurantId provided
+    if (hintRestaurantId) {
+      const rDoc = await db.collection('restaurants').doc(hintRestaurantId).get();
+      if (rDoc.exists) {
+        const rData = rDoc.data();
+        const hasAccess = rData.ownerId === userId || accessibleRestaurantIds.has(hintRestaurantId);
+        if (hasAccess && rData.menu?.items) {
+          const foundItem = rData.menu.items.find(item => item.id === itemId);
+          if (foundItem) { menuItem = foundItem; restaurantId = hintRestaurantId; restaurantDoc = rDoc; }
+        }
+      }
+    }
 
-      if (hasAccess && restaurantData.menu && restaurantData.menu.items) {
-        const foundItem = restaurantData.menu.items.find(item => item.id === itemId);
-        if (foundItem) {
-          menuItem = foundItem;
-          restaurantId = restId;
-          restaurantDoc = restaurantDocSnapshot;
-          break;
+    // Fallback: full scan (backward compatible for old clients)
+    if (!menuItem) {
+      const restaurantsSnapshot = await db.collection('restaurants').get();
+      for (const restaurantDocSnapshot of restaurantsSnapshot.docs) {
+        const restaurantData = restaurantDocSnapshot.data();
+        const restId = restaurantDocSnapshot.id;
+        const hasAccess = restaurantData.ownerId === userId || accessibleRestaurantIds.has(restId);
+        if (hasAccess && restaurantData.menu && restaurantData.menu.items) {
+          const foundItem = restaurantData.menu.items.find(item => item.id === itemId);
+          if (foundItem) { menuItem = foundItem; restaurantId = restId; restaurantDoc = restaurantDocSnapshot; break; }
         }
       }
     }
@@ -8242,25 +8266,35 @@ app.delete('/api/menu-items/:itemId/images/:imageIndex', authenticateToken, asyn
     const accessibleRestaurantIds = new Set();
     userRestaurantSnapshot.forEach(doc => accessibleRestaurantIds.add(doc.data().restaurantId));
 
-    // Find the menu item in the restaurant's menu structure
-    const restaurantsSnapshot = await db.collection('restaurants').get();
+    // Find the menu item
     let menuItem = null;
     let restaurantId = null;
     let restaurantDoc = null;
+    const hintRestaurantId = req.query.restaurantId;
 
-    for (const restaurantDocSnapshot of restaurantsSnapshot.docs) {
-      const restaurantData = restaurantDocSnapshot.data();
-      const restId = restaurantDocSnapshot.id;
-      // Check if user is owner OR has staff access
-      const hasAccess = restaurantData.ownerId === userId || accessibleRestaurantIds.has(restId);
+    // Fast path: single doc lookup when restaurantId provided
+    if (hintRestaurantId) {
+      const rDoc = await db.collection('restaurants').doc(hintRestaurantId).get();
+      if (rDoc.exists) {
+        const rData = rDoc.data();
+        const hasAccess = rData.ownerId === userId || accessibleRestaurantIds.has(hintRestaurantId);
+        if (hasAccess && rData.menu?.items) {
+          const foundItem = rData.menu.items.find(item => item.id === itemId);
+          if (foundItem) { menuItem = foundItem; restaurantId = hintRestaurantId; restaurantDoc = rDoc; }
+        }
+      }
+    }
 
-      if (hasAccess && restaurantData.menu && restaurantData.menu.items) {
-        const foundItem = restaurantData.menu.items.find(item => item.id === itemId);
-        if (foundItem) {
-          menuItem = foundItem;
-          restaurantId = restId;
-          restaurantDoc = restaurantDocSnapshot;
-          break;
+    // Fallback: full scan (backward compatible for old clients)
+    if (!menuItem) {
+      const restaurantsSnapshot = await db.collection('restaurants').get();
+      for (const restaurantDocSnapshot of restaurantsSnapshot.docs) {
+        const restaurantData = restaurantDocSnapshot.data();
+        const restId = restaurantDocSnapshot.id;
+        const hasAccess = restaurantData.ownerId === userId || accessibleRestaurantIds.has(restId);
+        if (hasAccess && restaurantData.menu && restaurantData.menu.items) {
+          const foundItem = restaurantData.menu.items.find(item => item.id === itemId);
+          if (foundItem) { menuItem = foundItem; restaurantId = restId; restaurantDoc = restaurantDocSnapshot; break; }
         }
       }
     }
