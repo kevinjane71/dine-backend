@@ -6340,7 +6340,9 @@ app.get('/api/orders/single/:orderId', authenticateToken, async (req, res) => {
       staffDisplay: {
         name: orderData.staffInfo?.name || 'Staff',
         role: orderData.staffInfo?.role || 'waiter',
-        userId: orderData.staffInfo?.userId || null
+        userId: orderData.staffInfo?.userId || null,
+        phone: orderData.staffInfo?.phone || null,
+        loginId: orderData.staffInfo?.loginId || null
       }
     };
 
@@ -6399,7 +6401,9 @@ app.get('/api/orders/:restaurantId', authenticateToken, async (req, res) => {
         staffDisplay: {
           name: orderData.staffInfo?.name || 'Staff',
           role: orderData.staffInfo?.role || 'waiter',
-          userId: orderData.staffInfo?.userId || null
+          userId: orderData.staffInfo?.userId || null,
+          phone: orderData.staffInfo?.phone || null,
+          loginId: orderData.staffInfo?.loginId || null
         }
       };
     };
