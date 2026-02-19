@@ -122,16 +122,22 @@ router.get('/dashboard', authenticateToken, requireOwnerRole, async (req, res) =
     // Process results for each restaurant
     let totalOrders = 0;
     let totalRevenue = 0;
+    let totalRevenueWithTax = 0;
     let totalStaff = 0;
     let totalLowStockItems = 0;
 
     const restaurantData = restaurants.map((restaurant, index) => {
-      // Process orders for the period
-      const orders = ordersResults[index].docs;
+      // Process orders for the period — exclude cancelled/deleted/saved orders
+      const nonCountedStatuses = ['cancelled', 'deleted', 'saved'];
+      const orders = ordersResults[index].docs.filter(doc => !nonCountedStatuses.includes(doc.data().status));
       const periodOrders = orders.length;
       const periodRevenue = orders.reduce((sum, doc) => {
         const order = doc.data();
-        return sum + (order.totalAmount || order.finalAmount || 0);
+        return sum + (order.totalAmount || 0);
+      }, 0);
+      const periodRevenueWithTax = orders.reduce((sum, doc) => {
+        const order = doc.data();
+        return sum + (order.finalAmount || order.totalAmount || 0);
       }, 0);
 
       // Process staff (exclude owners and customers)
@@ -151,6 +157,7 @@ router.get('/dashboard', authenticateToken, requireOwnerRole, async (req, res) =
       // Update totals
       totalOrders += periodOrders;
       totalRevenue += periodRevenue;
+      totalRevenueWithTax += periodRevenueWithTax;
       totalStaff += activeStaff;
       totalLowStockItems += lowStockItems;
 
@@ -167,6 +174,7 @@ router.get('/dashboard', authenticateToken, requireOwnerRole, async (req, res) =
         // Also add new generic field names
         orders: periodOrders,
         revenue: Math.round(periodRevenue * 100) / 100,
+        revenueWithTax: Math.round(periodRevenueWithTax * 100) / 100,
         activeStaff,
         lowStockItems,
         status: restaurant.status || 'active'
@@ -186,6 +194,7 @@ router.get('/dashboard', authenticateToken, requireOwnerRole, async (req, res) =
         // Also add new generic field names
         totalOrders,
         totalRevenue: Math.round(totalRevenue * 100) / 100,
+        totalRevenueWithTax: Math.round(totalRevenueWithTax * 100) / 100,
         totalStaff,
         totalLowStockItems
       },
@@ -310,24 +319,34 @@ router.get('/analytics', authenticateToken, requireOwnerRole, async (req, res) =
 
     // Aggregate analytics
     let totalRevenue = 0;
+    let totalRevenueWithTax = 0;
     let totalOrders = 0;
     const revenueByRestaurant = [];
     const allOrders = [];
 
+    const nonCountedStatuses = ['cancelled', 'deleted', 'saved'];
+
     restaurantIds.forEach((restaurantId, index) => {
-      const orders = ordersResults[index].docs;
+      // Exclude cancelled/deleted/saved orders from analytics
+      const orders = ordersResults[index].docs.filter(doc => !nonCountedStatuses.includes(doc.data().status));
       const restaurantRevenue = orders.reduce((sum, doc) => {
         const order = doc.data();
-        return sum + (order.totalAmount || order.finalAmount || 0);
+        return sum + (order.totalAmount || 0);
+      }, 0);
+      const restaurantRevenueWithTax = orders.reduce((sum, doc) => {
+        const order = doc.data();
+        return sum + (order.finalAmount || order.totalAmount || 0);
       }, 0);
 
       totalRevenue += restaurantRevenue;
+      totalRevenueWithTax += restaurantRevenueWithTax;
       totalOrders += orders.length;
 
       revenueByRestaurant.push({
         restaurantId,
         name: restaurantMap[restaurantId] || 'Unknown',
         revenue: Math.round(restaurantRevenue * 100) / 100,
+        revenueWithTax: Math.round(restaurantRevenueWithTax * 100) / 100,
         orders: orders.length
       });
 
@@ -407,6 +426,7 @@ router.get('/analytics', authenticateToken, requireOwnerRole, async (req, res) =
       success: true,
       analytics: {
         totalRevenue: Math.round(totalRevenue * 100) / 100,
+        totalRevenueWithTax: Math.round(totalRevenueWithTax * 100) / 100,
         totalOrders,
         avgOrderValue: totalOrders > 0 ? Math.round((totalRevenue / totalOrders) * 100) / 100 : 0,
         revenueByRestaurant: revenueByRestaurant.sort((a, b) => b.revenue - a.revenue),

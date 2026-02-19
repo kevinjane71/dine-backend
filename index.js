@@ -21,6 +21,99 @@ const firestoreOptimizer = require('./utils/firestoreOptimizer');
 const inventoryService = require('./services/inventoryService');
 const pusherService = require('./services/pusherService');
 
+// Pre-compute daily analytics stats on every order write (fire-and-forget)
+// Doc ID: {restaurantId}_{YYYY-MM-DD} in 'dailyStats' collection
+function updateDailyStats(restaurantId, order, operation) {
+  try {
+    const orderDate = order.createdAt?.toDate ? order.createdAt.toDate()
+      : (order.createdAt instanceof Date ? order.createdAt : new Date(order.createdAt || Date.now()));
+    const dateStr = orderDate.toISOString().split('T')[0];
+    const docId = `${restaurantId}_${dateStr}`;
+    const statsRef = db.collection('dailyStats').doc(docId);
+
+    const sign = operation === 'add' ? 1 : -1;
+    const amount = (order.totalAmount || 0) * sign;
+    const amountWithTax = (order.finalAmount || order.totalAmount || 0) * sign;
+
+    // Build atomic update
+    const update = {
+      restaurantId,
+      date: dateStr,
+      totalOrders: FieldValue.increment(sign),
+      totalRevenue: FieldValue.increment(amount),
+      totalRevenueWithTax: FieldValue.increment(amountWithTax),
+      updatedAt: FieldValue.serverTimestamp()
+    };
+
+    // Order type bucket
+    const orderType = (order.orderType || 'dine_in').toLowerCase().replace(/[\s-]+/g, '_');
+    update[`ordersByType_${orderType}`] = FieldValue.increment(sign);
+
+    // Busy hour bucket
+    const hour = orderDate.getHours();
+    update[`hour_${hour.toString().padStart(2, '0')}`] = FieldValue.increment(sign);
+
+    // Customer tracking (only add, never remove from array)
+    const customerId = order.customerId || order.customerInfo?.phone || null;
+    if (customerId && operation === 'add') {
+      update.customerIds = FieldValue.arrayUnion(customerId);
+    }
+
+    // Item counts — use set+merge with increment for qty/revenue per item
+    if (order.items && Array.isArray(order.items)) {
+      const itemCounts = {};
+      order.items.forEach(item => {
+        const name = item.name || item.itemName;
+        if (name) {
+          const key = name.replace(/[.\/]/g, '_'); // Firestore key-safe
+          if (!itemCounts[key]) itemCounts[key] = { qty: 0, revenue: 0 };
+          itemCounts[key].qty += (item.quantity || 1) * sign;
+          itemCounts[key].revenue += ((item.price || 0) * (item.quantity || 1)) * sign;
+        }
+      });
+      // Flatten into dot-notation fields for atomic merge
+      for (const [key, val] of Object.entries(itemCounts)) {
+        update[`itemCounts.${key}.qty`] = FieldValue.increment(val.qty);
+        update[`itemCounts.${key}.revenue`] = FieldValue.increment(val.revenue);
+      }
+    }
+
+    statsRef.set(update, { merge: true })
+      .catch(err => console.error('dailyStats update error (non-blocking):', err));
+  } catch (err) {
+    console.error('dailyStats helper error (non-blocking):', err);
+  }
+}
+
+// Update dailyStats when order amount changes (PATCH with items update)
+function updateDailyStatsRevenueDiff(restaurantId, order, oldAmount, newAmount, oldFinalAmount, newFinalAmount) {
+  try {
+    const orderDate = order.createdAt?.toDate ? order.createdAt.toDate()
+      : (order.createdAt instanceof Date ? order.createdAt : new Date(order.createdAt || Date.now()));
+    const dateStr = orderDate.toISOString().split('T')[0];
+    const docId = `${restaurantId}_${dateStr}`;
+    const statsRef = db.collection('dailyStats').doc(docId);
+
+    const diff = (newAmount || 0) - (oldAmount || 0);
+    const diffWithTax = (newFinalAmount || newAmount || 0) - (oldFinalAmount || oldAmount || 0);
+
+    if (diff === 0 && diffWithTax === 0) return;
+
+    const update = {
+      restaurantId,
+      date: dateStr,
+      updatedAt: FieldValue.serverTimestamp()
+    };
+    if (diff !== 0) update.totalRevenue = FieldValue.increment(diff);
+    if (diffWithTax !== 0) update.totalRevenueWithTax = FieldValue.increment(diffWithTax);
+
+    statsRef.set(update, { merge: true })
+      .catch(err => console.error('dailyStats revenue diff error (non-blocking):', err));
+  } catch (err) {
+    console.error('dailyStats revenueDiff helper error (non-blocking):', err);
+  }
+}
+
 // Generate daily order ID (starts from 1 each day)
 async function generateDailyOrderId(restaurantId) {
   try {
@@ -5542,6 +5635,9 @@ app.post('/api/public/orders/:restaurantId', vercelSecurityMiddleware.publicAPI,
       orderSource: resolvedOrderSource
     }).catch(err => console.error('Pusher notification error (non-blocking):', err));
 
+    // Update daily analytics stats (fire-and-forget)
+    updateDailyStats(restaurantId, orderData, 'add');
+
     // Trigger KOT print notification if Pusher printing is enabled
     const printSettings = restaurantData.printSettings || {};
     if (printSettings.kotPrinterEnabled !== false && printSettings.usePusherForKOT === true) {
@@ -6147,6 +6243,11 @@ app.post('/api/orders', async (req, res) => {
       orderType: orderType
     }).catch(err => console.error('Pusher notification error (non-blocking):', err));
 
+    // Update daily analytics stats (fire-and-forget) — skip 'saved' orders (counted when placed)
+    if (orderData.status !== 'saved') {
+      updateDailyStats(restaurantId, orderData, 'add');
+    }
+
     // Trigger KOT print notification if order is confirmed and Pusher printing is enabled
     const printSettings = restaurantData.printSettings || {};
     if (orderData.status === 'confirmed' && printSettings.kotPrinterEnabled !== false && printSettings.usePusherForKOT === true) {
@@ -6576,101 +6677,203 @@ app.get('/api/analytics/:restaurantId', authenticateToken, async (req, res) => {
   try {
     const { restaurantId } = req.params;
     const { period = '7d' } = req.query;
-    
+
     console.log(`📊 Fetching analytics for restaurant ${restaurantId}, period: ${period}`);
-    
-    // Calculate date range based on period
-    const now = new Date();
-    let startDate;
-    
-    switch (period) {
-      case 'today':
-        // Today's orders only
+
+    const useRawOrders = (period === 'today' || period === '24h' || period === 'last24hours');
+
+    if (useRawOrders) {
+      // For today/24h: read raw orders for real-time accuracy (small dataset)
+      const now = new Date();
+      let startDate;
+      if (period === 'today') {
         startDate = new Date(now);
         startDate.setHours(0, 0, 0, 0);
-        break;
-      case '24h':
-      case 'last24hours':
-        // Last 24 hours
+      } else {
         startDate = new Date(now.getTime() - 24 * 60 * 60 * 1000);
-        break;
-      case '7d':
-      case 'last7days':
-        // Last 7 days
-        startDate = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
-        break;
-      case '30d':
-      case 'last30days':
-        // Last 30 days
-        startDate = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000);
-        break;
-      case 'all':
-        // Cap "all" to last 1 year to prevent loading entire order history into memory
-        startDate = new Date(now);
-        startDate.setFullYear(startDate.getFullYear() - 1);
-        break;
-      default:
-        startDate = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
+      }
+
+      const ordersQuery = await db.collection(collections.orders)
+        .where('restaurantId', '==', restaurantId)
+        .where('createdAt', '>=', startDate)
+        .where('createdAt', '<=', now)
+        .get();
+
+      const orders = ordersQuery.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+      console.log(`📊 Found ${orders.length} raw orders for analytics (${period})`);
+
+      const analytics = calculateAnalytics(orders, period);
+      return res.json({ success: true, analytics, period, totalOrders: orders.length });
     }
-    
-    // Fetch orders for the restaurant in the date range
-    const ordersQuery = await db.collection(collections.orders)
-      .where('restaurantId', '==', restaurantId)
-      .where('createdAt', '>=', startDate)
-      .where('createdAt', '<=', now)
-      .get();
-    
-    const orders = ordersQuery.docs.map(doc => ({
-      id: doc.id,
-      ...doc.data()
-    }));
-    
-    console.log(`📊 Found ${orders.length} orders for analytics`);
-    
-    // Calculate analytics
-    const analytics = calculateAnalytics(orders, period);
-    
-    res.json({
-      success: true,
-      analytics,
-      period,
-      totalOrders: orders.length
-    });
-    
+
+    // For 7d/30d/all: read pre-computed dailyStats docs
+    const now = new Date();
+    let daysBack;
+    switch (period) {
+      case '7d': case 'last7days': daysBack = 7; break;
+      case '30d': case 'last30days': daysBack = 30; break;
+      case 'all': daysBack = 365; break;
+      default: daysBack = 7;
+    }
+
+    // Build list of date strings to query
+    const dateStrings = [];
+    for (let i = 0; i < daysBack; i++) {
+      const d = new Date(now.getTime() - i * 24 * 60 * 60 * 1000);
+      dateStrings.push(d.toISOString().split('T')[0]);
+    }
+
+    // Fetch dailyStats docs (Firestore getAll for batch read)
+    const statsRefs = dateStrings.map(ds => db.collection('dailyStats').doc(`${restaurantId}_${ds}`));
+    const statsDocs = await db.getAll(...statsRefs);
+    const dailyDocs = statsDocs.filter(d => d.exists).map(d => d.data());
+
+    console.log(`📊 Found ${dailyDocs.length} dailyStats docs for analytics (${period})`);
+
+    // Backward compatibility: if no dailyStats docs exist yet, fall back to raw orders
+    if (dailyDocs.length === 0) {
+      console.log(`📊 No dailyStats found, falling back to raw orders for ${period}`);
+      const startDate = new Date(now.getTime() - daysBack * 24 * 60 * 60 * 1000);
+      const ordersQuery = await db.collection(collections.orders)
+        .where('restaurantId', '==', restaurantId)
+        .where('createdAt', '>=', startDate)
+        .where('createdAt', '<=', now)
+        .get();
+      const orders = ordersQuery.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+      console.log(`📊 Fallback: found ${orders.length} raw orders`);
+      const analytics = calculateAnalytics(orders, period);
+      return res.json({ success: true, analytics, period, totalOrders: orders.length });
+    }
+
+    const analytics = aggregateDailyStats(dailyDocs, dateStrings);
+    return res.json({ success: true, analytics, period, totalOrders: analytics.totalOrders });
+
   } catch (error) {
     console.error('Analytics error:', error);
     res.status(500).json({ error: 'Failed to fetch analytics' });
   }
 });
 
-// Helper function to calculate analytics
-function calculateAnalytics(orders, period) {
-  if (orders.length === 0) {
+// Aggregate pre-computed dailyStats docs into the same analytics response shape
+function aggregateDailyStats(dailyDocs, dateStrings) {
+  if (dailyDocs.length === 0) {
     return {
-      totalRevenue: 0,
-      totalOrders: 0,
-      avgOrderValue: 0,
-      newCustomers: 0,
-      popularItems: [],
-      revenueData: [],
-      ordersByType: [],
-      busyHours: []
+      totalRevenue: 0, totalRevenueWithTax: 0, totalOrders: 0, avgOrderValue: 0, newCustomers: 0,
+      popularItems: [], revenueData: [], ordersByType: [], busyHours: []
     };
   }
-  
-  // Calculate basic metrics
+
+  let totalRevenue = 0;
+  let totalRevenueWithTax = 0;
+  let totalOrders = 0;
+  const allCustomerIds = new Set();
+  const itemCounts = {};       // key -> { qty, revenue }
+  const ordersByType = {};
+  const hourCounts = {};
+  const revenueByDay = {};
+  const dayNames = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+
+  for (const doc of dailyDocs) {
+    totalRevenue += doc.totalRevenue || 0;
+    totalRevenueWithTax += doc.totalRevenueWithTax || doc.totalRevenue || 0;
+    totalOrders += doc.totalOrders || 0;
+
+    // Customer IDs
+    if (doc.customerIds && Array.isArray(doc.customerIds)) {
+      doc.customerIds.forEach(id => allCustomerIds.add(id));
+    }
+
+    // Orders by type (flat fields like ordersByType_dine_in)
+    for (const [key, val] of Object.entries(doc)) {
+      if (key.startsWith('ordersByType_') && typeof val === 'number') {
+        const type = key.replace('ordersByType_', '');
+        ordersByType[type] = (ordersByType[type] || 0) + val;
+      }
+    }
+
+    // Busy hours (flat fields like hour_00 .. hour_23)
+    for (let h = 0; h < 24; h++) {
+      const hKey = `hour_${h.toString().padStart(2, '0')}`;
+      if (doc[hKey]) {
+        const hourStr = `${h.toString().padStart(2, '0')}:00`;
+        hourCounts[hourStr] = (hourCounts[hourStr] || 0) + doc[hKey];
+      }
+    }
+
+    // Item counts
+    if (doc.itemCounts && typeof doc.itemCounts === 'object') {
+      for (const [name, val] of Object.entries(doc.itemCounts)) {
+        if (!itemCounts[name]) itemCounts[name] = { qty: 0, revenue: 0 };
+        itemCounts[name].qty += val.qty || 0;
+        itemCounts[name].revenue += val.revenue || 0;
+      }
+    }
+
+    // Revenue by day-of-week
+    if (doc.date) {
+      const d = new Date(doc.date + 'T12:00:00'); // noon to avoid timezone edge
+      const dayName = dayNames[d.getDay()];
+      revenueByDay[dayName] = (revenueByDay[dayName] || 0) + (doc.totalRevenue || 0);
+    }
+  }
+
+  const avgOrderValue = totalOrders > 0 ? Math.round(totalRevenue / totalOrders) : 0;
+
+  // Popular items (top 5 by quantity)
+  const popularItems = Object.entries(itemCounts)
+    .map(([name, val]) => ({ name, orders: val.qty, revenue: val.revenue }))
+    .sort((a, b) => b.orders - a.orders)
+    .slice(0, 5);
+
+  // Revenue data by day of week
+  const revenueData = dayNames.map(day => ({ day, revenue: revenueByDay[day] || 0 }));
+
+  // Orders by type array
+  const totalOrderCount = Object.values(ordersByType).reduce((sum, c) => sum + c, 0);
+  const ordersByTypeArray = Object.entries(ordersByType).map(([type, count]) => ({
+    type,
+    count,
+    percentage: totalOrderCount > 0 ? Math.round((count / totalOrderCount) * 100 * 10) / 10 : 0
+  }));
+
+  // Busy hours (top 6)
+  const busyHours = Object.entries(hourCounts)
+    .map(([hour, orders]) => ({ hour, orders }))
+    .sort((a, b) => b.orders - a.orders)
+    .slice(0, 6);
+
+  return {
+    totalRevenue, totalRevenueWithTax, totalOrders, avgOrderValue,
+    newCustomers: allCustomerIds.size,
+    popularItems, revenueData,
+    ordersByType: ordersByTypeArray,
+    busyHours
+  };
+}
+
+// Helper function to calculate analytics from raw orders (used for today/24h)
+function calculateAnalytics(orders, period) {
+  // Exclude cancelled/deleted/saved orders from analytics — only count valid orders
+  orders = orders.filter(o => !['cancelled', 'deleted', 'saved'].includes(o.status));
+
+  if (orders.length === 0) {
+    return {
+      totalRevenue: 0, totalRevenueWithTax: 0, totalOrders: 0, avgOrderValue: 0, newCustomers: 0,
+      popularItems: [], revenueData: [], ordersByType: [], busyHours: []
+    };
+  }
+
   const totalRevenue = orders.reduce((sum, order) => sum + (order.totalAmount || 0), 0);
+  const totalRevenueWithTax = orders.reduce((sum, order) => sum + (order.finalAmount || order.totalAmount || 0), 0);
   const totalOrders = orders.length;
   const avgOrderValue = totalOrders > 0 ? Math.round(totalRevenue / totalOrders) : 0;
-  
-  // Calculate new customers (customers who placed their first order in this period)
+
   const customerIds = [...new Set(orders.map(order => order.customerId).filter(Boolean))];
-  const newCustomers = customerIds.length; // Simplified - in real app, check against historical data
-  
-  // Calculate popular items
+  const newCustomers = customerIds.length;
+
   const itemCounts = {};
   const itemRevenue = {};
-  
+
   orders.forEach(order => {
     if (order.items && Array.isArray(order.items)) {
       order.items.forEach(item => {
@@ -6682,46 +6885,36 @@ function calculateAnalytics(orders, period) {
       });
     }
   });
-  
+
   const popularItems = Object.keys(itemCounts)
-    .map(name => ({
-      name,
-      orders: itemCounts[name],
-      revenue: itemRevenue[name] || 0
-    }))
+    .map(name => ({ name, orders: itemCounts[name], revenue: itemRevenue[name] || 0 }))
     .sort((a, b) => b.orders - a.orders)
     .slice(0, 5);
-  
-  // Calculate revenue data by day
+
   const revenueByDay = {};
   const dayNames = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
-  
+
   orders.forEach(order => {
     const orderDate = order.createdAt?.toDate ? order.createdAt.toDate() : new Date(order.createdAt);
     const dayName = dayNames[orderDate.getDay()];
     revenueByDay[dayName] = (revenueByDay[dayName] || 0) + (order.totalAmount || 0);
   });
-  
-  const revenueData = dayNames.map(day => ({
-    day,
-    revenue: revenueByDay[day] || 0
-  }));
-  
-  // Calculate orders by type
+
+  const revenueData = dayNames.map(day => ({ day, revenue: revenueByDay[day] || 0 }));
+
   const ordersByType = {};
   orders.forEach(order => {
     const type = order.orderType || 'Dine In';
     ordersByType[type] = (ordersByType[type] || 0) + 1;
   });
-  
+
   const totalOrderCount = Object.values(ordersByType).reduce((sum, count) => sum + count, 0);
   const ordersByTypeArray = Object.keys(ordersByType).map(type => ({
     type,
     count: ordersByType[type],
     percentage: totalOrderCount > 0 ? Math.round((ordersByType[type] / totalOrderCount) * 100 * 10) / 10 : 0
   }));
-  
-  // Calculate busy hours
+
   const hourCounts = {};
   orders.forEach(order => {
     const orderDate = order.createdAt?.toDate ? order.createdAt.toDate() : new Date(order.createdAt);
@@ -6729,24 +6922,15 @@ function calculateAnalytics(orders, period) {
     const hourStr = `${hour.toString().padStart(2, '0')}:00`;
     hourCounts[hourStr] = (hourCounts[hourStr] || 0) + 1;
   });
-  
+
   const busyHours = Object.keys(hourCounts)
-    .map(hour => ({
-      hour,
-      orders: hourCounts[hour]
-    }))
+    .map(hour => ({ hour, orders: hourCounts[hour] }))
     .sort((a, b) => b.orders - a.orders)
     .slice(0, 6);
-  
+
   return {
-    totalRevenue,
-    totalOrders,
-    avgOrderValue,
-    newCustomers,
-    popularItems,
-    revenueData,
-    ordersByType: ordersByTypeArray,
-    busyHours
+    totalRevenue, totalRevenueWithTax, totalOrders, avgOrderValue, newCustomers,
+    popularItems, revenueData, ordersByType: ordersByTypeArray, busyHours
   };
 }
 
@@ -6867,6 +7051,18 @@ app.patch('/api/orders/:orderId/status', authenticateToken, async (req, res) => 
       status,
       updatedAt: new Date()
     });
+
+    // Update daily analytics stats for status transitions (fire-and-forget)
+    const _nonCounted = ['saved', 'cancelled', 'deleted'];
+    const _prevCounted = !_nonCounted.includes(orderData.status);
+    const _nowCounted = !_nonCounted.includes(status);
+    if (_prevCounted && !_nowCounted) {
+      // active → cancelled/deleted
+      updateDailyStats(orderData.restaurantId, orderData, 'cancel');
+    } else if (!_prevCounted && _nowCounted) {
+      // saved/cancelled → active (e.g., saved order placed)
+      updateDailyStats(orderData.restaurantId, orderData, 'add');
+    }
 
     // Trigger Pusher notification for real-time updates
     pusherService.notifyOrderStatusUpdated(orderData.restaurantId, orderId, status, {
@@ -7199,6 +7395,28 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
 
     console.log('🔄 Backend - Updating order:', orderId, 'with data:', updateData);
     await db.collection(collections.orders).doc(orderId).update(updateData);
+
+    // Update daily analytics stats (fire-and-forget)
+    const nonCountedStatuses = ['saved', 'cancelled', 'deleted'];
+    const prevCounted = !nonCountedStatuses.includes(currentOrder.status);
+    const newStatus = status || currentOrder.status;
+    const nowCounted = !nonCountedStatuses.includes(newStatus);
+
+    if (status && prevCounted !== nowCounted) {
+      // Status transition: order entered or left the "counted" set
+      if (nowCounted && !prevCounted) {
+        // saved → placed, or cancelled/deleted → re-activated (edge case)
+        updateDailyStats(currentOrder.restaurantId, { ...currentOrder, ...updateData }, 'add');
+      } else if (!nowCounted && prevCounted) {
+        // active → cancelled/deleted via PATCH
+        updateDailyStats(currentOrder.restaurantId, currentOrder, 'cancel');
+      }
+    } else if (prevCounted && nowCounted) {
+      // Order stayed counted — check if amount changed
+      if (updateData.totalAmount !== undefined && updateData.totalAmount !== currentOrder.totalAmount) {
+        updateDailyStatsRevenueDiff(currentOrder.restaurantId, currentOrder, currentOrder.totalAmount, updateData.totalAmount, currentOrder.finalAmount, updateData.finalAmount);
+      }
+    }
 
     // NEW: If order is linked to hotel check-in, update the check-in's foodOrders array
     // This ensures the checkbox auto-checks when order status changes to completed
@@ -7661,6 +7879,11 @@ app.delete('/api/orders/:orderId', authenticateToken, async (req, res) => {
     }
     await orderRef.update(updateData);
 
+    // Update daily analytics stats — only if order was counted (not saved/cancelled)
+    if (!['saved', 'cancelled', 'deleted'].includes(order.status)) {
+      updateDailyStats(order.restaurantId, order, 'delete');
+    }
+
     // Trigger Pusher notification for real-time updates
     pusherService.notifyOrderDeleted(order.restaurantId, orderId)
       .catch(err => console.error('Pusher notification error (non-blocking):', err));
@@ -7689,6 +7912,11 @@ app.post('/api/public/delete-order', async (req, res) => {
       return res.status(404).json({ error: 'Order not found' });
     }
     const order = orderDoc.data();
+    // Update daily analytics stats before hard delete (fire-and-forget) — only if order was counted
+    const _nonCountedStatuses = ['saved', 'cancelled', 'deleted'];
+    if (!_nonCountedStatuses.includes(order.status)) {
+      updateDailyStats(order.restaurantId, order, 'delete');
+    }
     await orderRef.delete();
     pusherService.notifyOrderDeleted(order.restaurantId, id).catch(err => console.error('Pusher delete-order (non-blocking):', err));
     res.json({ message: 'Order deleted successfully' });
@@ -11638,6 +11866,11 @@ app.patch('/api/orders/:orderId/cancel', authenticateToken, async (req, res) => 
 
     await db.collection(collections.orders).doc(orderId).update(updateData);
 
+    // Update daily analytics stats — only if order was counted (not saved)
+    if (!['saved', 'cancelled', 'deleted'].includes(orderData.status)) {
+      updateDailyStats(orderData.restaurantId, orderData, 'cancel');
+    }
+
     // If order has a table, update table status
     if (orderData.tableNumber) {
       try {
@@ -11646,7 +11879,7 @@ app.patch('/api/orders/:orderId/cancel', authenticateToken, async (req, res) => 
           .where('number', '==', orderData.tableNumber)
           .limit(1)
           .get();
-        
+
         if (!tablesSnapshot.empty) {
           await db.collection(collections.tables).doc(tablesSnapshot.docs[0].id).update({
             status: 'available',
@@ -11661,7 +11894,7 @@ app.patch('/api/orders/:orderId/cancel', authenticateToken, async (req, res) => 
     }
 
     console.log(`✅ Order ${orderId} cancelled successfully`);
-    
+
     res.json({
       success: true,
       message: 'Order cancelled successfully',
