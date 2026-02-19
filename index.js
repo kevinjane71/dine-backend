@@ -6297,9 +6297,30 @@ app.get('/api/orders/:restaurantId', authenticateToken, async (req, res) => {
       allOrders.push(order);
     });
 
-    // When status is 'all' or not set, exclude soft-deleted orders so they only appear when filter is "Deleted"
+    // When status is 'all' or not set, exclude soft-deleted and expired orders
     if (!status || status === 'all') {
-      allOrders = allOrders.filter(o => o.status !== 'deleted');
+      allOrders = allOrders.filter(o => o.status !== 'deleted' && o.status !== 'expired');
+    }
+
+    // Auto-expire saved orders older than 24 hours
+    if (status === 'saved') {
+      const twentyFourHoursAgo = new Date(Date.now() - 24 * 60 * 60 * 1000);
+      const expiredIds = [];
+      allOrders = allOrders.filter(order => {
+        const createdAt = order.createdAt?.toDate ? order.createdAt.toDate() : new Date(order.createdAt);
+        if (createdAt < twentyFourHoursAgo) {
+          expiredIds.push(order.id);
+          return false;
+        }
+        return true;
+      });
+      // Mark expired saved orders as 'expired' in background (fire-and-forget)
+      if (expiredIds.length > 0) {
+        console.log(`🗑️ Auto-expiring ${expiredIds.length} saved orders older than 24h`);
+        Promise.all(expiredIds.map(id =>
+          db.collection(collections.orders).doc(id).update({ status: 'expired', expiredAt: new Date() })
+        )).catch(err => console.error('Error expiring saved orders:', err));
+      }
     }
 
     console.log(`📋 Order History - Total orders before filtering: ${allOrders.length}`);
@@ -6571,8 +6592,8 @@ app.patch('/api/orders/:orderId/status', authenticateToken, async (req, res) => 
     const { orderId } = req.params;
     const { status } = req.body;
 
-    const validStatuses = ['pending', 'confirmed', 'preparing', 'ready', 'served', 'completed', 'cancelled'];
-    
+    const validStatuses = ['pending', 'confirmed', 'preparing', 'ready', 'served', 'completed', 'cancelled', 'deleted'];
+
     if (!validStatuses.includes(status)) {
       return res.status(400).json({ error: 'Invalid status' });
     }
