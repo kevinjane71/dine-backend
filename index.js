@@ -6206,6 +6206,53 @@ app.post('/api/orders', async (req, res) => {
   }
 });
 
+// Get a single order by ID — direct document fetch (1 read instead of a query)
+app.get('/api/orders/single/:orderId', authenticateToken, async (req, res) => {
+  try {
+    const { orderId } = req.params;
+
+    const orderRef = db.collection(collections.orders).doc(orderId);
+    const orderDoc = await orderRef.get();
+
+    if (!orderDoc.exists) {
+      return res.json({ orders: [], pagination: { currentPage: 1, totalPages: 0, totalOrders: 0, limit: 1, hasNextPage: false, hasPrevPage: false } });
+    }
+
+    const orderData = orderDoc.data();
+    const order = {
+      id: orderDoc.id,
+      ...orderData,
+      createdAt: orderData.createdAt,
+      updatedAt: orderData.updatedAt,
+      completedAt: orderData.completedAt || null,
+      orderFlow: {
+        isDirectBilling: orderData.status === 'completed' && !orderData.kotSent,
+        isKitchenOrder: orderData.kotSent || orderData.status === 'confirmed',
+        isCompleted: orderData.status === 'completed',
+        isPending: orderData.status === 'pending' || orderData.status === 'confirmed'
+      },
+      customerDisplay: {
+        name: orderData.customerInfo?.name || 'Walk-in Customer',
+        phone: orderData.customerInfo?.phone || null,
+        tableNumber: orderData.tableNumber || null
+      },
+      staffDisplay: {
+        name: orderData.staffInfo?.name || 'Staff',
+        role: orderData.staffInfo?.role || 'waiter',
+        userId: orderData.staffInfo?.userId || null
+      }
+    };
+
+    res.json({
+      orders: [order],
+      pagination: { currentPage: 1, totalPages: 1, totalOrders: 1, limit: 1, hasNextPage: false, hasPrevPage: false }
+    });
+  } catch (error) {
+    console.error('Get single order error:', error);
+    res.status(500).json({ error: 'Failed to fetch order' });
+  }
+});
+
 app.get('/api/orders/:restaurantId', authenticateToken, async (req, res) => {
   try {
     const { restaurantId } = req.params;
@@ -6256,62 +6303,104 @@ app.get('/api/orders/:restaurantId', authenticateToken, async (req, res) => {
       };
     };
 
+    // --- QUICK MATCH: If searching, try direct doc ID lookup first (1 read vs 5000) ---
+    if (search && search.trim() && !waiterId) {
+      const searchValue = search.trim();
+
+      // Try direct document lookup (works when search is a Firestore doc ID like "OurkX9Z1zzUFngG9OCmz")
+      const directDoc = await db.collection(collections.orders).doc(searchValue).get();
+      if (directDoc.exists && directDoc.data().restaurantId === restaurantId) {
+        const order = formatOrder(directDoc);
+        console.log(`📋 Order History (quick match by doc ID) - Found order ${searchValue}`);
+        return res.json({
+          orders: [order],
+          pagination: { currentPage: 1, totalPages: 1, totalOrders: 1, limit: limitNum, hasNextPage: false, hasPrevPage: false }
+        });
+      }
+
+      // Try lookup by dailyOrderId (works when search is an order number like "147")
+      const numericSearch = parseInt(searchValue);
+      if (!isNaN(numericSearch)) {
+        let numQuery = db.collection(collections.orders)
+          .where('restaurantId', '==', restaurantId)
+          .where('dailyOrderId', '==', numericSearch)
+          .orderBy('createdAt', 'desc')
+          .limit(10);
+
+        // If todayOnly, narrow down to today
+        if (todayOnly === 'true') {
+          const todayStart = new Date();
+          todayStart.setHours(0, 0, 0, 0);
+          numQuery = db.collection(collections.orders)
+            .where('restaurantId', '==', restaurantId)
+            .where('dailyOrderId', '==', numericSearch)
+            .where('createdAt', '>=', todayStart)
+            .orderBy('createdAt', 'desc')
+            .limit(10);
+        }
+
+        const numSnapshot = await numQuery.get();
+        if (!numSnapshot.empty) {
+          const orders = [];
+          numSnapshot.forEach(doc => orders.push(formatOrder(doc)));
+          console.log(`📋 Order History (quick match by order number) - Found ${orders.length} orders for #${numericSearch}`);
+          return res.json({
+            orders,
+            pagination: { currentPage: 1, totalPages: 1, totalOrders: orders.length, limit: limitNum, hasNextPage: false, hasPrevPage: false }
+          });
+        }
+      }
+
+      // Quick match failed — fall through to full search path below
+      console.log(`📋 Order History (quick match miss) - Falling through to full search for "${searchValue}"`);
+    }
+
     // Determine if we need in-memory filtering (search requires loading docs to filter)
     const needsInMemoryFilter = (search && search.trim()) || (waiterId && waiterId !== 'all');
 
-    // Build the base Firestore query with all supported filters
-    let query = db.collection(collections.orders)
-      .where('restaurantId', '==', restaurantId);
-
-    // Apply status filter
-    if (status && status !== 'all') {
-      query = query.where('status', '==', status);
-    } else if (!status || status === 'all') {
-      // Exclude deleted and expired orders at the Firestore level
-      // Using 'in' filter to only fetch active statuses (works with other filters)
-      query = query.where('status', 'in', ['pending', 'confirmed', 'preparing', 'ready', 'completed', 'cancelled', 'saved']);
-    }
-
-    // Apply order type filter
-    if (orderType && orderType !== 'all') {
-      query = query.where('orderType', '==', orderType);
-    }
-
-    // Apply waiter filter at Firestore level when no search is needed
-    if (waiterId && waiterId !== 'all' && !(search && search.trim())) {
-      query = query.where('staffInfo.userId', '==', waiterId);
-    }
-
-    // Apply today filter
-    if (todayOnly === 'true') {
-      const todayStart = new Date();
-      todayStart.setHours(0, 0, 0, 0);
-      const todayEnd = new Date();
-      todayEnd.setHours(23, 59, 59, 999);
-
-      query = query.where('createdAt', '>=', todayStart)
-                   .where('createdAt', '<=', todayEnd);
-    }
-
-    // Apply date filter (for specific date)
-    if (date && todayOnly !== 'true') {
-      const startDate = new Date(date);
-      const endDate = new Date(date);
-      endDate.setDate(endDate.getDate() + 1);
-
-      query = query.where('createdAt', '>=', startDate)
-                   .where('createdAt', '<', endDate);
-    }
-
-    // Add ordering
-    const orderedQuery = query.orderBy('createdAt', 'desc');
-
     // --- FAST PATH: No search needed, paginate at Firestore level ---
     if (!needsInMemoryFilter) {
+      let fastQuery = db.collection(collections.orders)
+        .where('restaurantId', '==', restaurantId);
+
+      // Apply status filter — use 'in' to exclude deleted/expired at Firestore level
+      if (status && status !== 'all') {
+        fastQuery = fastQuery.where('status', '==', status);
+      } else {
+        fastQuery = fastQuery.where('status', 'in', ['pending', 'confirmed', 'preparing', 'ready', 'completed', 'cancelled', 'saved']);
+      }
+
+      if (orderType && orderType !== 'all') {
+        fastQuery = fastQuery.where('orderType', '==', orderType);
+      }
+
+      if (waiterId && waiterId !== 'all') {
+        fastQuery = fastQuery.where('staffInfo.userId', '==', waiterId);
+      }
+
+      if (todayOnly === 'true') {
+        const todayStart = new Date();
+        todayStart.setHours(0, 0, 0, 0);
+        const todayEnd = new Date();
+        todayEnd.setHours(23, 59, 59, 999);
+        fastQuery = fastQuery.where('createdAt', '>=', todayStart)
+                             .where('createdAt', '<=', todayEnd);
+      }
+
+      if (date && todayOnly !== 'true') {
+        const startDate = new Date(date);
+        const endDate = new Date(date);
+        endDate.setDate(endDate.getDate() + 1);
+        fastQuery = fastQuery.where('createdAt', '>=', startDate)
+                             .where('createdAt', '<', endDate);
+      }
+
+      const orderedFastQuery = fastQuery.orderBy('createdAt', 'desc');
+
       // Run paginated fetch and count in parallel
       const [pageSnapshot, countSnapshot] = await Promise.all([
-        orderedQuery.offset(offset).limit(limitNum).get(),
-        query.count().get()
+        orderedFastQuery.offset(offset).limit(limitNum).get(),
+        fastQuery.count().get()
       ]);
 
       const orders = [];
@@ -6336,42 +6425,55 @@ app.get('/api/orders/:restaurantId', authenticateToken, async (req, res) => {
     }
 
     // --- SEARCH/FILTER PATH: Load capped set, filter in memory ---
-    // Cap at 5000 docs to prevent memory blowup while still allowing good search results.
-    // For search without date filter, default to last 90 days to bound the dataset.
+    // Uses simpler Firestore query (no 'in' filter) to avoid composite index requirements.
+    // Deleted/expired orders are filtered out in memory instead.
     const MAX_SEARCH_DOCS = 5000;
-    let searchQuery = orderedQuery;
 
-    if (search && search.trim() && todayOnly !== 'true' && !date) {
-      // No date filter provided with search — default to last 90 days
+    let searchQuery = db.collection(collections.orders)
+      .where('restaurantId', '==', restaurantId);
+
+    // Apply simple status filter (single equality, no 'in' — avoids composite index issues)
+    if (status && status !== 'all') {
+      searchQuery = searchQuery.where('status', '==', status);
+    }
+
+    if (orderType && orderType !== 'all') {
+      searchQuery = searchQuery.where('orderType', '==', orderType);
+    }
+
+    // Apply date filters
+    if (todayOnly === 'true') {
+      const todayStart = new Date();
+      todayStart.setHours(0, 0, 0, 0);
+      const todayEnd = new Date();
+      todayEnd.setHours(23, 59, 59, 999);
+      searchQuery = searchQuery.where('createdAt', '>=', todayStart)
+                               .where('createdAt', '<=', todayEnd);
+    } else if (date) {
+      const startDate = new Date(date);
+      const endDate = new Date(date);
+      endDate.setDate(endDate.getDate() + 1);
+      searchQuery = searchQuery.where('createdAt', '>=', startDate)
+                               .where('createdAt', '<', endDate);
+    } else if (search && search.trim()) {
+      // No date filter with search — default to last 90 days to bound the dataset
       const ninetyDaysAgo = new Date();
       ninetyDaysAgo.setDate(ninetyDaysAgo.getDate() - 90);
-      // Rebuild query with date bound (must re-add since we need createdAt filter)
-      let boundedQuery = db.collection(collections.orders)
-        .where('restaurantId', '==', restaurantId);
-
-      if (status && status !== 'all') {
-        boundedQuery = boundedQuery.where('status', '==', status);
-      } else {
-        boundedQuery = boundedQuery.where('status', 'in', ['pending', 'confirmed', 'preparing', 'ready', 'completed', 'cancelled', 'saved']);
-      }
-
-      if (orderType && orderType !== 'all') {
-        boundedQuery = boundedQuery.where('orderType', '==', orderType);
-      }
-
-      if (waiterId && waiterId !== 'all') {
-        boundedQuery = boundedQuery.where('staffInfo.userId', '==', waiterId);
-      }
-
-      boundedQuery = boundedQuery.where('createdAt', '>=', ninetyDaysAgo);
-      searchQuery = boundedQuery.orderBy('createdAt', 'desc');
+      searchQuery = searchQuery.where('createdAt', '>=', ninetyDaysAgo);
     }
+
+    searchQuery = searchQuery.orderBy('createdAt', 'desc');
 
     const allSnapshot = await searchQuery.limit(MAX_SEARCH_DOCS).get();
     let allOrders = [];
     allSnapshot.forEach(doc => allOrders.push(formatOrder(doc)));
 
     console.log(`📋 Order History (search path) - Loaded ${allOrders.length} orders for in-memory filtering`);
+
+    // Exclude deleted and expired when status is 'all' or not set (same as original behavior)
+    if (!status || status === 'all') {
+      allOrders = allOrders.filter(o => o.status !== 'deleted' && o.status !== 'expired');
+    }
 
     // Auto-expire saved orders older than 24 hours
     if (status === 'saved') {
