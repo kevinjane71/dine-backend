@@ -87,7 +87,7 @@ router.post('/login', async (req, res) => {
       return res.status(401).json({ success: false, error: 'Invalid credentials' });
     }
 
-    const valid = await bcrypt.compare(password, process.env.SUPER_ADMIN_PASSWORD_HASH);
+    const valid = password === process.env.SUPER_ADMIN_PASSWORD;
     if (!valid) {
       return res.status(401).json({ success: false, error: 'Invalid credentials' });
     }
