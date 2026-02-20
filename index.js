@@ -316,6 +316,7 @@ const currencyRoutes = require('./routes/currencyRoutes');
 // Owner chain dashboard routes
 const ownerDashboardRoutes = require('./routes/ownerDashboard');
 const aiInsightsRoutes = require('./routes/aiInsights');
+const superAdminRoutes = require('./routes/superAdmin');
 
 // Debug email service initialization
 console.log('📧 Email service loaded:', !!emailService);
@@ -411,8 +412,10 @@ const allowedOrigins = [
   'http://localhost:3001',
   'http://localhost:3002',
   'http://localhost:3003',
+  'http://localhost:3004',
   'https://dine-frontend-ecru.vercel.app',
-  'https://pms-hotel.vercel.app'
+  'https://pms-hotel.vercel.app',
+  "https://dine-admin.vercel.app"
 ];
 
 // Helper function to check if origin is a valid dineopen.com domain or subdomain
@@ -432,7 +435,7 @@ function isValidLocalhostOrigin(origin) {
 
   // Match localhost with optional subdomain on ports 3001, 3002, 3003
   // Valid: http://localhost:3001, http://dummy.localhost:3002
-  const localhostRegex = /^http:\/\/([a-zA-Z0-9-]+\.)?localhost:(3001|3002|3003)$/;
+  const localhostRegex = /^http:\/\/([a-zA-Z0-9-]+\.)?localhost:(3001|3002|3003|3004)$/;
   return localhostRegex.test(origin);
 }
 
@@ -10743,6 +10746,9 @@ app.use('/api/owner', ownerDashboardRoutes);
 // ==================== AI INSIGHTS & DAILY REPORTS ====================
 // AI-powered analytics and automated email reports
 app.use('/api/ai', aiInsightsRoutes);
+
+// ==================== SUPER ADMIN (internal dashboard) ====================
+app.use('/api/super-admin', superAdminRoutes);
 
 // ==================== BUSINESS SETTINGS (for GST invoices) ====================
 
