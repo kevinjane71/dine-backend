@@ -393,16 +393,17 @@ const initializePaymentRoutes = (db, razorpay) => {
           
         } catch (orderError) {
           console.error('[PAYMENT] Failed to fetch order details:', orderError);
-          // If we can't determine the app, respond with an error
-          return res.status(500).json({ 
-            error: 'Error determining app ownership',
-            details: orderError.message
+          // Always return 200 to prevent infinite retries
+          return res.status(200).json({
+            status: 'ok',
+            error: 'Error determining app ownership - logged'
           });
         }
 
       } catch (error) {
         console.error('[PAYMENT] Webhook error:', error);
-        res.status(500).json({ error: 'Internal server error' });
+        // Always return 200 to prevent infinite retries
+        res.status(200).json({ status: 'ok', error: 'Processing error logged' });
       }
   });
 
@@ -420,11 +421,10 @@ const initializePaymentRoutes = (db, razorpay) => {
         });
       }
 
-      // Get payment history for user
+      // Get payment history for user (no orderBy — avoids composite index requirement, sort in memory)
       const paymentsSnapshot = await db.collection('dine_payments')
         .where('userId', '==', userId)
-        .where('app', '==', 'Dine') // Filter by app name
-        .orderBy('verifiedAt', 'desc')
+        .where('app', '==', 'Dine')
         .limit(parseInt(limit))
         .get();
 
@@ -438,9 +438,12 @@ const initializePaymentRoutes = (db, razorpay) => {
           amount: data.amount / 100, // Convert from paise to currency units
           currency: data.currency,
           status: data.status,
-          date: data.verifiedAt ? data.verifiedAt.toDate() : null
+          date: data.verifiedAt ? (data.verifiedAt.toDate ? data.verifiedAt.toDate() : data.verifiedAt) : null
         });
       });
+
+      // Sort by date descending (in memory instead of Firestore)
+      payments.sort((a, b) => new Date(b.date || 0) - new Date(a.date || 0));
 
       res.json({
         success: true,
@@ -872,13 +875,12 @@ async function updateUserSubscription(db, userId, email, planId) {
 // Helper function to update the user document with subscription data
 async function updateUserSubscriptionDoc(userRef, planId) {
   const currentDate = new Date();
-  const endDate = new Date(currentDate);
-  
+  let endDate = null;
+
   // Set end date based on plan (default to 1 month)
   // Free-trial and starter plans have no end date
-  if (planId === 'free-trial' || planId === 'starter') {
-    endDate = null;
-  } else {
+  if (planId !== 'free-trial' && planId !== 'starter') {
+    endDate = new Date(currentDate);
     switch (planId) {
       case 'yearly':
         endDate.setFullYear(endDate.getFullYear() + 1);
