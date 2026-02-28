@@ -4248,6 +4248,172 @@ app.delete('/api/restaurants/:restaurantId', authenticateToken, async (req, res)
   }
 });
 
+// Seed default menu & tables for first-time users
+app.post('/api/restaurants/:restaurantId/seed-default', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+    const { userId } = req.user;
+
+    const hasAccess = await validateRestaurantAccess(userId, restaurantId);
+    if (!hasAccess) {
+      return res.status(403).json({ error: 'Access denied' });
+    }
+
+    const restaurantDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
+    if (!restaurantDoc.exists) {
+      return res.status(404).json({ error: 'Restaurant not found' });
+    }
+
+    const restaurantData = restaurantDoc.data();
+    const existingItems = restaurantData.menu?.items || [];
+
+    // Skip if restaurant already has menu items
+    if (existingItems.length > 0) {
+      return res.json({ success: true, message: 'Restaurant already has menu items', seeded: false });
+    }
+
+    // Default menu items - 30 items across 6 categories
+    const defaultMenuItems = [
+      // Chinese
+      { name: 'Veg Manchurian', price: 180, category: 'Chinese', isVeg: true, description: 'Crispy vegetable balls in tangy manchurian sauce' },
+      { name: 'Hakka Noodles', price: 160, category: 'Chinese', isVeg: true, description: 'Stir-fried noodles with fresh vegetables' },
+      { name: 'Chicken Fried Rice', price: 200, category: 'Chinese', isVeg: false, description: 'Wok-tossed rice with chicken and vegetables' },
+      { name: 'Spring Rolls (4 pcs)', price: 140, category: 'Chinese', isVeg: true, description: 'Crispy rolls stuffed with mixed vegetables' },
+      { name: 'Chilli Chicken', price: 220, category: 'Chinese', isVeg: false, description: 'Spicy chicken tossed with peppers and onions' },
+      // Continental
+      { name: 'Grilled Chicken Breast', price: 320, category: 'Continental', isVeg: false, description: 'Herb-marinated grilled chicken with mashed potatoes' },
+      { name: 'Caesar Salad', price: 240, category: 'Continental', isVeg: false, description: 'Romaine lettuce with caesar dressing and croutons' },
+      { name: 'Cream of Mushroom Soup', price: 160, category: 'Continental', isVeg: true, description: 'Rich and creamy mushroom soup' },
+      { name: 'Fish and Chips', price: 340, category: 'Continental', isVeg: false, description: 'Beer-battered fish with crispy fries' },
+      { name: 'Pasta Alfredo', price: 260, category: 'Continental', isVeg: true, description: 'Penne in creamy parmesan alfredo sauce' },
+      // Pizza
+      { name: 'Margherita Pizza', price: 250, category: 'Pizza', isVeg: true, description: 'Classic tomato sauce, mozzarella and fresh basil' },
+      { name: 'Pepperoni Pizza', price: 350, category: 'Pizza', isVeg: false, description: 'Loaded with pepperoni and mozzarella cheese' },
+      { name: 'BBQ Chicken Pizza', price: 380, category: 'Pizza', isVeg: false, description: 'Smoky BBQ sauce with grilled chicken and onions' },
+      { name: 'Veggie Supreme Pizza', price: 300, category: 'Pizza', isVeg: true, description: 'Bell peppers, olives, mushrooms, onions and corn' },
+      { name: 'Farmhouse Pizza', price: 320, category: 'Pizza', isVeg: true, description: 'Fresh vegetables with herbs on a crispy crust' },
+      // Pastries & Desserts
+      { name: 'Chocolate Brownie', price: 120, category: 'Pastries & Desserts', isVeg: true, description: 'Warm fudgy brownie with chocolate sauce' },
+      { name: 'Red Velvet Cake', price: 180, category: 'Pastries & Desserts', isVeg: true, description: 'Classic red velvet with cream cheese frosting' },
+      { name: 'Tiramisu', price: 220, category: 'Pastries & Desserts', isVeg: true, description: 'Italian coffee-flavoured layered dessert' },
+      { name: 'Cheesecake', price: 200, category: 'Pastries & Desserts', isVeg: true, description: 'New York style baked cheesecake' },
+      { name: 'Black Forest Cake', price: 160, category: 'Pastries & Desserts', isVeg: true, description: 'Chocolate sponge with cherries and whipped cream' },
+      // Dal & Roti
+      { name: 'Dal Tadka', price: 140, category: 'Dal & Roti', isVeg: true, description: 'Yellow lentils tempered with cumin and garlic' },
+      { name: 'Dal Makhani', price: 180, category: 'Dal & Roti', isVeg: true, description: 'Slow-cooked black lentils in creamy tomato gravy' },
+      { name: 'Butter Naan', price: 40, category: 'Dal & Roti', isVeg: true, description: 'Soft leavened bread brushed with butter' },
+      { name: 'Tandoori Roti', price: 30, category: 'Dal & Roti', isVeg: true, description: 'Whole wheat bread baked in tandoor' },
+      { name: 'Paneer Butter Masala', price: 220, category: 'Dal & Roti', isVeg: true, description: 'Cottage cheese cubes in rich buttery tomato gravy' },
+      // Beverages
+      { name: 'Masala Chai', price: 30, category: 'Beverages', isVeg: true, description: 'Traditional Indian spiced tea' },
+      { name: 'Cold Coffee', price: 120, category: 'Beverages', isVeg: true, description: 'Chilled blended coffee with ice cream' },
+      { name: 'Fresh Lime Soda', price: 60, category: 'Beverages', isVeg: true, description: 'Refreshing lime with soda water' },
+      { name: 'Mango Lassi', price: 80, category: 'Beverages', isVeg: true, description: 'Creamy mango yogurt smoothie' },
+      { name: 'Virgin Mojito', price: 140, category: 'Beverages', isVeg: true, description: 'Mint and lime refresher with soda' },
+    ];
+
+    // Build menu items with proper IDs and shortcodes
+    const menuItems = defaultMenuItems.map((item, index) => ({
+      id: `item_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+      name: item.name,
+      description: item.description,
+      price: item.price,
+      category: item.category,
+      isVeg: item.isVeg,
+      spiceLevel: 'medium',
+      allergens: [],
+      image: null,
+      shortCode: String(index + 1),
+      status: 'active',
+      order: index,
+      isAvailable: true,
+      stockQuantity: null,
+      lowStockThreshold: 5,
+      isStockManaged: false,
+      availableFrom: null,
+      availableUntil: null,
+      variants: [],
+      customizations: [],
+      createdAt: new Date(),
+      updatedAt: new Date()
+    }));
+
+    // Build categories
+    const categoryEmojis = {
+      'Chinese': '🥡',
+      'Continental': '🍽️',
+      'Pizza': '🍕',
+      'Pastries & Desserts': '🍰',
+      'Dal & Roti': '🫓',
+      'Beverages': '🥤'
+    };
+
+    const categories = Object.keys(categoryEmojis).map(name => ({
+      id: categoryNameToId(name),
+      name,
+      emoji: categoryEmojis[name],
+      description: '',
+      createdAt: new Date(),
+      updatedAt: new Date()
+    }));
+
+    // Update restaurant with menu items, categories, and hasDefaultMenu flag
+    await db.collection(collections.restaurants).doc(restaurantId).update({
+      'menu.items': menuItems,
+      'menu.lastUpdated': new Date(),
+      categories: categories,
+      hasDefaultMenu: true,
+      updatedAt: new Date()
+    });
+
+    // Create 20 tables on Ground Floor
+    const floorId = 'floor_ground_floor';
+    const floorRef = db.collection('restaurants').doc(restaurantId).collection('floors').doc(floorId);
+    const floorDoc = await floorRef.get();
+
+    if (!floorDoc.exists) {
+      await floorRef.set({
+        name: 'Ground Floor',
+        description: 'Auto-created default floor',
+        restaurantId,
+        createdAt: new Date(),
+        updatedAt: new Date()
+      });
+    }
+
+    const batch = db.batch();
+    for (let i = 1; i <= 20; i++) {
+      const tableRef = floorRef.collection('tables').doc();
+      batch.set(tableRef, {
+        name: String(i),
+        floor: 'Ground Floor',
+        capacity: 4,
+        section: 'Main',
+        status: 'available',
+        currentOrderId: null,
+        lastOrderTime: null,
+        createdAt: new Date(),
+        updatedAt: new Date()
+      });
+    }
+    await batch.commit();
+
+    console.log(`✅ Seeded default menu (${menuItems.length} items) and 20 tables for restaurant ${restaurantId}`);
+
+    res.json({
+      success: true,
+      message: 'Default menu and tables created',
+      seeded: true,
+      menuItemsCount: menuItems.length,
+      tablesCount: 20
+    });
+
+  } catch (error) {
+    console.error('Seed default error:', error);
+    res.status(500).json({ error: 'Failed to seed default data' });
+  }
+});
+
 // Demo Menu API - Fetch menu from demo account (phone: 9000000000) for new user preview
 app.get('/api/demo-menu', async (req, res) => {
   try {
@@ -4627,7 +4793,13 @@ app.post('/api/menus/:restaurantId', authenticateToken, async (req, res) => {
     }
 
     const restaurantData = restaurantDoc.data();
-    const currentMenu = restaurantData.menu || { categories: [], items: [] };
+    let currentMenu = restaurantData.menu || { categories: [], items: [] };
+
+    // If restaurant has default seeded menu, clear it before adding real items
+    if (restaurantData.hasDefaultMenu) {
+      currentMenu = { categories: [], items: [] };
+      // Will set hasDefaultMenu: false in the update below
+    }
 
     // Calculate next shortCode if not provided
     let finalShortCode = shortCode;
@@ -4701,13 +4873,21 @@ app.post('/api/menus/:restaurantId', authenticateToken, async (req, res) => {
     }
 
     // Update restaurant document with new menu structure
-    await db.collection(collections.restaurants).doc(restaurantId).update({
+    const menuUpdate = {
       menu: {
         categories,
         items: updatedItems,
         lastUpdated: new Date()
       }
-    });
+    };
+
+    // Clear hasDefaultMenu flag and reset top-level categories when replacing default menu
+    if (restaurantData.hasDefaultMenu) {
+      menuUpdate.hasDefaultMenu = false;
+      menuUpdate.categories = [];
+    }
+
+    await db.collection(collections.restaurants).doc(restaurantId).update(menuUpdate);
 
     // AUTO-GENERATE RECIPE (Asynchronous - Fire and Forget)
     // We don't await this so the user response is instant.
@@ -8614,10 +8794,19 @@ app.post('/api/menus/bulk-save/:restaurantId', authenticateToken, async (req, re
     }
 
     const restaurantData = restaurantDoc.data();
-    const existingMenu = restaurantData.menu || { items: [] };
-    const existingItems = [...(existingMenu.items || [])];
-    // Use restaurant.categories (what getCategories returns), not menu.categories
-    let existingCategories = [...(restaurantData.categories || [])];
+
+    // If restaurant has default seeded menu, clear it before adding real items
+    let existingItems;
+    let existingCategories;
+    if (restaurantData.hasDefaultMenu) {
+      existingItems = [];
+      existingCategories = [];
+      console.log('🔄 Clearing default seeded menu before bulk save');
+    } else {
+      const existingMenu = restaurantData.menu || { items: [] };
+      existingItems = [...(existingMenu.items || [])];
+      existingCategories = [...(restaurantData.categories || [])];
+    }
 
     // Find the max numeric shortCode in existing items to ensure uniqueness
     let maxShortCode = 0;
@@ -8722,9 +8911,15 @@ app.post('/api/menus/bulk-save/:restaurantId', authenticateToken, async (req, re
     if (savedItems.length > 0) {
       const updateData = {
         categories: existingCategories,
-        menu: { ...(existingMenu || {}), items: existingItems, lastUpdated: new Date() },
+        menu: { items: existingItems, lastUpdated: new Date() },
         updatedAt: new Date()
       };
+
+      // Clear hasDefaultMenu flag when replacing default menu with real items
+      if (restaurantData.hasDefaultMenu) {
+        updateData.hasDefaultMenu = false;
+      }
+
       await db.collection(collections.restaurants).doc(restaurantId).update(updateData);
       console.log('✅ Bulk save: categories=', existingCategories.length, 'items=', existingItems.length);
     }
