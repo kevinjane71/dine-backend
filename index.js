@@ -5630,9 +5630,14 @@ app.post('/api/public/orders/:restaurantId', vercelSecurityMiddleware.publicAPI,
     const preTaxTotal = Math.max(0, subtotal - discountAmount - loyaltyDiscount);
 
     // Calculate tax if enabled
+    // Use same defaults as GET /api/admin/tax endpoint for consistency
     let taxAmount = 0;
     const taxBreakdown = [];
-    const taxSettings = restaurantData.taxSettings || {};
+    const taxSettings = restaurantData.taxSettings || {
+      enabled: true,
+      taxes: [{ id: 'gst', name: 'GST', rate: 5, enabled: true, type: 'percentage' }],
+      defaultTaxRate: 5
+    };
 
     if (taxSettings.enabled && preTaxTotal > 0) {
       if (taxSettings.taxes && Array.isArray(taxSettings.taxes) && taxSettings.taxes.length > 0) {
@@ -6060,7 +6065,12 @@ app.post('/api/orders', async (req, res) => {
     let taxAmount = 0;
     let finalAmount = totalAmount;
     const taxBreakdown = []; // Store individual tax lines for historical accuracy
-    const taxSettings = restaurantData.taxSettings || {};
+    // Use same defaults as GET /api/admin/tax endpoint for consistency
+    const taxSettings = restaurantData.taxSettings || {
+      enabled: true,
+      taxes: [{ id: 'gst', name: 'GST', rate: 5, enabled: true, type: 'percentage' }],
+      defaultTaxRate: 5
+    };
 
     if (taxSettings.enabled && totalAmount > 0) {
       if (taxSettings.taxes && Array.isArray(taxSettings.taxes) && taxSettings.taxes.length > 0) {
@@ -7506,10 +7516,15 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
       }
       
       // Calculate tax if tax settings are enabled
+      // Use same defaults as GET /api/admin/tax endpoint for consistency
       const restaurantDoc = await db.collection(collections.restaurants).doc(currentOrder.restaurantId).get();
       if (restaurantDoc.exists) {
         const restaurantData = restaurantDoc.data();
-        const taxSettings = restaurantData.taxSettings || {};
+        const taxSettings = restaurantData.taxSettings || {
+          enabled: true,
+          taxes: [{ id: 'gst', name: 'GST', rate: 5, enabled: true, type: 'percentage' }],
+          defaultTaxRate: 5
+        };
 
         if (taxSettings.enabled && updateData.totalAmount > 0) {
           let taxAmount = 0;
