@@ -8795,6 +8795,8 @@ app.post('/api/menus/bulk-save/:restaurantId', authenticateToken, async (req, re
 
     const restaurantData = restaurantDoc.data();
 
+    const existingMenu = restaurantData.menu || { items: [] };
+
     // If restaurant has default seeded menu, clear it before adding real items
     let existingItems;
     let existingCategories;
@@ -8803,7 +8805,6 @@ app.post('/api/menus/bulk-save/:restaurantId', authenticateToken, async (req, re
       existingCategories = [];
       console.log('🔄 Clearing default seeded menu before bulk save');
     } else {
-      const existingMenu = restaurantData.menu || { items: [] };
       existingItems = [...(existingMenu.items || [])];
       existingCategories = [...(restaurantData.categories || [])];
     }
@@ -8911,7 +8912,7 @@ app.post('/api/menus/bulk-save/:restaurantId', authenticateToken, async (req, re
     if (savedItems.length > 0) {
       const updateData = {
         categories: existingCategories,
-        menu: { items: existingItems, lastUpdated: new Date() },
+        menu: { ...(existingMenu || {}), items: existingItems, lastUpdated: new Date() },
         updatedAt: new Date()
       };
 
