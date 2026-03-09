@@ -317,6 +317,7 @@ const currencyRoutes = require('./routes/currencyRoutes');
 const ownerDashboardRoutes = require('./routes/ownerDashboard');
 const aiInsightsRoutes = require('./routes/aiInsights');
 const superAdminRoutes = require('./routes/superAdmin');
+const publicToolsRoutes = require('./routes/publicTools');
 
 // Debug email service initialization
 console.log('📧 Email service loaded:', !!emailService);
@@ -631,7 +632,9 @@ const authenticateToken = (req, res, next) => {
     const staffRoles = ['waiter', 'manager', 'employee', 'cashier', 'sales'];
     if (user.userId) {
       try {
-        const userDoc = await db.collection(collections.users).doc(user.userId).get();
+        // Check the right collection based on JWT source field (staffUsers for new staff, users for legacy/owners)
+        const collName = user.source === 'staffUsers' ? collections.staffUsers : collections.users;
+        const userDoc = await db.collection(collName).doc(user.userId).get();
         if (userDoc.exists) {
           const userData = userDoc.data();
           const role = (userData.role || '').toLowerCase();
@@ -704,7 +707,16 @@ async function validateRestaurantAccess(userId, restaurantId) {
       }
     }
 
-    // Check 3: Staff in users collection (fallback for existing staff)
+    // Check 3: Staff in staffUsers collection
+    const staffDoc = await db.collection(collections.staffUsers).doc(userId).get();
+    if (staffDoc.exists) {
+      const staffData = staffDoc.data();
+      if (staffData.restaurantId === restaurantId) {
+        return true;
+      }
+    }
+
+    // Check 4: Staff in users collection (fallback for legacy staff)
     const userDoc = await db.collection(collections.users).doc(userId).get();
     if (userDoc.exists) {
       const userData = userDoc.data();
@@ -719,6 +731,83 @@ async function validateRestaurantAccess(userId, restaurantId) {
     return false;
   }
 }
+
+// --- Staff dual-collection helpers (staffUsers + legacy users fallback) ---
+
+// Find staff doc by ID — checks staffUsers first, falls back to users
+async function findStaffDoc(staffId) {
+  let doc = await db.collection(collections.staffUsers).doc(staffId).get();
+  if (doc.exists) return { doc, collection: 'staffUsers' };
+  doc = await db.collection(collections.users).doc(staffId).get();
+  if (doc.exists) return { doc, collection: 'users' };
+  return { doc: null, collection: null };
+}
+
+// Find staff by loginId or username — checks staffUsers first, falls back to users
+async function findStaffByLogin(identifier) {
+  const staffRoles = ['waiter', 'manager', 'employee', 'cashier', 'sales'];
+  const idLower = identifier.toLowerCase();
+
+  // Try staffUsers by loginId
+  let query = await db.collection(collections.staffUsers)
+    .where('loginId', '==', identifier).where('status', '==', 'active').limit(1).get();
+  if (!query.empty) return { doc: query.docs[0], collection: 'staffUsers' };
+
+  // Try staffUsers by username
+  query = await db.collection(collections.staffUsers)
+    .where('usernameLower', '==', idLower).where('status', '==', 'active').limit(1).get();
+  if (!query.empty) {
+    const d = query.docs[0].data();
+    if (!['owner', 'customer'].includes((d.role || '').toLowerCase()))
+      return { doc: query.docs[0], collection: 'staffUsers' };
+  }
+
+  // Fall back to users by loginId
+  query = await db.collection(collections.users)
+    .where('loginId', '==', identifier).where('status', '==', 'active').limit(1).get();
+  if (!query.empty) {
+    const d = query.docs[0].data();
+    if (staffRoles.includes((d.role || '').toLowerCase()))
+      return { doc: query.docs[0], collection: 'users' };
+  }
+
+  // Fall back to users by username
+  query = await db.collection(collections.users)
+    .where('usernameLower', '==', idLower).where('status', '==', 'active').limit(1).get();
+  if (!query.empty) {
+    const d = query.docs[0].data();
+    if (staffRoles.includes((d.role || '').toLowerCase()))
+      return { doc: query.docs[0], collection: 'users' };
+  }
+
+  return { doc: null, collection: null };
+}
+
+// Get all staff for a restaurant from both collections
+async function getStaffForRestaurant(restaurantId) {
+  const staffRoles = ['waiter', 'manager', 'employee', 'cashier', 'sales'];
+  const results = [];
+
+  // From staffUsers (new)
+  const newStaff = await db.collection(collections.staffUsers)
+    .where('restaurantId', '==', restaurantId).get();
+  newStaff.forEach(doc => results.push({ id: doc.id, ...doc.data(), _collection: 'staffUsers' }));
+
+  // From users (legacy)
+  const oldStaff = await db.collection(collections.users)
+    .where('restaurantId', '==', restaurantId).get();
+  oldStaff.forEach(doc => {
+    const d = doc.data();
+    const role = (d.role || '').toLowerCase();
+    if (staffRoles.includes(role)) {
+      results.push({ id: doc.id, ...d, _collection: 'users' });
+    }
+  });
+
+  return results;
+}
+
+// --- End staff dual-collection helpers ---
 
 // Generate database schema documentation for ChatGPT
 function generateDatabaseSchema(restaurantId) {
@@ -2048,35 +2137,31 @@ app.post('/api/auth/refresh', async (req, res) => {
     let userDoc;
     let userData;
 
-    if (userRole === 'staff' || userRole === 'cashier' || userRole === 'sales' || userRole === 'manager' || userRole === 'employee') {
-      // Staff user - check in staff collection
-      userDoc = await db.collection(collections.staff).doc(userId).get();
-      if (!userDoc.exists) {
-        return res.status(403).json({
-          success: false,
-          error: 'User not found. Please login again.'
-        });
-      }
-      userData = userDoc.data();
+    // Check appropriate collection based on source field in JWT
+    const collName = decoded.source === 'staffUsers' ? collections.staffUsers : collections.users;
+    userDoc = await db.collection(collName).doc(userId).get();
 
-      // Check if staff is active
-      if (userData.isActive === false) {
-        return res.status(401).json({
-          success: false,
-          error: 'Your account has been deactivated.',
-          inactive: true
-        });
-      }
-    } else {
-      // Regular user - check in users collection
-      userDoc = await db.collection(collections.users).doc(userId).get();
-      if (!userDoc.exists) {
-        return res.status(403).json({
-          success: false,
-          error: 'User not found. Please login again.'
-        });
-      }
-      userData = userDoc.data();
+    // If not found in primary collection, try the other one
+    if (!userDoc.exists) {
+      const fallbackColl = decoded.source === 'staffUsers' ? collections.users : collections.staffUsers;
+      userDoc = await db.collection(fallbackColl).doc(userId).get();
+    }
+
+    if (!userDoc.exists) {
+      return res.status(403).json({
+        success: false,
+        error: 'User not found. Please login again.'
+      });
+    }
+    userData = userDoc.data();
+
+    // Check if staff is active
+    if (userData.status === 'inactive' || userData.isActive === false) {
+      return res.status(401).json({
+        success: false,
+        error: 'Your account has been deactivated.',
+        inactive: true
+      });
     }
 
     // Generate new token with fresh 30-day expiry
@@ -2086,7 +2171,8 @@ app.post('/api/auth/refresh', async (req, res) => {
         email: decoded.email || userData.email,
         role: userRole,
         ...(decoded.restaurantId && { restaurantId: decoded.restaurantId }),
-        ...(decoded.ownerId && { ownerId: decoded.ownerId })
+        ...(decoded.ownerId && { ownerId: decoded.ownerId }),
+        ...(decoded.source && { source: decoded.source })
       },
       process.env.JWT_SECRET,
       { expiresIn: '30d' }
@@ -2889,9 +2975,9 @@ app.post('/api/staff/change-password', authenticateToken, async (req, res) => {
       return res.status(400).json({ error: 'New password must be at least 6 characters long' });
     }
 
-    // Get user document
-    const userDoc = await db.collection(collections.users).doc(userId).get();
-    if (!userDoc.exists) {
+    // Get user document — check correct collection based on JWT source
+    const { doc: userDoc, collection: userColl } = await findStaffDoc(userId);
+    if (!userDoc || !userDoc.exists) {
       return res.status(404).json({ error: 'Staff member not found' });
     }
 
@@ -2913,7 +2999,7 @@ app.post('/api/staff/change-password', authenticateToken, async (req, res) => {
 
     // Check if user has a password set
     if (!userData.password) {
-      return res.status(400).json({ 
+      return res.status(400).json({
         error: 'Password not set. Please contact your administrator.',
         noPasswordSet: true
       });
@@ -8215,6 +8301,9 @@ app.use('/api', customUrlRoutes);
 app.set('printInstallerBucket', bucket);
 app.use('/api/print-installer', printInstallerRoutes);
 
+// Public AI tools (no auth, IP rate-limited)
+app.use('/api/public/tools', vercelSecurityMiddleware.publicAPI, publicToolsRoutes);
+
 // Generic image upload API
 app.post('/api/upload/image', authenticateToken, upload.single('image'), async (req, res) => {
   try {
@@ -10078,19 +10167,23 @@ app.get('/api/waiters/:restaurantId', authenticateToken, async (req, res) => {
   try {
     const { restaurantId } = req.params;
 
-    // Get all active staff (any role except owner/customer)
-    const snapshot = await db.collection(collections.users)
-      .where('restaurantId', '==', restaurantId)
-      .where('status', '==', 'active')
-      .get();
+    // Get all active staff from both staffUsers and legacy users collections
+    const [staffUsersSnap, usersSnap] = await Promise.all([
+      db.collection(collections.staffUsers)
+        .where('restaurantId', '==', restaurantId)
+        .where('status', '==', 'active')
+        .get(),
+      db.collection(collections.users)
+        .where('restaurantId', '==', restaurantId)
+        .where('status', '==', 'active')
+        .get()
+    ]);
 
     const waiters = [];
-    snapshot.forEach(doc => {
+    const processDoc = (doc) => {
       const userData = doc.data();
-      // Skip owners and customers
       const role = (userData.role || '').toLowerCase();
       if (role === 'owner' || role === 'customer') return;
-
       waiters.push({
         id: doc.id,
         name: userData.name,
@@ -10099,7 +10192,9 @@ app.get('/api/waiters/:restaurantId', authenticateToken, async (req, res) => {
         phone: userData.phone,
         email: userData.email
       });
-    });
+    };
+    staffUsersSnap.forEach(processDoc);
+    usersSnap.forEach(processDoc);
 
     res.json({ waiters });
 
@@ -10117,24 +10212,15 @@ app.get('/api/staff/:restaurantId', authenticateToken, requireOwnerRole, async (
   try {
     const { restaurantId } = req.params;
 
-    // Get all users with this restaurantId (staff members)
-    // Don't filter by specific roles - show all staff regardless of role
-    const snapshot = await db.collection(collections.users)
-      .where('restaurantId', '==', restaurantId)
-      .get();
+    // Get all staff from both staffUsers and legacy users collections
+    const allStaff = await getStaffForRestaurant(restaurantId);
 
     const staff = [];
 
     // Process each staff member and fetch their credentials
-    for (const doc of snapshot.docs) {
-      const userData = doc.data();
-      const staffId = doc.id;
-
-      // Skip owners and customers - only show actual staff
-      const userRole = (userData.role || '').toLowerCase();
-      if (userRole === 'owner' || userRole === 'customer') {
-        continue;
-      }
+    for (const staffEntry of allStaff) {
+      const userData = staffEntry;
+      const staffId = staffEntry.id;
 
       // Check if temporary credentials exist
       let tempPassword = null;
@@ -10189,13 +10275,13 @@ app.get('/api/staff/:staffId/credentials', authenticateToken, requireOwnerRole, 
   try {
     const { staffId } = req.params;
 
-    const staffDoc = await db.collection(collections.users).doc(staffId).get();
-    if (!staffDoc.exists) {
+    const { doc: staffDoc, collection: staffColl } = await findStaffDoc(staffId);
+    if (!staffDoc || !staffDoc.exists) {
       return res.status(404).json({ error: 'Staff member not found' });
     }
 
     const staffData = staffDoc.data();
-    
+
     // Check if temporary credentials exist
     const credentialsDoc = await db.collection('staffCredentials').doc(staffId).get();
     
@@ -10245,15 +10331,15 @@ app.delete('/api/staff/:staffId', authenticateToken, requireOwnerRole, async (re
     console.log(`🗑️ Delete Staff API - Staff ID: ${staffId}`);
 
     // Get the staff member to verify they exist and get restaurant info
-    const staffDoc = await db.collection(collections.users).doc(staffId).get();
-    if (!staffDoc.exists) {
+    const { doc: staffDoc, collection: staffColl } = await findStaffDoc(staffId);
+    if (!staffDoc || !staffDoc.exists) {
       return res.status(404).json({ error: 'Staff member not found' });
     }
 
     const staffData = staffDoc.data();
 
-    // Delete the staff member
-    await db.collection(collections.users).doc(staffId).delete();
+    // Delete the staff member from the collection it was found in
+    await db.collection(staffColl === 'staffUsers' ? collections.staffUsers : collections.users).doc(staffId).delete();
 
     // Also delete any temporary credentials if they exist
     try {
@@ -10297,34 +10383,33 @@ app.post('/api/staff/:restaurantId', authenticateToken, requireOwnerRole, async 
         return res.status(400).json({ error: 'Username can only contain letters, numbers and underscore' });
       }
       usernameLower = raw.toLowerCase();
-      const existingByUsername = await db.collection(collections.users).where('usernameLower', '==', usernameLower).get();
-      if (!existingByUsername.empty) {
+      // Check username uniqueness in both staffUsers and users collections
+      const existingInStaff = await db.collection(collections.staffUsers).where('usernameLower', '==', usernameLower).get();
+      const existingInUsers = await db.collection(collections.users).where('usernameLower', '==', usernameLower).get();
+      if (!existingInStaff.empty || !existingInUsers.empty) {
         return res.status(400).json({ error: 'Username already exists. Choose a different username.' });
       }
       username = raw;
     }
 
 
-    // Check if email already exists (only if email is provided)
+    // Check if email already exists in both collections (only if email is provided)
     if (email) {
-    const existingUser = await db.collection(collections.users)
-      .where('email', '==', email)
-      .get();
-
-    if (!existingUser.empty) {
-      return res.status(400).json({ error: 'Email already registered' });
+      const existingInStaff = await db.collection(collections.staffUsers).where('email', '==', email).get();
+      const existingInUsers = await db.collection(collections.users).where('email', '==', email).get();
+      if (!existingInStaff.empty || !existingInUsers.empty) {
+        return res.status(400).json({ error: 'Email already registered' });
       }
     }
 
-    // Generate unique 5-digit numeric User ID
+    // Generate unique 5-digit numeric User ID (check both collections)
     let userId;
     let isUnique = false;
     while (!isUnique) {
       userId = Math.floor(10000 + Math.random() * 90000).toString(); // 5-digit number
-      const existingUserId = await db.collection(collections.users)
-        .where('loginId', '==', userId)
-        .get();
-      isUnique = existingUserId.empty;
+      const existInStaff = await db.collection(collections.staffUsers).where('loginId', '==', userId).get();
+      const existInUsers = await db.collection(collections.users).where('loginId', '==', userId).get();
+      isUnique = existInStaff.empty && existInUsers.empty;
     }
 
     // Generate random password for staff
@@ -10363,7 +10448,7 @@ app.post('/api/staff/:restaurantId', authenticateToken, requireOwnerRole, async 
       }
     };
 
-    const staffRef = await db.collection(collections.users).add(staffData);
+    const staffRef = await db.collection(collections.staffUsers).add(staffData);
 
     // Add to userRestaurants collection for access control
     await db.collection(collections.userRestaurants).add({
@@ -10425,6 +10510,12 @@ app.patch('/api/staff/:staffId', authenticateToken, requireOwnerRole, async (req
     const { staffId } = req.params;
     const { name, phone, email, role, status, pageAccess } = req.body;
 
+    // Find staff in the correct collection
+    const { doc: staffDoc, collection: staffColl } = await findStaffDoc(staffId);
+    if (!staffDoc || !staffDoc.exists) {
+      return res.status(404).json({ error: 'Staff member not found' });
+    }
+
     const updateData = {
       updatedAt: new Date()
     };
@@ -10436,7 +10527,8 @@ app.patch('/api/staff/:staffId', authenticateToken, requireOwnerRole, async (req
     if (status) updateData.status = status;
     if (pageAccess) updateData.pageAccess = pageAccess;
 
-    await db.collection(collections.users).doc(staffId).update(updateData);
+    const collName = staffColl === 'staffUsers' ? collections.staffUsers : collections.users;
+    await db.collection(collName).doc(staffId).update(updateData);
 
     res.json({ message: 'Staff member updated successfully' });
 
@@ -10446,28 +10538,17 @@ app.patch('/api/staff/:staffId', authenticateToken, requireOwnerRole, async (req
   }
 });
 
-// Delete staff member
-app.delete('/api/staff/:staffId', authenticateToken, requireOwnerRole, async (req, res) => {
-  try {
-    const { staffId } = req.params;
-
-    await db.collection(collections.users).doc(staffId).delete();
-
-    res.json({ message: 'Staff member deleted successfully' });
-
-  } catch (error) {
-    console.error('Delete staff error:', error);
-    res.status(500).json({ error: 'Failed to delete staff member' });
-  }
-});
+// (Duplicate DELETE /api/staff/:staffId removed — handled above with findStaffDoc)
 
 // Get user page access
 app.get('/api/user/page-access', authenticateToken, async (req, res) => {
   try {
     const userId = req.user.userId;
-    
-    const userDoc = await db.collection(collections.users).doc(userId).get();
-    
+
+    // Check the right collection based on JWT source
+    const collName = req.user.source === 'staffUsers' ? collections.staffUsers : collections.users;
+    const userDoc = await db.collection(collName).doc(userId).get();
+
     if (!userDoc.exists) {
       return res.status(404).json({ error: 'User not found' });
     }
@@ -10500,9 +10581,11 @@ app.get('/api/auth/me', authenticateToken, async (req, res) => {
   try {
     const userId = req.user.userId;
     console.log('🔍 /api/auth/me - userId:', userId);
-    
-    const userDoc = await db.collection(collections.users).doc(userId).get();
-    
+
+    // Check the right collection based on JWT source
+    const collName = req.user.source === 'staffUsers' ? collections.staffUsers : collections.users;
+    const userDoc = await db.collection(collName).doc(userId).get();
+
     if (!userDoc.exists) {
       console.log('❌ User not found:', userId);
       return res.status(404).json({ error: 'User not found' });
@@ -10616,37 +10699,14 @@ app.post('/api/auth/staff/login', async (req, res) => {
       return res.status(400).json({ error: 'User ID/username and password are required' });
     }
 
-    // Find staff: first by loginId (User ID), then by username (case-insensitive)
-    // Don't filter by specific roles - allow any role except owner/customer
-    let staffQuery = await db.collection(collections.users)
-      .where('loginId', '==', identifier)
-      .where('status', '==', 'active')
-      .get();
+    // Find staff in staffUsers first, then fall back to users
+    const { doc: foundDoc, collection: staffColl } = await findStaffByLogin(identifier);
 
-    // Filter out owners and customers
-    let staffDocs = staffQuery.docs.filter(doc => {
-      const role = (doc.data().role || '').toLowerCase();
-      return role !== 'owner' && role !== 'customer';
-    });
-
-    if (staffDocs.length === 0) {
-      const usernameLower = identifier.toLowerCase();
-      staffQuery = await db.collection(collections.users)
-        .where('usernameLower', '==', usernameLower)
-        .where('status', '==', 'active')
-        .get();
-
-      staffDocs = staffQuery.docs.filter(doc => {
-        const role = (doc.data().role || '').toLowerCase();
-        return role !== 'owner' && role !== 'customer';
-      });
-    }
-
-    if (staffDocs.length === 0) {
+    if (!foundDoc) {
       return res.status(404).json({ error: 'Staff member not found or inactive' });
     }
 
-    const staffDoc = staffDocs[0];
+    const staffDoc = foundDoc;
     const staffData = staffDoc.data();
 
     // Check password
@@ -10673,12 +10733,13 @@ app.post('/api/auth/staff/login', async (req, res) => {
     });
 
     const token = jwt.sign(
-      { 
-        userId: staffDoc.id, 
-        email: staffData.email, 
+      {
+        userId: staffDoc.id,
+        email: staffData.email,
         role: staffData.role,
         restaurantId: staffData.restaurantId,
-        ownerId: restaurantData?.ownerId
+        ownerId: restaurantData?.ownerId,
+        source: staffColl // 'staffUsers' or 'users' — tells authenticateToken which collection to check
       },
       process.env.JWT_SECRET,
       { expiresIn: '30d' }

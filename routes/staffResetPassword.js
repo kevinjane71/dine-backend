@@ -26,7 +26,11 @@ router.post('/:staffId/reset-password', authenticateToken, requireOwnerRole, asy
     const { staffId } = req.params;
     const { newPassword, confirmPassword, username: usernameInput } = req.body;
 
-    const staffDoc = await db.collection(collections.users).doc(staffId).get();
+    // Check staffUsers first, fall back to users
+    let staffDoc = await db.collection(collections.staffUsers).doc(staffId).get();
+    if (!staffDoc.exists) {
+      staffDoc = await db.collection(collections.users).doc(staffId).get();
+    }
     if (!staffDoc.exists) {
       return res.status(404).json({ error: 'Staff member not found' });
     }
@@ -44,10 +48,13 @@ router.post('/:staffId/reset-password', authenticateToken, requireOwnerRole, asy
     const parsed = parseUsername(usernameInput, res);
     if (parsed === null && usernameInput != null && String(usernameInput).trim() !== '') return; // parseUsername already sent error
     if (parsed) {
-      const existingByUsername = await db.collection(collections.users)
-        .where('usernameLower', '==', parsed.usernameLower)
-        .get();
-      const takenByOther = existingByUsername.docs.some(doc => doc.id !== staffId);
+      // Check username uniqueness in both collections
+      const existingInStaff = await db.collection(collections.staffUsers)
+        .where('usernameLower', '==', parsed.usernameLower).get();
+      const existingInUsers = await db.collection(collections.users)
+        .where('usernameLower', '==', parsed.usernameLower).get();
+      const allDocs = [...existingInStaff.docs, ...existingInUsers.docs];
+      const takenByOther = allDocs.some(doc => doc.id !== staffId);
       if (takenByOther) {
         return res.status(400).json({ error: 'Username already exists. Choose a different username.' });
       }

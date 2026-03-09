@@ -98,8 +98,14 @@ router.get('/dashboard', authenticateToken, requireOwnerRole, async (req, res) =
         .get()
     );
 
-    // Fetch staff count for all restaurants
-    const staffPromises = restaurantIds.map(restaurantId =>
+    // Fetch staff count for all restaurants (from both staffUsers and users)
+    const staffNewPromises = restaurantIds.map(restaurantId =>
+      db.collection(collections.staffUsers)
+        .where('restaurantId', '==', restaurantId)
+        .where('status', '==', 'active')
+        .get()
+    );
+    const staffLegacyPromises = restaurantIds.map(restaurantId =>
       db.collection(collections.users)
         .where('restaurantId', '==', restaurantId)
         .where('status', '==', 'active')
@@ -113,11 +119,17 @@ router.get('/dashboard', authenticateToken, requireOwnerRole, async (req, res) =
         .get()
     );
 
-    const [ordersResults, staffResults, inventoryResults] = await Promise.all([
+    const [ordersResults, staffNewResults, staffLegacyResults, inventoryResults] = await Promise.all([
       Promise.all(ordersPromises),
-      Promise.all(staffPromises),
+      Promise.all(staffNewPromises),
+      Promise.all(staffLegacyPromises),
       Promise.all(inventoryPromises)
     ]);
+
+    // Merge staff results: combine docs from both collections per restaurant
+    const staffResults = restaurantIds.map((_, index) => ({
+      docs: [...staffNewResults[index].docs, ...staffLegacyResults[index].docs]
+    }));
 
     // Process results for each restaurant
     let totalOrders = 0;
@@ -503,21 +515,25 @@ router.get('/staff', authenticateToken, requireOwnerRole, async (req, res) => {
       });
     }
 
-    // Fetch staff for all restaurants
+    // Fetch staff for all restaurants from both staffUsers and users collections
     // Note: Firestore 'in' query limited to 10 values, so we need to batch
     const batchSize = 10;
     const staffPromises = [];
 
     for (let i = 0; i < restaurantIds.length; i += batchSize) {
       const batch = restaurantIds.slice(i, i + batchSize);
-      let query = db.collection(collections.users)
+
+      // Query staffUsers collection
+      let staffQuery = db.collection(collections.staffUsers)
         .where('restaurantId', 'in', batch);
+      if (status) staffQuery = staffQuery.where('status', '==', status);
+      staffPromises.push(staffQuery.get());
 
-      if (status) {
-        query = query.where('status', '==', status);
-      }
-
-      staffPromises.push(query.get());
+      // Query legacy users collection
+      let usersQuery = db.collection(collections.users)
+        .where('restaurantId', 'in', batch);
+      if (status) usersQuery = usersQuery.where('status', '==', status);
+      staffPromises.push(usersQuery.get());
     }
 
     const staffResults = await Promise.all(staffPromises);
@@ -871,8 +887,13 @@ router.patch('/staff/:staffId/status', authenticateToken, requireOwnerRole, asyn
       return res.status(400).json({ error: 'Invalid status. Must be active or inactive.' });
     }
 
-    // Get staff member
-    const staffDoc = await db.collection(collections.users).doc(staffId).get();
+    // Get staff member — check staffUsers first, fall back to users
+    let staffDoc = await db.collection(collections.staffUsers).doc(staffId).get();
+    let staffColl = collections.staffUsers;
+    if (!staffDoc.exists) {
+      staffDoc = await db.collection(collections.users).doc(staffId).get();
+      staffColl = collections.users;
+    }
 
     if (!staffDoc.exists) {
       return res.status(404).json({ error: 'Staff member not found' });
@@ -889,8 +910,8 @@ router.patch('/staff/:staffId/status', authenticateToken, requireOwnerRole, asyn
       return res.status(403).json({ error: 'Access denied. You do not own this restaurant.' });
     }
 
-    // Update status
-    await db.collection(collections.users).doc(staffId).update({
+    // Update status in the correct collection
+    await db.collection(staffColl).doc(staffId).update({
       status,
       updatedAt: new Date()
     });

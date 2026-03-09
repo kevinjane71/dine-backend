@@ -758,13 +758,20 @@ router.post('/send-test-report', authenticateToken, requireOwnerRole, async (req
       }
     }
 
-    // Get staff count
+    // Get staff count from both staffUsers and users collections
     for (const restaurantId of restaurantIds) {
-      const staffSnap = await db.collection(collections.users)
-        .where('restaurantId', '==', restaurantId)
-        .where('status', '==', 'active')
-        .get();
-      staffSnap.docs.forEach(doc => {
+      const [staffNewSnap, staffLegacySnap] = await Promise.all([
+        db.collection(collections.staffUsers)
+          .where('restaurantId', '==', restaurantId)
+          .where('status', '==', 'active')
+          .get(),
+        db.collection(collections.users)
+          .where('restaurantId', '==', restaurantId)
+          .where('status', '==', 'active')
+          .get()
+      ]);
+      staffNewSnap.docs.forEach(() => staffCount++);
+      staffLegacySnap.docs.forEach(doc => {
         const role = (doc.data().role || '').toLowerCase();
         if (role !== 'owner' && role !== 'customer') staffCount++;
       });

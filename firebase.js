@@ -86,6 +86,7 @@ const collections = {
   tables: 'tables',
   floors: 'floors',
   bookings: 'bookings',
+  staffUsers: 'staffUsers',
   userRestaurants: 'userRestaurants',
   restaurantSettings: 'restaurantSettings',
   discountSettings: 'discountSettings',

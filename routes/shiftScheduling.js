@@ -213,12 +213,21 @@ router.post('/shifts/:restaurantId/auto-generate', authenticateToken, requireOwn
       });
     }
 
-    // Fetch all active staff for the restaurant
-    const staffSnapshot = await db.collection(collections.users)
-      .where('restaurantId', '==', restaurantId)
-      .where('status', '==', 'active')
-      .where('role', 'in', ['waiter', 'manager', 'employee', 'cook', 'bartender', 'server', 'dishwasher'])
-      .get();
+    // Fetch all active staff from both staffUsers and legacy users collections
+    const staffRoles = ['waiter', 'manager', 'employee', 'cook', 'bartender', 'server', 'dishwasher'];
+    const [staffNewSnap, staffLegacySnap] = await Promise.all([
+      db.collection(collections.staffUsers)
+        .where('restaurantId', '==', restaurantId)
+        .where('status', '==', 'active')
+        .where('role', 'in', staffRoles)
+        .get(),
+      db.collection(collections.users)
+        .where('restaurantId', '==', restaurantId)
+        .where('status', '==', 'active')
+        .where('role', 'in', staffRoles)
+        .get()
+    ]);
+    const staffSnapshot = { docs: [...staffNewSnap.docs, ...staffLegacySnap.docs] };
 
     const staff = [];
     for (const doc of staffSnapshot.docs) {
