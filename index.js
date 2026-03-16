@@ -4173,6 +4173,16 @@ app.post('/api/restaurants', authenticateToken, async (req, res) => {
       description: description || '',
       operatingHours: operatingHours || {},
       features: features || [],
+      businessType: req.body.businessType || 'restaurant',
+      posSettings: (() => {
+        const type = req.body.businessType || 'restaurant';
+        const defaults = { defaultOrderType: 'dine-in', defaultPaymentMethod: 'cash' };
+        if (type === 'cafe') return { ...defaults, defaultOrderType: 'takeaway', hideTableField: true };
+        if (type === 'bakery') return { ...defaults, defaultOrderType: 'takeaway', hideTableField: true, hidePlaceOrder: true };
+        if (type === 'ice_cream') return { ...defaults, defaultOrderType: 'takeaway', hideTableField: true, hidePlaceOrder: true };
+        if (type === 'qsr') return { ...defaults, defaultOrderType: 'takeaway', hideTableField: true, hidePlaceOrder: true };
+        return defaults; // restaurant & bar: all enabled
+      })(),
       ownerId: userId,
       subdomain: subdomain,
       subdomainEnabled: false, // Default: disabled, user can enable later
@@ -4232,7 +4242,7 @@ app.patch('/api/restaurants/:restaurantId', authenticateToken, async (req, res) 
     }
 
     // Update allowed basic fields
-    const allowedFields = ['name', 'address', 'city', 'phone', 'email', 'cuisine', 'description', 'logo', 'coverImage', 'openingHours', 'isActive', 'legalBusinessName', 'gstin'];
+    const allowedFields = ['name', 'address', 'city', 'phone', 'email', 'cuisine', 'description', 'logo', 'coverImage', 'openingHours', 'isActive', 'legalBusinessName', 'gstin', 'businessType', 'staffCount', 'seatingCapacity'];
     allowedFields.forEach(field => {
       if (req.body[field] !== undefined) {
         updateData[field] = req.body[field];
@@ -4293,6 +4303,12 @@ app.patch('/api/restaurants/:restaurantId', authenticateToken, async (req, res) 
     if (req.body.printSettings !== undefined) {
       const existing = restaurant.data().printSettings || {};
       updateData.printSettings = { ...existing, ...req.body.printSettings };
+    }
+
+    // POS settings (dashboard customization: button visibility, labels, payment methods, customer fields)
+    if (req.body.posSettings !== undefined) {
+      const existing = restaurant.data().posSettings || {};
+      updateData.posSettings = { ...existing, ...req.body.posSettings };
     }
 
     if (Object.keys(updateData).length === 0) {
@@ -5994,7 +6010,9 @@ app.post('/api/orders', async (req, res) => {
       seatNumber
     } = req.body;
 
-    if (!restaurantId || !items || items.length === 0) {
+    // Allow empty items for saved orders (bar tabs opened without items)
+    const isSavedOrder = req.body.status === 'saved';
+    if (!restaurantId || (!isSavedOrder && (!items || items.length === 0))) {
       console.log('❌ Order Creation Error: Missing required fields', { restaurantId: !!restaurantId, itemsCount: items?.length || 0 });
       return res.status(400).json({ error: 'Restaurant ID and items are required' });
     }
