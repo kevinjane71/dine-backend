@@ -114,6 +114,37 @@ function updateDailyStatsRevenueDiff(restaurantId, order, oldAmount, newAmount, 
   }
 }
 
+// Calculate pricing adjustments (zone surcharge, time-based pricing)
+function calculatePricingAdjustments(restaurantData, { tableSection, orderTime, subtotal }) {
+  const result = { zoneSurcharge: 0, appliedRules: [] };
+  const pricingSettings = restaurantData.pricingSettings;
+  if (!pricingSettings) return result;
+
+  // Zone pricing — flat surcharge on bill based on table section
+  const zonePricing = pricingSettings.zonePricing;
+  if (zonePricing?.enabled && tableSection && Array.isArray(zonePricing.zones)) {
+    const matchedZone = zonePricing.zones.find(z =>
+      z.isActive && z.sectionMatch && tableSection.toLowerCase().includes(z.sectionMatch.toLowerCase())
+    );
+    if (matchedZone && subtotal > 0) {
+      const surcharge = matchedZone.markupType === 'percentage'
+        ? Math.round((subtotal * (matchedZone.markupValue || 0) / 100) * 100) / 100
+        : Math.round((matchedZone.markupValue || 0) * 100) / 100;
+      result.zoneSurcharge = surcharge;
+      result.appliedRules.push({
+        type: 'zone',
+        zoneId: matchedZone.id,
+        zoneName: matchedZone.name,
+        markupType: matchedZone.markupType,
+        markupValue: matchedZone.markupValue,
+        surchargeAmount: surcharge
+      });
+    }
+  }
+
+  return result;
+}
+
 // Generate daily order ID (starts from 1 each day)
 async function generateDailyOrderId(restaurantId) {
   try {
@@ -4242,7 +4273,7 @@ app.patch('/api/restaurants/:restaurantId', authenticateToken, async (req, res) 
     }
 
     // Update allowed basic fields
-    const allowedFields = ['name', 'address', 'city', 'phone', 'email', 'cuisine', 'description', 'logo', 'coverImage', 'openingHours', 'isActive', 'legalBusinessName', 'gstin', 'businessType', 'staffCount', 'seatingCapacity'];
+    const allowedFields = ['name', 'address', 'city', 'phone', 'email', 'cuisine', 'description', 'logo', 'coverImage', 'openingHours', 'isActive', 'legalBusinessName', 'gstin', 'businessType', 'staffCount', 'seatingCapacity', 'pricingSettings'];
     allowedFields.forEach(field => {
       if (req.body[field] !== undefined) {
         updateData[field] = req.body[field];
@@ -4954,6 +4985,11 @@ app.post('/api/menus/:restaurantId', authenticateToken, async (req, res) => {
             description: c.description || ''
           }))
         : [],
+      // Bar-specific fields
+      spiritCategory: req.body.spiritCategory || null,
+      ingredients: req.body.ingredients || null,
+      abv: req.body.abv ? parseFloat(req.body.abv) : null,
+      servingUnit: req.body.servingUnit || null,
       createdAt: new Date(),
       updatedAt: new Date()
     };
@@ -5059,10 +5095,11 @@ app.patch('/api/menus/item/:id', authenticateToken, async (req, res) => {
     
     // Update allowed fields
     const allowedFields = [
-      'name', 'description', 'price', 'category', 'isVeg', 'spiceLevel', 
+      'name', 'description', 'price', 'category', 'isVeg', 'spiceLevel',
       'allergens', 'image', 'shortCode', 'status', 'order',
       'isAvailable', 'stockQuantity', 'lowStockThreshold', 'isStockManaged',
-      'availableFrom', 'availableUntil', 'variants', 'customizations'
+      'availableFrom', 'availableUntil', 'variants', 'customizations',
+      'spiritCategory', 'ingredients', 'abv', 'servingUnit'
     ];
     
     allowedFields.forEach(field => {
@@ -5660,16 +5697,55 @@ app.post('/api/public/orders/:restaurantId', vercelSecurityMiddleware.publicAPI,
         const meetsMinOrder = subtotal >= (offer.minOrderValue || 0);
         const isValidFirstOrder = !offer.isFirstOrderOnly || isFirstOrder;
 
-        if (offer.isActive && offer.restaurantId === restaurantId && isValidDate && isUnderUsageLimit && meetsMinOrder && isValidFirstOrder) {
-          // Calculate discount for this offer
+        // Check schedule (happy hour / time-based)
+        let isValidSchedule = true;
+        if (offer.schedule && offer.schedule.type === 'recurring') {
+          const currentDay = now.getDay(); // 0=Sunday
+          const currentTime = `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`;
+          const scheduleDays = offer.schedule.days || [];
+          const startTime = offer.schedule.startTime || '00:00';
+          const endTime = offer.schedule.endTime || '23:59';
+          isValidSchedule = scheduleDays.includes(currentDay) && currentTime >= startTime && currentTime <= endTime;
+        }
+
+        if (offer.isActive && offer.restaurantId === restaurantId && isValidDate && isUnderUsageLimit && meetsMinOrder && isValidFirstOrder && isValidSchedule) {
+          // Calculate discount based on scope
           let offerDiscount = 0;
-          if (offer.discountType === 'percentage') {
-            offerDiscount = (subtotal * offer.discountValue) / 100;
+          const offerScope = offer.scope || 'order';
+
+          // Determine applicable subtotal based on scope
+          let applicableSubtotal = subtotal;
+          if (offerScope === 'category' && Array.isArray(offer.targetCategories) && offer.targetCategories.length > 0) {
+            applicableSubtotal = (orderItems || [])
+              .filter(oi => offer.targetCategories.includes(oi.category))
+              .reduce((sum, oi) => sum + (oi.total || oi.price * oi.quantity), 0);
+          } else if (offerScope === 'item' && Array.isArray(offer.targetItems) && offer.targetItems.length > 0) {
+            applicableSubtotal = (orderItems || [])
+              .filter(oi => offer.targetItems.includes(oi.menuItemId))
+              .reduce((sum, oi) => sum + (oi.total || oi.price * oi.quantity), 0);
+          }
+
+          if (offer.promotionType === 'bogo' && offer.bogoConfig) {
+            // BOGO: calculate free items
+            const bogoItems = offerScope === 'item' && offer.targetItems?.length > 0
+              ? (orderItems || []).filter(oi => offer.targetItems.includes(oi.menuItemId))
+              : (orderItems || []);
+            const totalQty = bogoItems.reduce((sum, oi) => sum + oi.quantity, 0);
+            const buyQty = offer.bogoConfig.buyQty || 2;
+            const getQty = offer.bogoConfig.getQty || 1;
+            const getDiscount = offer.bogoConfig.getDiscount || 100;
+            const sets = Math.floor(totalQty / (buyQty + getQty));
+            if (sets > 0 && bogoItems.length > 0) {
+              const cheapestPrice = Math.min(...bogoItems.map(oi => oi.price));
+              offerDiscount = sets * getQty * cheapestPrice * (getDiscount / 100);
+            }
+          } else if (offer.discountType === 'percentage') {
+            offerDiscount = (applicableSubtotal * offer.discountValue) / 100;
             if (offer.maxDiscount && offerDiscount > offer.maxDiscount) {
               offerDiscount = offer.maxDiscount;
             }
           } else {
-            offerDiscount = offer.discountValue;
+            offerDiscount = Math.min(offer.discountValue, applicableSubtotal);
           }
 
           const appliedOfferData = {
@@ -5677,15 +5753,17 @@ app.post('/api/public/orders/:restaurantId', vercelSecurityMiddleware.publicAPI,
             name: offer.name,
             discountType: offer.discountType,
             discountValue: offer.discountValue,
-            discountApplied: offerDiscount
+            discountApplied: offerDiscount,
+            scope: offerScope,
+            promotionType: offer.promotionType || 'discount'
           };
 
           appliedOffers.push(appliedOfferData);
           discountAmount += offerDiscount;
 
-          console.log(`🎁 Offer applied: ${offer.name}, Discount: ₹${offerDiscount}`);
+          console.log(`🎁 Offer applied: ${offer.name}, Discount: ₹${offerDiscount}, Scope: ${offerScope}`);
         } else {
-          console.log(`⚠️ Offer ${currentOfferId} not valid for this order`);
+          console.log(`⚠️ Offer ${currentOfferId} not valid for this order (schedule: ${isValidSchedule})`);
         }
       }
     }
@@ -6054,6 +6132,7 @@ app.post('/api/orders', async (req, res) => {
         let tableStatus = null;
         let tableId = null;
         let tableFloor = null;
+        let tableSection = null;
         
         // Search for the table across all floors
         for (const floorDoc of floorsSnapshot.docs) {
@@ -6074,7 +6153,8 @@ app.post('/api/orders', async (req, res) => {
               tableStatus = tableData.status;
               tableId = tableDoc.id;
               tableFloor = floorData.name;
-              console.log('🪑 Found table:', { id: tableId, number: tableNumber, status: tableStatus, floor: tableFloor });
+              tableSection = tableData.section || floorData.section || null;
+              console.log('🪑 Found table:', { id: tableId, number: tableNumber, status: tableStatus, floor: tableFloor, section: tableSection });
               break;
             }
           }
@@ -6164,6 +6244,15 @@ app.post('/api/orders', async (req, res) => {
       });
     }
 
+    // Apply zone pricing surcharge (before tax)
+    const pricingAdjustments = calculatePricingAdjustments(restaurantData, {
+      tableSection: tableSection || null,
+      orderTime: new Date(),
+      subtotal: totalAmount
+    });
+    const zoneSurcharge = pricingAdjustments.zoneSurcharge || 0;
+    totalAmount += zoneSurcharge; // surcharge is taxable
+
     // Calculate tax if tax settings are enabled
     // Save tax breakdown so order history shows exact tax at time of order
     let taxAmount = 0;
@@ -6216,6 +6305,9 @@ app.post('/api/orders', async (req, res) => {
       totalAmount,
       taxAmount: Math.round(taxAmount * 100) / 100,
       taxBreakdown: taxBreakdown, // Save individual tax lines for historical accuracy
+      zoneSurcharge: zoneSurcharge > 0 ? Math.round(zoneSurcharge * 100) / 100 : 0,
+      tableSection: tableSection || null,
+      appliedPricingRules: pricingAdjustments.appliedRules || [],
       finalAmount: Math.round(finalAmount * 100) / 100,
           customerInfo: customerInfo || {
             phone: customerPhone,
@@ -9636,7 +9728,7 @@ app.get('/api/floors/:restaurantId', async (req, res) => {
 app.post('/api/floors/:restaurantId', authenticateToken, async (req, res) => {
   try {
     const { restaurantId } = req.params;
-    const { name, description } = req.body;
+    const { name, description, section } = req.body;
 
     if (!name) {
       return res.status(400).json({ error: 'Floor name is required' });
@@ -9647,6 +9739,7 @@ app.post('/api/floors/:restaurantId', authenticateToken, async (req, res) => {
     const floorData = {
       name,
       description: description || '',
+      section: section || null,
       restaurantId,
       createdAt: new Date(),
       updatedAt: new Date()
@@ -9664,6 +9757,7 @@ app.post('/api/floors/:restaurantId', authenticateToken, async (req, res) => {
         id: floorId,
         name,
         description: description || '',
+        section: section || null,
         restaurantId,
         tables: []
       }
@@ -9679,7 +9773,7 @@ app.post('/api/floors/:restaurantId', authenticateToken, async (req, res) => {
 app.patch('/api/floors/:floorId', authenticateToken, async (req, res) => {
   try {
     const { floorId } = req.params;
-    const { name, restaurantId } = req.body;
+    const { name, restaurantId, description, section } = req.body;
 
     if (!name || !restaurantId) {
       return res.status(400).json({ error: 'Floor name and restaurant ID are required' });
@@ -9687,7 +9781,7 @@ app.patch('/api/floors/:floorId', authenticateToken, async (req, res) => {
 
     // Extract original floor name from floorId
     const originalFloorName = floorId.replace('floor_', '').replace(/_/g, ' ');
-    const originalFloorNameCapitalized = originalFloorName.split(' ').map(word => 
+    const originalFloorNameCapitalized = originalFloorName.split(' ').map(word =>
       word.charAt(0).toUpperCase() + word.slice(1).toLowerCase()
     ).join(' ');
 
@@ -9704,6 +9798,13 @@ app.patch('/api/floors/:floorId', authenticateToken, async (req, res) => {
         updatedAt: new Date()
       });
     });
+
+    // Update the floor subcollection doc itself
+    const floorRef = db.collection('restaurants').doc(restaurantId).collection('floors').doc(floorId);
+    const floorUpdateData = { name, updatedAt: new Date() };
+    if (description !== undefined) floorUpdateData.description = description || '';
+    if (section !== undefined) floorUpdateData.section = section || null;
+    batch.update(floorRef, floorUpdateData);
 
     await batch.commit();
 
@@ -17124,7 +17225,15 @@ app.post('/api/offers/:restaurantId', authenticateToken, async (req, res) => {
       isActive = true,
       usageLimit = null,
       isFirstOrderOnly = false,
-      autoApply = false
+      autoApply = false,
+      // Enhanced offer fields
+      scope = 'order',
+      targetCategories = [],
+      targetItems = [],
+      schedule = null,
+      promotionType = 'discount',
+      bogoConfig = null,
+      eventLabel = null
     } = req.body;
 
     // Verify user has access to this restaurant
@@ -17137,12 +17246,14 @@ app.post('/api/offers/:restaurantId', authenticateToken, async (req, res) => {
       return res.status(400).json({ error: 'Offer name is required' });
     }
 
-    if (!discountValue || discountValue <= 0) {
-      return res.status(400).json({ error: 'Valid discount value is required' });
-    }
+    if (promotionType !== 'bogo') {
+      if (!discountValue || discountValue <= 0) {
+        return res.status(400).json({ error: 'Valid discount value is required' });
+      }
 
-    if (discountType === 'percentage' && discountValue > 100) {
-      return res.status(400).json({ error: 'Percentage discount cannot exceed 100%' });
+      if (discountType === 'percentage' && discountValue > 100) {
+        return res.status(400).json({ error: 'Percentage discount cannot exceed 100%' });
+      }
     }
 
     const offerData = {
@@ -17150,7 +17261,7 @@ app.post('/api/offers/:restaurantId', authenticateToken, async (req, res) => {
       name,
       description: description || '',
       discountType,
-      discountValue: Number(discountValue),
+      discountValue: Number(discountValue) || 0,
       minOrderValue: Number(minOrderValue) || 0,
       maxDiscount: maxDiscount ? Number(maxDiscount) : null,
       validFrom: validFrom || null,
@@ -17160,6 +17271,18 @@ app.post('/api/offers/:restaurantId', authenticateToken, async (req, res) => {
       usageCount: 0,
       isFirstOrderOnly,
       autoApply,
+      // Enhanced fields
+      scope,
+      targetCategories: Array.isArray(targetCategories) ? targetCategories : [],
+      targetItems: Array.isArray(targetItems) ? targetItems : [],
+      schedule: schedule || null,
+      promotionType,
+      bogoConfig: bogoConfig ? {
+        buyQty: Number(bogoConfig.buyQty) || 2,
+        getQty: Number(bogoConfig.getQty) || 1,
+        getDiscount: Number(bogoConfig.getDiscount) || 100
+      } : null,
+      eventLabel: eventLabel || null,
       createdAt: new Date(),
       updatedAt: new Date()
     };
@@ -17445,6 +17568,90 @@ app.put('/api/restaurants/:restaurantId/customer-app-settings', authenticateToke
   } catch (error) {
     console.error('Update customer app settings error:', error);
     res.status(500).json({ error: 'Failed to update customer app settings' });
+  }
+});
+
+// ==================== PRICING SETTINGS APIs ====================
+
+// Get pricing settings for a restaurant
+app.get('/api/restaurants/:restaurantId/pricing-settings', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+    const { userId } = req.user;
+
+    const restaurantDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
+    if (!restaurantDoc.exists) {
+      return res.status(404).json({ error: 'Restaurant not found' });
+    }
+    if (restaurantDoc.data().ownerId !== userId) {
+      return res.status(403).json({ error: 'Access denied' });
+    }
+
+    const existing = restaurantDoc.data().pricingSettings || {};
+    const pricingSettings = {
+      zonePricing: {
+        enabled: existing.zonePricing?.enabled ?? false,
+        zones: Array.isArray(existing.zonePricing?.zones) ? existing.zonePricing.zones : []
+      },
+      timePricing: {
+        enabled: existing.timePricing?.enabled ?? false,
+        rules: Array.isArray(existing.timePricing?.rules) ? existing.timePricing.rules : []
+      }
+    };
+
+    res.json({ settings: pricingSettings });
+  } catch (error) {
+    console.error('Get pricing settings error:', error);
+    res.status(500).json({ error: 'Failed to fetch pricing settings' });
+  }
+});
+
+// Update pricing settings for a restaurant
+app.put('/api/restaurants/:restaurantId/pricing-settings', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+    const { userId } = req.user;
+    const settings = req.body;
+
+    const restaurantDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
+    if (!restaurantDoc.exists) {
+      return res.status(404).json({ error: 'Restaurant not found' });
+    }
+    if (restaurantDoc.data().ownerId !== userId) {
+      return res.status(403).json({ error: 'Access denied' });
+    }
+
+    // Validate zones
+    const zones = Array.isArray(settings.zonePricing?.zones) ? settings.zonePricing.zones.map(z => ({
+      id: z.id || `zone_${Date.now()}_${Math.random().toString(36).substr(2, 4)}`,
+      name: z.name || 'Unnamed Zone',
+      sectionMatch: z.sectionMatch || '',
+      markupType: z.markupType === 'flat' ? 'flat' : 'percentage',
+      markupValue: Math.max(0, Number(z.markupValue) || 0),
+      isActive: z.isActive !== false
+    })) : [];
+
+    const pricingSettings = {
+      zonePricing: {
+        enabled: settings.zonePricing?.enabled ?? false,
+        zones
+      },
+      timePricing: {
+        enabled: settings.timePricing?.enabled ?? false,
+        rules: Array.isArray(settings.timePricing?.rules) ? settings.timePricing.rules : []
+      },
+      updatedAt: new Date()
+    };
+
+    await restaurantDoc.ref.update({ pricingSettings });
+
+    res.json({
+      message: 'Pricing settings updated successfully',
+      settings: pricingSettings
+    });
+  } catch (error) {
+    console.error('Update pricing settings error:', error);
+    res.status(500).json({ error: 'Failed to update pricing settings' });
   }
 });
 
