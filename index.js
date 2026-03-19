@@ -1490,21 +1490,21 @@ const uploadToFirebase = async (file, restaurantId) => {
 
 // Enhanced function to extract menu from any file type (images, PDFs, docs, CSV, etc.)
 // All extractors return { categories: [{ name, order }], menuItems: [...] }
-const extractMenuFromAnyFile = async (fileUrl, fileType, fileName) => {
+const extractMenuFromAnyFile = async (fileUrl, fileType, fileName, businessType = 'restaurant') => {
   try {
-    console.log(`🔍 Starting enhanced menu extraction for ${fileType} file: ${fileName}`);
+    console.log(`🔍 Starting enhanced menu extraction for ${fileType} file: ${fileName} (businessType: ${businessType})`);
     let result;
     if (fileType.startsWith('image/')) {
-      result = await extractMenuFromImage(fileUrl);
+      result = await extractMenuFromImage(fileUrl, businessType);
     } else if (fileType === 'application/pdf') {
-      result = await extractMenuFromPDF(fileUrl);
+      result = await extractMenuFromPDF(fileUrl, businessType);
     } else if (fileType.includes('csv') || fileType.includes('excel') || fileType.includes('spreadsheet')) {
-      result = await extractMenuFromCSV(fileUrl);
+      result = await extractMenuFromCSV(fileUrl, businessType);
     } else if (fileType.includes('document') || fileType.includes('text')) {
-      result = await extractMenuFromDocument(fileUrl);
+      result = await extractMenuFromDocument(fileUrl, businessType);
     } else {
       console.log('⚠️ Unknown file type, attempting image extraction as fallback...');
-      result = await extractMenuFromImage(fileUrl);
+      result = await extractMenuFromImage(fileUrl, businessType);
     }
     if (!Array.isArray(result.categories)) result.categories = [];
     if (!Array.isArray(result.menuItems)) result.menuItems = [];
@@ -1516,7 +1516,7 @@ const extractMenuFromAnyFile = async (fileUrl, fileType, fileName) => {
 };
 
 // Extract menu from PDF files. Returns { categories, menuItems }. Prefer section headers from document as categories.
-const extractMenuFromPDF = async (pdfUrl) => {
+const extractMenuFromPDF = async (pdfUrl, businessType = 'restaurant') => {
   try {
     console.log('📄 Extracting menu from PDF...');
     const response = await openai.chat.completions.create({
@@ -1554,7 +1554,7 @@ shortCode: 1,2,3... If NOT a menu: {"categories":[],"menuItems":[]}`
 };
 
 // Extract menu from CSV/Excel. Use Category column if present as categories; else categories:[] and item.category="Other".
-const extractMenuFromCSV = async (csvUrl) => {
+const extractMenuFromCSV = async (csvUrl, businessType = 'restaurant') => {
   try {
     console.log('📊 Extracting menu from CSV/Excel...');
     const response = await openai.chat.completions.create({
@@ -1592,7 +1592,7 @@ shortCode: 1,2,3... If NOT a menu: {"categories":[],"menuItems":[]}`
 };
 
 // Extract menu from document files. Use section headers as categories when present.
-const extractMenuFromDocument = async (docUrl) => {
+const extractMenuFromDocument = async (docUrl, businessType = 'restaurant') => {
   try {
     console.log('📝 Extracting menu from document...');
     const response = await openai.chat.completions.create({
@@ -1638,10 +1638,20 @@ const categoryNameToId = (name) => {
 // Helper function to extract menu from image using OpenAI Vision
 // Returns { categories: [{ name, order }], menuItems: [...] }
 // PREFERENCE: Use categories FROM THE MENU PHOTO first. Only if menu has no sections, use fallback.
-const extractMenuFromImage = async (imageUrl) => {
+const extractMenuFromImage = async (imageUrl, businessType = 'restaurant') => {
   try {
-    console.log('🔍 Starting menu extraction – categories from menu first...');
-    
+    console.log(`🔍 Starting menu extraction – categories from menu first... (type: ${businessType})`);
+
+    // Build type-specific extraction instructions
+    let typeInstructions = '';
+    if (businessType === 'bar') {
+      typeInstructions = `\nBUSINESS TYPE: This is a BAR menu. For each drink item, also extract:\n- "spiritCategory": one of "whiskey","vodka","rum","gin","tequila","beer","wine","cocktail","mocktail","shots","mixer","bar_snack" or null\n- "abv": alcohol percentage as number or null\n- "servingUnit": "ml","peg","glass","bottle","pint" or null\n- "bottleSize": e.g. "180ml","375ml","750ml","1L" or null\n`;
+    } else if (businessType === 'bakery') {
+      typeInstructions = `\nBUSINESS TYPE: This is a BAKERY menu. For each item, also extract:\n- "unit": "piece","kg","gram","dozen","box","slice" or null\n- "weight": e.g. "250g","500g","1kg" or null\n`;
+    } else if (businessType === 'ice_cream') {
+      typeInstructions = `\nBUSINESS TYPE: This is an ICE CREAM PARLOUR menu. For each item, also extract:\n- "servingSize": "scoop","cup","cone","sundae","shake","tub" or null\n`;
+    }
+
     const response = await openai.chat.completions.create({
       model: "gpt-4o",
       messages: [
@@ -1650,7 +1660,7 @@ const extractMenuFromImage = async (imageUrl) => {
           content: [
             {
               type: "text",
-              text: `You are an expert menu extraction AI. Analyze this image and extract menu items ONLY if it is a restaurant menu.
+              text: `You are an expert menu extraction AI. Analyze this image and extract menu items ONLY if it is a restaurant menu.${typeInstructions}
 
 STEP 1 – CATEGORIES FROM THE MENU (PRIORITY):
 - Menus are usually organized by SECTION HEADERS (e.g. "Starters", "Main Course", "Beverages", "Desserts", "Rice", "Breads", "Curries", "Chinese", "Pizza", custom names like "Chef Specials", "Today’s Special", etc.).
@@ -1689,7 +1699,9 @@ Return ONLY valid JSON in this exact format:
       "spiceLevel": "mild|medium|hot",
       "allergens": ["dairy", "gluten", "nuts"],
       "shortCode": "1",
-      "variants": []
+      "variants": [],
+      "spiritCategory": null, "abv": null, "bottleSize": null, "servingUnit": null,
+      "unit": null, "weight": null, "servingSize": null
     },
     {
       "name": "Dal",
@@ -1701,7 +1713,9 @@ Return ONLY valid JSON in this exact format:
       "variants": [
         { "name": "Half", "price": 110, "description": "" },
         { "name": "Full", "price": 180, "description": "" }
-      ]
+      ],
+      "spiritCategory": null, "abv": null, "bottleSize": null, "servingUnit": null,
+      "unit": null, "weight": null, "servingSize": null
     }
   ]
 }
@@ -1716,7 +1730,8 @@ RULES:
 4. isVeg: true/false based on dish. shortCode: sequential 1, 2, 3...
 5. description: "" if missing. allergens: only if mentioned.
 6. VARIANTS: Look for patterns like "Half/Full", "Small/Medium/Large", "110/180", "₹110/₹180", or any item showing multiple prices. Extract as variants array.
-7. Be thorough – do not skip items.`
+7. Type-specific fields (spiritCategory, abv, bottleSize, servingUnit, unit, weight, servingSize): Only set if the business type matches and data is visible in the menu. Otherwise set to null.
+8. Be thorough – do not skip items.`
             },
             {
               type: "image_url",
@@ -5007,6 +5022,16 @@ app.post('/api/menus/:restaurantId', authenticateToken, async (req, res) => {
       ingredients: req.body.ingredients || null,
       abv: req.body.abv ? parseFloat(req.body.abv) : null,
       servingUnit: req.body.servingUnit || null,
+      bottleSize: req.body.bottleSize || null,
+      // Bakery-specific fields
+      unit: req.body.unit || null,
+      weight: req.body.weight || null,
+      shelfLife: req.body.shelfLife ? parseInt(req.body.shelfLife) : null,
+      mfgDate: req.body.mfgDate || null,
+      expiryDate: req.body.expiryDate || null,
+      // Ice cream-specific fields
+      servingSize: req.body.servingSize || null,
+      scoopOptions: req.body.scoopOptions ? parseInt(req.body.scoopOptions) : null,
       createdAt: new Date(),
       updatedAt: new Date()
     };
@@ -5116,7 +5141,9 @@ app.patch('/api/menus/item/:id', authenticateToken, async (req, res) => {
       'allergens', 'image', 'shortCode', 'status', 'order',
       'isAvailable', 'stockQuantity', 'lowStockThreshold', 'isStockManaged',
       'availableFrom', 'availableUntil', 'variants', 'customizations',
-      'spiritCategory', 'ingredients', 'abv', 'servingUnit'
+      'spiritCategory', 'ingredients', 'abv', 'servingUnit', 'bottleSize',
+      'unit', 'weight', 'shelfLife', 'mfgDate', 'expiryDate',
+      'servingSize', 'scoopOptions'
     ];
     
     allowedFields.forEach(field => {
@@ -5142,12 +5169,16 @@ app.patch('/api/menus/item/:id', authenticateToken, async (req, res) => {
                 description: c.description || ''
               }))
             : [];
+        } else if (field === 'abv') {
+          updateData[field] = req.body[field] ? parseFloat(req.body[field]) : null;
+        } else if (field === 'shelfLife' || field === 'scoopOptions') {
+          updateData[field] = req.body[field] ? parseInt(req.body[field]) : null;
         } else {
           updateData[field] = req.body[field];
         }
       }
     });
-    
+
     if (Object.keys(updateData).length === 1) { // Only updatedAt
       return res.status(400).json({ error: 'No valid fields to update' });
     }
@@ -6262,7 +6293,12 @@ app.post('/api/orders', async (req, res) => {
         notes: item.notes || '',
         // Persist kitchen-facing details
         selectedVariant: selectedVariant ? { name: selectedVariant.name, price: selectedVariant.price || 0 } : null,
-        selectedCustomizations: customizations.map(c => ({ id: c.id || null, name: c.name || c, price: typeof c.price === 'number' ? c.price : 0 }))
+        selectedCustomizations: customizations.map(c => ({ id: c.id || null, name: c.name || c, price: typeof c.price === 'number' ? c.price : 0 })),
+        // Type-specific display fields (for receipts/KOT/billing summary)
+        unit: menuItem.unit || null,
+        weight: menuItem.weight || null,
+        servingSize: menuItem.servingSize || null,
+        bottleSize: menuItem.bottleSize || null,
       });
     }
 
@@ -9081,8 +9117,9 @@ app.post('/api/menus/bulk-upload/:restaurantId', authenticateToken, chatgptUsage
       console.log('File type:', uploadedFile.mimetype);
       
       try {
-        console.log(`Starting AI extraction for ${uploadedFile.mimetype} file: ${uploadedFile.originalName}`);
-        const menuData = await extractMenuFromAnyFile(uploadedFile.url, uploadedFile.mimetype, uploadedFile.originalName);
+        const restaurantBusinessType = restaurant.data()?.businessType || 'restaurant';
+        console.log(`Starting AI extraction for ${uploadedFile.mimetype} file: ${uploadedFile.originalName} (businessType: ${restaurantBusinessType})`);
+        const menuData = await extractMenuFromAnyFile(uploadedFile.url, uploadedFile.mimetype, uploadedFile.originalName, restaurantBusinessType);
         console.log('✅ AI extraction completed!');
         console.log('Extracted items:', menuData.menuItems ? menuData.menuItems.length : 0);
         
@@ -9335,6 +9372,16 @@ app.post('/api/menus/bulk-save/:restaurantId', authenticateToken, async (req, re
           availableUntil: null,
           variants: variants,
           customizations: [],
+          // Type-specific fields from AI extraction
+          spiritCategory: item.spiritCategory || null,
+          ingredients: item.ingredients || null,
+          abv: item.abv ? parseFloat(item.abv) : null,
+          servingUnit: item.servingUnit || null,
+          bottleSize: item.bottleSize || null,
+          unit: item.unit || null,
+          weight: item.weight || null,
+          servingSize: item.servingSize || null,
+          scoopOptions: item.scoopOptions ? parseInt(item.scoopOptions) : null,
           createdAt: new Date(),
           updatedAt: new Date(),
           source: 'ai_upload',
