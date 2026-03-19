@@ -236,6 +236,34 @@ async function getNextOrderId(restaurantId, restaurantDataOrNull) {
   return await generateDailyOrderId(restaurantId);
 }
 
+// Generate next tab number for bar tabs (daily reset, atomic via transaction)
+async function getNextTabNumber(restaurantId) {
+  try {
+    const today = new Date().toISOString().split('T')[0]; // YYYY-MM-DD
+    const counterRef = db.collection('tab_counters').doc(restaurantId);
+    const result = await db.runTransaction(async (transaction) => {
+      const snap = await transaction.get(counterRef);
+      let nextNum = 1;
+      if (snap.exists) {
+        const data = snap.data();
+        // Reset if new day, otherwise increment
+        nextNum = (data.date === today) ? (data.lastTabNumber + 1) : 1;
+      }
+      transaction.set(counterRef, {
+        restaurantId,
+        date: today,
+        lastTabNumber: nextNum,
+        updatedAt: new Date()
+      });
+      return nextNum;
+    });
+    return result;
+  } catch (error) {
+    console.error('Error generating tab number:', error);
+    return Date.now() % 1000; // fallback
+  }
+}
+
 // Helper function to create default free-trial subscription for new users
 async function createDefaultSubscription(userId, email, phone, role) {
   try {
@@ -6153,6 +6181,8 @@ app.post('/api/orders', async (req, res) => {
 
     let totalAmount = 0;
     const orderItems = [];
+    let tableSection = null;
+    let tableFloorData = null;
 
     // Get restaurant document to access embedded menu items
     const restaurantDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
@@ -6166,25 +6196,23 @@ app.post('/api/orders', async (req, res) => {
     // Validate table number if provided
     if (tableNumber && tableNumber.trim()) {
       console.log('🪑 Validating table number:', tableNumber);
-      
+
       try {
         // Use the new restaurant-centric structure
         console.log('🪑 Using new restaurant-centric structure for restaurant:', restaurantId);
-        
+
         // Get floors from restaurant subcollection
         const floorsSnapshot = await db.collection('restaurants')
           .doc(restaurantId)
           .collection('floors')
           .get();
-        
+
         console.log('🪑 Found floors:', floorsSnapshot.size);
-        
+
         let tableFound = false;
         let tableStatus = null;
         let tableId = null;
         let tableFloor = null;
-        let tableSection = null;
-        let tableFloorData = null;
 
         // Search for the table across all floors
         for (const floorDoc of floorsSnapshot.docs) {
@@ -6528,10 +6556,17 @@ app.post('/api/orders', async (req, res) => {
     const orderNumber = `ORD-${Date.now()}-${Math.random().toString(36).substr(2, 4).toUpperCase()}`;
     const dailyOrderId = await getNextOrderId(restaurantId);
 
+    // For bar tabs (saved orders), generate auto-incrementing tab number
+    let tabNumber = null;
+    if (isSavedOrder) {
+      tabNumber = await getNextTabNumber(restaurantId);
+    }
+
     const orderData = {
       restaurantId,
       orderNumber,
       dailyOrderId,
+      tabNumber,
       tableNumber: tableNumber || seatNumber || null,
       roomNumber: roomNumber || null, // NEW: Hotel room number
       orderType,
