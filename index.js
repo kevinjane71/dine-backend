@@ -115,12 +115,29 @@ function updateDailyStatsRevenueDiff(restaurantId, order, oldAmount, newAmount, 
 }
 
 // Calculate pricing adjustments (zone surcharge, time-based pricing)
-function calculatePricingAdjustments(restaurantData, { tableSection, orderTime, subtotal }) {
+function calculatePricingAdjustments(restaurantData, { tableSection, floorData, orderTime, subtotal }) {
   const result = { zoneSurcharge: 0, appliedRules: [] };
+
+  // Priority 1: Floor-level area charge (simple, set directly on the floor)
+  if (floorData?.areaChargeType && floorData.areaChargeType !== 'none' && floorData.areaChargeValue > 0 && subtotal > 0) {
+    const surcharge = floorData.areaChargeType === 'percentage'
+      ? Math.round((subtotal * floorData.areaChargeValue / 100) * 100) / 100
+      : Math.round(floorData.areaChargeValue * 100) / 100;
+    result.zoneSurcharge = surcharge;
+    result.appliedRules.push({
+      type: 'floor_area_charge',
+      floorName: floorData.name,
+      markupType: floorData.areaChargeType,
+      markupValue: floorData.areaChargeValue,
+      surchargeAmount: surcharge
+    });
+    return result; // Floor charge takes priority, skip zone pricing
+  }
+
+  // Priority 2: Zone pricing settings (advanced, sectionMatch-based)
   const pricingSettings = restaurantData.pricingSettings;
   if (!pricingSettings) return result;
 
-  // Zone pricing — flat surcharge on bill based on table section
   const zonePricing = pricingSettings.zonePricing;
   if (zonePricing?.enabled && tableSection && Array.isArray(zonePricing.zones)) {
     const matchedZone = zonePricing.zones.find(z =>
@@ -6085,7 +6102,10 @@ app.post('/api/orders', async (req, res) => {
       specialInstructions, // Kitchen special instructions
       customerPhone,
       customerName,
-      seatNumber
+      seatNumber,
+      offerIds,
+      manualDiscount,
+      redeemLoyaltyPoints,
     } = req.body;
 
     // Allow empty items for saved orders (bar tabs opened without items)
@@ -6133,11 +6153,12 @@ app.post('/api/orders', async (req, res) => {
         let tableId = null;
         let tableFloor = null;
         let tableSection = null;
-        
+        let tableFloorData = null;
+
         // Search for the table across all floors
         for (const floorDoc of floorsSnapshot.docs) {
           const floorData = floorDoc.data();
-          
+
           const tablesSnapshot = await db.collection('restaurants')
             .doc(restaurantId)
             .collection('floors')
@@ -6147,13 +6168,14 @@ app.post('/api/orders', async (req, res) => {
 
           for (const tableDoc of tablesSnapshot.docs) {
             const tableData = tableDoc.data();
-            
+
             if (tableData.name && tableData.name.toString().toLowerCase() === tableNumber.trim().toLowerCase()) {
               tableFound = true;
               tableStatus = tableData.status;
               tableId = tableDoc.id;
               tableFloor = floorData.name;
               tableSection = tableData.section || floorData.section || null;
+              tableFloorData = floorData;
               console.log('🪑 Found table:', { id: tableId, number: tableNumber, status: tableStatus, floor: tableFloor, section: tableSection });
               break;
             }
@@ -6247,16 +6269,192 @@ app.post('/api/orders', async (req, res) => {
     // Apply zone pricing surcharge (before tax)
     const pricingAdjustments = calculatePricingAdjustments(restaurantData, {
       tableSection: tableSection || null,
+      floorData: tableFloorData || null,
       orderTime: new Date(),
       subtotal: totalAmount
     });
     const zoneSurcharge = pricingAdjustments.zoneSurcharge || 0;
     totalAmount += zoneSurcharge; // surcharge is taxable
 
+    // ── Offer / Manual Discount / Loyalty Points ──────────────────────
+    const subtotalForDiscount = totalAmount; // items + zone surcharge (before discounts)
+    let discountAmount = 0;
+    let appliedOffer = null;
+    let appliedOffers = [];
+    let manualDiscountAmount = parseFloat(manualDiscount) || 0;
+    let loyaltyDiscount = 0;
+    let loyaltyPointsRedeemed = 0;
+    let loyaltyPointsEarned = 0;
+
+    // Validate and apply offers (server-side, same logic as public endpoint)
+    const allOfferIds = Array.isArray(offerIds) ? offerIds : (offerIds ? [offerIds] : []);
+
+    if (allOfferIds.length > 0) {
+      const customerAppSettings = restaurantData.customerAppSettings || {};
+      const offerSettings = customerAppSettings.offerSettings || {};
+      const allowMultipleOffers = offerSettings.allowMultipleOffers ?? false;
+      const maxOffersAllowed = offerSettings.maxOffersAllowed ?? 1;
+      const limitedOfferIds = allowMultipleOffers
+        ? allOfferIds.slice(0, maxOffersAllowed)
+        : allOfferIds.slice(0, 1);
+
+      for (const currentOfferId of limitedOfferIds) {
+        try {
+          const offerDoc = await db.collection('offers').doc(currentOfferId).get();
+          if (!offerDoc.exists) continue;
+
+          const offer = offerDoc.data();
+          const now = new Date();
+
+          const validFrom = offer.validFrom ? new Date(offer.validFrom) : null;
+          const validUntil = offer.validUntil ? new Date(offer.validUntil) : null;
+          const isValidDate = (!validFrom || now >= validFrom) && (!validUntil || now <= validUntil);
+          const isUnderUsageLimit = !offer.usageLimit || (offer.usageCount || 0) < offer.usageLimit;
+          const meetsMinOrder = subtotalForDiscount >= (offer.minOrderValue || offer.minimumOrder || 0);
+
+          // Check schedule (happy hour / time-based)
+          let isValidSchedule = true;
+          if (offer.schedule && offer.schedule.type === 'recurring') {
+            const currentDay = now.getDay();
+            const currentTime = `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`;
+            const scheduleDays = offer.schedule.days || [];
+            const startTime = offer.schedule.startTime || '00:00';
+            const endTime = offer.schedule.endTime || '23:59';
+            isValidSchedule = scheduleDays.includes(currentDay) && currentTime >= startTime && currentTime <= endTime;
+          }
+
+          if (offer.isActive && offer.restaurantId === restaurantId && isValidDate && isUnderUsageLimit && meetsMinOrder && isValidSchedule) {
+            let offerDiscount = 0;
+            const offerScope = offer.scope || 'order';
+
+            let applicableSubtotal = subtotalForDiscount;
+            if (offerScope === 'category' && Array.isArray(offer.targetCategories) && offer.targetCategories.length > 0) {
+              applicableSubtotal = orderItems
+                .filter(oi => offer.targetCategories.some(c => c.toLowerCase() === (oi.category || '').toLowerCase()))
+                .reduce((sum, oi) => sum + (oi.total || oi.price * oi.quantity), 0);
+            } else if (offerScope === 'item' && Array.isArray(offer.targetItems) && offer.targetItems.length > 0) {
+              applicableSubtotal = orderItems
+                .filter(oi => offer.targetItems.includes(oi.menuItemId))
+                .reduce((sum, oi) => sum + (oi.total || oi.price * oi.quantity), 0);
+            }
+
+            if (offer.promotionType === 'bogo' && offer.bogoConfig) {
+              const bogoItems = offerScope === 'item' && offer.targetItems?.length > 0
+                ? orderItems.filter(oi => offer.targetItems.includes(oi.menuItemId))
+                : orderItems;
+              const totalQty = bogoItems.reduce((sum, oi) => sum + oi.quantity, 0);
+              const buyQty = offer.bogoConfig.buyQty || 2;
+              const getQty = offer.bogoConfig.getQty || 1;
+              const getDiscount = offer.bogoConfig.getDiscount || 100;
+              const sets = Math.floor(totalQty / (buyQty + getQty));
+              if (sets > 0 && bogoItems.length > 0) {
+                const cheapestPrice = Math.min(...bogoItems.map(oi => oi.price));
+                offerDiscount = sets * getQty * cheapestPrice * (getDiscount / 100);
+              }
+            } else if (offer.discountType === 'percentage') {
+              offerDiscount = (applicableSubtotal * offer.discountValue) / 100;
+              if (offer.maxDiscount && offerDiscount > offer.maxDiscount) {
+                offerDiscount = offer.maxDiscount;
+              }
+            } else {
+              offerDiscount = Math.min(offer.discountValue, applicableSubtotal);
+            }
+
+            appliedOffers.push({
+              id: currentOfferId,
+              name: offer.name,
+              discountType: offer.discountType,
+              discountValue: offer.discountValue,
+              discountApplied: offerDiscount,
+              scope: offerScope,
+              promotionType: offer.promotionType || 'discount'
+            });
+            discountAmount += offerDiscount;
+            console.log(`🎁 POS Offer applied: ${offer.name}, Discount: ₹${offerDiscount}, Scope: ${offerScope}`);
+          }
+        } catch (offerError) {
+          console.error(`⚠️ Error validating offer ${currentOfferId}:`, offerError);
+        }
+      }
+    }
+
+    // Cap offer discount at subtotal
+    if (discountAmount > subtotalForDiscount) {
+      discountAmount = subtotalForDiscount;
+    }
+    if (appliedOffers.length > 0) {
+      appliedOffer = appliedOffers[0];
+    }
+
+    // Cap manual discount
+    if (manualDiscountAmount > 0) {
+      manualDiscountAmount = Math.min(manualDiscountAmount, subtotalForDiscount - discountAmount);
+      console.log(`✂️ POS Manual discount applied: ₹${manualDiscountAmount}`);
+    }
+
+    // Loyalty points redemption
+    const posCustomerAppSettings = restaurantData.customerAppSettings || {};
+    const posLoyaltySettings = posCustomerAppSettings.loyaltySettings || {};
+    const resolvedCustomerPhone = customerPhone || customerInfo?.phone || null;
+
+    if (redeemLoyaltyPoints > 0 && posLoyaltySettings.enabled && resolvedCustomerPhone) {
+      try {
+        const customerSnapshot = await db.collection('customers')
+          .where('restaurantId', '==', restaurantId)
+          .where('phone', '==', resolvedCustomerPhone)
+          .limit(1)
+          .get();
+
+        if (!customerSnapshot.empty) {
+          const customerData = customerSnapshot.docs[0].data();
+          const availablePoints = customerData.loyaltyPoints || 0;
+          const pointsToRedeem = Math.min(redeemLoyaltyPoints, availablePoints);
+
+          if (pointsToRedeem > 0) {
+            const redemptionRate = posLoyaltySettings.redemptionRate || 100;
+            loyaltyDiscount = pointsToRedeem / redemptionRate;
+
+            const maxRedemptionPercent = posLoyaltySettings.maxRedemptionPercent || 20;
+            const maxLoyaltyDiscount = (subtotalForDiscount * maxRedemptionPercent) / 100;
+
+            if (loyaltyDiscount > maxLoyaltyDiscount) {
+              loyaltyDiscount = maxLoyaltyDiscount;
+              loyaltyPointsRedeemed = Math.floor(loyaltyDiscount * redemptionRate);
+            } else {
+              loyaltyPointsRedeemed = pointsToRedeem;
+            }
+            console.log(`💎 POS Loyalty redeemed: ${loyaltyPointsRedeemed} points = ₹${loyaltyDiscount}`);
+          }
+        }
+      } catch (loyaltyError) {
+        console.error('⚠️ Loyalty redemption error:', loyaltyError);
+      }
+    }
+
+    // Calculate pre-tax total after all discounts
+    const totalDiscountAmount = discountAmount + manualDiscountAmount + loyaltyDiscount;
+    const preTaxTotal = Math.max(0, totalAmount - totalDiscountAmount);
+
+    // Calculate loyalty points earned (stored in order, awarded on completion)
+    if (posLoyaltySettings.enabled && resolvedCustomerPhone) {
+      const earnPerAmount = Number(posLoyaltySettings.earnPerAmount) || 100;
+      const pointsEarnedRate = Number(posLoyaltySettings.pointsEarned) || 4;
+
+      if (loyaltyPointsRedeemed > 0 && !posLoyaltySettings.earnPointsOnRedemption) {
+        loyaltyPointsEarned = 0;
+      } else if (loyaltyPointsRedeemed > 0 && posLoyaltySettings.earnOnFullAmount) {
+        loyaltyPointsEarned = Math.floor((totalAmount - discountAmount - manualDiscountAmount) / earnPerAmount) * pointsEarnedRate;
+      } else {
+        loyaltyPointsEarned = Math.floor(preTaxTotal / earnPerAmount) * pointsEarnedRate;
+      }
+    }
+
+    console.log(`💰 POS Order pricing: Subtotal ₹${subtotalForDiscount}, Offers -₹${discountAmount}, Manual -₹${manualDiscountAmount}, Loyalty -₹${loyaltyDiscount}, PreTax ₹${preTaxTotal}`);
+
     // Calculate tax if tax settings are enabled
     // Save tax breakdown so order history shows exact tax at time of order
     let taxAmount = 0;
-    let finalAmount = totalAmount;
+    let finalAmount = preTaxTotal;
     const taxBreakdown = []; // Store individual tax lines for historical accuracy
     // Use same defaults as GET /api/admin/tax endpoint for consistency
     const taxSettings = restaurantData.taxSettings || {
@@ -6265,12 +6463,12 @@ app.post('/api/orders', async (req, res) => {
       defaultTaxRate: 5
     };
 
-    if (taxSettings.enabled && totalAmount > 0) {
+    if (taxSettings.enabled && preTaxTotal > 0) {
       if (taxSettings.taxes && Array.isArray(taxSettings.taxes) && taxSettings.taxes.length > 0) {
         taxSettings.taxes
           .filter(tax => tax.enabled)
           .forEach(tax => {
-            const amt = Math.round((totalAmount * (tax.rate || 0) / 100) * 100) / 100;
+            const amt = Math.round((preTaxTotal * (tax.rate || 0) / 100) * 100) / 100;
             taxAmount += amt;
             taxBreakdown.push({
               name: tax.name || 'Tax',
@@ -6279,7 +6477,7 @@ app.post('/api/orders', async (req, res) => {
             });
           });
       } else if (taxSettings.defaultTaxRate) {
-        const amt = Math.round((totalAmount * (taxSettings.defaultTaxRate / 100)) * 100) / 100;
+        const amt = Math.round((preTaxTotal * (taxSettings.defaultTaxRate / 100)) * 100) / 100;
         taxAmount = amt;
         taxBreakdown.push({
           name: 'Tax',
@@ -6287,7 +6485,7 @@ app.post('/api/orders', async (req, res) => {
           amount: amt
         });
       }
-      finalAmount = totalAmount + taxAmount;
+      finalAmount = preTaxTotal + taxAmount;
     }
 
     // Generate order number and daily/sequential order ID (based on restaurant orderSettings.sequentialOrderIdEnabled)
@@ -6302,7 +6500,15 @@ app.post('/api/orders', async (req, res) => {
       roomNumber: roomNumber || null, // NEW: Hotel room number
       orderType,
       items: orderItems,
-      totalAmount,
+      subtotal: subtotalForDiscount,
+      totalAmount: preTaxTotal,
+      discountAmount: Math.round(discountAmount * 100) / 100,
+      manualDiscount: Math.round(manualDiscountAmount * 100) / 100,
+      loyaltyDiscount: Math.round(loyaltyDiscount * 100) / 100,
+      appliedOffer: appliedOffer,
+      appliedOffers: appliedOffers,
+      loyaltyPointsRedeemed: loyaltyPointsRedeemed,
+      loyaltyPointsEarned: loyaltyPointsEarned,
       taxAmount: Math.round(taxAmount * 100) / 100,
       taxBreakdown: taxBreakdown, // Save individual tax lines for historical accuracy
       zoneSurcharge: zoneSurcharge > 0 ? Math.round(zoneSurcharge * 100) / 100 : 0,
@@ -6680,7 +6886,13 @@ app.post('/api/orders', async (req, res) => {
         customerName: orderData.customerInfo?.name || '',
         customerMobile: orderData.customerInfo?.phone || '',
         items: orderItems,
-        totalAmount: totalAmount,
+        subtotal: subtotalForDiscount,
+        totalAmount: preTaxTotal,
+        discountAmount: discountAmount,
+        manualDiscount: manualDiscountAmount,
+        loyaltyDiscount: loyaltyDiscount,
+        appliedOffer: appliedOffer,
+        appliedOffers: appliedOffers,
         taxAmount: taxAmount,
         taxBreakdown: taxBreakdown,
         finalAmount: finalAmount,
@@ -6767,6 +6979,8 @@ app.get('/api/orders/:restaurantId', authenticateToken, async (req, res) => {
       limit = 10,
       status,
       date,
+      startDate,
+      endDate,
       search,
       waiterId,
       orderType,
@@ -6896,11 +7110,18 @@ app.get('/api/orders/:restaurantId', authenticateToken, async (req, res) => {
       }
 
       if (date && todayOnly !== 'true') {
-        const startDate = new Date(date);
-        const endDate = new Date(date);
-        endDate.setDate(endDate.getDate() + 1);
-        fastQuery = fastQuery.where('createdAt', '>=', startDate)
-                             .where('createdAt', '<', endDate);
+        const sDate = new Date(date);
+        const eDate = new Date(date);
+        eDate.setDate(eDate.getDate() + 1);
+        fastQuery = fastQuery.where('createdAt', '>=', sDate)
+                             .where('createdAt', '<', eDate);
+      } else if (startDate && endDate && todayOnly !== 'true' && !date) {
+        const rangeStart = new Date(startDate);
+        rangeStart.setHours(0, 0, 0, 0);
+        const rangeEnd = new Date(endDate);
+        rangeEnd.setHours(23, 59, 59, 999);
+        fastQuery = fastQuery.where('createdAt', '>=', rangeStart)
+                             .where('createdAt', '<=', rangeEnd);
       }
 
       const orderedFastQuery = fastQuery.orderBy('createdAt', 'desc');
@@ -6958,11 +7179,18 @@ app.get('/api/orders/:restaurantId', authenticateToken, async (req, res) => {
       searchQuery = searchQuery.where('createdAt', '>=', todayStart)
                                .where('createdAt', '<=', todayEnd);
     } else if (date) {
-      const startDate = new Date(date);
-      const endDate = new Date(date);
-      endDate.setDate(endDate.getDate() + 1);
-      searchQuery = searchQuery.where('createdAt', '>=', startDate)
-                               .where('createdAt', '<', endDate);
+      const sDate = new Date(date);
+      const eDate = new Date(date);
+      eDate.setDate(eDate.getDate() + 1);
+      searchQuery = searchQuery.where('createdAt', '>=', sDate)
+                               .where('createdAt', '<', eDate);
+    } else if (startDate && endDate) {
+      const rangeStart = new Date(startDate);
+      rangeStart.setHours(0, 0, 0, 0);
+      const rangeEnd = new Date(endDate);
+      rangeEnd.setHours(23, 59, 59, 999);
+      searchQuery = searchQuery.where('createdAt', '>=', rangeStart)
+                               .where('createdAt', '<=', rangeEnd);
     } else if (search && search.trim()) {
       // No date filter with search — default to last 90 days to bound the dataset
       const ninetyDaysAgo = new Date();
@@ -9728,11 +9956,16 @@ app.get('/api/floors/:restaurantId', async (req, res) => {
 app.post('/api/floors/:restaurantId', authenticateToken, async (req, res) => {
   try {
     const { restaurantId } = req.params;
-    const { name, description, section } = req.body;
+    const { name, description, section, areaChargeType, areaChargeValue } = req.body;
 
     if (!name) {
       return res.status(400).json({ error: 'Floor name is required' });
     }
+
+    // Validate area charge fields
+    const validChargeTypes = ['none', 'percentage', 'flat'];
+    const chargeType = validChargeTypes.includes(areaChargeType) ? areaChargeType : 'none';
+    const chargeValue = Math.max(0, parseFloat(areaChargeValue) || 0);
 
     // Create floor document in restaurant subcollection
     const floorId = `floor_${name.toLowerCase().replace(/\s+/g, '_')}`;
@@ -9740,6 +9973,8 @@ app.post('/api/floors/:restaurantId', authenticateToken, async (req, res) => {
       name,
       description: description || '',
       section: section || null,
+      areaChargeType: chargeType,
+      areaChargeValue: chargeType !== 'none' ? chargeValue : 0,
       restaurantId,
       createdAt: new Date(),
       updatedAt: new Date()
@@ -9758,6 +9993,8 @@ app.post('/api/floors/:restaurantId', authenticateToken, async (req, res) => {
         name,
         description: description || '',
         section: section || null,
+        areaChargeType: chargeType,
+        areaChargeValue: chargeType !== 'none' ? chargeValue : 0,
         restaurantId,
         tables: []
       }
@@ -9773,7 +10010,7 @@ app.post('/api/floors/:restaurantId', authenticateToken, async (req, res) => {
 app.patch('/api/floors/:floorId', authenticateToken, async (req, res) => {
   try {
     const { floorId } = req.params;
-    const { name, restaurantId, description, section } = req.body;
+    const { name, restaurantId, description, section, areaChargeType, areaChargeValue } = req.body;
 
     if (!name || !restaurantId) {
       return res.status(400).json({ error: 'Floor name and restaurant ID are required' });
@@ -9804,6 +10041,14 @@ app.patch('/api/floors/:floorId', authenticateToken, async (req, res) => {
     const floorUpdateData = { name, updatedAt: new Date() };
     if (description !== undefined) floorUpdateData.description = description || '';
     if (section !== undefined) floorUpdateData.section = section || null;
+    // Area charge fields
+    if (areaChargeType !== undefined) {
+      const validChargeTypes = ['none', 'percentage', 'flat'];
+      const chargeType = validChargeTypes.includes(areaChargeType) ? areaChargeType : 'none';
+      const chargeVal = Math.max(0, parseFloat(areaChargeValue) || 0);
+      floorUpdateData.areaChargeType = chargeType;
+      floorUpdateData.areaChargeValue = chargeType !== 'none' ? chargeVal : 0;
+    }
     batch.update(floorRef, floorUpdateData);
 
     await batch.commit();
