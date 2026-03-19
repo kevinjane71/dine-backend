@@ -3710,21 +3710,26 @@ app.post('/api/auth/phone/verify-otp', async (req, res) => {
       { expiresIn: '30d' }
     );
 
-    // Get user's restaurants for subdomain check (only if feature is enabled)
+    // Fetch user's restaurants (full data, same as firebase/verify)
     let subdomainUrl = null;
-    if (SUBDOMAIN_FEATURE_ENABLED && hasRestaurants) {
+    let userRestaurants = [];
+    if (hasRestaurants) {
       const restaurantsQuery = await db.collection(collections.restaurants)
         .where('ownerId', '==', userId)
-        .limit(1)
         .get();
 
-      if (!restaurantsQuery.empty) {
-        const restaurant = restaurantsQuery.docs[0].data();
-        if (restaurant.subdomainEnabled && restaurant.subdomain) {
-          subdomainUrl = getSubdomainUrl(restaurant.subdomain, '/dashboard');
+      userRestaurants = restaurantsQuery.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+
+      if (SUBDOMAIN_FEATURE_ENABLED && userRestaurants.length > 0) {
+        const firstRestaurant = userRestaurants[0];
+        if (firstRestaurant.subdomainEnabled && firstRestaurant.subdomain) {
+          subdomainUrl = getSubdomainUrl(firstRestaurant.subdomain, '/dashboard');
         }
       }
     }
+
+    const userData = userDoc.empty ? {} : userDoc.docs[0].data();
+    const firstRestaurant = userRestaurants.length > 0 ? userRestaurants[0] : null;
 
     res.json({
       success: true,
@@ -3733,14 +3738,20 @@ app.post('/api/auth/phone/verify-otp', async (req, res) => {
       user: {
         id: userId,
         phone,
-        name: name || userDoc.docs[0]?.data()?.name || 'Restaurant Owner',
-        role: 'owner',
-        setupComplete: userDoc.empty ? false : userDoc.docs[0]?.data()?.setupComplete || false
+        name: name || userData.name || 'Restaurant Owner',
+        role: userData.role || 'owner',
+        email: userData.email || null,
+        photoURL: userData.photoURL || null,
+        provider: userData.provider || 'phone',
+        restaurantId: firstRestaurant?.id || null,
+        restaurant: firstRestaurant || null,
+        setupComplete: userData.setupComplete || false
       },
       firstTimeUser: isNewUser,
-      isNewUser, // Keep for backward compatibility
+      isNewUser,
       hasRestaurants,
-      subdomainUrl, // Include subdomain URL if enabled
+      restaurants: userRestaurants,
+      subdomainUrl,
       redirectTo: subdomainUrl || (hasRestaurants ? '/dashboard' : '/admin')
     });
 
