@@ -4476,57 +4476,215 @@ app.post('/api/restaurants/:restaurantId/seed-default', authenticateToken, async
       return res.json({ success: true, message: 'Restaurant already has menu items', seeded: false });
     }
 
-    // Default menu items - 30 items across 6 categories
-    const defaultMenuItems = [
-      // Chinese
-      { name: 'Veg Manchurian', price: 180, category: 'Chinese', isVeg: true, description: 'Crispy vegetable balls in tangy manchurian sauce' },
-      { name: 'Hakka Noodles', price: 160, category: 'Chinese', isVeg: true, description: 'Stir-fried noodles with fresh vegetables' },
-      { name: 'Chicken Fried Rice', price: 200, category: 'Chinese', isVeg: false, description: 'Wok-tossed rice with chicken and vegetables' },
-      { name: 'Spring Rolls (4 pcs)', price: 140, category: 'Chinese', isVeg: true, description: 'Crispy rolls stuffed with mixed vegetables' },
-      { name: 'Chilli Chicken', price: 220, category: 'Chinese', isVeg: false, description: 'Spicy chicken tossed with peppers and onions' },
-      // Continental
-      { name: 'Grilled Chicken Breast', price: 320, category: 'Continental', isVeg: false, description: 'Herb-marinated grilled chicken with mashed potatoes' },
-      { name: 'Caesar Salad', price: 240, category: 'Continental', isVeg: false, description: 'Romaine lettuce with caesar dressing and croutons' },
-      { name: 'Cream of Mushroom Soup', price: 160, category: 'Continental', isVeg: true, description: 'Rich and creamy mushroom soup' },
-      { name: 'Fish and Chips', price: 340, category: 'Continental', isVeg: false, description: 'Beer-battered fish with crispy fries' },
-      { name: 'Pasta Alfredo', price: 260, category: 'Continental', isVeg: true, description: 'Penne in creamy parmesan alfredo sauce' },
-      // Pizza
-      { name: 'Margherita Pizza', price: 250, category: 'Pizza', isVeg: true, description: 'Classic tomato sauce, mozzarella and fresh basil' },
-      { name: 'Pepperoni Pizza', price: 350, category: 'Pizza', isVeg: false, description: 'Loaded with pepperoni and mozzarella cheese' },
-      { name: 'BBQ Chicken Pizza', price: 380, category: 'Pizza', isVeg: false, description: 'Smoky BBQ sauce with grilled chicken and onions' },
-      { name: 'Veggie Supreme Pizza', price: 300, category: 'Pizza', isVeg: true, description: 'Bell peppers, olives, mushrooms, onions and corn' },
-      { name: 'Farmhouse Pizza', price: 320, category: 'Pizza', isVeg: true, description: 'Fresh vegetables with herbs on a crispy crust' },
-      // Pastries & Desserts
-      { name: 'Chocolate Brownie', price: 120, category: 'Pastries & Desserts', isVeg: true, description: 'Warm fudgy brownie with chocolate sauce' },
-      { name: 'Red Velvet Cake', price: 180, category: 'Pastries & Desserts', isVeg: true, description: 'Classic red velvet with cream cheese frosting' },
-      { name: 'Tiramisu', price: 220, category: 'Pastries & Desserts', isVeg: true, description: 'Italian coffee-flavoured layered dessert' },
-      { name: 'Cheesecake', price: 200, category: 'Pastries & Desserts', isVeg: true, description: 'New York style baked cheesecake' },
-      { name: 'Black Forest Cake', price: 160, category: 'Pastries & Desserts', isVeg: true, description: 'Chocolate sponge with cherries and whipped cream' },
-      // Dal & Roti
-      { name: 'Dal Tadka', price: 140, category: 'Dal & Roti', isVeg: true, description: 'Yellow lentils tempered with cumin and garlic' },
-      { name: 'Dal Makhani', price: 180, category: 'Dal & Roti', isVeg: true, description: 'Slow-cooked black lentils in creamy tomato gravy' },
-      { name: 'Butter Naan', price: 40, category: 'Dal & Roti', isVeg: true, description: 'Soft leavened bread brushed with butter' },
-      { name: 'Tandoori Roti', price: 30, category: 'Dal & Roti', isVeg: true, description: 'Whole wheat bread baked in tandoor' },
-      { name: 'Paneer Butter Masala', price: 220, category: 'Dal & Roti', isVeg: true, description: 'Cottage cheese cubes in rich buttery tomato gravy' },
-      // Beverages
-      { name: 'Masala Chai', price: 30, category: 'Beverages', isVeg: true, description: 'Traditional Indian spiced tea' },
-      { name: 'Cold Coffee', price: 120, category: 'Beverages', isVeg: true, description: 'Chilled blended coffee with ice cream' },
-      { name: 'Fresh Lime Soda', price: 60, category: 'Beverages', isVeg: true, description: 'Refreshing lime with soda water' },
-      { name: 'Mango Lassi', price: 80, category: 'Beverages', isVeg: true, description: 'Creamy mango yogurt smoothie' },
-      { name: 'Virgin Mojito', price: 140, category: 'Beverages', isVeg: true, description: 'Mint and lime refresher with soda' },
+    // ===== Business-type-specific demo menus =====
+    const businessType = restaurantData.businessType || 'restaurant';
+    const img = (id) => `https://images.unsplash.com/${id}?w=400&h=300&fit=crop&q=80`;
+
+    // --- BAR / PUB ---
+    const barMenuItems = [
+      // Whiskey
+      { name: "Jack Daniel's Old No. 7", price: 350, category: 'Whiskey', isVeg: true, description: 'Classic Tennessee whiskey, smooth with caramel and vanilla notes', image: img('photo-1527281400683-1aae777175f8'), spiritCategory: 'whiskey', abv: 40, servingUnit: 'peg', bottleSize: '60ml' },
+      { name: 'Jameson Irish Whiskey', price: 320, category: 'Whiskey', isVeg: true, description: 'Triple-distilled smooth Irish whiskey', image: img('photo-1569529465841-dfecdab7503b'), spiritCategory: 'whiskey', abv: 40, servingUnit: 'peg', bottleSize: '60ml' },
+      { name: 'Glenfiddich 12 Year', price: 550, category: 'Whiskey', isVeg: true, description: 'Single malt Scotch with pear and oak notes', image: img('photo-1602081957921-9137a5d6eaee'), spiritCategory: 'whiskey', abv: 40, servingUnit: 'peg', bottleSize: '60ml' },
+      { name: 'Johnnie Walker Black Label', price: 450, category: 'Whiskey', isVeg: true, description: 'Rich blended Scotch with smoky complexity', image: img('photo-1614313511387-1436a4480ebb'), spiritCategory: 'whiskey', abv: 40, servingUnit: 'peg', bottleSize: '60ml' },
+      { name: 'Monkey Shoulder', price: 400, category: 'Whiskey', isVeg: true, description: 'Smooth triple malt blend, perfect for cocktails', image: img('photo-1594394874498-1e5e26c793e1'), spiritCategory: 'whiskey', abv: 40, servingUnit: 'peg', bottleSize: '60ml' },
+      // Vodka & Gin
+      { name: 'Absolut Vodka', price: 250, category: 'Vodka & Gin', isVeg: true, description: 'Swedish premium vodka, clean and smooth', image: img('photo-1607622750671-6cd9a99eabd1'), spiritCategory: 'vodka', abv: 40, servingUnit: 'peg', bottleSize: '60ml' },
+      { name: 'Grey Goose', price: 450, category: 'Vodka & Gin', isVeg: true, description: 'French luxury vodka distilled from wheat', image: img('photo-1613063050781-7b9164690fa5'), spiritCategory: 'vodka', abv: 40, servingUnit: 'peg', bottleSize: '60ml' },
+      { name: 'Bombay Sapphire', price: 350, category: 'Vodka & Gin', isVeg: true, description: 'Premium London dry gin with 10 botanicals', image: img('photo-1608885898957-a559228e4793'), spiritCategory: 'gin', abv: 40, servingUnit: 'peg', bottleSize: '60ml' },
+      { name: "Hendrick's Gin", price: 400, category: 'Vodka & Gin', isVeg: true, description: 'Scottish gin infused with cucumber and rose', image: img('photo-1550985543-f47f38aeee65'), spiritCategory: 'gin', abv: 41.4, servingUnit: 'peg', bottleSize: '60ml' },
+      { name: 'Smirnoff Vodka', price: 200, category: 'Vodka & Gin', isVeg: true, description: 'Triple-distilled classic vodka', image: img('photo-1607622750671-6cd9a99eabd1'), spiritCategory: 'vodka', abv: 37.5, servingUnit: 'peg', bottleSize: '60ml' },
+      // Beer
+      { name: 'Kingfisher Premium', price: 180, category: 'Beer', isVeg: true, description: 'India\'s most popular lager, crisp and refreshing', image: img('photo-1535958636474-b021ee887b13'), spiritCategory: 'beer', abv: 4.8, servingUnit: 'bottle', bottleSize: '650ml' },
+      { name: 'Heineken', price: 250, category: 'Beer', isVeg: true, description: 'Dutch pale lager with a balanced bitter taste', image: img('photo-1608270586620-248524c67de9'), spiritCategory: 'beer', abv: 5, servingUnit: 'bottle', bottleSize: '330ml' },
+      { name: 'Corona Extra', price: 280, category: 'Beer', isVeg: true, description: 'Mexican light beer, best served with a lime wedge', image: img('photo-1600788886242-5c96aabe3757'), spiritCategory: 'beer', abv: 4.5, servingUnit: 'bottle', bottleSize: '330ml' },
+      { name: 'Budweiser', price: 200, category: 'Beer', isVeg: true, description: 'American lager with smooth, crisp finish', image: img('photo-1618183479302-1e0aa382c36b'), spiritCategory: 'beer', abv: 5, servingUnit: 'bottle', bottleSize: '330ml' },
+      { name: 'Bira White', price: 220, category: 'Beer', isVeg: true, description: 'Indian craft wheat beer with citrus and coriander', image: img('photo-1571613316887-6f8d5cbf7ef7'), spiritCategory: 'beer', abv: 4.7, servingUnit: 'bottle', bottleSize: '330ml' },
+      // Cocktails
+      { name: 'Classic Mojito', price: 350, category: 'Cocktails', isVeg: true, description: 'Rum, fresh mint, lime, sugar and soda water', image: img('photo-1551538827-9c037cb4f32a'), spiritCategory: 'cocktail', abv: 15, servingUnit: 'glass', bottleSize: null },
+      { name: 'Long Island Iced Tea', price: 450, category: 'Cocktails', isVeg: true, description: 'Vodka, rum, gin, tequila, triple sec, cola and lemon', image: img('photo-1536935338788-846bb9981813'), spiritCategory: 'cocktail', abv: 22, servingUnit: 'glass', bottleSize: null },
+      { name: 'Cosmopolitan', price: 380, category: 'Cocktails', isVeg: true, description: 'Vodka, triple sec, cranberry juice and lime', image: img('photo-1514362545857-3bc16c4c7d1b'), spiritCategory: 'cocktail', abv: 18, servingUnit: 'glass', bottleSize: null },
+      { name: 'Old Fashioned', price: 420, category: 'Cocktails', isVeg: true, description: 'Bourbon, sugar, Angostura bitters and orange peel', image: img('photo-1470338745628-171cf53de3a8'), spiritCategory: 'cocktail', abv: 30, servingUnit: 'glass', bottleSize: null },
+      { name: 'Margarita', price: 380, category: 'Cocktails', isVeg: true, description: 'Tequila, triple sec, fresh lime with a salt rim', image: img('photo-1544145945-f90425340c7e'), spiritCategory: 'cocktail', abv: 20, servingUnit: 'glass', bottleSize: null },
+      { name: 'Piña Colada', price: 350, category: 'Cocktails', isVeg: true, description: 'Rum, coconut cream and pineapple juice, frozen', image: img('photo-1587223962217-f4bc79e63498'), spiritCategory: 'cocktail', abv: 13, servingUnit: 'glass', bottleSize: null },
+      // Wine
+      { name: 'House Red (Cabernet)', price: 300, category: 'Wine', isVeg: true, description: 'Full-bodied Cabernet Sauvignon by the glass', image: img('photo-1510812431401-41d2bd2722f3'), spiritCategory: 'wine', abv: 13.5, servingUnit: 'glass', bottleSize: '150ml' },
+      { name: 'House White (Chardonnay)', price: 300, category: 'Wine', isVeg: true, description: 'Crisp Chardonnay with citrus and vanilla notes', image: img('photo-1558001373-7b93ee48ffa0'), spiritCategory: 'wine', abv: 13, servingUnit: 'glass', bottleSize: '150ml' },
+      { name: 'Rosé Wine', price: 320, category: 'Wine', isVeg: true, description: 'Light and fruity rosé, perfect for warm evenings', image: img('photo-1558618666-fcd25c85f82e'), spiritCategory: 'wine', abv: 12, servingUnit: 'glass', bottleSize: '150ml' },
+      { name: 'Sangria Pitcher', price: 550, category: 'Wine', isVeg: true, description: 'Red wine with fresh fruits, brandy and soda', image: img('photo-1583766395091-2eb9994ed094'), spiritCategory: 'wine', abv: 12, servingUnit: 'glass', bottleSize: '500ml' },
+      { name: 'Sparkling Wine', price: 400, category: 'Wine', isVeg: true, description: 'Crisp and bubbly, great for celebrations', image: img('photo-1594372365401-3b5ff14eaaed'), spiritCategory: 'wine', abv: 12, servingUnit: 'glass', bottleSize: '150ml' },
+      // Bar Snacks
+      { name: 'Masala Peanuts', price: 120, category: 'Bar Snacks', isVeg: true, description: 'Crunchy spiced peanuts with curry leaves', image: img('photo-1599599810769-bcde5a160d32'), spiritCategory: 'bar_snack', abv: null, servingUnit: null, bottleSize: null },
+      { name: 'Chicken Wings (8 pcs)', price: 320, category: 'Bar Snacks', isVeg: false, description: 'Crispy wings tossed in spicy buffalo sauce', image: img('photo-1608039829572-25e8182a7e46'), spiritCategory: 'bar_snack', abv: null, servingUnit: null, bottleSize: null },
+      { name: 'Fish Fingers', price: 280, category: 'Bar Snacks', isVeg: false, description: 'Golden fried fish strips with tartare sauce', image: img('photo-1604909052743-94e838986d24'), spiritCategory: 'bar_snack', abv: null, servingUnit: null, bottleSize: null },
+      { name: 'Nachos with Salsa', price: 220, category: 'Bar Snacks', isVeg: true, description: 'Crispy tortilla chips with cheese, salsa and guacamole', image: img('photo-1513456852971-30c0b8199d4d'), spiritCategory: 'bar_snack', abv: null, servingUnit: null, bottleSize: null },
+      { name: 'French Fries', price: 150, category: 'Bar Snacks', isVeg: true, description: 'Crispy golden fries with ketchup and mayo', image: img('photo-1573080496219-bb080dd4f877'), spiritCategory: 'bar_snack', abv: null, servingUnit: null, bottleSize: null },
+      { name: 'Paneer Tikka', price: 260, category: 'Bar Snacks', isVeg: true, description: 'Smoky grilled cottage cheese with mint chutney', image: img('photo-1567188040759-fb8a883dc6d8'), spiritCategory: 'bar_snack', abv: null, servingUnit: null, bottleSize: null },
     ];
 
+    // --- BAKERY ---
+    const bakeryMenuItems = [
+      // Breads
+      { name: 'Sourdough Loaf', price: 180, category: 'Breads', isVeg: true, description: 'Artisan sourdough with a crispy crust and tangy crumb', image: img('photo-1585478259715-876acc5be8eb'), weight: '500g', unit: 'loaf' },
+      { name: 'Multigrain Bread', price: 120, category: 'Breads', isVeg: true, description: 'Healthy bread with oats, flax and sunflower seeds', image: img('photo-1509440159596-0249088772ff'), weight: '400g', unit: 'loaf' },
+      { name: 'French Baguette', price: 80, category: 'Breads', isVeg: true, description: 'Long crusty French bread, perfect with butter', image: img('photo-1549931319-a545dcf3bc73'), weight: '250g', unit: 'piece' },
+      { name: 'Garlic Bread', price: 100, category: 'Breads', isVeg: true, description: 'Toasted bread with garlic butter and herbs', image: img('photo-1619535860434-ba1d8fa12536'), weight: '200g', unit: 'piece' },
+      { name: 'Ciabatta', price: 90, category: 'Breads', isVeg: true, description: 'Italian flatbread with olive oil, airy and chewy', image: img('photo-1600398142498-0e371a62bf26'), weight: '300g', unit: 'piece' },
+      // Cakes
+      { name: 'Chocolate Truffle Cake', price: 450, category: 'Cakes', isVeg: true, description: 'Rich dark chocolate layered cake with ganache', image: img('photo-1578985545062-69928b1d9587'), weight: 'per slice', unit: 'slice' },
+      { name: 'Red Velvet Cake', price: 420, category: 'Cakes', isVeg: true, description: 'Classic red velvet with cream cheese frosting', image: img('photo-1616541823729-00fe0aacd32c'), weight: 'per slice', unit: 'slice' },
+      { name: 'Black Forest Cake', price: 380, category: 'Cakes', isVeg: true, description: 'Chocolate sponge with cherries and whipped cream', image: img('photo-1606890737304-86aed9e44ce6'), weight: 'per slice', unit: 'slice' },
+      { name: 'Pineapple Cake', price: 350, category: 'Cakes', isVeg: true, description: 'Light sponge with fresh pineapple and cream layers', image: img('photo-1488477181946-6428a0291777'), weight: 'per slice', unit: 'slice' },
+      { name: 'Carrot Cake', price: 380, category: 'Cakes', isVeg: true, description: 'Moist spiced cake with carrots and walnut cream cheese', image: img('photo-1621303837174-89787a7d4729'), weight: 'per slice', unit: 'slice' },
+      { name: 'New York Cheesecake', price: 420, category: 'Cakes', isVeg: true, description: 'Creamy baked cheesecake on a buttery biscuit base', image: img('photo-1524351199678-941a58a3df50'), weight: 'per slice', unit: 'slice' },
+      // Pastries
+      { name: 'Butter Croissant', price: 90, category: 'Pastries', isVeg: true, description: 'Flaky French pastry with layers of golden butter', image: img('photo-1555507036-ab1f4038024a'), weight: '80g', unit: 'piece' },
+      { name: 'Danish Pastry', price: 110, category: 'Pastries', isVeg: true, description: 'Sweet pastry with custard filling and fruit glaze', image: img('photo-1509365390695-33aee754301f'), weight: '100g', unit: 'piece' },
+      { name: 'Chocolate Éclair', price: 120, category: 'Pastries', isVeg: true, description: 'Choux pastry filled with cream, topped with chocolate', image: img('photo-1525059696034-4967a8e1dca2'), weight: '90g', unit: 'piece' },
+      { name: 'Veg Puff', price: 45, category: 'Pastries', isVeg: true, description: 'Crispy puff pastry with spiced potato and peas filling', image: img('photo-1608039858788-667850f129f6'), weight: '80g', unit: 'piece' },
+      { name: 'Apple Turnover', price: 100, category: 'Pastries', isVeg: true, description: 'Golden pastry pocket filled with spiced apple', image: img('photo-1621955511667-e2c316e4575d'), weight: '100g', unit: 'piece' },
+      { name: 'Cinnamon Roll', price: 120, category: 'Pastries', isVeg: true, description: 'Soft rolled pastry swirled with cinnamon sugar glaze', image: img('photo-1509365465985-25d11c17e812'), weight: '110g', unit: 'piece' },
+      // Cookies & Biscuits
+      { name: 'Chocolate Chip Cookie', price: 60, category: 'Cookies & Biscuits', isVeg: true, description: 'Classic soft-baked cookie loaded with chocolate chips', image: img('photo-1499636136210-6f4ee915583e'), weight: '50g', unit: 'piece' },
+      { name: 'Oatmeal Raisin Cookie', price: 55, category: 'Cookies & Biscuits', isVeg: true, description: 'Chewy oat cookie with plump raisins and cinnamon', image: img('photo-1590080874088-eec64895b423'), weight: '50g', unit: 'piece' },
+      { name: 'French Macaron (2 pcs)', price: 120, category: 'Cookies & Biscuits', isVeg: true, description: 'Delicate almond meringue sandwiches with ganache', image: img('photo-1569864358642-9d1684040f43'), weight: '40g', unit: 'box' },
+      { name: 'Chocolate Brownie', price: 100, category: 'Cookies & Biscuits', isVeg: true, description: 'Dense fudgy brownie with walnuts', image: img('photo-1606313564200-e75d5e30476c'), weight: '80g', unit: 'piece' },
+      { name: 'Almond Biscotti', price: 80, category: 'Cookies & Biscuits', isVeg: true, description: 'Twice-baked Italian almond cookies, perfect with coffee', image: img('photo-1558961363-fa8fdf82db35'), weight: '60g', unit: 'piece' },
+      // Savory
+      { name: 'Chicken Patty', price: 80, category: 'Savory', isVeg: false, description: 'Spiced minced chicken in flaky pastry', image: img('photo-1600891964599-f94d5421b378'), weight: '120g', unit: 'piece' },
+      { name: 'Paneer Roll', price: 70, category: 'Savory', isVeg: true, description: 'Cottage cheese and vegetables wrapped in a paratha', image: img('photo-1626700051175-6818013e1d4f'), weight: '150g', unit: 'piece' },
+      { name: 'Quiche Lorraine', price: 160, category: 'Savory', isVeg: false, description: 'French savory tart with bacon, cheese and cream', image: img('photo-1608039783021-96698e4e3ddf'), weight: '180g', unit: 'slice' },
+      { name: 'Spinach Corn Sandwich', price: 100, category: 'Savory', isVeg: true, description: 'Grilled sandwich with creamy spinach corn filling', image: img('photo-1528735602780-2552fd46c7af'), weight: '200g', unit: 'piece' },
+      { name: 'Cheese Garlic Bread', price: 120, category: 'Savory', isVeg: true, description: 'Toasted bread loaded with mozzarella and garlic butter', image: img('photo-1573140401552-3fab0b4fca47'), weight: '150g', unit: 'piece' },
+      // Beverages
+      { name: 'Cappuccino', price: 150, category: 'Beverages', isVeg: true, description: 'Espresso with steamed milk foam and cocoa dust', image: img('photo-1572442388796-11668a67e53d'), weight: null, unit: 'cup' },
+      { name: 'Café Latte', price: 160, category: 'Beverages', isVeg: true, description: 'Smooth espresso with velvety steamed milk', image: img('photo-1461023058943-07fcbe16d735'), weight: null, unit: 'cup' },
+      { name: 'Hot Chocolate', price: 170, category: 'Beverages', isVeg: true, description: 'Rich chocolate drink topped with whipped cream', image: img('photo-1542990253-0d0f5be5f0ed'), weight: null, unit: 'cup' },
+      { name: 'Fresh Orange Juice', price: 120, category: 'Beverages', isVeg: true, description: 'Freshly squeezed orange juice, no sugar added', image: img('photo-1621506289937-a8e4df240d0b'), weight: null, unit: 'glass' },
+      { name: 'Iced Tea', price: 100, category: 'Beverages', isVeg: true, description: 'Refreshing peach iced tea with lemon', image: img('photo-1556679343-c7306c1976bc'), weight: null, unit: 'glass' },
+    ];
+
+    // --- ICE CREAM ---
+    const iceCreamMenuItems = [
+      // Classic Scoops
+      { name: 'Vanilla Bean', price: 80, category: 'Classic Scoops', isVeg: true, description: 'Creamy vanilla ice cream with real vanilla bean specks', image: img('photo-1570197788417-0e82375c9371'), servingSize: 'scoop', scoopOptions: 3 },
+      { name: 'Belgian Chocolate', price: 90, category: 'Classic Scoops', isVeg: true, description: 'Rich dark chocolate ice cream with cocoa nibs', image: img('photo-1563805042-7684c019e1cb'), servingSize: 'scoop', scoopOptions: 3 },
+      { name: 'Strawberry Swirl', price: 85, category: 'Classic Scoops', isVeg: true, description: 'Fresh strawberry ice cream with fruit swirls', image: img('photo-1497034825429-c343d7c6a68f'), servingSize: 'scoop', scoopOptions: 3 },
+      { name: 'Mango Alphonso', price: 100, category: 'Classic Scoops', isVeg: true, description: 'Made with real Alphonso mango pulp, tropical and sweet', image: img('photo-1501443762994-82bd5dace89a'), servingSize: 'scoop', scoopOptions: 3 },
+      { name: 'Butterscotch Crunch', price: 85, category: 'Classic Scoops', isVeg: true, description: 'Buttery caramel ice cream with crunchy toffee bits', image: img('photo-1580915411954-282cb1b0d780'), servingSize: 'scoop', scoopOptions: 3 },
+      // Premium Scoops
+      { name: 'Salted Caramel', price: 120, category: 'Premium Scoops', isVeg: true, description: 'Sweet and salty caramel swirl, luxuriously smooth', image: img('photo-1560008581-09826d1de69e'), servingSize: 'scoop', scoopOptions: 3 },
+      { name: 'Cookie Dough', price: 120, category: 'Premium Scoops', isVeg: true, description: 'Vanilla base loaded with chocolate chip cookie dough', image: img('photo-1629385701021-fcd568a743e8'), servingSize: 'scoop', scoopOptions: 3 },
+      { name: 'Pistachio', price: 130, category: 'Premium Scoops', isVeg: true, description: 'Nutty pistachio gelato with roasted pistachio pieces', image: img('photo-1557142046-c704a3adf364'), servingSize: 'scoop', scoopOptions: 3 },
+      { name: 'Blueberry Cheesecake', price: 130, category: 'Premium Scoops', isVeg: true, description: 'Cheesecake-flavoured ice cream with blueberry ribbon', image: img('photo-1488900128323-21503983a07e'), servingSize: 'scoop', scoopOptions: 3 },
+      { name: 'Dark Rum Raisin', price: 140, category: 'Premium Scoops', isVeg: true, description: 'Rich rum-infused ice cream studded with plump raisins', image: img('photo-1516559828984-fb3b99548b21'), servingSize: 'scoop', scoopOptions: 3 },
+      // Sundaes
+      { name: 'Hot Fudge Sundae', price: 220, category: 'Sundaes', isVeg: true, description: 'Vanilla and chocolate scoops with hot fudge and whipped cream', image: img('photo-1563805042-7684c019e1cb'), servingSize: 'sundae', scoopOptions: 3 },
+      { name: 'Brownie Sundae', price: 250, category: 'Sundaes', isVeg: true, description: 'Warm brownie topped with ice cream, nuts and chocolate sauce', image: img('photo-1551024506-0bccd828d307'), servingSize: 'sundae', scoopOptions: 2 },
+      { name: 'Banana Split', price: 260, category: 'Sundaes', isVeg: true, description: 'Fresh banana with 3 scoops, whipped cream, nuts and cherry', image: img('photo-1432457990754-c8b5f21448de'), servingSize: 'sundae', scoopOptions: 3 },
+      { name: 'Caramel Crunch Sundae', price: 240, category: 'Sundaes', isVeg: true, description: 'Caramel ice cream with toffee crunch and butterscotch sauce', image: img('photo-1580915411954-282cb1b0d780'), servingSize: 'sundae', scoopOptions: 2 },
+      { name: 'Fruit Paradise', price: 230, category: 'Sundaes', isVeg: true, description: 'Mixed fruit with mango and strawberry ice cream', image: img('photo-1488900128323-21503983a07e'), servingSize: 'sundae', scoopOptions: 3 },
+      // Shakes & Smoothies
+      { name: 'Oreo Milkshake', price: 180, category: 'Shakes & Smoothies', isVeg: true, description: 'Thick creamy shake blended with Oreo cookies', image: img('photo-1572490122747-3968b75cc699'), servingSize: 'shake', scoopOptions: null },
+      { name: 'Mango Smoothie', price: 160, category: 'Shakes & Smoothies', isVeg: true, description: 'Fresh mango blended with yogurt and honey', image: img('photo-1623065422902-30a2d299bbe4'), servingSize: 'shake', scoopOptions: null },
+      { name: 'Strawberry Milkshake', price: 170, category: 'Shakes & Smoothies', isVeg: true, description: 'Classic strawberry shake with fresh berries', image: img('photo-1579954115545-a95591f28bfc'), servingSize: 'shake', scoopOptions: null },
+      { name: 'Cold Coffee Shake', price: 160, category: 'Shakes & Smoothies', isVeg: true, description: 'Espresso blended with vanilla ice cream and milk', image: img('photo-1461023058943-07fcbe16d735'), servingSize: 'shake', scoopOptions: null },
+      { name: 'Nutella Shake', price: 200, category: 'Shakes & Smoothies', isVeg: true, description: 'Indulgent Nutella blended with chocolate ice cream', image: img('photo-1541658016709-82535e94bc69'), servingSize: 'shake', scoopOptions: null },
+      // Cones & Cups
+      { name: 'Single Scoop Cone', price: 80, category: 'Cones & Cups', isVeg: true, description: 'One scoop of your choice in a crispy wafer cone', image: img('photo-1497034825429-c343d7c6a68f'), servingSize: 'cone', scoopOptions: 1 },
+      { name: 'Double Scoop Cone', price: 140, category: 'Cones & Cups', isVeg: true, description: 'Two scoops of your choice in a crispy wafer cone', image: img('photo-1501443762994-82bd5dace89a'), servingSize: 'cone', scoopOptions: 2 },
+      { name: 'Waffle Cone', price: 160, category: 'Cones & Cups', isVeg: true, description: 'Freshly made waffle cone with two scoops', image: img('photo-1570197788417-0e82375c9371'), servingSize: 'cone', scoopOptions: 2 },
+      { name: 'Cup - Small', price: 100, category: 'Cones & Cups', isVeg: true, description: 'Two scoops in a cup with your choice of topping', image: img('photo-1563805042-7684c019e1cb'), servingSize: 'cup', scoopOptions: 2 },
+      { name: 'Cup - Large', price: 180, category: 'Cones & Cups', isVeg: true, description: 'Three scoops in a large cup with two toppings', image: img('photo-1488900128323-21503983a07e'), servingSize: 'cup', scoopOptions: 3 },
+      // Specials
+      { name: 'Ice Cream Sandwich', price: 120, category: 'Specials', isVeg: true, description: 'Vanilla ice cream between two chocolate chip cookies', image: img('photo-1629385701021-fcd568a743e8'), servingSize: 'piece', scoopOptions: null },
+      { name: 'Kulfi Stick', price: 70, category: 'Specials', isVeg: true, description: 'Traditional Indian frozen dessert with cardamom and pistachio', image: img('photo-1516559828984-fb3b99548b21'), servingSize: 'piece', scoopOptions: null },
+      { name: 'Falooda', price: 180, category: 'Specials', isVeg: true, description: 'Rose falooda with vermicelli, basil seeds and ice cream', image: img('photo-1551024506-0bccd828d307'), servingSize: 'glass', scoopOptions: 1 },
+      { name: 'Affogato', price: 160, category: 'Specials', isVeg: true, description: 'Vanilla gelato drowned in a shot of hot espresso', image: img('photo-1461023058943-07fcbe16d735'), servingSize: 'cup', scoopOptions: 1 },
+      { name: 'Ice Cream Cake Slice', price: 200, category: 'Specials', isVeg: true, description: 'Layered ice cream cake with chocolate and vanilla', image: img('photo-1578985545062-69928b1d9587'), servingSize: 'slice', scoopOptions: null },
+    ];
+
+    // --- RESTAURANT (existing items + images) ---
+    const restaurantMenuItems = [
+      // Chinese
+      { name: 'Veg Manchurian', price: 180, category: 'Chinese', isVeg: true, description: 'Crispy vegetable balls in tangy manchurian sauce', image: img('photo-1525755662778-989d0524087e') },
+      { name: 'Hakka Noodles', price: 160, category: 'Chinese', isVeg: true, description: 'Stir-fried noodles with fresh vegetables', image: img('photo-1569718212165-3a8278d5f624') },
+      { name: 'Chicken Fried Rice', price: 200, category: 'Chinese', isVeg: false, description: 'Wok-tossed rice with chicken and vegetables', image: img('photo-1603133872878-684f208fb84b') },
+      { name: 'Spring Rolls (4 pcs)', price: 140, category: 'Chinese', isVeg: true, description: 'Crispy rolls stuffed with mixed vegetables', image: img('photo-1548507200-e9e0add0ef19') },
+      { name: 'Chilli Chicken', price: 220, category: 'Chinese', isVeg: false, description: 'Spicy chicken tossed with peppers and onions', image: img('photo-1525755662778-989d0524087e') },
+      // Continental
+      { name: 'Grilled Chicken Breast', price: 320, category: 'Continental', isVeg: false, description: 'Herb-marinated grilled chicken with mashed potatoes', image: img('photo-1532550907401-a500c9a57435') },
+      { name: 'Caesar Salad', price: 240, category: 'Continental', isVeg: false, description: 'Romaine lettuce with caesar dressing and croutons', image: img('photo-1546793665-c74683f339c1') },
+      { name: 'Cream of Mushroom Soup', price: 160, category: 'Continental', isVeg: true, description: 'Rich and creamy mushroom soup', image: img('photo-1547592166-23ac45744acd') },
+      { name: 'Fish and Chips', price: 340, category: 'Continental', isVeg: false, description: 'Beer-battered fish with crispy fries', image: img('photo-1579208030886-b1f5b6b0a7f7') },
+      { name: 'Pasta Alfredo', price: 260, category: 'Continental', isVeg: true, description: 'Penne in creamy parmesan alfredo sauce', image: img('photo-1621996346565-e3dbc646d9a9') },
+      // Pizza
+      { name: 'Margherita Pizza', price: 250, category: 'Pizza', isVeg: true, description: 'Classic tomato sauce, mozzarella and fresh basil', image: img('photo-1574071318508-1cdbab80d002') },
+      { name: 'Pepperoni Pizza', price: 350, category: 'Pizza', isVeg: false, description: 'Loaded with pepperoni and mozzarella cheese', image: img('photo-1628840042765-356cda07504e') },
+      { name: 'BBQ Chicken Pizza', price: 380, category: 'Pizza', isVeg: false, description: 'Smoky BBQ sauce with grilled chicken and onions', image: img('photo-1565299624946-b28f40a0ae38') },
+      { name: 'Veggie Supreme Pizza', price: 300, category: 'Pizza', isVeg: true, description: 'Bell peppers, olives, mushrooms, onions and corn', image: img('photo-1571407970349-bc81e7e96d47') },
+      { name: 'Farmhouse Pizza', price: 320, category: 'Pizza', isVeg: true, description: 'Fresh vegetables with herbs on a crispy crust', image: img('photo-1513104890138-7c749659a591') },
+      // Pastries & Desserts
+      { name: 'Chocolate Brownie', price: 120, category: 'Pastries & Desserts', isVeg: true, description: 'Warm fudgy brownie with chocolate sauce', image: img('photo-1606313564200-e75d5e30476c') },
+      { name: 'Red Velvet Cake', price: 180, category: 'Pastries & Desserts', isVeg: true, description: 'Classic red velvet with cream cheese frosting', image: img('photo-1616541823729-00fe0aacd32c') },
+      { name: 'Tiramisu', price: 220, category: 'Pastries & Desserts', isVeg: true, description: 'Italian coffee-flavoured layered dessert', image: img('photo-1571877227200-a0d98ea607e9') },
+      { name: 'Cheesecake', price: 200, category: 'Pastries & Desserts', isVeg: true, description: 'New York style baked cheesecake', image: img('photo-1524351199678-941a58a3df50') },
+      { name: 'Black Forest Cake', price: 160, category: 'Pastries & Desserts', isVeg: true, description: 'Chocolate sponge with cherries and whipped cream', image: img('photo-1606890737304-86aed9e44ce6') },
+      // Dal & Roti
+      { name: 'Dal Tadka', price: 140, category: 'Dal & Roti', isVeg: true, description: 'Yellow lentils tempered with cumin and garlic', image: img('photo-1546833999-b9f581a1996d') },
+      { name: 'Dal Makhani', price: 180, category: 'Dal & Roti', isVeg: true, description: 'Slow-cooked black lentils in creamy tomato gravy', image: img('photo-1585937421612-70a008356fbe') },
+      { name: 'Butter Naan', price: 40, category: 'Dal & Roti', isVeg: true, description: 'Soft leavened bread brushed with butter', image: img('photo-1565557623262-b51c2513a641') },
+      { name: 'Tandoori Roti', price: 30, category: 'Dal & Roti', isVeg: true, description: 'Whole wheat bread baked in tandoor', image: img('photo-1565557623262-b51c2513a641') },
+      { name: 'Paneer Butter Masala', price: 220, category: 'Dal & Roti', isVeg: true, description: 'Cottage cheese cubes in rich buttery tomato gravy', image: img('photo-1631452180519-c014fe946bc7') },
+      // Beverages
+      { name: 'Masala Chai', price: 30, category: 'Beverages', isVeg: true, description: 'Traditional Indian spiced tea', image: img('photo-1561336526-2914f13db765') },
+      { name: 'Cold Coffee', price: 120, category: 'Beverages', isVeg: true, description: 'Chilled blended coffee with ice cream', image: img('photo-1461023058943-07fcbe16d735') },
+      { name: 'Fresh Lime Soda', price: 60, category: 'Beverages', isVeg: true, description: 'Refreshing lime with soda water', image: img('photo-1513558161293-cdaf765ed2fd') },
+      { name: 'Mango Lassi', price: 80, category: 'Beverages', isVeg: true, description: 'Creamy mango yogurt smoothie', image: img('photo-1623065422902-30a2d299bbe4') },
+      { name: 'Virgin Mojito', price: 140, category: 'Beverages', isVeg: true, description: 'Mint and lime refresher with soda', image: img('photo-1551538827-9c037cb4f32a') },
+    ];
+
+    // Category emojis per business type
+    const categoryEmojisByType = {
+      bar: { 'Whiskey': '🥃', 'Vodka & Gin': '🍸', 'Beer': '🍺', 'Cocktails': '🍹', 'Wine': '🍷', 'Bar Snacks': '🍗' },
+      bakery: { 'Breads': '🍞', 'Cakes': '🎂', 'Pastries': '🥐', 'Cookies & Biscuits': '🍪', 'Savory': '🥧', 'Beverages': '☕' },
+      ice_cream: { 'Classic Scoops': '🍦', 'Premium Scoops': '⭐', 'Sundaes': '🍨', 'Shakes & Smoothies': '🥤', 'Cones & Cups': '🍧', 'Specials': '✨' },
+      restaurant: { 'Chinese': '🥡', 'Continental': '🍽️', 'Pizza': '🍕', 'Pastries & Desserts': '🍰', 'Dal & Roti': '🫓', 'Beverages': '🥤' },
+    };
+
+    // Pick menu and emojis based on business type
+    let selectedMenuItems;
+    let selectedEmojis;
+    switch (businessType) {
+      case 'bar':
+        selectedMenuItems = barMenuItems;
+        selectedEmojis = categoryEmojisByType.bar;
+        break;
+      case 'bakery':
+        selectedMenuItems = bakeryMenuItems;
+        selectedEmojis = categoryEmojisByType.bakery;
+        break;
+      case 'ice_cream':
+        selectedMenuItems = iceCreamMenuItems;
+        selectedEmojis = categoryEmojisByType.ice_cream;
+        break;
+      default:
+        selectedMenuItems = restaurantMenuItems;
+        selectedEmojis = categoryEmojisByType.restaurant;
+        break;
+    }
+
     // Build menu items with proper IDs and shortcodes
-    const menuItems = defaultMenuItems.map((item, index) => ({
+    const menuItems = selectedMenuItems.map((item, index) => ({
       id: `item_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
       name: item.name,
       description: item.description,
       price: item.price,
       category: item.category,
       isVeg: item.isVeg,
-      spiceLevel: 'medium',
+      spiceLevel: item.spiceLevel || 'medium',
       allergens: [],
-      image: null,
+      image: item.image || null,
       shortCode: String(index + 1),
       status: 'active',
       order: index,
@@ -4538,24 +4696,24 @@ app.post('/api/restaurants/:restaurantId/seed-default', authenticateToken, async
       availableUntil: null,
       variants: [],
       customizations: [],
+      // Type-specific fields
+      ...(item.spiritCategory !== undefined && { spiritCategory: item.spiritCategory }),
+      ...(item.abv !== undefined && { abv: item.abv }),
+      ...(item.servingUnit !== undefined && { servingUnit: item.servingUnit }),
+      ...(item.bottleSize !== undefined && { bottleSize: item.bottleSize }),
+      ...(item.weight !== undefined && { weight: item.weight }),
+      ...(item.unit !== undefined && { unit: item.unit }),
+      ...(item.servingSize !== undefined && { servingSize: item.servingSize }),
+      ...(item.scoopOptions !== undefined && { scoopOptions: item.scoopOptions }),
       createdAt: new Date(),
       updatedAt: new Date()
     }));
 
     // Build categories
-    const categoryEmojis = {
-      'Chinese': '🥡',
-      'Continental': '🍽️',
-      'Pizza': '🍕',
-      'Pastries & Desserts': '🍰',
-      'Dal & Roti': '🫓',
-      'Beverages': '🥤'
-    };
-
-    const categories = Object.keys(categoryEmojis).map(name => ({
+    const categories = Object.keys(selectedEmojis).map(name => ({
       id: categoryNameToId(name),
       name,
-      emoji: categoryEmojis[name],
+      emoji: selectedEmojis[name],
       description: '',
       createdAt: new Date(),
       updatedAt: new Date()
