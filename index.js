@@ -10396,11 +10396,11 @@ app.get('/api/bookings/:restaurantId', authenticateToken, async (req, res) => {
     // Sort by bookingDate descending
     bookings.sort((a, b) => new Date(b.bookingDate) - new Date(a.bookingDate));
 
-    res.json({ success: true, bookings });
+    res.json({ success: true, bookings, _debug: { totalInCollection: snapshot.size, afterFilter: bookings.length, collection: collections.bookings || 'bookings', restaurantId, date } });
 
   } catch (error) {
     console.error('Get bookings error:', error);
-    res.status(500).json({ error: 'Failed to fetch bookings' });
+    res.status(500).json({ error: 'Failed to fetch bookings', _error: error.message });
   }
 });
 
