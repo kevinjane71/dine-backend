@@ -10351,40 +10351,51 @@ app.delete('/api/floors/:floorId', authenticateToken, async (req, res) => {
 
 // Booking Management APIs
 app.get('/api/bookings/:restaurantId', authenticateToken, async (req, res) => {
-  try {
-    const { restaurantId } = req.params;
-    const { date, status } = req.query;
+  const { restaurantId } = req.params;
+  const { date, status } = req.query;
 
-    // Fetch all bookings for this restaurant (avoids composite index issues)
+  try {
     const snapshot = await db.collection(collections.bookings || 'bookings')
       .where('restaurantId', '==', restaurantId)
       .get();
 
     let bookings = [];
-
-    snapshot.forEach(doc => {
+    snapshot.docs.forEach(doc => {
       const data = doc.data();
-      // Convert Firestore Timestamp to JS Date for comparison
-      const bookingDateValue = data.bookingDate?.toDate ? data.bookingDate.toDate() : new Date(data.bookingDate);
+      const bookingDateValue = data.bookingDate && data.bookingDate.toDate ? data.bookingDate.toDate() : (data.bookingDate ? new Date(data.bookingDate) : null);
+      const endTimeValue = data.endTime && data.endTime.toDate ? data.endTime.toDate() : (data.endTime ? new Date(data.endTime) : null);
+      const createdAtValue = data.createdAt && data.createdAt.toDate ? data.createdAt.toDate() : (data.createdAt ? new Date(data.createdAt) : null);
+      const updatedAtValue = data.updatedAt && data.updatedAt.toDate ? data.updatedAt.toDate() : (data.updatedAt ? new Date(data.updatedAt) : null);
 
       bookings.push({
         id: doc.id,
-        ...data,
-        bookingDate: bookingDateValue.toISOString(),
-        endTime: data.endTime?.toDate ? data.endTime.toDate().toISOString() : data.endTime,
-        createdAt: data.createdAt?.toDate ? data.createdAt.toDate().toISOString() : data.createdAt,
-        updatedAt: data.updatedAt?.toDate ? data.updatedAt.toDate().toISOString() : data.updatedAt,
+        restaurantId: data.restaurantId,
+        tableId: data.tableId,
+        tableName: data.tableName,
+        floor: data.floor,
+        customerName: data.customerName,
+        customerPhone: data.customerPhone,
+        customerEmail: data.customerEmail,
+        partySize: data.partySize,
+        bookingDate: bookingDateValue ? bookingDateValue.toISOString() : null,
+        bookingTime: data.bookingTime,
+        duration: data.duration,
+        endTime: endTimeValue ? endTimeValue.toISOString() : null,
+        status: data.status,
+        specialRequests: data.specialRequests,
+        occasionType: data.occasionType,
+        createdAt: createdAtValue ? createdAtValue.toISOString() : null,
+        updatedAt: updatedAtValue ? updatedAtValue.toISOString() : null,
       });
     });
 
-    // Filter by status in JS
     if (status) {
       bookings = bookings.filter(b => b.status === status);
     }
 
-    // Filter by date in JS — compare date portion only (YYYY-MM-DD)
     if (date) {
       bookings = bookings.filter(b => {
+        if (!b.bookingDate) return false;
         const bDate = new Date(b.bookingDate);
         const bDateStr = bDate.getFullYear() + '-' +
           String(bDate.getMonth() + 1).padStart(2, '0') + '-' +
@@ -10393,14 +10404,13 @@ app.get('/api/bookings/:restaurantId', authenticateToken, async (req, res) => {
       });
     }
 
-    // Sort by bookingDate descending
     bookings.sort((a, b) => new Date(b.bookingDate) - new Date(a.bookingDate));
 
-    res.json({ success: true, bookings, _debug: { totalInCollection: snapshot.size, afterFilter: bookings.length, collection: collections.bookings || 'bookings', restaurantId, date } });
+    return res.json({ success: true, bookings, _total: snapshot.size });
 
   } catch (error) {
-    console.error('Get bookings error:', error);
-    res.status(500).json({ error: 'Failed to fetch bookings', _error: error.message });
+    console.error('Get bookings error:', error.message);
+    return res.status(500).json({ error: 'Failed to fetch bookings', message: error.message });
   }
 });
 

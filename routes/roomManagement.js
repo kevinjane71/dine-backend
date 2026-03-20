@@ -634,7 +634,7 @@ router.post('/booking', authenticateToken, async (req, res) => {
 });
 
 // Get all bookings
-router.get('/bookings/:restaurantId', authenticateToken, async (req, res) => {
+router.get('/room-bookings/:restaurantId', authenticateToken, async (req, res) => {
   try {
     const { restaurantId } = req.params;
     const { status, date } = req.query;
