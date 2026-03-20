@@ -5,7 +5,7 @@ const { authenticateToken, requireOwnerRole } = require('../middleware/auth');
 const emailService = require('../emailService');
 
 // ============================================
-// AI INSIGHTS & DAILY REPORTS
+// AI INSIGHTS & DAILY REPORTS fds
 // Provides AI-powered analytics and automated emails
 // ============================================
 
