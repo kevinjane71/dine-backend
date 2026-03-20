@@ -10355,33 +10355,48 @@ app.get('/api/bookings/:restaurantId', authenticateToken, async (req, res) => {
     const { restaurantId } = req.params;
     const { date, status } = req.query;
 
-    let query = db.collection(collections.bookings || 'bookings')
-      .where('restaurantId', '==', restaurantId);
+    // Fetch all bookings for this restaurant (avoids composite index issues)
+    const snapshot = await db.collection(collections.bookings || 'bookings')
+      .where('restaurantId', '==', restaurantId)
+      .get();
 
-    if (status) {
-      query = query.where('status', '==', status);
-    }
-
-    if (date) {
-      const startDate = new Date(date);
-      const endDate = new Date(date);
-      endDate.setDate(endDate.getDate() + 1);
-      
-      query = query.where('bookingDate', '>=', startDate)
-                   .where('bookingDate', '<', endDate);
-    }
-
-    const snapshot = await query.orderBy('bookingDate', 'desc').get();
-    const bookings = [];
+    let bookings = [];
 
     snapshot.forEach(doc => {
+      const data = doc.data();
+      // Convert Firestore Timestamp to JS Date for comparison
+      const bookingDateValue = data.bookingDate?.toDate ? data.bookingDate.toDate() : new Date(data.bookingDate);
+
       bookings.push({
         id: doc.id,
-        ...doc.data()
+        ...data,
+        bookingDate: bookingDateValue.toISOString(),
+        endTime: data.endTime?.toDate ? data.endTime.toDate().toISOString() : data.endTime,
+        createdAt: data.createdAt?.toDate ? data.createdAt.toDate().toISOString() : data.createdAt,
+        updatedAt: data.updatedAt?.toDate ? data.updatedAt.toDate().toISOString() : data.updatedAt,
       });
     });
 
-    res.json({ bookings });
+    // Filter by status in JS
+    if (status) {
+      bookings = bookings.filter(b => b.status === status);
+    }
+
+    // Filter by date in JS — compare date portion only (YYYY-MM-DD)
+    if (date) {
+      bookings = bookings.filter(b => {
+        const bDate = new Date(b.bookingDate);
+        const bDateStr = bDate.getFullYear() + '-' +
+          String(bDate.getMonth() + 1).padStart(2, '0') + '-' +
+          String(bDate.getDate()).padStart(2, '0');
+        return bDateStr === date;
+      });
+    }
+
+    // Sort by bookingDate descending
+    bookings.sort((a, b) => new Date(b.bookingDate) - new Date(a.bookingDate));
+
+    res.json({ success: true, bookings });
 
   } catch (error) {
     console.error('Get bookings error:', error);
