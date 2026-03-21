@@ -16984,6 +16984,9 @@ app.get('/api/customers/:restaurantId', authenticateToken, async (req, res) => {
   try {
     const { restaurantId } = req.params;
     const { userId } = req.user;
+    const page = Math.max(1, parseInt(req.query.page) || 1);
+    const pageSize = Math.min(100, Math.max(1, parseInt(req.query.pageSize) || 50));
+    const search = (req.query.search || '').trim().toLowerCase();
 
     // Verify user has access to this restaurant
     const restaurant = await db.collection(collections.restaurants).doc(restaurantId).get();
@@ -16991,10 +16994,52 @@ app.get('/api/customers/:restaurantId', authenticateToken, async (req, res) => {
       return res.status(403).json({ error: 'Access denied' });
     }
 
+    if (search) {
+      // When searching, fetch all and filter in memory (Firestore doesn't support full-text search)
+      const allSnapshot = await db.collection(collections.customers)
+        .where('restaurantId', '==', restaurantId)
+        .orderBy('lastOrderDate', 'desc')
+        .get();
+
+      const allCustomers = [];
+      allSnapshot.forEach(doc => {
+        const data = doc.data();
+        const nameMatch = data.name && data.name.toLowerCase().includes(search);
+        const phoneMatch = data.phone && data.phone.includes(search);
+        const emailMatch = data.email && data.email.toLowerCase().includes(search);
+        const cityMatch = data.city && data.city.toLowerCase().includes(search);
+        if (nameMatch || phoneMatch || emailMatch || cityMatch) {
+          allCustomers.push({ id: doc.id, ...data });
+        }
+      });
+
+      const total = allCustomers.length;
+      const skip = (page - 1) * pageSize;
+      const customers = allCustomers.slice(skip, skip + pageSize);
+
+      return res.json({
+        customers,
+        total,
+        page,
+        pageSize,
+        totalPages: Math.ceil(total / pageSize)
+      });
+    }
+
+    // Get total count
+    const countSnapshot = await db.collection(collections.customers)
+      .where('restaurantId', '==', restaurantId)
+      .count()
+      .get();
+    const total = countSnapshot.data().count;
+
+    // Fetch paginated customers
+    const skip = (page - 1) * pageSize;
     const customersSnapshot = await db.collection(collections.customers)
       .where('restaurantId', '==', restaurantId)
       .orderBy('lastOrderDate', 'desc')
-      .limit(100)
+      .offset(skip)
+      .limit(pageSize)
       .get();
 
     const customers = [];
@@ -17005,10 +17050,42 @@ app.get('/api/customers/:restaurantId', authenticateToken, async (req, res) => {
       });
     });
 
-    res.json({ customers });
+    res.json({
+      customers,
+      total,
+      page,
+      pageSize,
+      totalPages: Math.ceil(total / pageSize)
+    });
   } catch (error) {
     console.error('Get customers error:', error);
     res.status(500).json({ error: 'Failed to fetch customers' });
+  }
+});
+
+// Get single customer by ID
+app.get('/api/customers/detail/:customerId', authenticateToken, async (req, res) => {
+  try {
+    const { customerId } = req.params;
+    const { userId } = req.user;
+
+    const customerDoc = await db.collection(collections.customers).doc(customerId).get();
+    if (!customerDoc.exists) {
+      return res.status(404).json({ error: 'Customer not found' });
+    }
+
+    const customerData = customerDoc.data();
+
+    // Verify user has access to this customer's restaurant
+    const restaurant = await db.collection(collections.restaurants).doc(customerData.restaurantId).get();
+    if (!restaurant.exists || restaurant.data().ownerId !== userId) {
+      return res.status(403).json({ error: 'Access denied' });
+    }
+
+    res.json({ customer: { id: customerDoc.id, ...customerData } });
+  } catch (error) {
+    console.error('Get single customer error:', error);
+    res.status(500).json({ error: 'Failed to fetch customer' });
   }
 });
 
