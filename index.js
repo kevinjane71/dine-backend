@@ -6609,7 +6609,29 @@ app.post('/api/orders', async (req, res) => {
             isValidSchedule = scheduleDays.includes(currentDay) && currentTime >= startTime && currentTime <= endTime;
           }
 
-          if (offer.isActive && offer.restaurantId === restaurantId && isValidDate && isUnderUsageLimit && meetsMinOrder && isValidSchedule) {
+          // Check targetRestaurants
+          const offerTargetRestaurants = offer.targetRestaurants || 'all';
+          const isTargetedRestaurant = offerTargetRestaurants === 'all' || (Array.isArray(offerTargetRestaurants) && offerTargetRestaurants.includes(restaurantId));
+
+          // Check isFirstOrderOnly
+          let passesFirstOrderCheck = true;
+          if (offer.isFirstOrderOnly && customerPhone) {
+            try {
+              const custQuery = await db.collection('customers')
+                .where('restaurantId', '==', restaurantId)
+                .where('phone', '==', customerPhone)
+                .limit(1)
+                .get();
+              if (!custQuery.empty) {
+                const custData = custQuery.docs[0].data();
+                if ((custData.totalOrders || 0) > 0) {
+                  passesFirstOrderCheck = false;
+                }
+              }
+            } catch (e) { /* ignore lookup error */ }
+          }
+
+          if (offer.isActive && isTargetedRestaurant && isValidDate && isUnderUsageLimit && meetsMinOrder && isValidSchedule && passesFirstOrderCheck) {
             let offerDiscount = 0;
             const offerScope = offer.scope || 'order';
 
@@ -6969,6 +6991,12 @@ app.post('/api/orders', async (req, res) => {
           const customerData = await customerResponse.json();
           customerId = customerData.customer.id;
           console.log(`👤 Customer processed successfully: ${customerId} - ${customerData.message}`);
+          // Write customerId back to order document for loyalty tracking
+          try {
+            await orderRef.update({ customerId });
+          } catch (updateErr) {
+            console.error('Failed to write customerId to order:', updateErr);
+          }
         } else {
           const errorData = await customerResponse.json();
           console.log(`❌ Customer processing failed:`, errorData);
@@ -17458,22 +17486,42 @@ app.get('/api/offers/:restaurantId', authenticateToken, async (req, res) => {
 // Get customer loyalty data by phone (public endpoint for Crave app)
 app.post('/api/public/customer/lookup', vercelSecurityMiddleware.publicAPI, async (req, res) => {
   try {
-    const { restaurantId, phone } = req.body;
+    const { restaurantId, phone, countryCode } = req.body;
 
     if (!restaurantId || !phone) {
       return res.status(400).json({ error: 'Restaurant ID and phone are required' });
     }
 
-    // Helper function to normalize phone number
+    // Country dial code map
+    const countryDialCodes = {
+      'IN': '91', 'US': '1', 'CA': '1', 'GB': '44', 'AU': '61', 'AE': '971',
+      'SG': '65', 'MY': '60', 'TH': '66', 'PH': '63', 'ID': '62', 'NZ': '64',
+      'ZA': '27', 'KE': '254', 'NG': '234', 'DE': '49', 'FR': '33', 'IT': '39',
+      'ES': '34', 'NL': '31', 'BE': '32', 'SE': '46', 'NO': '47', 'DK': '45',
+      'JP': '81', 'KR': '82', 'CN': '86', 'HK': '852', 'TW': '886',
+      'BR': '55', 'MX': '52', 'AR': '54', 'CL': '56', 'CO': '57',
+      'SA': '966', 'QA': '974', 'KW': '965', 'BH': '973', 'OM': '968',
+      'LK': '94', 'NP': '977', 'BD': '880', 'PK': '92', 'MM': '95'
+    };
+    const dialCode = countryDialCodes[countryCode] || '91'; // Default to India
+    const localPhoneLength = ['US', 'CA', 'IN', 'GB', 'AU', 'FR', 'DE'].includes(countryCode) ? 10 : 
+                             ['SG', 'HK'].includes(countryCode) ? 8 : 
+                             ['MY', 'PH', 'ID', 'TH', 'KR', 'JP'].includes(countryCode) ? 9 : 10;
+
+    // Helper function to normalize phone number (country-aware)
     const normalizePhone = (phoneNum) => {
       if (!phoneNum) return null;
       const digits = phoneNum.replace(/\D/g, '');
-      if (digits.length === 12 && digits.startsWith('91')) {
-        return digits.substring(2);
-      } else if (digits.length === 10) {
-        return digits;
-      } else if (digits.length === 11 && digits.startsWith('0')) {
+      // Strip country dial code if present
+      if (digits.startsWith(dialCode) && digits.length === dialCode.length + localPhoneLength) {
+        return digits.substring(dialCode.length);
+      }
+      // Handle 0-prefix (common in many countries)
+      if (digits.startsWith('0') && digits.length === localPhoneLength + 1) {
         return digits.substring(1);
+      }
+      if (digits.length === localPhoneLength) {
+        return digits;
       }
       return digits;
     };
@@ -17976,6 +18024,102 @@ app.get('/api/public/customer-app-settings/:restaurantId', vercelSecurityMiddlew
   } catch (error) {
     console.error('Get public customer app settings error:', error);
     res.status(500).json({ error: 'Failed to fetch settings' });
+  }
+});
+
+// Get active offers for POS (authenticated, returns full fields including scope, schedule, bogoConfig)
+app.get('/api/offers/:restaurantId/active', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+    const { isFirstOrder } = req.query;
+    const now = new Date();
+
+    const customerIsFirstOrder = isFirstOrder === 'true' ? true : isFirstOrder === 'false' ? false : undefined;
+
+    const offersSnapshot = await db.collection('offers')
+      .where('restaurantId', '==', restaurantId)
+      .where('isActive', '==', true)
+      .get();
+
+    // Also fetch offers targeting 'all' restaurants from same owner
+    const restaurant = await db.collection(collections.restaurants).doc(restaurantId).get();
+    const ownerId = restaurant.exists ? restaurant.data().ownerId : null;
+    let crossRestaurantOffers = [];
+    if (ownerId) {
+      const ownerRestaurants = await db.collection(collections.restaurants)
+        .where('ownerId', '==', ownerId)
+        .get();
+      const ownerRestaurantIds = ownerRestaurants.docs.map(d => d.id).filter(id => id !== restaurantId);
+      for (const rId of ownerRestaurantIds) {
+        const otherOffers = await db.collection('offers')
+          .where('restaurantId', '==', rId)
+          .where('isActive', '==', true)
+          .get();
+        otherOffers.forEach(doc => {
+          const offer = doc.data();
+          if (offer.targetRestaurants === 'all' || (Array.isArray(offer.targetRestaurants) && offer.targetRestaurants.includes(restaurantId))) {
+            crossRestaurantOffers.push({ id: doc.id, ...offer });
+          }
+        });
+      }
+    }
+
+    const offers = [];
+    const processOffer = (doc, offerData) => {
+      const offer = offerData || doc.data();
+      const docId = offerData ? offer.id : doc.id;
+
+      let validFrom = null;
+      let validUntil = null;
+      if (offer.validFrom) {
+        validFrom = offer.validFrom.toDate ? offer.validFrom.toDate() : new Date(offer.validFrom);
+      }
+      if (offer.validUntil) {
+        validUntil = offer.validUntil.toDate ? offer.validUntil.toDate() : new Date(offer.validUntil);
+      }
+
+      const isValidDate = (!validFrom || now >= validFrom) && (!validUntil || now <= validUntil);
+      const isUnderUsageLimit = !offer.usageLimit || (offer.usageCount || 0) < offer.usageLimit;
+      const isEligibleForFirstOrderOffer = !offer.isFirstOrderOnly || customerIsFirstOrder !== false;
+
+      if (isValidDate && isUnderUsageLimit && isEligibleForFirstOrderOffer) {
+        offers.push({
+          id: docId,
+          name: offer.name,
+          description: offer.description,
+          discountType: offer.discountType,
+          discountValue: offer.discountValue,
+          minOrderValue: offer.minOrderValue || 0,
+          maxDiscount: offer.maxDiscount,
+          validFrom: validFrom ? validFrom.toISOString() : null,
+          validUntil: validUntil ? validUntil.toISOString() : null,
+          isActive: offer.isActive ?? true,
+          usageLimit: offer.usageLimit || null,
+          usageCount: offer.usageCount || 0,
+          isFirstOrderOnly: offer.isFirstOrderOnly || false,
+          autoApply: offer.autoApply || false,
+          scope: offer.scope || 'order',
+          targetCategories: offer.targetCategories || [],
+          targetItems: offer.targetItems || [],
+          schedule: offer.schedule || null,
+          promotionType: offer.promotionType || 'discount',
+          bogoConfig: offer.bogoConfig || null,
+          eventLabel: offer.eventLabel || null,
+          targetRestaurants: offer.targetRestaurants || 'all'
+        });
+      }
+    };
+
+    offersSnapshot.forEach(doc => processOffer(doc, null));
+    crossRestaurantOffers.forEach(offer => processOffer(null, offer));
+
+    // Deduplicate by id
+    const uniqueOffers = [...new Map(offers.map(o => [o.id, o])).values()];
+
+    res.json({ offers: uniqueOffers });
+  } catch (error) {
+    console.error('Get active offers for POS error:', error);
+    res.status(500).json({ error: 'Failed to fetch active offers' });
   }
 });
 
