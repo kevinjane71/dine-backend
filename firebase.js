@@ -107,7 +107,10 @@ const collections = {
   automationSettings: 'automation-settings',
   automationLogs: 'automation-logs',
   coupons: 'coupons',
-  customerSegments: 'customer-segments'
+  customerSegments: 'customer-segments',
+  // Saved Carts & Offline Support
+  savedCarts: 'saved_carts',
+  idempotencyKeys: 'idempotency_keys'
 };
 
 const admin = null; // We don't need the legacy admin object anymore

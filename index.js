@@ -4236,7 +4236,29 @@ app.get('/api/restaurants', authenticateToken, async (req, res) => {
       });
     });
 
-    res.json({ restaurants });
+    // Include user's defaultRestaurantId preference
+    let defaultRestaurantId = null;
+    try {
+      const collName = req.user.source === 'staffUsers' ? collections.staffUsers : collections.users;
+      const userDoc = await db.collection(collName).doc(userId).get();
+      if (userDoc.exists) {
+        defaultRestaurantId = userDoc.data().defaultRestaurantId || null;
+      }
+
+      // Auto-set default for existing users who don't have one yet
+      if (!defaultRestaurantId && restaurants.length > 0 && userDoc.exists) {
+        defaultRestaurantId = restaurants[0].id;
+        // Fire-and-forget — don't block the response
+        db.collection(collName).doc(userId).update({
+          defaultRestaurantId,
+          updatedAt: new Date()
+        }).catch(() => {});
+      }
+    } catch (e) {
+      // Non-critical — just return restaurants without default
+    }
+
+    res.json({ restaurants, defaultRestaurantId });
 
   } catch (error) {
     console.error('Get restaurants error:', error);
@@ -6336,6 +6358,37 @@ app.post('/api/orders', async (req, res) => {
       redeemLoyaltyPoints,
     } = req.body;
 
+    // Extract offline/sync fields
+    const idempotencyKey = req.body.idempotencyKey || null;
+    const syncSource = req.body.syncSource || 'online';
+
+    // Idempotency check: if key provided, check if order already exists
+    if (idempotencyKey && restaurantId) {
+      try {
+        const existingKeySnapshot = await db.collection('idempotency_keys')
+          .where('key', '==', idempotencyKey)
+          .where('restaurantId', '==', restaurantId)
+          .limit(1)
+          .get();
+
+        if (!existingKeySnapshot.empty) {
+          const existingData = existingKeySnapshot.docs[0].data();
+          const existingOrderDoc = await db.collection(collections.orders).doc(existingData.orderId).get();
+          if (existingOrderDoc.exists) {
+            console.log(`🔑 Idempotency key hit: ${idempotencyKey} -> order ${existingData.orderId}`);
+            return res.status(200).json({
+              message: 'Order already created (idempotency)',
+              order: { id: existingData.orderId, ...existingOrderDoc.data() },
+              idempotent: true
+            });
+          }
+        }
+      } catch (idempErr) {
+        console.error('Idempotency check error (non-blocking):', idempErr);
+        // Continue with normal creation if check fails
+      }
+    }
+
     // Allow empty items for saved orders (bar tabs opened without items)
     const isSavedOrder = req.body.status === 'saved';
     if (!restaurantId || (!isSavedOrder && (!items || items.length === 0))) {
@@ -6774,6 +6827,8 @@ app.post('/api/orders', async (req, res) => {
       status: req.body.status || 'confirmed',
       kotSent: false,
       paymentStatus: roomNumber ? 'hotel-billing' : 'pending', // NEW: Mark as hotel billing if room number provided
+      syncSource: syncSource, // 'online' | 'offline' — tracks how order was placed
+      ...(idempotencyKey ? { idempotencyKey } : {}),
       createdAt: new Date(),
       updatedAt: new Date()
     };
@@ -6786,6 +6841,16 @@ app.post('/api/orders', async (req, res) => {
     console.log('🛒 Creating order in database...');
     const orderRef = await db.collection(collections.orders).add(orderData);
     console.log('🛒 Backend Order Creation - Order saved to DB with ID:', orderRef.id);
+
+    // Store idempotency key for deduplication (fire-and-forget)
+    if (idempotencyKey) {
+      db.collection('idempotency_keys').add({
+        key: idempotencyKey,
+        orderId: orderRef.id,
+        restaurantId,
+        createdAt: new Date()
+      }).catch(err => console.error('Idempotency key store error (non-blocking):', err));
+    }
     console.log('🛒 Backend Order Creation - Order data saved:', orderData);
     
     // NEW: Auto-link order to hotel check-in if room number is provided
@@ -7161,6 +7226,144 @@ app.post('/api/orders', async (req, res) => {
     res.status(500).json({ error: 'Failed to create order' });
   }
 });
+
+// ============================================
+// SAVED CARTS (Parked Orders & Templates)
+// Separate from orders — no side effects, no order IDs, no inventory
+// ============================================
+
+// Create a saved cart (parked or template)
+app.post('/api/saved-carts', authenticateToken, async (req, res) => {
+  try {
+    const {
+      restaurantId, name, type, items, customerInfo,
+      orderType, tableNumber, notes, paymentMethod
+    } = req.body;
+
+    if (!restaurantId) {
+      return res.status(400).json({ error: 'Restaurant ID is required' });
+    }
+    if (!type || !['parked', 'template'].includes(type)) {
+      return res.status(400).json({ error: 'Type must be "parked" or "template"' });
+    }
+
+    const user = req.user;
+    const cartData = {
+      restaurantId,
+      name: name || `Cart - ${new Date().toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' })}`,
+      type,
+      items: items || [],
+      customerInfo: customerInfo || null,
+      orderType: orderType || 'dine-in',
+      tableNumber: tableNumber || null,
+      paymentMethod: paymentMethod || 'cash',
+      notes: notes || '',
+      createdBy: {
+        userId: user.id || user.userId,
+        name: user.name || 'Staff',
+        role: user.role || 'waiter'
+      },
+      isActive: true,
+      createdAt: new Date(),
+      updatedAt: new Date()
+    };
+
+    const cartRef = await db.collection(collections.savedCarts).add(cartData);
+
+    res.status(201).json({
+      message: 'Cart saved successfully',
+      cart: { id: cartRef.id, ...cartData }
+    });
+  } catch (error) {
+    console.error('❌ Create saved cart error:', error);
+    res.status(500).json({ error: 'Failed to save cart' });
+  }
+});
+
+// List saved carts for a restaurant
+app.get('/api/saved-carts/:restaurantId', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+    const { type } = req.query;
+
+    let query = db.collection(collections.savedCarts)
+      .where('restaurantId', '==', restaurantId)
+      .where('isActive', '==', true);
+
+    if (type && ['parked', 'template'].includes(type)) {
+      query = query.where('type', '==', type);
+    }
+
+    query = query.orderBy('updatedAt', 'desc').limit(50);
+
+    const snapshot = await query.get();
+    const carts = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+
+    res.json({ carts });
+  } catch (error) {
+    console.error('❌ Get saved carts error:', error);
+    res.status(500).json({ error: 'Failed to fetch saved carts' });
+  }
+});
+
+// Update a saved cart
+app.patch('/api/saved-carts/:id', authenticateToken, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const updateData = { ...req.body, updatedAt: new Date() };
+
+    // Prevent overwriting system fields
+    delete updateData.id;
+    delete updateData.createdAt;
+    delete updateData.createdBy;
+    delete updateData.restaurantId;
+
+    const cartRef = db.collection(collections.savedCarts).doc(id);
+    const cartDoc = await cartRef.get();
+
+    if (!cartDoc.exists) {
+      return res.status(404).json({ error: 'Saved cart not found' });
+    }
+
+    await cartRef.update(updateData);
+    const updatedDoc = await cartRef.get();
+
+    res.json({
+      message: 'Cart updated successfully',
+      cart: { id: updatedDoc.id, ...updatedDoc.data() }
+    });
+  } catch (error) {
+    console.error('❌ Update saved cart error:', error);
+    res.status(500).json({ error: 'Failed to update cart' });
+  }
+});
+
+// Delete a saved cart (soft delete)
+app.delete('/api/saved-carts/:id', authenticateToken, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const cartRef = db.collection(collections.savedCarts).doc(id);
+    const cartDoc = await cartRef.get();
+
+    if (!cartDoc.exists) {
+      return res.status(404).json({ error: 'Saved cart not found' });
+    }
+
+    await cartRef.update({
+      isActive: false,
+      updatedAt: new Date()
+    });
+
+    res.json({ message: 'Cart deleted successfully' });
+  } catch (error) {
+    console.error('❌ Delete saved cart error:', error);
+    res.status(500).json({ error: 'Failed to delete cart' });
+  }
+});
+
+// ============================================
+// ORDER QUERIES
+// ============================================
 
 // Get a single order by ID — direct document fetch (1 read instead of a query)
 app.get('/api/orders/single/:orderId', authenticateToken, async (req, res) => {
@@ -11242,6 +11445,8 @@ app.get('/api/auth/me', authenticateToken, async (req, res) => {
       phone: userData.phone || null,
       role: userData.role || null,
       restaurantId: userData.restaurantId || null,
+      defaultRestaurantId: userData.defaultRestaurantId || null,
+      language: userData.language || null,
       permissions: userData.permissions || {},
       pageAccess: userData.pageAccess || null,
       status: userData.status || null,
@@ -11255,6 +11460,26 @@ app.get('/api/auth/me', authenticateToken, async (req, res) => {
     console.error('❌ Get current user error:', error);
     console.error('Error stack:', error.stack);
     res.status(500).json({ error: 'Failed to get user information', details: error.message });
+  }
+});
+
+// Update user preferences (default restaurant, language, etc.)
+app.patch('/api/user/preferences', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const { defaultRestaurantId, language } = req.body;
+
+    const updateData = { updatedAt: new Date() };
+    if (defaultRestaurantId !== undefined) updateData.defaultRestaurantId = defaultRestaurantId;
+    if (language !== undefined) updateData.language = language;
+
+    const collName = req.user.source === 'staffUsers' ? collections.staffUsers : collections.users;
+    await db.collection(collName).doc(userId).update(updateData);
+
+    res.json({ success: true, message: 'Preferences updated', preferences: updateData });
+  } catch (error) {
+    console.error('Update preferences error:', error);
+    res.status(500).json({ error: 'Failed to update preferences' });
   }
 });
 
