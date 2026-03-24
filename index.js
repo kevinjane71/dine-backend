@@ -12274,16 +12274,28 @@ app.post('/api/invoice/generate/:orderId', authenticateToken, async (req, res) =
       defaultTaxRate: 5
     };
 
-    // Calculate totals
-    const subtotal = order.items.reduce((sum, item) => sum + (item.price * item.quantity), 0);
-    
+    // Use order's stored values if available (backend already calculated with discounts)
+    const itemsSubtotal = order.items.reduce((sum, item) => sum + (item.price * item.quantity), 0);
+    const subtotal = order.subtotal || itemsSubtotal;
+
+    // Discount fields from order
+    const discountAmount = Math.round((order.discountAmount || 0) * 100) / 100;
+    const manualDiscount = Math.round((order.manualDiscount || 0) * 100) / 100;
+    const loyaltyDiscount = Math.round((order.loyaltyDiscount || 0) * 100) / 100;
+    const totalDiscount = discountAmount + manualDiscount + loyaltyDiscount;
+
+    // Use order's stored tax breakdown if available, else recalculate
     let totalTax = 0;
-    const taxBreakdown = [];
-    
-    if (taxSettings.enabled) {
+    let taxBreakdown = [];
+
+    if (order.taxBreakdown && Array.isArray(order.taxBreakdown) && order.taxBreakdown.length > 0) {
+      taxBreakdown = order.taxBreakdown;
+      totalTax = order.taxAmount || taxBreakdown.reduce((sum, t) => sum + (t.amount || 0), 0);
+    } else if (taxSettings.enabled) {
+      const taxableAmount = Math.max(0, subtotal - totalDiscount);
       for (const tax of taxSettings.taxes) {
         if (tax.enabled) {
-          const taxAmount = (subtotal * tax.rate) / 100;
+          const taxAmount = (taxableAmount * tax.rate) / 100;
           taxBreakdown.push({
             id: tax.id,
             name: tax.name,
@@ -12295,12 +12307,13 @@ app.post('/api/invoice/generate/:orderId', authenticateToken, async (req, res) =
       }
     }
 
-    const grandTotal = subtotal + totalTax;
+    const grandTotal = order.finalAmount || (subtotal - totalDiscount + totalTax);
 
     // Generate invoice
     const invoice = {
       id: `INV-${Date.now()}-${Math.random().toString(36).substr(2, 4).toUpperCase()}`,
       orderId: orderId,
+      dailyOrderId: order.dailyOrderId || null,
       restaurantId: order.restaurantId,
       restaurantName: restaurant.name,
       restaurantAddress: restaurant.address || '',
@@ -12313,6 +12326,11 @@ app.post('/api/invoice/generate/:orderId', authenticateToken, async (req, res) =
       orderType: order.orderType || 'dine-in',
       items: order.items,
       subtotal: Math.round(subtotal * 100) / 100,
+      discountAmount,
+      manualDiscount,
+      loyaltyDiscount,
+      totalDiscount: Math.round(totalDiscount * 100) / 100,
+      appliedOffer: order.appliedOffer || null,
       taxBreakdown,
       totalTax: Math.round(totalTax * 100) / 100,
       grandTotal: Math.round(grandTotal * 100) / 100,
