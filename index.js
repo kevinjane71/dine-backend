@@ -395,6 +395,10 @@ const aiInsightsRoutes = require('./routes/aiInsights');
 const superAdminRoutes = require('./routes/superAdmin');
 const publicToolsRoutes = require('./routes/publicTools');
 
+// Invoice Module
+const initializeInvoiceRoutes = require('./invoice');
+const invoiceRoutes = initializeInvoiceRoutes(db, collections);
+
 // Debug email service initialization
 console.log('📧 Email service loaded:', !!emailService);
 if (emailService) {
@@ -490,6 +494,7 @@ const allowedOrigins = [
   'http://localhost:3002',
   'http://localhost:3003',
   'http://localhost:3004',
+  'http://localhost:3005',
   'https://dine-frontend-ecru.vercel.app',
   'https://pms-hotel.vercel.app',
   "https://dine-admin.vercel.app"
@@ -11914,6 +11919,9 @@ app.use('/api/ai', aiInsightsRoutes);
 
 // ==================== SUPER ADMIN (internal dashboard) ====================
 app.use('/api/super-admin', superAdminRoutes);
+
+// ==================== INVOICE MODULE ====================
+app.use('/api/invoice', invoiceRoutes);
 
 // ==================== BUSINESS SETTINGS (for GST invoices) ====================
 

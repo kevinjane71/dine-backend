@@ -110,7 +110,18 @@ const collections = {
   customerSegments: 'customer-segments',
   // Saved Carts & Offline Support
   savedCarts: 'saved_carts',
-  idempotencyKeys: 'idempotency_keys'
+  idempotencyKeys: 'idempotency_keys',
+  // Invoice Module Collections
+  invOrganizations: 'inv_organizations',
+  invCustomers: 'inv_customers',
+  invItems: 'inv_items',
+  invInvoices: 'inv_invoices',
+  invQuotes: 'inv_quotes',
+  invChallans: 'inv_challans',
+  invPayments: 'inv_payments',
+  invExpenses: 'inv_expenses',
+  invSettings: 'inv_settings',
+  invNumberSequences: 'inv_number_sequences'
 };
 
 const admin = null; // We don't need the legacy admin object anymore
