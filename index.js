@@ -3770,6 +3770,284 @@ app.post('/api/auth/phone/verify-otp', async (req, res) => {
   }
 });
 
+// ========== PIN LOGIN ENDPOINTS ==========
+
+// GET /api/auth/pin/status - Check if PIN is enabled for current user
+app.get('/api/auth/pin/status', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const userDoc = await db.collection(collections.users).doc(userId).get();
+    if (!userDoc.exists) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+    const userData = userDoc.data();
+    res.json({
+      success: true,
+      pinEnabled: userData.pinEnabled || false,
+      pinUpdatedAt: userData.pinUpdatedAt || null
+    });
+  } catch (error) {
+    console.error('PIN status error:', error);
+    res.status(500).json({ error: 'Failed to get PIN status' });
+  }
+});
+
+// POST /api/auth/pin/set - Set PIN for first time (authenticated owners only)
+app.post('/api/auth/pin/set', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const { pin, confirmPin } = req.body;
+
+    // Validate
+    if (!pin || !confirmPin) {
+      return res.status(400).json({ error: 'PIN and confirmation are required' });
+    }
+    if (pin !== confirmPin) {
+      return res.status(400).json({ error: 'PINs do not match' });
+    }
+    if (!/^\d{5,10}$/.test(pin)) {
+      return res.status(400).json({ error: 'PIN must be 5-10 digits' });
+    }
+
+    // Check user is owner
+    const userDoc = await db.collection(collections.users).doc(userId).get();
+    if (!userDoc.exists) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+    const userData = userDoc.data();
+    if (userData.role !== 'owner') {
+      return res.status(403).json({ error: 'PIN login is only available for restaurant owners' });
+    }
+    if (userData.pinEnabled && userData.pinHash) {
+      return res.status(400).json({ error: 'PIN already set. Use change PIN instead.' });
+    }
+
+    const pinHash = await bcrypt.hash(pin, 10);
+    await db.collection(collections.users).doc(userId).update({
+      pinHash,
+      pinEnabled: true,
+      pinUpdatedAt: new Date(),
+      pinAttempts: 0,
+      pinLockedUntil: null
+    });
+
+    res.json({ success: true, message: 'PIN set successfully' });
+  } catch (error) {
+    console.error('PIN set error:', error);
+    res.status(500).json({ error: 'Failed to set PIN' });
+  }
+});
+
+// POST /api/auth/pin/change - Change existing PIN (authenticated owners only)
+app.post('/api/auth/pin/change', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const { currentPin, newPin, confirmNewPin } = req.body;
+
+    if (!currentPin || !newPin || !confirmNewPin) {
+      return res.status(400).json({ error: 'Current PIN, new PIN, and confirmation are required' });
+    }
+    if (newPin !== confirmNewPin) {
+      return res.status(400).json({ error: 'New PINs do not match' });
+    }
+    if (!/^\d{5,10}$/.test(newPin)) {
+      return res.status(400).json({ error: 'PIN must be 5-10 digits' });
+    }
+
+    const userDoc = await db.collection(collections.users).doc(userId).get();
+    if (!userDoc.exists) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+    const userData = userDoc.data();
+    if (userData.role !== 'owner') {
+      return res.status(403).json({ error: 'PIN login is only available for restaurant owners' });
+    }
+    if (!userData.pinHash || !userData.pinEnabled) {
+      return res.status(400).json({ error: 'No PIN set. Use set PIN first.' });
+    }
+
+    const isValid = await bcrypt.compare(currentPin, userData.pinHash);
+    if (!isValid) {
+      return res.status(401).json({ error: 'Current PIN is incorrect' });
+    }
+
+    const pinHash = await bcrypt.hash(newPin, 10);
+    await db.collection(collections.users).doc(userId).update({
+      pinHash,
+      pinUpdatedAt: new Date(),
+      pinAttempts: 0,
+      pinLockedUntil: null
+    });
+
+    res.json({ success: true, message: 'PIN changed successfully' });
+  } catch (error) {
+    console.error('PIN change error:', error);
+    res.status(500).json({ error: 'Failed to change PIN' });
+  }
+});
+
+// POST /api/auth/pin/disable - Disable PIN login (authenticated owners only)
+app.post('/api/auth/pin/disable', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const { currentPin } = req.body;
+
+    if (!currentPin) {
+      return res.status(400).json({ error: 'Current PIN is required to disable' });
+    }
+
+    const userDoc = await db.collection(collections.users).doc(userId).get();
+    if (!userDoc.exists) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+    const userData = userDoc.data();
+    if (!userData.pinHash || !userData.pinEnabled) {
+      return res.status(400).json({ error: 'PIN is not enabled' });
+    }
+
+    const isValid = await bcrypt.compare(currentPin, userData.pinHash);
+    if (!isValid) {
+      return res.status(401).json({ error: 'Current PIN is incorrect' });
+    }
+
+    await db.collection(collections.users).doc(userId).update({
+      pinEnabled: false,
+      pinHash: null,
+      pinUpdatedAt: new Date(),
+      pinAttempts: 0,
+      pinLockedUntil: null
+    });
+
+    res.json({ success: true, message: 'PIN login disabled' });
+  } catch (error) {
+    console.error('PIN disable error:', error);
+    res.status(500).json({ error: 'Failed to disable PIN' });
+  }
+});
+
+// POST /api/auth/pin/login - Login with phone/email + PIN (public, no auth)
+app.post('/api/auth/pin/login', async (req, res) => {
+  try {
+    const { identifier, pin } = req.body;
+
+    if (!identifier || !pin) {
+      return res.status(400).json({ error: 'Phone/email and PIN are required' });
+    }
+
+    // Determine if identifier is email or phone
+    const isEmail = identifier.includes('@');
+    const queryField = isEmail ? 'email' : 'phone';
+    const normalizedIdentifier = isEmail ? identifier.toLowerCase().trim() : identifier.trim();
+
+    const userQuery = await db.collection(collections.users)
+      .where(queryField, '==', normalizedIdentifier)
+      .limit(1)
+      .get();
+
+    if (userQuery.empty) {
+      return res.status(401).json({ error: 'Account not found' });
+    }
+
+    const userDoc = userQuery.docs[0];
+    const userData = userDoc.data();
+    const userId = userDoc.id;
+
+    // Check PIN is enabled
+    if (!userData.pinEnabled || !userData.pinHash) {
+      return res.status(403).json({ error: 'PIN login is not enabled for this account. Please enable it from Settings.' });
+    }
+
+    // Check rate limiting - lock after 5 failed attempts for 15 minutes
+    if (userData.pinAttempts >= 5 && userData.pinLockedUntil) {
+      const lockedUntil = userData.pinLockedUntil.toDate ? userData.pinLockedUntil.toDate() : new Date(userData.pinLockedUntil);
+      if (new Date() < lockedUntil) {
+        const minutesLeft = Math.ceil((lockedUntil - new Date()) / 60000);
+        return res.status(429).json({ error: `Too many failed attempts. Try again in ${minutesLeft} minute(s).` });
+      }
+      // Lock expired, reset
+      await userDoc.ref.update({ pinAttempts: 0, pinLockedUntil: null });
+    }
+
+    // Verify PIN
+    const isValid = await bcrypt.compare(pin, userData.pinHash);
+    if (!isValid) {
+      const newAttempts = (userData.pinAttempts || 0) + 1;
+      const updateData = { pinAttempts: newAttempts };
+      if (newAttempts >= 5) {
+        updateData.pinLockedUntil = new Date(Date.now() + 15 * 60 * 1000); // 15 min lock
+      }
+      await userDoc.ref.update(updateData);
+      return res.status(401).json({ error: 'Invalid PIN', attemptsRemaining: Math.max(0, 5 - newAttempts) });
+    }
+
+    // PIN verified - reset attempts, update lastLogin
+    await userDoc.ref.update({
+      pinAttempts: 0,
+      pinLockedUntil: null,
+      lastLogin: new Date(),
+      updatedAt: new Date()
+    });
+
+    // Generate JWT token (same as phone verify-otp)
+    const token = jwt.sign(
+      { userId, phone: userData.phone || null, email: userData.email || null, role: userData.role || 'owner' },
+      process.env.JWT_SECRET,
+      { expiresIn: '30d' }
+    );
+
+    // Check restaurants
+    let hasRestaurants = false;
+    let userRestaurants = [];
+    let subdomainUrl = null;
+
+    const restaurantsQuery = await db.collection(collections.restaurants)
+      .where('ownerId', '==', userId)
+      .get();
+
+    if (!restaurantsQuery.empty) {
+      hasRestaurants = true;
+      userRestaurants = restaurantsQuery.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+
+      if (typeof SUBDOMAIN_FEATURE_ENABLED !== 'undefined' && SUBDOMAIN_FEATURE_ENABLED && userRestaurants.length > 0) {
+        const firstRestaurant = userRestaurants[0];
+        if (firstRestaurant.subdomainEnabled && firstRestaurant.subdomain) {
+          subdomainUrl = getSubdomainUrl(firstRestaurant.subdomain, '/dashboard');
+        }
+      }
+    }
+
+    const firstRestaurant = userRestaurants.length > 0 ? userRestaurants[0] : null;
+
+    res.json({
+      success: true,
+      message: 'PIN login successful',
+      token,
+      user: {
+        id: userId,
+        phone: userData.phone || null,
+        email: userData.email || null,
+        name: userData.name || 'Restaurant Owner',
+        role: userData.role || 'owner',
+        photoURL: userData.photoURL || null,
+        provider: userData.provider || 'phone',
+        restaurantId: firstRestaurant?.id || null,
+        restaurant: firstRestaurant || null,
+        setupComplete: userData.setupComplete || false
+      },
+      hasRestaurants,
+      restaurants: userRestaurants,
+      subdomainUrl,
+      redirectTo: subdomainUrl || (hasRestaurants ? '/dashboard' : '/admin')
+    });
+
+  } catch (error) {
+    console.error('PIN login error:', error);
+    res.status(500).json({ error: 'PIN login failed' });
+  }
+});
+
+// ========== END PIN LOGIN ENDPOINTS ==========
+
 // Admin Setup Endpoint - Bypass OTP for client setup
 // POST /api/admin/setup-client
 // Requires: ADMIN_SETUP_KEY in environment variable
