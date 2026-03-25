@@ -47,6 +47,52 @@ module.exports = (db, collections) => {
     }
   });
 
+  // GET /dineopen — Search DineOpen restaurant customers (for cross-app integration)
+  router.get('/dineopen', async (req, res) => {
+    try {
+      const { restaurantId, search } = req.query;
+      if (!restaurantId) {
+        return res.status(400).json({ success: false, error: 'restaurantId is required' });
+      }
+
+      const snapshot = await db.collection('customers')
+        .where('restaurantId', '==', restaurantId)
+        .get();
+
+      let customers = snapshot.docs.map(doc => {
+        const d = doc.data();
+        return {
+          id: doc.id,
+          displayName: d.name || 'Unnamed Customer',
+          email: d.email || '',
+          phone: d.phone || '',
+          mobile: d.phone || '',
+          totalOrders: d.totalOrders || 0,
+          totalSpent: d.totalSpent || 0,
+          source: 'dineopen',
+        };
+      });
+
+      if (search) {
+        const s = search.toLowerCase();
+        customers = customers.filter(c =>
+          (c.displayName || '').toLowerCase().includes(s) ||
+          (c.email || '').toLowerCase().includes(s) ||
+          (c.phone || '').includes(s)
+        );
+      }
+
+      // Sort by name and limit results
+      customers.sort((a, b) => a.displayName.localeCompare(b.displayName));
+      customers = customers.slice(0, 50);
+
+      return res.json({ success: true, data: customers });
+    } catch (error) {
+      console.error('Error fetching DineOpen customers:', error);
+      return res.status(500).json({ success: false, error: 'Failed to fetch customers' });
+    }
+  });
+
   // GET /:id — Get single customer
   router.get('/:id', async (req, res) => {
     try {
