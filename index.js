@@ -162,6 +162,40 @@ function calculatePricingAdjustments(restaurantData, { tableSection, floorData, 
   return result;
 }
 
+// Multi-tier pricing: resolve per-item price for a given pricing rule
+function resolveItemPriceForRule(menuItem, ruleId, rules) {
+  if (!ruleId || !rules?.length) return null;
+  const rule = rules.find(r => r.id === ruleId && r.isActive);
+  if (!rule) return null;
+  // Priority 1: Per-item specific price
+  if (menuItem.pricingRules && typeof menuItem.pricingRules[ruleId] === 'number') {
+    return menuItem.pricingRules[ruleId];
+  }
+  // Priority 2: Rule's default markup
+  const basePrice = menuItem.price;
+  if (rule.defaultMarkupType === 'percentage' && rule.defaultMarkupValue) {
+    return Math.round(basePrice * (1 + rule.defaultMarkupValue / 100) * 100) / 100;
+  }
+  if (rule.defaultMarkupType === 'flat' && rule.defaultMarkupValue) {
+    return Math.round((basePrice + rule.defaultMarkupValue) * 100) / 100;
+  }
+  return null; // no adjustment — use base price
+}
+
+// Multi-tier pricing: resolve which pricing rule applies based on floor name
+function resolveTablePricingRule(floorName, multiPricing) {
+  if (!multiPricing?.enabled || !floorName) return null;
+  for (const rule of (multiPricing.rules || [])) {
+    if (!rule.isActive) continue;
+    for (const mapping of (rule.tableMappings || [])) {
+      if (mapping && floorName.toLowerCase().includes(mapping.toLowerCase())) {
+        return rule.id;
+      }
+    }
+  }
+  return null;
+}
+
 // Generate daily order ID (starts from 1 each day)
 async function generateDailyOrderId(restaurantId) {
   try {
@@ -5534,6 +5568,14 @@ app.post('/api/menus/:restaurantId', authenticateToken, async (req, res) => {
       // Ice cream-specific fields
       servingSize: req.body.servingSize || null,
       scoopOptions: req.body.scoopOptions ? parseInt(req.body.scoopOptions) : null,
+      // Multi-tier pricing: per-rule price overrides
+      pricingRules: (typeof req.body.pricingRules === 'object' && req.body.pricingRules !== null && !Array.isArray(req.body.pricingRules))
+        ? Object.fromEntries(
+            Object.entries(req.body.pricingRules)
+              .filter(([_, v]) => typeof v === 'number' && v >= 0)
+              .map(([k, v]) => [k, Math.round(v * 100) / 100])
+          )
+        : {},
       createdAt: new Date(),
       updatedAt: new Date()
     };
@@ -5645,7 +5687,7 @@ app.patch('/api/menus/item/:id', authenticateToken, async (req, res) => {
       'availableFrom', 'availableUntil', 'variants', 'customizations',
       'spiritCategory', 'ingredients', 'abv', 'servingUnit', 'bottleSize',
       'unit', 'weight', 'shelfLife', 'mfgDate', 'expiryDate',
-      'servingSize', 'scoopOptions'
+      'servingSize', 'scoopOptions', 'pricingRules'
     ];
     
     allowedFields.forEach(field => {
@@ -5675,6 +5717,14 @@ app.patch('/api/menus/item/:id', authenticateToken, async (req, res) => {
           updateData[field] = req.body[field] ? parseFloat(req.body[field]) : null;
         } else if (field === 'shelfLife' || field === 'scoopOptions') {
           updateData[field] = req.body[field] ? parseInt(req.body[field]) : null;
+        } else if (field === 'pricingRules') {
+          if (typeof req.body[field] === 'object' && req.body[field] !== null && !Array.isArray(req.body[field])) {
+            updateData[field] = Object.fromEntries(
+              Object.entries(req.body[field])
+                .filter(([_, v]) => typeof v === 'number' && v >= 0)
+                .map(([k, v]) => [k, Math.round(v * 100) / 100])
+            );
+          }
         } else {
           updateData[field] = req.body[field];
         }
@@ -6639,6 +6689,7 @@ app.post('/api/orders', async (req, res) => {
       offerIds,
       manualDiscount,
       redeemLoyaltyPoints,
+      pricingRuleId,
     } = req.body;
 
     // Extract offline/sync fields
@@ -6791,10 +6842,28 @@ app.post('/api/orders', async (req, res) => {
       }
     }
 
+    // Multi-tier pricing: resolve which pricing rule applies to this order
+    const multiPricing = restaurantData.pricingSettings?.multiPricing;
+    let activePricingRuleId = null;
+    if (multiPricing?.enabled) {
+      // Priority 1: Table floor auto-mapping
+      const autoRule = resolveTablePricingRule(tableFloorData?.name, multiPricing);
+      if (autoRule) {
+        activePricingRuleId = autoRule;
+      }
+      // Priority 2: Manual selection from order payload
+      else if (pricingRuleId) {
+        const manualRule = (multiPricing.rules || []).find(r => r.id === pricingRuleId && r.isActive);
+        if (manualRule) {
+          activePricingRuleId = manualRule.id;
+        }
+      }
+    }
+
     for (const item of items) {
       // Find menu item in the embedded menu structure
       const menuItem = menuItems.find(menuItem => menuItem.id === item.menuItemId);
-      
+
       if (!menuItem) {
         return res.status(400).json({ error: `Menu item ${item.menuItemId} not found` });
       }
@@ -6805,9 +6874,17 @@ app.post('/api/orders', async (req, res) => {
         ? item.selectedCustomizations
         : (Array.isArray(item.customizations) ? item.customizations : []);
 
-      const basePrice = typeof selectedVariant?.price === 'number'
+      let basePrice = typeof selectedVariant?.price === 'number'
         ? selectedVariant.price
         : (typeof item.basePrice === 'number' ? item.basePrice : (typeof item.price === 'number' ? item.price : menuItem.price));
+
+      // Multi-tier pricing: override base price for non-variant items
+      if (multiPricing?.enabled && activePricingRuleId && !selectedVariant) {
+        const rulePrice = resolveItemPriceForRule(menuItem, activePricingRuleId, multiPricing.rules);
+        if (rulePrice !== null) {
+          basePrice = rulePrice;
+        }
+      }
 
       const customizationPrice = customizations.reduce((sum, c) => sum + (typeof c.price === 'number' ? c.price : 0), 0);
       const unitPrice = (basePrice || 0) + (customizationPrice || 0);
@@ -6835,14 +6912,18 @@ app.post('/api/orders', async (req, res) => {
       });
     }
 
-    // Apply zone pricing surcharge (before tax)
-    const pricingAdjustments = calculatePricingAdjustments(restaurantData, {
-      tableSection: tableSection || null,
-      floorData: tableFloorData || null,
-      orderTime: new Date(),
-      subtotal: totalAmount
-    });
-    const zoneSurcharge = pricingAdjustments.zoneSurcharge || 0;
+    // Apply zone pricing surcharge (before tax) — skip if multi-tier pricing rule is active
+    let zoneSurcharge = 0;
+    let pricingAdjustments = { zoneSurcharge: 0, appliedRules: [] };
+    if (!activePricingRuleId) {
+      pricingAdjustments = calculatePricingAdjustments(restaurantData, {
+        tableSection: tableSection || null,
+        floorData: tableFloorData || null,
+        orderTime: new Date(),
+        subtotal: totalAmount
+      });
+      zoneSurcharge = pricingAdjustments.zoneSurcharge || 0;
+    }
     totalAmount += zoneSurcharge; // surcharge is taxable
 
     // ── Offer / Manual Discount / Loyalty Points ──────────────────────
@@ -7112,6 +7193,10 @@ app.post('/api/orders', async (req, res) => {
       zoneSurcharge: zoneSurcharge > 0 ? Math.round(zoneSurcharge * 100) / 100 : 0,
       tableSection: tableSection || null,
       appliedPricingRules: pricingAdjustments.appliedRules || [],
+      pricingRuleId: activePricingRuleId || null,
+      pricingRuleName: activePricingRuleId
+        ? ((multiPricing?.rules || []).find(r => r.id === activePricingRuleId)?.name || null)
+        : null,
       finalAmount: Math.round(finalAmount * 100) / 100,
           customerInfo: customerInfo || {
             phone: customerPhone,
@@ -18898,6 +18983,10 @@ app.get('/api/restaurants/:restaurantId/pricing-settings', authenticateToken, as
       timePricing: {
         enabled: existing.timePricing?.enabled ?? false,
         rules: Array.isArray(existing.timePricing?.rules) ? existing.timePricing.rules : []
+      },
+      multiPricing: {
+        enabled: existing.multiPricing?.enabled ?? false,
+        rules: Array.isArray(existing.multiPricing?.rules) ? existing.multiPricing.rules : []
       }
     };
 
@@ -18933,6 +19022,20 @@ app.put('/api/restaurants/:restaurantId/pricing-settings', authenticateToken, as
       isActive: z.isActive !== false
     })) : [];
 
+    // Validate multi-pricing rules
+    const multiRules = Array.isArray(settings.multiPricing?.rules)
+      ? settings.multiPricing.rules.map(r => ({
+          id: r.id || `rule_${Date.now()}_${Math.random().toString(36).substr(2, 6)}`,
+          name: r.name || 'Unnamed Rule',
+          type: r.type === 'fixed' ? 'fixed' : 'dynamic',
+          defaultMarkupType: ['none', 'percentage', 'flat'].includes(r.defaultMarkupType) ? r.defaultMarkupType : 'none',
+          defaultMarkupValue: Number(r.defaultMarkupValue) || 0,
+          tableMappings: Array.isArray(r.tableMappings) ? r.tableMappings.filter(m => typeof m === 'string' && m.trim()) : [],
+          isActive: r.isActive !== false,
+          order: Number(r.order) || 0
+        }))
+      : [];
+
     const pricingSettings = {
       zonePricing: {
         enabled: settings.zonePricing?.enabled ?? false,
@@ -18941,6 +19044,10 @@ app.put('/api/restaurants/:restaurantId/pricing-settings', authenticateToken, as
       timePricing: {
         enabled: settings.timePricing?.enabled ?? false,
         rules: Array.isArray(settings.timePricing?.rules) ? settings.timePricing.rules : []
+      },
+      multiPricing: {
+        enabled: settings.multiPricing?.enabled ?? false,
+        rules: multiRules
       },
       updatedAt: new Date()
     };
