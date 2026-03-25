@@ -11730,6 +11730,37 @@ app.get('/api/user/page-access', authenticateToken, async (req, res) => {
   }
 });
 
+// Update feature toggles (notAllowedPages) for owner
+app.patch('/api/user/features', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const { notAllowedPages } = req.body;
+
+    if (!Array.isArray(notAllowedPages)) {
+      return res.status(400).json({ error: 'notAllowedPages must be an array' });
+    }
+
+    const userDoc = await db.collection(collections.users).doc(userId).get();
+    if (!userDoc.exists) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+    const userData = userDoc.data();
+    if (userData.role !== 'owner') {
+      return res.status(403).json({ error: 'Only owners can manage features' });
+    }
+
+    await db.collection(collections.users).doc(userId).update({
+      notAllowedPages,
+      updatedAt: new Date()
+    });
+
+    res.json({ success: true, message: 'Features updated', notAllowedPages });
+  } catch (error) {
+    console.error('Update features error:', error);
+    res.status(500).json({ error: 'Failed to update features' });
+  }
+});
+
 // Get current authenticated user (for hotel PMS and other apps)
 app.get('/api/auth/me', authenticateToken, async (req, res) => {
   try {
