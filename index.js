@@ -6041,13 +6041,14 @@ app.delete('/api/menus/:restaurantId/bulk-delete', authenticateToken, async (req
       }))
     }));
 
-    // Update the restaurant document
+    // Update the restaurant document — also clear categories so stale ones don't persist
     await db.collection(collections.restaurants).doc(restaurantId).update({
       menu: {
         categories: updatedCategories,
         items: updatedItems,
         lastUpdated: deletedTimestamp
-      }
+      },
+      categories: []
     });
 
     console.log(`✅ Bulk deleted ${activeItemsCount} menu items for restaurant ${restaurantId}`);
@@ -10185,6 +10186,8 @@ app.post('/api/menus/bulk-save/:restaurantId', authenticateToken, async (req, re
           weight: item.weight || null,
           servingSize: item.servingSize || null,
           scoopOptions: item.scoopOptions ? parseInt(item.scoopOptions) : null,
+          // Multi-tier pricing rules (e.g. { rule_ac_dining: 60, rule_takeaway: 55 })
+          pricingRules: item.pricingRules || {},
           createdAt: new Date(),
           updatedAt: new Date(),
           source: 'ai_upload',
