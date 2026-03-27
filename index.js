@@ -6693,6 +6693,16 @@ app.post('/api/orders', async (req, res) => {
       pricingRuleId,
     } = req.body;
 
+    // Billing feature fields
+    const serviceChargeRate = req.body.serviceChargeRate || null;
+    const serviceChargeAmount = req.body.serviceChargeAmount || null;
+    const tipAmount = req.body.tipAmount || null;
+    const tipPercentage = req.body.tipPercentage || null;
+    const cashReceived = req.body.cashReceived || null;
+    const changeReturned = req.body.changeReturned || null;
+    const splitPayments = req.body.splitPayments || null;
+    const roundOffAmount = req.body.roundOffAmount || null;
+
     // Extract offline/sync fields
     const idempotencyKey = req.body.idempotencyKey || null;
     const syncSource = req.body.syncSource || 'online';
@@ -7207,7 +7217,20 @@ app.post('/api/orders', async (req, res) => {
             dob: customerInfo?.dob || null,
             seatNumber: seatNumber || 'Walk-in'
           },
-      paymentMethod: paymentMethod || 'cash',
+      paymentMethod: splitPayments && splitPayments.length > 1 ? 'split' : (paymentMethod || 'cash'),
+      // Billing feature fields
+      serviceChargeRate: serviceChargeRate,
+      serviceChargeAmount: serviceChargeAmount ? Math.round(serviceChargeAmount * 100) / 100 : null,
+      tipAmount: tipAmount ? Math.round(tipAmount * 100) / 100 : null,
+      tipPercentage: tipPercentage,
+      cashReceived: cashReceived ? Math.round(cashReceived * 100) / 100 : null,
+      changeReturned: changeReturned ? Math.round(changeReturned * 100) / 100 : null,
+      splitPayments: splitPayments,
+      roundOffAmount: roundOffAmount ? Math.round(roundOffAmount * 100) / 100 : null,
+      paidAmount: req.body.partialPayAmount ? Math.round(Number(req.body.partialPayAmount) * 100) / 100 : null,
+      outstandingAmount: req.body.partialPayAmount ? Math.round((finalAmount - Number(req.body.partialPayAmount)) * 100) / 100 : null,
+      compItems: req.body.compItems || null,
+      voidItems: req.body.voidItems || null,
       staffInfo: orderType === 'customer_self_order' ? {
         waiterId: null,
         waiterName: 'Customer Self-Order',
@@ -7217,7 +7240,7 @@ app.post('/api/orders', async (req, res) => {
       specialInstructions: specialInstructions || null, // Kitchen special instructions
       status: req.body.status || 'confirmed',
       kotSent: false,
-      paymentStatus: roomNumber ? 'hotel-billing' : 'pending', // NEW: Mark as hotel billing if room number provided
+      paymentStatus: req.body.partialPayAmount ? 'partial' : (roomNumber ? 'hotel-billing' : 'pending'), // Handle partial payment, hotel billing, or default pending
       syncSource: syncSource, // 'online' | 'offline' — tracks how order was placed
       ...(idempotencyKey ? { idempotencyKey } : {}),
       createdAt: new Date(),
@@ -7375,7 +7398,25 @@ app.post('/api/orders', async (req, res) => {
         // Don't fail the order if customer creation fails
       }
     }
-    
+
+    // Track partial payment in customer credit
+    if (req.body.partialPayAmount && customerId) {
+      const outstanding = Math.round((finalAmount - Number(req.body.partialPayAmount)) * 100) / 100;
+      if (outstanding > 0) {
+        db.collection('customers').doc(customerId).update({
+          outstandingBalance: admin.firestore.FieldValue.increment(outstanding),
+          creditHistory: admin.firestore.FieldValue.arrayUnion({
+            orderId: orderRef.id,
+            orderNumber: orderNumber,
+            date: new Date().toISOString(),
+            totalAmount: Math.round(finalAmount * 100) / 100,
+            paidAmount: Math.round(Number(req.body.partialPayAmount) * 100) / 100,
+            outstandingAmount: outstanding
+          })
+        }).catch(err => console.error('Error updating customer credit:', err));
+      }
+    }
+
     console.log(`🛒 Order created successfully: ${orderRef.id} with status: ${orderData.status}`);
     console.log(`📋 Order items: ${orderData.items.length} items`);
     console.log(`🏪 Restaurant: ${orderData.restaurantId}`);
@@ -8900,6 +8941,30 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
     if (specialInstructions !== undefined) updateData.specialInstructions = specialInstructions;
     if (lastUpdatedBy) updateData.lastUpdatedBy = lastUpdatedBy;
 
+    // Billing feature fields
+    if (req.body.serviceChargeRate !== undefined) updateData.serviceChargeRate = req.body.serviceChargeRate;
+    if (req.body.serviceChargeAmount !== undefined) updateData.serviceChargeAmount = req.body.serviceChargeAmount;
+    if (req.body.tipAmount !== undefined) updateData.tipAmount = req.body.tipAmount;
+    if (req.body.tipPercentage !== undefined) updateData.tipPercentage = req.body.tipPercentage;
+    if (req.body.cashReceived !== undefined) updateData.cashReceived = req.body.cashReceived;
+    if (req.body.changeReturned !== undefined) updateData.changeReturned = req.body.changeReturned;
+    if (req.body.splitPayments !== undefined) updateData.splitPayments = req.body.splitPayments;
+    if (req.body.roundOffAmount !== undefined) updateData.roundOffAmount = req.body.roundOffAmount;
+    if (req.body.paidAmount !== undefined) updateData.paidAmount = req.body.paidAmount;
+    if (req.body.outstandingAmount !== undefined) updateData.outstandingAmount = req.body.outstandingAmount;
+    if (req.body.paymentStatus !== undefined) updateData.paymentStatus = req.body.paymentStatus;
+    if (req.body.compItems !== undefined) updateData.compItems = req.body.compItems;
+    if (req.body.voidItems !== undefined) updateData.voidItems = req.body.voidItems;
+    // Override payment method if split
+    if (req.body.splitPayments && req.body.splitPayments.length > 1) {
+      updateData.paymentMethod = 'split';
+    }
+    // Use frontend-calculated finalAmount if provided (includes service charge, tip, round-off)
+    if (req.body.finalAmount !== undefined) updateData.finalAmount = req.body.finalAmount;
+    if (req.body.totalAmount !== undefined) updateData.totalAmount = req.body.totalAmount;
+    if (req.body.taxAmount !== undefined) updateData.taxAmount = req.body.taxAmount;
+    if (req.body.taxBreakdown !== undefined) updateData.taxBreakdown = req.body.taxBreakdown;
+
     // Add update history
     const updateHistory = currentOrder.updateHistory || [];
     updateHistory.push({
@@ -9181,6 +9246,19 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
             billPrinted: false
           });
 
+          // Track tips for staff (fire-and-forget)
+          const finalTipAmount = updateData.tipAmount || currentOrder.tipAmount;
+          const staffWaiterId = currentOrder.staffInfo?.waiterId || currentOrder.staffInfo?.userId;
+          if (finalTipAmount > 0 && staffWaiterId) {
+            db.collection('users').doc(staffWaiterId).update({
+              tipEarnings: admin.firestore.FieldValue.increment(finalTipAmount),
+              tipHistory: admin.firestore.FieldValue.arrayUnion({
+                orderId, orderNumber: currentOrder.orderNumber,
+                amount: finalTipAmount, date: new Date()
+              })
+            }).catch(err => console.error('Tip tracking error (non-blocking):', err));
+          }
+
           console.log('🧾 Order completed, triggering billing print for order:', orderId);
           pusherService.notifyBillingPrintRequest(currentOrder.restaurantId, {
             id: orderId,
@@ -9197,6 +9275,12 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
             finalAmount: updateData.finalAmount || currentOrder.finalAmount || currentOrder.totalAmount,
             paymentMethod: paymentMethod || currentOrder.paymentMethod,
             orderType: orderType || currentOrder.orderType,
+            serviceChargeAmount: updateData.serviceChargeAmount || currentOrder.serviceChargeAmount || null,
+            tipAmount: updateData.tipAmount || currentOrder.tipAmount || null,
+            roundOffAmount: updateData.roundOffAmount || currentOrder.roundOffAmount || null,
+            splitPayments: updateData.splitPayments || currentOrder.splitPayments || null,
+            cashReceived: updateData.cashReceived || currentOrder.cashReceived || null,
+            changeReturned: updateData.changeReturned || currentOrder.changeReturned || null,
             createdAt: currentOrder.createdAt?.toDate?.()?.toISOString() || new Date().toISOString(),
             completedAt: new Date()
           }).catch(err => console.error('Billing print Pusher notification error (non-blocking):', err));
@@ -12987,7 +13071,7 @@ app.get('/api/kot/:restaurantId', async (req, res) => {
     });
 
     const orders = [];
-    const validKotStatuses = ['pending', 'confirmed', 'preparing', 'ready'];
+    const validKotStatuses = ['pending', 'confirmed', 'preparing', 'ready', 'completed'];
     console.log(`✅ Valid KOT statuses: ${validKotStatuses.join(', ')}`);
 
     for (const doc of ordersSnapshot.docs) {
@@ -19587,6 +19671,359 @@ app.put('/api/restaurants/:restaurantId/pricing-settings', authenticateToken, as
   } catch (error) {
     console.error('Update pricing settings error:', error);
     res.status(500).json({ error: 'Failed to update pricing settings' });
+  }
+});
+
+// ==================== BILLING SETTINGS ====================
+
+// Get billing settings
+app.get('/api/restaurants/:restaurantId/billing-settings', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+    const { userId } = req.user;
+
+    const restaurantDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
+    if (!restaurantDoc.exists) {
+      return res.status(404).json({ error: 'Restaurant not found' });
+    }
+    if (restaurantDoc.data().ownerId !== userId) {
+      return res.status(403).json({ error: 'Access denied' });
+    }
+
+    const existing = restaurantDoc.data().billingSettings || {};
+    const billingSettings = {
+      serviceChargeEnabled: existing.serviceChargeEnabled ?? false,
+      serviceChargeRate: existing.serviceChargeRate ?? 10,
+      serviceChargeLabel: existing.serviceChargeLabel || 'Service Charge',
+      roundOffEnabled: existing.roundOffEnabled ?? false,
+      roundOffTo: [1, 5, 10].includes(existing.roundOffTo) ? existing.roundOffTo : 1,
+      tipsEnabled: existing.tipsEnabled ?? false,
+      tipPresets: Array.isArray(existing.tipPresets) ? existing.tipPresets : [5, 10, 15, 20],
+      cashTenderingEnabled: existing.cashTenderingEnabled ?? false,
+      denominations: Array.isArray(existing.denominations) ? existing.denominations : [10, 20, 50, 100, 200, 500, 2000],
+      splitPaymentEnabled: existing.splitPaymentEnabled ?? false,
+      partialPaymentEnabled: existing.partialPaymentEnabled ?? false,
+      compVoidEnabled: existing.compVoidEnabled ?? false,
+      compVoidRequiresPin: existing.compVoidRequiresPin ?? true,
+      managerPin: existing.managerPin || '',
+      refundsEnabled: existing.refundsEnabled ?? false,
+      refundsRequireApproval: existing.refundsRequireApproval ?? true,
+    };
+
+    res.json({ settings: billingSettings });
+  } catch (error) {
+    console.error('Get billing settings error:', error);
+    res.status(500).json({ error: 'Failed to fetch billing settings' });
+  }
+});
+
+// Update billing settings
+app.put('/api/restaurants/:restaurantId/billing-settings', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+    const { userId } = req.user;
+    const settings = req.body;
+
+    const restaurantDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
+    if (!restaurantDoc.exists) {
+      return res.status(404).json({ error: 'Restaurant not found' });
+    }
+    if (restaurantDoc.data().ownerId !== userId) {
+      return res.status(403).json({ error: 'Access denied' });
+    }
+
+    const billingSettings = {
+      serviceChargeEnabled: settings.serviceChargeEnabled ?? false,
+      serviceChargeRate: Math.max(0, Math.min(100, Number(settings.serviceChargeRate) || 10)),
+      serviceChargeLabel: (settings.serviceChargeLabel || 'Service Charge').trim().substring(0, 50),
+      roundOffEnabled: settings.roundOffEnabled ?? false,
+      roundOffTo: [1, 5, 10].includes(Number(settings.roundOffTo)) ? Number(settings.roundOffTo) : 1,
+      tipsEnabled: settings.tipsEnabled ?? false,
+      tipPresets: Array.isArray(settings.tipPresets)
+        ? settings.tipPresets.filter(p => typeof p === 'number' && p > 0 && p <= 100).slice(0, 6)
+        : [5, 10, 15, 20],
+      cashTenderingEnabled: settings.cashTenderingEnabled ?? false,
+      denominations: Array.isArray(settings.denominations)
+        ? settings.denominations.filter(d => typeof d === 'number' && d > 0).sort((a, b) => a - b)
+        : [10, 20, 50, 100, 200, 500, 2000],
+      splitPaymentEnabled: settings.splitPaymentEnabled ?? false,
+      partialPaymentEnabled: settings.partialPaymentEnabled ?? false,
+      compVoidEnabled: settings.compVoidEnabled ?? false,
+      compVoidRequiresPin: settings.compVoidRequiresPin ?? true,
+      managerPin: settings.managerPin || '',
+      refundsEnabled: settings.refundsEnabled ?? false,
+      refundsRequireApproval: settings.refundsRequireApproval ?? true,
+      updatedAt: new Date(),
+    };
+
+    await restaurantDoc.ref.update({ billingSettings });
+
+    res.json({
+      message: 'Billing settings updated successfully',
+      settings: billingSettings,
+    });
+  } catch (error) {
+    console.error('Update billing settings error:', error);
+    res.status(500).json({ error: 'Failed to update billing settings' });
+  }
+});
+
+// Validate manager PIN
+app.post('/api/billing/validate-manager-pin', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId, pin } = req.body;
+    const { userId } = req.user;
+
+    if (!restaurantId || !pin) {
+      return res.status(400).json({ error: 'Restaurant ID and PIN are required' });
+    }
+
+    const restaurantDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
+    if (!restaurantDoc.exists) {
+      return res.status(404).json({ error: 'Restaurant not found' });
+    }
+
+    const billingSettings = restaurantDoc.data().billingSettings || {};
+    const valid = billingSettings.managerPin && billingSettings.managerPin === pin;
+
+    res.json({ valid });
+  } catch (error) {
+    console.error('Validate manager PIN error:', error);
+    res.status(500).json({ error: 'Failed to validate PIN' });
+  }
+});
+
+// Fetch staff tip earnings
+app.get('/api/staff/:userId/tips', authenticateToken, async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const userDoc = await db.collection('users').doc(userId).get();
+    if (!userDoc.exists) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+    const userData = userDoc.data();
+    res.json({
+      tipEarnings: userData.tipEarnings || 0,
+      tipHistory: (userData.tipHistory || []).sort((a, b) => new Date(b.date) - new Date(a.date)).slice(0, 50)
+    });
+  } catch (error) {
+    console.error('Error fetching staff tips:', error);
+    res.status(500).json({ error: 'Failed to fetch tip data' });
+  }
+});
+
+// Process refund for an order
+app.post('/api/orders/:orderId/refund', authenticateToken, async (req, res) => {
+  try {
+    const { orderId } = req.params;
+    const { refundAmount, refundReason, refundType } = req.body;
+    const { userId } = req.user;
+
+    if (!refundAmount || refundAmount <= 0) {
+      return res.status(400).json({ error: 'Valid refund amount is required' });
+    }
+
+    const orderRef = db.collection(collections.orders).doc(orderId);
+    const orderDoc = await orderRef.get();
+    if (!orderDoc.exists) {
+      return res.status(404).json({ error: 'Order not found' });
+    }
+
+    const orderData = orderDoc.data();
+    if (orderData.refundedAt) {
+      return res.status(400).json({ error: 'Order has already been refunded' });
+    }
+
+    const finalAmount = orderData.finalAmount || orderData.totalAmount || 0;
+    if (refundAmount > finalAmount) {
+      return res.status(400).json({ error: 'Refund amount cannot exceed order total' });
+    }
+
+    await orderRef.update({
+      refundAmount: Number(refundAmount),
+      refundReason: refundReason || null,
+      refundType: refundType || (refundAmount >= finalAmount ? 'full' : 'partial'),
+      refundedAt: new Date().toISOString(),
+      refundedBy: userId,
+      status: refundAmount >= finalAmount ? 'refunded' : orderData.status
+    });
+
+    res.json({ success: true, message: 'Refund processed successfully' });
+  } catch (error) {
+    console.error('Error processing refund:', error);
+    res.status(500).json({ error: 'Failed to process refund' });
+  }
+});
+
+// Record partial payment for an order
+app.post('/api/orders/:orderId/partial-payment', authenticateToken, async (req, res) => {
+  try {
+    const { orderId } = req.params;
+    const { paidAmount, customerId, paymentMethod } = req.body;
+
+    if (!paidAmount || paidAmount <= 0) {
+      return res.status(400).json({ error: 'Valid payment amount is required' });
+    }
+
+    const orderRef = db.collection(collections.orders).doc(orderId);
+    const orderDoc = await orderRef.get();
+    if (!orderDoc.exists) {
+      return res.status(404).json({ error: 'Order not found' });
+    }
+
+    const orderData = orderDoc.data();
+    const finalAmount = orderData.finalAmount || orderData.totalAmount || 0;
+    const previousPaid = orderData.paidAmount || 0;
+    const totalPaid = previousPaid + Number(paidAmount);
+    const outstanding = Math.max(0, Math.round((finalAmount - totalPaid) * 100) / 100);
+
+    await orderRef.update({
+      paidAmount: totalPaid,
+      outstandingAmount: outstanding,
+      paymentStatus: outstanding <= 0 ? 'paid' : 'partial',
+      paymentMethod: paymentMethod || orderData.paymentMethod || 'cash'
+    });
+
+    // Update customer credit if customerId provided
+    if (customerId && outstanding > 0) {
+      const customerRef = db.collection(collections.customers).doc(customerId);
+      await customerRef.update({
+        outstandingBalance: admin.firestore.FieldValue.increment(outstanding),
+        creditHistory: admin.firestore.FieldValue.arrayUnion({
+          orderId,
+          orderNumber: orderData.orderNumber || orderId,
+          date: new Date().toISOString(),
+          totalAmount: finalAmount,
+          paidAmount: totalPaid,
+          outstandingAmount: outstanding
+        })
+      });
+    }
+
+    res.json({ success: true, paidAmount: totalPaid, outstandingAmount: outstanding });
+  } catch (error) {
+    console.error('Error recording partial payment:', error);
+    res.status(500).json({ error: 'Failed to record partial payment' });
+  }
+});
+
+// Comp or void items on an order
+app.post('/api/orders/:orderId/comp-void', authenticateToken, async (req, res) => {
+  try {
+    const { orderId } = req.params;
+    const { type, items, reason } = req.body;
+    const { userId } = req.user;
+
+    if (!type || !['comp', 'void'].includes(type)) {
+      return res.status(400).json({ error: 'Type must be comp or void' });
+    }
+    if (!items || !Array.isArray(items) || items.length === 0) {
+      return res.status(400).json({ error: 'Items are required' });
+    }
+
+    const orderRef = db.collection(collections.orders).doc(orderId);
+    const orderDoc = await orderRef.get();
+    if (!orderDoc.exists) {
+      return res.status(404).json({ error: 'Order not found' });
+    }
+
+    const fieldName = type === 'comp' ? 'compItems' : 'voidItems';
+    const newItems = items.map(item => ({
+      ...item,
+      reason: reason || null,
+      authorizedBy: userId,
+      authorizedAt: new Date().toISOString()
+    }));
+
+    await orderRef.update({
+      [fieldName]: admin.firestore.FieldValue.arrayUnion(...newItems)
+    });
+
+    res.json({ success: true, message: `Items ${type === 'comp' ? 'comped' : 'voided'} successfully` });
+  } catch (error) {
+    console.error('Error processing comp/void:', error);
+    res.status(500).json({ error: 'Failed to process comp/void' });
+  }
+});
+
+// Get customer credit history
+app.get('/api/customers/:customerId/credit-history', authenticateToken, async (req, res) => {
+  try {
+    const { customerId } = req.params;
+    const customerDoc = await db.collection(collections.customers).doc(customerId).get();
+    if (!customerDoc.exists) {
+      return res.status(404).json({ error: 'Customer not found' });
+    }
+    const customerData = customerDoc.data();
+    res.json({
+      outstandingBalance: customerData.outstandingBalance || 0,
+      creditHistory: (customerData.creditHistory || []).sort((a, b) => new Date(b.date) - new Date(a.date))
+    });
+  } catch (error) {
+    console.error('Error fetching credit history:', error);
+    res.status(500).json({ error: 'Failed to fetch credit history' });
+  }
+});
+
+// Settle outstanding customer credit balance
+app.post('/api/customers/:customerId/settle-credit', authenticateToken, async (req, res) => {
+  try {
+    const { customerId } = req.params;
+    const { amount, paymentMethod, orderId } = req.body;
+
+    if (!amount || amount <= 0) {
+      return res.status(400).json({ error: 'Valid amount is required' });
+    }
+
+    const customerRef = db.collection(collections.customers).doc(customerId);
+    const customerDoc = await customerRef.get();
+    if (!customerDoc.exists) {
+      return res.status(404).json({ error: 'Customer not found' });
+    }
+
+    const customerData = customerDoc.data();
+    const currentBalance = customerData.outstandingBalance || 0;
+    const settleAmount = Math.min(Number(amount), currentBalance);
+    const newBalance = Math.max(0, Math.round((currentBalance - settleAmount) * 100) / 100);
+
+    const updateData = {
+      outstandingBalance: newBalance
+    };
+
+    // If settling a specific order, update that credit history entry
+    if (orderId) {
+      const creditHistory = customerData.creditHistory || [];
+      const updatedHistory = creditHistory.map(entry => {
+        if (entry.orderId === orderId) {
+          return { ...entry, settledAt: new Date().toISOString(), settledAmount: settleAmount, paymentMethod: paymentMethod || 'cash' };
+        }
+        return entry;
+      });
+      updateData.creditHistory = updatedHistory;
+    }
+
+    await customerRef.update(updateData);
+
+    // Also update the order if orderId provided
+    if (orderId) {
+      const orderRef = db.collection(collections.orders).doc(orderId);
+      const orderDoc = await orderRef.get();
+      if (orderDoc.exists) {
+        const orderData = orderDoc.data();
+        const newPaid = (orderData.paidAmount || 0) + settleAmount;
+        const newOutstanding = Math.max(0, (orderData.outstandingAmount || 0) - settleAmount);
+        await orderRef.update({
+          paidAmount: newPaid,
+          outstandingAmount: newOutstanding,
+          paymentStatus: newOutstanding <= 0 ? 'paid' : 'partial'
+        });
+      }
+    }
+
+    res.json({ success: true, newBalance, settledAmount: settleAmount });
+  } catch (error) {
+    console.error('Error settling credit:', error);
+    res.status(500).json({ error: 'Failed to settle credit' });
   }
 });
 
