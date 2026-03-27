@@ -7171,6 +7171,12 @@ app.post('/api/orders', async (req, res) => {
       finalAmount = preTaxTotal + taxAmount;
     }
 
+    // Add billing components to finalAmount
+    const scAmt = serviceChargeAmount ? Number(serviceChargeAmount) : 0;
+    const tipAmt = tipAmount ? Number(tipAmount) : 0;
+    const roAmt = roundOffAmount ? Number(roundOffAmount) : 0;
+    finalAmount = finalAmount + scAmt + tipAmt + roAmt;
+
     // Generate order number and daily/sequential order ID (based on restaurant orderSettings.sequentialOrderIdEnabled)
     const orderNumber = `ORD-${Date.now()}-${Math.random().toString(36).substr(2, 4).toUpperCase()}`;
     const dailyOrderId = await getNextOrderId(restaurantId);
@@ -8976,6 +8982,15 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
     if (req.body.paidAmount !== undefined) updateData.paidAmount = req.body.paidAmount;
     if (req.body.outstandingAmount !== undefined) updateData.outstandingAmount = req.body.outstandingAmount;
     if (req.body.paymentStatus !== undefined) updateData.paymentStatus = req.body.paymentStatus;
+
+    // Handle partialPayAmount - compute paidAmount and outstandingAmount
+    if (req.body.partialPayAmount && !req.body.paidAmount) {
+      const partialPay = Number(req.body.partialPayAmount);
+      const orderFinal = updateData.finalAmount || currentOrder.finalAmount || (updateData.totalAmount || currentOrder.totalAmount || 0);
+      updateData.paidAmount = Math.round(partialPay * 100) / 100;
+      updateData.outstandingAmount = Math.round((orderFinal - partialPay) * 100) / 100;
+      updateData.paymentStatus = 'partial';
+    }
     if (req.body.compItems !== undefined) updateData.compItems = req.body.compItems;
     if (req.body.voidItems !== undefined) updateData.voidItems = req.body.voidItems;
     // Override payment method if split
@@ -9280,6 +9295,26 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
                 amount: finalTipAmount, date: new Date()
               })
             }).catch(err => console.error('Tip tracking error (non-blocking):', err));
+          }
+
+          // Track partial payment in customer credit on completion
+          if (updateData.outstandingAmount > 0) {
+            const creditCustomerId = req.body.customerId || currentOrder.customerId || currentOrder.customerInfo?.customerId;
+            if (creditCustomerId) {
+              const outstanding = updateData.outstandingAmount;
+              const finalAmt = updateData.finalAmount || currentOrder.finalAmount || currentOrder.totalAmount || 0;
+              db.collection('customers').doc(creditCustomerId).update({
+                outstandingBalance: admin.firestore.FieldValue.increment(outstanding),
+                creditHistory: admin.firestore.FieldValue.arrayUnion({
+                  orderId,
+                  orderNumber: currentOrder.orderNumber,
+                  date: new Date().toISOString(),
+                  totalAmount: Math.round(finalAmt * 100) / 100,
+                  paidAmount: updateData.paidAmount || 0,
+                  outstandingAmount: outstanding
+                })
+              }).catch(err => console.error('Customer credit tracking error (non-blocking):', err));
+            }
           }
 
           console.log('🧾 Order completed, triggering billing print for order:', orderId);
