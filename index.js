@@ -14901,12 +14901,13 @@ Return [] if no items could be identified.`
       console.log('📦 Quick order created:', orderRef.id);
 
       // Deduct inventory via recipes (synchronous for user feedback)
+      let deductions = [];
       try {
-        await inventoryService.deductInventoryForOrder(
+        deductions = await inventoryService.deductInventoryForOrder(
           restaurantId,
           orderRef.id,
           validItems.map(i => ({ menuItemId: i.menuItemId, name: i.name, quantity: i.quantity || 1 }))
-        );
+        ) || [];
         console.log('✅ Inventory deducted for quick order:', orderRef.id);
       } catch (deductError) {
         console.error('⚠️ Inventory deduction failed (order still created):', deductError.message);
@@ -14917,6 +14918,7 @@ Return [] if no items could be identified.`
         orderId: orderRef.id,
         message: `Order logged! ${validItems.length} item(s) processed, inventory deducted.`,
         deductedItems: validItems.length,
+        deductions,
         totalAmount,
       });
     }
@@ -15303,6 +15305,54 @@ app.post('/api/recipes/:restaurantId', authenticateToken, async (req, res) => {
   } catch (error) {
     console.error('Create recipe error:', error);
     res.status(500).json({ error: 'Failed to create recipe' });
+  }
+});
+
+// Generate recipe steps with AI
+app.post('/api/recipes/:restaurantId/generate-steps', authenticateToken, aiUsageLimiter.middleware(), async (req, res) => {
+  try {
+    const { name, category, description, ingredients, servings } = req.body;
+
+    if (!name) {
+      return res.status(400).json({ error: 'Recipe name is required' });
+    }
+
+    const prompt = `You are a professional chef writing concise recipe instructions.
+
+Recipe: ${name}
+${category ? `Category: ${category}` : ''}
+${description ? `Description: ${description}` : ''}
+${ingredients ? `Ingredients: ${ingredients}` : ''}
+${servings ? `Servings: ${servings}` : ''}
+
+Generate clear, concise step-by-step cooking instructions for this recipe. Each step should be 1-2 sentences. Be practical and specific. Return JSON with a "steps" array of strings.
+
+Example: {"steps": ["Boil water in a saucepan over medium heat.", "Add tea leaves and simmer for 2 minutes.", "Pour in milk and bring to a gentle boil.", "Strain into a cup and serve hot."]}`;
+
+    const response = await openai.chat.completions.create({
+      model: 'gpt-4o-mini',
+      messages: [{ role: 'user', content: prompt }],
+      temperature: 0.7,
+      max_tokens: 500,
+      response_format: { type: 'json_object' },
+    });
+
+    const content = response.choices[0]?.message?.content || '{}';
+    let parsed;
+    try {
+      parsed = JSON.parse(content);
+    } catch {
+      parsed = {};
+    }
+
+    const steps = Array.isArray(parsed) ? parsed :
+                  Array.isArray(parsed.steps) ? parsed.steps :
+                  Array.isArray(parsed.instructions) ? parsed.instructions : [];
+
+    res.json({ steps });
+  } catch (error) {
+    console.error('Generate recipe steps error:', error);
+    res.status(500).json({ error: 'Failed to generate recipe steps' });
   }
 });
 

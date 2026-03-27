@@ -66,7 +66,7 @@ class InventoryService {
     console.log(`📉 Processing inventory deduction for Order ${orderId}`);
     
     try {
-      if (!orderItems || orderItems.length === 0) return;
+      if (!orderItems || orderItems.length === 0) return [];
 
       // Create batch using the db instance
       const batch = db.batch();
@@ -81,6 +81,8 @@ class InventoryService {
       inventorySnapshot.forEach(doc => {
         inventoryItems.push({ id: doc.id, ...doc.data(), ref: doc.ref });
       });
+
+      const deductions = [];
 
       // 2. Process each ordered item
       for (const item of orderItems) {
@@ -158,6 +160,14 @@ class InventoryService {
                 });
 
                 hasUpdates = true;
+                deductions.push({
+                  inventoryItemId: inventoryItem.id,
+                  inventoryItemName: inventoryItem.name,
+                  unit: inventoryItem.unit,
+                  quantityDeducted: deductionAmount,
+                  newStock,
+                  menuItemName: item.name,
+                });
                 // Update local array to reflect changes if same ingredient used multiple times in order
                 inventoryItem.currentStock = newStock;
             } else {
@@ -171,8 +181,11 @@ class InventoryService {
         console.log(`✅ Inventory updated for Order ${orderId}`);
       }
 
+      return deductions;
+
     } catch (error) {
       console.error(`❌ Error in inventory deduction for Order ${orderId}:`, error);
+      return [];
     }
   }
 

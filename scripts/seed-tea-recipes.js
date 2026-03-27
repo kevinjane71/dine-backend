@@ -8,6 +8,7 @@ require('dotenv').config({ path: require('path').join(__dirname, '..', '.env') }
 
 // ===== CONFIGURATION =====
 const TARGET_RESTAURANT_ID = 'LUETVd1eMwu4Bm7PvP9K';
+const SEED_MENU_ITEMS = true; // Also add menu items to the restaurant document
 // =========================
 
 initializeApp({
@@ -338,6 +339,26 @@ const RECIPES = [
   },
 ];
 
+const MENU_ITEMS = [
+  // Tea Counter
+  { name: 'Black Tea', category: 'Tea Counter', price: 20, shortCode: 'BT', isVeg: true, description: 'Classic black tea with sugar or jaggery' },
+  { name: 'Plain Milk Tea', category: 'Tea Counter', price: 30, shortCode: 'PMT', isVeg: true, description: 'Classic Indian milk tea' },
+  { name: 'Cardamom Tea', category: 'Tea Counter', price: 35, shortCode: 'CT', isVeg: true, description: 'Fragrant cardamom-infused milk tea' },
+  { name: 'Ginger Milk Tea', category: 'Tea Counter', price: 35, shortCode: 'GMT', isVeg: true, description: 'Warming ginger-infused milk tea' },
+  { name: 'Mint Tea', category: 'Tea Counter', price: 35, shortCode: 'MT', isVeg: true, description: 'Refreshing mint-infused milk tea' },
+  // Herbal & Speciality Tea
+  { name: 'Green Tea', category: 'Herbal & Speciality Tea', price: 40, shortCode: 'GT', isVeg: true, description: 'Light green tea with honey' },
+  { name: 'Lemon Tea', category: 'Herbal & Speciality Tea', price: 35, shortCode: 'LT', isVeg: true, description: 'Tangy lemon tea with honey' },
+  { name: 'Hibiscus Tea', category: 'Herbal & Speciality Tea', price: 45, shortCode: 'HT', isVeg: true, description: 'Floral hibiscus herbal tea' },
+  { name: 'Blue Pea Tea', category: 'Herbal & Speciality Tea', price: 50, shortCode: 'BPT', isVeg: true, description: 'Vibrant butterfly pea flower tea' },
+  { name: 'Chamomile Tea', category: 'Herbal & Speciality Tea', price: 50, shortCode: 'CHT', isVeg: true, description: 'Calming chamomile herbal tea' },
+  // Coffee Counter
+  { name: 'Black Coffee', category: 'Coffee Counter', price: 30, shortCode: 'BC', isVeg: true, description: 'Strong black coffee with sugar or jaggery' },
+  { name: 'Milk Coffee', category: 'Coffee Counter', price: 40, shortCode: 'MC', isVeg: true, description: 'South Indian filter-style milk coffee' },
+  { name: 'Hot Chocolate', category: 'Coffee Counter', price: 60, shortCode: 'HC', isVeg: true, description: 'Rich hot chocolate with cinnamon' },
+  { name: 'Hot Cafe Mocha', category: 'Coffee Counter', price: 70, shortCode: 'HCM', isVeg: true, description: 'Filter coffee meets hot chocolate' },
+];
+
 async function seedData() {
   console.log(`\nSeeding inventory and recipes for restaurant: ${TARGET_RESTAURANT_ID}\n`);
 
@@ -413,9 +434,70 @@ async function seedData() {
     console.log(`  + Created recipe: ${recipe.name} (${ingredients.length} ingredients)`);
   }
 
+  // Step 3: Seed menu items into the restaurant document
+  if (SEED_MENU_ITEMS) {
+    console.log('\n--- Seeding Menu Items ---');
+    const restaurantRef = firestoreDb.collection('restaurants').doc(TARGET_RESTAURANT_ID);
+    const restaurantDoc = await restaurantRef.get();
+
+    if (!restaurantDoc.exists) {
+      console.log('  ⚠ Restaurant doc not found, creating menu in a new doc');
+    }
+
+    const existingData = restaurantDoc.exists ? restaurantDoc.data() : {};
+    const existingMenu = existingData.menu || { categories: [], items: [] };
+    const existingItems = existingMenu.items || [];
+    const existingNames = new Set(existingItems.map(i => i.name));
+
+    const categories = [...new Set(MENU_ITEMS.map(i => i.category))];
+    const existingCats = new Set((existingMenu.categories || []).map(c => c.name));
+    const newCategories = [...(existingMenu.categories || [])];
+    let catOrder = newCategories.length;
+    for (const cat of categories) {
+      if (!existingCats.has(cat)) {
+        newCategories.push({ name: cat, order: ++catOrder });
+        console.log(`  + Category: ${cat}`);
+      }
+    }
+
+    let added = 0;
+    for (const item of MENU_ITEMS) {
+      if (existingNames.has(item.name)) {
+        console.log(`  ~ Exists: ${item.name}`);
+        continue;
+      }
+      const menuItemId = `menu_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+      existingItems.push({
+        id: menuItemId,
+        name: item.name,
+        price: item.price,
+        category: item.category,
+        description: item.description,
+        shortCode: item.shortCode,
+        isVeg: item.isVeg,
+        status: 'active',
+        isAvailable: true,
+        variants: [],
+        createdAt: new Date().toISOString(),
+      });
+      console.log(`  + Menu item: ${item.name} (₹${item.price}, ${item.shortCode})`);
+      added++;
+      // Small delay to ensure unique IDs
+      await new Promise(r => setTimeout(r, 5));
+    }
+
+    await restaurantRef.set({
+      ...existingData,
+      menu: { categories: newCategories, items: existingItems },
+    }, { merge: true });
+
+    console.log(`  ✓ ${added} menu items added to restaurant doc`);
+  }
+
   console.log(`\n✅ Seeding complete!`);
   console.log(`   ${RAW_MATERIALS.length} inventory items`);
   console.log(`   ${RECIPES.length} recipes`);
+  console.log(`   ${SEED_MENU_ITEMS ? MENU_ITEMS.length : 0} menu items`);
   console.log(`   Restaurant: ${TARGET_RESTAURANT_ID}\n`);
 
   process.exit(0);
