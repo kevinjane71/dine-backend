@@ -7373,8 +7373,17 @@ app.post('/api/orders', async (req, res) => {
               orderId: orderRef.id,
               orderNumber: orderNumber,
               totalAmount: totalAmount,
+              finalAmount: Math.round(finalAmount * 100) / 100,
+              taxAmount: Math.round(taxAmount * 100) / 100,
+              serviceChargeAmount: serviceChargeAmount ? Math.round(serviceChargeAmount * 100) / 100 : 0,
+              tipAmount: tipAmount ? Math.round(tipAmount * 100) / 100 : 0,
+              roundOffAmount: roundOffAmount ? Math.round(roundOffAmount * 100) / 100 : 0,
+              outstandingAmount: req.body.partialPayAmount ? Math.round((finalAmount - Number(req.body.partialPayAmount)) * 100) / 100 : 0,
+              paidAmount: req.body.partialPayAmount ? Math.round(Number(req.body.partialPayAmount) * 100) / 100 : 0,
               orderDate: new Date(),
-              tableNumber: tableNumber || seatNumber || null
+              tableNumber: tableNumber || seatNumber || null,
+              orderType: orderType,
+              orderTypeLabel: orderTypeLabels[orderType] || orderType
             }]
           })
         });
@@ -8560,7 +8569,7 @@ app.patch('/api/orders/:orderId/status', authenticateToken, async (req, res) => 
         try {
           const customerUpdateData = {
             totalOrders: FieldValue.increment(1),
-            totalSpent: FieldValue.increment(orderData.totalAmount || 0),
+            totalSpent: FieldValue.increment(orderData.finalAmount || orderData.totalAmount || 0),
             lastOrderDate: new Date(),
             updatedAt: new Date()
           };
@@ -8582,7 +8591,14 @@ app.patch('/api/orders/:orderId/status', authenticateToken, async (req, res) => 
             orderNumber: orderData.orderNumber,
             orderDate: new Date(), // Completion date
             totalAmount: orderData.totalAmount,
+            finalAmount: orderData.finalAmount || orderData.totalAmount,
             subtotal: orderData.subtotal,
+            taxAmount: orderData.taxAmount || 0,
+            serviceChargeAmount: orderData.serviceChargeAmount || 0,
+            tipAmount: orderData.tipAmount || 0,
+            roundOffAmount: orderData.roundOffAmount || 0,
+            outstandingAmount: orderData.outstandingAmount || 0,
+            paidAmount: orderData.paidAmount || 0,
             discountAmount: orderData.discountAmount,
             loyaltyDiscount: orderData.loyaltyDiscount,
             tableNumber: orderData.tableNumber,
@@ -12896,6 +12912,16 @@ app.post('/api/invoice/generate/:orderId', authenticateToken, async (req, res) =
       totalTax: Math.round(totalTax * 100) / 100,
       grandTotal: Math.round(grandTotal * 100) / 100,
       paymentMethod: order.paymentMethod || 'cash',
+      serviceChargeRate: order.serviceChargeRate || null,
+      serviceChargeAmount: order.serviceChargeAmount ? Math.round(order.serviceChargeAmount * 100) / 100 : null,
+      tipAmount: order.tipAmount ? Math.round(order.tipAmount * 100) / 100 : null,
+      tipPercentage: order.tipPercentage || null,
+      roundOffAmount: order.roundOffAmount ? Math.round(order.roundOffAmount * 100) / 100 : null,
+      splitPayments: order.splitPayments || null,
+      cashReceived: order.cashReceived ? Math.round(order.cashReceived * 100) / 100 : null,
+      changeReturned: order.changeReturned ? Math.round(order.changeReturned * 100) / 100 : null,
+      paidAmount: order.paidAmount ? Math.round(order.paidAmount * 100) / 100 : null,
+      outstandingAmount: order.outstandingAmount ? Math.round(order.outstandingAmount * 100) / 100 : null,
       invoiceDate: new Date(),
       generatedBy: userId,
       status: 'generated'
@@ -18240,7 +18266,7 @@ app.post('/api/customers', authenticateToken, async (req, res) => {
           invoiceGenerated: order.invoiceId ? true : false
         })),
         totalOrders: orderHistory.length,
-        totalSpent: orderHistory.reduce((sum, order) => sum + (order.totalAmount || 0), 0),
+        totalSpent: orderHistory.reduce((sum, order) => sum + (order.finalAmount || order.totalAmount || 0), 0),
         lastOrderDate: orderHistory.length > 0 ? new Date() : null,
         createdAt: new Date(),
         updatedAt: new Date()
