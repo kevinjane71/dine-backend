@@ -8919,18 +8919,25 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
 
           updateData.taxAmount = Math.round(taxAmount * 100) / 100;
           updateData.taxBreakdown = taxBreakdown;
-          updateData.finalAmount = Math.round((updateData.totalAmount + taxAmount) * 100) / 100;
+          // Base finalAmount = totalAmount + tax (frontend may override with full billing amount)
+          const scAmt = req.body.serviceChargeAmount || currentOrder.serviceChargeAmount || 0;
+          const tipAmt = req.body.tipAmount || currentOrder.tipAmount || 0;
+          const roAmt = req.body.roundOffAmount || currentOrder.roundOffAmount || 0;
+          updateData.finalAmount = Math.round((updateData.totalAmount + taxAmount + scAmt + tipAmt + roAmt) * 100) / 100;
         } else {
-          // Tax disabled - set taxAmount to 0 and finalAmount = totalAmount
+          // Tax disabled - finalAmount includes billing features
+          const scAmt = req.body.serviceChargeAmount || currentOrder.serviceChargeAmount || 0;
+          const tipAmt = req.body.tipAmount || currentOrder.tipAmount || 0;
+          const roAmt = req.body.roundOffAmount || currentOrder.roundOffAmount || 0;
           updateData.taxAmount = 0;
           updateData.taxBreakdown = [];
-          updateData.finalAmount = updateData.totalAmount;
+          updateData.finalAmount = Math.round((updateData.totalAmount + scAmt + tipAmt + roAmt) * 100) / 100;
         }
       } else {
         // Restaurant doc doesn't exist - preserve existing values for backward compatibility
         updateData.taxAmount = currentOrder.taxAmount || 0;
         updateData.taxBreakdown = currentOrder.taxBreakdown || [];
-        updateData.finalAmount = updateData.totalAmount || currentOrder.finalAmount || currentOrder.totalAmount || 0;
+        updateData.finalAmount = currentOrder.finalAmount || updateData.totalAmount || currentOrder.totalAmount || 0;
       }
       
       console.log('🔄 Updated order totals:', {
@@ -12884,7 +12891,7 @@ app.post('/api/invoice/generate/:orderId', authenticateToken, async (req, res) =
       }
     }
 
-    const grandTotal = order.finalAmount || (subtotal - totalDiscount + totalTax);
+    const grandTotal = order.finalAmount || (subtotal - totalDiscount + totalTax + (order.serviceChargeAmount || 0) + (order.tipAmount || 0) + (order.roundOffAmount || 0));
 
     // Generate invoice
     const invoice = {
