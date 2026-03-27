@@ -14500,6 +14500,435 @@ app.get('/api/inventory/:restaurantId/dashboard', authenticateToken, async (req,
   }
 });
 
+// Get inventory transactions (usage log)
+app.get('/api/inventory/:restaurantId/transactions', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+    const { date, startDate, endDate, itemId, type, limit = 50, page = 1 } = req.query;
+
+    let query = db.collection(collections.inventoryTransactions)
+      .where('restaurantId', '==', restaurantId);
+
+    if (itemId) {
+      query = query.where('inventoryItemId', '==', itemId);
+    }
+    if (type) {
+      query = query.where('type', '==', type.toUpperCase());
+    }
+
+    // Date filtering
+    if (date) {
+      const dayStart = new Date(date);
+      dayStart.setHours(0, 0, 0, 0);
+      const dayEnd = new Date(date);
+      dayEnd.setHours(23, 59, 59, 999);
+      query = query.where('date', '>=', dayStart).where('date', '<=', dayEnd);
+    } else if (startDate || endDate) {
+      if (startDate) {
+        const sd = new Date(startDate);
+        sd.setHours(0, 0, 0, 0);
+        query = query.where('date', '>=', sd);
+      }
+      if (endDate) {
+        const ed = new Date(endDate);
+        ed.setHours(23, 59, 59, 999);
+        query = query.where('date', '<=', ed);
+      }
+    }
+
+    query = query.orderBy('date', 'desc');
+
+    const pageNum = parseInt(page, 10) || 1;
+    const limitNum = Math.min(parseInt(limit, 10) || 50, 200);
+    const offset = (pageNum - 1) * limitNum;
+
+    const snapshot = await query.limit(limitNum + offset).get();
+    const allDocs = [];
+    snapshot.forEach(doc => allDocs.push({ id: doc.id, ...doc.data() }));
+    const transactions = allDocs.slice(offset, offset + limitNum);
+
+    // Convert Firestore Timestamps to ISO strings
+    const serialized = transactions.map(t => ({
+      ...t,
+      date: t.date?.toDate ? t.date.toDate().toISOString() : t.date,
+    }));
+
+    res.json({
+      transactions: serialized,
+      total: allDocs.length,
+      page: pageNum,
+      limit: limitNum,
+      hasMore: allDocs.length > offset + limitNum,
+    });
+
+  } catch (error) {
+    console.error('Get inventory transactions error:', error);
+    res.status(500).json({ error: 'Failed to fetch inventory transactions' });
+  }
+});
+
+// Get usage summary — aggregated by item for a date range
+app.get('/api/inventory/:restaurantId/usage-summary', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+    const { period = 'today', startDate, endDate } = req.query;
+
+    let start, end;
+    const now = new Date();
+
+    if (period === 'today') {
+      start = new Date(now); start.setHours(0, 0, 0, 0);
+      end = new Date(now); end.setHours(23, 59, 59, 999);
+    } else if (period === 'week' || period === '7days') {
+      start = new Date(now); start.setDate(now.getDate() - 6); start.setHours(0, 0, 0, 0);
+      end = new Date(now); end.setHours(23, 59, 59, 999);
+    } else if (period === 'month' || period === '30days') {
+      start = new Date(now); start.setDate(now.getDate() - 29); start.setHours(0, 0, 0, 0);
+      end = new Date(now); end.setHours(23, 59, 59, 999);
+    } else if (period === 'custom' && startDate && endDate) {
+      start = new Date(startDate); start.setHours(0, 0, 0, 0);
+      end = new Date(endDate); end.setHours(23, 59, 59, 999);
+    } else {
+      start = new Date(now); start.setHours(0, 0, 0, 0);
+      end = new Date(now); end.setHours(23, 59, 59, 999);
+    }
+
+    const snapshot = await db.collection(collections.inventoryTransactions)
+      .where('restaurantId', '==', restaurantId)
+      .where('type', '==', 'DEDUCTION')
+      .where('date', '>=', start)
+      .where('date', '<=', end)
+      .get();
+
+    // Aggregate by inventoryItemId
+    const summaryMap = {};
+    snapshot.forEach(doc => {
+      const t = doc.data();
+      const key = t.inventoryItemId || t.inventoryItemName;
+      if (!summaryMap[key]) {
+        summaryMap[key] = {
+          inventoryItemId: t.inventoryItemId,
+          inventoryItemName: t.inventoryItemName,
+          unit: t.unit,
+          totalQuantityConsumed: 0,
+          transactionCount: 0,
+        };
+      }
+      summaryMap[key].totalQuantityConsumed += Math.abs(t.quantityChange || 0);
+      summaryMap[key].transactionCount++;
+    });
+
+    // Enrich with costPerUnit from inventory collection
+    const itemIds = Object.values(summaryMap).map(s => s.inventoryItemId).filter(Boolean);
+    const costMap = {};
+    if (itemIds.length > 0) {
+      const inventoryDocs = await Promise.all(
+        itemIds.map(id => db.collection(collections.inventory).doc(id).get())
+      );
+      inventoryDocs.forEach(doc => {
+        if (doc.exists) costMap[doc.id] = doc.data().costPerUnit || 0;
+      });
+    }
+
+    const summary = Object.values(summaryMap)
+      .map(item => ({
+        ...item,
+        costPerUnit: costMap[item.inventoryItemId] || 0,
+        totalCostConsumed: Math.round(item.totalQuantityConsumed * (costMap[item.inventoryItemId] || 0) * 100) / 100,
+      }))
+      .sort((a, b) => b.totalQuantityConsumed - a.totalQuantityConsumed);
+
+    res.json({
+      summary,
+      period,
+      startDate: start.toISOString(),
+      endDate: end.toISOString(),
+      totalItems: summary.length,
+    });
+
+  } catch (error) {
+    console.error('Get usage summary error:', error);
+    res.status(500).json({ error: 'Failed to fetch usage summary' });
+  }
+});
+
+// Quick Order Logger — parse text/image into menu items OR confirm and deduct inventory
+app.post('/api/inventory/:restaurantId/quick-order', authenticateToken, aiUsageLimiter.middleware(), upload.single('image'), async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+    const mode = req.body.mode; // 'parse' or 'confirm'
+
+    if (!mode) {
+      return res.status(400).json({ error: 'mode is required (parse or confirm)' });
+    }
+
+    // Load restaurant menu items
+    const restaurantDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
+    if (!restaurantDoc.exists) {
+      return res.status(404).json({ error: 'Restaurant not found' });
+    }
+    const restaurantData = restaurantDoc.data();
+    const menuData = restaurantData.menu || { items: [] };
+    let menuItems = (menuData.items || []).filter(item => item.status === 'active' || item.active === true);
+
+    if (menuItems.length === 0) {
+      return res.status(404).json({ error: 'No active menu items found' });
+    }
+
+    const fuzzyMatch = (name1, name2) => {
+      const n1 = name1.toLowerCase().replace(/[^a-z0-9]/g, '');
+      const n2 = name2.toLowerCase().replace(/[^a-z0-9]/g, '');
+      return n1.includes(n2) || n2.includes(n1);
+    };
+
+    // ── PARSE MODE ──────────────────────────────────
+    if (mode === 'parse') {
+      const subMode = req.body.subMode; // 'text' or 'image'
+
+      const menuContext = menuItems.map(item =>
+        `- ${item.name} (₹${item.price}) - ID: ${item.id}${item.shortCode ? ` [code: ${item.shortCode}]` : ''}`
+      ).join('\n');
+
+      let aiResponse;
+
+      if (subMode === 'text') {
+        const text = req.body.text;
+        if (!text || !text.trim()) {
+          return res.status(400).json({ error: 'text is required for text mode' });
+        }
+
+        console.log('📋 Quick order text parse:', { restaurantId, textLength: text.length });
+
+        const completion = await openai.chat.completions.create({
+          model: 'gpt-4o-mini',
+          messages: [
+            {
+              role: 'system',
+              content: `You are a restaurant order parser for Indian restaurants. Parse order text that may contain BULK orders, multiple sections, or summaries.
+
+Available menu items:
+${menuContext}
+
+RULES:
+1. AGGREGATE quantities for the SAME item across all sections (e.g. "Morning: 10 chai. Evening: 5 chai" = 15 chai total)
+2. Handle Hindi/regional names: adrak chai=ginger tea, elaichi chai=cardamom tea, kali coffee=black coffee, doodh=milk
+3. Handle Hindi numbers: ek=1, do=2, teen=3, chaar=4, paanch=5, chheh=6, saat=7, aath=8, nau=9, das=10, bees=20, tees=30
+4. Handle multipliers: "2x", "x2", "×2", "2 nos", "2 cups" all mean quantity 2
+5. Handle WhatsApp formats: "*CustomerName*\\n2x Item" — ignore customer names, extract items
+6. Handle Zomato/Swiggy notification formats
+7. Match abbreviations to item codes in [code: XX] if provided
+8. IGNORE summary/total lines like "Total: 25 orders", "Grand total", "Bill amount"
+9. IGNORE non-menu text like addresses, phone numbers, delivery instructions
+10. Default quantity is 1 if not specified
+11. Return ONLY items that match the menu. Do NOT invent items.
+
+Return a JSON array: [{"id": "menuItemId", "name": "matched menu item name", "quantity": number}]
+Return [] if no items could be matched.`
+            },
+            { role: 'user', content: text }
+          ],
+          temperature: 0.1,
+          max_tokens: 1000,
+        });
+
+        aiResponse = completion.choices[0].message.content.trim();
+
+      } else if (subMode === 'image') {
+        if (!req.file) {
+          return res.status(400).json({ error: 'image file is required for image mode' });
+        }
+
+        console.log('📸 Quick order image parse:', { restaurantId, fileName: req.file.originalname });
+
+        const imageBase64 = req.file.buffer.toString('base64');
+        const imageMimeType = req.file.mimetype;
+
+        const completion = await openai.chat.completions.create({
+          model: 'gpt-4o',
+          messages: [
+            {
+              role: 'user',
+              content: [
+                {
+                  type: 'text',
+                  text: `Extract food/drink order items and quantities from this image. This could be a screenshot of a Zomato/Swiggy order, a WhatsApp chat, a handwritten order slip, a KOT, or a bill/receipt.
+
+Available menu items at this restaurant:
+${menuContext}
+
+RULES:
+1. Extract all ordered items with quantities
+2. Match extracted items to the menu list above
+3. Aggregate duplicate items
+4. Ignore prices, addresses, customer info — only extract item names and quantities
+5. Return ONLY items that match the menu
+
+Return a JSON array: [{"id": "menuItemId", "name": "matched menu item name", "quantity": number}]
+Return [] if no items could be identified.`
+                },
+                {
+                  type: 'image_url',
+                  image_url: { url: `data:${imageMimeType};base64,${imageBase64}` }
+                }
+              ]
+            }
+          ],
+          max_tokens: 1000,
+        });
+
+        aiResponse = completion.choices[0].message.content.trim();
+      } else {
+        return res.status(400).json({ error: 'subMode must be text or image' });
+      }
+
+      // Parse AI response
+      let parsedFromAI;
+      try {
+        const jsonMatch = aiResponse.match(/```json\s*([\s\S]*?)\s*```/) || aiResponse.match(/```\s*([\s\S]*?)\s*```/);
+        parsedFromAI = jsonMatch ? JSON.parse(jsonMatch[1]) : JSON.parse(aiResponse);
+      } catch (parseError) {
+        console.error('Failed to parse AI response:', aiResponse);
+        return res.status(500).json({ error: 'AI could not parse the order text. Try rephrasing or adding items manually.' });
+      }
+
+      if (!Array.isArray(parsedFromAI)) {
+        return res.status(500).json({ error: 'AI returned unexpected format' });
+      }
+
+      // Enrich and validate against menu
+      const parsedItems = [];
+      const unmatchedNames = [];
+
+      for (const item of parsedFromAI) {
+        let menuItem = menuItems.find(m => m.id === item.id);
+        let matchType = 'exact';
+
+        if (!menuItem) {
+          menuItem = menuItems.find(m => m.name.toLowerCase() === (item.name || '').toLowerCase());
+        }
+        if (!menuItem) {
+          menuItem = menuItems.find(m => fuzzyMatch(m.name, item.name || ''));
+          if (menuItem) matchType = 'fuzzy';
+        }
+        if (!menuItem && item.id) {
+          menuItem = menuItems.find(m => m.id === item.id);
+          if (menuItem) matchType = 'fuzzy';
+        }
+
+        if (menuItem) {
+          // Check if we already have this item — aggregate quantities
+          const existing = parsedItems.find(p => p.menuItemId === menuItem.id);
+          if (existing) {
+            existing.quantity += (item.quantity || 1);
+          } else {
+            parsedItems.push({
+              menuItemId: menuItem.id,
+              name: menuItem.name,
+              price: menuItem.price,
+              quantity: item.quantity || 1,
+              matchType,
+            });
+          }
+        } else {
+          unmatchedNames.push(item.name || 'Unknown');
+          parsedItems.push({
+            menuItemId: null,
+            name: item.name || 'Unknown',
+            price: 0,
+            quantity: item.quantity || 1,
+            matchType: 'unmatched',
+          });
+        }
+      }
+
+      console.log('✅ Quick order parsed:', { matched: parsedItems.filter(p => p.menuItemId).length, unmatched: unmatchedNames.length });
+
+      return res.json({
+        success: true,
+        parsedItems,
+        unmatchedNames,
+        totalMatched: parsedItems.filter(p => p.menuItemId).length,
+        totalUnmatched: unmatchedNames.length,
+      });
+    }
+
+    // ── CONFIRM MODE ────────────────────────────────
+    if (mode === 'confirm') {
+      const { items, source = 'other', notes = '' } = req.body;
+
+      if (!items || !Array.isArray(items) || items.length === 0) {
+        return res.status(400).json({ error: 'items array is required' });
+      }
+
+      // Filter to only matched items
+      const validItems = items.filter(i => i.menuItemId);
+      if (validItems.length === 0) {
+        return res.status(400).json({ error: 'No valid menu items to log' });
+      }
+
+      // Validate items exist in menu
+      for (const item of validItems) {
+        const found = menuItems.find(m => m.id === item.menuItemId);
+        if (!found) {
+          return res.status(400).json({ error: `Menu item not found: ${item.name || item.menuItemId}` });
+        }
+        // Enrich with current price if not provided
+        if (!item.price) item.price = found.price;
+        if (!item.name) item.name = found.name;
+      }
+
+      const totalAmount = validItems.reduce((sum, i) => sum + ((i.price || 0) * (i.quantity || 1)), 0);
+
+      // Create order document
+      const orderData = {
+        restaurantId,
+        orderType: 'quick_log',
+        orderSource: source,
+        items: validItems.map(i => ({
+          menuItemId: i.menuItemId,
+          name: i.name,
+          quantity: i.quantity || 1,
+          price: i.price || 0,
+        })),
+        status: 'completed',
+        totalAmount,
+        createdAt: new Date(),
+        createdBy: req.user?.userId || 'quick_log',
+        notes,
+      };
+
+      const orderRef = await db.collection(collections.orders).add(orderData);
+      console.log('📦 Quick order created:', orderRef.id);
+
+      // Deduct inventory via recipes (synchronous for user feedback)
+      try {
+        await inventoryService.deductInventoryForOrder(
+          restaurantId,
+          orderRef.id,
+          validItems.map(i => ({ menuItemId: i.menuItemId, name: i.name, quantity: i.quantity || 1 }))
+        );
+        console.log('✅ Inventory deducted for quick order:', orderRef.id);
+      } catch (deductError) {
+        console.error('⚠️ Inventory deduction failed (order still created):', deductError.message);
+      }
+
+      return res.json({
+        success: true,
+        orderId: orderRef.id,
+        message: `Order logged! ${validItems.length} item(s) processed, inventory deducted.`,
+        deductedItems: validItems.length,
+        totalAmount,
+      });
+    }
+
+    return res.status(400).json({ error: 'Invalid mode. Use parse or confirm.' });
+
+  } catch (error) {
+    console.error('Quick order error:', error);
+    res.status(500).json({ error: 'Failed to process quick order', message: error.message });
+  }
+});
+
 // Get single inventory item
 app.get('/api/inventory/:restaurantId/:itemId', authenticateToken, async (req, res) => {
   try {

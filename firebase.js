@@ -100,6 +100,7 @@ const collections = {
   poTemplates: 'po-templates',
   supplierQuotations: 'supplier-quotations',
   supplierPerformance: 'supplier-performance',
+  inventoryTransactions: 'inventoryTransactions',
   aiUsage: 'aiUsage',
   // Automation & Loyalty Collections
   automations: 'automations',
