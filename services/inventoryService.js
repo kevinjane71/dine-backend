@@ -88,13 +88,29 @@ class InventoryService {
       for (const item of orderItems) {
         const qtySold = item.quantity;
         
-        // Find recipe for this menu item
-        // Note: Using 'menuItemId' which we expect to be stored on the recipe
-        const recipeQuery = await db.collection('recipes')
+        // Find recipe for this menu item — first by menuItemId, then fallback to name match
+        let recipeQuery = await db.collection('recipes')
             .where('restaurantId', '==', restaurantId)
             .where('menuItemId', '==', item.menuItemId)
             .limit(1)
             .get();
+
+        // Fallback: match by recipe name if no menuItemId link exists
+        if (recipeQuery.empty && item.name) {
+            const allRecipes = await db.collection('recipes')
+                .where('restaurantId', '==', restaurantId)
+                .get();
+            const itemNameLower = item.name.toLowerCase().replace(/\s*\(.*?\)\s*/g, '').trim();
+            const matched = allRecipes.docs.find(doc => {
+                const rName = (doc.data().name || '').toLowerCase().trim();
+                return rName === itemNameLower || itemNameLower.includes(rName) || rName.includes(itemNameLower);
+            });
+            if (matched) {
+                recipeQuery = { empty: false, docs: [matched] };
+                // Auto-link for future lookups
+                matched.ref.update({ menuItemId: item.menuItemId }).catch(() => {});
+            }
+        }
 
         if (recipeQuery.empty) {
             console.log(`⚠️ No recipe found for item: ${item.name} (${item.menuItemId}). Skipping deduction.`);

@@ -7,7 +7,10 @@
     "dev": "node index.js",
     "build": "echo 'No build process needed for Node.js server'",
     "vercel-build": "echo 'Vercel build completed'",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "seed:tea": "node scripts/seed-tea-recipes.js",
+    "seed:menu": "node scripts/bulk-menu-seed.js",
+    "seed:menu:dry": "node scripts/bulk-menu-seed.js --dry-run"
   },
   "keywords": [],
   "author": "",

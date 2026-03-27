@@ -7824,10 +7824,11 @@ app.get('/api/orders/:restaurantId', authenticateToken, async (req, res) => {
       search,
       waiterId,
       orderType,
-      todayOnly
+      todayOnly,
+      paymentMethod
     } = req.query;
 
-    console.log(`🔍 Orders API - Restaurant: ${restaurantId}, Page: ${page}, Limit: ${limit}, Status: ${status || 'all'}, Search: ${search || 'none'}, Waiter: ${waiterId || 'all'}, TodayOnly: ${todayOnly}`);
+    console.log(`🔍 Orders API - Restaurant: ${restaurantId}, Page: ${page}, Limit: ${limit}, Status: ${status || 'all'}, Search: ${search || 'none'}, Waiter: ${waiterId || 'all'}, TodayOnly: ${todayOnly}, PaymentMethod: ${paymentMethod || 'all'}`);
 
     // Calculate pagination
     const pageNum = parseInt(page);
@@ -7918,7 +7919,7 @@ app.get('/api/orders/:restaurantId', authenticateToken, async (req, res) => {
     }
 
     // Determine if we need in-memory filtering (search requires loading docs to filter)
-    const needsInMemoryFilter = (search && search.trim()) || (waiterId && waiterId !== 'all');
+    const needsInMemoryFilter = (search && search.trim()) || (waiterId && waiterId !== 'all') || (paymentMethod && paymentMethod !== 'all');
 
     // --- FAST PATH: No search needed, paginate at Firestore level ---
     if (!needsInMemoryFilter) {
@@ -8080,6 +8081,15 @@ app.get('/api/orders/:restaurantId', authenticateToken, async (req, res) => {
       console.log(`Filtered by waiter ${waiterId}: ${allOrders.length} orders found`);
     }
 
+    // Apply payment method filter in memory
+    if (paymentMethod && paymentMethod !== 'all') {
+      allOrders = allOrders.filter(order => {
+        const method = (order.paymentMethod || 'cash').toLowerCase();
+        return method === paymentMethod.toLowerCase();
+      });
+      console.log(`Filtered by payment method ${paymentMethod}: ${allOrders.length} orders found`);
+    }
+
     // Apply search filter
     if (search && search.trim()) {
       const searchValue = search.toLowerCase().trim();
@@ -8151,9 +8161,29 @@ app.get('/api/orders/:restaurantId', authenticateToken, async (req, res) => {
 app.get('/api/analytics/:restaurantId', authenticateToken, async (req, res) => {
   try {
     const { restaurantId } = req.params;
-    const { period = '7d' } = req.query;
+    const { period = '7d', startDate, endDate } = req.query;
 
-    console.log(`📊 Fetching analytics for restaurant ${restaurantId}, period: ${period}`);
+    console.log(`📊 Fetching analytics for restaurant ${restaurantId}, period: ${period}, startDate: ${startDate || 'none'}, endDate: ${endDate || 'none'}`);
+
+    // Custom date range: read raw orders for the specified range
+    if (startDate && endDate) {
+      const rangeStart = new Date(startDate);
+      rangeStart.setHours(0, 0, 0, 0);
+      const rangeEnd = new Date(endDate);
+      rangeEnd.setHours(23, 59, 59, 999);
+
+      const ordersQuery = await db.collection(collections.orders)
+        .where('restaurantId', '==', restaurantId)
+        .where('createdAt', '>=', rangeStart)
+        .where('createdAt', '<=', rangeEnd)
+        .get();
+
+      const orders = ordersQuery.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+      console.log(`📊 Found ${orders.length} raw orders for custom date range analytics`);
+
+      const analytics = calculateAnalytics(orders, 'custom');
+      return res.json({ success: true, analytics, period: 'custom', totalOrders: orders.length });
+    }
 
     const useRawOrders = (period === 'today' || period === '24h' || period === 'last24hours');
 
@@ -8234,7 +8264,7 @@ function aggregateDailyStats(dailyDocs, dateStrings) {
   if (dailyDocs.length === 0) {
     return {
       totalRevenue: 0, totalRevenueWithTax: 0, totalOrders: 0, avgOrderValue: 0, newCustomers: 0,
-      popularItems: [], revenueData: [], ordersByType: [], busyHours: []
+      popularItems: [], revenueData: [], ordersByType: [], busyHours: [], paymentBreakdown: {}
     };
   }
 
@@ -8322,7 +8352,8 @@ function aggregateDailyStats(dailyDocs, dateStrings) {
     newCustomers: allCustomerIds.size,
     popularItems, revenueData,
     ordersByType: ordersByTypeArray,
-    busyHours
+    busyHours,
+    paymentBreakdown: {}
   };
 }
 
@@ -8334,7 +8365,7 @@ function calculateAnalytics(orders, period) {
   if (orders.length === 0) {
     return {
       totalRevenue: 0, totalRevenueWithTax: 0, totalOrders: 0, avgOrderValue: 0, newCustomers: 0,
-      popularItems: [], revenueData: [], ordersByType: [], busyHours: []
+      popularItems: [], revenueData: [], ordersByType: [], busyHours: [], paymentBreakdown: {}
     };
   }
 
@@ -8403,9 +8434,22 @@ function calculateAnalytics(orders, period) {
     .sort((a, b) => b.orders - a.orders)
     .slice(0, 6);
 
+  // Payment method breakdown
+  const paymentBreakdown = {};
+  orders.forEach(order => {
+    const method = (order.paymentMethod || 'cash').toLowerCase();
+    if (!paymentBreakdown[method]) paymentBreakdown[method] = { count: 0, total: 0 };
+    paymentBreakdown[method].count += 1;
+    paymentBreakdown[method].total += (order.finalAmount || order.totalAmount || 0);
+  });
+  // Round totals
+  Object.keys(paymentBreakdown).forEach(method => {
+    paymentBreakdown[method].total = Math.round(paymentBreakdown[method].total * 100) / 100;
+  });
+
   return {
     totalRevenue, totalRevenueWithTax, totalOrders, avgOrderValue, newCustomers,
-    popularItems, revenueData, ordersByType: ordersByTypeArray, busyHours
+    popularItems, revenueData, ordersByType: ordersByTypeArray, busyHours, paymentBreakdown
   };
 }
 

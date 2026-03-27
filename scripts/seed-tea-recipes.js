@@ -435,6 +435,7 @@ async function seedData() {
   }
 
   // Step 3: Seed menu items into the restaurant document
+  // Uses same patterns as POST /api/menus/bulk-save/:restaurantId (index.js:10098)
   if (SEED_MENU_ITEMS) {
     console.log('\n--- Seeding Menu Items ---');
     const restaurantRef = firestoreDb.collection('restaurants').doc(TARGET_RESTAURANT_ID);
@@ -445,53 +446,166 @@ async function seedData() {
     }
 
     const existingData = restaurantDoc.exists ? restaurantDoc.data() : {};
-    const existingMenu = existingData.menu || { categories: [], items: [] };
-    const existingItems = existingMenu.items || [];
-    const existingNames = new Set(existingItems.map(i => i.name));
+    const existingMenu = existingData.menu || { items: [] };
+    const existingItems = [...(existingMenu.items || [])];
 
-    const categories = [...new Set(MENU_ITEMS.map(i => i.category))];
-    const existingCats = new Set((existingMenu.categories || []).map(c => c.name));
-    const newCategories = [...(existingMenu.categories || [])];
-    let catOrder = newCategories.length;
-    for (const cat of categories) {
-      if (!existingCats.has(cat)) {
-        newCategories.push({ name: cat, order: ++catOrder });
-        console.log(`  + Category: ${cat}`);
+    // Canonical categoryNameToId — same as index.js:1700
+    const categoryNameToId = (name) => {
+      if (!name || typeof name !== 'string') return 'other';
+      return name.toLowerCase().trim().replace(/\s+/g, '-').replace(/[^a-z0-9-]/g, '');
+    };
+
+    // Merge categories into restaurant.categories[] (same as bulk-save:10149)
+    const existingCategories = [...(existingData.categories || [])];
+    const categoryNames = [...new Set(MENU_ITEMS.map(i => i.category))];
+
+    // Build lookup maps: by ID and by name (case-insensitive)
+    const catIdMap = {}; // categoryName → resolved ID
+    for (const c of existingCategories) {
+      catIdMap[c.name.toLowerCase()] = c.id;
+    }
+
+    for (const catName of categoryNames) {
+      const catId = categoryNameToId(catName);
+      // Check if already exists by ID or by name
+      const existsById = existingCategories.some(c => (c.id || '').toLowerCase() === catId);
+      const existsByName = existingCategories.some(c => c.name.toLowerCase() === catName.toLowerCase());
+
+      if (!existsById && !existsByName) {
+        existingCategories.push({
+          id: catId,
+          name: catName,
+          emoji: catName.toLowerCase().includes('coffee') ? '☕' : catName.toLowerCase().includes('herbal') ? '🌿' : '🍵',
+          description: '',
+          createdAt: new Date(),
+          updatedAt: new Date(),
+        });
+        console.log(`  + Category: ${catName} (${catId})`);
+      } else if (existsByName && !existsById) {
+        // Existing category with same name but different ID — use existing ID
+        const existing = existingCategories.find(c => c.name.toLowerCase() === catName.toLowerCase());
+        catIdMap[catName.toLowerCase()] = existing.id;
+        console.log(`  ~ Category exists by name: ${catName} → ${existing.id}`);
       }
+
+      // Map this category name to its ID
+      if (!catIdMap[catName.toLowerCase()]) {
+        catIdMap[catName.toLowerCase()] = catId;
+      }
+    }
+
+    // Find max numeric shortCode for auto-increment (same as bulk-save:10139-10146)
+    let maxShortCode = 0;
+    for (const item of existingItems) {
+      const sc = parseInt(item.shortCode, 10);
+      if (!isNaN(sc) && sc > maxShortCode) maxShortCode = sc;
     }
 
     let added = 0;
+    let fixed = 0;
     for (const item of MENU_ITEMS) {
-      if (existingNames.has(item.name)) {
-        console.log(`  ~ Exists: ${item.name}`);
+      const catId = catIdMap[item.category.toLowerCase()] || categoryNameToId(item.category);
+
+      // Check if item already exists by name (case-insensitive)
+      const existingItem = existingItems.find(i => i.name.toLowerCase() === item.name.toLowerCase());
+      if (existingItem) {
+        // Fix category if it was stored as name string or wrong format
+        const currentCat = existingItem.category || '';
+        if (!currentCat || currentCat === item.category || !existingCategories.some(c => c.id === currentCat)) {
+          existingItem.category = catId;
+          fixed++;
+        }
+        // Fix missing fields on existing items
+        if (!existingItem.pricingRules) existingItem.pricingRules = {};
+        if (!existingItem.customizations) existingItem.customizations = [];
+        if (existingItem.id && existingItem.id.startsWith('menu_')) {
+          existingItem.id = existingItem.id.replace('menu_', 'item_');
+        }
+        console.log(`  ~ Exists: ${item.name} (category → ${catId})`);
         continue;
       }
-      const menuItemId = `menu_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+
+      maxShortCode++;
+      const menuItemId = `item_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+
+      // Handle variants (same as bulk-save:10178-10196)
+      const variants = (item.variants || [])
+        .filter(v => v && v.name && v.price != null)
+        .map(v => ({ name: String(v.name).trim(), price: parseFloat(v.price) || 0, description: (v.description || '').trim() }));
+
+      const basePrice = variants.length > 0
+        ? Math.min(...variants.map(v => v.price))
+        : (parseFloat(item.price) || 0);
+
       existingItems.push({
         id: menuItemId,
+        restaurantId: TARGET_RESTAURANT_ID,
         name: item.name,
-        price: item.price,
-        category: item.category,
-        description: item.description,
-        shortCode: item.shortCode,
-        isVeg: item.isVeg,
+        description: item.description || '',
+        price: basePrice,
+        category: catId,
+        isVeg: item.isVeg || false,
+        spiceLevel: item.spiceLevel || 'medium',
+        allergens: item.allergens || [],
+        shortCode: String(maxShortCode),
         status: 'active',
+        order: existingItems.length,
         isAvailable: true,
-        variants: [],
-        createdAt: new Date().toISOString(),
+        stockQuantity: null,
+        lowStockThreshold: 5,
+        isStockManaged: false,
+        availableFrom: null,
+        availableUntil: null,
+        variants,
+        customizations: [],
+        pricingRules: item.pricingRules || {},
+        source: 'seed_script',
+        createdAt: new Date(),
+        updatedAt: new Date(),
       });
-      console.log(`  + Menu item: ${item.name} (₹${item.price}, ${item.shortCode})`);
+      console.log(`  + ${item.name} (₹${basePrice}, ${catId}, #${maxShortCode})`);
       added++;
-      // Small delay to ensure unique IDs
       await new Promise(r => setTimeout(r, 5));
     }
 
-    await restaurantRef.set({
-      ...existingData,
-      menu: { categories: newCategories, items: existingItems },
-    }, { merge: true });
+    // Clear hasDefaultMenu if present (same as bulk-save:10258)
+    const updateData = {
+      categories: existingCategories,
+      menu: { ...existingMenu, items: existingItems, lastUpdated: new Date() },
+      updatedAt: new Date(),
+    };
+    if (existingData.hasDefaultMenu) {
+      updateData.hasDefaultMenu = false;
+    }
 
-    console.log(`  ✓ ${added} menu items added to restaurant doc`);
+    await restaurantRef.set(updateData, { merge: true });
+
+    console.log(`  ✓ ${added} added, ${fixed} fixed in restaurant doc`);
+
+    // Link recipes to menu items by matching names
+    console.log('\n--- Linking Recipes to Menu Items ---');
+    const allRecipes = await firestoreDb.collection('recipes')
+      .where('restaurantId', '==', TARGET_RESTAURANT_ID)
+      .get();
+
+    // Re-read menu items to get the final list with IDs
+    const freshDoc = await restaurantRef.get();
+    const finalMenuItems = freshDoc.data()?.menu?.items || [];
+
+    let linked = 0;
+    for (const recipeDoc of allRecipes.docs) {
+      const recipe = recipeDoc.data();
+      if (recipe.menuItemId) continue; // already linked
+      const matchedMenuItem = finalMenuItems.find(m =>
+        m.name.toLowerCase().trim() === (recipe.name || '').toLowerCase().trim()
+      );
+      if (matchedMenuItem) {
+        await recipeDoc.ref.update({ menuItemId: matchedMenuItem.id });
+        console.log(`  🔗 Linked: ${recipe.name} → ${matchedMenuItem.id}`);
+        linked++;
+      }
+    }
+    console.log(`  ✓ ${linked} recipes linked to menu items`);
   }
 
   console.log(`\n✅ Seeding complete!`);
