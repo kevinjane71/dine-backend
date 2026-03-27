@@ -7341,65 +7341,110 @@ app.post('/api/orders', async (req, res) => {
       }
     }
     
-    // Create/update customer if customer info is provided
-    let customerId = null;
+    // Create/update customer if customer info is provided (direct Firestore, no internal fetch)
+    let customerId = req.body.customerId || null;
     if (customerInfo && (customerInfo.name || customerInfo.phone)) {
       console.log(`📞 Processing customer info for order:`, {
         name: customerInfo.name,
         phone: customerInfo.phone,
-        email: customerInfo.email,
         restaurantId: restaurantId
       });
-      
-      try {
-        const customerResponse = await fetch(`${req.protocol}://${req.get('host')}/api/customers`, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'Authorization': req.headers.authorization || ''
-          },
-          body: JSON.stringify({
-            name: customerInfo.name,
-            phone: customerInfo.phone,
-            email: customerInfo.email,
-            city: customerInfo.city,
-            dob: customerInfo.dob,
-            restaurantId: restaurantId,
-            orderHistory: [{
-              orderId: orderRef.id,
-              orderNumber: orderNumber,
-              totalAmount: totalAmount,
-              finalAmount: Math.round(finalAmount * 100) / 100,
-              taxAmount: Math.round(taxAmount * 100) / 100,
-              serviceChargeAmount: serviceChargeAmount ? Math.round(serviceChargeAmount * 100) / 100 : 0,
-              tipAmount: tipAmount ? Math.round(tipAmount * 100) / 100 : 0,
-              roundOffAmount: roundOffAmount ? Math.round(roundOffAmount * 100) / 100 : 0,
-              outstandingAmount: req.body.partialPayAmount ? Math.round((finalAmount - Number(req.body.partialPayAmount)) * 100) / 100 : 0,
-              paidAmount: req.body.partialPayAmount ? Math.round(Number(req.body.partialPayAmount) * 100) / 100 : 0,
-              orderDate: new Date(),
-              tableNumber: tableNumber || seatNumber || null,
-              orderType: orderType,
-              orderTypeLabel: orderTypeLabels[orderType] || orderType
-            }]
-          })
-        });
 
-        if (customerResponse.ok) {
-          const customerData = await customerResponse.json();
-          customerId = customerData.customer.id;
-          console.log(`👤 Customer processed successfully: ${customerId} - ${customerData.message}`);
-          // Write customerId back to order document for loyalty tracking
-          try {
-            await orderRef.update({ customerId });
-          } catch (updateErr) {
-            console.error('Failed to write customerId to order:', updateErr);
+      const orderHistoryEntry = {
+        orderId: orderRef.id,
+        orderNumber: orderNumber,
+        totalAmount: totalAmount,
+        finalAmount: Math.round(finalAmount * 100) / 100,
+        taxAmount: Math.round(taxAmount * 100) / 100,
+        serviceChargeAmount: serviceChargeAmount ? Math.round(serviceChargeAmount * 100) / 100 : 0,
+        tipAmount: tipAmount ? Math.round(tipAmount * 100) / 100 : 0,
+        roundOffAmount: roundOffAmount ? Math.round(roundOffAmount * 100) / 100 : 0,
+        outstandingAmount: req.body.partialPayAmount ? Math.round((finalAmount - Number(req.body.partialPayAmount)) * 100) / 100 : 0,
+        paidAmount: req.body.partialPayAmount ? Math.round(Number(req.body.partialPayAmount) * 100) / 100 : 0,
+        orderDate: new Date(),
+        tableNumber: tableNumber || seatNumber || null,
+        orderType: orderType,
+        orderTypeLabel: orderType
+      };
+
+      try {
+        // Helper to normalize phone
+        const normalizePhone = (p) => {
+          if (!p) return null;
+          const d = p.replace(/\D/g, '');
+          if (d.length === 12 && d.startsWith('91')) return d.substring(2);
+          if (d.length === 11 && d.startsWith('0')) return d.substring(1);
+          if (d.length === 10) return d;
+          return d;
+        };
+
+        // Look up existing customer directly
+        let existingCustomer = null;
+        if (customerInfo.phone) {
+          const phoneQuery = await db.collection(collections.customers)
+            .where('restaurantId', '==', restaurantId)
+            .where('phone', '==', customerInfo.phone)
+            .limit(1)
+            .get();
+
+          if (!phoneQuery.empty) {
+            existingCustomer = phoneQuery.docs[0];
+          } else {
+            // Try normalized phone match
+            const normalizedPhone = normalizePhone(customerInfo.phone);
+            if (normalizedPhone) {
+              const allCusts = await db.collection(collections.customers)
+                .where('restaurantId', '==', restaurantId)
+                .get();
+              existingCustomer = allCusts.docs.find(doc => normalizePhone(doc.data().phone) === normalizedPhone) || null;
+            }
           }
+        }
+
+        if (existingCustomer) {
+          // Update existing customer
+          customerId = existingCustomer.id;
+          const custData = existingCustomer.data();
+          const existingHistory = custData.orderHistory || [];
+          const newHistory = [...existingHistory, orderHistoryEntry];
+          await existingCustomer.ref.update({
+            name: customerInfo.name || custData.name,
+            orderHistory: newHistory,
+            totalOrders: newHistory.length,
+            totalSpent: newHistory.reduce((s, o) => s + (o.finalAmount || o.totalAmount || 0), 0),
+            lastOrderDate: new Date(),
+            updatedAt: new Date()
+          });
+          console.log(`👤 Existing customer updated: ${customerId} — now ${newHistory.length} orders`);
         } else {
-          const errorData = await customerResponse.json();
-          console.log(`❌ Customer processing failed:`, errorData);
+          // Create new customer
+          const newCustData = {
+            name: customerInfo.name || 'Walk-in Customer',
+            phone: customerInfo.phone || null,
+            email: customerInfo.email || null,
+            city: customerInfo.city || null,
+            dob: customerInfo.dob || null,
+            restaurantId,
+            orderHistory: [orderHistoryEntry],
+            totalOrders: 1,
+            totalSpent: Math.round(finalAmount * 100) / 100,
+            lastOrderDate: new Date(),
+            createdAt: new Date(),
+            updatedAt: new Date()
+          };
+          const newCustRef = await db.collection(collections.customers).add(newCustData);
+          customerId = newCustRef.id;
+          console.log(`👤 New customer created: ${customerId}`);
+        }
+
+        // Write customerId back to order document
+        try {
+          await orderRef.update({ customerId });
+        } catch (updateErr) {
+          console.error('Failed to write customerId to order:', updateErr);
         }
       } catch (error) {
-        console.error('Customer creation error:', error);
+        console.error('Customer creation/update error:', error);
         // Don't fail the order if customer creation fails
       }
     }
@@ -7409,8 +7454,8 @@ app.post('/api/orders', async (req, res) => {
       const outstanding = Math.round((finalAmount - Number(req.body.partialPayAmount)) * 100) / 100;
       if (outstanding > 0) {
         db.collection('customers').doc(customerId).update({
-          outstandingBalance: admin.firestore.FieldValue.increment(outstanding),
-          creditHistory: admin.firestore.FieldValue.arrayUnion({
+          outstandingBalance: FieldValue.increment(outstanding),
+          creditHistory: FieldValue.arrayUnion({
             orderId: orderRef.id,
             orderNumber: orderNumber,
             date: new Date().toISOString(),
@@ -8556,8 +8601,81 @@ app.patch('/api/orders/:orderId/status', authenticateToken, async (req, res) => 
     // NEW: Handle deferred loyalty/stats updates on completion
     if (status === 'completed' && orderData.status !== 'completed') {
       console.log(`✅ Order ${orderId} marked as completed. Processing deferred updates...`);
-      
-      const customerId = orderData.customerId;
+
+      let customerId = orderData.customerId;
+
+      // Create/update customer record if customer info exists but customerId not set yet
+      // (handles KOT→billing flow where customer wasn't linked during initial order creation)
+      const customerPhone = orderData.customerInfo?.phone || req.body.customerInfo?.phone;
+      const customerName = orderData.customerInfo?.name || req.body.customerInfo?.name;
+      if (customerPhone && customerPhone !== 'null' && !orderData.customerId) {
+        try {
+          const orderFinalAmount = req.body.finalAmount || orderData.finalAmount || orderData.totalAmount || 0;
+          const orderTotalAmount = req.body.totalAmount || orderData.totalAmount || 0;
+          const histEntry = {
+            orderId: orderId,
+            orderNumber: orderData.orderNumber,
+            totalAmount: Math.round(orderTotalAmount * 100) / 100,
+            finalAmount: Math.round(orderFinalAmount * 100) / 100,
+            taxAmount: Math.round((req.body.taxAmount || orderData.taxAmount || 0) * 100) / 100,
+            orderDate: new Date(),
+            tableNumber: orderData.tableNumber || null,
+            orderType: orderData.orderType,
+          };
+          // Normalize phone helper
+          const normPhone = (p) => {
+            if (!p) return null;
+            const d = p.replace(/\D/g, '');
+            if (d.length === 12 && d.startsWith('91')) return d.substring(2);
+            if (d.length === 11 && d.startsWith('0')) return d.substring(1);
+            return d.length === 10 ? d : d;
+          };
+          // Find existing customer
+          let custDoc = null;
+          const pq = await db.collection(collections.customers)
+            .where('restaurantId', '==', orderData.restaurantId)
+            .where('phone', '==', customerPhone)
+            .limit(1).get();
+          if (!pq.empty) {
+            custDoc = pq.docs[0];
+          } else {
+            const np = normPhone(customerPhone);
+            if (np) {
+              const all = await db.collection(collections.customers).where('restaurantId', '==', orderData.restaurantId).get();
+              custDoc = all.docs.find(d => normPhone(d.data().phone) === np) || null;
+            }
+          }
+          if (custDoc) {
+            customerId = custDoc.id;
+            const cd = custDoc.data();
+            const nh = [...(cd.orderHistory || []), histEntry];
+            await custDoc.ref.update({
+              orderHistory: nh,
+              totalOrders: nh.length,
+              totalSpent: nh.reduce((s, o) => s + (o.finalAmount || o.totalAmount || 0), 0),
+              lastOrderDate: new Date(),
+              updatedAt: new Date()
+            });
+          } else {
+            const newRef = await db.collection(collections.customers).add({
+              name: customerName || 'Walk-in Customer',
+              phone: customerPhone,
+              restaurantId: orderData.restaurantId,
+              orderHistory: [histEntry],
+              totalOrders: 1,
+              totalSpent: Math.round(orderFinalAmount * 100) / 100,
+              lastOrderDate: new Date(),
+              createdAt: new Date(),
+              updatedAt: new Date()
+            });
+            customerId = newRef.id;
+          }
+          try { await db.collection('orders').doc(orderId).update({ customerId }); } catch (e) {}
+          console.log(`👤 Customer processed on completion: ${customerId}`);
+        } catch (custErr) {
+          console.error('Error creating/updating customer on completion:', custErr);
+        }
+      }
       
       // Update Offer Usage for all applied offers
       const offersToUpdate = orderData.appliedOffers && orderData.appliedOffers.length > 0
@@ -8844,8 +8962,9 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
       }
     }
     
-    // Don't allow updates to completed or cancelled orders unless we're completing them
-    if ((currentOrder.status === 'completed' || currentOrder.status === 'cancelled') && status !== 'completed') {
+    // Don't allow updates to completed or cancelled orders unless we're completing them or updating payment status
+    const isPaymentUpdate = req.body.paymentStatus || req.body.paidAmount !== undefined || req.body.outstandingAmount !== undefined;
+    if ((currentOrder.status === 'completed' || currentOrder.status === 'cancelled') && status !== 'completed' && !isPaymentUpdate) {
       return res.status(400).json({ error: 'Cannot update completed or cancelled orders' });
     }
 
@@ -9294,8 +9413,8 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
           const staffWaiterId = currentOrder.staffInfo?.waiterId || currentOrder.staffInfo?.userId;
           if (finalTipAmount > 0 && staffWaiterId) {
             db.collection('users').doc(staffWaiterId).update({
-              tipEarnings: admin.firestore.FieldValue.increment(finalTipAmount),
-              tipHistory: admin.firestore.FieldValue.arrayUnion({
+              tipEarnings: FieldValue.increment(finalTipAmount),
+              tipHistory: FieldValue.arrayUnion({
                 orderId, orderNumber: currentOrder.orderNumber,
                 amount: finalTipAmount, date: new Date()
               })
@@ -9309,8 +9428,8 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
               const outstanding = updateData.outstandingAmount;
               const finalAmt = updateData.finalAmount || currentOrder.finalAmount || currentOrder.totalAmount || 0;
               db.collection('customers').doc(creditCustomerId).update({
-                outstandingBalance: admin.firestore.FieldValue.increment(outstanding),
-                creditHistory: admin.firestore.FieldValue.arrayUnion({
+                outstandingBalance: FieldValue.increment(outstanding),
+                creditHistory: FieldValue.arrayUnion({
                   orderId,
                   orderNumber: currentOrder.orderNumber,
                   date: new Date().toISOString(),
@@ -18280,13 +18399,13 @@ app.post('/api/customers', authenticateToken, async (req, res) => {
         email: email || customerData.email,
         city: city || customerData.city,
         dob: dob || customerData.dob,
-        orderHistory: [...customerData.orderHistory, ...orderHistory.map(order => ({
+        orderHistory: [...(customerData.orderHistory || []), ...orderHistory.map(order => ({
           ...order,
           invoiceId: order.invoiceId || null,
           invoiceGenerated: order.invoiceId ? true : false
         }))],
-        totalOrders: (customerData.totalOrders || 0) + (orderHistory.length || 0),
-        totalSpent: (customerData.totalSpent || 0) + orderHistory.reduce((sum, order) => sum + (order.finalAmount || order.totalAmount || 0), 0),
+        totalOrders: ((customerData.orderHistory || []).length + (orderHistory.length || 0)),
+        totalSpent: ((customerData.orderHistory || []).reduce((sum, o) => sum + (o.finalAmount || o.totalAmount || 0), 0)) + orderHistory.reduce((sum, order) => sum + (order.finalAmount || order.totalAmount || 0), 0),
         lastOrderDate: orderHistory.length > 0 ? new Date() : customerData.lastOrderDate,
         updatedAt: new Date()
       };
@@ -18368,7 +18487,13 @@ app.get('/api/customers/:restaurantId', authenticateToken, async (req, res) => {
         const emailMatch = data.email && data.email.toLowerCase().includes(search);
         const cityMatch = data.city && data.city.toLowerCase().includes(search);
         if (nameMatch || phoneMatch || emailMatch || cityMatch) {
-          allCustomers.push({ id: doc.id, ...data });
+          const oh = data.orderHistory || [];
+          allCustomers.push({
+            id: doc.id,
+            ...data,
+            totalOrders: Math.max(data.totalOrders || 0, oh.length),
+            totalSpent: Math.max(data.totalSpent || 0, oh.reduce((s, o) => s + (o.finalAmount || o.totalAmount || 0), 0)),
+          });
         }
       });
 
@@ -18403,9 +18528,13 @@ app.get('/api/customers/:restaurantId', authenticateToken, async (req, res) => {
 
     const customers = [];
     customersSnapshot.forEach(doc => {
+      const data = doc.data();
+      const oh = data.orderHistory || [];
       customers.push({
         id: doc.id,
-        ...doc.data()
+        ...data,
+        totalOrders: Math.max(data.totalOrders || 0, oh.length),
+        totalSpent: Math.max(data.totalSpent || 0, oh.reduce((s, o) => s + (o.finalAmount || o.totalAmount || 0), 0)),
       });
     });
 
@@ -19964,8 +20093,8 @@ app.post('/api/orders/:orderId/partial-payment', authenticateToken, async (req, 
     if (customerId && outstanding > 0) {
       const customerRef = db.collection(collections.customers).doc(customerId);
       await customerRef.update({
-        outstandingBalance: admin.firestore.FieldValue.increment(outstanding),
-        creditHistory: admin.firestore.FieldValue.arrayUnion({
+        outstandingBalance: FieldValue.increment(outstanding),
+        creditHistory: FieldValue.arrayUnion({
           orderId,
           orderNumber: orderData.orderNumber || orderId,
           date: new Date().toISOString(),
@@ -20012,7 +20141,7 @@ app.post('/api/orders/:orderId/comp-void', authenticateToken, async (req, res) =
     }));
 
     await orderRef.update({
-      [fieldName]: admin.firestore.FieldValue.arrayUnion(...newItems)
+      [fieldName]: FieldValue.arrayUnion(...newItems)
     });
 
     res.json({ success: true, message: `Items ${type === 'comp' ? 'comped' : 'voided'} successfully` });
