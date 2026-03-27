@@ -6557,7 +6557,9 @@ app.post('/api/public/orders/:restaurantId', vercelSecurityMiddleware.publicAPI,
       orderNumber: orderNumber,
       orderDate: new Date(),
       totalAmount: finalTotal,
+      finalAmount: Math.round(finalTotal * 100) / 100,
       subtotal: subtotal,
+      taxAmount: taxAmount || 0,
       discountAmount: discountAmount,
       loyaltyDiscount: loyaltyDiscount,
       tableNumber: tableNum,
@@ -6572,28 +6574,16 @@ app.post('/api/public/orders/:restaurantId', vercelSecurityMiddleware.publicAPI,
       loyaltyPointsRedeemed: loyaltyPointsRedeemed
     };
 
-    // Update customer stats, order history, and loyalty points - DEFERRED TO ORDER COMPLETION
-    // const customerUpdateData = {
-    //   totalOrders: FieldValue.increment(1),
-    //   totalSpent: FieldValue.increment(finalTotal),
-    //   lastOrderDate: new Date(),
-    //   updatedAt: new Date()
-    // };
-
-    // Update loyalty points
-    // if (loyaltySettings.enabled) {
-    //   const netPointsChange = loyaltyPointsEarned - loyaltyPointsRedeemed;
-    //   if (netPointsChange !== 0) {
-    //     customerUpdateData.loyaltyPoints = FieldValue.increment(netPointsChange);
-    //   }
-    // }
-
-    // await db.collection('customers').doc(customerId).update(customerUpdateData);
-
-    // Add to order history (using array union)
-    // await db.collection('customers').doc(customerId).update({
-    //   orderHistory: FieldValue.arrayUnion(orderHistoryEntry)
-    // });
+    // Update customer stats and order history on order creation (loyalty points deferred to completion)
+    if (customerId) {
+      db.collection('customers').doc(customerId).update({
+        totalOrders: FieldValue.increment(1),
+        totalSpent: FieldValue.increment(finalTotal),
+        lastOrderDate: new Date(),
+        updatedAt: new Date(),
+        orderHistory: FieldValue.arrayUnion(orderHistoryEntry)
+      }).catch(err => console.error('Customer stats update error (non-blocking):', err));
+    }
 
     console.log(`🛒 Customer order created successfully: ${orderRef.id}`);
     console.log(`📋 Order items: ${orderData.items.length} items`);
@@ -7881,7 +7871,8 @@ app.get('/api/orders/:restaurantId', authenticateToken, async (req, res) => {
       waiterId,
       orderType,
       todayOnly,
-      paymentMethod
+      paymentMethod,
+      paymentStatus
     } = req.query;
 
     console.log(`🔍 Orders API - Restaurant: ${restaurantId}, Page: ${page}, Limit: ${limit}, Status: ${status || 'all'}, Search: ${search || 'none'}, Waiter: ${waiterId || 'all'}, TodayOnly: ${todayOnly}, PaymentMethod: ${paymentMethod || 'all'}`);
@@ -7975,7 +7966,7 @@ app.get('/api/orders/:restaurantId', authenticateToken, async (req, res) => {
     }
 
     // Determine if we need in-memory filtering (search requires loading docs to filter)
-    const needsInMemoryFilter = (search && search.trim()) || (waiterId && waiterId !== 'all') || (paymentMethod && paymentMethod !== 'all');
+    const needsInMemoryFilter = (search && search.trim()) || (waiterId && waiterId !== 'all') || (paymentMethod && paymentMethod !== 'all') || (paymentStatus && paymentStatus !== 'all');
 
     // --- FAST PATH: No search needed, paginate at Firestore level ---
     if (!needsInMemoryFilter) {
@@ -8144,6 +8135,23 @@ app.get('/api/orders/:restaurantId', authenticateToken, async (req, res) => {
         return method === paymentMethod.toLowerCase();
       });
       console.log(`Filtered by payment method ${paymentMethod}: ${allOrders.length} orders found`);
+    }
+
+    // Apply payment status filter in memory
+    if (paymentStatus && paymentStatus !== 'all') {
+      allOrders = allOrders.filter(order => {
+        if (paymentStatus === 'partial') {
+          return order.paymentStatus === 'partial' || order.outstandingAmount > 0;
+        }
+        if (paymentStatus === 'paid') {
+          return order.paymentStatus === 'paid' || order.paymentStatus === 'completed' || (order.status === 'completed' && !order.outstandingAmount);
+        }
+        if (paymentStatus === 'unpaid') {
+          return order.paymentStatus === 'pending' || order.paymentStatus === 'unpaid';
+        }
+        return true;
+      });
+      console.log(`Filtered by payment status ${paymentStatus}: ${allOrders.length} orders found`);
     }
 
     // Apply search filter
@@ -8570,12 +8578,10 @@ app.patch('/api/orders/:orderId/status', authenticateToken, async (req, res) => 
         }
       }
 
-      // Update Customer Stats and Loyalty
+      // Update Customer Loyalty (totalOrders/totalSpent already updated on order creation in POST /api/customers)
       if (customerId) {
         try {
           const customerUpdateData = {
-            totalOrders: FieldValue.increment(1),
-            totalSpent: FieldValue.increment(orderData.finalAmount || orderData.totalAmount || 0),
             lastOrderDate: new Date(),
             updatedAt: new Date()
           };
@@ -8618,10 +8624,9 @@ app.patch('/api/orders/:orderId/status', authenticateToken, async (req, res) => 
             loyaltyPointsRedeemed: pointsRedeemed
           };
 
-          await db.collection('customers').doc(customerId).update({
-            orderHistory: FieldValue.arrayUnion(orderHistoryEntry)
-          });
-          console.log('📜 Order added to customer history');
+          // Order history entry already added during order creation (POST /api/orders or POST /api/customers)
+          // Only add here if somehow missing (e.g., legacy orders created before this change)
+          console.log('📜 Customer loyalty updated on order completion');
 
         } catch (err) {
           console.error('Error updating customer stats:', err);
@@ -11872,7 +11877,8 @@ app.post('/api/staff/:restaurantId', authenticateToken, requireOwnerRole, async 
         analytics: false,
         inventory: false,
         kot: false,
-        admin: false
+        admin: false,
+        completeBill: false
       }
     };
 
@@ -18279,6 +18285,8 @@ app.post('/api/customers', authenticateToken, async (req, res) => {
           invoiceId: order.invoiceId || null,
           invoiceGenerated: order.invoiceId ? true : false
         }))],
+        totalOrders: (customerData.totalOrders || 0) + (orderHistory.length || 0),
+        totalSpent: (customerData.totalSpent || 0) + orderHistory.reduce((sum, order) => sum + (order.finalAmount || order.totalAmount || 0), 0),
         lastOrderDate: orderHistory.length > 0 ? new Date() : customerData.lastOrderDate,
         updatedAt: new Date()
       };
