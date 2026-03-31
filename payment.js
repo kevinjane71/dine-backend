@@ -2,6 +2,28 @@
 const express = require('express');
 const crypto = require('crypto');
 const router = express.Router();
+// Safe email service import — never crash payment flow if email service fails
+let emailService = null;
+try {
+  emailService = require('./emailService');
+} catch (e) {
+  console.warn('[PAYMENT] Email service not available:', e.message);
+}
+
+// Safe wrapper — fire-and-forget email, never throws, never blocks
+function notifyPaymentStatus(data) {
+  try {
+    if (!emailService || typeof emailService.sendPaymentStatusNotification !== 'function') {
+      console.warn('[PAYMENT] Email service not available, skipping notification');
+      return;
+    }
+    emailService.sendPaymentStatusNotification(data).catch(err => {
+      console.error('[PAYMENT] Email notification failed (non-critical):', err.message);
+    });
+  } catch (err) {
+    console.error('[PAYMENT] Email notification error (non-critical):', err.message);
+  }
+}
 
 // Initialize routes using shared database instance
 const initializePaymentRoutes = (db, razorpay) => {
@@ -125,6 +147,21 @@ const initializePaymentRoutes = (db, razorpay) => {
 
         if (digest !== razorpay_signature) {
           console.error('[PAYMENT] Razorpay signature mismatch:', { razorpay_order_id, razorpay_payment_id });
+
+          // Send failure email (non-blocking, never breaks flow)
+          notifyPaymentStatus({
+            status: 'failed',
+            planId: planId || 'unknown',
+            amount: 0,
+            currency: 'INR',
+            userId: userId || 'unknown',
+            email: '',
+            gateway: 'Razorpay',
+            paymentId: razorpay_payment_id,
+            orderId: razorpay_order_id,
+            reason: 'Signature mismatch — possible tampering'
+          });
+
           return res.status(400).json({
             success: false,
             error: 'Invalid payment signature'
@@ -190,6 +227,20 @@ const initializePaymentRoutes = (db, razorpay) => {
           paymentId: razorpay_payment_id,
           planId: orderData.planId,
           userId: orderData.userId
+        });
+
+        // Send success email (non-blocking, never breaks flow)
+        notifyPaymentStatus({
+          status: 'success',
+          planId: orderData.planId,
+          amount: orderData.amount ? orderData.amount / 100 : 0,
+          currency: orderData.currency || 'INR',
+          userId: orderData.userId,
+          email: orderData.email || '',
+          phone: orderData.phone || '',
+          gateway: 'Razorpay',
+          paymentId: razorpay_payment_id,
+          orderId: razorpay_order_id
         });
 
         res.json({
@@ -842,7 +893,36 @@ const initializePaymentRoutes = (db, razorpay) => {
     }
   });
 
-  // 10. Sync with Razorpay API — recover missed payments
+  // 10. Report payment status (for client-side failures/cancellations)
+  router.post('/report-status', async (req, res) => {
+    try {
+      const { status, planId, amount, currency, userId, email, phone, gateway, paymentId, orderId, reason } = req.body;
+
+      console.log('[PAYMENT] Payment status report:', { status, planId, userId, reason });
+
+      // Send email notification (non-blocking, never breaks flow)
+      notifyPaymentStatus({
+        status: status || 'unknown',
+        planId: planId || 'unknown',
+        amount: amount || 0,
+        currency: currency || 'INR',
+        userId: userId || 'unknown',
+        email: email || '',
+        phone: phone || '',
+        gateway: gateway || 'Razorpay',
+        paymentId: paymentId || '',
+        orderId: orderId || '',
+        reason: reason || ''
+      });
+
+      res.json({ success: true, message: 'Status reported' });
+    } catch (error) {
+      console.error('[PAYMENT] Report status error:', error);
+      res.status(500).json({ success: false, error: 'Failed to report status' });
+    }
+  });
+
+  // 11. Sync with Razorpay API — recover missed payments
   router.get('/sync-razorpay/:userId', async (req, res) => {
     try {
       const { userId } = req.params;

@@ -18,6 +18,7 @@ const { db, collections } = require('./firebase');
 const { FieldValue } = require('firebase-admin/firestore');
 const performanceOptimizer = require('./middleware/performanceOptimizer');
 const firestoreOptimizer = require('./utils/firestoreOptimizer');
+const { kvGet, kvSet, kvDel, getCachedRestaurant, invalidateRestaurantCache, invalidateUserCache } = require('./utils/kvCache');
 const inventoryService = require('./services/inventoryService');
 const pusherService = require('./services/pusherService');
 
@@ -744,22 +745,33 @@ const authenticateToken = (req, res, next) => {
     req.user = user;
 
     // Staff/employee: if marked inactive, reject all requests (revoke access)
+    // Uses KV cache (5 min TTL) to avoid Firestore read on every request
     const staffRoles = ['waiter', 'manager', 'employee', 'cashier', 'sales'];
     if (user.userId) {
       try {
-        // Check the right collection based on JWT source field (staffUsers for new staff, users for legacy/owners)
-        const collName = user.source === 'staffUsers' ? collections.staffUsers : collections.users;
-        const userDoc = await db.collection(collName).doc(user.userId).get();
-        if (userDoc.exists) {
-          const userData = userDoc.data();
-          const role = (userData.role || '').toLowerCase();
-          if (staffRoles.includes(role) && userData.status === 'inactive') {
-            return res.status(401).json({
-              error: 'Account deactivated',
-              message: 'Your account has been deactivated. Please contact your manager.',
-              inactive: true
-            });
+        const userCacheKey = `user:${user.userId}`;
+        let userStatus = await kvGet(userCacheKey);
+
+        if (userStatus === null) {
+          // Cache miss — read from Firestore
+          const collName = user.source === 'staffUsers' ? collections.staffUsers : collections.users;
+          const userDoc = await db.collection(collName).doc(user.userId).get();
+          if (userDoc.exists) {
+            const userData = userDoc.data();
+            userStatus = { role: (userData.role || '').toLowerCase(), status: userData.status || 'active' };
+          } else {
+            userStatus = { role: '', status: 'active' };
           }
+          // Cache for 5 minutes (fire-and-forget)
+          kvSet(userCacheKey, userStatus, 300).catch(() => {});
+        }
+
+        if (staffRoles.includes(userStatus.role) && userStatus.status === 'inactive') {
+          return res.status(401).json({
+            error: 'Account deactivated',
+            message: 'Your account has been deactivated. Please contact your manager.',
+            inactive: true
+          });
         }
       } catch (dbErr) {
         console.error('Auth staff status check error:', dbErr);
@@ -4759,6 +4771,7 @@ app.patch('/api/restaurants/:restaurantId', authenticateToken, async (req, res) 
     updateData.updatedAt = new Date();
 
     await db.collection(collections.restaurants).doc(restaurantId).update(updateData);
+    invalidateRestaurantCache(restaurantId);
 
     res.json({ message: 'Restaurant updated successfully', updatedFields: Object.keys(updateData) });
 
@@ -5066,6 +5079,7 @@ app.post('/api/restaurants/:restaurantId/seed-default', authenticateToken, async
       hasDefaultMenu: true,
       updatedAt: new Date()
     });
+    invalidateRestaurantCache(restaurantId);
 
     // Create 20 tables on Ground Floor
     const floorId = 'floor_ground_floor';
@@ -5165,16 +5179,14 @@ app.get('/api/public/menu/:restaurantId', vercelSecurityMiddleware.publicAPI, as
       });
     }
 
-    // Get restaurant info
-    const restaurantDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
-    if (!restaurantDoc.exists) {
+    // Get restaurant info (with KV cache — 3 min TTL)
+    const { data: restaurantData } = await getCachedRestaurant(db, collections.restaurants, restaurantId);
+    if (!restaurantData) {
       return res.status(404).json({
         success: false,
         error: 'Restaurant not found'
       });
     }
-
-    const restaurantData = restaurantDoc.data();
 
     // Get menu items from embedded menu structure
     const embeddedMenuItems = restaurantData.menu?.items || [];
@@ -5306,6 +5318,7 @@ app.post('/api/menu-theme/:restaurantId', authenticateToken, async (req, res) =>
         updatedAt: FieldValue.serverTimestamp(),
       },
     });
+    invalidateRestaurantCache(restaurantId);
 
     res.json({
       success: true,
@@ -5405,13 +5418,13 @@ app.get('/public/placeorder', vercelSecurityMiddleware.publicAPI, async (req, re
 app.get('/api/public/menu-theme/:restaurantId', vercelSecurityMiddleware.publicAPI, async (req, res) => {
   try {
     const { restaurantId } = req.params;
-    const restaurantDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
-    
-    if (!restaurantDoc.exists) {
+    // Get restaurant (with KV cache — 3 min TTL)
+    const { data: restaurantData } = await getCachedRestaurant(db, collections.restaurants, restaurantId);
+
+    if (!restaurantData) {
       return res.status(404).json({ success: false, error: 'Restaurant not found' });
     }
 
-    const restaurantData = restaurantDoc.data();
     const menuTheme = restaurantData.menuTheme || {};
     
     res.json({
@@ -5430,14 +5443,13 @@ app.get('/api/menus/:restaurantId', async (req, res) => {
     const { restaurantId } = req.params;
     const { category } = req.query;
 
-    // Get restaurant document which now contains the menu
-    const restaurantDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
-    
-    if (!restaurantDoc.exists) {
+    // Get restaurant document which now contains the menu (with KV cache — 3 min TTL)
+    const { data: restaurantData } = await getCachedRestaurant(db, collections.restaurants, restaurantId);
+
+    if (!restaurantData) {
       return res.status(404).json({ error: 'Restaurant not found' });
     }
 
-    const restaurantData = restaurantDoc.data();
     const menuData = restaurantData.menu || { categories: [], items: [] };
 
     let menuItems = menuData.items || [];
@@ -5612,6 +5624,7 @@ app.post('/api/menus/:restaurantId', authenticateToken, async (req, res) => {
     }
 
     await db.collection(collections.restaurants).doc(restaurantId).update(menuUpdate);
+    invalidateRestaurantCache(restaurantId);
 
     // AUTO-GENERATE RECIPE (Asynchronous - Fire and Forget)
     // We don't await this so the user response is instant.
@@ -5762,8 +5775,9 @@ app.patch('/api/menus/item/:id', authenticateToken, async (req, res) => {
         lastUpdated: new Date()
       }
     });
-    
-    res.json({ 
+    invalidateRestaurantCache(foundRestaurant.id);
+
+    res.json({
       message: 'Menu item updated successfully',
       updatedFields: Object.keys(updateData).filter(key => key !== 'updatedAt')
     });
@@ -5822,8 +5836,9 @@ app.post('/api/menus/:restaurantId/item/:itemId/favorite', authenticateToken, as
         lastUpdated: new Date()
       }
     });
+    invalidateRestaurantCache(restaurantId);
 
-    res.json({ 
+    res.json({
       message: 'Menu item marked as favorite',
       itemId,
       isFavorite: true
@@ -5883,8 +5898,9 @@ app.delete('/api/menus/:restaurantId/item/:itemId/favorite', authenticateToken, 
         lastUpdated: new Date()
       }
     });
+    invalidateRestaurantCache(restaurantId);
 
-    res.json({ 
+    res.json({
       message: 'Menu item unmarked as favorite',
       itemId,
       isFavorite: false
@@ -5975,7 +5991,8 @@ app.delete('/api/menus/item/:id', authenticateToken, async (req, res) => {
         lastUpdated: new Date()
       }
     });
-    
+    invalidateRestaurantCache(foundRestaurant.id);
+
     res.json({
       message: 'Menu item deleted successfully',
       note: 'Item has been soft deleted and can be restored if needed'
@@ -6050,6 +6067,7 @@ app.delete('/api/menus/:restaurantId/bulk-delete', authenticateToken, async (req
       },
       categories: []
     });
+    invalidateRestaurantCache(restaurantId);
 
     console.log(`✅ Bulk deleted ${activeItemsCount} menu items for restaurant ${restaurantId}`);
 
@@ -10700,6 +10718,7 @@ app.post('/api/menus/bulk-save/:restaurantId', authenticateToken, async (req, re
       }
 
       await db.collection(collections.restaurants).doc(restaurantId).update(updateData);
+      invalidateRestaurantCache(restaurantId);
       console.log('✅ Bulk save: categories=', existingCategories.length, 'items=', existingItems.length);
     }
 
@@ -12065,6 +12084,7 @@ app.delete('/api/staff/:staffId', authenticateToken, requireOwnerRole, async (re
 
     // Delete the staff member from the collection it was found in
     await db.collection(staffColl === 'staffUsers' ? collections.staffUsers : collections.users).doc(staffId).delete();
+    invalidateUserCache(staffId);
 
     // Also delete any temporary credentials if they exist
     try {
@@ -12255,6 +12275,11 @@ app.patch('/api/staff/:staffId', authenticateToken, requireOwnerRole, async (req
 
     const collName = staffColl === 'staffUsers' ? collections.staffUsers : collections.users;
     await db.collection(collName).doc(staffId).update(updateData);
+
+    // Invalidate user cache if status or role changed
+    if (status || role) {
+      invalidateUserCache(staffId);
+    }
 
     res.json({ message: 'Staff member updated successfully' });
 
@@ -13137,6 +13162,7 @@ app.put('/api/admin/print-settings/:restaurantId', authenticateToken, async (req
       printSettings: updatedSettings,
       updatedAt: new Date()
     });
+    invalidateRestaurantCache(restaurantId);
 
     res.json({
       success: true,
@@ -20726,6 +20752,7 @@ app.get('/api/categories/:restaurantId', authenticateToken, async (req, res) => 
           categories: categories,
           updatedAt: new Date()
         });
+        invalidateRestaurantCache(restaurantId);
         console.log(`✅ Auto-extracted ${categories.length} categories for restaurant ${restaurantId}`);
       }
     }
@@ -20780,6 +20807,7 @@ app.post('/api/categories/:restaurantId', authenticateToken, async (req, res) =>
       categories: updatedCategories,
       updatedAt: new Date()
     });
+    invalidateRestaurantCache(restaurantId);
 
     res.status(201).json({
       message: 'Category created successfully',
@@ -20828,6 +20856,7 @@ app.patch('/api/categories/:restaurantId/:categoryId', authenticateToken, async 
       categories: categories,
       updatedAt: new Date()
     });
+    invalidateRestaurantCache(restaurantId);
 
     res.json({
       message: 'Category updated successfully',
@@ -20877,6 +20906,7 @@ app.delete('/api/categories/:restaurantId/:categoryId', authenticateToken, async
       categories: categories,
       updatedAt: new Date()
     });
+    invalidateRestaurantCache(restaurantId);
 
     res.json({ message: 'Category deleted successfully' });
   } catch (error) {

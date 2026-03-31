@@ -896,6 +896,108 @@ Please follow up with the potential customer as soon as possible.
       };
     }
   }
+  // Send payment status notification to admin (internal use)
+  // Fully defensive — never throws, always returns safely
+  async sendPaymentStatusNotification(paymentData) {
+    try {
+      if (!paymentData || typeof paymentData !== 'object') {
+        console.warn('[EMAIL] sendPaymentStatusNotification called with invalid data, skipping');
+        return { success: false, error: 'Invalid payment data' };
+      }
+
+      const adminEmails = 'info@dineopen.com,malik.vk07@gmail.com';
+      const status = (paymentData.status || 'unknown').toUpperCase();
+      const statusEmoji = status === 'SUCCESS' ? '✅' : status === 'FAILED' ? '❌' : status === 'CANCELLED' ? '🚫' : '⚠️';
+      const statusColor = status === 'SUCCESS' ? '#10b981' : status === 'FAILED' ? '#ef4444' : status === 'CANCELLED' ? '#f59e0b' : '#6b7280';
+
+      const timestamp = new Date().toLocaleString('en-IN', {
+        timeZone: 'Asia/Kolkata',
+        dateStyle: 'medium',
+        timeStyle: 'medium'
+      });
+
+      const subject = `${statusEmoji} Payment ${status} — ${paymentData.planId || 'Unknown Plan'} | DineOpen`;
+
+      const text = `Payment Status: ${status}
+Plan: ${paymentData.planId || 'N/A'}
+Amount: ${paymentData.currency || 'INR'} ${paymentData.amount || 0}
+User ID: ${paymentData.userId || 'N/A'}
+Email: ${paymentData.email || 'N/A'}
+Phone: ${paymentData.phone || 'N/A'}
+Gateway: ${paymentData.gateway || 'Razorpay'}
+Payment ID: ${paymentData.paymentId || 'N/A'}
+Order ID: ${paymentData.orderId || 'N/A'}
+Reason: ${paymentData.reason || 'N/A'}
+Time: ${timestamp}`;
+
+      const html = `<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"></head>
+<body style="margin:0;padding:0;background-color:#f3f4f6;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;">
+  <div style="max-width:520px;margin:20px auto;background:white;border-radius:12px;overflow:hidden;box-shadow:0 2px 8px rgba(0,0,0,0.08);">
+    <div style="background:${statusColor};padding:20px 24px;text-align:center;">
+      <div style="font-size:32px;margin-bottom:6px;">${statusEmoji}</div>
+      <h1 style="margin:0;color:white;font-size:20px;font-weight:700;">Payment ${status}</h1>
+      <p style="margin:4px 0 0;color:rgba(255,255,255,0.85);font-size:13px;">${timestamp}</p>
+    </div>
+    <div style="padding:24px;">
+      <table style="width:100%;border-collapse:collapse;font-size:14px;">
+        <tr style="border-bottom:1px solid #f3f4f6;">
+          <td style="padding:10px 0;color:#6b7280;width:110px;">Plan</td>
+          <td style="padding:10px 0;color:#1f2937;font-weight:600;">${paymentData.planId || 'N/A'}</td>
+        </tr>
+        <tr style="border-bottom:1px solid #f3f4f6;">
+          <td style="padding:10px 0;color:#6b7280;">Amount</td>
+          <td style="padding:10px 0;color:#1f2937;font-weight:600;">${paymentData.currency === 'INR' ? '₹' : '$'}${paymentData.amount || 0}</td>
+        </tr>
+        <tr style="border-bottom:1px solid #f3f4f6;">
+          <td style="padding:10px 0;color:#6b7280;">User ID</td>
+          <td style="padding:10px 0;color:#1f2937;font-size:12px;word-break:break-all;">${paymentData.userId || 'N/A'}</td>
+        </tr>
+        <tr style="border-bottom:1px solid #f3f4f6;">
+          <td style="padding:10px 0;color:#6b7280;">Email</td>
+          <td style="padding:10px 0;color:#1f2937;">${paymentData.email || 'N/A'}</td>
+        </tr>
+        <tr style="border-bottom:1px solid #f3f4f6;">
+          <td style="padding:10px 0;color:#6b7280;">Phone</td>
+          <td style="padding:10px 0;color:#1f2937;">${paymentData.phone || 'N/A'}</td>
+        </tr>
+        <tr style="border-bottom:1px solid #f3f4f6;">
+          <td style="padding:10px 0;color:#6b7280;">Gateway</td>
+          <td style="padding:10px 0;color:#1f2937;">${paymentData.gateway || 'Razorpay'}</td>
+        </tr>
+        <tr style="border-bottom:1px solid #f3f4f6;">
+          <td style="padding:10px 0;color:#6b7280;">Payment ID</td>
+          <td style="padding:10px 0;color:#1f2937;font-size:12px;word-break:break-all;">${paymentData.paymentId || 'N/A'}</td>
+        </tr>
+        <tr style="border-bottom:1px solid #f3f4f6;">
+          <td style="padding:10px 0;color:#6b7280;">Order ID</td>
+          <td style="padding:10px 0;color:#1f2937;font-size:12px;word-break:break-all;">${paymentData.orderId || 'N/A'}</td>
+        </tr>
+        ${paymentData.reason ? `<tr>
+          <td style="padding:10px 0;color:#6b7280;">Reason</td>
+          <td style="padding:10px 0;color:#dc2626;font-weight:500;">${paymentData.reason}</td>
+        </tr>` : ''}
+      </table>
+    </div>
+    <div style="padding:16px 24px;background:#f9fafb;text-align:center;border-top:1px solid #e5e7eb;">
+      <p style="margin:0;font-size:12px;color:#9ca3af;">DineOpen Payment Notification — Internal Use</p>
+    </div>
+  </div>
+</body>
+</html>`;
+
+      return this.sendEmail({
+        to: adminEmails,
+        subject,
+        text,
+        html
+      });
+    } catch (error) {
+      console.error('Error sending payment status notification email:', error);
+      return { success: false, error: error.message };
+    }
+  }
 }
 
 module.exports = new EmailService();
