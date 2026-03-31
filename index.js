@@ -8562,6 +8562,170 @@ function calculateAnalytics(orders, period) {
   };
 }
 
+// Sales Summary — supports single date, period presets, and custom date ranges
+app.get('/api/analytics/:restaurantId/daily-summary', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+    const { date, period, startDate, endDate } = req.query;
+
+    // Determine date range
+    const today = new Date().toISOString().split('T')[0];
+    let dates = []; // array of YYYY-MM-DD strings to aggregate
+
+    if (startDate && endDate) {
+      // Custom range
+      const start = new Date(startDate);
+      const end = new Date(endDate);
+      for (let d = new Date(start); d <= end; d.setDate(d.getDate() + 1)) {
+        dates.push(d.toISOString().split('T')[0]);
+      }
+    } else if (period) {
+      const daysMap = { today: 0, yesterday: 1, '2d': 2, '7d': 7, '30d': 30 };
+      const daysBack = daysMap[period] ?? 0;
+      if (period === 'yesterday') {
+        const d = new Date(); d.setDate(d.getDate() - 1);
+        dates = [d.toISOString().split('T')[0]];
+      } else {
+        for (let i = daysBack; i >= 0; i--) {
+          const d = new Date(); d.setDate(d.getDate() - i);
+          dates.push(d.toISOString().split('T')[0]);
+        }
+      }
+    } else {
+      dates = [date || today];
+    }
+
+    // Batch-read dailyStats docs
+    const docRefs = dates.map(d => db.collection('dailyStats').doc(`${restaurantId}_${d}`));
+    const docs = docRefs.length > 0 ? await db.getAll(...docRefs) : [];
+
+    // Aggregate across all dates
+    let totalOrders = 0, totalRevenue = 0, totalRevenueWithTax = 0;
+    const itemMap = {};
+    const ordersByType = {};
+    const hourlyBreakdown = {};
+    const customerSet = new Set();
+    const dailyRevenue = []; // for trend chart
+    let hasItemCounts = false;
+
+    docs.forEach((doc, idx) => {
+      if (!doc.exists) {
+        dailyRevenue.push({ date: dates[idx], revenue: 0, orders: 0 });
+        return;
+      }
+      const data = doc.data();
+      totalOrders += (data.totalOrders || 0);
+      totalRevenue += (data.totalRevenue || 0);
+      totalRevenueWithTax += (data.totalRevenueWithTax || 0);
+      dailyRevenue.push({
+        date: dates[idx],
+        revenue: Math.round((data.totalRevenueWithTax || data.totalRevenue || 0) * 100) / 100,
+        orders: data.totalOrders || 0
+      });
+
+      // Aggregate itemCounts
+      if (data.itemCounts) {
+        hasItemCounts = true;
+        for (const [name, val] of Object.entries(data.itemCounts)) {
+          if (!itemMap[name]) itemMap[name] = { qty: 0, revenue: 0 };
+          itemMap[name].qty += (val.qty || 0);
+          itemMap[name].revenue += (val.revenue || 0);
+        }
+      }
+
+      // Aggregate order types
+      for (const [key, val] of Object.entries(data)) {
+        if (key.startsWith('ordersByType_') && val > 0) {
+          const type = key.replace('ordersByType_', '');
+          ordersByType[type] = (ordersByType[type] || 0) + val;
+        }
+        if (key.startsWith('hour_') && val > 0) {
+          const hour = key.replace('hour_', '');
+          hourlyBreakdown[hour] = (hourlyBreakdown[hour] || 0) + val;
+        }
+      }
+
+      (data.customerIds || []).forEach(id => customerSet.add(id));
+    });
+
+    // Build items array from aggregated map
+    let items = [];
+    for (const [name, val] of Object.entries(itemMap)) {
+      if (val.qty > 0) {
+        items.push({
+          name,
+          originalKey: name,
+          quantity: val.qty,
+          revenue: Math.round(val.revenue * 100) / 100
+        });
+      }
+    }
+
+    // Fallback: if no itemCounts in dailyStats, aggregate from raw orders
+    if (items.length === 0 && totalOrders > 0) {
+      const rangeStart = new Date(dates[0] + 'T00:00:00.000Z');
+      const rangeEnd = new Date(dates[dates.length - 1] + 'T23:59:59.999Z');
+      const ordersSnap = await db.collection(collections.orders)
+        .where('restaurantId', '==', restaurantId)
+        .where('createdAt', '>=', rangeStart)
+        .where('createdAt', '<=', rangeEnd)
+        .get();
+
+      totalOrders = 0; totalRevenue = 0; totalRevenueWithTax = 0;
+
+      ordersSnap.docs.forEach(doc => {
+        const order = doc.data();
+        if (['cancelled', 'deleted', 'saved'].includes(order.status)) return;
+        totalOrders++;
+        totalRevenue += (order.totalAmount || 0);
+        totalRevenueWithTax += (order.finalAmount || order.totalAmount || 0);
+
+        const type = (order.orderType || 'dine_in').toLowerCase().replace(/[\s-]+/g, '_');
+        ordersByType[type] = (ordersByType[type] || 0) + 1;
+
+        if (order.items && Array.isArray(order.items)) {
+          order.items.forEach(item => {
+            const name = item.name || item.itemName;
+            if (name) {
+              if (!itemMap[name]) itemMap[name] = { qty: 0, revenue: 0 };
+              itemMap[name].qty += (item.quantity || 1);
+              itemMap[name].revenue += ((item.price || 0) * (item.quantity || 1));
+            }
+          });
+        }
+      });
+
+      items = [];
+      for (const [name, val] of Object.entries(itemMap)) {
+        if (val.qty > 0) {
+          items.push({ name, originalKey: name, quantity: val.qty, revenue: Math.round(val.revenue * 100) / 100 });
+        }
+      }
+    }
+
+    items.sort((a, b) => b.quantity - a.quantity);
+
+    res.json({
+      success: true,
+      summary: {
+        dateRange: { start: dates[0], end: dates[dates.length - 1] },
+        totalOrders,
+        totalRevenue: Math.round(totalRevenue * 100) / 100,
+        totalRevenueWithTax: Math.round(totalRevenueWithTax * 100) / 100,
+        avgOrderValue: totalOrders > 0 ? Math.round((totalRevenueWithTax / totalOrders) * 100) / 100 : 0,
+        items,
+        ordersByType,
+        hourlyBreakdown,
+        dailyRevenue: dates.length > 1 ? dailyRevenue : undefined,
+        uniqueCustomers: customerSet.size
+      }
+    });
+  } catch (error) {
+    console.error('Daily summary error:', error);
+    res.status(500).json({ error: 'Failed to fetch daily summary' });
+  }
+});
+
 app.patch('/api/orders/:orderId/status', authenticateToken, async (req, res) => {
   try {
     const { orderId } = req.params;
