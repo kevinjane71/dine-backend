@@ -11426,22 +11426,17 @@ app.delete('/api/floors/:floorId', authenticateToken, async (req, res) => {
       return res.status(400).json({ error: 'Restaurant ID is required' });
     }
 
-    // Extract floor name from floorId
-    const floorName = floorId.replace('floor_', '').replace(/_/g, ' ');
-    const floorNameCapitalized = floorName.split(' ').map(word => 
-      word.charAt(0).toUpperCase() + word.slice(1).toLowerCase()
-    ).join(' ');
+    const floorRef = db.collection('restaurants').doc(restaurantId).collection('floors').doc(floorId);
 
-    // Delete all tables on this floor
-    const tablesSnapshot = await db.collection(collections.tables)
-      .where('restaurantId', '==', restaurantId)
-      .where('floor', '==', floorNameCapitalized)
-      .get();
-
+    // Delete all tables in the floor subcollection
+    const tablesSnapshot = await floorRef.collection('tables').get();
     const batch = db.batch();
     tablesSnapshot.forEach(doc => {
       batch.delete(doc.ref);
     });
+
+    // Delete the floor document itself
+    batch.delete(floorRef);
 
     await batch.commit();
 
