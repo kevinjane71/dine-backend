@@ -95,11 +95,12 @@ const initializePaymentRoutes = (db, razorpay) => {
     try {
       const {
         orderId,
-        paymentMethod = 'cash',
+        paymentMethod,
         amount,
         userId,
         restaurantId,
-        // Legacy Razorpay fields (for backward compatibility)
+        planId,
+        // Razorpay fields
         razorpay_order_id,
         razorpay_payment_id,
         razorpay_signature
@@ -111,86 +112,11 @@ const initializePaymentRoutes = (db, razorpay) => {
         amount,
         userId,
         restaurantId,
-        hasRazorpayData: !!(razorpay_order_id && razorpay_payment_id)
+        planId,
+        hasRazorpayData: !!(razorpay_order_id && razorpay_payment_id && razorpay_signature)
       });
 
-      // Handle offline/manual payments
-      if (paymentMethod === 'cash' || paymentMethod === 'card' || paymentMethod === 'upi') {
-        if (!orderId) {
-          return res.status(400).json({ 
-            success: false, 
-            error: 'Order ID is required for offline payments' 
-          });
-        }
-
-        // Get order details from the main orders collection
-        const orderDoc = await db.collection('orders').doc(orderId).get();
-
-        if (!orderDoc.exists) {
-          return res.status(404).json({ 
-            success: false, 
-            error: 'Order not found' 
-          });
-        }
-
-        const orderData = orderDoc.data();
-
-        // Generate payment ID for offline payments
-        const paymentId = `offline_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
-
-        // Create payment record for offline payment
-        const paymentRef = db.collection('payments').doc(paymentId);
-        const paymentDoc = {
-          orderId: orderId,
-          paymentId: paymentId,
-          paymentMethod: paymentMethod,
-          amount: orderData.totalAmount || amount,
-          currency: 'INR',
-          status: 'completed',
-          completedAt: new Date(),
-          userId: userId,
-          restaurantId: restaurantId,
-          type: 'offline',
-          app: 'Dine'
-        };
-
-        await paymentRef.set(paymentDoc);
-
-        // Update order status to completed
-        console.log('[PAYMENT] Updating order status to completed:', orderId);
-        await db.collection('orders').doc(orderId).update({
-          status: 'completed',
-          paymentStatus: 'paid',
-          paymentMethod: paymentMethod,
-          paymentId: paymentId,
-          completedAt: new Date(),
-          updatedAt: new Date()
-        });
-
-        console.log('[PAYMENT] Offline payment completed successfully:', {
-          orderId,
-          paymentId,
-          paymentMethod,
-          amount: orderData.totalAmount,
-          status: 'completed'
-        });
-
-        res.json({ 
-          success: true, 
-          message: 'Payment completed successfully',
-          data: {
-            orderId: orderId,
-            paymentId: paymentId,
-            paymentMethod: paymentMethod,
-            amount: orderData.totalAmount,
-            status: 'completed'
-          }
-        });
-
-        return;
-      }
-
-      // Handle Razorpay payments (legacy support)
+      // Handle Razorpay subscription payments FIRST (check for razorpay fields)
       if (razorpay_order_id && razorpay_payment_id && razorpay_signature) {
         // Verify signature
         const shasum = crypto.createHmac('sha256', process.env.RAZORPAY_KEY_SECRET);
@@ -198,9 +124,10 @@ const initializePaymentRoutes = (db, razorpay) => {
         const digest = shasum.digest('hex');
 
         if (digest !== razorpay_signature) {
-          return res.status(400).json({ 
-            success: false, 
-            error: 'Invalid signature' 
+          console.error('[PAYMENT] Razorpay signature mismatch:', { razorpay_order_id, razorpay_payment_id });
+          return res.status(400).json({
+            success: false,
+            error: 'Invalid payment signature'
           });
         }
 
@@ -208,9 +135,10 @@ const initializePaymentRoutes = (db, razorpay) => {
         const orderDoc = await db.collection('dine_orders').doc(razorpay_order_id).get();
 
         if (!orderDoc.exists) {
-          return res.status(404).json({ 
-            success: false, 
-            error: 'Order not found' 
+          console.error('[PAYMENT] Order not found in dine_orders:', razorpay_order_id);
+          return res.status(404).json({
+            success: false,
+            error: 'Order not found'
           });
         }
 
@@ -231,7 +159,7 @@ const initializePaymentRoutes = (db, razorpay) => {
           status: 'verified',
           verifiedAt: new Date()
         };
-        
+
         // Only add optional fields if they have values
         if (orderData.phone) paymentDoc.phone = orderData.phone;
         if (orderData.shopId) paymentDoc.shopId = orderData.shopId;
@@ -245,8 +173,27 @@ const initializePaymentRoutes = (db, razorpay) => {
           updatedAt: new Date()
         });
 
-        res.json({ 
-          success: true, 
+        // Activate the user's subscription immediately
+        const subUserId = orderData.userId || userId;
+        const subPlanId = orderData.planId || planId;
+        if (subUserId && subPlanId) {
+          try {
+            await updateUserSubscription(db, subUserId, orderData.email, subPlanId);
+            console.log('[PAYMENT] Subscription activated via verify:', { userId: subUserId, planId: subPlanId });
+          } catch (subError) {
+            console.error('[PAYMENT] Failed to activate subscription (will retry via webhook):', subError);
+          }
+        }
+
+        console.log('[PAYMENT] Razorpay payment verified successfully:', {
+          orderId: razorpay_order_id,
+          paymentId: razorpay_payment_id,
+          planId: orderData.planId,
+          userId: orderData.userId
+        });
+
+        res.json({
+          success: true,
           message: 'Payment verified successfully',
           data: {
             planId: orderData.planId,
@@ -263,16 +210,93 @@ const initializePaymentRoutes = (db, razorpay) => {
         return;
       }
 
-      // If neither offline nor Razorpay data is provided
-      return res.status(400).json({ 
-        success: false, 
-        error: 'Invalid payment data. Provide either offline payment details or Razorpay payment details.' 
+      // Handle offline/manual payments (cash/card/upi)
+      const offlineMethod = paymentMethod || 'cash';
+      if (offlineMethod === 'cash' || offlineMethod === 'card' || offlineMethod === 'upi') {
+        if (!orderId) {
+          return res.status(400).json({
+            success: false,
+            error: 'Order ID is required for offline payments'
+          });
+        }
+
+        // Get order details from the main orders collection
+        const orderDoc = await db.collection('orders').doc(orderId).get();
+
+        if (!orderDoc.exists) {
+          return res.status(404).json({
+            success: false,
+            error: 'Order not found'
+          });
+        }
+
+        const orderData = orderDoc.data();
+
+        // Generate payment ID for offline payments
+        const paymentId = `offline_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+
+        // Create payment record for offline payment
+        const paymentRef = db.collection('payments').doc(paymentId);
+        const offlinePaymentDoc = {
+          orderId: orderId,
+          paymentId: paymentId,
+          paymentMethod: offlineMethod,
+          amount: orderData.totalAmount || amount,
+          currency: 'INR',
+          status: 'completed',
+          completedAt: new Date(),
+          userId: userId,
+          restaurantId: restaurantId,
+          type: 'offline',
+          app: 'Dine'
+        };
+
+        await paymentRef.set(offlinePaymentDoc);
+
+        // Update order status to completed
+        console.log('[PAYMENT] Updating order status to completed:', orderId);
+        await db.collection('orders').doc(orderId).update({
+          status: 'completed',
+          paymentStatus: 'paid',
+          paymentMethod: offlineMethod,
+          paymentId: paymentId,
+          completedAt: new Date(),
+          updatedAt: new Date()
+        });
+
+        console.log('[PAYMENT] Offline payment completed successfully:', {
+          orderId,
+          paymentId,
+          paymentMethod: offlineMethod,
+          amount: orderData.totalAmount,
+          status: 'completed'
+        });
+
+        res.json({
+          success: true,
+          message: 'Payment completed successfully',
+          data: {
+            orderId: orderId,
+            paymentId: paymentId,
+            paymentMethod: offlineMethod,
+            amount: orderData.totalAmount,
+            status: 'completed'
+          }
+        });
+
+        return;
+      }
+
+      // If neither Razorpay nor offline data is provided
+      return res.status(400).json({
+        success: false,
+        error: 'Invalid payment data. Provide either Razorpay payment details or offline payment details.'
       });
 
     } catch (error) {
       console.error('[PAYMENT] Payment verification error:', error);
-      res.status(500).json({ 
-        success: false, 
+      res.status(500).json({
+        success: false,
         error: 'Payment verification failed',
         details: error.message
       });
@@ -876,26 +900,30 @@ async function updateUserSubscription(db, userId, email, planId) {
 async function updateUserSubscriptionDoc(userRef, planId) {
   const currentDate = new Date();
   let endDate = null;
+  const isTrial = planId === 'free-trial' || planId === 'starter';
 
-  // Set end date based on plan (default to 1 month)
-  // Free-trial and starter plans have no end date
-  if (planId !== 'free-trial' && planId !== 'starter') {
+  // Set end date based on plan
+  if (!isTrial) {
     endDate = new Date(currentDate);
     switch (planId) {
       case 'yearly':
+      case 'spark-yearly':
         endDate.setFullYear(endDate.getFullYear() + 1);
         break;
       case 'quarterly':
         endDate.setMonth(endDate.getMonth() + 3);
         break;
+      case 'monthly':
+      case 'spark-monthly':
       default:
         endDate.setMonth(endDate.getMonth() + 1); // Monthly plan
     }
   }
-  
-  // Get plan details
+
+  // Get plan details and pricing
   const planDetails = getPlanDetails(planId);
-  
+  const planPricing = getPlanPricing(planId);
+
   // Update user document with subscription information
   const subscriptionData = {
     planId,
@@ -903,17 +931,46 @@ async function updateUserSubscriptionDoc(userRef, planId) {
     status: 'active',
     startDate: currentDate.toISOString(),
     endDate: endDate ? endDate.toISOString() : null,
+    amount: planPricing.amount,
+    currency: planPricing.currency,
     features: planDetails.features,
+    paymentGateway: 'razorpay',
     lastUpdated: currentDate.toISOString(),
-    app: 'Dine' // Add app name
+    app: 'Dine'
   };
+
+  // Preserve trial dates for trial plans, clear them for paid plans
+  if (isTrial) {
+    subscriptionData.trialStartDate = currentDate.toISOString();
+    subscriptionData.trialEndDate = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString();
+    subscriptionData.trialDays = 30;
+  }
 
   await userRef.update({
     subscription: subscriptionData,
     lastUpdated: currentDate
   });
-  
+
   return true;
+}
+
+// Helper function to get plan pricing
+function getPlanPricing(planId) {
+  const pricing = {
+    'free-trial': { amount: 0, currency: 'INR' },
+    'starter': { amount: 0, currency: 'INR' },
+    'free': { amount: 0, currency: 'INR' },
+    'spark-monthly': { amount: 300, currency: 'INR' },
+    'spark-yearly': { amount: 2500, currency: 'INR' },
+    'basic': { amount: 99, currency: 'INR' },
+    'pro': { amount: 299, currency: 'INR' },
+    'monthly': { amount: 299, currency: 'INR' },
+    'quarterly': { amount: 799, currency: 'INR' },
+    'yearly': { amount: 2499, currency: 'INR' },
+    'professional': { amount: 499, currency: 'INR' },
+    'enterprise': { amount: 999, currency: 'INR' },
+  };
+  return pricing[planId] || { amount: 0, currency: 'INR' };
 }
 
 // Helper function to get plan details
@@ -958,9 +1015,17 @@ function getPlanDetails(planId) {
     'yearly': {
       name: 'Annual Plan',
       features: getFeaturesByPlan('pro')
+    },
+    'spark-monthly': {
+      name: 'Spark',
+      features: getFeaturesByPlan('pro')
+    },
+    'spark-yearly': {
+      name: 'Spark Yearly',
+      features: getFeaturesByPlan('pro')
     }
   };
-  
+
   return plans[planId] || plans['free-trial'];
 }
 
