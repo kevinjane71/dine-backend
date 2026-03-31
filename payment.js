@@ -579,7 +579,8 @@ const initializePaymentRoutes = (db, razorpay) => {
       // Calculate trial days remaining
       let trialDaysRemaining = null;
       let trialIsExpired = false;
-      const isTrial = subscription.planId === 'free-trial' || subscription.planId === 'starter' || subscription.planName === 'Free Trial' || subscription.amount === 0;
+      const trialPlanIds = ['free-trial', 'starter', 'free'];
+      const isTrial = trialPlanIds.includes(subscription.planId);
 
       if (isTrial) {
         const trialStart = subscription.trialStartDate || subscription.startDate;
@@ -838,6 +839,129 @@ const initializePaymentRoutes = (db, razorpay) => {
         success: false,
         error: error.message || 'Internal server error'
       });
+    }
+  });
+
+  // 10. Sync with Razorpay API — recover missed payments
+  router.get('/sync-razorpay/:userId', async (req, res) => {
+    try {
+      const { userId } = req.params;
+
+      if (!userId) {
+        return res.status(400).json({ success: false, error: 'User ID is required' });
+      }
+
+      if (!razorpay) {
+        return res.status(503).json({ success: false, error: 'Razorpay not configured' });
+      }
+
+      // Get all orders for this user that are NOT yet marked as paid
+      const ordersSnapshot = await db.collection('dine_orders')
+        .where('userId', '==', userId)
+        .where('app', '==', 'Dine')
+        .get();
+
+      if (ordersSnapshot.empty) {
+        return res.json({ success: true, synced: false, message: 'No orders found for this user' });
+      }
+
+      let syncedPayment = null;
+
+      for (const doc of ordersSnapshot.docs) {
+        const order = doc.data();
+
+        // Skip orders already marked as paid
+        if (order.status === 'paid') continue;
+
+        // Fetch order status from Razorpay API
+        try {
+          const rzpOrder = await razorpay.orders.fetch(doc.id);
+
+          if (rzpOrder.status === 'paid') {
+            // Order is paid on Razorpay — fetch the payment details
+            const payments = await razorpay.orders.fetchPayments(doc.id);
+            const capturedPayment = payments.items.find(p => p.status === 'captured');
+
+            if (capturedPayment) {
+              console.log('[PAYMENT] Razorpay sync: Found missed payment', {
+                orderId: doc.id,
+                paymentId: capturedPayment.id,
+                userId,
+                planId: order.planId
+              });
+
+              // Update our order to paid
+              await db.collection('dine_orders').doc(doc.id).update({
+                status: 'paid',
+                paymentId: capturedPayment.id,
+                syncedFromRazorpay: true,
+                updatedAt: new Date()
+              });
+
+              // Create payment record if it doesn't exist
+              const paymentRef = db.collection('dine_payments').doc(capturedPayment.id);
+              const paymentDoc = await paymentRef.get();
+
+              if (!paymentDoc.exists) {
+                const paymentData = {
+                  orderId: doc.id,
+                  paymentId: capturedPayment.id,
+                  planId: order.planId,
+                  email: order.email,
+                  userId: order.userId,
+                  amount: capturedPayment.amount,
+                  currency: capturedPayment.currency,
+                  status: 'verified',
+                  method: capturedPayment.method || null,
+                  app: 'Dine',
+                  syncedFromRazorpay: true,
+                  verifiedAt: new Date()
+                };
+                if (order.phone) paymentData.phone = order.phone;
+                await paymentRef.set(paymentData);
+              }
+
+              // Activate subscription
+              await updateUserSubscription(db, order.userId, order.email, order.planId);
+
+              syncedPayment = {
+                orderId: doc.id,
+                paymentId: capturedPayment.id,
+                planId: order.planId,
+                amount: capturedPayment.amount / 100,
+                currency: capturedPayment.currency,
+                method: capturedPayment.method
+              };
+
+              // We found the latest successful payment — break
+              break;
+            }
+          }
+        } catch (rzpError) {
+          console.error('[PAYMENT] Razorpay sync: Error fetching order', doc.id, rzpError.message);
+          // Continue checking other orders
+        }
+      }
+
+      if (syncedPayment) {
+        // Fetch updated subscription to return
+        const userDoc = await db.collection('dine_user_data').doc(userId).get();
+        const subscription = userDoc.exists ? userDoc.data().subscription : null;
+
+        return res.json({
+          success: true,
+          synced: true,
+          message: 'Payment recovered from Razorpay',
+          payment: syncedPayment,
+          subscription
+        });
+      }
+
+      return res.json({ success: true, synced: false, message: 'No missed payments found' });
+
+    } catch (error) {
+      console.error('[PAYMENT] Razorpay sync error:', error);
+      res.status(500).json({ success: false, error: 'Sync failed', details: error.message });
     }
   });
 
