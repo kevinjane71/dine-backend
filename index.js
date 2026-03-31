@@ -14858,6 +14858,42 @@ app.get('/api/smart-suggestions/:restaurantId', authenticateToken, async (req, r
 // INVENTORY MANAGEMENT APIs
 // ========================================
 
+// Helper: resolve inventory permissions from pageAccess (boolean or object)
+function resolveInventoryPerms(pageAccess) {
+  const inv = pageAccess?.inventory;
+  if (typeof inv === 'object' && inv !== null) {
+    return { read: !!inv.read, add: !!inv.add, update: !!inv.update, delete: !!inv.delete };
+  }
+  const val = !!inv;
+  return { read: val, add: val, update: val, delete: val };
+}
+
+// Helper: check inventory permission for staff (async, checks Firestore)
+async function checkInventoryPermission(req, operation) {
+  const { role } = req.user;
+  if (role === 'owner' || role === 'admin') return true;
+  // Manager default: full access unless restricted
+  if (role === 'manager') {
+    try {
+      const userId = req.user.userId || req.user.id;
+      let userDoc = await db.collection(collections.staffUsers).doc(userId).get();
+      if (!userDoc.exists) userDoc = await db.collection(collections.users).doc(userId).get();
+      if (!userDoc.exists) return true; // Can't find doc, allow manager by default
+      const perms = resolveInventoryPerms(userDoc.data()?.pageAccess);
+      return perms[operation];
+    } catch { return true; }
+  }
+  // Employee and other roles
+  try {
+    const userId = req.user.userId || req.user.id;
+    let userDoc = await db.collection(collections.staffUsers).doc(userId).get();
+    if (!userDoc.exists) userDoc = await db.collection(collections.users).doc(userId).get();
+    if (!userDoc.exists) return false;
+    const perms = resolveInventoryPerms(userDoc.data()?.pageAccess);
+    return perms[operation];
+  } catch { return false; }
+}
+
 // Get all inventory items for a restaurant
 app.get('/api/inventory/:restaurantId', authenticateToken, async (req, res) => {
   try {
@@ -14908,9 +14944,32 @@ app.get('/api/inventory/:restaurantId', authenticateToken, async (req, res) => {
       items.push(itemData);
     });
 
+    // Fetch wastage data from stock batches (expired with remaining qty)
+    try {
+      const batchesSnapshot = await db.collection(collections.stockBatches)
+        .where('restaurantId', '==', restaurantId)
+        .get();
+      const now = new Date();
+      const wastageMap = {};
+      batchesSnapshot.forEach(doc => {
+        const data = doc.data();
+        const expiry = data.expiryDate?.toDate?.() || (data.expiryDate ? new Date(data.expiryDate) : null);
+        if (expiry && expiry < now && (data.remainingQty || 0) > 0) {
+          const iid = data.inventoryItemId;
+          wastageMap[iid] = (wastageMap[iid] || 0) + data.remainingQty;
+        }
+      });
+      // Attach wastedQty to each item
+      items.forEach(item => {
+        item.wastedQty = wastageMap[item.id] || 0;
+      });
+    } catch (e) {
+      console.warn('Wastage data fetch failed (non-critical):', e.message);
+    }
+
     console.log(`📊 Inventory results: ${items.length} items found for restaurant ${restaurantId}`);
 
-    res.json({ 
+    res.json({
       items,
       total: items.length,
       timestamp: new Date().toISOString()
@@ -14993,18 +15052,42 @@ app.get('/api/inventory/:restaurantId/dashboard', authenticateToken, async (req,
       totalValue += (itemData.currentStock || 0) * (itemData.costPerUnit || 0);
     });
 
+    // Wastage stats from expired batches
+    let wastedItemsCount = 0;
+    let totalWasteValue = 0;
+    try {
+      const batchesSnapshot = await db.collection(collections.stockBatches)
+        .where('restaurantId', '==', restaurantId)
+        .get();
+      const now = new Date();
+      const wastedItemIds = new Set();
+      batchesSnapshot.forEach(doc => {
+        const data = doc.data();
+        const expiry = data.expiryDate?.toDate?.() || (data.expiryDate ? new Date(data.expiryDate) : null);
+        if (expiry && expiry < now && (data.remainingQty || 0) > 0) {
+          wastedItemIds.add(data.inventoryItemId);
+          totalWasteValue += (data.remainingQty || 0) * (data.costPerUnit || 0);
+        }
+      });
+      wastedItemsCount = wastedItemIds.size;
+    } catch (e) {
+      console.warn('Wastage stats query failed (non-critical):', e.message);
+    }
+
     const stats = {
       totalItems,
       lowStockItems,
       expiredItems,
       totalValue: Math.round(totalValue * 100) / 100,
       totalCategories: categories.size,
+      wastedItemsCount,
+      totalWasteValue: Math.round(totalWasteValue * 100) / 100,
       timestamp: new Date().toISOString()
     };
 
     console.log(`📈 Dashboard stats: ${JSON.stringify(stats)}`);
 
-    res.json({ 
+    res.json({
       stats,
       timestamp: new Date().toISOString()
     });
@@ -15476,10 +15559,11 @@ app.post('/api/inventory/:restaurantId', authenticateToken, async (req, res) => 
   try {
     const { restaurantId } = req.params;
     const { userId, role } = req.user;
-    
-    // Check permissions
-    if (role !== 'owner' && role !== 'manager') {
-      return res.status(403).json({ error: 'Access denied. Owner or manager privileges required.' });
+
+    // Check granular inventory add permission
+    const canAdd = await checkInventoryPermission(req, 'add');
+    if (!canAdd) {
+      return res.status(403).json({ error: 'Access denied. Inventory add permission required.' });
     }
 
     const {
@@ -15494,6 +15578,8 @@ app.post('/api/inventory/:restaurantId', authenticateToken, async (req, res) => 
       description,
       barcode,
       expiryDate,
+      mfgDate,
+      expiryDays,
       location
     } = req.body;
 
@@ -15513,12 +15599,20 @@ app.post('/api/inventory/:restaurantId', authenticateToken, async (req, res) => 
       return res.status(400).json({ error: 'Item with this name already exists' });
     }
 
+    // Auto-calculate expiryDate from mfgDate + expiryDays if provided
+    let calculatedExpiryDate = expiryDate || null;
+    if (mfgDate && expiryDays && !expiryDate) {
+      const mfg = new Date(mfgDate);
+      mfg.setDate(mfg.getDate() + parseInt(expiryDays));
+      calculatedExpiryDate = mfg.toISOString().split('T')[0];
+    }
+
     // Determine status based on stock levels
     let status = 'good';
     if (currentStock <= minStock) {
       status = 'low';
     }
-    if (expiryDate && new Date(expiryDate) < new Date()) {
+    if (calculatedExpiryDate && new Date(calculatedExpiryDate) < new Date()) {
       status = 'expired';
     }
 
@@ -15534,7 +15628,9 @@ app.post('/api/inventory/:restaurantId', authenticateToken, async (req, res) => 
       supplier: supplier?.trim() || '',
       description: description?.trim() || '',
       barcode: barcode?.trim() || '',
-      expiryDate: expiryDate || null,
+      expiryDate: calculatedExpiryDate,
+      mfgDate: mfgDate || null,
+      expiryDays: expiryDays ? parseInt(expiryDays) : null,
       location: location?.trim() || '',
       status,
       createdAt: new Date(),
@@ -15544,6 +15640,29 @@ app.post('/api/inventory/:restaurantId', authenticateToken, async (req, res) => 
     };
 
     const itemRef = await db.collection(collections.inventory).add(itemData);
+
+    // Create initial stock batch if there's stock
+    const stockQty = parseFloat(currentStock) || 0;
+    if (stockQty > 0) {
+      await db.collection(collections.stockBatches).add({
+        restaurantId,
+        inventoryItemId: itemRef.id,
+        inventoryItemName: itemData.name,
+        quantity: stockQty,
+        remainingQty: stockQty,
+        unit: itemData.unit,
+        mfgDate: mfgDate ? new Date(mfgDate) : new Date(),
+        expiryDays: expiryDays ? parseInt(expiryDays) : null,
+        expiryDate: calculatedExpiryDate ? new Date(calculatedExpiryDate) : null,
+        costPerUnit: itemData.costPerUnit,
+        supplier: itemData.supplier,
+        addedBy: userId,
+        source: 'manual',
+        status: 'active',
+        createdAt: new Date(),
+        updatedAt: new Date()
+      });
+    }
 
     console.log(`📦 Inventory item created: ${itemRef.id} - ${itemData.name}`);
 
@@ -15563,10 +15682,11 @@ app.patch('/api/inventory/:restaurantId/:itemId', authenticateToken, async (req,
   try {
     const { restaurantId, itemId } = req.params;
     const { userId, role } = req.user;
-    
-    // Check permissions
-    if (role !== 'owner' && role !== 'manager') {
-      return res.status(403).json({ error: 'Access denied. Owner or manager privileges required.' });
+
+    // Check granular inventory update permission
+    const canUpdate = await checkInventoryPermission(req, 'update');
+    if (!canUpdate) {
+      return res.status(403).json({ error: 'Access denied. Inventory update permission required.' });
     }
 
     // Get current item
@@ -15590,21 +15710,32 @@ app.patch('/api/inventory/:restaurantId/:itemId', authenticateToken, async (req,
     // Update fields if provided
     const fieldsToUpdate = [
       'name', 'category', 'unit', 'currentStock', 'minStock', 'maxStock',
-      'costPerUnit', 'supplier', 'description', 'barcode', 'expiryDate', 'location'
+      'costPerUnit', 'supplier', 'description', 'barcode', 'expiryDate', 'mfgDate', 'expiryDays', 'location'
     ];
 
     fieldsToUpdate.forEach(field => {
       if (req.body[field] !== undefined) {
-        if (field === 'name' || field === 'category' || field === 'unit' || 
+        if (field === 'name' || field === 'category' || field === 'unit' ||
             field === 'supplier' || field === 'description' || field === 'barcode' || field === 'location') {
           updateData[field] = req.body[field]?.trim() || '';
         } else if (field === 'currentStock' || field === 'minStock' || field === 'maxStock' || field === 'costPerUnit') {
           updateData[field] = parseFloat(req.body[field]) || 0;
-        } else if (field === 'expiryDate') {
+        } else if (field === 'expiryDate' || field === 'mfgDate') {
           updateData[field] = req.body[field] || null;
+        } else if (field === 'expiryDays') {
+          updateData[field] = req.body[field] ? parseInt(req.body[field]) : null;
         }
       }
     });
+
+    // Auto-calculate expiryDate from mfgDate + expiryDays
+    const newMfgDate = updateData.mfgDate !== undefined ? updateData.mfgDate : currentItem.mfgDate;
+    const newExpiryDays = updateData.expiryDays !== undefined ? updateData.expiryDays : currentItem.expiryDays;
+    if (newMfgDate && newExpiryDays && updateData.expiryDate === undefined) {
+      const mfg = new Date(newMfgDate);
+      mfg.setDate(mfg.getDate() + parseInt(newExpiryDays));
+      updateData.expiryDate = mfg.toISOString().split('T')[0];
+    }
 
     // Recalculate status
     const newCurrentStock = updateData.currentStock !== undefined ? updateData.currentStock : currentItem.currentStock;
@@ -15619,6 +15750,54 @@ app.patch('/api/inventory/:restaurantId/:itemId', authenticateToken, async (req,
       status = 'expired';
     }
     updateData.status = status;
+
+    // If stock increased, create a new batch for the added amount
+    const oldStock = parseFloat(currentItem.currentStock) || 0;
+    const updatedStock = updateData.currentStock !== undefined ? updateData.currentStock : oldStock;
+    const stockIncrease = updatedStock - oldStock;
+
+    if (stockIncrease > 0) {
+      const batchMfgDate = updateData.mfgDate || currentItem.mfgDate || null;
+      const batchExpiryDate = updateData.expiryDate || currentItem.expiryDate || null;
+      const batchExpiryDays = updateData.expiryDays || currentItem.expiryDays || null;
+
+      await db.collection(collections.stockBatches).add({
+        restaurantId,
+        inventoryItemId: itemId,
+        inventoryItemName: updateData.name || currentItem.name,
+        quantity: stockIncrease,
+        remainingQty: stockIncrease,
+        unit: updateData.unit || currentItem.unit,
+        mfgDate: batchMfgDate ? new Date(batchMfgDate) : new Date(),
+        expiryDays: batchExpiryDays,
+        expiryDate: batchExpiryDate ? new Date(batchExpiryDate) : null,
+        costPerUnit: updateData.costPerUnit !== undefined ? updateData.costPerUnit : (currentItem.costPerUnit || 0),
+        supplier: updateData.supplier || currentItem.supplier || '',
+        addedBy: userId,
+        source: 'manual',
+        status: 'active',
+        createdAt: new Date(),
+        updatedAt: new Date()
+      });
+    }
+
+    // Log manual stock changes as transactions
+    if (stockIncrease !== 0) {
+      await db.collection(collections.inventoryTransactions).add({
+        restaurantId,
+        inventoryItemId: itemId,
+        inventoryItemName: updateData.name || currentItem.name,
+        type: stockIncrease > 0 ? 'ADDITION' : 'ADJUSTMENT',
+        source: 'MANUAL',
+        quantityChange: stockIncrease,
+        previousStock: oldStock,
+        newStock: updatedStock,
+        unit: updateData.unit || currentItem.unit,
+        date: new Date(),
+        performedBy: userId,
+        notes: stockIncrease > 0 ? `Manual stock addition of ${stockIncrease}` : `Manual stock adjustment of ${stockIncrease}`
+      });
+    }
 
     await db.collection(collections.inventory).doc(itemId).update(updateData);
 
@@ -15640,10 +15819,11 @@ app.delete('/api/inventory/:restaurantId/:itemId', authenticateToken, async (req
   try {
     const { restaurantId, itemId } = req.params;
     const { userId, role } = req.user;
-    
-    // Check permissions
-    if (role !== 'owner' && role !== 'manager') {
-      return res.status(403).json({ error: 'Access denied. Owner or manager privileges required.' });
+
+    // Check granular inventory delete permission
+    const canDelete = await checkInventoryPermission(req, 'delete');
+    if (!canDelete) {
+      return res.status(403).json({ error: 'Access denied. Inventory delete permission required.' });
     }
 
     // Get item to verify ownership
@@ -15668,6 +15848,135 @@ app.delete('/api/inventory/:restaurantId/:itemId', authenticateToken, async (req
   } catch (error) {
     console.error('Delete inventory item error:', error);
     res.status(500).json({ error: 'Failed to delete inventory item' });
+  }
+});
+
+// Get stock batches for an inventory item
+app.get('/api/inventory/:restaurantId/:itemId/batches', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId, itemId } = req.params;
+
+    const batchesSnapshot = await db.collection(collections.stockBatches)
+      .where('restaurantId', '==', restaurantId)
+      .where('inventoryItemId', '==', itemId)
+      .get();
+
+    const batches = [];
+    batchesSnapshot.forEach(doc => {
+      const data = doc.data();
+      batches.push({
+        id: doc.id,
+        ...data,
+        mfgDate: data.mfgDate?.toDate?.() || data.mfgDate || null,
+        expiryDate: data.expiryDate?.toDate?.() || data.expiryDate || null,
+        createdAt: data.createdAt?.toDate?.() || data.createdAt,
+        updatedAt: data.updatedAt?.toDate?.() || data.updatedAt,
+      });
+    });
+
+    // Sort by createdAt DESC (newest first for display)
+    batches.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+
+    res.json({ batches });
+  } catch (error) {
+    console.error('Get stock batches error:', error);
+    res.status(500).json({ error: 'Failed to fetch stock batches' });
+  }
+});
+
+// Get stock history (transactions + batches) for an inventory item
+app.get('/api/inventory/:restaurantId/:itemId/history', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId, itemId } = req.params;
+
+    // Get transactions for this item
+    const txSnapshot = await db.collection(collections.inventoryTransactions)
+      .where('restaurantId', '==', restaurantId)
+      .where('inventoryItemId', '==', itemId)
+      .get();
+
+    const transactions = [];
+    txSnapshot.forEach(doc => {
+      const data = doc.data();
+      transactions.push({
+        id: doc.id,
+        ...data,
+        date: data.date?.toDate?.() || data.date,
+      });
+    });
+    transactions.sort((a, b) => new Date(b.date) - new Date(a.date));
+
+    // Get batches for this item
+    const batchesSnapshot = await db.collection(collections.stockBatches)
+      .where('restaurantId', '==', restaurantId)
+      .where('inventoryItemId', '==', itemId)
+      .get();
+
+    const batches = [];
+    batchesSnapshot.forEach(doc => {
+      const data = doc.data();
+      batches.push({
+        id: doc.id,
+        ...data,
+        mfgDate: data.mfgDate?.toDate?.() || data.mfgDate || null,
+        expiryDate: data.expiryDate?.toDate?.() || data.expiryDate || null,
+        createdAt: data.createdAt?.toDate?.() || data.createdAt,
+        updatedAt: data.updatedAt?.toDate?.() || data.updatedAt,
+      });
+    });
+    batches.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+
+    res.json({ transactions, batches });
+  } catch (error) {
+    console.error('Get stock history error:', error);
+    res.status(500).json({ error: 'Failed to fetch stock history' });
+  }
+});
+
+// Get wastage summary for a restaurant
+app.get('/api/inventory/:restaurantId/wastage', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+
+    const batchesSnapshot = await db.collection(collections.stockBatches)
+      .where('restaurantId', '==', restaurantId)
+      .get();
+
+    const now = new Date();
+    const wastageMap = {};
+    let totalWasteValue = 0;
+
+    batchesSnapshot.forEach(doc => {
+      const data = doc.data();
+      const expiryDate = data.expiryDate?.toDate?.() || (data.expiryDate ? new Date(data.expiryDate) : null);
+      if (expiryDate && expiryDate < now && (data.remainingQty || 0) > 0) {
+        const itemId = data.inventoryItemId;
+        if (!wastageMap[itemId]) {
+          wastageMap[itemId] = { itemId, itemName: data.inventoryItemName, wastedQty: 0, wastedValue: 0, unit: data.unit, batches: [] };
+        }
+        const wasteVal = (data.remainingQty || 0) * (data.costPerUnit || 0);
+        wastageMap[itemId].wastedQty += data.remainingQty;
+        wastageMap[itemId].wastedValue += wasteVal;
+        wastageMap[itemId].batches.push({
+          batchId: doc.id,
+          remainingQty: data.remainingQty,
+          expiryDate: expiryDate,
+          mfgDate: data.mfgDate?.toDate?.() || data.mfgDate || null,
+        });
+        totalWasteValue += wasteVal;
+      }
+    });
+
+    const wastage = Object.values(wastageMap);
+
+    res.json({
+      wastage,
+      totalWasteValue,
+      wastedItemsCount: wastage.length,
+    });
+  } catch (error) {
+    console.error('Get wastage error:', error);
+    res.status(500).json({ error: 'Failed to fetch wastage data' });
   }
 });
 

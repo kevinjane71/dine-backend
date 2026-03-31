@@ -1,4 +1,4 @@
-const { db } = require('../firebase');
+const { db, collections } = require('../firebase');
 const aiRecipeService = require('./aiRecipeService');
 
 class InventoryService {
@@ -141,10 +141,8 @@ class InventoryService {
             }
 
             if (inventoryItem) {
-                // Perform simple unit conversion if possible (basic implementation)
-                // Assuming units match for now or are simple metric (g/kg, ml/l)
                 let deductionAmount = qtyNeeded;
-                
+
                 // Basic Unit Handling (Simple scaling)
                 if (ingredient.unit === 'g' && inventoryItem.unit === 'kg') {
                     deductionAmount = qtyNeeded / 1000;
@@ -152,8 +150,55 @@ class InventoryService {
                     deductionAmount = qtyNeeded / 1000;
                 }
 
-                const newStock = (inventoryItem.currentStock || 0) - deductionAmount;
-                
+                // --- FIFO Batch Deduction ---
+                const batchIds = [];
+                let newStock;
+
+                try {
+                  const batchesSnapshot = await db.collection(collections.stockBatches)
+                    .where('inventoryItemId', '==', inventoryItem.id)
+                    .where('status', '==', 'active')
+                    .get();
+
+                  const activeBatches = [];
+                  batchesSnapshot.forEach(doc => {
+                    const d = doc.data();
+                    if ((d.remainingQty || 0) > 0) {
+                      activeBatches.push({ id: doc.id, ...d, ref: doc.ref });
+                    }
+                  });
+
+                  if (activeBatches.length > 0) {
+                    // Sort oldest first (FIFO): mfgDate ASC, fallback to createdAt
+                    activeBatches.sort((a, b) => {
+                      const dateA = a.mfgDate?.toDate?.() || a.mfgDate || a.createdAt?.toDate?.() || a.createdAt || 0;
+                      const dateB = b.mfgDate?.toDate?.() || b.mfgDate || b.createdAt?.toDate?.() || b.createdAt || 0;
+                      return new Date(dateA) - new Date(dateB);
+                    });
+
+                    let remaining = deductionAmount;
+                    for (const stockBatch of activeBatches) {
+                      if (remaining <= 0) break;
+                      const deductFromBatch = Math.min(stockBatch.remainingQty, remaining);
+                      const updatedRemaining = stockBatch.remainingQty - deductFromBatch;
+                      batch.update(stockBatch.ref, {
+                        remainingQty: updatedRemaining,
+                        status: updatedRemaining <= 0 ? 'depleted' : 'active',
+                        updatedAt: new Date()
+                      });
+                      batchIds.push(stockBatch.id);
+                      remaining -= deductFromBatch;
+                    }
+                    newStock = (inventoryItem.currentStock || 0) - deductionAmount;
+                  } else {
+                    // No batches — backward-compatible simple deduction
+                    newStock = (inventoryItem.currentStock || 0) - deductionAmount;
+                  }
+                } catch (batchErr) {
+                  console.warn(`⚠️ FIFO batch query failed for ${inventoryItem.name}, using simple deduction:`, batchErr.message);
+                  newStock = (inventoryItem.currentStock || 0) - deductionAmount;
+                }
+
                 // Update Inventory
                 batch.update(inventoryItem.ref, {
                     currentStock: newStock,
@@ -162,18 +207,20 @@ class InventoryService {
 
                 // Log Transaction
                 const transactionRef = db.collection('inventoryTransactions').doc();
-                batch.set(transactionRef, {
+                const txData = {
                     restaurantId,
                     inventoryItemId: inventoryItem.id,
                     inventoryItemName: inventoryItem.name,
                     type: 'DEDUCTION',
                     source: 'ORDER',
-                    referenceId: orderId, // Order ID
+                    referenceId: orderId,
                     quantityChange: -deductionAmount,
                     unit: inventoryItem.unit,
                     date: new Date(),
                     notes: `Order of ${qtySold}x ${item.name}`
-                });
+                };
+                if (batchIds.length > 0) txData.batchIds = batchIds;
+                batch.set(transactionRef, txData);
 
                 hasUpdates = true;
                 deductions.push({
@@ -183,8 +230,8 @@ class InventoryService {
                   quantityDeducted: deductionAmount,
                   newStock,
                   menuItemName: item.name,
+                  ...(batchIds.length > 0 && { batchIds }),
                 });
-                // Update local array to reflect changes if same ingredient used multiple times in order
                 inventoryItem.currentStock = newStock;
             } else {
                 console.log(`⚠️ Could not find inventory item for ingredient: ${ingredient.inventoryItemName}`);

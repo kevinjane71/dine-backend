@@ -101,6 +101,7 @@ const collections = {
   supplierQuotations: 'supplier-quotations',
   supplierPerformance: 'supplier-performance',
   inventoryTransactions: 'inventoryTransactions',
+  stockBatches: 'stockBatches',
   aiUsage: 'aiUsage',
   // Automation & Loyalty Collections
   automations: 'automations',
