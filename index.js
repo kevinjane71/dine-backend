@@ -8595,9 +8595,13 @@ app.get('/api/analytics/:restaurantId/daily-summary', authenticateToken, async (
       dates = [date || today];
     }
 
+    console.log(`📊 daily-summary: restaurantId=${restaurantId}, dates=${JSON.stringify(dates)}, period=${period}`);
+
     // Batch-read dailyStats docs
     const docRefs = dates.map(d => db.collection('dailyStats').doc(`${restaurantId}_${d}`));
     const docs = docRefs.length > 0 ? await db.getAll(...docRefs) : [];
+
+    console.log(`📊 daily-summary: found ${docs.filter(d => d.exists).length}/${docs.length} dailyStats docs`);
 
     // Aggregate across all dates
     let totalOrders = 0, totalRevenue = 0, totalRevenueWithTax = 0;
@@ -8661,16 +8665,21 @@ app.get('/api/analytics/:restaurantId/daily-summary', authenticateToken, async (
       }
     }
 
-    // Fallback: if no itemCounts in dailyStats, aggregate from raw orders
-    if (items.length === 0 && totalOrders > 0) {
-      const rangeStart = new Date(dates[0] + 'T00:00:00.000Z');
-      const rangeEnd = new Date(dates[dates.length - 1] + 'T23:59:59.999Z');
+    // Fallback: if no itemCounts in dailyStats (or no dailyStats docs found), aggregate from raw orders
+    if (items.length === 0) {
+      // Use local timezone (matching how orders are created with new Date())
+      const [sy, sm, sd] = dates[0].split('-').map(Number);
+      const [ey, em, ed] = dates[dates.length - 1].split('-').map(Number);
+      const rangeStart = new Date(sy, sm - 1, sd, 0, 0, 0, 0);
+      const rangeEnd = new Date(ey, em - 1, ed, 23, 59, 59, 999);
+      console.log(`📊 daily-summary fallback: querying raw orders from ${rangeStart.toISOString()} to ${rangeEnd.toISOString()}`);
       const ordersSnap = await db.collection(collections.orders)
         .where('restaurantId', '==', restaurantId)
         .where('createdAt', '>=', rangeStart)
         .where('createdAt', '<=', rangeEnd)
         .get();
 
+      console.log(`📊 daily-summary fallback: found ${ordersSnap.size} raw orders`);
       totalOrders = 0; totalRevenue = 0; totalRevenueWithTax = 0;
 
       ordersSnap.docs.forEach(doc => {
