@@ -532,7 +532,8 @@ const allowedOrigins = [
   'http://localhost:3005',
   'https://dine-frontend-ecru.vercel.app',
   'https://pms-hotel.vercel.app',
-  "https://dine-admin.vercel.app"
+  "https://dine-admin.vercel.app",
+  'https://dine-invoice-fe.vercel.app'
 ];
 
 // Helper function to check if origin is a valid dineopen.com domain or subdomain
