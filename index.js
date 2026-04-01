@@ -1,19 +1,75 @@
 const express = require('express');
-const compression = require('compression');
 const cors = require('cors');
 const helmet = require('helmet');
 const morgan = require('morgan');
 const bodyParser = require('body-parser');
 const jwt = require('jsonwebtoken');
 const bcrypt = require('bcryptjs');
-const QRCode = require('qrcode');
-const { OAuth2Client } = require('google-auth-library');
-const multer = require('multer');
-const { Storage } = require('@google-cloud/storage');
-const OpenAI = require('openai');
-// const twilio = require('twilio');
-const Razorpay = require('razorpay');
 require('dotenv').config();
+
+// Lazy-loaded heavy dependencies (reduce cold start by ~1-2s)
+// These are only require()'d and initialized when first accessed, not on every cold start.
+// Uses Proxy so existing code (openai.chat..., bucket.file..., upload.single...) works unchanged.
+function lazyInit(factory) {
+  let instance;
+  return new Proxy({}, {
+    get(_, prop) {
+      if (!instance) instance = factory();
+      return typeof instance[prop] === 'function' ? instance[prop].bind(instance) : instance[prop];
+    }
+  });
+}
+
+const openai = lazyInit(() => {
+  const OpenAI = require('openai');
+  return new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+});
+
+const QRCode = lazyInit(() => require('qrcode'));
+
+let _razorpayInstance;
+function getRazorpay() {
+  if (_razorpayInstance !== undefined) return _razorpayInstance;
+  try {
+    const Razorpay = require('razorpay');
+    if (process.env.RAZORPAY_KEY_ID && process.env.RAZORPAY_KEY_SECRET) {
+      _razorpayInstance = new Razorpay({ key_id: process.env.RAZORPAY_KEY_ID, key_secret: process.env.RAZORPAY_KEY_SECRET });
+    } else { _razorpayInstance = null; }
+  } catch (e) { _razorpayInstance = null; }
+  return _razorpayInstance;
+}
+
+const upload = lazyInit(() => {
+  const multer = require('multer');
+  return multer({
+    storage: multer.memoryStorage(),
+    limits: { fileSize: 300 * 1024 * 1024, files: 10 },
+    fileFilter: (req, file, cb) => {
+      const allowedTypes = ['image/jpeg', 'image/png', 'image/jpg', 'image/webp', 'application/pdf'];
+      if (allowedTypes.includes(file.mimetype)) cb(null, true);
+      else cb(new Error('Invalid file type. Only images and PDFs are allowed.'), false);
+    }
+  });
+});
+
+const bucket = lazyInit(() => {
+  const { Storage } = require('@google-cloud/storage');
+  let storage;
+  if (process.env.NODE_ENV === 'production') {
+    try {
+      const credentialsJson = process.env.GOOGLE_APPLICATION_CREDENTIALS_JSON;
+      if (!credentialsJson || credentialsJson === 'undefined') {
+        storage = new Storage();
+      } else {
+        const serviceAccount = JSON.parse(credentialsJson);
+        storage = new Storage({ projectId: serviceAccount.project_id, credentials: { client_email: serviceAccount.client_email, private_key: serviceAccount.private_key } });
+      }
+    } catch (e) { storage = new Storage(); }
+  } else {
+    storage = new Storage();
+  }
+  return storage.bucket(process.env.FIREBASE_STORAGE_BUCKET || 'dine-menu-uploads');
+});
 
 const { db, collections } = require('./firebase');
 const { FieldValue } = require('firebase-admin/firestore');
@@ -382,10 +438,6 @@ const dinebotConfig = {
   model: 'text-davinci-003'
 };
 
-// Initialize OpenAI
-const openai = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY,
-});
 const initializePaymentRoutes = require('./payment');
 const initializeDodoPaymentRoutes = require('./dodoPayment');
 const emailService = require('./emailService');
@@ -448,78 +500,7 @@ const app = express();
 
 const PORT = process.env.PORT || 3003;
 
-const googleClient = new OAuth2Client(process.env.GOOGLE_CLIENT_ID);
-// const twilioClient = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
-
-// Initialize Razorpay with validation
-let razorpay;
-try {
-  if (!process.env.RAZORPAY_KEY_ID || !process.env.RAZORPAY_KEY_SECRET) {
-    console.warn('⚠️ Razorpay environment variables not set - payment features will be disabled');
-    razorpay = null;
-  } else {
-    razorpay = new Razorpay({
-      key_id: process.env.RAZORPAY_KEY_ID,
-      key_secret: process.env.RAZORPAY_KEY_SECRET
-    });
-    console.log('✅ Razorpay initialized successfully');
-  }
-} catch (error) {
-  console.error('❌ Razorpay initialization error:', error.message);
-  console.error('Please check your RAZORPAY_KEY_ID and RAZORPAY_KEY_SECRET environment variables');
-  razorpay = null;
-}
-
-// Initialize Firebase Storage
-let storage;
-if (process.env.NODE_ENV === 'production') {
-  // For production
-  try {
-    const credentialsJson = process.env.GOOGLE_APPLICATION_CREDENTIALS_JSON;
-    if (!credentialsJson || credentialsJson === 'undefined') {
-      console.warn('⚠️ GOOGLE_APPLICATION_CREDENTIALS_JSON not set, using default Firebase initialization');
-      storage = new Storage();
-    } else {
-      const serviceAccount = JSON.parse(credentialsJson);
-      storage = new Storage({
-        projectId: serviceAccount.project_id,
-        credentials: {
-          client_email: serviceAccount.client_email,
-          private_key: serviceAccount.private_key
-        }
-      });
-      console.log('✅ Firebase Storage initialized with service account');
-    }
-  } catch (error) {
-    console.error('❌ Error parsing Firebase credentials:', error.message);
-    console.warn('⚠️ Falling back to default Firebase initialization');
-    storage = new Storage();
-  }
-} else {
-  // For local development
-  storage = new Storage();
-  console.log('✅ Firebase Storage initialized for development');
-}
-const bucket = storage.bucket(process.env.FIREBASE_STORAGE_BUCKET || 'dine-menu-uploads');
-
-
-// Configure multer for file uploads
-const upload = multer({ 
-  storage: multer.memoryStorage(),
-  limits: {
-    fileSize: 300 * 1024 * 1024, // 300MB max file size
-    files: 10 // Max 10 files
-  },
-  fileFilter: (req, file, cb) => {
-    // Allow images and PDFs
-    const allowedTypes = ['image/jpeg', 'image/png', 'image/jpg', 'image/webp', 'application/pdf'];
-    if (allowedTypes.includes(file.mimetype)) {
-      cb(null, true);
-    } else {
-      cb(new Error('Invalid file type. Only images and PDFs are allowed.'), false);
-    }
-  }
-});
+// googleClient, razorpay, storage, multer — all lazy-loaded via getters above
 // Feature flag for subdomain functionality
 const SUBDOMAIN_FEATURE_ENABLED = process.env.ENABLE_SUBDOMAIN === 'true'; // Default: false (disabled)
 console.log(`🌐 Subdomain feature: ${SUBDOMAIN_FEATURE_ENABLED ? 'ENABLED' : 'DISABLED'}`);
@@ -682,8 +663,8 @@ app.use((req, res, next) => {
 
 app.use(helmet({ crossOriginResourcePolicy: { policy: "cross-origin" } }));
 
-// Compress responses (gzip) — reduces payload size by ~60-80% for JSON
-app.use(compression());
+// Note: compression removed — Vercel Edge applies gzip/brotli automatically.
+// Running compression() in serverless adds CPU overhead without benefit.
 
 app.use(morgan(process.env.NODE_ENV === 'production' ? 'combined' : 'dev'));
 app.use(bodyParser.json({
@@ -9964,7 +9945,7 @@ async function calculateOrderTotal(items) {
 }
 
 // Initialize payment routes
-const paymentRoutes = initializePaymentRoutes(db, razorpay);
+const paymentRoutes = initializePaymentRoutes(db, getRazorpay());
 app.use('/api/payments', paymentRoutes);
 
 // Initialize Dodo Payments routes (international payments)
@@ -21607,7 +21588,7 @@ app.get('/api/restaurants/:restaurantId/qr-code', authenticateToken, async (req,
 });
 
 // Mount payment routes
-const paymentRouter = initializePaymentRoutes(db, razorpay);
+const paymentRouter = initializePaymentRoutes(db, getRazorpay());
 app.use('/api/payments', paymentRouter);
 
 // Mount Dodo payment routes (international payments)
