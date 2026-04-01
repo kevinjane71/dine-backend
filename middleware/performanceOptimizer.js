@@ -20,13 +20,15 @@ const performanceOptimizer = (req, res, next) => {
   const originalJson = res.json.bind(res);
   res.json = function(data) {
     const duration = Date.now() - startTime;
-    res.setHeader('X-Response-Time', `${duration}ms`);
-    
+    if (!res.headersSent) {
+      res.setHeader('X-Response-Time', `${duration}ms`);
+    }
+
     // Log slow requests (> 1 second)
     if (duration > 1000) {
       console.warn(`⚠️ Slow API request: ${req.method} ${req.path} took ${duration}ms`);
     }
-    
+
     return originalJson(data);
   };
 
@@ -34,12 +36,14 @@ const performanceOptimizer = (req, res, next) => {
   const originalSend = res.send.bind(res);
   res.send = function(data) {
     const duration = Date.now() - startTime;
-    res.setHeader('X-Response-Time', `${duration}ms`);
-    
+    if (!res.headersSent) {
+      res.setHeader('X-Response-Time', `${duration}ms`);
+    }
+
     if (duration > 1000) {
       console.warn(`⚠️ Slow API request: ${req.method} ${req.path} took ${duration}ms`);
     }
-    
+
     return originalSend(data);
   };
 

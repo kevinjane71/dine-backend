@@ -123,7 +123,9 @@ const collections = {
   invPayments: 'inv_payments',
   invExpenses: 'inv_expenses',
   invSettings: 'inv_settings',
-  invNumberSequences: 'inv_number_sequences'
+  invNumberSequences: 'inv_number_sequences',
+  // Books (Accounting) Collections
+  expenses: 'expenses'
 };
 
 const admin = null; // We don't need the legacy admin object anymore

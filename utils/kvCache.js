@@ -11,18 +11,35 @@ let redis = null;
 function getRedis() {
   if (redis) return redis;
 
-  // Only initialize if env vars are present
-  if (!process.env.KV_REST_API_URL || !process.env.KV_REST_API_TOKEN) {
-    return null;
-  }
-
   try {
     const { Redis } = require('@upstash/redis');
-    redis = new Redis({
-      url: process.env.KV_REST_API_URL,
-      token: process.env.KV_REST_API_TOKEN,
-    });
-    return redis;
+
+    // Option 1: Explicit REST API vars (preferred)
+    if (process.env.KV_REST_API_URL && process.env.KV_REST_API_TOKEN) {
+      redis = new Redis({
+        url: process.env.KV_REST_API_URL,
+        token: process.env.KV_REST_API_TOKEN,
+      });
+      return redis;
+    }
+
+    // Option 2: Derive from REDIS_URL (Vercel auto-injected)
+    // Format: redis://default:<token>@<host>:6379
+    if (process.env.REDIS_URL) {
+      const parsed = new URL(process.env.REDIS_URL);
+      const host = parsed.hostname; // e.g. xxxx.upstash.io
+      const token = parsed.password; // the auth token
+      if (host && token) {
+        redis = new Redis({
+          url: `https://${host}`,
+          token: token,
+        });
+        console.log('KV Cache: Initialized from REDIS_URL');
+        return redis;
+      }
+    }
+
+    return null;
   } catch (err) {
     console.error('KV Cache: Failed to initialize Redis:', err.message);
     return null;

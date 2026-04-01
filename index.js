@@ -1,4 +1,5 @@
 const express = require('express');
+const compression = require('compression');
 const cors = require('cors');
 const helmet = require('helmet');
 const morgan = require('morgan');
@@ -618,6 +619,8 @@ app.use((req, res, next) => {
 
   // Helper to set CORS headers - ALWAYS uses the request origin
   const setCorsHeaders = () => {
+    // Guard: don't touch headers after response is already sent (avoids ERR_HTTP_HEADERS_SENT)
+    if (res.headersSent) return;
     if (origin) {
       // ✅ Allow ALL dineopen.com domains and subdomains (*.dineopen.com)
       // ✅ Allow whitelisted origins
@@ -679,6 +682,8 @@ app.use((req, res, next) => {
 
 app.use(helmet({ crossOriginResourcePolicy: { policy: "cross-origin" } }));
 
+// Compress responses (gzip) — reduces payload size by ~60-80% for JSON
+app.use(compression());
 
 app.use(morgan(process.env.NODE_ENV === 'production' ? 'combined' : 'dev'));
 app.use(bodyParser.json({
@@ -4480,38 +4485,51 @@ app.post('/api/auth/local-login', async (req, res) => {
 app.get('/api/public/restaurants', vercelSecurityMiddleware.publicAPI, async (req, res) => {
   try {
     const { city, search } = req.query;
-    
-    let query = db.collection(collections.restaurants)
-      .where('status', '==', 'active'); // Only show active restaurants
 
-    if (city) {
-      // Note: Case-sensitive match. For better search, we'd use Algolia/Typesense or normalize fields.
-      query = query.where('city', '==', city);
-    }
+    // Cache key varies by city filter (search is done client-side on cached data)
+    const cacheKey = city ? `public-restaurants:${city}` : 'public-restaurants:all';
+    let restaurants = await kvGet(cacheKey);
 
-    const snapshot = await query.get();
-    let restaurants = [];
+    if (!restaurants) {
+      // Cache miss — read from Firestore
+      let query = db.collection(collections.restaurants)
+        .where('status', '==', 'active'); // Only show active restaurants
 
-    snapshot.forEach(doc => {
-      const data = doc.data();
-      // Filter out sensitive data, only send public profile info
-      const { ownerId, menu, staff, settings, ...publicData } = data;
-      
-      // Basic client-side search filter if query param provided (since Firestore has limited search)
-      if (search) {
-        const searchLower = search.toLowerCase();
-        const nameMatch = publicData.name?.toLowerCase().includes(searchLower);
-        const cuisineMatch = Array.isArray(publicData.cuisine) && publicData.cuisine.some(c => c.toLowerCase().includes(searchLower));
-        if (!nameMatch && !cuisineMatch) return;
+      if (city) {
+        query = query.where('city', '==', city);
       }
 
-      restaurants.push({
-        id: doc.id,
-        ...publicData,
-        menuTheme: data.menuTheme || { themeId: 'default' } // Include theme info for linking
-      });
-    });
+      const snapshot = await query.get();
+      restaurants = [];
 
+      snapshot.forEach(doc => {
+        const data = doc.data();
+        // Filter out sensitive data, only send public profile info
+        const { ownerId, menu, staff, settings, ...publicData } = data;
+
+        restaurants.push({
+          id: doc.id,
+          ...publicData,
+          menuTheme: data.menuTheme || { themeId: 'default' }
+        });
+      });
+
+      // Cache for 5 min (fire-and-forget)
+      kvSet(cacheKey, restaurants, 300).catch(() => {});
+    }
+
+    // Apply search filter on cached data (client-side filtering)
+    if (search) {
+      const searchLower = search.toLowerCase();
+      restaurants = restaurants.filter(r => {
+        const nameMatch = r.name?.toLowerCase().includes(searchLower);
+        const cuisineMatch = Array.isArray(r.cuisine) && r.cuisine.some(c => c.toLowerCase().includes(searchLower));
+        return nameMatch || cuisineMatch;
+      });
+    }
+
+    // Cache at Vercel Edge for 5 min
+    res.set('Cache-Control', 'public, s-maxage=300, stale-while-revalidate=120');
     res.json({ success: true, restaurants });
   } catch (error) {
     console.error('Error fetching public restaurants:', error);
@@ -5209,6 +5227,8 @@ app.get('/api/public/menu/:restaurantId', vercelSecurityMiddleware.publicAPI, as
         allergens: item.allergens || []
       }));
 
+    // Cache at Vercel Edge for 3 min, serve stale for 1 min while revalidating
+    res.set('Cache-Control', 'public, s-maxage=180, stale-while-revalidate=60');
     res.json({
       success: true,
       restaurant: {
@@ -12795,6 +12815,9 @@ app.put('/api/admin/tax/:restaurantId', authenticateToken, async (req, res) => {
       }
     });
 
+    // Invalidate Redis cache so public endpoints serve fresh data
+    invalidateRestaurantCache(restaurantId);
+
     res.json({
       success: true,
       message: 'Tax settings updated successfully',
@@ -12966,6 +12989,9 @@ app.put('/api/admin/business/:restaurantId', authenticateToken, async (req, res)
     }
 
     await restaurantRef.update(updateData);
+
+    // Invalidate Redis cache so public endpoints serve fresh data
+    invalidateRestaurantCache(restaurantId);
 
     res.json({
       success: true,
@@ -18437,6 +18463,557 @@ app.use((err, req, res, next) => {
   });
 });
 
+// ========================================
+// BOOKS (ACCOUNTING) APIs
+// ========================================
+
+// Helper: date range from period/custom params
+function getDateRange(period, startDate, endDate) {
+  const now = new Date();
+  let start, end;
+  end = new Date(now); end.setHours(23, 59, 59, 999);
+
+  switch (period) {
+    case 'today':
+      start = new Date(now); start.setHours(0, 0, 0, 0);
+      break;
+    case '7d':
+      start = new Date(now); start.setDate(start.getDate() - 7); start.setHours(0, 0, 0, 0);
+      break;
+    case '30d':
+      start = new Date(now); start.setDate(start.getDate() - 30); start.setHours(0, 0, 0, 0);
+      break;
+    case 'this_month':
+      start = new Date(now.getFullYear(), now.getMonth(), 1);
+      break;
+    case 'last_month':
+      start = new Date(now.getFullYear(), now.getMonth() - 1, 1);
+      end = new Date(now.getFullYear(), now.getMonth(), 0, 23, 59, 59, 999);
+      break;
+    case 'this_year':
+      start = new Date(now.getFullYear(), 0, 1);
+      break;
+    case 'custom':
+      start = startDate ? new Date(startDate) : new Date(now.getFullYear(), now.getMonth(), 1);
+      end = endDate ? new Date(endDate) : new Date(now);
+      start.setHours(0, 0, 0, 0);
+      end.setHours(23, 59, 59, 999);
+      break;
+    default:
+      start = new Date(now.getFullYear(), now.getMonth(), 1); // default this month
+  }
+  return { start, end };
+}
+
+// Helper: get previous period for comparison
+function getPreviousRange(start, end) {
+  const duration = end.getTime() - start.getTime();
+  const prevEnd = new Date(start.getTime() - 1);
+  const prevStart = new Date(prevEnd.getTime() - duration);
+  prevStart.setHours(0, 0, 0, 0);
+  prevEnd.setHours(23, 59, 59, 999);
+  return { start: prevStart, end: prevEnd };
+}
+
+// --- Revenue Aggregation ---
+app.get('/api/books/:restaurantId/revenue', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+    const { period = 'this_month', startDate, endDate } = req.query;
+    const { start, end } = getDateRange(period, startDate, endDate);
+    const prev = getPreviousRange(start, end);
+
+    const ordersRef = db.collection(collections.orders);
+    const [currentSnap, prevSnap] = await Promise.all([
+      ordersRef.where('restaurantId', '==', restaurantId)
+        .where('createdAt', '>=', start).where('createdAt', '<=', end).get(),
+      ordersRef.where('restaurantId', '==', restaurantId)
+        .where('createdAt', '>=', prev.start).where('createdAt', '<=', prev.end).get()
+    ]);
+
+    let totalRevenue = 0, totalTax = 0, totalDiscounts = 0, refunds = 0, orderCount = 0;
+    const byPaymentMethod = {};
+    const byOrderType = {};
+    const dailyMap = {};
+
+    currentSnap.forEach(doc => {
+      const o = doc.data();
+      if (o.status === 'cancelled') return;
+      const amount = o.finalAmount || o.totalAmount || 0;
+      totalRevenue += amount;
+      totalTax += o.taxAmount || 0;
+      totalDiscounts += o.discountAmount || 0;
+      if (o.refundAmount) refunds += o.refundAmount;
+      orderCount++;
+
+      const pm = o.paymentMethod || 'cash';
+      byPaymentMethod[pm] = (byPaymentMethod[pm] || 0) + amount;
+
+      const ot = o.orderType || 'dine-in';
+      byOrderType[ot] = (byOrderType[ot] || 0) + amount;
+
+      const dateKey = (o.createdAt?.toDate ? o.createdAt.toDate() : new Date(o.createdAt)).toISOString().split('T')[0];
+      if (!dailyMap[dateKey]) dailyMap[dateKey] = { date: dateKey, revenue: 0, orders: 0, tax: 0 };
+      dailyMap[dateKey].revenue += amount;
+      dailyMap[dateKey].orders++;
+      dailyMap[dateKey].tax += o.taxAmount || 0;
+    });
+
+    let prevRevenue = 0;
+    prevSnap.forEach(doc => {
+      const o = doc.data();
+      if (o.status !== 'cancelled') prevRevenue += o.finalAmount || o.totalAmount || 0;
+    });
+
+    const dailyBreakdown = Object.values(dailyMap).sort((a, b) => a.date.localeCompare(b.date));
+    const changePercent = prevRevenue > 0 ? ((totalRevenue - prevRevenue) / prevRevenue * 100) : 0;
+
+    res.json({
+      success: true,
+      data: {
+        totalRevenue, totalTax, totalDiscounts, refunds, orderCount,
+        avgOrderValue: orderCount > 0 ? totalRevenue / orderCount : 0,
+        byPaymentMethod, byOrderType, dailyBreakdown,
+        previousRevenue: prevRevenue, changePercent: Math.round(changePercent * 10) / 10
+      }
+    });
+  } catch (error) {
+    console.error('Books revenue error:', error);
+    res.status(500).json({ error: 'Failed to fetch revenue data' });
+  }
+});
+
+// --- COGS Aggregation ---
+app.get('/api/books/:restaurantId/cogs', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+    const { period = 'this_month', startDate, endDate } = req.query;
+    const { start, end } = getDateRange(period, startDate, endDate);
+
+    const txSnap = await db.collection(collections.inventoryTransactions)
+      .where('restaurantId', '==', restaurantId)
+      .where('type', '==', 'DEDUCTION')
+      .where('date', '>=', start).where('date', '<=', end).get();
+
+    // Get inventory items for costPerUnit lookup
+    const invSnap = await db.collection(collections.inventory)
+      .where('restaurantId', '==', restaurantId).get();
+    const invMap = {};
+    invSnap.forEach(doc => { invMap[doc.id] = doc.data(); });
+
+    let totalCOGS = 0;
+    const cogsByItem = {};
+
+    txSnap.forEach(doc => {
+      const tx = doc.data();
+      const itemId = tx.inventoryItemId;
+      const qty = Math.abs(tx.quantityChange || 0);
+      // Use stored costPerUnit if available, otherwise look up from inventory
+      const cost = tx.costPerUnit || tx.totalCost / qty || invMap[itemId]?.costPerUnit || 0;
+      const itemCost = qty * cost;
+      totalCOGS += itemCost;
+
+      if (!cogsByItem[itemId]) {
+        cogsByItem[itemId] = {
+          itemId, itemName: tx.inventoryItemName || invMap[itemId]?.name || 'Unknown',
+          totalQty: 0, unitCost: cost, totalCost: 0, unit: tx.unit || invMap[itemId]?.unit || ''
+        };
+      }
+      cogsByItem[itemId].totalQty += qty;
+      cogsByItem[itemId].totalCost += itemCost;
+    });
+
+    const cogsList = Object.values(cogsByItem).sort((a, b) => b.totalCost - a.totalCost);
+
+    res.json({
+      success: true,
+      data: { totalCOGS, cogsByItem: cogsList }
+    });
+  } catch (error) {
+    console.error('Books COGS error:', error);
+    res.status(500).json({ error: 'Failed to fetch COGS data' });
+  }
+});
+
+// --- Expenses CRUD ---
+app.get('/api/books/:restaurantId/expenses', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+    const { period = 'this_month', startDate, endDate, category } = req.query;
+    const { start, end } = getDateRange(period, startDate, endDate);
+
+    let query = db.collection(collections.expenses)
+      .where('restaurantId', '==', restaurantId)
+      .where('date', '>=', start).where('date', '<=', end);
+
+    const snap = await query.get();
+    const expenses = [];
+    const byCategory = {};
+    let total = 0;
+
+    snap.forEach(doc => {
+      const data = { id: doc.id, ...doc.data() };
+      if (category && data.category !== category) return;
+      // Convert Firestore timestamps
+      if (data.date?.toDate) data.date = data.date.toDate().toISOString();
+      if (data.createdAt?.toDate) data.createdAt = data.createdAt.toDate().toISOString();
+      if (data.updatedAt?.toDate) data.updatedAt = data.updatedAt.toDate().toISOString();
+      expenses.push(data);
+      total += data.amount || 0;
+      const cat = data.category || 'miscellaneous';
+      byCategory[cat] = (byCategory[cat] || 0) + (data.amount || 0);
+    });
+
+    expenses.sort((a, b) => new Date(b.date) - new Date(a.date));
+
+    res.json({
+      success: true,
+      data: { expenses, total, byCategory, count: expenses.length }
+    });
+  } catch (error) {
+    console.error('Books expenses list error:', error);
+    res.status(500).json({ error: 'Failed to fetch expenses' });
+  }
+});
+
+app.post('/api/books/:restaurantId/expenses', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+    const { category, amount, date, description, paymentMethod, receiptUrl, isRecurring, recurringFrequency, vendor } = req.body;
+
+    if (!category || !amount || !date) {
+      return res.status(400).json({ error: 'Category, amount, and date are required' });
+    }
+
+    const expenseData = {
+      restaurantId,
+      category,
+      amount: parseFloat(amount),
+      date: new Date(date),
+      description: description || '',
+      paymentMethod: paymentMethod || 'cash',
+      receiptUrl: receiptUrl || null,
+      isRecurring: isRecurring || false,
+      recurringFrequency: isRecurring ? (recurringFrequency || 'monthly') : null,
+      vendor: vendor || '',
+      createdBy: req.user.userId || req.user.id,
+      createdAt: new Date(),
+      updatedAt: new Date()
+    };
+
+    const docRef = await db.collection(collections.expenses).add(expenseData);
+    res.status(201).json({ success: true, data: { id: docRef.id, ...expenseData } });
+  } catch (error) {
+    console.error('Books add expense error:', error);
+    res.status(500).json({ error: 'Failed to add expense' });
+  }
+});
+
+app.patch('/api/books/:restaurantId/expenses/:expenseId', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId, expenseId } = req.params;
+    const updates = req.body;
+
+    const docRef = db.collection(collections.expenses).doc(expenseId);
+    const doc = await docRef.get();
+    if (!doc.exists || doc.data().restaurantId !== restaurantId) {
+      return res.status(404).json({ error: 'Expense not found' });
+    }
+
+    const updateData = { updatedAt: new Date() };
+    const allowedFields = ['category', 'amount', 'date', 'description', 'paymentMethod', 'receiptUrl', 'isRecurring', 'recurringFrequency', 'vendor'];
+    allowedFields.forEach(f => {
+      if (updates[f] !== undefined) {
+        updateData[f] = f === 'amount' ? parseFloat(updates[f]) : f === 'date' ? new Date(updates[f]) : updates[f];
+      }
+    });
+
+    await docRef.update(updateData);
+    res.json({ success: true, data: { id: expenseId, ...doc.data(), ...updateData } });
+  } catch (error) {
+    console.error('Books update expense error:', error);
+    res.status(500).json({ error: 'Failed to update expense' });
+  }
+});
+
+app.delete('/api/books/:restaurantId/expenses/:expenseId', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId, expenseId } = req.params;
+    const docRef = db.collection(collections.expenses).doc(expenseId);
+    const doc = await docRef.get();
+    if (!doc.exists || doc.data().restaurantId !== restaurantId) {
+      return res.status(404).json({ error: 'Expense not found' });
+    }
+    await docRef.delete();
+    res.json({ success: true, message: 'Expense deleted' });
+  } catch (error) {
+    console.error('Books delete expense error:', error);
+    res.status(500).json({ error: 'Failed to delete expense' });
+  }
+});
+
+// --- Supplier Dues ---
+app.get('/api/books/:restaurantId/supplier-dues', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+    const now = new Date();
+
+    const invSnap = await db.collection(collections.supplierInvoices)
+      .where('restaurantId', '==', restaurantId).get();
+
+    // Get supplier names
+    const suppSnap = await db.collection(collections.suppliers)
+      .where('restaurantId', '==', restaurantId).get();
+    const suppMap = {};
+    suppSnap.forEach(doc => { suppMap[doc.id] = doc.data().name || 'Unknown'; });
+
+    let totalOwed = 0, overdueAmount = 0;
+    const supplierDues = {};
+
+    invSnap.forEach(doc => {
+      const inv = doc.data();
+      if (inv.paymentStatus === 'paid') return;
+
+      const balance = (inv.totalAmount || 0) - (inv.paidAmount || 0);
+      if (balance <= 0) return;
+
+      totalOwed += balance;
+      const suppId = inv.supplierId || 'unknown';
+      if (!supplierDues[suppId]) {
+        supplierDues[suppId] = {
+          supplierId: suppId, supplierName: suppMap[suppId] || inv.supplierName || 'Unknown',
+          totalOwed: 0, current: 0, days31_60: 0, days61_90: 0, days90plus: 0, invoices: []
+        };
+      }
+
+      const dueDate = inv.dueDate?.toDate ? inv.dueDate.toDate() : inv.dueDate ? new Date(inv.dueDate) : null;
+      let ageDays = 0;
+      if (dueDate) {
+        ageDays = Math.floor((now - dueDate) / (1000 * 60 * 60 * 24));
+      }
+
+      if (ageDays <= 0) supplierDues[suppId].current += balance;
+      else if (ageDays <= 60) supplierDues[suppId].days31_60 += balance;
+      else if (ageDays <= 90) supplierDues[suppId].days61_90 += balance;
+      else { supplierDues[suppId].days90plus += balance; overdueAmount += balance; }
+
+      supplierDues[suppId].totalOwed += balance;
+      supplierDues[suppId].invoices.push({
+        id: doc.id, invoiceNumber: inv.invoiceNumber,
+        totalAmount: inv.totalAmount, paidAmount: inv.paidAmount || 0, balance,
+        dueDate: dueDate ? dueDate.toISOString() : null,
+        invoiceDate: inv.invoiceDate?.toDate ? inv.invoiceDate.toDate().toISOString() : inv.invoiceDate,
+        paymentStatus: inv.paymentStatus, ageDays: Math.max(0, ageDays)
+      });
+    });
+
+    const suppliers = Object.values(supplierDues).sort((a, b) => b.totalOwed - a.totalOwed);
+
+    res.json({
+      success: true,
+      data: { totalOwed, overdueAmount, suppliersCount: suppliers.length, suppliers }
+    });
+  } catch (error) {
+    console.error('Books supplier dues error:', error);
+    res.status(500).json({ error: 'Failed to fetch supplier dues' });
+  }
+});
+
+// --- Profit & Loss ---
+app.get('/api/books/:restaurantId/pnl', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+    const { period = 'this_month', startDate, endDate } = req.query;
+    const { start, end } = getDateRange(period, startDate, endDate);
+    const prev = getPreviousRange(start, end);
+
+    // Fetch revenue, COGS, expenses, credits in parallel
+    const ordersRef = db.collection(collections.orders);
+    const txRef = db.collection(collections.inventoryTransactions);
+    const expRef = db.collection(collections.expenses);
+    const retRef = db.collection(collections.supplierReturns);
+
+    const [orderSnap, prevOrderSnap, txSnap, expSnap, prevExpSnap, retSnap] = await Promise.all([
+      ordersRef.where('restaurantId', '==', restaurantId).where('createdAt', '>=', start).where('createdAt', '<=', end).get(),
+      ordersRef.where('restaurantId', '==', restaurantId).where('createdAt', '>=', prev.start).where('createdAt', '<=', prev.end).get(),
+      txRef.where('restaurantId', '==', restaurantId).where('type', '==', 'DEDUCTION').where('date', '>=', start).where('date', '<=', end).get(),
+      expRef.where('restaurantId', '==', restaurantId).where('date', '>=', start).where('date', '<=', end).get(),
+      expRef.where('restaurantId', '==', restaurantId).where('date', '>=', prev.start).where('date', '<=', prev.end).get(),
+      retRef.where('restaurantId', '==', restaurantId).where('status', '==', 'credited').get()
+    ]);
+
+    // Revenue
+    let revenue = 0;
+    orderSnap.forEach(doc => {
+      const o = doc.data();
+      if (o.status !== 'cancelled') revenue += o.finalAmount || o.totalAmount || 0;
+    });
+    let prevRevenue = 0;
+    prevOrderSnap.forEach(doc => {
+      const o = doc.data();
+      if (o.status !== 'cancelled') prevRevenue += o.finalAmount || o.totalAmount || 0;
+    });
+
+    // COGS
+    const invSnap = await db.collection(collections.inventory).where('restaurantId', '==', restaurantId).get();
+    const invMap = {};
+    invSnap.forEach(doc => { invMap[doc.id] = doc.data(); });
+
+    let cogs = 0;
+    txSnap.forEach(doc => {
+      const tx = doc.data();
+      const qty = Math.abs(tx.quantityChange || 0);
+      const cost = tx.costPerUnit || invMap[tx.inventoryItemId]?.costPerUnit || 0;
+      cogs += qty * cost;
+    });
+
+    // Expenses by category
+    let totalExpenses = 0;
+    const expByCategory = {};
+    expSnap.forEach(doc => {
+      const e = doc.data();
+      totalExpenses += e.amount || 0;
+      const cat = e.category || 'miscellaneous';
+      expByCategory[cat] = (expByCategory[cat] || 0) + (e.amount || 0);
+    });
+    let prevExpenses = 0;
+    prevExpSnap.forEach(doc => { prevExpenses += doc.data().amount || 0; });
+
+    // Supplier credits
+    let supplierCredits = 0;
+    retSnap.forEach(doc => {
+      const r = doc.data();
+      const created = r.createdAt?.toDate ? r.createdAt.toDate() : new Date(r.createdAt || 0);
+      if (created >= start && created <= end) supplierCredits += r.creditAmount || 0;
+    });
+
+    const grossProfit = revenue - cogs;
+    const netProfit = grossProfit - totalExpenses + supplierCredits;
+    const grossMargin = revenue > 0 ? (grossProfit / revenue * 100) : 0;
+    const netMargin = revenue > 0 ? (netProfit / revenue * 100) : 0;
+    const prevNetProfit = prevRevenue - prevExpenses;
+
+    res.json({
+      success: true,
+      data: {
+        revenue, cogs, grossProfit,
+        grossMargin: Math.round(grossMargin * 10) / 10,
+        expenses: totalExpenses,
+        expensesByCategory: expByCategory,
+        supplierCredits, netProfit,
+        netMargin: Math.round(netMargin * 10) / 10,
+        previousPeriod: { revenue: prevRevenue, expenses: prevExpenses, netProfit: prevNetProfit },
+        revenueChange: prevRevenue > 0 ? Math.round((revenue - prevRevenue) / prevRevenue * 1000) / 10 : 0,
+        profitChange: prevNetProfit !== 0 ? Math.round((netProfit - prevNetProfit) / Math.abs(prevNetProfit) * 1000) / 10 : 0
+      }
+    });
+  } catch (error) {
+    console.error('Books P&L error:', error);
+    res.status(500).json({ error: 'Failed to generate P&L report' });
+  }
+});
+
+// --- Overview Dashboard ---
+app.get('/api/books/:restaurantId/overview', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+    const { period = 'this_month', startDate, endDate } = req.query;
+    const { start, end } = getDateRange(period, startDate, endDate);
+    const prev = getPreviousRange(start, end);
+
+    const ordersRef = db.collection(collections.orders);
+    const txRef = db.collection(collections.inventoryTransactions);
+    const expRef = db.collection(collections.expenses);
+    const invRef = db.collection(collections.supplierInvoices);
+
+    const [orderSnap, prevOrderSnap, txSnap, expSnap, prevExpSnap, duesSnap] = await Promise.all([
+      ordersRef.where('restaurantId', '==', restaurantId).where('createdAt', '>=', start).where('createdAt', '<=', end).get(),
+      ordersRef.where('restaurantId', '==', restaurantId).where('createdAt', '>=', prev.start).where('createdAt', '<=', prev.end).get(),
+      txRef.where('restaurantId', '==', restaurantId).where('type', '==', 'DEDUCTION').where('date', '>=', start).where('date', '<=', end).get(),
+      expRef.where('restaurantId', '==', restaurantId).where('date', '>=', start).where('date', '<=', end).get(),
+      expRef.where('restaurantId', '==', restaurantId).where('date', '>=', prev.start).where('date', '<=', prev.end).get(),
+      invRef.where('restaurantId', '==', restaurantId).get()
+    ]);
+
+    // Revenue
+    let revenue = 0, prevRevenue = 0;
+    const dailyCashFlow = {};
+    orderSnap.forEach(doc => {
+      const o = doc.data();
+      if (o.status === 'cancelled') return;
+      const amt = o.finalAmount || o.totalAmount || 0;
+      revenue += amt;
+      const dk = (o.createdAt?.toDate ? o.createdAt.toDate() : new Date(o.createdAt)).toISOString().split('T')[0];
+      if (!dailyCashFlow[dk]) dailyCashFlow[dk] = { date: dk, revenue: 0, expenses: 0 };
+      dailyCashFlow[dk].revenue += amt;
+    });
+    prevOrderSnap.forEach(doc => {
+      const o = doc.data();
+      if (o.status !== 'cancelled') prevRevenue += o.finalAmount || o.totalAmount || 0;
+    });
+
+    // COGS
+    const invItemSnap = await db.collection(collections.inventory).where('restaurantId', '==', restaurantId).get();
+    const invMap = {};
+    invItemSnap.forEach(doc => { invMap[doc.id] = doc.data(); });
+    let cogs = 0;
+    txSnap.forEach(doc => {
+      const tx = doc.data();
+      const qty = Math.abs(tx.quantityChange || 0);
+      cogs += qty * (tx.costPerUnit || invMap[tx.inventoryItemId]?.costPerUnit || 0);
+    });
+
+    // Expenses
+    let expenses = 0, prevExpenses = 0;
+    const topCategories = {};
+    expSnap.forEach(doc => {
+      const e = doc.data();
+      expenses += e.amount || 0;
+      const cat = e.category || 'miscellaneous';
+      topCategories[cat] = (topCategories[cat] || 0) + (e.amount || 0);
+      const dk = (e.date?.toDate ? e.date.toDate() : new Date(e.date)).toISOString().split('T')[0];
+      if (!dailyCashFlow[dk]) dailyCashFlow[dk] = { date: dk, revenue: 0, expenses: 0 };
+      dailyCashFlow[dk].expenses += e.amount || 0;
+    });
+    prevExpSnap.forEach(doc => { prevExpenses += doc.data().amount || 0; });
+
+    // Supplier dues
+    let supplierDuesTotal = 0;
+    duesSnap.forEach(doc => {
+      const inv = doc.data();
+      if (inv.paymentStatus !== 'paid') supplierDuesTotal += (inv.totalAmount || 0) - (inv.paidAmount || 0);
+    });
+
+    const netProfit = revenue - cogs - expenses;
+    const prevNetProfit = prevRevenue - prevExpenses;
+    const grossMargin = revenue > 0 ? ((revenue - cogs) / revenue * 100) : 0;
+    const cashFlowData = Object.values(dailyCashFlow).sort((a, b) => a.date.localeCompare(b.date));
+    const topExpenseCategories = Object.entries(topCategories)
+      .map(([name, amount]) => ({ name, amount }))
+      .sort((a, b) => b.amount - a.amount).slice(0, 6);
+
+    const pct = (curr, prev) => prev > 0 ? Math.round((curr - prev) / prev * 1000) / 10 : 0;
+
+    res.json({
+      success: true,
+      data: {
+        revenue: { total: revenue, changePercent: pct(revenue, prevRevenue) },
+        cogs: { total: cogs },
+        expenses: { total: expenses, changePercent: pct(expenses, prevExpenses) },
+        profit: { total: netProfit, changePercent: prevNetProfit !== 0 ? pct(netProfit, Math.abs(prevNetProfit)) : 0 },
+        grossMargin: Math.round(grossMargin * 10) / 10,
+        supplierDuesTotal,
+        cashFlowData,
+        topExpenseCategories,
+        orderCount: orderSnap.size
+      }
+    });
+  } catch (error) {
+    console.error('Books overview error:', error);
+    res.status(500).json({ error: 'Failed to fetch overview' });
+  }
+});
+
 // ==================== ADMIN SETTINGS APIs ====================
 
 // Get all admin settings for a restaurant
@@ -18616,10 +19193,12 @@ app.put('/api/admin/settings/:restaurantId', authenticateToken, async (req, res)
 
       if (!restaurantSnapshot.empty) {
         await restaurantSnapshot.docs[0].ref.update(restaurantUpdate);
+        // Invalidate Redis cache so public endpoints serve fresh data
+        invalidateRestaurantCache(restaurantId);
       }
     }
 
-    res.json({ 
+    res.json({
       message: 'Settings updated successfully',
       settings: updatedSettings
     });
@@ -18769,9 +19348,12 @@ app.put('/api/admin/settings/:restaurantId/status', authenticateToken, async (re
 
     if (!restaurantSnapshot.empty) {
       await restaurantSnapshot.docs[0].ref.update(statusUpdate);
+      // Invalidate Redis cache (restaurant data + public directory)
+      invalidateRestaurantCache(restaurantId);
+      kvDel('public-restaurants:all').catch(() => {});
     }
 
-    res.json({ 
+    res.json({
       message: 'Restaurant status updated successfully',
       status: statusUpdate
     });
@@ -19856,38 +20438,33 @@ app.get('/api/public/offers/:restaurantId', vercelSecurityMiddleware.publicAPI, 
     // Parse isFirstOrder query param (default to undefined if not provided)
     const customerIsFirstOrder = isFirstOrder === 'true' ? true : isFirstOrder === 'false' ? false : undefined;
 
-    const offersSnapshot = await db.collection('offers')
-      .where('restaurantId', '==', restaurantId)
-      .where('isActive', '==', true)
-      .get();
+    // Try Redis cache first (cache all active offers, filter in-memory)
+    const offersCacheKey = `offers:${restaurantId}`;
+    let allOffers = await kvGet(offersCacheKey);
 
-    const offers = [];
-    offersSnapshot.forEach(doc => {
-      const offer = doc.data();
+    if (!allOffers) {
+      // Cache miss — read from Firestore
+      const offersSnapshot = await db.collection('offers')
+        .where('restaurantId', '==', restaurantId)
+        .where('isActive', '==', true)
+        .get();
 
-      // Handle Firestore Timestamps - convert to JS Date
-      let validFrom = null;
-      let validUntil = null;
+      allOffers = [];
+      offersSnapshot.forEach(doc => {
+        const offer = doc.data();
 
-      if (offer.validFrom) {
-        // Check if it's a Firestore Timestamp
-        validFrom = offer.validFrom.toDate ? offer.validFrom.toDate() : new Date(offer.validFrom);
-      }
-      if (offer.validUntil) {
-        validUntil = offer.validUntil.toDate ? offer.validUntil.toDate() : new Date(offer.validUntil);
-      }
+        // Handle Firestore Timestamps - convert to JS Date for caching
+        let validFrom = null;
+        let validUntil = null;
 
-      // Filter by date range
-      const isValidDate = (!validFrom || now >= validFrom) && (!validUntil || now <= validUntil);
-      const isUnderUsageLimit = !offer.usageLimit || (offer.usageCount || 0) < offer.usageLimit;
+        if (offer.validFrom) {
+          validFrom = offer.validFrom.toDate ? offer.validFrom.toDate().toISOString() : new Date(offer.validFrom).toISOString();
+        }
+        if (offer.validUntil) {
+          validUntil = offer.validUntil.toDate ? offer.validUntil.toDate().toISOString() : new Date(offer.validUntil).toISOString();
+        }
 
-      // Filter first-order-only offers if customer status is provided
-      // If isFirstOrder is false, exclude first-order-only offers
-      // If isFirstOrder is true or not provided, include all offers
-      const isEligibleForFirstOrderOffer = !offer.isFirstOrderOnly || customerIsFirstOrder !== false;
-
-      if (isValidDate && isUnderUsageLimit && isEligibleForFirstOrderOffer) {
-        offers.push({
+        allOffers.push({
           id: doc.id,
           name: offer.name,
           description: offer.description,
@@ -19895,18 +20472,32 @@ app.get('/api/public/offers/:restaurantId', vercelSecurityMiddleware.publicAPI, 
           discountValue: offer.discountValue,
           minOrderValue: offer.minOrderValue || 0,
           maxDiscount: offer.maxDiscount,
-          validFrom: validFrom ? validFrom.toISOString() : null,
-          validUntil: validUntil ? validUntil.toISOString() : null,
+          validFrom,
+          validUntil,
           isActive: offer.isActive ?? true,
           usageLimit: offer.usageLimit || null,
           usageCount: offer.usageCount || 0,
           isFirstOrderOnly: offer.isFirstOrderOnly || false,
           autoApply: offer.autoApply || false
         });
-      }
+      });
+
+      // Cache for 3 min (fire-and-forget)
+      kvSet(offersCacheKey, allOffers, 180).catch(() => {});
+    }
+
+    // Filter cached offers by date, usage, and first-order eligibility
+    const offers = allOffers.filter(offer => {
+      const validFrom = offer.validFrom ? new Date(offer.validFrom) : null;
+      const validUntil = offer.validUntil ? new Date(offer.validUntil) : null;
+      const isValidDate = (!validFrom || now >= validFrom) && (!validUntil || now <= validUntil);
+      const isUnderUsageLimit = !offer.usageLimit || (offer.usageCount || 0) < offer.usageLimit;
+      const isEligibleForFirstOrderOffer = !offer.isFirstOrderOnly || customerIsFirstOrder !== false;
+      return isValidDate && isUnderUsageLimit && isEligibleForFirstOrderOffer;
     });
 
-    console.log(`Found ${offers.length} valid offers for restaurant ${restaurantId} (isFirstOrder: ${customerIsFirstOrder})`);
+    // Cache at Vercel Edge for 3 min
+    res.set('Cache-Control', 'public, s-maxage=180, stale-while-revalidate=60');
     res.json({ offers });
   } catch (error) {
     console.error('Get public offers error:', error);
@@ -19995,6 +20586,9 @@ app.post('/api/offers/:restaurantId', authenticateToken, async (req, res) => {
 
     const offerRef = await db.collection('offers').add(offerData);
 
+    // Invalidate offers cache so public endpoint serves fresh data
+    kvDel(`offers:${restaurantId}`).catch(() => {});
+
     res.status(201).json({
       message: 'Offer created successfully',
       offer: {
@@ -20057,6 +20651,9 @@ app.put('/api/offers/:restaurantId/:offerId', authenticateToken, async (req, res
 
     await offerDoc.ref.update(updatedData);
 
+    // Invalidate offers cache so public endpoint serves fresh data
+    kvDel(`offers:${restaurantId}`).catch(() => {});
+
     res.json({
       message: 'Offer updated successfully',
       offer: {
@@ -20094,6 +20691,9 @@ app.delete('/api/offers/:restaurantId/:offerId', authenticateToken, async (req, 
     }
 
     await offerDoc.ref.delete();
+
+    // Invalidate offers cache so public endpoint serves fresh data
+    kvDel(`offers:${restaurantId}`).catch(() => {});
 
     res.json({
       message: 'Offer deleted successfully'
@@ -20169,20 +20769,14 @@ app.get('/api/restaurants/:restaurantId/customer-app-settings', authenticateToke
 app.get('/api/restaurants/:restaurantId', authenticateToken, async (req, res) => {
   try {
     const { restaurantId } = req.params;
-    
-    const restaurantDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
-    if (!restaurantDoc.exists) {
+
+    // Use Redis-cached restaurant data (3 min TTL)
+    const { data: restaurant } = await getCachedRestaurant(db, collections.restaurants, restaurantId);
+    if (!restaurant) {
       return res.status(404).json({ error: 'Restaurant not found' });
     }
 
-    // For now, allow any authenticated user to fetch basic details to fix the 404
-    // Ideally we should check ownership, but the frontend calls this indiscriminately
-    const restaurant = restaurantDoc.data();
-    
-    // Don't leak sensitive data if not owner
-    // if (restaurant.ownerId !== req.user.userId) { ... }
-
-    res.json({ restaurant: { id: restaurantDoc.id, ...restaurant } });
+    res.json({ restaurant: { id: restaurantId, ...restaurant } });
   } catch (error) {
     console.error('Get restaurant error:', error);
     res.status(500).json({ error: 'Failed to fetch restaurant' });
@@ -20266,6 +20860,9 @@ app.put('/api/restaurants/:restaurantId/customer-app-settings', authenticateToke
     await restaurantDoc.ref.update({
       customerAppSettings: customerAppSettings
     });
+
+    // Invalidate Redis cache so public endpoints serve fresh data
+    invalidateRestaurantCache(restaurantId);
 
     res.json({
       message: 'Customer app settings updated successfully',
@@ -20373,6 +20970,9 @@ app.put('/api/restaurants/:restaurantId/pricing-settings', authenticateToken, as
 
     await restaurantDoc.ref.update({ pricingSettings });
 
+    // Invalidate Redis cache so public endpoints serve fresh data
+    invalidateRestaurantCache(restaurantId);
+
     res.json({
       message: 'Pricing settings updated successfully',
       settings: pricingSettings
@@ -20466,6 +21066,9 @@ app.put('/api/restaurants/:restaurantId/billing-settings', authenticateToken, as
     };
 
     await restaurantDoc.ref.update({ billingSettings });
+
+    // Invalidate Redis cache so public endpoints serve fresh data
+    invalidateRestaurantCache(restaurantId);
 
     res.json({
       message: 'Billing settings updated successfully',

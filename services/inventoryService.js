@@ -205,7 +205,8 @@ class InventoryService {
                     updatedAt: new Date()
                 });
 
-                // Log Transaction
+                // Log Transaction (include costPerUnit for COGS tracking)
+                const unitCost = inventoryItem.costPerUnit || 0;
                 const transactionRef = db.collection('inventoryTransactions').doc();
                 const txData = {
                     restaurantId,
@@ -216,6 +217,8 @@ class InventoryService {
                     referenceId: orderId,
                     quantityChange: -deductionAmount,
                     unit: inventoryItem.unit,
+                    costPerUnit: unitCost,
+                    totalCost: deductionAmount * unitCost,
                     date: new Date(),
                     notes: `Order of ${qtySold}x ${item.name}`
                 };
