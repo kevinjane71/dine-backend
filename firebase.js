@@ -125,7 +125,12 @@ const collections = {
   invSettings: 'inv_settings',
   invNumberSequences: 'inv_number_sequences',
   // Books (Accounting) Collections
-  expenses: 'expenses'
+  expenses: 'expenses',
+  payrollConfig: 'payrollConfig',
+  payrollRuns: 'payrollRuns',
+  paySlips: 'paySlips',
+  chartOfAccounts: 'chartOfAccounts',
+  journalEntries: 'journalEntries'
 };
 
 const admin = null; // We don't need the legacy admin object anymore

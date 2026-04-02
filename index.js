@@ -487,6 +487,11 @@ const publicToolsRoutes = require('./routes/publicTools');
 const initializeInvoiceRoutes = require('./invoice');
 const invoiceRoutes = initializeInvoiceRoutes(db, collections);
 
+// Books Module (separate route files)
+const payrollRoutes = require('./routes/payroll');
+const gstRoutes = require('./routes/gstReports');
+const ledgerRoutes = require('./routes/ledger');
+
 // Debug email service initialization
 console.log('📧 Email service loaded:', !!emailService);
 if (emailService) {
@@ -12828,6 +12833,11 @@ app.use('/api/super-admin', superAdminRoutes);
 
 // ==================== INVOICE MODULE ====================
 app.use('/api/invoice', invoiceRoutes);
+
+// ==================== BOOKS MODULE (Payroll, GST, Ledger) ====================
+app.use('/api/payroll', payrollRoutes);
+app.use('/api/gst', gstRoutes);
+app.use('/api/ledger', ledgerRoutes);
 
 // ==================== BUSINESS SETTINGS (for GST invoices) ====================
 
