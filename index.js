@@ -16925,6 +16925,378 @@ app.post('/api/inventory/:restaurantId/confirm-leftover-waste', authenticateToke
   }
 });
 
+// ══════════════════════════════════════════════════════════════
+// SMART IMPORT — Parse text/image → create inventory + menu + recipes
+// ══════════════════════════════════════════════════════════════
+app.post('/api/inventory/:restaurantId/smart-import/parse', authenticateToken, aiUsageLimiter.middleware(), upload.single('image'), async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+    const { text } = req.body;
+    const imageFile = req.file;
+
+    if (!text && !imageFile) {
+      return res.status(400).json({ error: 'Either text or image is required' });
+    }
+
+    // Load existing inventory items and menu for duplicate detection
+    const [inventorySnap, restaurantDoc] = await Promise.all([
+      db.collection(collections.inventory).where('restaurantId', '==', restaurantId).get(),
+      db.collection(collections.restaurants).doc(restaurantId).get()
+    ]);
+
+    if (!restaurantDoc.exists) {
+      return res.status(404).json({ error: 'Restaurant not found' });
+    }
+
+    const restaurantData = restaurantDoc.data();
+    const existingInventory = [];
+    inventorySnap.forEach(doc => existingInventory.push({ id: doc.id, ...doc.data() }));
+    const existingMenuItems = (restaurantData.menu?.items || []).filter(i => i.status === 'active' || i.active === true);
+    const existingCategories = restaurantData.categories || [];
+
+    const existingContext = `
+EXISTING INVENTORY ITEMS (do NOT re-create these, reference them by name):
+${existingInventory.map(i => `- ${i.name} (${i.unit}, category: ${i.category})`).join('\n') || 'None'}
+
+EXISTING MENU ITEMS:
+${existingMenuItems.map(i => `- ${i.name} (₹${i.price}, category: ${i.category})`).join('\n') || 'None'}
+
+EXISTING MENU CATEGORIES:
+${existingCategories.map(c => c.name).join(', ') || 'None'}`;
+
+    const systemPrompt = `You are a restaurant setup assistant. Parse the provided text (or image) which contains recipes, ingredient lists, or menu items. Extract structured data to set up the restaurant's inventory, menu, and recipes.
+
+${existingContext}
+
+Return a JSON object with these arrays:
+{
+  "inventoryItems": [
+    { "name": "Tea Leaves", "unit": "g", "category": "Beverages", "costPerUnit": 0.5, "isNew": true }
+  ],
+  "menuCategories": ["Hot Beverages", "Cold Beverages"],
+  "menuItems": [
+    { "name": "Masala Tea", "price": 30, "category": "Hot Beverages", "description": "Traditional Indian spiced tea", "isVeg": true }
+  ],
+  "recipes": [
+    {
+      "menuItemName": "Masala Tea",
+      "servings": 1,
+      "category": "Beverages",
+      "ingredients": [
+        { "itemName": "Tea Leaves", "qty": 5, "unit": "g" },
+        { "itemName": "Milk", "qty": 150, "unit": "ml" },
+        { "itemName": "Sugar", "qty": 10, "unit": "g" }
+      ],
+      "instructions": "Boil water, add tea leaves and spices, add milk, strain and serve."
+    }
+  ]
+}
+
+RULES:
+1. For inventoryItems: set "isNew": false if the item already exists in EXISTING INVENTORY ITEMS (match by name, case-insensitive). Set "isNew": true for new items only.
+2. For menuCategories: only include NEW categories not already in EXISTING MENU CATEGORIES.
+3. For menuItems: skip items that already exist in EXISTING MENU ITEMS (match by name).
+4. For recipes: always create recipes linking menuItems to inventoryItems.
+5. Use sensible units: g, kg, ml, L, pieces, nos, bunches, etc.
+6. Estimate reasonable prices in INR (₹) for menu items if not provided.
+7. Estimate reasonable cost per unit in INR for inventory items if not provided.
+8. Parse Hindi/regional ingredient names correctly.
+9. If the text has multiple recipes, extract ALL of them.
+10. Return valid JSON only.`;
+
+    let aiResponse;
+
+    if (imageFile) {
+      const imageBase64 = imageFile.buffer.toString('base64');
+      const imageMimeType = imageFile.mimetype;
+
+      const completion = await openai.chat.completions.create({
+        model: 'gpt-4o',
+        messages: [
+          { role: 'system', content: systemPrompt },
+          {
+            role: 'user',
+            content: [
+              { type: 'text', text: 'Extract all recipes, ingredients, and menu items from this image.' },
+              { type: 'image_url', image_url: { url: `data:${imageMimeType};base64,${imageBase64}` } }
+            ]
+          }
+        ],
+        temperature: 0.2,
+        max_tokens: 4000,
+      });
+      aiResponse = completion.choices[0].message.content.trim();
+    } else {
+      const completion = await openai.chat.completions.create({
+        model: 'gpt-4o-mini',
+        messages: [
+          { role: 'system', content: systemPrompt },
+          { role: 'user', content: text }
+        ],
+        temperature: 0.2,
+        max_tokens: 4000,
+        response_format: { type: 'json_object' },
+      });
+      aiResponse = completion.choices[0].message.content.trim();
+    }
+
+    // Parse AI response
+    let parsed;
+    try {
+      const jsonMatch = aiResponse.match(/```json\s*([\s\S]*?)\s*```/) || aiResponse.match(/```\s*([\s\S]*?)\s*```/);
+      parsed = jsonMatch ? JSON.parse(jsonMatch[1]) : JSON.parse(aiResponse);
+    } catch (parseError) {
+      console.error('Smart import parse error:', aiResponse);
+      return res.status(500).json({ error: 'AI could not parse the input. Try rephrasing or simplifying.' });
+    }
+
+    // Validate and enrich
+    const result = {
+      inventoryItems: (parsed.inventoryItems || []).map(item => ({
+        name: (item.name || '').trim(),
+        unit: (item.unit || 'g').trim(),
+        category: (item.category || 'General').trim(),
+        costPerUnit: parseFloat(item.costPerUnit) || 0,
+        isNew: item.isNew !== false,
+        isDuplicate: existingInventory.some(e => e.name.toLowerCase() === (item.name || '').toLowerCase().trim()),
+        existingId: existingInventory.find(e => e.name.toLowerCase() === (item.name || '').toLowerCase().trim())?.id || null,
+      })),
+      menuCategories: (parsed.menuCategories || []).filter(c => c && typeof c === 'string').map(c => c.trim()),
+      menuItems: (parsed.menuItems || []).map(item => ({
+        name: (item.name || '').trim(),
+        price: parseFloat(item.price) || 0,
+        category: (item.category || 'Other').trim(),
+        description: (item.description || '').trim(),
+        isVeg: item.isVeg !== false,
+        isDuplicate: existingMenuItems.some(e => e.name.toLowerCase() === (item.name || '').toLowerCase().trim()),
+      })),
+      recipes: (parsed.recipes || []).map(recipe => ({
+        menuItemName: (recipe.menuItemName || '').trim(),
+        servings: parseInt(recipe.servings) || 1,
+        category: (recipe.category || 'Main Course').trim(),
+        ingredients: (recipe.ingredients || []).map(ing => ({
+          itemName: (ing.itemName || '').trim(),
+          qty: parseFloat(ing.qty) || 0,
+          unit: (ing.unit || 'g').trim(),
+        })),
+        instructions: (recipe.instructions || '').trim(),
+      })),
+    };
+
+    console.log(`🧠 Smart import parsed: ${result.inventoryItems.length} inventory, ${result.menuItems.length} menu, ${result.recipes.length} recipes`);
+
+    res.json({ success: true, data: result });
+
+  } catch (error) {
+    console.error('Smart import parse error:', error);
+    res.status(500).json({ error: 'Failed to parse input', message: error.message });
+  }
+});
+
+app.post('/api/inventory/:restaurantId/smart-import/confirm', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+    const { userId, role } = req.user;
+    const { inventoryItems = [], menuCategories = [], menuItems = [], recipes = [] } = req.body;
+
+    if (!inventoryItems.length && !menuItems.length && !recipes.length) {
+      return res.status(400).json({ error: 'Nothing to import' });
+    }
+
+    const summary = { inventoryItems: 0, menuCategories: 0, menuItems: 0, recipes: 0 };
+    const errors = [];
+
+    // 1. Create inventory items (skip duplicates)
+    const inventoryMap = {}; // name → id mapping for recipe linking
+
+    // First, load existing inventory for mapping
+    const existingInvSnap = await db.collection(collections.inventory)
+      .where('restaurantId', '==', restaurantId).get();
+    existingInvSnap.forEach(doc => {
+      inventoryMap[doc.data().name.toLowerCase()] = doc.id;
+    });
+
+    for (const item of inventoryItems) {
+      if (item.isDuplicate || !item.isNew) {
+        // Use existing item's ID
+        if (item.existingId) inventoryMap[item.name.toLowerCase()] = item.existingId;
+        continue;
+      }
+      try {
+        // Check if already exists (safety check)
+        if (inventoryMap[item.name.toLowerCase()]) continue;
+
+        const itemData = {
+          restaurantId,
+          name: item.name.trim(),
+          category: item.category.trim(),
+          unit: item.unit.trim(),
+          currentStock: 0,
+          minStock: 0,
+          maxStock: 0,
+          costPerUnit: parseFloat(item.costPerUnit) || 0,
+          supplier: '',
+          description: '',
+          barcode: '',
+          expiryDate: null,
+          mfgDate: null,
+          expiryDays: null,
+          location: '',
+          status: 'good',
+          createdAt: new Date(),
+          updatedAt: new Date(),
+          createdBy: userId,
+          updatedBy: userId
+        };
+
+        const ref = await db.collection(collections.inventory).add(itemData);
+        inventoryMap[item.name.toLowerCase()] = ref.id;
+        summary.inventoryItems++;
+      } catch (e) {
+        errors.push(`Inventory "${item.name}": ${e.message}`);
+      }
+    }
+
+    // 2. Add menu categories
+    const restaurantDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
+    if (!restaurantDoc.exists) {
+      return res.status(404).json({ error: 'Restaurant not found' });
+    }
+    const restaurantData = restaurantDoc.data();
+    const existingCats = [...(restaurantData.categories || [])];
+    const existingMenu = restaurantData.menu || { items: [] };
+    const existingMenuItemsList = [...(existingMenu.items || [])];
+
+    for (const catName of menuCategories) {
+      const id = categoryNameToId(catName);
+      if (!id || existingCats.some(c => (c.id || '').toLowerCase() === id)) continue;
+      existingCats.push({ id, name: catName.trim(), emoji: '🍽️', description: '' });
+      summary.menuCategories++;
+    }
+
+    // 3. Add menu items
+    let maxShortCode = 0;
+    for (const item of existingMenuItemsList) {
+      const sc = parseInt(item.shortCode, 10);
+      if (!isNaN(sc) && sc > maxShortCode) maxShortCode = sc;
+    }
+
+    const menuItemNameToId = {};
+    // Map existing menu items
+    for (const item of existingMenuItemsList) {
+      menuItemNameToId[item.name.toLowerCase()] = item.id;
+    }
+
+    for (const item of menuItems) {
+      if (item.isDuplicate) continue;
+      if (menuItemNameToId[item.name.toLowerCase()]) continue;
+
+      try {
+        const rawCat = item.category || 'Other';
+        const resolvedId = categoryNameToId(rawCat);
+        const validCatIds = new Set(existingCats.map(c => (c.id || '').toLowerCase()));
+        const categoryId = (resolvedId && validCatIds.has(resolvedId)) ? resolvedId : 'other';
+
+        // Ensure 'other' category exists
+        if (categoryId === 'other' && !existingCats.some(c => c.id === 'other')) {
+          existingCats.push({ id: 'other', name: 'Other', emoji: '🍽️', description: '' });
+        }
+
+        maxShortCode++;
+        const menuItem = {
+          id: `item_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+          restaurantId,
+          name: item.name.trim(),
+          description: item.description || '',
+          price: parseFloat(item.price) || 0,
+          category: categoryId,
+          isVeg: item.isVeg !== false,
+          spiceLevel: 'medium',
+          allergens: [],
+          shortCode: String(maxShortCode),
+          status: 'active',
+          order: existingMenuItemsList.length,
+          isAvailable: true,
+          stockQuantity: null,
+          lowStockThreshold: 5,
+          isStockManaged: false,
+          variants: [],
+          customizations: [],
+          pricingRules: {},
+          createdAt: new Date(),
+          updatedAt: new Date(),
+          source: 'smart_import'
+        };
+
+        existingMenuItemsList.push(menuItem);
+        menuItemNameToId[item.name.toLowerCase()] = menuItem.id;
+        summary.menuItems++;
+      } catch (e) {
+        errors.push(`Menu "${item.name}": ${e.message}`);
+      }
+    }
+
+    // Save menu + categories update
+    if (summary.menuCategories > 0 || summary.menuItems > 0) {
+      await db.collection(collections.restaurants).doc(restaurantId).update({
+        categories: existingCats,
+        menu: { ...existingMenu, items: existingMenuItemsList, lastUpdated: new Date() },
+        updatedAt: new Date()
+      });
+      invalidateRestaurantCache(restaurantId);
+    }
+
+    // 4. Create recipes
+    for (const recipe of recipes) {
+      try {
+        const ingredients = recipe.ingredients.map(ing => {
+          const invId = inventoryMap[ing.itemName.toLowerCase()] || null;
+          return {
+            inventoryItemId: invId,
+            inventoryItemName: ing.itemName,
+            quantity: parseFloat(ing.qty) || 0,
+            unit: ing.unit || 'g'
+          };
+        });
+
+        const recipeData = {
+          restaurantId,
+          name: recipe.menuItemName.trim(),
+          description: '',
+          ingredients,
+          instructions: recipe.instructions || '',
+          servings: parseInt(recipe.servings) || 1,
+          prepTime: 0,
+          cookTime: 0,
+          category: recipe.category || 'Main Course',
+          isActive: true,
+          createdAt: new Date(),
+          updatedAt: new Date(),
+          createdBy: userId
+        };
+
+        await db.collection(collections.recipes).add(recipeData);
+        summary.recipes++;
+      } catch (e) {
+        errors.push(`Recipe "${recipe.menuItemName}": ${e.message}`);
+      }
+    }
+
+    console.log(`✅ Smart import complete: ${JSON.stringify(summary)}`);
+
+    res.json({
+      success: true,
+      message: `Import complete! Created ${summary.inventoryItems} inventory items, ${summary.menuCategories} categories, ${summary.menuItems} menu items, ${summary.recipes} recipes.`,
+      summary,
+      errors
+    });
+
+  } catch (error) {
+    console.error('Smart import confirm error:', error);
+    res.status(500).json({ error: 'Failed to import', message: error.message });
+  }
+});
+
 // Get single inventory item (MUST be after all named /api/inventory/:restaurantId/<name> routes to avoid catching them)
 app.get('/api/inventory/:restaurantId/:itemId', authenticateToken, async (req, res) => {
   try {
