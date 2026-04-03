@@ -176,20 +176,73 @@ class InventoryService {
                       return new Date(dateA) - new Date(dateB);
                     });
 
-                    let remaining = deductionAmount;
+                    const now = new Date();
+                    let expiredWasteQty = 0;
+
+                    // First pass: skip expired batches and auto-mark them as waste
+                    const validBatches = [];
                     for (const stockBatch of activeBatches) {
+                      const expiryDate = stockBatch.expiryDate?.toDate?.() || (stockBatch.expiryDate ? new Date(stockBatch.expiryDate) : null);
+                      if (expiryDate && expiryDate < now) {
+                        // Expired — mark as waste, deplete batch
+                        const wastedQty = stockBatch.remainingQty;
+                        batch.update(stockBatch.ref, {
+                          remainingQty: 0,
+                          status: 'depleted',
+                          updatedAt: now
+                        });
+                        // Create waste entry for expired batch
+                        const costPU = inventoryItem.costPerUnit || stockBatch.costPerUnit || 0;
+                        const wasteRef = db.collection('wasteEntries').doc();
+                        batch.set(wasteRef, {
+                          restaurantId,
+                          itemId: inventoryItem.id,
+                          itemName: inventoryItem.name,
+                          quantity: wastedQty,
+                          unit: inventoryItem.unit || '',
+                          reason: 'expired',
+                          source: 'AUTO_EXPIRY',
+                          costPerUnit: costPU,
+                          wasteValue: wastedQty * costPU,
+                          totalCost: wastedQty * costPU,
+                          batchId: stockBatch.id,
+                          notes: `Auto-detected expired batch during order ${orderId}`,
+                          date: now,
+                          createdAt: now
+                        });
+                        expiredWasteQty += wastedQty;
+                        console.log(`🗑️ Auto-wasted expired batch ${stockBatch.id} for ${inventoryItem.name}: ${wastedQty} ${inventoryItem.unit || ''}`);
+                      } else {
+                        validBatches.push(stockBatch);
+                      }
+                    }
+
+                    // Deduct expired waste from current stock
+                    if (expiredWasteQty > 0) {
+                      inventoryItem.currentStock = (inventoryItem.currentStock || 0) - expiredWasteQty;
+                    }
+
+                    // Second pass: FIFO deduction from valid (non-expired) batches
+                    let remaining = deductionAmount;
+                    for (const stockBatch of validBatches) {
                       if (remaining <= 0) break;
                       const deductFromBatch = Math.min(stockBatch.remainingQty, remaining);
                       const updatedRemaining = stockBatch.remainingQty - deductFromBatch;
                       batch.update(stockBatch.ref, {
                         remainingQty: updatedRemaining,
                         status: updatedRemaining <= 0 ? 'depleted' : 'active',
-                        updatedAt: new Date()
+                        updatedAt: now
                       });
                       batchIds.push(stockBatch.id);
                       remaining -= deductFromBatch;
                     }
-                    newStock = (inventoryItem.currentStock || 0) - deductionAmount;
+
+                    // If all valid batches exhausted but still need more, log warning
+                    if (remaining > 0 && validBatches.length > 0) {
+                      console.warn(`⚠️ Not enough non-expired stock in batches for ${inventoryItem.name}. Short by ${remaining} ${inventoryItem.unit || ''}`);
+                    }
+
+                    newStock = inventoryItem.currentStock - deductionAmount;
                   } else {
                     // No batches — backward-compatible simple deduction
                     newStock = (inventoryItem.currentStock || 0) - deductionAmount;

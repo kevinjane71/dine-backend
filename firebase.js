@@ -130,7 +130,11 @@ const collections = {
   payrollRuns: 'payrollRuns',
   paySlips: 'paySlips',
   chartOfAccounts: 'chartOfAccounts',
-  journalEntries: 'journalEntries'
+  journalEntries: 'journalEntries',
+  // Waste Tracking Collections
+  wasteEntries: 'wasteEntries',
+  stockAudits: 'stockAudits',
+  productionEntries: 'productionEntries'
 };
 
 const admin = null; // We don't need the legacy admin object anymore
