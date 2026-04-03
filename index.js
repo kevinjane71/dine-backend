@@ -2005,11 +2005,23 @@ app.post('/api/demo-request', async (req, res) => {
         console.log('✅ Demo request notification email sent:', emailResult.emailId);
       } else {
         console.warn('⚠️ Failed to send demo request notification email:', emailResult.error);
-        // Don't fail the request if email fails
       }
     } catch (emailError) {
       console.error('❌ Error sending demo request notification email:', emailError);
-      // Don't fail the request if email fails
+    }
+
+    // Send thank-you email with demo link to user (email contact only)
+    if (contactType === 'email' && email) {
+      try {
+        const thankYouResult = await emailService.sendDemoThankYouEmail({ email, restaurantName });
+        if (thankYouResult.success) {
+          console.log('✅ Demo thank-you email sent to:', email);
+        } else {
+          console.warn('⚠️ Failed to send demo thank-you email:', thankYouResult.error);
+        }
+      } catch (thankYouError) {
+        console.error('❌ Error sending demo thank-you email:', thankYouError);
+      }
     }
 
     res.status(201).json({

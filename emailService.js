@@ -998,6 +998,98 @@ Time: ${timestamp}`;
       return { success: false, error: error.message };
     }
   }
+  // Send demo thank-you email to the user (email contact only)
+  async sendDemoThankYouEmail({ email, restaurantName }) {
+    if (!email) return { success: false, error: 'No email provided' };
+
+    const name = restaurantName || 'there';
+    const subject = 'Hey from DineOpen — Here\'s your demo!';
+
+    const text = `Hello ${name}!
+
+Thanks for checking out DineOpen — we're glad you're here.
+
+Here's a quick product demo to get you started:
+https://www.youtube.com/watch?v=u7LsbFNMTPk
+
+Want us to set up your account? Just reply to this email with:
+- Your menu (photo or PDF works great)
+- We'll configure everything and give you a live walkthrough
+
+Need help right away? Call us directly:
++91 95286 32779
+
+Talk soon,
+Team DineOpen
+https://www.dineopen.com`;
+
+    const html = `<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"></head>
+<body style="margin:0;padding:0;background-color:#f9fafb;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;">
+  <div style="max-width:520px;margin:24px auto;background:white;border-radius:16px;overflow:hidden;box-shadow:0 2px 12px rgba(0,0,0,0.06);">
+
+    <!-- Header -->
+    <div style="background:linear-gradient(135deg,#ef4444,#dc2626);padding:32px 28px;text-align:center;">
+      <div style="font-size:36px;margin-bottom:8px;">👋</div>
+      <h1 style="margin:0;color:white;font-size:22px;font-weight:700;">Hello${restaurantName ? ', ' + restaurantName : ''}!</h1>
+      <p style="margin:6px 0 0;color:rgba(255,255,255,0.9);font-size:14px;">Thanks for your interest in DineOpen</p>
+    </div>
+
+    <!-- Body -->
+    <div style="padding:28px;">
+      <p style="margin:0 0 20px;color:#374151;font-size:15px;line-height:1.6;">
+        We're excited you want to see DineOpen in action. Here's a quick demo of how it works:
+      </p>
+
+      <!-- Demo Video Link -->
+      <a href="https://www.youtube.com/watch?v=u7LsbFNMTPk" target="_blank" style="text-decoration:none;display:block;margin-bottom:24px;">
+        <div style="background:#fef2f2;border:2px solid #fecaca;border-radius:12px;padding:20px;text-align:center;">
+          <div style="font-size:40px;margin-bottom:8px;">▶️</div>
+          <div style="color:#dc2626;font-size:16px;font-weight:700;">Watch Product Demo</div>
+          <div style="color:#6b7280;font-size:13px;margin-top:4px;">See DineOpen in action</div>
+        </div>
+      </a>
+
+      <!-- CTA: Send menu -->
+      <div style="background:#f0fdf4;border:1px solid #bbf7d0;border-radius:12px;padding:20px;margin-bottom:24px;">
+        <div style="font-size:20px;margin-bottom:6px;">📋</div>
+        <p style="margin:0 0 6px;color:#166534;font-size:15px;font-weight:600;">Want us to set you up?</p>
+        <p style="margin:0;color:#374151;font-size:14px;line-height:1.5;">
+          Just reply to this email with your <strong>menu photo or PDF</strong>. We'll configure your account and give you a personal live demo.
+        </p>
+      </div>
+
+      <!-- Call support -->
+      <div style="background:#f8fafc;border:1px solid #e2e8f0;border-radius:12px;padding:16px;text-align:center;">
+        <p style="margin:0 0 4px;color:#64748b;font-size:13px;">Prefer to talk? Call us directly</p>
+        <a href="tel:+919528632779" style="color:#dc2626;font-size:18px;font-weight:700;text-decoration:none;">+91 95286 32779</a>
+      </div>
+    </div>
+
+    <!-- Footer -->
+    <div style="padding:16px 28px;background:#f9fafb;border-top:1px solid #f1f5f9;text-align:center;">
+      <p style="margin:0;font-size:12px;color:#9ca3af;">
+        <a href="https://www.dineopen.com" style="color:#ef4444;text-decoration:none;font-weight:600;">DineOpen</a> — AI-Powered Restaurant Management
+      </p>
+    </div>
+
+  </div>
+</body>
+</html>`;
+
+    try {
+      return await this.sendEmail({
+        to: email,
+        subject,
+        text,
+        html
+      });
+    } catch (error) {
+      console.error('Error sending demo thank-you email:', error);
+      return { success: false, error: error.message };
+    }
+  }
 }
 
 module.exports = new EmailService();
