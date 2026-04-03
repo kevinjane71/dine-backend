@@ -8087,9 +8087,7 @@ app.get('/api/orders/:restaurantId', authenticateToken, async (req, res) => {
                              .where('createdAt', '<', eDate);
       } else if (startDate && endDate && todayOnly !== 'true' && !date) {
         const rangeStart = new Date(startDate);
-        rangeStart.setHours(0, 0, 0, 0);
         const rangeEnd = new Date(endDate);
-        rangeEnd.setHours(23, 59, 59, 999);
         fastQuery = fastQuery.where('createdAt', '>=', rangeStart)
                              .where('createdAt', '<=', rangeEnd);
       }
@@ -8156,9 +8154,7 @@ app.get('/api/orders/:restaurantId', authenticateToken, async (req, res) => {
                                .where('createdAt', '<', eDate);
     } else if (startDate && endDate) {
       const rangeStart = new Date(startDate);
-      rangeStart.setHours(0, 0, 0, 0);
       const rangeEnd = new Date(endDate);
-      rangeEnd.setHours(23, 59, 59, 999);
       searchQuery = searchQuery.where('createdAt', '>=', rangeStart)
                                .where('createdAt', '<=', rangeEnd);
     } else if (search && search.trim()) {

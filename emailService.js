@@ -1024,12 +1024,12 @@ https://www.dineopen.com`;
   <div style="max-width:520px;margin:24px auto;background:white;border-radius:20px;overflow:hidden;box-shadow:0 4px 24px rgba(0,0,0,0.08);">
 
     <!-- Header -->
-    <div style="background:#1f2937;padding:36px 28px 32px;text-align:center;">
-      <div style="display:inline-block;background:#ef4444;width:48px;height:48px;border-radius:12px;line-height:48px;font-size:24px;margin-bottom:16px;">
-        <span style="color:white;font-weight:800;font-size:20px;">D</span>
+    <div style="background:linear-gradient(135deg,#ef4444,#dc2626);padding:36px 28px 32px;text-align:center;">
+      <div style="display:inline-block;background:white;width:48px;height:48px;border-radius:12px;line-height:48px;font-size:24px;margin-bottom:16px;">
+        <span style="color:#ef4444;font-weight:800;font-size:20px;">D</span>
       </div>
       <h1 style="margin:0;color:white;font-size:24px;font-weight:800;letter-spacing:-0.5px;">Your Demo is Ready</h1>
-      <p style="margin:8px 0 0;color:#9ca3af;font-size:14px;">Hi${restaurantName ? ' <span style="color:#f87171;font-weight:600;">' + restaurantName + '</span>' : ''} — thanks for checking us out</p>
+      <p style="margin:8px 0 0;color:rgba(255,255,255,0.85);font-size:14px;">Hi${restaurantName ? ' <span style="color:white;font-weight:700;">' + restaurantName + '</span> —' : ' —'} thanks for checking us out</p>
     </div>
 
     <!-- Body -->
@@ -1037,12 +1037,12 @@ https://www.dineopen.com`;
 
       <!-- Demo Video -->
       <a href="https://www.youtube.com/watch?v=u7LsbFNMTPk" target="_blank" style="text-decoration:none;display:block;margin-bottom:20px;">
-        <div style="background:#111827;border-radius:14px;padding:28px 20px;text-align:center;position:relative;">
+        <div style="background:#fef2f2;border:2px solid #fecaca;border-radius:14px;padding:28px 20px;text-align:center;position:relative;">
           <div style="display:inline-block;width:56px;height:56px;background:#ef4444;border-radius:50%;line-height:56px;margin-bottom:12px;">
             <span style="color:white;font-size:22px;margin-left:3px;">&#9654;</span>
           </div>
-          <div style="color:white;font-size:17px;font-weight:700;">Watch DineOpen in Action</div>
-          <div style="color:#9ca3af;font-size:13px;margin-top:6px;">3 min product walkthrough</div>
+          <div style="color:#dc2626;font-size:17px;font-weight:700;">Watch DineOpen in Action</div>
+          <div style="color:#6b7280;font-size:13px;margin-top:6px;">3 min product walkthrough</div>
         </div>
       </a>
 
@@ -1051,7 +1051,7 @@ https://www.dineopen.com`;
 
       <!-- Send Menu CTA -->
       <div style="margin-bottom:20px;">
-        <p style="margin:0 0 8px;color:#1f2937;font-size:16px;font-weight:700;">Get your account set up — free</p>
+        <p style="margin:0 0 8px;color:#1f2937;font-size:16px;font-weight:700;">Get your account set up free</p>
         <p style="margin:0 0 16px;color:#6b7280;font-size:14px;line-height:1.6;">
           Reply to this email with your <strong style="color:#1f2937;">menu photo or PDF</strong>. We'll build your account and walk you through it live.
         </p>
