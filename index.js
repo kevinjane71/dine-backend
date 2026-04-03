@@ -233,6 +233,235 @@ function findDineInRule(rules) {
   return (rules || []).find(r => r.isActive && DINEIN_NAMES.includes((r.name || '').toLowerCase().trim()));
 }
 
+// --- Menu Item ↔ Inventory Linkage Helpers ---
+
+function getInventoryUnitForMenuItem(menuItem) {
+  if (menuItem.bottleSize) return 'bottle';
+  if (menuItem.servingUnit) return menuItem.servingUnit;
+  if (menuItem.unit) return menuItem.unit;
+  if (menuItem.servingSize) return menuItem.servingSize === 'scoop' ? 'scoop' : 'pcs';
+  return 'pcs';
+}
+
+async function linkMenuItemToInventory(restaurantId, menuItem, userId) {
+  try {
+    const unit = getInventoryUnitForMenuItem(menuItem);
+    const stockQty = parseFloat(menuItem.stockQuantity) || 0;
+    const minStock = parseFloat(menuItem.lowStockThreshold) || 5;
+
+    // Check if linked inventory item already exists
+    let inventoryItemId = null;
+    const existingSnap = await db.collection(collections.inventory)
+      .where('restaurantId', '==', restaurantId)
+      .where('linkedMenuItemId', '==', menuItem.id)
+      .limit(1)
+      .get();
+
+    if (!existingSnap.empty) {
+      // Update existing linked inventory item
+      inventoryItemId = existingSnap.docs[0].id;
+      const currentItem = existingSnap.docs[0].data();
+      const updateData = {
+        name: menuItem.name,
+        currentStock: stockQty,
+        minStock,
+        unit,
+        updatedAt: new Date(),
+        updatedBy: userId
+      };
+      if (menuItem.expiryDate) updateData.expiryDate = menuItem.expiryDate;
+      if (menuItem.mfgDate) updateData.mfgDate = menuItem.mfgDate;
+      if (menuItem.shelfLife) updateData.expiryDays = menuItem.shelfLife;
+      // Recalculate status
+      updateData.status = stockQty <= minStock ? 'low' : 'good';
+      if (menuItem.expiryDate && new Date(menuItem.expiryDate) < new Date()) updateData.status = 'expired';
+
+      await db.collection(collections.inventory).doc(inventoryItemId).update(updateData);
+
+      // If stock changed, create/update batch
+      const oldStock = parseFloat(currentItem.currentStock) || 0;
+      const stockDiff = stockQty - oldStock;
+      if (stockDiff > 0) {
+        await db.collection(collections.stockBatches).add({
+          restaurantId, inventoryItemId, inventoryItemName: menuItem.name,
+          quantity: stockDiff, remainingQty: stockDiff, unit,
+          mfgDate: menuItem.mfgDate ? new Date(menuItem.mfgDate) : new Date(),
+          expiryDays: menuItem.shelfLife ? parseInt(menuItem.shelfLife) : null,
+          expiryDate: menuItem.expiryDate ? new Date(menuItem.expiryDate) : null,
+          costPerUnit: menuItem.price ? menuItem.price * 0.3 : 0,
+          supplier: '', addedBy: userId, source: 'menu-link',
+          status: 'active', createdAt: new Date(), updatedAt: new Date()
+        });
+      }
+      console.log(`📦 Menu→Inventory sync updated: ${menuItem.name} (${inventoryItemId}) stock=${stockQty}`);
+    } else {
+      // Create new inventory item
+      let status = 'good';
+      if (stockQty <= minStock) status = 'low';
+      if (menuItem.expiryDate && new Date(menuItem.expiryDate) < new Date()) status = 'expired';
+
+      const itemData = {
+        restaurantId,
+        name: menuItem.name,
+        category: menuItem.category || 'other',
+        unit,
+        currentStock: stockQty,
+        minStock,
+        maxStock: 0,
+        costPerUnit: menuItem.price ? Math.round(menuItem.price * 0.3 * 100) / 100 : 0,
+        supplier: '',
+        description: menuItem.description || '',
+        barcode: '',
+        expiryDate: menuItem.expiryDate || null,
+        mfgDate: menuItem.mfgDate || null,
+        expiryDays: menuItem.shelfLife ? parseInt(menuItem.shelfLife) : null,
+        location: '',
+        status,
+        linkedMenuItemId: menuItem.id,
+        createdAt: new Date(),
+        updatedAt: new Date(),
+        createdBy: userId,
+        updatedBy: userId
+      };
+
+      const itemRef = await db.collection(collections.inventory).add(itemData);
+      inventoryItemId = itemRef.id;
+
+      // Create initial stock batch
+      if (stockQty > 0) {
+        await db.collection(collections.stockBatches).add({
+          restaurantId, inventoryItemId, inventoryItemName: menuItem.name,
+          quantity: stockQty, remainingQty: stockQty, unit,
+          mfgDate: menuItem.mfgDate ? new Date(menuItem.mfgDate) : new Date(),
+          expiryDays: menuItem.shelfLife ? parseInt(menuItem.shelfLife) : null,
+          expiryDate: menuItem.expiryDate ? new Date(menuItem.expiryDate) : null,
+          costPerUnit: itemData.costPerUnit, supplier: '',
+          addedBy: userId, source: 'menu-link',
+          status: 'active', createdAt: new Date(), updatedAt: new Date()
+        });
+      }
+      console.log(`📦 Menu→Inventory created: ${menuItem.name} (${inventoryItemId}) stock=${stockQty}`);
+    }
+
+    // Ensure a 1:1 recipe exists for this menu item
+    const recipeSnap = await db.collection(collections.recipes)
+      .where('restaurantId', '==', restaurantId)
+      .where('menuItemId', '==', menuItem.id)
+      .limit(1)
+      .get();
+
+    if (recipeSnap.empty && inventoryItemId) {
+      await db.collection(collections.recipes).add({
+        restaurantId,
+        menuItemId: menuItem.id,
+        menuItemName: menuItem.name,
+        name: `${menuItem.name} (Stock-Linked)`,
+        description: 'Auto-generated 1:1 recipe for stock tracking',
+        ingredients: [{
+          inventoryItemId,
+          inventoryItemName: menuItem.name,
+          quantity: 1,
+          unit
+        }],
+        isAutoGenerated: true,
+        isActive: true,
+        createdAt: new Date(),
+        updatedAt: new Date(),
+        createdBy: userId
+      });
+      console.log(`📋 1:1 recipe created for: ${menuItem.name}`);
+    }
+
+    return inventoryItemId;
+  } catch (err) {
+    console.error('linkMenuItemToInventory error:', err);
+    return null;
+  }
+}
+
+async function syncInventoryToMenuItem(restaurantId, inventoryItemId) {
+  try {
+    const itemDoc = await db.collection(collections.inventory).doc(inventoryItemId).get();
+    if (!itemDoc.exists) return;
+    const invItem = itemDoc.data();
+    if (!invItem.linkedMenuItemId) return;
+
+    const restaurantRef = db.collection(collections.restaurants).doc(restaurantId);
+    const restaurantDoc = await restaurantRef.get();
+    if (!restaurantDoc.exists) return;
+
+    const restaurantData = restaurantDoc.data();
+    const menuItems = restaurantData.menu?.items || [];
+    let changed = false;
+
+    const updatedItems = menuItems.map(mi => {
+      if (mi.id !== invItem.linkedMenuItemId) return mi;
+      const newQty = Math.max(0, Math.round(invItem.currentStock));
+      const newAvail = newQty > 0;
+      if (mi.stockQuantity === newQty && mi.isAvailable === newAvail) return mi;
+      changed = true;
+      return { ...mi, stockQuantity: newQty, isAvailable: newAvail, updatedAt: new Date() };
+    });
+
+    if (changed) {
+      await restaurantRef.update({
+        'menu.items': updatedItems,
+        'menu.lastUpdated': new Date()
+      });
+      invalidateRestaurantCache(restaurantId);
+      console.log(`🔄 Inventory→Menu sync: ${invItem.name} stock=${Math.round(invItem.currentStock)}`);
+    }
+  } catch (err) {
+    console.error('syncInventoryToMenuItem error:', err);
+  }
+}
+
+async function syncInventoryStockToMenuItems(restaurantId) {
+  try {
+    const invSnap = await db.collection(collections.inventory)
+      .where('restaurantId', '==', restaurantId)
+      .where('linkedMenuItemId', '!=', null)
+      .get();
+
+    if (invSnap.empty) return;
+
+    const restaurantRef = db.collection(collections.restaurants).doc(restaurantId);
+    const restaurantDoc = await restaurantRef.get();
+    if (!restaurantDoc.exists) return;
+
+    const restaurantData = restaurantDoc.data();
+    const menuItems = restaurantData.menu?.items || [];
+    let changed = false;
+
+    const invMap = {};
+    invSnap.docs.forEach(doc => {
+      const d = doc.data();
+      if (d.linkedMenuItemId) invMap[d.linkedMenuItemId] = d;
+    });
+
+    const updatedItems = menuItems.map(mi => {
+      const inv = invMap[mi.id];
+      if (!inv) return mi;
+      const newQty = Math.max(0, Math.round(inv.currentStock));
+      const newAvail = newQty > 0;
+      if (mi.stockQuantity === newQty && mi.isAvailable === newAvail) return mi;
+      changed = true;
+      return { ...mi, stockQuantity: newQty, isAvailable: newAvail, updatedAt: new Date() };
+    });
+
+    if (changed) {
+      await restaurantRef.update({
+        'menu.items': updatedItems,
+        'menu.lastUpdated': new Date()
+      });
+      invalidateRestaurantCache(restaurantId);
+      console.log(`🔄 Bulk inventory→menu sync for ${restaurantId}`);
+    }
+  } catch (err) {
+    console.error('syncInventoryStockToMenuItems error:', err);
+  }
+}
+
 // Multi-tier pricing: resolve per-item price for a given pricing rule
 function resolveItemPriceForRule(menuItem, ruleId, rules) {
   if (!ruleId || !rules?.length) return null;
@@ -5504,6 +5733,8 @@ app.get('/api/menus/:restaurantId', async (req, res) => {
     // Filter only active items
     menuItems = menuItems.filter(item => item.status === 'active');
 
+    // Cache at Vercel Edge for 1 min, serve stale for 30s while revalidating
+    res.set('Cache-Control', 'public, s-maxage=60, stale-while-revalidate=30');
     res.json({ menuItems });
 
   } catch (error) {
@@ -5672,12 +5903,18 @@ app.post('/api/menus/:restaurantId', authenticateToken, async (req, res) => {
     // We don't await this so the user response is instant.
     if (req.body.generateRecipe) {
       inventoryService.createDefaultRecipe(
-        restaurantId, 
-        newMenuItem.id, 
-        newMenuItem.name, 
+        restaurantId,
+        newMenuItem.id,
+        newMenuItem.name,
         newMenuItem.description,
         req.user.uid
       ).catch(err => console.error('BG Recipe Gen Error:', err));
+    }
+
+    // AUTO-LINK to inventory if stock tracking enabled
+    if (newMenuItem.isStockManaged) {
+      linkMenuItemToInventory(restaurantId, newMenuItem, req.user.uid)
+        .catch(err => console.error('Menu→Inventory link error:', err));
     }
 
     res.status(201).json({
@@ -5819,11 +6056,20 @@ app.patch('/api/menus/item/:id', authenticateToken, async (req, res) => {
     });
     invalidateRestaurantCache(foundRestaurant.id);
 
+    // AUTO-LINK to inventory if stock tracking enabled or stock changed
+    const updatedMenuItem = updatedItems.find(i => i.id === id);
+    if (updatedMenuItem && (updateData.isStockManaged || updateData.stockQuantity !== undefined)) {
+      if (updatedMenuItem.isStockManaged) {
+        linkMenuItemToInventory(foundRestaurant.id, updatedMenuItem, req.user.uid)
+          .catch(err => console.error('Menu→Inventory link error:', err));
+      }
+    }
+
     res.json({
       message: 'Menu item updated successfully',
       updatedFields: Object.keys(updateData).filter(key => key !== 'updatedAt')
     });
-    
+
   } catch (error) {
     console.error('Update menu item error:', error);
     res.status(500).json({ error: 'Failed to update menu item' });
@@ -6313,7 +6559,19 @@ app.post('/api/public/orders/:restaurantId', vercelSecurityMiddleware.publicAPI,
         quantity: item.quantity,
         total: itemTotal,
         shortCode: menuItem.shortCode || null,
-        notes: item.notes || ''
+        notes: item.notes || '',
+        // Type-specific display fields
+        unit: menuItem.unit || null,
+        weight: menuItem.weight || null,
+        servingSize: menuItem.servingSize || null,
+        bottleSize: menuItem.bottleSize || null,
+        spiritCategory: menuItem.spiritCategory || null,
+        abv: menuItem.abv || null,
+        servingUnit: menuItem.servingUnit || null,
+        scoopOptions: menuItem.scoopOptions || null,
+        expiryDate: menuItem.expiryDate || null,
+        shelfLife: menuItem.shelfLife || null,
+        mfgDate: menuItem.mfgDate || null,
       });
     }
 
@@ -6654,6 +6912,7 @@ app.post('/api/public/orders/:restaurantId', vercelSecurityMiddleware.publicAPI,
 
     // SMART INVENTORY: Deduct stock asynchronously
     inventoryService.deductInventoryForOrder(restaurantId, orderRef.id, orderItems)
+        .then(() => syncInventoryStockToMenuItems(restaurantId))
         .catch(err => console.error('Inventory Deduction Error:', err));
 
     // Trigger Pusher notification for real-time updates (public/online orders)
@@ -6929,6 +7188,11 @@ app.post('/api/orders', async (req, res) => {
         return res.status(400).json({ error: `Menu item ${item.menuItemId} not found` });
       }
 
+      // Block out-of-stock items
+      if (menuItem.isAvailable === false) {
+        return res.status(400).json({ error: `"${menuItem.name}" is currently out of stock` });
+      }
+
       // Compute unit price considering variant and selected customizations (toppings)
       const selectedVariant = item.selectedVariant || item.variant || null; // { name, price }
       const customizations = Array.isArray(item.selectedCustomizations)
@@ -6970,6 +7234,13 @@ app.post('/api/orders', async (req, res) => {
         weight: menuItem.weight || null,
         servingSize: menuItem.servingSize || null,
         bottleSize: menuItem.bottleSize || null,
+        spiritCategory: menuItem.spiritCategory || null,
+        abv: menuItem.abv || null,
+        servingUnit: menuItem.servingUnit || null,
+        scoopOptions: menuItem.scoopOptions || null,
+        expiryDate: menuItem.expiryDate || null,
+        shelfLife: menuItem.shelfLife || null,
+        mfgDate: menuItem.mfgDate || null,
       });
     }
 
@@ -7537,6 +7808,7 @@ app.post('/api/orders', async (req, res) => {
 
     // SMART INVENTORY: Deduct stock asynchronously
     inventoryService.deductInventoryForOrder(restaurantId, orderRef.id, orderItems)
+        .then(() => syncInventoryStockToMenuItems(restaurantId))
         .catch(err => console.error('Inventory Deduction Error:', err));
 
     // NEW: Link order to hotel check-in if room number is provided
@@ -10852,6 +11124,8 @@ app.get('/api/tables/:restaurantId', async (req, res) => {
       });
     });
 
+    // Cache at Vercel Edge for 1 min, serve stale for 30s
+    res.set('Cache-Control', 'public, s-maxage=60, stale-while-revalidate=30');
     res.json({ tables });
 
   } catch (error) {
@@ -11361,6 +11635,8 @@ app.get('/api/floors/:restaurantId', async (req, res) => {
       });
     }
 
+    // Short CDN cache — floors have live order totals
+    res.set('Cache-Control', 'public, s-maxage=15, stale-while-revalidate=10');
     res.json({ floors });
 
   } catch (error) {
@@ -15936,6 +16212,12 @@ app.patch('/api/inventory/:restaurantId/:itemId', authenticateToken, async (req,
 
     console.log(`📦 Inventory item updated: ${itemId}`);
 
+    // Reverse sync: if this inventory item is linked to a menu item, update its stock
+    if (currentItem.linkedMenuItemId || updateData.linkedMenuItemId) {
+      syncInventoryToMenuItem(restaurantId, itemId)
+        .catch(err => console.error('Inventory→Menu sync error:', err));
+    }
+
     res.json({
       message: 'Inventory item updated successfully',
       item: { id: itemId, ...currentItem, ...updateData }
@@ -16385,6 +16667,10 @@ app.post('/api/inventory/:restaurantId/stock-audits', authenticateToken, async (
         createdAt: new Date()
       });
     }
+
+    // Sync linked menu items after audit
+    syncInventoryStockToMenuItems(restaurantId)
+      .catch(err => console.error('Audit→Menu sync error:', err));
 
     res.status(201).json({ id: auditRef.id, ...auditData });
   } catch (error) {
@@ -22326,15 +22612,16 @@ app.get('/api/restaurants/:restaurantId/pricing-settings', authenticateToken, as
     const { restaurantId } = req.params;
     const { userId } = req.user;
 
-    const restaurantDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
-    if (!restaurantDoc.exists) {
+    // Use KV-cached restaurant data instead of direct Firestore read
+    const { data: restaurantData } = await getCachedRestaurant(db, collections.restaurants, restaurantId);
+    if (!restaurantData) {
       return res.status(404).json({ error: 'Restaurant not found' });
     }
-    if (restaurantDoc.data().ownerId !== userId) {
+    if (restaurantData.ownerId !== userId) {
       return res.status(403).json({ error: 'Access denied' });
     }
 
-    const existing = restaurantDoc.data().pricingSettings || {};
+    const existing = restaurantData.pricingSettings || {};
     const pricingSettings = {
       zonePricing: {
         enabled: existing.zonePricing?.enabled ?? false,
@@ -23065,13 +23352,11 @@ app.get('/api/categories/:restaurantId', authenticateToken, async (req, res) => 
   try {
     const { restaurantId } = req.params;
 
-    // Get restaurant document to access embedded categories
-    const restaurantDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
-    if (!restaurantDoc.exists) {
+    // Use KV-cached restaurant data instead of direct Firestore read
+    const { data: restaurantData } = await getCachedRestaurant(db, collections.restaurants, restaurantId);
+    if (!restaurantData) {
       return res.status(404).json({ error: 'Restaurant not found' });
     }
-
-    const restaurantData = restaurantDoc.data();
     let categories = restaurantData.categories || [];
 
     // If no categories defined, extract them dynamically from menu items
