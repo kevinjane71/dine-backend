@@ -51,7 +51,8 @@ const notifyOrderStatusUpdated = async (restaurantId, orderId, newStatus, orderD
     orderId,
     status: newStatus,
     orderNumber: orderData.orderNumber || orderData.dailyOrderId,
-    totalAmount: orderData.totalAmount
+    totalAmount: orderData.totalAmount,
+    tableNumber: orderData.tableNumber
   });
 };
 
@@ -64,7 +65,8 @@ const notifyOrderUpdated = async (restaurantId, orderId, orderData) => {
     status: orderData.status,
     orderNumber: orderData.orderNumber || orderData.dailyOrderId,
     totalAmount: orderData.totalAmount,
-    itemsCount: orderData.items?.length || 0
+    itemsCount: orderData.items?.length || 0,
+    tableNumber: orderData.tableNumber
   });
 };
 

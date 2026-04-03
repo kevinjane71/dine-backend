@@ -2541,7 +2541,7 @@ app.post('/api/auth/email/register', async (req, res) => {
       isNewUser: true,
       hasRestaurants,
       verificationRequired: !otp,
-      redirectTo: hasRestaurants ? '/dashboard' : '/admin'
+      redirectTo: hasRestaurants ? '/home' : '/admin'
     });
 
   } catch (error) {
@@ -2687,7 +2687,7 @@ app.post('/api/auth/email/verify-otp', async (req, res) => {
         setupComplete: userData.setupComplete || false
       },
       hasRestaurants,
-      redirectTo: hasRestaurants ? '/dashboard' : '/admin'
+      redirectTo: hasRestaurants ? '/home' : '/admin'
     });
 
   } catch (error) {
@@ -2797,7 +2797,7 @@ app.post('/api/auth/email/login', async (req, res) => {
       },
       hasRestaurants,
       subdomainUrl,
-      redirectTo: subdomainUrl || (hasRestaurants ? '/dashboard' : '/admin')
+      redirectTo: subdomainUrl || (hasRestaurants ? '/home' : '/admin')
     });
 
   } catch (error) {
@@ -3346,7 +3346,7 @@ app.post('/api/auth/google', async (req, res) => {
       firstTimeUser: isNewUser,
       isNewUser, // Keep for backward compatibility
       hasRestaurants,
-      redirectTo: hasRestaurants ? '/dashboard' : '/admin'
+      redirectTo: hasRestaurants ? '/home' : '/admin'
     });
 
   } catch (error) {
@@ -3646,7 +3646,7 @@ app.post('/api/auth/firebase/verify', async (req, res) => {
       hasRestaurants,
       restaurants: userRestaurants,
       subdomainUrl, // Include subdomain URL if enabled
-      redirectTo: subdomainUrl || (hasRestaurants ? '/dashboard' : '/admin')
+      redirectTo: subdomainUrl || (hasRestaurants ? '/home' : '/admin')
     });
 
   } catch (error) {
@@ -3795,7 +3795,7 @@ app.post('/api/auth/phone/verify-otp', async (req, res) => {
       hasRestaurants,
       restaurants: userRestaurants,
       subdomainUrl,
-      redirectTo: subdomainUrl || (hasRestaurants ? '/dashboard' : '/admin')
+      redirectTo: subdomainUrl || (hasRestaurants ? '/home' : '/admin')
     });
 
   } catch (error) {
@@ -4075,7 +4075,7 @@ app.post('/api/auth/pin/login', async (req, res) => {
       hasRestaurants,
       restaurants: userRestaurants,
       subdomainUrl,
-      redirectTo: subdomainUrl || (hasRestaurants ? '/dashboard' : '/admin')
+      redirectTo: subdomainUrl || (hasRestaurants ? '/home' : '/admin')
     });
 
   } catch (error) {
@@ -4245,7 +4245,7 @@ app.post('/api/admin/setup-client', async (req, res) => {
         email: restaurant.email
       } : null,
       hasRestaurants: existingRestaurants.size > 0 || !!restaurant,
-      redirectTo: restaurant ? '/dashboard' : '/admin'
+      redirectTo: restaurant ? '/home' : '/admin'
     });
 
   } catch (error) {
@@ -4454,7 +4454,7 @@ app.post('/api/auth/local-login', async (req, res) => {
       isNewUser,
       hasRestaurants: isStaff ? !!staffRestaurantId : hasRestaurants,
       subdomainUrl,
-      redirectTo: subdomainUrl || (hasRestaurants ? '/dashboard' : '/admin')
+      redirectTo: subdomainUrl || (hasRestaurants ? '/home' : '/admin')
     });
 
   } catch (error) {
@@ -8971,7 +8971,8 @@ app.patch('/api/orders/:orderId/status', authenticateToken, async (req, res) => 
     pusherService.notifyOrderStatusUpdated(orderData.restaurantId, orderId, status, {
       orderNumber: orderData.orderNumber,
       dailyOrderId: orderData.dailyOrderId,
-      totalAmount: orderData.totalAmount
+      totalAmount: orderData.totalAmount,
+      tableNumber: orderData.tableNumber
     }).catch(err => console.error('Pusher notification error (non-blocking):', err));
 
     // Trigger KOT print notification when order is confirmed (sent to kitchen)
@@ -9554,7 +9555,8 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
       orderNumber: currentOrder.orderNumber,
       dailyOrderId: currentOrder.dailyOrderId,
       totalAmount: updateData.totalAmount || currentOrder.totalAmount,
-      items: updateData.items || currentOrder.items
+      items: updateData.items || currentOrder.items,
+      tableNumber: currentOrder.tableNumber
     }).catch(err => console.error('Pusher notification error (non-blocking):', err));
 
     // If items were updated and order is NOT completed/cancelled/deleted/saved, trigger KOT reprint (Pusher and/or polling)
@@ -11378,11 +11380,14 @@ app.patch('/api/floors/:floorId', authenticateToken, async (req, res) => {
       return res.status(400).json({ error: 'Floor name and restaurant ID are required' });
     }
 
-    // Extract original floor name from floorId
-    const originalFloorName = floorId.replace('floor_', '').replace(/_/g, ' ');
-    const originalFloorNameCapitalized = originalFloorName.split(' ').map(word =>
-      word.charAt(0).toUpperCase() + word.slice(1).toLowerCase()
-    ).join(' ');
+    // Read the actual floor document to get the current name (more reliable than deriving from floorId)
+    const floorRef = db.collection('restaurants').doc(restaurantId).collection('floors').doc(floorId);
+    const floorDoc = await floorRef.get();
+    const oldFloorName = floorDoc.exists ? floorDoc.data().name : null;
+
+    // Fallback: derive from floorId if floor doc doesn't have a name
+    const originalFloorNameCapitalized = oldFloorName || floorId.replace('floor_', '').replace(/_/g, ' ')
+      .split(' ').map(word => word.charAt(0).toUpperCase() + word.slice(1).toLowerCase()).join(' ');
 
     // Update all tables on this floor
     const tablesSnapshot = await db.collection(collections.tables)
@@ -11399,7 +11404,6 @@ app.patch('/api/floors/:floorId', authenticateToken, async (req, res) => {
     });
 
     // Update the floor subcollection doc itself
-    const floorRef = db.collection('restaurants').doc(restaurantId).collection('floors').doc(floorId);
     const floorUpdateData = { name, updatedAt: new Date() };
     if (description !== undefined) floorUpdateData.description = description || '';
     if (section !== undefined) floorUpdateData.section = section || null;
@@ -11414,6 +11418,31 @@ app.patch('/api/floors/:floorId', authenticateToken, async (req, res) => {
     batch.update(floorRef, floorUpdateData);
 
     await batch.commit();
+
+    // Sync pricing rules: update tableMappings if floor name changed
+    if (originalFloorNameCapitalized && name !== originalFloorNameCapitalized) {
+      try {
+        const restDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
+        const pricingSettings = restDoc.exists ? restDoc.data().pricingSettings : null;
+        if (pricingSettings?.multiPricing?.rules) {
+          let pricingChanged = false;
+          for (const rule of pricingSettings.multiPricing.rules) {
+            const idx = (rule.tableMappings || []).indexOf(originalFloorNameCapitalized);
+            if (idx !== -1) {
+              rule.tableMappings[idx] = name;
+              pricingChanged = true;
+            }
+          }
+          if (pricingChanged) {
+            pricingSettings.updatedAt = new Date().toISOString();
+            await db.collection(collections.restaurants).doc(restaurantId).update({ pricingSettings });
+            console.log(`✅ Pricing rules updated: "${originalFloorNameCapitalized}" → "${name}"`);
+          }
+        }
+      } catch (pricingError) {
+        console.error('⚠️ Failed to sync pricing rules on floor rename (non-blocking):', pricingError);
+      }
+    }
 
     res.json({ message: 'Floor updated successfully' });
 
@@ -11435,6 +11464,10 @@ app.delete('/api/floors/:floorId', authenticateToken, async (req, res) => {
 
     const floorRef = db.collection('restaurants').doc(restaurantId).collection('floors').doc(floorId);
 
+    // Read floor doc first to get the name (needed for pricing rule cleanup)
+    const floorDoc = await floorRef.get();
+    const floorName = floorDoc.exists ? floorDoc.data().name : null;
+
     // Delete all tables in the floor subcollection
     const tablesSnapshot = await floorRef.collection('tables').get();
     const batch = db.batch();
@@ -11446,6 +11479,31 @@ app.delete('/api/floors/:floorId', authenticateToken, async (req, res) => {
     batch.delete(floorRef);
 
     await batch.commit();
+
+    // Sync pricing rules: remove deleted floor name from tableMappings
+    if (floorName) {
+      try {
+        const restDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
+        const pricingSettings = restDoc.exists ? restDoc.data().pricingSettings : null;
+        if (pricingSettings?.multiPricing?.rules) {
+          let pricingChanged = false;
+          for (const rule of pricingSettings.multiPricing.rules) {
+            const idx = (rule.tableMappings || []).indexOf(floorName);
+            if (idx !== -1) {
+              rule.tableMappings.splice(idx, 1);
+              pricingChanged = true;
+            }
+          }
+          if (pricingChanged) {
+            pricingSettings.updatedAt = new Date().toISOString();
+            await db.collection(collections.restaurants).doc(restaurantId).update({ pricingSettings });
+            console.log(`✅ Pricing rules updated: removed "${floorName}" from tableMappings`);
+          }
+        }
+      } catch (pricingError) {
+        console.error('⚠️ Failed to sync pricing rules on floor delete (non-blocking):', pricingError);
+      }
+    }
 
     res.json({ message: 'Floor and all its tables deleted successfully' });
 
