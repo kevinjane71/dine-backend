@@ -6,7 +6,7 @@
  * 1. Parallel query execution
  * 2. Connection reuse
  * 3. Query result caching
- * 4. Batch operations
+ * 4. Batch operations ff
  */
 
 const { getDb } = require('../firebase');
