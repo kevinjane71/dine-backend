@@ -1002,76 +1002,76 @@ Time: ${timestamp}`;
   async sendDemoThankYouEmail({ email, restaurantName }) {
     if (!email) return { success: false, error: 'No email provided' };
 
-    const name = restaurantName || 'there';
-    const subject = 'Hey from DineOpen — Here\'s your demo!';
+    const subject = 'Your DineOpen Demo is Ready';
 
-    const text = `Hello ${name}!
+    const text = `Hi${restaurantName ? ' ' + restaurantName : ''}!
 
-Thanks for checking out DineOpen — we're glad you're here.
+Thanks for requesting a demo. Here's everything you need:
 
-Here's a quick product demo to get you started:
-https://www.youtube.com/watch?v=u7LsbFNMTPk
+Watch the demo: https://www.youtube.com/watch?v=u7LsbFNMTPk
 
-Want us to set up your account? Just reply to this email with:
-- Your menu (photo or PDF works great)
-- We'll configure everything and give you a live walkthrough
+Ready to get started? Reply to this email with your menu (photo or PDF) and we'll set up your account + give you a personal walkthrough.
 
-Need help right away? Call us directly:
-+91 95286 32779
+Call us anytime: +91 95286 32779
 
-Talk soon,
-Team DineOpen
+— Team DineOpen
 https://www.dineopen.com`;
 
     const html = `<!DOCTYPE html>
 <html>
 <head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"></head>
-<body style="margin:0;padding:0;background-color:#f9fafb;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;">
-  <div style="max-width:520px;margin:24px auto;background:white;border-radius:16px;overflow:hidden;box-shadow:0 2px 12px rgba(0,0,0,0.06);">
+<body style="margin:0;padding:0;background-color:#f3f4f6;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;">
+  <div style="max-width:520px;margin:24px auto;background:white;border-radius:20px;overflow:hidden;box-shadow:0 4px 24px rgba(0,0,0,0.08);">
 
     <!-- Header -->
-    <div style="background:linear-gradient(135deg,#ef4444,#dc2626);padding:32px 28px;text-align:center;">
-      <div style="font-size:36px;margin-bottom:8px;">👋</div>
-      <h1 style="margin:0;color:white;font-size:22px;font-weight:700;">Hello${restaurantName ? ', ' + restaurantName : ''}!</h1>
-      <p style="margin:6px 0 0;color:rgba(255,255,255,0.9);font-size:14px;">Thanks for your interest in DineOpen</p>
+    <div style="background:#1f2937;padding:36px 28px 32px;text-align:center;">
+      <div style="display:inline-block;background:#ef4444;width:48px;height:48px;border-radius:12px;line-height:48px;font-size:24px;margin-bottom:16px;">
+        <span style="color:white;font-weight:800;font-size:20px;">D</span>
+      </div>
+      <h1 style="margin:0;color:white;font-size:24px;font-weight:800;letter-spacing:-0.5px;">Your Demo is Ready</h1>
+      <p style="margin:8px 0 0;color:#9ca3af;font-size:14px;">Hi${restaurantName ? ' <span style="color:#f87171;font-weight:600;">' + restaurantName + '</span>' : ''} — thanks for checking us out</p>
     </div>
 
     <!-- Body -->
     <div style="padding:28px;">
-      <p style="margin:0 0 20px;color:#374151;font-size:15px;line-height:1.6;">
-        We're excited you want to see DineOpen in action. Here's a quick demo of how it works:
-      </p>
 
-      <!-- Demo Video Link -->
-      <a href="https://www.youtube.com/watch?v=u7LsbFNMTPk" target="_blank" style="text-decoration:none;display:block;margin-bottom:24px;">
-        <div style="background:#fef2f2;border:2px solid #fecaca;border-radius:12px;padding:20px;text-align:center;">
-          <div style="font-size:40px;margin-bottom:8px;">▶️</div>
-          <div style="color:#dc2626;font-size:16px;font-weight:700;">Watch Product Demo</div>
-          <div style="color:#6b7280;font-size:13px;margin-top:4px;">See DineOpen in action</div>
+      <!-- Demo Video -->
+      <a href="https://www.youtube.com/watch?v=u7LsbFNMTPk" target="_blank" style="text-decoration:none;display:block;margin-bottom:20px;">
+        <div style="background:#111827;border-radius:14px;padding:28px 20px;text-align:center;position:relative;">
+          <div style="display:inline-block;width:56px;height:56px;background:#ef4444;border-radius:50%;line-height:56px;margin-bottom:12px;">
+            <span style="color:white;font-size:22px;margin-left:3px;">&#9654;</span>
+          </div>
+          <div style="color:white;font-size:17px;font-weight:700;">Watch DineOpen in Action</div>
+          <div style="color:#9ca3af;font-size:13px;margin-top:6px;">3 min product walkthrough</div>
         </div>
       </a>
 
-      <!-- CTA: Send menu -->
-      <div style="background:#f0fdf4;border:1px solid #bbf7d0;border-radius:12px;padding:20px;margin-bottom:24px;">
-        <div style="font-size:20px;margin-bottom:6px;">📋</div>
-        <p style="margin:0 0 6px;color:#166534;font-size:15px;font-weight:600;">Want us to set you up?</p>
-        <p style="margin:0;color:#374151;font-size:14px;line-height:1.5;">
-          Just reply to this email with your <strong>menu photo or PDF</strong>. We'll configure your account and give you a personal live demo.
+      <!-- Divider -->
+      <div style="height:1px;background:#f1f5f9;margin:24px 0;"></div>
+
+      <!-- Send Menu CTA -->
+      <div style="margin-bottom:20px;">
+        <p style="margin:0 0 8px;color:#1f2937;font-size:16px;font-weight:700;">Get your account set up — free</p>
+        <p style="margin:0 0 16px;color:#6b7280;font-size:14px;line-height:1.6;">
+          Reply to this email with your <strong style="color:#1f2937;">menu photo or PDF</strong>. We'll build your account and walk you through it live.
         </p>
+        <a href="mailto:info@dineopen.com?subject=Menu%20for%20DineOpen%20Setup" style="text-decoration:none;display:inline-block;background:#ef4444;color:white;padding:12px 24px;border-radius:10px;font-size:14px;font-weight:700;">Send My Menu</a>
       </div>
 
-      <!-- Call support -->
-      <div style="background:#f8fafc;border:1px solid #e2e8f0;border-radius:12px;padding:16px;text-align:center;">
-        <p style="margin:0 0 4px;color:#64748b;font-size:13px;">Prefer to talk? Call us directly</p>
-        <a href="tel:+919528632779" style="color:#dc2626;font-size:18px;font-weight:700;text-decoration:none;">+91 95286 32779</a>
+      <!-- Divider -->
+      <div style="height:1px;background:#f1f5f9;margin:24px 0;"></div>
+
+      <!-- Call -->
+      <div style="text-align:center;">
+        <p style="margin:0 0 6px;color:#9ca3af;font-size:12px;text-transform:uppercase;letter-spacing:0.5px;font-weight:600;">Need help now?</p>
+        <a href="tel:+919528632779" style="color:#1f2937;font-size:20px;font-weight:800;text-decoration:none;letter-spacing:-0.3px;">+91 95286 32779</a>
       </div>
     </div>
 
     <!-- Footer -->
-    <div style="padding:16px 28px;background:#f9fafb;border-top:1px solid #f1f5f9;text-align:center;">
-      <p style="margin:0;font-size:12px;color:#9ca3af;">
-        <a href="https://www.dineopen.com" style="color:#ef4444;text-decoration:none;font-weight:600;">DineOpen</a> — AI-Powered Restaurant Management
-      </p>
+    <div style="padding:20px 28px;background:#f9fafb;border-top:1px solid #f1f5f9;text-align:center;">
+      <a href="https://www.dineopen.com" style="color:#ef4444;text-decoration:none;font-weight:700;font-size:13px;">dineopen.com</a>
+      <p style="margin:4px 0 0;font-size:11px;color:#9ca3af;">AI-Powered Restaurant Management</p>
     </div>
 
   </div>
