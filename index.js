@@ -220,6 +220,19 @@ function calculatePricingAdjustments(restaurantData, { tableSection, floorData, 
   return result;
 }
 
+// Channel name constants for pricing rule identification
+const DINEIN_NAMES = ['dine-in', 'dine in', 'dinein'];
+const TAKEAWAY_NAMES = ['takeaway', 'take away', 'take-away'];
+const DELIVERY_NAMES = ['delivery'];
+const CHANNEL_NAMES = [...DINEIN_NAMES, ...TAKEAWAY_NAMES, ...DELIVERY_NAMES];
+
+function isZoneRule(rule) {
+  return !CHANNEL_NAMES.includes((rule?.name || '').toLowerCase().trim());
+}
+function findDineInRule(rules) {
+  return (rules || []).find(r => r.isActive && DINEIN_NAMES.includes((r.name || '').toLowerCase().trim()));
+}
+
 // Multi-tier pricing: resolve per-item price for a given pricing rule
 function resolveItemPriceForRule(menuItem, ruleId, rules) {
   if (!ruleId || !rules?.length) return null;
@@ -229,7 +242,14 @@ function resolveItemPriceForRule(menuItem, ruleId, rules) {
   if (menuItem.pricingRules && typeof menuItem.pricingRules[ruleId] === 'number') {
     return menuItem.pricingRules[ruleId];
   }
-  // Priority 2: Rule's default markup
+  // Priority 2 (zone rules only): Inherit from Dine-In per-item price
+  if (isZoneRule(rule)) {
+    const dineInRule = findDineInRule(rules);
+    if (dineInRule && menuItem.pricingRules && typeof menuItem.pricingRules[dineInRule.id] === 'number') {
+      return menuItem.pricingRules[dineInRule.id];
+    }
+  }
+  // Priority 3: Rule's default markup
   const basePrice = menuItem.price;
   if (rule.defaultMarkupType === 'percentage' && rule.defaultMarkupValue) {
     return Math.round(basePrice * (1 + rule.defaultMarkupValue / 100) * 100) / 100;
@@ -1772,7 +1792,8 @@ Return ONLY valid JSON in this exact format:
       "shortCode": "1",
       "variants": [],
       "spiritCategory": null, "abv": null, "bottleSize": null, "servingUnit": null,
-      "unit": null, "weight": null, "servingSize": null
+      "unit": null, "weight": null, "servingSize": null,
+      "channelPrices": null
     },
     {
       "name": "Dal",
@@ -1786,7 +1807,8 @@ Return ONLY valid JSON in this exact format:
         { "name": "Full", "price": 180, "description": "" }
       ],
       "spiritCategory": null, "abv": null, "bottleSize": null, "servingUnit": null,
-      "unit": null, "weight": null, "servingSize": null
+      "unit": null, "weight": null, "servingSize": null,
+      "channelPrices": { "dineIn": 120, "takeaway": 100 }
     }
   ]
 }
@@ -1802,7 +1824,8 @@ RULES:
 5. description: "" if missing. allergens: only if mentioned.
 6. VARIANTS: Look for patterns like "Half/Full", "Small/Medium/Large", "110/180", "₹110/₹180", or any item showing multiple prices. Extract as variants array.
 7. Type-specific fields (spiritCategory, abv, bottleSize, servingUnit, unit, weight, servingSize): Only set if the business type matches and data is visible in the menu. Otherwise set to null.
-8. Be thorough – do not skip items.`
+8. Be thorough – do not skip items.
+9. CHANNEL-SPECIFIC PRICING: Some menus show different prices for Dine-In, Takeaway, and Delivery (e.g., "Dine-In: ₹100 | Takeaway: ₹90" or separate columns for different channels). If you detect channel-specific prices for an item: set "price" to the base/lowest price, and add "channelPrices": {"dineIn": 100, "takeaway": 90, "delivery": 85}. Only include channels that have explicitly different prices. If only one price is shown (no channel differentiation), set "channelPrices" to null.`
             },
             {
               type: "image_url",
@@ -10705,7 +10728,29 @@ app.post('/api/menus/bulk-save/:restaurantId', authenticateToken, async (req, re
           servingSize: item.servingSize || null,
           scoopOptions: item.scoopOptions ? parseInt(item.scoopOptions) : null,
           // Multi-tier pricing rules (e.g. { rule_ac_dining: 60, rule_takeaway: 55 })
-          pricingRules: item.pricingRules || {},
+          pricingRules: (() => {
+            const pr = item.pricingRules ? { ...item.pricingRules } : {};
+            // Map AI-extracted channel prices to actual rule IDs
+            if (item.channelPrices && typeof item.channelPrices === 'object') {
+              const mp = restaurantData.pricingSettings?.multiPricing;
+              if (mp?.enabled && mp.rules?.length) {
+                const rules = mp.rules;
+                if (item.channelPrices.dineIn != null) {
+                  const diRule = rules.find(r => r.isActive && DINEIN_NAMES.includes((r.name || '').toLowerCase().trim()));
+                  if (diRule) pr[diRule.id] = parseFloat(item.channelPrices.dineIn) || 0;
+                }
+                if (item.channelPrices.takeaway != null) {
+                  const tkRule = rules.find(r => r.isActive && TAKEAWAY_NAMES.includes((r.name || '').toLowerCase().trim()));
+                  if (tkRule) pr[tkRule.id] = parseFloat(item.channelPrices.takeaway) || 0;
+                }
+                if (item.channelPrices.delivery != null) {
+                  const dlRule = rules.find(r => r.isActive && DELIVERY_NAMES.includes((r.name || '').toLowerCase().trim()));
+                  if (dlRule) pr[dlRule.id] = parseFloat(item.channelPrices.delivery) || 0;
+                }
+              }
+            }
+            return pr;
+          })(),
           createdAt: new Date(),
           updatedAt: new Date(),
           source: 'ai_upload',
