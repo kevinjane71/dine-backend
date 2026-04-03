@@ -16951,8 +16951,11 @@ app.post('/api/inventory/:restaurantId/smart-import/parse', authenticateToken, a
     const restaurantData = restaurantDoc.data();
     const existingInventory = [];
     inventorySnap.forEach(doc => existingInventory.push({ id: doc.id, ...doc.data() }));
-    const existingMenuItems = (restaurantData.menu?.items || []).filter(i => i.status === 'active' || i.active === true);
-    const existingCategories = restaurantData.categories || [];
+
+    // If restaurant has default seeded menu, treat it as empty (it will be cleared on confirm)
+    const hasDefaultMenu = restaurantData.hasDefaultMenu;
+    const existingMenuItems = hasDefaultMenu ? [] : (restaurantData.menu?.items || []).filter(i => i.status === 'active' || i.active === true);
+    const existingCategories = hasDefaultMenu ? [] : (restaurantData.categories || []);
 
     const existingContext = `
 EXISTING INVENTORY ITEMS (do NOT re-create these, reference them by name):
@@ -17163,9 +17166,19 @@ app.post('/api/inventory/:restaurantId/smart-import/confirm', authenticateToken,
       return res.status(404).json({ error: 'Restaurant not found' });
     }
     const restaurantData = restaurantDoc.data();
-    const existingCats = [...(restaurantData.categories || [])];
     const existingMenu = restaurantData.menu || { items: [] };
-    const existingMenuItemsList = [...(existingMenu.items || [])];
+
+    // If restaurant has default seeded menu, clear it before adding real items
+    let existingCats;
+    let existingMenuItemsList;
+    if (restaurantData.hasDefaultMenu) {
+      existingCats = [];
+      existingMenuItemsList = [];
+      console.log('🔄 Smart Import: Clearing default seeded menu before import');
+    } else {
+      existingCats = [...(restaurantData.categories || [])];
+      existingMenuItemsList = [...(existingMenu.items || [])];
+    }
 
     for (const catName of menuCategories) {
       const id = categoryNameToId(catName);
@@ -17237,12 +17250,17 @@ app.post('/api/inventory/:restaurantId/smart-import/confirm', authenticateToken,
     }
 
     // Save menu + categories update
-    if (summary.menuCategories > 0 || summary.menuItems > 0) {
-      await db.collection(collections.restaurants).doc(restaurantId).update({
+    if (summary.menuCategories > 0 || summary.menuItems > 0 || restaurantData.hasDefaultMenu) {
+      const updateData = {
         categories: existingCats,
         menu: { ...existingMenu, items: existingMenuItemsList, lastUpdated: new Date() },
         updatedAt: new Date()
-      });
+      };
+      // Clear hasDefaultMenu flag when replacing default menu with real items
+      if (restaurantData.hasDefaultMenu) {
+        updateData.hasDefaultMenu = false;
+      }
+      await db.collection(collections.restaurants).doc(restaurantId).update(updateData);
       invalidateRestaurantCache(restaurantId);
     }
 
