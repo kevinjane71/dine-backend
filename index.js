@@ -9754,7 +9754,7 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
             });
             console.log('✅ Table released after order completion:', currentOrder.tableNumber);
             // Send Pusher event for real-time table sync
-            pusherService.trigger(`restaurant-${currentOrder.restaurantId}`, 'table-status-updated', {
+            pusherService.pusher.trigger(`restaurant-${currentOrder.restaurantId}`, 'table-status-updated', {
               tableId: tableDoc.id,
               status: 'available',
               orderId: null,
@@ -11434,7 +11434,7 @@ app.patch('/api/tables/:tableId/status', authenticateToken, async (req, res) => 
     }
 
     // Send Pusher event for real-time table sync
-    pusherService.trigger(`restaurant-${restaurantId}`, 'table-status-updated', {
+    pusherService.pusher.trigger(`restaurant-${restaurantId}`, 'table-status-updated', {
       tableId,
       status,
       orderId: status === 'occupied' ? orderId : null,
@@ -11494,7 +11494,7 @@ app.post('/api/tables/:restaurantId/reset-all', authenticateToken, async (req, r
       await batch.commit();
 
       // Send Pusher event for real-time sync
-      pusherService.trigger(`restaurant-${restaurantId}`, 'tables-reset', {
+      pusherService.pusher.trigger(`restaurant-${restaurantId}`, 'tables-reset', {
         resetCount,
       }).catch(err => console.error('Pusher tables-reset error:', err));
     }
