@@ -9753,6 +9753,13 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
               updatedAt: new Date()
             });
             console.log('✅ Table released after order completion:', currentOrder.tableNumber);
+            // Send Pusher event for real-time table sync
+            pusherService.trigger(`restaurant-${currentOrder.restaurantId}`, 'table-status-updated', {
+              tableId: tableDoc.id,
+              status: 'available',
+              orderId: null,
+              tableNumber: currentOrder.tableNumber,
+            }).catch(err => console.error('Pusher table-status-updated error:', err));
             tableReleased = true;
             break;
           }
@@ -11426,11 +11433,76 @@ app.patch('/api/tables/:tableId/status', authenticateToken, async (req, res) => 
       return res.status(404).json({ error: 'Table not found' });
     }
 
+    // Send Pusher event for real-time table sync
+    pusherService.trigger(`restaurant-${restaurantId}`, 'table-status-updated', {
+      tableId,
+      status,
+      orderId: status === 'occupied' ? orderId : null,
+    }).catch(err => console.error('Pusher table-status-updated error:', err));
+
     res.json({ message: 'Table status updated successfully' });
 
   } catch (error) {
     console.error('Update table status error:', error);
     res.status(500).json({ error: 'Failed to update table status' });
+  }
+});
+
+// Reset all occupied tables to available (Master Reset)
+app.post('/api/tables/:restaurantId/reset-all', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+    const { role } = req.user;
+    const userId = req.user.uid || req.user.userId;
+
+    // Permission check: owner/admin always allowed, others need pageAccess.resetTables
+    if (role !== 'owner' && role !== 'admin') {
+      const staffDoc = await db.collection(collections.staffUsers).doc(userId).get();
+      if (!staffDoc.exists || !staffDoc.data()?.pageAccess?.resetTables) {
+        return res.status(403).json({ error: 'Permission denied. Reset Tables access required.' });
+      }
+    }
+
+    const floorsSnapshot = await db.collection('restaurants')
+      .doc(restaurantId)
+      .collection('floors')
+      .get();
+
+    let resetCount = 0;
+    const batch = db.batch();
+
+    for (const floorDoc of floorsSnapshot.docs) {
+      const tablesSnapshot = await db.collection('restaurants')
+        .doc(restaurantId)
+        .collection('floors')
+        .doc(floorDoc.id)
+        .collection('tables')
+        .where('status', '==', 'occupied')
+        .get();
+
+      for (const tableDoc of tablesSnapshot.docs) {
+        batch.update(tableDoc.ref, {
+          status: 'available',
+          currentOrderId: null,
+          updatedAt: new Date(),
+        });
+        resetCount++;
+      }
+    }
+
+    if (resetCount > 0) {
+      await batch.commit();
+
+      // Send Pusher event for real-time sync
+      pusherService.trigger(`restaurant-${restaurantId}`, 'tables-reset', {
+        resetCount,
+      }).catch(err => console.error('Pusher tables-reset error:', err));
+    }
+
+    res.json({ message: `${resetCount} table(s) reset to available`, resetCount });
+  } catch (error) {
+    console.error('Reset all tables error:', error);
+    res.status(500).json({ error: 'Failed to reset tables' });
   }
 });
 
