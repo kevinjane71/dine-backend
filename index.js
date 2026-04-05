@@ -9623,6 +9623,214 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
     if (req.body.splitPayments && req.body.splitPayments.length > 1) {
       updateData.paymentMethod = 'split';
     }
+    // Discount/offer fields — server-side validation when completing order
+    const offerIds = req.body.offerIds;
+    const manualDiscountVal = parseFloat(req.body.manualDiscount) || 0;
+    const redeemLoyaltyPointsVal = parseInt(req.body.redeemLoyaltyPoints) || 0;
+    const orderSubtotal = updateData.totalAmount || currentOrder.totalAmount || 0;
+
+    if (req.body.manualDiscount !== undefined) updateData.manualDiscount = manualDiscountVal;
+    if (req.body.selectedOfferName !== undefined) updateData.selectedOfferName = req.body.selectedOfferName;
+
+    // Validate and apply offers server-side
+    if (Array.isArray(offerIds) && offerIds.length > 0 && status === 'completed') {
+      let serverDiscountAmount = 0;
+      const appliedOffers = [];
+      let singleAppliedOffer = null;
+
+      // Load offer settings
+      let offerSettingsData = { allowMultipleOffers: false, maxOffersAllowed: 1 };
+      try {
+        const restDoc = await db.collection(collections.restaurants).doc(currentOrder.restaurantId).get();
+        if (restDoc.exists) {
+          const cas = restDoc.data().customerAppSettings || {};
+          offerSettingsData = cas.offerSettings || offerSettingsData;
+        }
+      } catch (e) {}
+
+      const maxOffers = offerSettingsData.allowMultipleOffers ? (offerSettingsData.maxOffersAllowed || 3) : 1;
+      const idsToProcess = offerIds.slice(0, maxOffers);
+
+      for (const oid of idsToProcess) {
+        try {
+          const offerDoc = await db.collection('offers').doc(oid).get();
+          if (!offerDoc.exists) continue;
+          const offer = { id: offerDoc.id, ...offerDoc.data() };
+
+          // Basic validations
+          if (offer.isActive === false) continue;
+          if (offer.validFrom && new Date() < new Date(offer.validFrom)) continue;
+          if (offer.validUntil && new Date() > new Date(offer.validUntil)) continue;
+          if (offer.usageLimit && (offer.usageCount || 0) >= offer.usageLimit) continue;
+          if (offer.minOrderValue && orderSubtotal < offer.minOrderValue) continue;
+
+          // Schedule validation
+          if (offer.schedule?.type === 'recurring') {
+            const now = new Date();
+            const day = now.getDay();
+            const timeStr = `${String(now.getHours()).padStart(2,'0')}:${String(now.getMinutes()).padStart(2,'0')}`;
+            const days = offer.schedule.days || [];
+            const startT = offer.schedule.startTime || '00:00';
+            const endT = offer.schedule.endTime || '23:59';
+            if (!days.includes(day) || timeStr < startT || timeStr > endT) continue;
+          }
+
+          // Calculate discount (scope-aware)
+          const offerScope = offer.scope || 'order';
+          const orderItems = updateData.items || currentOrder.items || [];
+          let applicableSubtotal = orderSubtotal;
+
+          if (offerScope === 'category' && Array.isArray(offer.targetCategories) && offer.targetCategories.length > 0) {
+            applicableSubtotal = orderItems
+              .filter(item => offer.targetCategories.some(c => c.toLowerCase() === (item.category || '').toLowerCase()))
+              .reduce((sum, item) => sum + ((item.price || 0) * (item.quantity || 1)), 0);
+          } else if (offerScope === 'item' && Array.isArray(offer.targetItems) && offer.targetItems.length > 0) {
+            applicableSubtotal = orderItems
+              .filter(item => offer.targetItems.includes(item.menuItemId || item.id))
+              .reduce((sum, item) => sum + ((item.price || 0) * (item.quantity || 1)), 0);
+          }
+
+          if (applicableSubtotal <= 0) continue;
+
+          let offerDisc = 0;
+          if (offer.promotionType === 'bogo' && offer.bogoConfig) {
+            const bogoItems = offerScope === 'item' && offer.targetItems?.length > 0
+              ? orderItems.filter(item => offer.targetItems.includes(item.menuItemId || item.id))
+              : orderItems;
+            const totalQty = bogoItems.reduce((sum, item) => sum + (item.quantity || 1), 0);
+            const buyQty = offer.bogoConfig.buyQty || 2;
+            const getQty = offer.bogoConfig.getQty || 1;
+            const getDiscount = offer.bogoConfig.getDiscount || 100;
+            const sets = Math.floor(totalQty / (buyQty + getQty));
+            if (sets > 0 && bogoItems.length > 0) {
+              const cheapest = Math.min(...bogoItems.map(item => item.price || 0));
+              offerDisc = sets * getQty * cheapest * (getDiscount / 100);
+            }
+          } else if (offer.discountType === 'percentage') {
+            offerDisc = (applicableSubtotal * (offer.discountValue || 0)) / 100;
+            if (offer.maxDiscount && offerDisc > offer.maxDiscount) offerDisc = offer.maxDiscount;
+          } else {
+            offerDisc = Math.min(offer.discountValue || 0, applicableSubtotal);
+          }
+
+          offerDisc = Math.round(offerDisc * 100) / 100;
+          if (offerDisc > 0) {
+            serverDiscountAmount += offerDisc;
+            const offerEntry = {
+              id: offer.id, name: offer.name,
+              discountType: offer.discountType, discountValue: offer.discountValue,
+              discountApplied: offerDisc, scope: offerScope
+            };
+            appliedOffers.push(offerEntry);
+            if (!singleAppliedOffer) singleAppliedOffer = offerEntry;
+          }
+        } catch (e) {
+          console.error(`Error validating offer ${oid}:`, e);
+        }
+      }
+
+      // Cap total discount at subtotal
+      serverDiscountAmount = Math.min(serverDiscountAmount, orderSubtotal);
+      updateData.discountAmount = Math.round(serverDiscountAmount * 100) / 100;
+      updateData.offerDiscount = updateData.discountAmount;
+      updateData.offerIds = idsToProcess;
+      updateData.appliedOffer = singleAppliedOffer;
+      updateData.appliedOffers = appliedOffers;
+      console.log(`🎁 PATCH: Applied ${appliedOffers.length} offers, discount: ₹${updateData.discountAmount}`);
+    } else {
+      // No offers — use frontend values as fallback
+      if (req.body.discountAmount !== undefined) updateData.discountAmount = req.body.discountAmount;
+      if (req.body.offerDiscount !== undefined) updateData.offerDiscount = req.body.offerDiscount;
+      if (req.body.offerIds !== undefined) updateData.offerIds = req.body.offerIds;
+    }
+
+    // Loyalty points — server-side calculation when completing order
+    if (redeemLoyaltyPointsVal > 0 && status === 'completed') {
+      try {
+        const restDoc = await db.collection(collections.restaurants).doc(currentOrder.restaurantId).get();
+        const cas = restDoc.exists ? (restDoc.data().customerAppSettings || {}) : {};
+        const loyaltySettings = cas.loyaltySettings || {};
+
+        if (loyaltySettings.enabled) {
+          // Find customer
+          const custId = req.body.customerId || currentOrder.customerId;
+          let custPoints = 0;
+          if (custId) {
+            const custDoc = await db.collection('customers').doc(custId).get();
+            if (custDoc.exists) custPoints = custDoc.data().loyaltyPoints || 0;
+          }
+
+          const pointsToRedeem = Math.min(redeemLoyaltyPointsVal, custPoints);
+          const redemptionRate = loyaltySettings.redemptionRate || 100;
+          let loyaltyDiscount = pointsToRedeem / redemptionRate;
+          const maxPct = loyaltySettings.maxRedemptionPercent || 20;
+          const discAmount = updateData.discountAmount || 0;
+          const manualDisc = manualDiscountVal || 0;
+          const maxLoyaltyDiscount = ((orderSubtotal - discAmount - manualDisc) * maxPct) / 100;
+
+          let loyaltyPointsRedeemed = pointsToRedeem;
+          if (loyaltyDiscount > maxLoyaltyDiscount) {
+            loyaltyDiscount = maxLoyaltyDiscount;
+            loyaltyPointsRedeemed = Math.floor(loyaltyDiscount * redemptionRate);
+          }
+
+          loyaltyDiscount = Math.round(loyaltyDiscount * 100) / 100;
+          updateData.loyaltyDiscount = loyaltyDiscount;
+          updateData.loyaltyPointsRedeemed = loyaltyPointsRedeemed;
+          updateData.redeemLoyaltyPoints = redeemLoyaltyPointsVal;
+
+          // Calculate points to earn
+          const earnPerAmount = loyaltySettings.earnPerAmount || 100;
+          const pointsEarnedRate = loyaltySettings.pointsEarned || 4;
+          const preTaxTotal = Math.max(0, orderSubtotal - (updateData.discountAmount || 0) - manualDisc - loyaltyDiscount);
+          let loyaltyPointsEarned = 0;
+
+          if (loyaltyPointsRedeemed > 0 && !loyaltySettings.earnPointsOnRedemption) {
+            loyaltyPointsEarned = 0;
+          } else if (loyaltyPointsRedeemed > 0 && loyaltySettings.earnOnFullAmount) {
+            loyaltyPointsEarned = Math.floor((orderSubtotal - (updateData.discountAmount || 0) - manualDisc) / earnPerAmount) * pointsEarnedRate;
+          } else {
+            loyaltyPointsEarned = Math.floor(preTaxTotal / earnPerAmount) * pointsEarnedRate;
+          }
+
+          updateData.loyaltyPointsEarned = loyaltyPointsEarned;
+          console.log(`💎 PATCH: Loyalty redeemed ${loyaltyPointsRedeemed} pts = ₹${loyaltyDiscount}, earning ${loyaltyPointsEarned} pts`);
+        }
+      } catch (e) {
+        console.error('Error calculating loyalty on PATCH:', e);
+      }
+    } else if (status === 'completed') {
+      // No redemption but still calculate earnings
+      try {
+        const restDoc = await db.collection(collections.restaurants).doc(currentOrder.restaurantId).get();
+        const cas = restDoc.exists ? (restDoc.data().customerAppSettings || {}) : {};
+        const loyaltySettings = cas.loyaltySettings || {};
+        const custId = req.body.customerId || currentOrder.customerId;
+
+        if (loyaltySettings.enabled && custId) {
+          const earnPerAmount = loyaltySettings.earnPerAmount || 100;
+          const pointsEarnedRate = loyaltySettings.pointsEarned || 4;
+          const discAmount = updateData.discountAmount || 0;
+          const manualDisc = manualDiscountVal || 0;
+          const preTaxTotal = Math.max(0, orderSubtotal - discAmount - manualDisc);
+          const loyaltyPointsEarned = Math.floor(preTaxTotal / earnPerAmount) * pointsEarnedRate;
+          updateData.loyaltyPointsEarned = loyaltyPointsEarned;
+          updateData.loyaltyPointsRedeemed = 0;
+          updateData.loyaltyDiscount = 0;
+          console.log(`💎 PATCH: No redemption, earning ${loyaltyPointsEarned} pts`);
+        }
+      } catch (e) {
+        console.error('Error calculating loyalty earnings on PATCH:', e);
+      }
+    } else {
+      // Non-completion update — just pass through
+      if (req.body.loyaltyDiscount !== undefined) updateData.loyaltyDiscount = req.body.loyaltyDiscount;
+      if (req.body.redeemLoyaltyPoints !== undefined) updateData.redeemLoyaltyPoints = req.body.redeemLoyaltyPoints;
+    }
+
+    // Compute totalDiscountAmount
+    updateData.totalDiscountAmount = Math.round(((updateData.discountAmount || 0) + (updateData.manualDiscount || 0) + (updateData.loyaltyDiscount || 0)) * 100) / 100;
+
     // Use frontend-calculated finalAmount if provided (includes service charge, tip, round-off)
     if (req.body.finalAmount !== undefined) updateData.finalAmount = req.body.finalAmount;
     if (req.body.totalAmount !== undefined) updateData.totalAmount = req.body.totalAmount;
@@ -22280,7 +22488,14 @@ app.get('/api/public/offers/:restaurantId', vercelSecurityMiddleware.publicAPI, 
           usageLimit: offer.usageLimit || null,
           usageCount: offer.usageCount || 0,
           isFirstOrderOnly: offer.isFirstOrderOnly || false,
-          autoApply: offer.autoApply || false
+          autoApply: offer.autoApply || false,
+          scope: offer.scope || 'order',
+          targetCategories: offer.targetCategories || [],
+          targetItems: offer.targetItems || [],
+          schedule: offer.schedule || null,
+          promotionType: offer.promotionType || 'discount',
+          bogoConfig: offer.bogoConfig || null,
+          eventLabel: offer.eventLabel || null
         });
       });
 
@@ -22332,7 +22547,8 @@ app.post('/api/offers/:restaurantId', authenticateToken, async (req, res) => {
       schedule = null,
       promotionType = 'discount',
       bogoConfig = null,
-      eventLabel = null
+      eventLabel = null,
+      targetRestaurants = 'all'
     } = req.body;
 
     // Verify user has access to this restaurant
@@ -22382,6 +22598,7 @@ app.post('/api/offers/:restaurantId', authenticateToken, async (req, res) => {
         getDiscount: Number(bogoConfig.getDiscount) || 100
       } : null,
       eventLabel: eventLabel || null,
+      targetRestaurants: targetRestaurants || 'all',
       createdAt: new Date(),
       updatedAt: new Date()
     };
@@ -25204,6 +25421,267 @@ app.post('/api/debug/fix-table', authenticateToken, async (req, res) => {
   } catch (error) {
     console.error('❌ Error fixing table:', error);
     res.status(500).json({ error: 'Failed to fix table status' });
+  }
+});
+
+// ============================
+// Batch Sync Endpoint (Offline Mode)
+// Process multiple offline operations in a single request
+// ============================
+app.post('/api/sync/batch', authenticateToken, async (req, res) => {
+  try {
+    const { operations } = req.body;
+
+    if (!Array.isArray(operations) || operations.length === 0) {
+      return res.status(400).json({ error: 'operations array is required' });
+    }
+
+    if (operations.length > 50) {
+      return res.status(400).json({ error: 'Maximum 50 operations per batch' });
+    }
+
+    const results = [];
+
+    for (const op of operations) {
+      const { idempotencyKey, entityType, operation, endpoint, method, payload } = op;
+
+      try {
+        // Check idempotency for all entity types
+        if (idempotencyKey) {
+          const existingKeySnapshot = await db.collection('idempotency_keys')
+            .where('key', '==', idempotencyKey)
+            .limit(1)
+            .get();
+
+          if (!existingKeySnapshot.empty) {
+            const existingData = existingKeySnapshot.docs[0].data();
+            results.push({
+              idempotencyKey,
+              status: 'duplicate',
+              message: 'Already processed',
+              data: existingData.responseData || { id: existingData.orderId },
+            });
+            continue;
+          }
+        }
+
+        // Route to the appropriate handler based on entityType
+        let result;
+
+        switch (entityType) {
+          case 'order': {
+            if (operation === 'create') {
+              // Reuse existing order creation logic
+              const orderPayload = { ...payload, idempotencyKey, syncSource: 'offline_batch' };
+              const restaurantId = orderPayload.restaurantId;
+
+              if (!restaurantId) {
+                results.push({ idempotencyKey, status: 'error', error: 'restaurantId required' });
+                continue;
+              }
+
+              // Minimal order creation — delegate to the main POST /api/orders handler logic
+              // We create a synthetic req/res to reuse the same route
+              result = await new Promise((resolve, reject) => {
+                const fakeReq = {
+                  body: orderPayload,
+                  params: {},
+                  user: req.user,
+                  headers: req.headers,
+                };
+                const fakeRes = {
+                  status: (code) => ({
+                    json: (data) => {
+                      if (code >= 400) reject({ status: code, ...data });
+                      else resolve(data);
+                    }
+                  }),
+                  json: (data) => resolve(data),
+                };
+                // We can't easily call route handlers directly, so use a direct approach
+                reject({ status: 501, error: 'Use individual endpoints for order creation' });
+              }).catch(e => e);
+
+              // Fallback: for batch sync, orders should still go through individual endpoints
+              // The sync engine already handles this item-by-item
+              results.push({
+                idempotencyKey,
+                status: 'skip',
+                message: 'Order creation should use individual endpoint /api/orders',
+              });
+              continue;
+            }
+            break;
+          }
+
+          case 'order_status':
+          case 'order_update': {
+            const orderId = payload.orderId || endpoint.match(/\/api\/orders\/([^/]+)/)?.[1];
+            if (!orderId) {
+              results.push({ idempotencyKey, status: 'error', error: 'orderId required' });
+              continue;
+            }
+
+            const orderRef = db.collection(collections.orders).doc(orderId);
+            const orderDoc = await orderRef.get();
+            if (!orderDoc.exists) {
+              results.push({ idempotencyKey, status: 'error', error: 'Order not found' });
+              continue;
+            }
+
+            const updateData = { updatedAt: new Date() };
+            if (payload.status) updateData.status = payload.status;
+            if (payload.items) updateData.items = payload.items;
+
+            await orderRef.update(updateData);
+            result = { order: { id: orderId, ...updateData } };
+            break;
+          }
+
+          case 'table_status': {
+            const tableId = payload.tableId || endpoint.match(/\/api\/tables\/([^/]+)/)?.[1];
+            const restaurantId = payload.restaurantId;
+            const status = payload.status;
+
+            if (!tableId || !restaurantId || !status) {
+              results.push({ idempotencyKey, status: 'error', error: 'tableId, restaurantId, status required' });
+              continue;
+            }
+
+            // Find and update table across floors
+            const floorsSnapshot = await db.collection('restaurants')
+              .doc(restaurantId)
+              .collection('floors')
+              .get();
+
+            let updated = false;
+            for (const floorDoc of floorsSnapshot.docs) {
+              const floorData = floorDoc.data();
+              const tables = floorData.tables || [];
+              const tableIndex = tables.findIndex(t => t.id === tableId || t.name === tableId);
+              if (tableIndex !== -1) {
+                tables[tableIndex].status = status;
+                if (status === 'occupied' && payload.orderId) {
+                  tables[tableIndex].currentOrderId = payload.orderId;
+                } else if (status === 'available') {
+                  tables[tableIndex].currentOrderId = null;
+                }
+                tables[tableIndex].updatedAt = new Date();
+                await floorDoc.ref.update({ tables });
+                updated = true;
+                break;
+              }
+            }
+
+            result = { updated, tableId, status };
+            break;
+          }
+
+          case 'kot_status': {
+            const orderId = payload.orderId || endpoint.match(/\/api\/kot\/([^/]+)/)?.[1];
+            const status = payload.status;
+
+            if (!orderId || !status) {
+              results.push({ idempotencyKey, status: 'error', error: 'orderId, status required' });
+              continue;
+            }
+
+            const kotUpdateData = { status, updatedAt: new Date() };
+            if (status === 'preparing') kotUpdateData.cookingStartTime = new Date();
+            if (status === 'ready') kotUpdateData.cookingEndTime = new Date();
+
+            await db.collection(collections.orders).doc(orderId).update(kotUpdateData);
+            result = { orderId, status };
+            break;
+          }
+
+          case 'customer': {
+            const restaurantId = payload.restaurantId;
+            if (!restaurantId) {
+              results.push({ idempotencyKey, status: 'error', error: 'restaurantId required' });
+              continue;
+            }
+
+            if (operation === 'create') {
+              const customerData = {
+                name: payload.name || '',
+                phone: payload.phone || '',
+                email: payload.email || '',
+                restaurantId,
+                createdAt: new Date(),
+                updatedAt: new Date(),
+              };
+              const customerRef = await db.collection('customers').add(customerData);
+              result = { customer: { id: customerRef.id, ...customerData } };
+            } else if (operation === 'update' && payload.customerId) {
+              await db.collection('customers').doc(payload.customerId).update({
+                ...payload,
+                updatedAt: new Date(),
+              });
+              result = { customer: { id: payload.customerId } };
+            }
+            break;
+          }
+
+          case 'waste_entry': {
+            const restaurantId = payload.restaurantId;
+            if (!restaurantId) {
+              results.push({ idempotencyKey, status: 'error', error: 'restaurantId required' });
+              continue;
+            }
+
+            const wasteData = {
+              ...payload,
+              createdAt: new Date(),
+              syncSource: 'offline_batch',
+            };
+            const wasteRef = await db.collection('waste_entries').add(wasteData);
+            result = { wasteEntry: { id: wasteRef.id } };
+            break;
+          }
+
+          default:
+            results.push({ idempotencyKey, status: 'error', error: `Unknown entity type: ${entityType}` });
+            continue;
+        }
+
+        // Store idempotency key
+        if (idempotencyKey) {
+          db.collection('idempotency_keys').add({
+            key: idempotencyKey,
+            entityType,
+            operation,
+            responseData: result || {},
+            createdAt: new Date(),
+          }).catch(err => console.error('Batch idempotency key store error:', err));
+        }
+
+        results.push({ idempotencyKey, status: 'success', data: result });
+
+      } catch (opError) {
+        console.error(`Batch sync operation error [${entityType}/${operation}]:`, opError);
+        results.push({
+          idempotencyKey,
+          status: 'error',
+          error: opError.message || 'Internal error',
+        });
+      }
+    }
+
+    res.json({
+      processed: results.length,
+      results,
+      summary: {
+        success: results.filter(r => r.status === 'success').length,
+        duplicate: results.filter(r => r.status === 'duplicate').length,
+        error: results.filter(r => r.status === 'error').length,
+        skip: results.filter(r => r.status === 'skip').length,
+      },
+    });
+
+  } catch (error) {
+    console.error('❌ Batch sync error:', error);
+    res.status(500).json({ error: 'Batch sync failed' });
   }
 });
 
