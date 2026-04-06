@@ -22913,6 +22913,11 @@ app.get('/api/offers/:restaurantId/active', authenticateToken, async (req, res) 
       }
       if (offer.validUntil) {
         validUntil = offer.validUntil.toDate ? offer.validUntil.toDate() : new Date(offer.validUntil);
+        // If validUntil is a date-only string (e.g. "2026-04-06"), it parses to midnight UTC.
+        // Treat it as end-of-day by adding 23:59:59 so the offer is valid for the entire last day.
+        if (typeof offer.validUntil === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(offer.validUntil)) {
+          validUntil = new Date(offer.validUntil + 'T23:59:59.999Z');
+        }
       }
 
       const isValidDate = (!validFrom || now >= validFrom) && (!validUntil || now <= validUntil);
@@ -22995,7 +23000,12 @@ app.get('/api/public/offers/:restaurantId', vercelSecurityMiddleware.publicAPI, 
           validFrom = offer.validFrom.toDate ? offer.validFrom.toDate().toISOString() : new Date(offer.validFrom).toISOString();
         }
         if (offer.validUntil) {
-          validUntil = offer.validUntil.toDate ? offer.validUntil.toDate().toISOString() : new Date(offer.validUntil).toISOString();
+          // If validUntil is a date-only string (e.g. "2026-04-06"), treat as end-of-day
+          if (typeof offer.validUntil === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(offer.validUntil)) {
+            validUntil = new Date(offer.validUntil + 'T23:59:59.999Z').toISOString();
+          } else {
+            validUntil = offer.validUntil.toDate ? offer.validUntil.toDate().toISOString() : new Date(offer.validUntil).toISOString();
+          }
         }
 
         allOffers.push({
