@@ -1873,7 +1873,7 @@ const extractMenuFromPDF = async (pdfUrl, businessType = 'restaurant') => {
               text: `Analyze this document. If it is a restaurant menu: 1) List section headers in "categories" as [{"name":"SectionName","order":1}]. Use EXACT names. If no sections, use "categories":[].
 2) Extract ALL menu items. Set "category" to section name or "Other".
 3) VARIANTS: If item shows multiple sizes/prices (e.g., "Half ₹110/Full ₹180", "110/180"), extract as "variants":[{"name":"Half","price":110},{"name":"Full","price":180}]. Otherwise use "variants":[].
-For each item also add "imageKeyword": a short specific English search term (2-4 words) for a stock photo of this dish (e.g. "butter chicken curry", "masala dosa", "chocolate brownie dessert").
+For each item also add "imageKeyword": a specific hyphen-separated keyword (1-3 words) that uniquely identifies this dish. Make each keyword DIFFERENT from similar items: "egg-thali" not "thali", "chicken-biryani" not "biryani", "masala-dosa" not "dosa", "chocolate-icecream" not "icecream", "chicken-burger" not "burger". Use the protein/variant as prefix (e.g. "mutton-thali", "veg-fried-rice", "strawberry-shake", "cheese-naan").
 Return JSON: {"categories":[...],"menuItems":[{"name":"","description":"","price":0,"category":"...","isVeg":true,"shortCode":"1","variants":[],"imageKeyword":""}]}
 shortCode: 1,2,3... If NOT a menu: {"categories":[],"menuItems":[]}`
             },
@@ -1955,7 +1955,7 @@ const extractMenuFromCSV = async (csvUrl, businessType = 'restaurant') => {
           content: `This is the content of a CSV/Excel file that may contain a restaurant menu:\n\n${textContent.substring(0, 15000)}\n\n1) If there is a Category/Type column, collect unique values as "categories":[{"name":"X","order":1},...]. If no category column, use "categories":[].
 2) Extract ALL rows as menu items. For "category" use the row's Category/Type value if present, else "Other".
 3) VARIANTS: If price column shows multiple values (e.g., "110/180", "Half/Full"), extract as "variants":[{"name":"Half","price":110},{"name":"Full","price":180}]. Otherwise use "variants":[].
-4) For each item add "imageKeyword": a short specific English search term (2-4 words) for a stock photo of this dish (e.g. "butter chicken curry", "masala dosa", "chocolate brownie dessert").
+4) For each item add "imageKeyword": a specific hyphen-separated keyword (1-3 words) that uniquely identifies this dish. Make each keyword DIFFERENT from similar items: "egg-thali" not "thali", "chicken-biryani" not "biryani", "masala-dosa" not "dosa", "chocolate-icecream" not "icecream", "chicken-burger" not "burger". Use the protein/variant as prefix (e.g. "mutton-thali", "veg-fried-rice", "strawberry-shake", "cheese-naan").
 Return JSON: {"categories":[...],"menuItems":[{"name":"","description":"","price":0,"category":"...","isVeg":true,"shortCode":"1","variants":[],"imageKeyword":""}]}
 shortCode: 1,2,3... If NOT a menu: {"categories":[],"menuItems":[]}`
         }
@@ -1999,7 +1999,7 @@ const extractMenuFromDocument = async (docUrl, businessType = 'restaurant') => {
           content: `This is the content of a document that may contain a restaurant menu:\n\n${textContent.substring(0, 15000)}\n\n1) List section headers as "categories":[{"name":"SectionName","order":1}]. If no sections, "categories":[].
 2) Extract ALL items; "category" = section name or "Other".
 3) VARIANTS: If item shows multiple sizes/prices (e.g., "Half ₹110/Full ₹180", "110/180"), extract as "variants":[{"name":"Half","price":110},{"name":"Full","price":180}]. Otherwise use "variants":[].
-4) For each item add "imageKeyword": a short specific English search term (2-4 words) for a stock photo of this dish (e.g. "butter chicken curry", "masala dosa", "chocolate brownie dessert").
+4) For each item add "imageKeyword": a specific hyphen-separated keyword (1-3 words) that uniquely identifies this dish. Make each keyword DIFFERENT from similar items: "egg-thali" not "thali", "chicken-biryani" not "biryani", "masala-dosa" not "dosa", "chocolate-icecream" not "icecream", "chicken-burger" not "burger". Use the protein/variant as prefix (e.g. "mutton-thali", "veg-fried-rice", "strawberry-shake", "cheese-naan").
 Return JSON: {"categories":[...],"menuItems":[{"name":"","description":"","price":0,"category":"...","isVeg":true,"shortCode":"1","variants":[],"imageKeyword":""}]}
 shortCode: 1,2,3... If NOT a menu: {"categories":[],"menuItems":[]}`
         }
@@ -2023,6 +2023,31 @@ shortCode: 1,2,3... If NOT a menu: {"categories":[],"menuItems":[]}`
 // ─── Local placeholder keyword matching (mirrors frontend placeholderImages.js) ───
 // Keywords sorted by length desc so longer (more specific) matches win.
 const LOCAL_PLACEHOLDER_KEYWORDS = [
+  // Specific Thalis
+  'egg thali','egg-thali','dim thali','fish thali','fish-thali','machli thali','meen thali',
+  'chicken thali','chicken-thali','murgh thali','mutton thali','mutton-thali','gosht thali','lamb thali',
+  'veg thali','veg-thali','vegetarian thali','vegetable thali','paneer thali','paneer-thali',
+  'special thali','spl thali','deluxe thali',
+  // Specific Biryanis
+  'chicken biryani','chicken-biryani','murgh biryani','mutton biryani','mutton-biryani','gosht biryani','lamb biryani',
+  'egg biryani','egg-biryani','anda biryani','dim biryani','veg biryani','veg-biryani','vegetable biryani','subz biryani',
+  'fish biryani','fish-biryani','meen biryani','prawn biryani','prawn-biryani','shrimp biryani','jhinga biryani',
+  // Specific Fried Rice
+  'chicken fried rice','chicken-fried-rice','egg fried rice','egg-fried-rice',
+  'paneer fried rice','paneer-fried-rice','veg fried rice','chilli garlic rice','chilli-garlic-rice',
+  'manchurian rice','manchurian-rice',
+  // Specific Noodles
+  'chicken noodles','chicken-noodles','chicken chow mein','egg noodles','egg-noodles','egg chow mein',
+  'veg noodles','veg-noodles','vegetable noodles',
+  // Specific Manchurian
+  'gobi manchurian','gobi-manchurian','cauliflower manchurian',
+  'paneer manchurian','paneer-manchurian','chicken manchurian','chicken-manchurian',
+  // Specific new items
+  'chicken 65','chicken-65','chicken lollipop','chicken-lollipop','fish tikka','fish-tikka',
+  'egg bhurji','egg-bhurji','anda bhurji','kadhai chicken','kadai chicken','karahi chicken',
+  'paneer tikka masala','paneer-tikka-masala','butter paneer','butter-paneer',
+  'szechuan chicken','szechwan chicken','crispy chicken','crispy-chicken',
+  'gobi 65','gobi-65','cauliflower 65','mushroom 65','mushroom-65',
   // Indian Main Course
   'biryani','biriyani','briyani','biriani','butter chicken','murgh makhani','tandoori chicken','tanduri chicken',
   'chicken tikka','chicken kosha','kosha chicken','chicken do pyaza','do pyaza',
@@ -2100,8 +2125,26 @@ const LOCAL_PLACEHOLDER_KEYWORDS = [
   // Rice
   'jeera rice','cumin rice','zeera rice','pulao','pilaf','pulav','basanti pulao',
   'lemon rice','curd rice','khichdi','khichri','plain rice','steamed rice','bhaat',
+  // Specific Sandwiches & Burgers
+  'chicken sandwich','chicken-sandwich','veg sandwich','veg-sandwich','vegetable sandwich',
+  'paneer sandwich','paneer-sandwich','club sandwich','club-sandwich',
+  'cheese sandwich','cheese-sandwich','grilled cheese',
+  'veg burger','veg-burger','veggie burger','chicken burger','chicken-burger',
+  'cheese burger','cheese-burger','cheeseburger',
+  // Specific Snacks
+  'paneer pakora','paneer-pakora','onion pakora','onion-pakora','pyaaz pakora',
+  'aloo bonda','aloo-bonda','potato bonda','bonda','masala peanut','masala-peanut','spicy peanut',
+  'papdi chaat','papdi-chaat','ragda pattice','ragda-pattice','ragda patties',
+  'kachori','mirchi bajji','mirchi-bajji','mirchi pakora','chilli bajji',
+  'paneer popcorn','paneer-popcorn',
+  // Specific Chutneys
+  'green chutney','green-chutney','tomato chutney','tomato-chutney','red chutney',
+  'coconut chutney','coconut-chutney','onion salad','onion-salad',
   // Breads
-  'garlic naan','stuffed paratha','aloo paratha','gobi paratha','paneer paratha',
+  'cheese naan','cheese-naan','keema naan','keema-naan','plain naan','plain-naan',
+  'garlic naan','aloo paratha','aloo-paratha','gobi paratha','gobi-paratha',
+  'paneer paratha','paneer-paratha','egg paratha','egg-paratha','anda paratha',
+  'tandoori paratha','tandoori-paratha','stuffed paratha',
   'lachha paratha','laccha paratha','lachha','rumali roti','roomali',
   'kulcha','amritsari','puri','poori','tandoori roti','butter naan','missi roti',
   'naan','roti','paratha','chapati','bhatura','pao',
@@ -2134,6 +2177,18 @@ const LOCAL_PLACEHOLDER_KEYWORDS = [
   'boost','horlicks','bournvita','malt drink',
   'milk','hot milk','badam milk','haldi milk','turmeric milk',
   'chai','tea','coffee',
+  // Specific Cold Drinks
+  'chocolate shake','chocolate-shake','chocolate milkshake',
+  'strawberry shake','strawberry-shake','strawberry milkshake',
+  'banana shake','banana-shake','banana milkshake',
+  'oreo shake','oreo-shake','oreo milkshake','cookies shake',
+  'green smoothie','green-smoothie','kale smoothie',
+  'fruit punch','fruit-punch','blue lagoon','blue-lagoon','blue curacao',
+  'mint lemonade','mint-lemonade','mint lime',
+  'sweet lime soda','sweet-lime-soda',
+  'orange juice','orange-juice','pomegranate juice','pomegranate-juice','anaar juice',
+  'pineapple juice','pineapple-juice','tender coconut','tender-coconut',
+  'badam milk','badam-milk','almond milk','kesar milk',
   // Cold Beverages
   'mango lassi','lassi','sweet lassi','salted lassi',
   'mango shake','mango smoothie','watermelon juice','sugarcane juice','ganne ka juice',
@@ -2155,6 +2210,24 @@ const LOCAL_PLACEHOLDER_KEYWORDS = [
   'whiskey','whisky','scotch','bourbon','jack daniels','johnnie walker','jameson','glenfiddich','monkey shoulder','black label','blue label',
   'vodka','absolut','grey goose','smirnoff','rum','bacardi','old monk','captain morgan',
   'gin','bombay sapphire','hendrick','tanqueray','gin tonic','g&t','tequila','patron','jose cuervo',
+  // Specific Desserts & Ice Cream
+  'gajar halwa','gajar-halwa','carrot halwa','moong dal halwa','moong-dal-halwa',
+  'gulab jamun ice cream','gulab-jamun-icecream',
+  'shahi tukda','shahi-tukda','shahi tukra','double ka meetha','double-ka-meetha',
+  'fruit custard','fruit-custard','fruit salad','fruit-salad','fresh fruit',
+  'falooda','falooda-icecream',
+  'vanilla ice cream','vanilla-icecream','vanilla icecream',
+  'chocolate ice cream','chocolate-icecream','chocolate icecream',
+  'strawberry ice cream','strawberry-icecream','strawberry icecream',
+  'mango ice cream','mango-icecream','mango icecream',
+  'butterscotch ice cream','butterscotch-icecream','butterscotch icecream',
+  'ice cream sundae','icecream-sundae','banana split','banana-split',
+  'frozen yogurt','frozen-yogurt','froyo',
+  // Specific Cakes
+  'chocolate cake','chocolate-cake','red velvet cake','red-velvet-cake','red velvet',
+  'black forest cake','black-forest-cake','black forest',
+  'fruit cake','fruit-cake','mixed fruit cake',
+  'pineapple cake','pineapple-cake','vanilla cake','vanilla-cake',
   // Indian Desserts
   'gulab jamun','gulabjamun','rasmalai','ras malai','kheer','rice pudding','phirni',
   'jalebi','imarti','malpua','halwa','gajar halwa','suji halwa','moong dal halwa','carrot halwa',
@@ -2169,6 +2242,10 @@ const LOCAL_PLACEHOLDER_KEYWORDS = [
   'panna cotta','ice cream','icecream','sundae','gelato','chocolate','chocolate cake','choco',
   'cake slice','cake','cupcake','pastry','croissant',
   // Bakery
+  'eclair','chocolate eclair','macaron','macaroon','swiss roll','swiss-roll',
+  'cheese puff','cheese-puff','veg puff','veg-puff','vegetable puff',
+  'chicken puff','chicken-puff','rusk','biscotti',
+  'bread butter','bread-butter','bread and butter',
   'cinnamon roll','bread loaf','bread','puff','puff pastry','patties',
   'focaccia','bagel','scone','danish pastry','danish','bun','dinner roll','roll',
   // Breakfast
@@ -2359,7 +2436,21 @@ RULES:
 7. Type-specific fields (spiritCategory, abv, bottleSize, servingUnit, unit, weight, servingSize): Only set if the business type matches and data is visible in the menu. Otherwise set to null.
 8. Be thorough – do not skip items.
 9. CHANNEL-SPECIFIC PRICING: Some menus show different prices for Dine-In, Takeaway, and Delivery (e.g., "Dine-In: ₹100 | Takeaway: ₹90" or separate columns for different channels). If you detect channel-specific prices for an item: set "price" to the base/lowest price, and add "channelPrices": {"dineIn": 100, "takeaway": 90, "delivery": 85}. Only include channels that have explicitly different prices. If only one price is shown (no channel differentiation), set "channelPrices" to null.
-10. IMAGE KEYWORD: For each item, add "imageKeyword" — a short, specific English search term (2-4 words) that would find a good stock photo of this exact dish. Be specific: use "butter chicken curry" not "food", "masala dosa" not "dosa", "chocolate brownie dessert" not "dessert". For drinks: "espresso coffee cup", "mango lassi drink", etc.`
+10. IMAGE KEYWORD: For each item, add "imageKeyword" — a specific English keyword (1-3 words, hyphen-separated like a filename) that uniquely identifies this dish for image matching. CRITICAL RULES:
+- Make each item's keyword DIFFERENT from similar items. "egg thali" not "thali", "fish thali" not "thali", "chicken biryani" not "biryani"
+- For thalis: use the protein/main ingredient + "thali" (e.g., "egg-thali", "fish-thali", "chicken-thali", "mutton-thali", "veg-thali", "paneer-thali")
+- For biryani: "chicken-biryani", "mutton-biryani", "egg-biryani", "veg-biryani", "fish-biryani", "prawn-biryani"
+- For fried rice: "chicken-fried-rice", "egg-fried-rice", "veg-fried-rice"
+- For noodles: "chicken-noodles", "egg-noodles", "veg-noodles"
+- For dosa: "masala-dosa", "ghee-dosa", "rava-dosa", "paper-roast-dosa", "onion-dosa", "podi-dosa"
+- For sandwiches: "chicken-sandwich", "veg-sandwich", "cheese-sandwich", "club-sandwich"
+- For burgers: "chicken-burger", "veg-burger", "cheese-burger"
+- For ice cream: "vanilla-icecream", "chocolate-icecream", "strawberry-icecream", "mango-icecream", "butterscotch-icecream"
+- For cakes: "chocolate-cake", "red-velvet-cake", "black-forest-cake", "vanilla-cake"
+- For shakes: "chocolate-shake", "strawberry-shake", "banana-shake", "oreo-shake", "mango-shake"
+- For specific items: "gobi-manchurian", "chicken-65", "paneer-tikka", "fish-tikka", "chicken-lollipop"
+- For parathas: "aloo-paratha", "gobi-paratha", "paneer-paratha", "egg-paratha"
+- Always prefer the most specific keyword possible. Never use generic words like "food", "dish", "plate", "curry" alone.`
             },
             {
               type: "image_url",
