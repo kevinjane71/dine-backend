@@ -6,7 +6,7 @@ const emailService = require('../emailService');
 
 // ============================================
 // AI INSIGHTS & DAILY REPORTS fds
-// Provides AI-powered analytics and automated emails
+// Provides AI-powered analytics and automated emailss
 // ============================================
 
 /**
