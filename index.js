@@ -45,9 +45,32 @@ const upload = lazyInit(() => {
     storage: multer.memoryStorage(),
     limits: { fileSize: 300 * 1024 * 1024, files: 10 },
     fileFilter: (req, file, cb) => {
-      const allowedTypes = ['image/jpeg', 'image/png', 'image/jpg', 'image/webp', 'application/pdf'];
-      if (allowedTypes.includes(file.mimetype)) cb(null, true);
-      else cb(new Error('Invalid file type. Only images and PDFs are allowed.'), false);
+      // Block dangerous executable/script file types, allow everything else
+      const blockedTypes = [
+        'application/x-msdownload',        // .exe, .dll
+        'application/x-executable',         // Linux executables
+        'application/x-msdos-program',      // .com, .bat
+        'application/x-sh', 'application/x-bash', 'application/x-csh', // Shell scripts
+        'application/x-httpd-php',          // PHP
+        'application/javascript', 'text/javascript', // JS
+        'application/x-python-code',        // Python
+        'application/java-archive',         // .jar
+        'application/x-ms-shortcut',        // .lnk
+        'application/x-msi',               // .msi
+        'application/vnd.microsoft.portable-executable', // PE files
+      ];
+      const blockedExtensions = [
+        '.exe', '.dll', '.bat', '.cmd', '.com', '.msi', '.scr', '.pif',
+        '.vbs', '.vbe', '.js', '.jse', '.wsf', '.wsh', '.ps1', '.psm1',
+        '.sh', '.bash', '.csh', '.ksh', '.php', '.py', '.rb', '.pl',
+        '.jar', '.class', '.lnk', '.inf', '.reg', '.hta', '.cpl',
+      ];
+      const ext = '.' + (file.originalname || '').split('.').pop().toLowerCase();
+      if (blockedTypes.includes(file.mimetype) || blockedExtensions.includes(ext)) {
+        cb(new Error('This file type is not allowed for security reasons.'), false);
+      } else {
+        cb(null, true);
+      }
     }
   });
 });
