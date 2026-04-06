@@ -1873,7 +1873,8 @@ const extractMenuFromPDF = async (pdfUrl, businessType = 'restaurant') => {
               text: `Analyze this document. If it is a restaurant menu: 1) List section headers in "categories" as [{"name":"SectionName","order":1}]. Use EXACT names. If no sections, use "categories":[].
 2) Extract ALL menu items. Set "category" to section name or "Other".
 3) VARIANTS: If item shows multiple sizes/prices (e.g., "Half ₹110/Full ₹180", "110/180"), extract as "variants":[{"name":"Half","price":110},{"name":"Full","price":180}]. Otherwise use "variants":[].
-Return JSON: {"categories":[...],"menuItems":[{"name":"","description":"","price":0,"category":"...","isVeg":true,"shortCode":"1","variants":[]}]}
+For each item also add "imageKeyword": a short specific English search term (2-4 words) for a stock photo of this dish (e.g. "butter chicken curry", "masala dosa", "chocolate brownie dessert").
+Return JSON: {"categories":[...],"menuItems":[{"name":"","description":"","price":0,"category":"...","isVeg":true,"shortCode":"1","variants":[],"imageKeyword":""}]}
 shortCode: 1,2,3... If NOT a menu: {"categories":[],"menuItems":[]}`
             },
             { type: "image_url", image_url: { url: pdfUrl, detail: "high" } }
@@ -1954,7 +1955,8 @@ const extractMenuFromCSV = async (csvUrl, businessType = 'restaurant') => {
           content: `This is the content of a CSV/Excel file that may contain a restaurant menu:\n\n${textContent.substring(0, 15000)}\n\n1) If there is a Category/Type column, collect unique values as "categories":[{"name":"X","order":1},...]. If no category column, use "categories":[].
 2) Extract ALL rows as menu items. For "category" use the row's Category/Type value if present, else "Other".
 3) VARIANTS: If price column shows multiple values (e.g., "110/180", "Half/Full"), extract as "variants":[{"name":"Half","price":110},{"name":"Full","price":180}]. Otherwise use "variants":[].
-Return JSON: {"categories":[...],"menuItems":[{"name":"","description":"","price":0,"category":"...","isVeg":true,"shortCode":"1","variants":[]}]}
+4) For each item add "imageKeyword": a short specific English search term (2-4 words) for a stock photo of this dish (e.g. "butter chicken curry", "masala dosa", "chocolate brownie dessert").
+Return JSON: {"categories":[...],"menuItems":[{"name":"","description":"","price":0,"category":"...","isVeg":true,"shortCode":"1","variants":[],"imageKeyword":""}]}
 shortCode: 1,2,3... If NOT a menu: {"categories":[],"menuItems":[]}`
         }
       ],
@@ -1997,7 +1999,8 @@ const extractMenuFromDocument = async (docUrl, businessType = 'restaurant') => {
           content: `This is the content of a document that may contain a restaurant menu:\n\n${textContent.substring(0, 15000)}\n\n1) List section headers as "categories":[{"name":"SectionName","order":1}]. If no sections, "categories":[].
 2) Extract ALL items; "category" = section name or "Other".
 3) VARIANTS: If item shows multiple sizes/prices (e.g., "Half ₹110/Full ₹180", "110/180"), extract as "variants":[{"name":"Half","price":110},{"name":"Full","price":180}]. Otherwise use "variants":[].
-Return JSON: {"categories":[...],"menuItems":[{"name":"","description":"","price":0,"category":"...","isVeg":true,"shortCode":"1","variants":[]}]}
+4) For each item add "imageKeyword": a short specific English search term (2-4 words) for a stock photo of this dish (e.g. "butter chicken curry", "masala dosa", "chocolate brownie dessert").
+Return JSON: {"categories":[...],"menuItems":[{"name":"","description":"","price":0,"category":"...","isVeg":true,"shortCode":"1","variants":[],"imageKeyword":""}]}
 shortCode: 1,2,3... If NOT a menu: {"categories":[],"menuItems":[]}`
         }
       ],
@@ -2015,6 +2018,237 @@ shortCode: 1,2,3... If NOT a menu: {"categories":[],"menuItems":[]}`
     console.error('❌ Document extraction failed:', error);
     return { categories: [], menuItems: [] };
   }
+};
+
+// ─── Local placeholder keyword matching (mirrors frontend placeholderImages.js) ───
+// Keywords sorted by length desc so longer (more specific) matches win.
+const LOCAL_PLACEHOLDER_KEYWORDS = [
+  // Indian Main Course
+  'biryani','biriyani','briyani','biriani','butter chicken','murgh makhani','tandoori chicken','tanduri chicken',
+  'chicken tikka','chicken kosha','kosha chicken','chicken do pyaza','do pyaza',
+  'chicken curry','chicken gravy','chicken masala','chicken chaap',
+  'mutton kosha','kosha mutton','kosha mangsho','mutton curry','mutton gravy','lamb curry',
+  'gosht','goat curry','mutton masala','rogan josh','mangsho',
+  'fish kalia','katla fish','katla kalia','rohu fish','rohu kalia',
+  'prawn malai','malai curry prawn','chingri malai','galda prawn','prawn malaikari',
+  'ilish','hilsa','sorshe ilish','shorshe ilish',
+  'fish curry','machli curry','meen curry','machher jhol',
+  'egg curry','anda curry','egg masala','dim curry','dim kosha',
+  'chole bhature','chhole bhature','chole','chana masala','chickpea','chhole',
+  'rajma chawal','rajma rice','rajma','kidney bean',
+  'palak paneer','saag paneer','spinach paneer','malai kofta','kadhi pakora','kadhi',
+  'aloo gobi','gobi aloo','cauliflower potato','aloo matar','matar aloo','peas potato',
+  'mixed veg','mix veg','sabzi','subzi','korma','qorma',
+  'dal tadka','tadka dal','yellow dal','dal chawal','dal rice','dal khichdi','chana dal','chana daal',
+  'kadhai paneer','kadai paneer','karahi','shahi paneer',
+  'paneer butter masala','paneer makhani','methi malai','methi paneer','methi matar',
+  'paneer tikka','chilli paneer','chilly paneer','paneer 65','paneer fry',
+  'paneer butter','paneer curry','paneer masala','paneer gravy','matar paneer','paneer bhurji',
+  'dal makhani','dal makhni','daal makhani','daal makhni','black dal',
+  'dal','daal','lentil','pav bhaji','bhaji','vada pav','vada pao',
+  'baingan','eggplant','brinjal','baigan','begun',
+  'bhindi','okra','lady finger','bhendi','lauki','bottle gourd','ghiya','dudhi',
+  'mushroom curry','mushroom masala','kofta curry','veg kofta',
+  'stuffed capsicum','bharwa shimla mirch','baby corn','thali',
+  // Bengali
+  'mughlai paratha','mughlai','fish batter fry','batter fry','bhetki fry',
+  'diamond fish fry','diamond fry','kochuri','koraishutir kochuri','radhaballabhi',
+  'sandesh','sondesh','mishti doi','misti doi','sweet curd','mishti dohi',
+  'payesh','cham cham','chamcham',
+  // South Indian
+  'ghee roast masala dosa','ghee masala dosa','ghee roast dosa','ghee roast','ghee rava dosa',
+  'ghee podi dosa','ghee podi','paper roast masala dosa','paper roast dosa','paper roast','paper dosa',
+  'podi onion dosa','podi onion uthappam','podi uthappam','podi uttapam',
+  'podi dosa','podi idly','ghee podi idly',
+  'onion rava masala dosa','onion rava dosa','onion dosa','onion uthappam','onion uttapam','onion pesarattu',
+  'rava masala dosa','masala dosa','rava dosa','ghee ravva dosa',
+  'rava kichidi','rava kichadi','ragi dosa','kambu dosa','millet dosa',
+  'butter dosa','carrot dosa','dosa','mysore dosa','set dosa','plain dosa',
+  'sambar idli','sambar idly','ghee sambar idli','ghee sambar idly',
+  'ghee podi idli','podi idli','mini idli','mini idly',
+  'idli','idly','idiyappam','string hopper','nool puttu',
+  'sambar vada','sambhar vada','medu vada','curd vada',
+  'vada curry','vadacurry','vada','wada',
+  'uttapam','uthappam','upma pesarattu','upma','uppma','appam','hoppers',
+  'ven pongal','pongal','rasam','sambhar','sambar','pesarattu',
+  'south indian thali','north indian meal','north indian thali',
+  'mini tiffin','spl mini tiffin','tiffin',
+  'parota','parotta','kerala parotta','malabar parotta',
+  'chapathi','chapati','chola poori','chola puri','chole poori',
+  // Chinese
+  'hakka noodles','chowmein','chow mein','schezwan noodles','szechuan noodles',
+  'chilli garlic noodles','noodles','fried rice','manchurian','spring roll',
+  'chilli chicken','chilly chicken','dragon chicken','honey chilli','honey chilly',
+  'american chopsuey','chop suey','sweet corn soup','corn soup','hot and sour','hot sour soup',
+  'manchow soup','dim sum','dumpling','sweet sour','sweet and sour',
+  'crispy vegetable','crispy veg','chinese platter',
+  // Snacks
+  'samosa','pakora','pakoda','bhajiya','bhajia','bread pakora',
+  'tandoori momos','fried momos','momos','momo',
+  'chaat','papdi chaat','dahi bhalla','sev puri','dahi vada',
+  'pani puri','gol gappa','golgappa','puchka','phuchka',
+  'tikki','aloo tikki','cutlet','veg cutlet','aloo chop','potato chop',
+  'seekh kebab','seekh kabab','kebab','kabab','shami',
+  'chicken wings','buffalo wings','wings','chicken pokora','chicken pakora',
+  'mushroom','soya chaap','chaap','crispy corn','masala corn','corn',
+  'onion ring','fish finger','dhokla','khandvi','dabeli',
+  'tandoori platter','sizzler','mixed platter','non veg platter',
+  'salt pepper',
+  // Rolls
+  'egg roll','anda roll','chicken roll','chicken kathi','mutton roll',
+  'paneer roll','fish roll',
+  // Rice
+  'jeera rice','cumin rice','zeera rice','pulao','pilaf','pulav','basanti pulao',
+  'lemon rice','curd rice','khichdi','khichri','plain rice','steamed rice','bhaat',
+  // Breads
+  'garlic naan','stuffed paratha','aloo paratha','gobi paratha','paneer paratha',
+  'lachha paratha','laccha paratha','lachha','rumali roti','roomali',
+  'kulcha','amritsari','puri','poori','tandoori roti','butter naan','missi roti',
+  'naan','roti','paratha','chapati','bhatura','pao',
+  // Sides
+  'raita','salad','caesar','greek salad','chutney','mint chutney','pudina chutney',
+  'pickle','achaar','achar','papad','papadum','poppadom',
+  'dal shorba','dal soup','manchow soup','cream of mushroom','cream soup',
+  'soup','shorba','tomato soup','broth',
+  // Pizza & Italian
+  'pizza','margherita','pepperoni pizza','garlic bread','white sauce pasta','alfredo',
+  'red sauce pasta','arrabbiata','pasta','spaghetti','macaroni','penne',
+  'lasagna','lasagne','risotto','bruschetta','calzone','mac cheese','mac and cheese','macaroni cheese',
+  // Fast Food
+  'burger','hamburger','cheeseburger','club sandwich','sandwich','grilled sandwich','panini',
+  'wrap','tortilla','burrito','shawarma','kathi roll','frankie',
+  'french fries','fries','finger chips','loaded fries','poutine',
+  'tacos','taco','nachos','quesadilla',
+  'fried chicken','chicken popcorn','chicken nuggets','chicken strip','nuggets',
+  'grilled chicken','chicken breast','steak','beef steak','tenderloin',
+  'sausage','hot dog','hotdog','sub sandwich','submarine',
+  // Seafood
+  'fish fry','fried fish','fish chips','fish and chips',
+  'prawn fry','fried prawn','prawn','shrimp','jhinga','kolambi','chingri',
+  'grilled fish','baked fish','fish steak','calamari','squid',
+  'crab','lobster','fish',
+  // Hot Beverages
+  'masala chai','adrak chai','ginger tea','filter coffee','south indian coffee',
+  'cappuccino','espresso','americano','latte',
+  'green tea','herbal tea','hot chocolate','hot cocoa',
+  'boost','horlicks','bournvita','malt drink',
+  'milk','hot milk','badam milk','haldi milk','turmeric milk',
+  'chai','tea','coffee',
+  // Cold Beverages
+  'mango lassi','lassi','sweet lassi','salted lassi',
+  'mango shake','mango smoothie','watermelon juice','sugarcane juice','ganne ka juice',
+  'fresh juice','orange juice','fruit juice','mixed juice','apple juice',
+  'smoothie','shake','virgin mojito','mojito',
+  'cold coffee','iced coffee','cold brew','frappe',
+  'lemonade','nimbu pani','shikanji','lime soda','milkshake',
+  'buttermilk','chaas','chaach','mattha','coconut water','nariyal pani','tender coconut',
+  'iced tea','thandai','jaljeera','jal jeera',
+  'rose sharbat','rooh afza','sharbat','kokum',
+  'soda','soft drink','cola','coke','pepsi','sprite','fanta','thumbs up','limca',
+  // Alcohol
+  'craft beer','ipa','wheat beer',
+  'beer','lager','ale','stout','draft','draught','pint','kingfisher','budweiser','heineken','corona','bira','carlsberg','tuborg',
+  'margarita','old fashioned','long island','liit','martini','pina colada','pinacolada','daiquiri',
+  'cocktail','cosmopolitan','manhattan','negroni',
+  'champagne','prosecco','sparkling wine','sangria',
+  'wine','red wine','white wine','rose wine','merlot','cabernet','chardonnay','pinot','shiraz',
+  'whiskey','whisky','scotch','bourbon','jack daniels','johnnie walker','jameson','glenfiddich','monkey shoulder','black label','blue label',
+  'vodka','absolut','grey goose','smirnoff','rum','bacardi','old monk','captain morgan',
+  'gin','bombay sapphire','hendrick','tanqueray','gin tonic','g&t','tequila','patron','jose cuervo',
+  // Indian Desserts
+  'gulab jamun','gulabjamun','rasmalai','ras malai','kheer','rice pudding','phirni',
+  'jalebi','imarti','malpua','halwa','gajar halwa','suji halwa','moong dal halwa','carrot halwa',
+  'rabri','rabdi','kulfi','rasgulla','rosogolla','rasgolla',
+  'ladoo','laddu','laddoo','motichoor','barfi','burfi','kaju katli','kaju barfi',
+  'sandesh','sondesh','mishti doi','misti doi','sweet curd',
+  'payesh','payasam','cham cham','chamcham','soan papdi','peda',
+  // Western Desserts
+  'cheesecake','creme brulee','fruit tart','tres leches',
+  'pudding','custard','caramel pudding','flan','cookie','cookies','biscuit','muffin',
+  'donut','doughnut','waffle','tiramisu','brownie','chocolate brownie','mousse','chocolate mousse',
+  'panna cotta','ice cream','icecream','sundae','gelato','chocolate','chocolate cake','choco',
+  'cake slice','cake','cupcake','pastry','croissant',
+  // Bakery
+  'cinnamon roll','bread loaf','bread','puff','puff pastry','patties',
+  'focaccia','bagel','scone','danish pastry','danish','bun','dinner roll','roll',
+  // Breakfast
+  'eggs benedict','french toast','omelette','omelet','egg omelette',
+  'scrambled egg','boiled egg','fried egg','hash brown',
+  'acai bowl','toast','pancake','poha','flattened rice',
+  'cereal','muesli','granola','oats','porridge','egg',
+  // Combos
+  'combo meal','combo','non veg platter','mixed grill','breakfast platter','snack platter',
+  // Misc
+  'potato','aloo',
+].sort((a, b) => b.length - a.length);
+
+// Check if an item name or imageKeyword matches any local placeholder
+const hasLocalPlaceholder = (itemName, imageKeyword) => {
+  const name = (itemName || '').toLowerCase();
+  const kw = (imageKeyword || '').toLowerCase();
+  for (const keyword of LOCAL_PLACEHOLDER_KEYWORDS) {
+    if (kw.includes(keyword) || name.includes(keyword)) return true;
+  }
+  return false;
+};
+
+// Helper: fetch a food photo URL from Pexels API using a search keyword
+const fetchFoodImage = async (keyword) => {
+  const apiKey = process.env.PEXELS_API_KEY;
+  if (!apiKey || !keyword) return null;
+  try {
+    const axios = require('axios');
+    const res = await axios.get('https://api.pexels.com/v1/search', {
+      headers: { Authorization: apiKey },
+      params: { query: `${keyword} food`, per_page: 1, orientation: 'square' },
+      timeout: 5000
+    });
+    const photo = res.data?.photos?.[0];
+    if (photo) {
+      return photo.src?.medium || photo.src?.small || null;
+    }
+    return null;
+  } catch (err) {
+    console.log(`⚠️ Pexels fetch failed for "${keyword}":`, err.message);
+    return null;
+  }
+};
+
+// Fetch food images ONLY for items that don't match any local placeholder
+const fetchFoodImagesBatch = async (items) => {
+  const apiKey = process.env.PEXELS_API_KEY;
+  if (!apiKey) {
+    console.log('ℹ️ PEXELS_API_KEY not set — using local placeholders only');
+    return {};
+  }
+
+  // Filter to only items that need Pexels (no local match)
+  const needPexels = items.filter(item =>
+    item.imageKeyword && !hasLocalPlaceholder(item.name, item.imageKeyword)
+  );
+
+  const totalWithKeywords = items.filter(i => i.imageKeyword).length;
+  const localMatched = totalWithKeywords - needPexels.length;
+  console.log(`📸 Images: ${localMatched} local matches, ${needPexels.length} need Pexels API`);
+
+  if (needPexels.length === 0) return {};
+
+  const results = {};
+  const batchSize = 5;
+  for (let i = 0; i < needPexels.length; i += batchSize) {
+    const batch = needPexels.slice(i, i + batchSize);
+    const promises = batch.map(async (item) => {
+      const url = await fetchFoodImage(item.imageKeyword);
+      if (url) results[item.name] = url;
+    });
+    await Promise.all(promises);
+    if (i + batchSize < needPexels.length) {
+      await new Promise(r => setTimeout(r, 200));
+    }
+  }
+
+  console.log(`📸 Fetched ${Object.keys(results).length}/${needPexels.length} images from Pexels`);
+  return results;
 };
 
 // Helper: normalize category name to id (used for storage and matching)
@@ -2090,7 +2324,8 @@ Return ONLY valid JSON in this exact format:
       "variants": [],
       "spiritCategory": null, "abv": null, "bottleSize": null, "servingUnit": null,
       "unit": null, "weight": null, "servingSize": null,
-      "channelPrices": null
+      "channelPrices": null,
+      "imageKeyword": "paneer tikka appetizer"
     },
     {
       "name": "Dal",
@@ -2105,7 +2340,8 @@ Return ONLY valid JSON in this exact format:
       ],
       "spiritCategory": null, "abv": null, "bottleSize": null, "servingUnit": null,
       "unit": null, "weight": null, "servingSize": null,
-      "channelPrices": { "dineIn": 120, "takeaway": 100 }
+      "channelPrices": { "dineIn": 120, "takeaway": 100 },
+      "imageKeyword": "dal lentil curry bowl"
     }
   ]
 }
@@ -2122,7 +2358,8 @@ RULES:
 6. VARIANTS: Look for patterns like "Half/Full", "Small/Medium/Large", "110/180", "₹110/₹180", or any item showing multiple prices. Extract as variants array.
 7. Type-specific fields (spiritCategory, abv, bottleSize, servingUnit, unit, weight, servingSize): Only set if the business type matches and data is visible in the menu. Otherwise set to null.
 8. Be thorough – do not skip items.
-9. CHANNEL-SPECIFIC PRICING: Some menus show different prices for Dine-In, Takeaway, and Delivery (e.g., "Dine-In: ₹100 | Takeaway: ₹90" or separate columns for different channels). If you detect channel-specific prices for an item: set "price" to the base/lowest price, and add "channelPrices": {"dineIn": 100, "takeaway": 90, "delivery": 85}. Only include channels that have explicitly different prices. If only one price is shown (no channel differentiation), set "channelPrices" to null.`
+9. CHANNEL-SPECIFIC PRICING: Some menus show different prices for Dine-In, Takeaway, and Delivery (e.g., "Dine-In: ₹100 | Takeaway: ₹90" or separate columns for different channels). If you detect channel-specific prices for an item: set "price" to the base/lowest price, and add "channelPrices": {"dineIn": 100, "takeaway": 90, "delivery": 85}. Only include channels that have explicitly different prices. If only one price is shown (no channel differentiation), set "channelPrices" to null.
+10. IMAGE KEYWORD: For each item, add "imageKeyword" — a short, specific English search term (2-4 words) that would find a good stock photo of this exact dish. Be specific: use "butter chicken curry" not "food", "masala dosa" not "dosa", "chocolate brownie dessert" not "dessert". For drinks: "espresso coffee cup", "mango lassi drink", etc.`
             },
             {
               type: "image_url",
@@ -2158,8 +2395,8 @@ RULES:
               {
                 type: "text",
                 text: `Extract menu from this image. Return JSON:
-{"categories": [{"name":"SectionName","order":1}], "menuItems": [{"name":"","price":0,"category":"SectionName","isVeg":true,"shortCode":"1","variants":[]}]}
-Use EXACT section names. If item shows variants (e.g., "Half ₹110/Full ₹180"), use "variants":[{"name":"Half","price":110},{"name":"Full","price":180}]. If no sections, use "categories":[] and item "category":"Other". shortCode: 1,2,3...`
+{"categories": [{"name":"SectionName","order":1}], "menuItems": [{"name":"","price":0,"category":"SectionName","isVeg":true,"shortCode":"1","variants":[],"imageKeyword":"butter chicken curry"}]}
+Use EXACT section names. If item shows variants (e.g., "Half ₹110/Full ₹180"), use "variants":[{"name":"Half","price":110},{"name":"Full","price":180}]. If no sections, use "categories":[] and item "category":"Other". shortCode: 1,2,3... imageKeyword: 2-4 word English search term for a stock photo of this dish.`
               },
               { type: "image_url", image_url: { url: imageUrl, detail: "high" } }
             ]
@@ -5813,6 +6050,10 @@ app.get('/api/menus/:restaurantId', async (req, res) => {
 
 app.post('/api/menus/:restaurantId', authenticateToken, async (req, res) => {
   try {
+    // Granular permission check: menu.add
+    if (!(await checkFeaturePermission(req, 'menu', 'add'))) {
+      return res.status(403).json({ error: 'Access denied. Menu add permission required.' });
+    }
     const { restaurantId } = req.params;
     const { userId } = req.user;
     const {
@@ -5999,6 +6240,11 @@ app.post('/api/menus/:restaurantId', authenticateToken, async (req, res) => {
 // Update menu item
 app.patch('/api/menus/item/:id', authenticateToken, async (req, res) => {
   try {
+    // Granular permission check: menu.update (or markOutOfStock for stock toggle)
+    const menuOp = (req.body && Object.keys(req.body).length === 1 && req.body.isOutOfStock !== undefined) ? 'markOutOfStock' : 'update';
+    if (!(await checkFeaturePermission(req, 'menu', menuOp))) {
+      return res.status(403).json({ error: `Access denied. Menu ${menuOp} permission required.` });
+    }
     const { id } = req.params;
     const { userId } = req.user;
 
@@ -6271,6 +6517,10 @@ app.delete('/api/menus/:restaurantId/item/:itemId/favorite', authenticateToken, 
 // Delete menu item (soft delete)
 app.delete('/api/menus/item/:id', authenticateToken, async (req, res) => {
   try {
+    // Granular permission check: menu.delete
+    if (!(await checkFeaturePermission(req, 'menu', 'delete'))) {
+      return res.status(403).json({ error: 'Access denied. Menu delete permission required.' });
+    }
     const { id } = req.params;
     const { userId } = req.user;
 
@@ -6363,6 +6613,10 @@ app.delete('/api/menus/item/:id', authenticateToken, async (req, res) => {
 // Bulk delete all menu items for a restaurant
 app.delete('/api/menus/:restaurantId/bulk-delete', authenticateToken, async (req, res) => {
   try {
+    // Granular permission check: menu.delete
+    if (!(await checkFeaturePermission(req, 'menu', 'delete'))) {
+      return res.status(403).json({ error: 'Access denied. Menu delete permission required.' });
+    }
     const { restaurantId } = req.params;
     const { userId } = req.user;
 
@@ -9136,6 +9390,12 @@ app.patch('/api/orders/:orderId/status', authenticateToken, async (req, res) => 
     const { orderId } = req.params;
     const { status } = req.body;
 
+    // Granular permission check based on status change type
+    const statusOp = (status === 'cancelled' || status === 'deleted') ? 'cancel' : status === 'completed' ? 'completeBill' : 'update';
+    if (!(await checkFeaturePermission(req, 'orders', statusOp))) {
+      return res.status(403).json({ error: `Access denied. Orders ${statusOp} permission required.` });
+    }
+
     const validStatuses = ['pending', 'confirmed', 'preparing', 'ready', 'served', 'completed', 'cancelled', 'deleted'];
 
     if (!validStatuses.includes(status)) {
@@ -9427,6 +9687,13 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
       updatedAt,
       lastUpdatedBy
     } = req.body;
+
+    // Granular permission check: determine operation type
+    const isCompleteBill = status === 'completed' || paymentStatus === 'paid';
+    const orderOp = isCompleteBill ? 'completeBill' : 'update';
+    if (!(await checkFeaturePermission(req, 'orders', orderOp))) {
+      return res.status(403).json({ error: `Access denied. Orders ${orderOp} permission required.` });
+    }
 
     // Validate items if provided
     if (items && (!Array.isArray(items) || items.length === 0)) {
@@ -10394,6 +10661,10 @@ app.post('/api/orders/:orderId/manual-print', authenticateToken, async (req, res
 // Delete order (admin/owner only) – soft delete: set status to 'deleted' so order appears under "Deleted" filter
 app.delete('/api/orders/:orderId', authenticateToken, async (req, res) => {
   try {
+    // Granular permission check: orders.cancel
+    if (!(await checkFeaturePermission(req, 'orders', 'cancel'))) {
+      return res.status(403).json({ error: 'Access denied. Orders cancel permission required.' });
+    }
     const { orderId } = req.params;
     const { userId, role } = req.user;
     const { reason } = req.body || {};
@@ -11149,6 +11420,10 @@ app.post('/api/menus/bulk-upload/:restaurantId', authenticateToken, chatgptUsage
 // Categories from extraction (menu photo) are merged into restaurant.categories. Item category uses dynamic id; fallback only when missing.
 app.post('/api/menus/bulk-save/:restaurantId', authenticateToken, async (req, res) => {
   try {
+    // Granular permission check: menu.add
+    if (!(await checkFeaturePermission(req, 'menu', 'add'))) {
+      return res.status(403).json({ error: 'Access denied. Menu add permission required.' });
+    }
     const { restaurantId } = req.params;
     const { userId } = req.user;
     const { menuItems, categories: extractedCategories = [] } = req.body;
@@ -11197,6 +11472,14 @@ app.post('/api/menus/bulk-save/:restaurantId', authenticateToken, async (req, re
       }
     }
     console.log(`📊 Current max shortCode: ${maxShortCode}`);
+
+    // Fetch AI-suggested images from Pexels in parallel while processing items
+    let imageMap = {};
+    try {
+      imageMap = await fetchFoodImagesBatch(menuItems);
+    } catch (err) {
+      console.log('⚠️ Image fetch failed, continuing without images:', err.message);
+    }
 
     // Merge extracted categories into restaurant.categories (by unique id)
     for (const c of extractedCategories) {
@@ -11308,6 +11591,8 @@ app.post('/api/menus/bulk-save/:restaurantId', authenticateToken, async (req, re
           })(),
           createdAt: new Date(),
           updatedAt: new Date(),
+          image: imageMap[item.name || ''] || null,
+          imageKeyword: item.imageKeyword || null,
           source: 'ai_upload',
           originalFile: item.originalFile || null
         };
@@ -11419,6 +11704,10 @@ app.get('/api/tables/:restaurantId', async (req, res) => {
 
 app.post('/api/tables/:restaurantId', authenticateToken, async (req, res) => {
   try {
+    // Granular permission check: tables.add
+    if (!(await checkFeaturePermission(req, 'tables', 'add'))) {
+      return res.status(403).json({ error: 'Access denied. Tables add permission required.' });
+    }
     const { restaurantId } = req.params;
     const { name, floor, capacity, section } = req.body;
 
@@ -11512,6 +11801,10 @@ app.post('/api/tables/:restaurantId', authenticateToken, async (req, res) => {
 // Bulk create tables
 app.post('/api/tables/:restaurantId/bulk', authenticateToken, async (req, res) => {
   try {
+    // Granular permission check: tables.add
+    if (!(await checkFeaturePermission(req, 'tables', 'add'))) {
+      return res.status(403).json({ error: 'Access denied. Tables add permission required.' });
+    }
     const { restaurantId } = req.params;
     const { floor, fromNumber, toNumber, capacity, section } = req.body;
 
@@ -11727,17 +12020,11 @@ app.patch('/api/tables/:tableId/status', authenticateToken, async (req, res) => 
 // Reset all occupied tables to available (Master Reset)
 app.post('/api/tables/:restaurantId/reset-all', authenticateToken, async (req, res) => {
   try {
-    const { restaurantId } = req.params;
-    const { role } = req.user;
-    const userId = req.user.uid || req.user.userId;
-
-    // Permission check: owner/admin always allowed, others need pageAccess.resetTables
-    if (role !== 'owner' && role !== 'admin') {
-      const staffDoc = await db.collection(collections.staffUsers).doc(userId).get();
-      if (!staffDoc.exists || !staffDoc.data()?.pageAccess?.resetTables) {
-        return res.status(403).json({ error: 'Permission denied. Reset Tables access required.' });
-      }
+    // Granular permission check: tables.reset (also checks legacy pageAccess.resetTables)
+    if (!(await checkFeaturePermission(req, 'tables', 'reset'))) {
+      return res.status(403).json({ error: 'Access denied. Tables reset permission required.' });
     }
+    const { restaurantId } = req.params;
 
     const floorsSnapshot = await db.collection('restaurants')
       .doc(restaurantId)
@@ -11785,6 +12072,10 @@ app.post('/api/tables/:restaurantId/reset-all', authenticateToken, async (req, r
 // Update table details
 app.patch('/api/tables/:tableId', authenticateToken, async (req, res) => {
   try {
+    // Granular permission check: tables.update
+    if (!(await checkFeaturePermission(req, 'tables', 'update'))) {
+      return res.status(403).json({ error: 'Access denied. Tables update permission required.' });
+    }
     const { tableId } = req.params;
     const { name, floor, capacity, section, restaurantId } = req.body;
 
@@ -11850,6 +12141,10 @@ app.patch('/api/tables/:tableId', authenticateToken, async (req, res) => {
 // Delete table
 app.delete('/api/tables/:tableId', authenticateToken, async (req, res) => {
   try {
+    // Granular permission check: tables.delete
+    if (!(await checkFeaturePermission(req, 'tables', 'delete'))) {
+      return res.status(403).json({ error: 'Access denied. Tables delete permission required.' });
+    }
     const { tableId } = req.params;
     const { restaurantId } = req.body;
 
@@ -14728,6 +15023,10 @@ app.get('/api/kot/:restaurantId/:orderId', async (req, res) => {
 // Cancel Order API
 app.patch('/api/orders/:orderId/cancel', authenticateToken, async (req, res) => {
   try {
+    // Granular permission check: orders.cancel
+    if (!(await checkFeaturePermission(req, 'orders', 'cancel'))) {
+      return res.status(403).json({ error: 'Access denied. Orders cancel permission required.' });
+    }
     const { orderId } = req.params;
     const { reason } = req.body;
 
@@ -15611,41 +15910,68 @@ app.get('/api/smart-suggestions/:restaurantId', authenticateToken, async (req, r
 // INVENTORY MANAGEMENT APIs
 // ========================================
 
-// Helper: resolve inventory permissions from pageAccess (boolean or object)
-function resolveInventoryPerms(pageAccess) {
-  const inv = pageAccess?.inventory;
-  if (typeof inv === 'object' && inv !== null) {
-    return { read: !!inv.read, add: !!inv.add, update: !!inv.update, delete: !!inv.delete };
+// Generic feature permission helpers
+const FEATURE_OPS = {
+  inventory: ['read', 'add', 'update', 'delete'],
+  menu: ['read', 'add', 'update', 'delete', 'markOutOfStock'],
+  orders: ['read', 'update', 'cancel', 'refund', 'completeBill'],
+  tables: ['read', 'add', 'update', 'delete', 'reset'],
+  customers: ['read', 'add', 'update', 'delete'],
+  offers: ['read', 'add', 'update', 'delete']
+};
+
+function resolveFeaturePerms(pageAccess, feature) {
+  const ops = FEATURE_OPS[feature] || ['read', 'add', 'update', 'delete'];
+  const val = pageAccess?.[feature];
+  if (typeof val === 'object' && val !== null) {
+    const result = {};
+    for (const op of ops) result[op] = !!val[op];
+    return result;
   }
-  const val = !!inv;
-  return { read: val, add: val, update: val, delete: val };
+  const boolVal = !!val;
+  const result = {};
+  for (const op of ops) result[op] = boolVal;
+  return result;
 }
 
-// Helper: check inventory permission for staff (async, checks Firestore)
-async function checkInventoryPermission(req, operation) {
+async function checkFeaturePermission(req, feature, operation) {
   const { role } = req.user;
   if (role === 'owner' || role === 'admin') return true;
-  // Manager default: full access unless restricted
-  if (role === 'manager') {
-    try {
-      const userId = req.user.userId || req.user.id;
-      let userDoc = await db.collection(collections.staffUsers).doc(userId).get();
-      if (!userDoc.exists) userDoc = await db.collection(collections.users).doc(userId).get();
-      if (!userDoc.exists) return true; // Can't find doc, allow manager by default
-      const perms = resolveInventoryPerms(userDoc.data()?.pageAccess);
-      return perms[operation];
-    } catch { return true; }
-  }
-  // Employee and other roles
+
   try {
     const userId = req.user.userId || req.user.id;
     let userDoc = await db.collection(collections.staffUsers).doc(userId).get();
     if (!userDoc.exists) userDoc = await db.collection(collections.users).doc(userId).get();
-    if (!userDoc.exists) return false;
-    const perms = resolveInventoryPerms(userDoc.data()?.pageAccess);
-    return perms[operation];
-  } catch { return false; }
+
+    if (!userDoc.exists) {
+      return role === 'manager'; // manager default: allow
+    }
+
+    const pageAccess = userDoc.data()?.pageAccess;
+
+    // Legacy standalone boolean fallbacks
+    if (feature === 'orders' && operation === 'completeBill' && pageAccess?.completeBill !== undefined) {
+      return !!pageAccess.completeBill;
+    }
+    if (feature === 'tables' && operation === 'reset' && pageAccess?.resetTables !== undefined) {
+      return !!pageAccess.resetTables;
+    }
+
+    const perms = resolveFeaturePerms(pageAccess, feature);
+    if (perms[operation]) return true;
+
+    // Manager fallback: if feature key not present at all, allow
+    if (role === 'manager' && pageAccess?.[feature] === undefined) return true;
+
+    return false;
+  } catch {
+    return role === 'manager'; // on error, managers allowed
+  }
 }
+
+// Backward-compatible aliases
+function resolveInventoryPerms(pageAccess) { return resolveFeaturePerms(pageAccess, 'inventory'); }
+async function checkInventoryPermission(req, operation) { return checkFeaturePermission(req, 'inventory', operation); }
 
 // Get all inventory items for a restaurant
 app.get('/api/inventory/:restaurantId', authenticateToken, async (req, res) => {
@@ -21444,6 +21770,10 @@ app.put('/api/admin/settings/:restaurantId/status', authenticateToken, async (re
 // Customer Management APIs
 app.post('/api/customers', authenticateToken, async (req, res) => {
   try {
+    // Granular permission check: customers.add
+    if (!(await checkFeaturePermission(req, 'customers', 'add'))) {
+      return res.status(403).json({ error: 'Access denied. Customers add permission required.' });
+    }
     const { userId } = req.user;
     const { name, phone, email, city, dob, restaurantId, orderHistory = [] } = req.body;
 
@@ -21743,6 +22073,10 @@ app.get('/api/customers/detail/:customerId', authenticateToken, async (req, res)
 
 app.patch('/api/customers/:customerId', authenticateToken, async (req, res) => {
   try {
+    // Granular permission check: customers.update
+    if (!(await checkFeaturePermission(req, 'customers', 'update'))) {
+      return res.status(403).json({ error: 'Access denied. Customers update permission required.' });
+    }
     const { customerId } = req.params;
     const { userId } = req.user;
     const updateData = req.body;
@@ -21782,6 +22116,10 @@ app.patch('/api/customers/:customerId', authenticateToken, async (req, res) => {
 
 app.delete('/api/customers/:customerId', authenticateToken, async (req, res) => {
   try {
+    // Granular permission check: customers.delete
+    if (!(await checkFeaturePermission(req, 'customers', 'delete'))) {
+      return res.status(403).json({ error: 'Access denied. Customers delete permission required.' });
+    }
     const { customerId } = req.params;
     const { userId } = req.user;
 
@@ -22593,6 +22931,10 @@ app.get('/api/public/offers/:restaurantId', vercelSecurityMiddleware.publicAPI, 
 // Create a new offer
 app.post('/api/offers/:restaurantId', authenticateToken, async (req, res) => {
   try {
+    // Granular permission check: offers.add
+    if (!(await checkFeaturePermission(req, 'offers', 'add'))) {
+      return res.status(403).json({ error: 'Access denied. Offers add permission required.' });
+    }
     const { restaurantId } = req.params;
     const { userId } = req.user;
     const {
@@ -22692,6 +23034,10 @@ app.post('/api/offers/:restaurantId', authenticateToken, async (req, res) => {
 // Update an offer
 app.put('/api/offers/:restaurantId/:offerId', authenticateToken, async (req, res) => {
   try {
+    // Granular permission check: offers.update
+    if (!(await checkFeaturePermission(req, 'offers', 'update'))) {
+      return res.status(403).json({ error: 'Access denied. Offers update permission required.' });
+    }
     const { restaurantId, offerId } = req.params;
     const { userId } = req.user;
     const updateData = req.body;
@@ -22758,6 +23104,10 @@ app.put('/api/offers/:restaurantId/:offerId', authenticateToken, async (req, res
 // Delete an offer
 app.delete('/api/offers/:restaurantId/:offerId', authenticateToken, async (req, res) => {
   try {
+    // Granular permission check: offers.delete
+    if (!(await checkFeaturePermission(req, 'offers', 'delete'))) {
+      return res.status(403).json({ error: 'Access denied. Offers delete permission required.' });
+    }
     const { restaurantId, offerId } = req.params;
     const { userId } = req.user;
 
@@ -23215,6 +23565,10 @@ app.get('/api/staff/:userId/tips', authenticateToken, async (req, res) => {
 // Process refund for an order
 app.post('/api/orders/:orderId/refund', authenticateToken, async (req, res) => {
   try {
+    // Granular permission check: orders.refund
+    if (!(await checkFeaturePermission(req, 'orders', 'refund'))) {
+      return res.status(403).json({ error: 'Access denied. Orders refund permission required.' });
+    }
     const { orderId } = req.params;
     const { refundAmount, refundReason, refundType } = req.body;
     const { userId } = req.user;
@@ -23310,6 +23664,10 @@ app.post('/api/orders/:orderId/partial-payment', authenticateToken, async (req, 
 // Comp or void items on an order
 app.post('/api/orders/:orderId/comp-void', authenticateToken, async (req, res) => {
   try {
+    // Granular permission check: orders.refund (comp/void requires refund-level permission)
+    if (!(await checkFeaturePermission(req, 'orders', 'refund'))) {
+      return res.status(403).json({ error: 'Access denied. Orders refund permission required.' });
+    }
     const { orderId } = req.params;
     const { type, items, reason } = req.body;
     const { userId } = req.user;
