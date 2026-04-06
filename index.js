@@ -14226,7 +14226,9 @@ app.get('/api/admin/print-settings/:restaurantId', authenticateToken, async (req
       autoPrintOnOnlineOrder: false,     // Reserved: Auto-print for online orders
       autoPrintOnTableCall: false,       // Reserved: Auto-print when customer calls waiter
       printKOTCopy: 1,                   // Number of KOT copies to print
-      printBillCopy: 1                   // Number of bill copies to print
+      printBillCopy: 1,                  // Number of bill copies to print
+      billFontSize: 'medium',            // Bill print font size preset: small, medium, large, xlarge (legacy)
+      billFontScale: 100                  // Bill print font scale: 50-150 (100 = default medium)
     };
 
     const printSettings = { ...defaultSettings, ...(restaurantData.printSettings || {}) };
@@ -14271,6 +14273,11 @@ app.put('/api/admin/print-settings/:restaurantId', authenticateToken, async (req
       'printBillCopy'
     ];
 
+    // String enum fields
+    const enumFields = {
+      billFontSize: ['small', 'medium', 'large', 'xlarge']
+    };
+
     const sanitizedSettings = {};
     for (const field of booleanFields) {
       if (printSettings[field] !== undefined) {
@@ -14282,6 +14289,16 @@ app.put('/api/admin/print-settings/:restaurantId', authenticateToken, async (req
         const val = parseInt(printSettings[field]);
         sanitizedSettings[field] = isNaN(val) ? 1 : Math.max(1, Math.min(val, 5)); // 1-5 copies
       }
+    }
+    for (const [field, allowed] of Object.entries(enumFields)) {
+      if (printSettings[field] !== undefined) {
+        sanitizedSettings[field] = allowed.includes(printSettings[field]) ? printSettings[field] : allowed[1]; // default to 2nd value (medium)
+      }
+    }
+    // billFontScale: numeric 50-150 (default 100)
+    if (printSettings.billFontScale !== undefined) {
+      const val = parseInt(printSettings.billFontScale);
+      sanitizedSettings.billFontScale = isNaN(val) ? 100 : Math.max(50, Math.min(val, 150));
     }
 
     const restaurantDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
