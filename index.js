@@ -1896,26 +1896,66 @@ shortCode: 1,2,3... If NOT a menu: {"categories":[],"menuItems":[]}`
   }
 };
 
-// Extract menu from CSV/Excel. Use Category column if present as categories; else categories:[] and item.category="Other".
+// Helper: download file from URL and return buffer
+const downloadFileBuffer = async (url) => {
+  const axios = require('axios');
+  const response = await axios.get(url, { responseType: 'arraybuffer' });
+  return Buffer.from(response.data);
+};
+
+// Helper: parse Excel/CSV file buffer to text table
+const parseSpreadsheetToText = (buffer, fileName) => {
+  const XLSX = require('xlsx');
+  const workbook = XLSX.read(buffer, { type: 'buffer' });
+  const lines = [];
+  for (const sheetName of workbook.SheetNames) {
+    const sheet = workbook.Sheets[sheetName];
+    const data = XLSX.utils.sheet_to_csv(sheet);
+    if (data.trim()) {
+      if (workbook.SheetNames.length > 1) lines.push(`--- Sheet: ${sheetName} ---`);
+      lines.push(data);
+    }
+  }
+  return lines.join('\n');
+};
+
+// Helper: parse Word document buffer to text
+const parseDocumentToText = async (buffer, fileName) => {
+  const ext = (fileName || '').split('.').pop().toLowerCase();
+  if (ext === 'docx') {
+    const mammoth = require('mammoth');
+    const result = await mammoth.extractRawText({ buffer });
+    return result.value;
+  }
+  // For .doc, .txt and other text files, try as UTF-8 text
+  return buffer.toString('utf-8');
+};
+
+// Extract menu from CSV/Excel. Downloads file, parses to text, sends to GPT-4o.
 const extractMenuFromCSV = async (csvUrl, businessType = 'restaurant') => {
   try {
     console.log('📊 Extracting menu from CSV/Excel...');
+    console.log('📥 Downloading file...');
+    const buffer = await downloadFileBuffer(csvUrl);
+    const fileName = csvUrl.split('/').pop().split('?')[0];
+    const textContent = parseSpreadsheetToText(buffer, fileName);
+    console.log(`📄 Parsed spreadsheet to text (${textContent.length} chars)`);
+
+    if (!textContent.trim()) {
+      console.log('⚠️ Empty spreadsheet');
+      return { categories: [], menuItems: [] };
+    }
+
     const response = await openai.chat.completions.create({
       model: "gpt-4o",
       messages: [
         {
           role: "user",
-          content: [
-            {
-              type: "text",
-              text: `This may be a menu in CSV/Excel. 1) If there is a Category/Type column, collect unique values as "categories":[{"name":"X","order":1},...]. If no category column, use "categories":[].
+          content: `This is the content of a CSV/Excel file that may contain a restaurant menu:\n\n${textContent.substring(0, 15000)}\n\n1) If there is a Category/Type column, collect unique values as "categories":[{"name":"X","order":1},...]. If no category column, use "categories":[].
 2) Extract ALL rows as menu items. For "category" use the row's Category/Type value if present, else "Other".
 3) VARIANTS: If price column shows multiple values (e.g., "110/180", "Half/Full"), extract as "variants":[{"name":"Half","price":110},{"name":"Full","price":180}]. Otherwise use "variants":[].
 Return JSON: {"categories":[...],"menuItems":[{"name":"","description":"","price":0,"category":"...","isVeg":true,"shortCode":"1","variants":[]}]}
 shortCode: 1,2,3... If NOT a menu: {"categories":[],"menuItems":[]}`
-            },
-            { type: "image_url", image_url: { url: csvUrl, detail: "high" } }
-          ]
         }
       ],
       max_tokens: 8000,
@@ -1934,26 +1974,31 @@ shortCode: 1,2,3... If NOT a menu: {"categories":[],"menuItems":[]}`
   }
 };
 
-// Extract menu from document files. Use section headers as categories when present.
+// Extract menu from document files. Downloads file, parses to text, sends to GPT-4o.
 const extractMenuFromDocument = async (docUrl, businessType = 'restaurant') => {
   try {
     console.log('📝 Extracting menu from document...');
+    console.log('📥 Downloading file...');
+    const buffer = await downloadFileBuffer(docUrl);
+    const fileName = docUrl.split('/').pop().split('?')[0];
+    const textContent = await parseDocumentToText(buffer, fileName);
+    console.log(`📄 Parsed document to text (${textContent.length} chars)`);
+
+    if (!textContent.trim()) {
+      console.log('⚠️ Empty document');
+      return { categories: [], menuItems: [] };
+    }
+
     const response = await openai.chat.completions.create({
       model: "gpt-4o",
       messages: [
         {
           role: "user",
-          content: [
-            {
-              type: "text",
-              text: `Analyze this document. If it is a menu: 1) List section headers as "categories":[{"name":"SectionName","order":1}]. If no sections, "categories":[].
+          content: `This is the content of a document that may contain a restaurant menu:\n\n${textContent.substring(0, 15000)}\n\n1) List section headers as "categories":[{"name":"SectionName","order":1}]. If no sections, "categories":[].
 2) Extract ALL items; "category" = section name or "Other".
 3) VARIANTS: If item shows multiple sizes/prices (e.g., "Half ₹110/Full ₹180", "110/180"), extract as "variants":[{"name":"Half","price":110},{"name":"Full","price":180}]. Otherwise use "variants":[].
 Return JSON: {"categories":[...],"menuItems":[{"name":"","description":"","price":0,"category":"...","isVeg":true,"shortCode":"1","variants":[]}]}
 shortCode: 1,2,3... If NOT a menu: {"categories":[],"menuItems":[]}`
-            },
-            { type: "image_url", image_url: { url: docUrl, detail: "high" } }
-          ]
         }
       ],
       max_tokens: 8000,
