@@ -14228,7 +14228,8 @@ app.get('/api/admin/print-settings/:restaurantId', authenticateToken, async (req
       printKOTCopy: 1,                   // Number of KOT copies to print
       printBillCopy: 1,                  // Number of bill copies to print
       billFontSize: 'medium',            // Bill print font size preset: small, medium, large, xlarge (legacy)
-      billFontScale: 100                  // Bill print font scale: 50-150 (100 = default medium)
+      billFontScale: 100,                 // Bill print font scale: 50-150 (100 = default medium)
+      billFontFamily: 'default'           // Bill print font family: default, arial, verdana, tahoma, georgia, times
     };
 
     const printSettings = { ...defaultSettings, ...(restaurantData.printSettings || {}) };
@@ -14275,7 +14276,8 @@ app.put('/api/admin/print-settings/:restaurantId', authenticateToken, async (req
 
     // String enum fields
     const enumFields = {
-      billFontSize: ['small', 'medium', 'large', 'xlarge']
+      billFontSize: ['small', 'medium', 'large', 'xlarge'],
+      billFontFamily: ['default', 'arial', 'verdana', 'tahoma', 'georgia', 'times']
     };
 
     const sanitizedSettings = {};
@@ -14862,7 +14864,9 @@ app.get('/api/kot/pending-print/:restaurantId', async (req, res) => {
         autoPrintOnOnlineOrder,        // Reserved: Auto-print for online orders
         autoPrintOnTableCall,          // Reserved: Auto-print on customer call
         printKOTCopy,                  // Number of KOT copies
-        printBillCopy                  // Number of bill copies
+        printBillCopy,                 // Number of bill copies
+        billFontScale: printSettings.billFontScale || 100,      // Font scale 50-150
+        billFontFamily: printSettings.billFontFamily || 'default' // Font family id
       }
     });
 
@@ -14994,7 +14998,13 @@ app.get('/api/billing/pending-print/:restaurantId', async (req, res) => {
       count: pendingBills.length,
       timestamp: new Date().toISOString(),
       shouldPrint: kotPrinterEnabled && autoPrintOnBilling,
-      printCopies: printBillCopy
+      printCopies: printBillCopy,
+      printSettings: {
+        autoPrintOnBilling,
+        printBillCopy,
+        billFontScale: printSettings.billFontScale || 100,
+        billFontFamily: printSettings.billFontFamily || 'default'
+      }
     });
 
   } catch (error) {
