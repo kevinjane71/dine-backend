@@ -84,29 +84,19 @@ const notifyOrderDeleted = async (restaurantId, orderId) => {
  * Used when an order is confirmed/sent to kitchen
  */
 const notifyKOTPrintRequest = async (restaurantId, orderData) => {
+  // Lightweight notification only — printer app must fetch full order via
+  // GET /api/kot/:restaurantId/:orderId to stay under Pusher's 10KB limit.
   await triggerOrderEvent(restaurantId, 'kot-print-request', {
     id: orderData.id,
+    orderId: orderData.id,
     kotId: `KOT-${orderData.id.slice(-6).toUpperCase()}`,
     dailyOrderId: orderData.dailyOrderId,
     orderNumber: orderData.orderNumber,
     tableNumber: orderData.tableNumber || '',
     roomNumber: orderData.roomNumber || '',
-    items: orderData.items || [],
-    notes: orderData.notes || '',
-    specialInstructions: orderData.specialInstructions || '',
-    staffInfo: orderData.staffInfo || {},
     orderType: orderData.orderType || 'dine-in',
-    createdAt: orderData.createdAt || new Date().toISOString(),
-    formattedTime: new Date().toLocaleTimeString('en-IN', {
-      hour: '2-digit',
-      minute: '2-digit',
-      hour12: true
-    }),
-    formattedDate: new Date().toLocaleDateString('en-IN', {
-      day: '2-digit',
-      month: 'short',
-      year: 'numeric'
-    })
+    itemsCount: orderData.items?.length || 0,
+    createdAt: orderData.createdAt || new Date().toISOString()
   });
 };
 
@@ -115,6 +105,8 @@ const notifyKOTPrintRequest = async (restaurantId, orderData) => {
  * Used when billing is completed for an order
  */
 const notifyBillingPrintRequest = async (restaurantId, orderData) => {
+  // Lightweight notification only — printer app must fetch full order via
+  // GET /api/kot/:restaurantId/:orderId to stay under Pusher's 10KB limit.
   const completedAt = orderData.completedAt || new Date();
   await triggerOrderEvent(restaurantId, 'billing-print-request', {
     id: orderData.id,
@@ -123,27 +115,12 @@ const notifyBillingPrintRequest = async (restaurantId, orderData) => {
     orderNumber: orderData.orderNumber,
     tableNumber: orderData.tableNumber || '',
     roomNumber: orderData.roomNumber || '',
-    customerName: orderData.customerName || orderData.customerInfo?.name || '',
-    customerMobile: orderData.customerMobile || orderData.customerInfo?.phone || '',
-    items: orderData.items || [],
-    subtotal: orderData.totalAmount || 0,
-    taxAmount: orderData.taxAmount || 0,
-    taxBreakdown: orderData.taxBreakdown || [],
+    orderType: orderData.orderType || 'dine-in',
+    itemsCount: orderData.items?.length || 0,
     totalAmount: orderData.finalAmount || orderData.totalAmount || 0,
     paymentMethod: orderData.paymentMethod || 'cash',
-    orderType: orderData.orderType || 'dine-in',
     createdAt: orderData.createdAt || new Date().toISOString(),
-    completedAt: completedAt instanceof Date ? completedAt.toISOString() : completedAt,
-    formattedTime: new Date().toLocaleTimeString('en-IN', {
-      hour: '2-digit',
-      minute: '2-digit',
-      hour12: true
-    }),
-    formattedDate: new Date().toLocaleDateString('en-IN', {
-      day: '2-digit',
-      month: 'short',
-      year: 'numeric'
-    })
+    completedAt: completedAt instanceof Date ? completedAt.toISOString() : completedAt
   });
 };
 

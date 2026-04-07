@@ -15062,13 +15062,43 @@ app.get('/api/restaurant/info/:restaurantId', async (req, res) => {
 
     const data = restaurantDoc.data();
 
+    // Merge default print settings with restaurant overrides so the
+    // printer app can use them without hitting an authenticated endpoint.
+    const defaultPrintSettings = {
+      kotPrinterEnabled: true,
+      manualPrintEnabled: true,
+      showKOTSummaryAfterOrder: true,
+      showBillSummaryAfterBilling: true,
+      usePusherForKOT: false,
+      autoPrintOnKOT: true,
+      autoPrintOnBilling: false,
+      autoPrintOnOnlineOrder: false,
+      autoPrintOnTableCall: false,
+      printKOTCopy: 1,
+      printBillCopy: 1,
+      billFontSize: 'medium',
+      billFontScale: 100,
+      billFontFamily: 'default'
+    };
+    const printSettings = { ...defaultPrintSettings, ...(data.printSettings || {}) };
+
     res.json({
       success: true,
       restaurant: {
         id: restaurantDoc.id,
         name: data.name || 'Restaurant',
+        legalBusinessName: data.legalBusinessName || '',
         address: data.address || '',
-        phone: data.phone || ''
+        city: data.city || '',
+        phone: data.phone || '',
+        email: data.email || '',
+        gstin: data.gstin || '',
+        showGstOnInvoice: data.showGstOnInvoice === true,
+        businessType: data.businessType || 'restaurant',
+        cuisine: data.cuisine || '',
+        logo: data.logo || '',
+        currency: data.currency || 'INR',
+        printSettings
       }
     });
 
@@ -23577,6 +23607,8 @@ app.get('/api/restaurants/:restaurantId/billing-settings', authenticateToken, as
       cashTenderingEnabled: existing.cashTenderingEnabled ?? false,
       denominations: Array.isArray(existing.denominations) ? existing.denominations : [10, 20, 50, 100, 200, 500, 2000],
       splitPaymentEnabled: existing.splitPaymentEnabled ?? false,
+      settlementShowOnDashboard: existing.settlementShowOnDashboard ?? true,
+      settlementShowOnOrderHistory: existing.settlementShowOnOrderHistory ?? false,
       partialPaymentEnabled: existing.partialPaymentEnabled ?? false,
       compVoidEnabled: existing.compVoidEnabled ?? false,
       compVoidRequiresPin: existing.compVoidRequiresPin ?? true,
@@ -23622,6 +23654,8 @@ app.put('/api/restaurants/:restaurantId/billing-settings', authenticateToken, as
         ? settings.denominations.filter(d => typeof d === 'number' && d > 0).sort((a, b) => a - b)
         : [10, 20, 50, 100, 200, 500, 2000],
       splitPaymentEnabled: settings.splitPaymentEnabled ?? false,
+      settlementShowOnDashboard: settings.settlementShowOnDashboard ?? true,
+      settlementShowOnOrderHistory: settings.settlementShowOnOrderHistory ?? false,
       partialPaymentEnabled: settings.partialPaymentEnabled ?? false,
       compVoidEnabled: settings.compVoidEnabled ?? false,
       compVoidRequiresPin: settings.compVoidRequiresPin ?? true,
