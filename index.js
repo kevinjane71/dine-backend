@@ -7329,7 +7329,10 @@ app.post('/api/public/orders/:restaurantId', vercelSecurityMiddleware.publicAPI,
         .catch(err => console.error('Inventory Deduction Error:', err));
 
     // Trigger Pusher notification for real-time updates (public/online orders)
-    pusherService.notifyOrderCreated(restaurantId, {
+    // NOTE: awaited so it doesn't race with the KOT print trigger below — when
+    // fire-and-forget, one of two back-to-back pusher.trigger HTTPS calls can
+    // be aborted by the runtime after res.json(), breaking dashboard sync.
+    await pusherService.notifyOrderCreated(restaurantId, {
       id: orderRef.id,
       orderNumber: orderData.orderNumber,
       dailyOrderId: orderData.dailyOrderId,
@@ -7346,7 +7349,7 @@ app.post('/api/public/orders/:restaurantId', vercelSecurityMiddleware.publicAPI,
     // Trigger KOT print notification if Pusher printing is enabled
     const printSettings = restaurantData.printSettings || {};
     if (printSettings.kotPrinterEnabled !== false && printSettings.usePusherForKOT === true) {
-      pusherService.notifyKOTPrintRequest(restaurantId, {
+      await pusherService.notifyKOTPrintRequest(restaurantId, {
         id: orderRef.id,
         dailyOrderId: orderData.dailyOrderId,
         orderNumber: orderData.orderNumber,
@@ -8380,7 +8383,8 @@ app.post('/api/orders', async (req, res) => {
     }
 
     // Trigger Pusher notification for real-time updates
-    pusherService.notifyOrderCreated(restaurantId, {
+    // NOTE: awaited to prevent race with the KOT/Billing print triggers below.
+    await pusherService.notifyOrderCreated(restaurantId, {
       id: orderRef.id,
       orderNumber: orderNumber,
       dailyOrderId: dailyOrderId,
@@ -8398,7 +8402,7 @@ app.post('/api/orders', async (req, res) => {
     // Trigger KOT print notification if order is confirmed and Pusher printing is enabled
     const printSettings = restaurantData.printSettings || {};
     if (orderData.status === 'confirmed' && printSettings.kotPrinterEnabled !== false && printSettings.usePusherForKOT === true) {
-      pusherService.notifyKOTPrintRequest(restaurantId, {
+      await pusherService.notifyKOTPrintRequest(restaurantId, {
         id: orderRef.id,
         dailyOrderId: dailyOrderId,
         orderNumber: orderNumber,
@@ -8415,7 +8419,7 @@ app.post('/api/orders', async (req, res) => {
 
     // Trigger Billing print notification if order is created as completed directly (Complete Billing clicked)
     if (orderData.status === 'completed' && printSettings.kotPrinterEnabled !== false && printSettings.usePusherForKOT === true) {
-      pusherService.notifyBillingPrintRequest(restaurantId, {
+      await pusherService.notifyBillingPrintRequest(restaurantId, {
         id: orderRef.id,
         dailyOrderId: dailyOrderId,
         orderNumber: orderNumber,
@@ -9690,7 +9694,8 @@ app.patch('/api/orders/:orderId/status', authenticateToken, async (req, res) => 
     }
 
     // Trigger Pusher notification for real-time updates
-    pusherService.notifyOrderStatusUpdated(orderData.restaurantId, orderId, status, {
+    // NOTE: awaited to prevent race with KOT/Billing print triggers below.
+    await pusherService.notifyOrderStatusUpdated(orderData.restaurantId, orderId, status, {
       orderNumber: orderData.orderNumber,
       dailyOrderId: orderData.dailyOrderId,
       totalAmount: orderData.totalAmount,
@@ -9704,7 +9709,7 @@ app.patch('/api/orders/:orderId/status', authenticateToken, async (req, res) => 
       const printSettings = restaurantDoc.exists ? (restaurantDoc.data().printSettings || {}) : {};
 
       if (printSettings.kotPrinterEnabled !== false && printSettings.usePusherForKOT === true) {
-        pusherService.notifyKOTPrintRequest(orderData.restaurantId, {
+        await pusherService.notifyKOTPrintRequest(orderData.restaurantId, {
           id: orderId,
           dailyOrderId: orderData.dailyOrderId,
           orderNumber: orderData.orderNumber,
@@ -9732,7 +9737,7 @@ app.patch('/api/orders/:orderId/status', authenticateToken, async (req, res) => 
           billPrinted: false
         });
 
-        pusherService.notifyBillingPrintRequest(orderData.restaurantId, {
+        await pusherService.notifyBillingPrintRequest(orderData.restaurantId, {
           id: orderId,
           dailyOrderId: orderData.dailyOrderId,
           orderNumber: orderData.orderNumber,
@@ -10494,7 +10499,8 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
     }
 
     // Trigger Pusher notification for real-time updates
-    pusherService.notifyOrderUpdated(currentOrder.restaurantId, orderId, {
+    // NOTE: awaited to prevent race with KOT/Billing print triggers below.
+    await pusherService.notifyOrderUpdated(currentOrder.restaurantId, orderId, {
       status: status || currentOrder.status,
       orderNumber: currentOrder.orderNumber,
       dailyOrderId: currentOrder.dailyOrderId,
@@ -10520,7 +10526,7 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
 
         if (printSettings.kotPrinterEnabled !== false && printSettings.usePusherForKOT === true) {
           console.log('🖨️ Order items updated, triggering KOT reprint for order:', orderId);
-          pusherService.notifyKOTPrintRequest(currentOrder.restaurantId, {
+          await pusherService.notifyKOTPrintRequest(currentOrder.restaurantId, {
             id: orderId,
             dailyOrderId: currentOrder.dailyOrderId,
             orderNumber: currentOrder.orderNumber,
@@ -10586,7 +10592,7 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
           }
 
           console.log('🧾 Order completed, triggering billing print for order:', orderId);
-          pusherService.notifyBillingPrintRequest(currentOrder.restaurantId, {
+          await pusherService.notifyBillingPrintRequest(currentOrder.restaurantId, {
             id: orderId,
             dailyOrderId: currentOrder.dailyOrderId,
             orderNumber: currentOrder.orderNumber,
@@ -15165,6 +15171,303 @@ app.get('/api/kot/:restaurantId/:orderId', async (req, res) => {
   } catch (error) {
     console.error('Get KOT details error:', error);
     res.status(500).json({ error: 'Failed to fetch KOT details' });
+  }
+});
+
+// ============================================================================
+// UNIFIED BILL / KOT RENDER ENDPOINTS
+// ----------------------------------------------------------------------------
+// Single source of truth for "ready-to-print" bill & KOT payloads.
+// Consumed by: web (OrderSummary post-billing, orderhistory InvoiceModal),
+//              electron dine-kot-printer, android dine-kot-printer-android.
+// Guarantees visual + data parity across web preview and thermal print.
+// Public (scope-checked by restaurantId param) so printer kiosks can use it.
+// ============================================================================
+
+const DEFAULT_PRINT_SETTINGS = {
+  kotPrinterEnabled: true,
+  manualPrintEnabled: true,
+  showKOTSummaryAfterOrder: true,
+  showBillSummaryAfterBilling: true,
+  usePusherForKOT: false,
+  autoPrintOnKOT: true,
+  autoPrintOnBilling: false,
+  autoPrintOnOnlineOrder: false,
+  autoPrintOnTableCall: false,
+  printKOTCopy: 1,
+  printBillCopy: 1,
+  billFontSize: 'medium',
+  billFontScale: 100,
+  billFontFamily: 'default'
+};
+
+// Business-type aware labels — mirrors the web InvoiceModal map so server can
+// return the right wording once instead of every client duplicating it.
+const BUSINESS_TYPE_LABELS = {
+  restaurant: { title: 'TAX INVOICE',  billTo: 'Bill To',       itemCol: 'Item',    footer: 'Thank you for dining with us!' },
+  bar:        { title: 'BAR BILL',     billTo: 'Customer',      itemCol: 'Drink',   footer: 'Drink responsibly. Thank you!' },
+  bakery:     { title: 'BAKERY BILL',  billTo: 'Customer',      itemCol: 'Item',    footer: 'Thank you for your order!' },
+  ice_cream:  { title: 'RECEIPT',      billTo: 'Customer',      itemCol: 'Item',    footer: 'Have a sweet day!' },
+  cafe:       { title: 'CAFE RECEIPT', billTo: 'Customer',      itemCol: 'Item',    footer: 'Thank you! Visit again.' },
+  qsr:        { title: 'RECEIPT',      billTo: 'Customer',      itemCol: 'Item',    footer: 'Thank you! Visit again.' }
+};
+
+const KOT_LABELS = {
+  restaurant: { title: 'KITCHEN ORDER TICKET', footer: 'Please prepare ASAP' },
+  bar:        { title: 'BAR ORDER',            footer: 'Please prepare ASAP' },
+  bakery:     { title: 'BAKERY ORDER',         footer: 'Please prepare ASAP' },
+  ice_cream:  { title: 'ORDER TICKET',         footer: 'Please prepare ASAP' },
+  cafe:       { title: 'CAFE ORDER',           footer: 'Please prepare ASAP' },
+  qsr:        { title: 'ORDER TICKET',         footer: 'Please prepare ASAP' }
+};
+
+const toIsoOrNull = (v) => {
+  if (!v) return null;
+  if (v instanceof Date) return v.toISOString();
+  if (typeof v === 'string') return v;
+  if (typeof v?.toDate === 'function') return v.toDate().toISOString();
+  return null;
+};
+
+const formatIST = (iso) => {
+  const d = iso ? new Date(iso) : new Date();
+  const formattedTime = d.toLocaleTimeString('en-IN', {
+    hour: '2-digit', minute: '2-digit', hour12: true, timeZone: 'Asia/Kolkata'
+  });
+  const formattedDate = d.toLocaleDateString('en-IN', {
+    day: '2-digit', month: 'short', year: 'numeric', timeZone: 'Asia/Kolkata'
+  });
+  return { formattedDate, formattedTime };
+};
+
+const r2 = (n) => Math.round((Number(n) || 0) * 100) / 100;
+
+const buildRestaurantBlock = (restaurantId, data) => ({
+  id: restaurantId,
+  name: data.name || 'Restaurant',
+  legalBusinessName: data.legalBusinessName || '',
+  address: data.address || '',
+  city: data.city || '',
+  phone: data.phone || '',
+  email: data.email || '',
+  gstin: data.gstin || '',
+  fssai: data.fssai || '',
+  showGstOnInvoice: data.showGstOnInvoice === true,
+  businessType: data.businessType || 'restaurant',
+  cuisine: data.cuisine || '',
+  logo: data.logo || '',
+  tagline: data.tagline || '',
+  upiId: data.upiId || '',
+  currency: data.currency || 'INR',
+  currencySymbol: data.currencySymbol || (data.currency === 'USD' ? '$' : '₹')
+});
+
+// Build the full bill render payload from order + restaurant docs.
+// Returned shape is a SUPERSET of the legacy POST /api/invoice/generate
+// response — all `invoice.*` fields exist at the top level AND inside
+// `bill.*`, so existing web code that reads `invoice.restaurantName` etc.
+// continues to work when pointed at this endpoint.
+const assembleBillRenderPayload = (orderId, orderData, restaurantId, restaurantData) => {
+  const taxSettings = restaurantData.taxSettings || {
+    enabled: true,
+    taxes: [{ id: 'gst', name: 'GST', rate: 5, enabled: true, type: 'percentage' }],
+    defaultTaxRate: 5
+  };
+
+  const itemsSubtotal = (orderData.items || [])
+    .reduce((sum, it) => sum + ((it.price || 0) * (it.quantity || 1)), 0);
+  const subtotal = r2(orderData.subtotal || itemsSubtotal);
+
+  const discountAmount = r2(orderData.discountAmount);
+  const manualDiscount = r2(orderData.manualDiscount);
+  const loyaltyDiscount = r2(orderData.loyaltyDiscount);
+  const totalDiscount = r2(discountAmount + manualDiscount + loyaltyDiscount);
+
+  let totalTax = 0;
+  let taxBreakdown = [];
+  if (Array.isArray(orderData.taxBreakdown) && orderData.taxBreakdown.length > 0) {
+    taxBreakdown = orderData.taxBreakdown;
+    totalTax = r2(orderData.taxAmount || taxBreakdown.reduce((s, t) => s + (t.amount || 0), 0));
+  } else if (taxSettings.enabled) {
+    const taxable = Math.max(0, subtotal - totalDiscount);
+    for (const tax of (taxSettings.taxes || [])) {
+      if (tax.enabled) {
+        const amt = (taxable * (tax.rate || 0)) / 100;
+        taxBreakdown.push({ id: tax.id, name: tax.name, rate: tax.rate, amount: r2(amt) });
+        totalTax += amt;
+      }
+    }
+    totalTax = r2(totalTax);
+  }
+
+  const serviceChargeAmount = orderData.serviceChargeAmount ? r2(orderData.serviceChargeAmount) : null;
+  const tipAmount           = orderData.tipAmount ? r2(orderData.tipAmount) : null;
+  const roundOffAmount      = orderData.roundOffAmount != null ? r2(orderData.roundOffAmount) : null;
+
+  const grandTotal = r2(
+    orderData.finalAmount ||
+    (subtotal - totalDiscount + totalTax + (serviceChargeAmount || 0) + (tipAmount || 0) + (roundOffAmount || 0))
+  );
+
+  const createdAtIso   = toIsoOrNull(orderData.createdAt);
+  const completedAtIso = toIsoOrNull(orderData.completedAt);
+  const { formattedDate, formattedTime } = formatIST(completedAtIso || createdAtIso);
+
+  const printSettings = { ...DEFAULT_PRINT_SETTINGS, ...(restaurantData.printSettings || {}) };
+  const businessType = restaurantData.businessType || 'restaurant';
+  const labels = BUSINESS_TYPE_LABELS[businessType] || BUSINESS_TYPE_LABELS.restaurant;
+
+  const restaurant = buildRestaurantBlock(restaurantId, restaurantData);
+
+  // Legacy-compatible flat invoice fields (used by existing web OrderSummary)
+  const flat = {
+    id: orderData.invoiceId || null,
+    orderId,
+    dailyOrderId: orderData.dailyOrderId || null,
+    orderNumber: orderData.orderNumber || null,
+    restaurantId,
+    restaurantName: restaurant.name,
+    restaurantAddress: restaurant.address,
+    restaurantPhone: restaurant.phone,
+    restaurantEmail: restaurant.email,
+    customerName: orderData.customerInfo?.name || orderData.customerName || 'Walk-in Customer',
+    customerPhone: orderData.customerInfo?.phone || orderData.customerMobile || '',
+    customerEmail: orderData.customerInfo?.email || '',
+    tableNumber: orderData.tableNumber || '',
+    roomNumber: orderData.roomNumber || '',
+    orderType: orderData.orderType || 'dine-in',
+    items: orderData.items || [],
+    subtotal,
+    discountAmount,
+    manualDiscount,
+    loyaltyDiscount,
+    totalDiscount,
+    appliedOffer: orderData.appliedOffer || null,
+    appliedOffers: orderData.appliedOffers || null,
+    taxBreakdown,
+    totalTax,
+    taxAmount: totalTax,
+    grandTotal,
+    finalAmount: grandTotal,
+    totalAmount: r2(orderData.totalAmount || (subtotal - totalDiscount)),
+    paymentMethod: orderData.paymentMethod || 'cash',
+    serviceChargeRate: orderData.serviceChargeRate || null,
+    serviceChargeAmount,
+    tipAmount,
+    tipPercentage: orderData.tipPercentage || null,
+    roundOffAmount,
+    splitPayments: orderData.splitPayments || null,
+    cashReceived: orderData.cashReceived ? r2(orderData.cashReceived) : null,
+    changeReturned: orderData.changeReturned ? r2(orderData.changeReturned) : null,
+    paidAmount: orderData.paidAmount ? r2(orderData.paidAmount) : null,
+    outstandingAmount: orderData.outstandingAmount ? r2(orderData.outstandingAmount) : null,
+    notes: orderData.notes || '',
+    specialInstructions: orderData.specialInstructions || '',
+    staffInfo: orderData.staffInfo || null,
+    status: orderData.status || null,
+    createdAt: createdAtIso,
+    completedAt: completedAtIso,
+    invoiceDate: completedAtIso || createdAtIso,
+    generatedAt: new Date().toISOString(),
+    formattedDate,
+    formattedTime
+  };
+
+  return {
+    success: true,
+    restaurant,
+    printSettings,
+    labels,
+    bill: flat,
+    // Legacy compatibility: also expose at top level so existing web code
+    // treating the response as `invoice` continues to work unchanged.
+    invoice: flat
+  };
+};
+
+// GET /api/bill/render/:restaurantId/:orderId
+// Public, scope-checked. Returns unified ready-to-print bill payload.
+// Used by web bill summary, electron + android thermal printers.
+app.get('/api/bill/render/:restaurantId/:orderId', async (req, res) => {
+  try {
+    const { restaurantId, orderId } = req.params;
+
+    const [orderDoc, restaurantDoc] = await Promise.all([
+      db.collection(collections.orders).doc(orderId).get(),
+      db.collection(collections.restaurants).doc(restaurantId).get()
+    ]);
+
+    if (!orderDoc.exists) return res.status(404).json({ error: 'Order not found' });
+    if (!restaurantDoc.exists) return res.status(404).json({ error: 'Restaurant not found' });
+
+    const orderData = orderDoc.data();
+    if (orderData.restaurantId !== restaurantId) {
+      return res.status(403).json({ error: 'Access denied to this order' });
+    }
+
+    const payload = assembleBillRenderPayload(orderDoc.id, orderData, restaurantId, restaurantDoc.data());
+    res.json(payload);
+  } catch (error) {
+    console.error('Bill render error:', error);
+    res.status(500).json({ error: 'Failed to render bill' });
+  }
+});
+
+// GET /api/kot/render/:restaurantId/:orderId
+// Public, scope-checked. Returns unified ready-to-print KOT payload.
+app.get('/api/kot/render/:restaurantId/:orderId', async (req, res) => {
+  try {
+    const { restaurantId, orderId } = req.params;
+
+    const [orderDoc, restaurantDoc] = await Promise.all([
+      db.collection(collections.orders).doc(orderId).get(),
+      db.collection(collections.restaurants).doc(restaurantId).get()
+    ]);
+
+    if (!orderDoc.exists) return res.status(404).json({ error: 'Order not found' });
+    if (!restaurantDoc.exists) return res.status(404).json({ error: 'Restaurant not found' });
+
+    const orderData = orderDoc.data();
+    if (orderData.restaurantId !== restaurantId) {
+      return res.status(403).json({ error: 'Access denied to this order' });
+    }
+
+    const restaurantData = restaurantDoc.data();
+    const createdAtIso = toIsoOrNull(orderData.createdAt);
+    const { formattedDate, formattedTime } = formatIST(createdAtIso);
+    const printSettings = { ...DEFAULT_PRINT_SETTINGS, ...(restaurantData.printSettings || {}) };
+    const businessType = restaurantData.businessType || 'restaurant';
+    const labels = KOT_LABELS[businessType] || KOT_LABELS.restaurant;
+    const restaurant = buildRestaurantBlock(restaurantId, restaurantData);
+    const kotId = `KOT-${orderDoc.id.slice(-6).toUpperCase()}`;
+
+    res.json({
+      success: true,
+      restaurant,
+      printSettings,
+      labels,
+      kot: {
+        id: orderDoc.id,
+        orderId: orderDoc.id,
+        kotId,
+        dailyOrderId: orderData.dailyOrderId || null,
+        orderNumber: orderData.orderNumber || null,
+        tableNumber: orderData.tableNumber || '',
+        roomNumber: orderData.roomNumber || '',
+        orderType: orderData.orderType || 'dine-in',
+        items: orderData.items || [],
+        notes: orderData.notes || '',
+        specialInstructions: orderData.specialInstructions || '',
+        staffInfo: orderData.staffInfo || null,
+        createdAt: createdAtIso,
+        formattedDate,
+        formattedTime,
+        isReprint: orderData.kotPrinted === true
+      }
+    });
+  } catch (error) {
+    console.error('KOT render error:', error);
+    res.status(500).json({ error: 'Failed to render KOT' });
   }
 });
 
