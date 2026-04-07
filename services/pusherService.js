@@ -1,4 +1,5 @@
 const Pusher = require('pusher');
+const fcmService = require('./fcmService');
 
 // Initialize Pusher with environment variables
 const pusher = new Pusher({
@@ -98,6 +99,10 @@ const notifyKOTPrintRequest = async (restaurantId, orderData) => {
     itemsCount: orderData.items?.length || 0,
     createdAt: orderData.createdAt || new Date().toISOString()
   });
+  // Fire-and-forget FCM fan-out. Never blocks or throws — failures are
+  // logged inside fcmService. Printer clients in 'fcm' mode receive this.
+  fcmService.sendKOTPrintNotification(restaurantId, orderData)
+    .catch(err => console.error('FCM KOT notify failed:', err.message));
 };
 
 /**
@@ -122,6 +127,9 @@ const notifyBillingPrintRequest = async (restaurantId, orderData) => {
     createdAt: orderData.createdAt || new Date().toISOString(),
     completedAt: completedAt instanceof Date ? completedAt.toISOString() : completedAt
   });
+  // Fire-and-forget FCM fan-out for billing print.
+  fcmService.sendBillingPrintNotification(restaurantId, orderData)
+    .catch(err => console.error('FCM Bill notify failed:', err.message));
 };
 
 module.exports = {

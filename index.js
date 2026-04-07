@@ -6847,9 +6847,9 @@ app.post('/api/public/orders/:restaurantId', vercelSecurityMiddleware.publicAPI,
 
     // Helper function to normalize phone number
     const normalizePhone = (phone) => {
-      if (!phone) return null;
-      // Remove all non-digit characters
-      const digits = phone.replace(/\D/g, '');
+      if (phone === null || phone === undefined || phone === '') return null;
+      // Coerce to string (clients sometimes send numbers)
+      const digits = String(phone).replace(/\D/g, '');
 
       // Handle Indian phone numbers
       if (digits.length === 12 && digits.startsWith('91')) {
@@ -8117,8 +8117,8 @@ app.post('/api/orders', async (req, res) => {
       try {
         // Helper to normalize phone
         const normalizePhone = (p) => {
-          if (!p) return null;
-          const d = p.replace(/\D/g, '');
+          if (p === null || p === undefined || p === '') return null;
+          const d = String(p).replace(/\D/g, '');
           if (d.length === 12 && d.startsWith('91')) return d.substring(2);
           if (d.length === 11 && d.startsWith('0')) return d.substring(1);
           if (d.length === 10) return d;
@@ -9548,8 +9548,8 @@ app.patch('/api/orders/:orderId/status', authenticateToken, async (req, res) => 
           };
           // Normalize phone helper
           const normPhone = (p) => {
-            if (!p) return null;
-            const d = p.replace(/\D/g, '');
+            if (p === null || p === undefined || p === '') return null;
+            const d = String(p).replace(/\D/g, '');
             if (d.length === 12 && d.startsWith('91')) return d.substring(2);
             if (d.length === 11 && d.startsWith('0')) return d.substring(1);
             return d.length === 10 ? d : d;
@@ -15555,6 +15555,42 @@ app.patch('/api/orders/:orderId/cancel', authenticateToken, async (req, res) => 
   } catch (error) {
     console.error('Cancel order error:', error);
     res.status(500).json({ error: 'Failed to cancel order' });
+  }
+});
+
+// ========================================
+// FCM (Firebase Cloud Messaging) — Printer device token registration
+// ========================================
+// These endpoints let printer clients (Android/Electron) register their FCM
+// token so the server can fan out KOT/Bill print events as data messages
+// alongside (or instead of) Pusher. See services/fcmService.js for details.
+const fcmService = require('./services/fcmService');
+
+app.post('/api/printer/register-fcm-token', async (req, res) => {
+  try {
+    const { restaurantId, deviceId, token, deviceType, deviceName } = req.body || {};
+    if (!restaurantId || !deviceId || !token) {
+      return res.status(400).json({ success: false, error: 'restaurantId, deviceId and token are required' });
+    }
+    await fcmService.registerToken({ restaurantId, deviceId, token, deviceType, deviceName });
+    res.json({ success: true });
+  } catch (error) {
+    console.error('FCM register error:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.post('/api/printer/unregister-fcm-token', async (req, res) => {
+  try {
+    const { restaurantId, deviceId } = req.body || {};
+    if (!restaurantId || !deviceId) {
+      return res.status(400).json({ success: false, error: 'restaurantId and deviceId are required' });
+    }
+    await fcmService.unregisterToken({ restaurantId, deviceId });
+    res.json({ success: true });
+  } catch (error) {
+    console.error('FCM unregister error:', error);
+    res.status(500).json({ success: false, error: error.message });
   }
 });
 
@@ -22242,10 +22278,10 @@ app.post('/api/customers', authenticateToken, async (req, res) => {
 
     // Helper function to normalize phone number
     const normalizePhone = (phone) => {
-      if (!phone) return null;
-      // Remove all non-digit characters
-      const digits = phone.replace(/\D/g, '');
-      
+      if (phone === null || phone === undefined || phone === '') return null;
+      // Coerce to string (clients sometimes send numbers)
+      const digits = String(phone).replace(/\D/g, '');
+
       // Handle Indian phone numbers
       if (digits.length === 12 && digits.startsWith('91')) {
         // Remove country code for Indian numbers
@@ -22680,8 +22716,8 @@ app.post('/api/public/customer/lookup', vercelSecurityMiddleware.publicAPI, asyn
 
     // Helper function to normalize phone number (country-aware)
     const normalizePhone = (phoneNum) => {
-      if (!phoneNum) return null;
-      const digits = phoneNum.replace(/\D/g, '');
+      if (phoneNum === null || phoneNum === undefined || phoneNum === '') return null;
+      const digits = String(phoneNum).replace(/\D/g, '');
       // Strip country dial code if present
       if (digits.startsWith(dialCode) && digits.length === dialCode.length + localPhoneLength) {
         return digits.substring(dialCode.length);
@@ -22776,8 +22812,8 @@ app.post('/api/crave-app/auth/firebase/verify', vercelSecurityMiddleware.publicA
 
     // Normalize phone number
     const normalizePhone = (phoneNum) => {
-      if (!phoneNum) return null;
-      const digits = phoneNum.replace(/\D/g, '');
+      if (phoneNum === null || phoneNum === undefined || phoneNum === '') return null;
+      const digits = String(phoneNum).replace(/\D/g, '');
       if (digits.length === 12 && digits.startsWith('91')) {
         return digits.substring(2);
       } else if (digits.length === 10) {
