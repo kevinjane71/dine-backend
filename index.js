@@ -78,17 +78,20 @@ const upload = lazyInit(() => {
 const bucket = lazyInit(() => {
   const { Storage } = require('@google-cloud/storage');
   let storage;
-  if (process.env.NODE_ENV === 'production') {
-    try {
-      const credentialsJson = process.env.GOOGLE_APPLICATION_CREDENTIALS_JSON;
-      if (!credentialsJson || credentialsJson === 'undefined') {
-        storage = new Storage();
-      } else {
-        const serviceAccount = JSON.parse(credentialsJson);
-        storage = new Storage({ projectId: serviceAccount.project_id, credentials: { client_email: serviceAccount.client_email, private_key: serviceAccount.private_key } });
-      }
-    } catch (e) { storage = new Storage(); }
-  } else {
+  try {
+    const credentialsJson = process.env.GOOGLE_APPLICATION_CREDENTIALS_JSON;
+    if (credentialsJson && credentialsJson !== 'undefined') {
+      const serviceAccount = JSON.parse(credentialsJson);
+      storage = new Storage({
+        projectId: serviceAccount.project_id,
+        credentials: { client_email: serviceAccount.client_email, private_key: serviceAccount.private_key }
+      });
+    } else {
+      // Fall back to ADC (works in production via GOOGLE_APPLICATION_CREDENTIALS file)
+      storage = new Storage();
+    }
+  } catch (e) {
+    console.error('⚠️ Failed to init Storage with JSON creds, falling back to ADC:', e.message);
     storage = new Storage();
   }
   return storage.bucket(process.env.FIREBASE_STORAGE_BUCKET || 'dine-menu-uploads');
@@ -1859,30 +1862,94 @@ const extractMenuFromAnyFile = async (fileUrl, fileType, fileName, businessType 
 };
 
 // Extract menu from PDF files. Returns { categories, menuItems }. Prefer section headers from document as categories.
-const extractMenuFromPDF = async (pdfUrl, businessType = 'restaurant') => {
+const MENU_PDF_PROMPT = `Analyze this document. If it is a restaurant menu: 1) List section headers in "categories" as [{"name":"SectionName","order":1}]. Use EXACT names. If no sections, use "categories":[].
+2) Extract ALL menu items. Set "category" to section name or "Other".
+3) VARIANTS: If item shows multiple sizes/prices (e.g., "Half ₹110/Full ₹180", "110/180"), extract as "variants":[{"name":"Half","price":110},{"name":"Full","price":180}]. Otherwise use "variants":[].
+For each item also add "imageKeyword": a specific hyphen-separated keyword (1-3 words) that uniquely identifies this dish. Make each keyword DIFFERENT from similar items: "egg-thali" not "thali", "chicken-biryani" not "biryani", "masala-dosa" not "dosa", "chocolate-icecream" not "icecream", "chicken-burger" not "burger". Use the protein/variant as prefix (e.g. "mutton-thali", "veg-fried-rice", "strawberry-shake", "cheese-naan").
+Return JSON: {"categories":[...],"menuItems":[{"name":"","description":"","price":0,"category":"...","isVeg":true,"shortCode":"1","variants":[],"imageKeyword":""}]}
+shortCode: 1,2,3... If NOT a menu: {"categories":[],"menuItems":[]}`;
+
+// Primary path: upload PDF to OpenAI Files API and reference via file_id.
+// gpt-4o reads both text + visual layout/images of each page natively.
+const extractMenuFromPDFViaFilesAPI = async (buffer, fileName) => {
+  console.log('📤 Uploading PDF to OpenAI Files API...');
+  const { toFile } = require('openai');
+  const uploaded = await openai.files.create({
+    file: await toFile(buffer, fileName || 'menu.pdf', { type: 'application/pdf' }),
+    purpose: 'user_data'
+  });
+  console.log(`✅ Uploaded as ${uploaded.id}`);
+
   try {
-    console.log('📄 Extracting menu from PDF...');
     const response = await openai.chat.completions.create({
       model: "gpt-4o",
       messages: [
         {
           role: "user",
           content: [
-            {
-              type: "text",
-              text: `Analyze this document. If it is a restaurant menu: 1) List section headers in "categories" as [{"name":"SectionName","order":1}]. Use EXACT names. If no sections, use "categories":[].
-2) Extract ALL menu items. Set "category" to section name or "Other".
-3) VARIANTS: If item shows multiple sizes/prices (e.g., "Half ₹110/Full ₹180", "110/180"), extract as "variants":[{"name":"Half","price":110},{"name":"Full","price":180}]. Otherwise use "variants":[].
-For each item also add "imageKeyword": a specific hyphen-separated keyword (1-3 words) that uniquely identifies this dish. Make each keyword DIFFERENT from similar items: "egg-thali" not "thali", "chicken-biryani" not "biryani", "masala-dosa" not "dosa", "chocolate-icecream" not "icecream", "chicken-burger" not "burger". Use the protein/variant as prefix (e.g. "mutton-thali", "veg-fried-rice", "strawberry-shake", "cheese-naan").
-Return JSON: {"categories":[...],"menuItems":[{"name":"","description":"","price":0,"category":"...","isVeg":true,"shortCode":"1","variants":[],"imageKeyword":""}]}
-shortCode: 1,2,3... If NOT a menu: {"categories":[],"menuItems":[]}`
-            },
-            { type: "image_url", image_url: { url: pdfUrl, detail: "high" } }
+            { type: "file", file: { file_id: uploaded.id } },
+            { type: "text", text: MENU_PDF_PROMPT }
           ]
         }
       ],
       max_tokens: 8000,
-      temperature: 0.1
+      temperature: 0.1,
+      response_format: { type: "json_object" }
+    });
+    const content = response.choices[0].message.content;
+    const jsonMatch = content.match(/\{[\s\S]*\}/);
+    if (jsonMatch) {
+      const d = JSON.parse(jsonMatch[0]);
+      return { categories: Array.isArray(d.categories) ? d.categories : [], menuItems: Array.isArray(d.menuItems) ? d.menuItems : [] };
+    }
+    return { categories: [], menuItems: [] };
+  } finally {
+    // Clean up uploaded file
+    openai.files.del(uploaded.id).catch(err => console.warn('Failed to delete OpenAI file:', err.message));
+  }
+};
+
+const extractMenuFromPDF = async (pdfUrl, businessType = 'restaurant') => {
+  console.log('📄 Extracting menu from PDF...');
+  console.log('📥 Downloading PDF...');
+  const buffer = await downloadFileBuffer(pdfUrl);
+  const fileName = pdfUrl.split('/').pop().split('?')[0] || 'menu.pdf';
+
+  // Try 1: OpenAI native PDF (Files API + gpt-4o) — best, reads visual layout + text
+  try {
+    const result = await extractMenuFromPDFViaFilesAPI(buffer, fileName);
+    if (result.menuItems.length > 0) {
+      console.log(`✅ Files API path extracted ${result.menuItems.length} items`);
+      return result;
+    }
+    console.log('⚠️ Files API returned 0 items, trying text fallback...');
+  } catch (err) {
+    console.warn('⚠️ Files API path failed, falling back to pdf-parse:', err.message);
+  }
+
+  // Try 2: Fallback — pdf-parse text extraction + GPT-4o
+  try {
+    const pdfParse = require('pdf-parse');
+    const parsed = await pdfParse(buffer);
+    const textContent = (parsed.text || '').trim();
+    console.log(`📄 Parsed PDF to text (${textContent.length} chars, ${parsed.numpages} pages)`);
+
+    if (!textContent) {
+      console.log('⚠️ PDF has no extractable text (scanned/image-only PDF).');
+      return { categories: [], menuItems: [] };
+    }
+
+    const response = await openai.chat.completions.create({
+      model: "gpt-4o",
+      messages: [
+        {
+          role: "user",
+          content: `${MENU_PDF_PROMPT}\n\nPDF TEXT:\n"""\n${textContent.slice(0, 60000)}\n"""`
+        }
+      ],
+      max_tokens: 8000,
+      temperature: 0.1,
+      response_format: { type: "json_object" }
     });
     const content = response.choices[0].message.content;
     const jsonMatch = content.match(/\{[\s\S]*\}/);
