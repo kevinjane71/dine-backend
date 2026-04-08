@@ -103,6 +103,7 @@ const performanceOptimizer = require('./middleware/performanceOptimizer');
 const firestoreOptimizer = require('./utils/firestoreOptimizer');
 const { kvGet, kvSet, kvDel, getCachedRestaurant, invalidateRestaurantCache, invalidateUserCache } = require('./utils/kvCache');
 const inventoryService = require('./services/inventoryService');
+const offerEngine = require('./services/offerEngine');
 const pusherService = require('./services/pusherService');
 
 // Pre-compute daily analytics stats on every order write (fire-and-forget)
@@ -754,6 +755,7 @@ const currencyRoutes = require('./routes/currencyRoutes');
 
 // Owner chain dashboard routes
 const ownerDashboardRoutes = require('./routes/ownerDashboard');
+const customerGroupsRoutes = require('./routes/customerGroups');
 const aiInsightsRoutes = require('./routes/aiInsights');
 const superAdminRoutes = require('./routes/superAdmin');
 const publicToolsRoutes = require('./routes/publicTools');
@@ -7081,71 +7083,75 @@ app.post('/api/public/orders/:restaurantId', vercelSecurityMiddleware.publicAPI,
       ? allOfferIds.slice(0, maxOffersAllowed)
       : allOfferIds.slice(0, 1);
 
+    // Build offer engine context: look up customer groups (for audience matching)
+    let offerContextGroupIds = [];
+    try {
+      if (customerData && customerPhone) {
+        const groupsSnap = await db.collection('customerGroups')
+          .where('restaurantId', '==', restaurantId)
+          .get();
+        const normPhoneForCtx = offerEngine.normalizePhone(customerPhone);
+        const cid = customerData?.id || null;
+        groupsSnap.forEach(doc => {
+          const data = doc.data() || {};
+          const members = data.customerIds || data.members || [];
+          const memberPhones = (data.customerPhones || []).map(offerEngine.normalizePhone).filter(Boolean);
+          if ((cid && members.includes(cid)) || (normPhoneForCtx && memberPhones.includes(normPhoneForCtx))) {
+            offerContextGroupIds.push(doc.id);
+          }
+        });
+      }
+    } catch (ctxErr) {
+      console.error('[offerEngine] order-create: customerGroups lookup failed', ctxErr);
+    }
+
+    const offerContext = {
+      customerId: customerData?.id || null,
+      customerPhone,
+      customerGroupIds: offerContextGroupIds,
+      isFirstOrder,
+    };
+    const offerCustomerKey = offerEngine.buildCustomerKey(offerContext.customerId, customerPhone);
+
     for (const currentOfferId of limitedOfferIds) {
       const offerDoc = await db.collection('offers').doc(currentOfferId).get();
 
       if (offerDoc.exists) {
-        const offer = offerDoc.data();
+        const offer = { id: offerDoc.id, ...offerDoc.data() };
         const now = new Date();
 
-        // Validate offer
+        // Legacy validity checks (preserved for back-compat)
         const validFrom = offer.validFrom ? new Date(offer.validFrom) : null;
         const validUntil = offer.validUntil ? new Date(offer.validUntil) : null;
         const isValidDate = (!validFrom || now >= validFrom) && (!validUntil || now <= validUntil);
         const isUnderUsageLimit = !offer.usageLimit || (offer.usageCount || 0) < offer.usageLimit;
         const meetsMinOrder = subtotal >= (offer.minOrderValue || 0);
-        const isValidFirstOrder = !offer.isFirstOrderOnly || isFirstOrder;
+        const isValidSchedule = offerEngine.isScheduleValid(offer, now);
+        const audienceOk = offerEngine.matchesAudience(offer, offerContext);
 
-        // Check schedule (happy hour / time-based)
-        let isValidSchedule = true;
-        if (offer.schedule && offer.schedule.type === 'recurring') {
-          const currentDay = now.getDay(); // 0=Sunday
-          const currentTime = `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`;
-          const scheduleDays = offer.schedule.days || [];
-          const startTime = offer.schedule.startTime || '00:00';
-          const endTime = offer.schedule.endTime || '23:59';
-          isValidSchedule = scheduleDays.includes(currentDay) && currentTime >= startTime && currentTime <= endTime;
+        // Per-customer usage cap
+        let perCustomerOk = true;
+        if (offer.usageLimitPerCustomer && offerCustomerKey) {
+          const usageMap = await offerEngine.getCustomerUsageMap(db, [currentOfferId], offerCustomerKey);
+          if ((usageMap[currentOfferId] || 0) >= Number(offer.usageLimitPerCustomer)) {
+            perCustomerOk = false;
+          }
         }
 
-        if (offer.isActive && offer.restaurantId === restaurantId && isValidDate && isUnderUsageLimit && meetsMinOrder && isValidFirstOrder && isValidSchedule) {
-          // Calculate discount based on scope
-          let offerDiscount = 0;
+        if (offer.isActive && offer.restaurantId === restaurantId && isValidDate && isUnderUsageLimit && meetsMinOrder && isValidSchedule && audienceOk && perCustomerOk) {
+          // Delegate discount calc to the centralized engine
+          const cartForEngine = (orderItems || []).map(oi => ({
+            id: oi.menuItemId,
+            menuItemId: oi.menuItemId,
+            name: oi.name,
+            price: oi.price,
+            quantity: oi.quantity,
+            category: oi.category,
+            total: oi.total,
+          }));
+          const result = offerEngine.calculateDiscountForOffer(offer, subtotal, cartForEngine, offerContext);
+          const offerDiscount = result.discount || 0;
           const offerScope = offer.scope || 'order';
-
-          // Determine applicable subtotal based on scope
-          let applicableSubtotal = subtotal;
-          if (offerScope === 'category' && Array.isArray(offer.targetCategories) && offer.targetCategories.length > 0) {
-            applicableSubtotal = (orderItems || [])
-              .filter(oi => offer.targetCategories.includes(oi.category))
-              .reduce((sum, oi) => sum + (oi.total || oi.price * oi.quantity), 0);
-          } else if (offerScope === 'item' && Array.isArray(offer.targetItems) && offer.targetItems.length > 0) {
-            applicableSubtotal = (orderItems || [])
-              .filter(oi => offer.targetItems.includes(oi.menuItemId))
-              .reduce((sum, oi) => sum + (oi.total || oi.price * oi.quantity), 0);
-          }
-
-          if (offer.promotionType === 'bogo' && offer.bogoConfig) {
-            // BOGO: calculate free items
-            const bogoItems = offerScope === 'item' && offer.targetItems?.length > 0
-              ? (orderItems || []).filter(oi => offer.targetItems.includes(oi.menuItemId))
-              : (orderItems || []);
-            const totalQty = bogoItems.reduce((sum, oi) => sum + oi.quantity, 0);
-            const buyQty = offer.bogoConfig.buyQty || 2;
-            const getQty = offer.bogoConfig.getQty || 1;
-            const getDiscount = offer.bogoConfig.getDiscount || 100;
-            const sets = Math.floor(totalQty / (buyQty + getQty));
-            if (sets > 0 && bogoItems.length > 0) {
-              const cheapestPrice = Math.min(...bogoItems.map(oi => oi.price));
-              offerDiscount = sets * getQty * cheapestPrice * (getDiscount / 100);
-            }
-          } else if (offer.discountType === 'percentage') {
-            offerDiscount = (applicableSubtotal * offer.discountValue) / 100;
-            if (offer.maxDiscount && offerDiscount > offer.maxDiscount) {
-              offerDiscount = offer.maxDiscount;
-            }
-          } else {
-            offerDiscount = Math.min(offer.discountValue, applicableSubtotal);
-          }
 
           const appliedOfferData = {
             id: currentOfferId,
@@ -7154,7 +7160,9 @@ app.post('/api/public/orders/:restaurantId', vercelSecurityMiddleware.publicAPI,
             discountValue: offer.discountValue,
             discountApplied: offerDiscount,
             scope: offerScope,
-            promotionType: offer.promotionType || 'discount'
+            promotionType: offer.promotionType || 'discount',
+            freeItems: result.freeItems || [],
+            appliedTier: result.appliedTier || null,
           };
 
           appliedOffers.push(appliedOfferData);
@@ -7162,7 +7170,10 @@ app.post('/api/public/orders/:restaurantId', vercelSecurityMiddleware.publicAPI,
 
           console.log(`🎁 Offer applied: ${offer.name}, Discount: ₹${offerDiscount}, Scope: ${offerScope}`);
         } else {
-          console.log(`⚠️ Offer ${currentOfferId} not valid for this order (schedule: ${isValidSchedule})`);
+          if (!perCustomerOk) {
+            return res.status(400).json({ success: false, error: 'Offer usage limit reached' });
+          }
+          console.log(`⚠️ Offer ${currentOfferId} not valid for this order (schedule: ${isValidSchedule}, audience: ${audienceOk})`);
         }
       }
     }
@@ -7384,6 +7395,20 @@ app.post('/api/public/orders/:restaurantId', vercelSecurityMiddleware.publicAPI,
     }
 
     console.log(`🛒 Customer order created successfully: ${orderRef.id}`);
+
+    // Best-effort per-customer offer usage increment (Phase 2)
+    try {
+      if (offerCustomerKey && appliedOffers.length > 0) {
+        for (const ao of appliedOffers) {
+          if (ao && ao.id) {
+            offerEngine.incrementUsage(db, ao.id, offerCustomerKey).catch(() => {});
+          }
+        }
+      }
+    } catch (usageErr) {
+      console.error('[offerEngine] per-customer usage increment failed:', usageErr);
+    }
+
     console.log(`📋 Order items: ${orderData.items.length} items`);
     console.log(`🏪 Restaurant: ${orderData.restaurantId}`);
     console.log(`👤 Customer: ${customerPhone}`);
@@ -14017,6 +14042,7 @@ app.use('/api', currencyRoutes);
 // ==================== OWNER CHAIN DASHBOARD ====================
 // Owner dashboard routes for multi-restaurant management
 app.use('/api/owner', ownerDashboardRoutes);
+app.use('/api/customer-groups', customerGroupsRoutes);
 
 // ==================== AI INSIGHTS & DAILY REPORTS ====================
 // AI-powered analytics and automated email reports
@@ -22749,10 +22775,127 @@ app.get('/api/offers/:restaurantId', authenticateToken, async (req, res) => {
       });
     });
 
+    // Optional eligibility enrichment when customerId/phone passed
+    try {
+      const { customerId, phone } = req.query || {};
+      if (customerId || phone) {
+        let customerGroupIds = [];
+        try {
+          const groupsSnap = await db.collection('customerGroups')
+            .where('restaurantId', '==', restaurantId)
+            .get();
+          groupsSnap.forEach(doc => {
+            const data = doc.data() || {};
+            const members = data.customerIds || data.members || [];
+            const memberPhones = (data.customerPhones || []).map(offerEngine.normalizePhone).filter(Boolean);
+            const normPhone = offerEngine.normalizePhone(phone);
+            if ((customerId && members.includes(customerId)) || (normPhone && memberPhones.includes(normPhone))) {
+              customerGroupIds.push(doc.id);
+            }
+          });
+        } catch (e) {
+          // Best-effort only
+        }
+        const context = { customerId, customerPhone: phone, customerGroupIds, isFirstOrder: false };
+        offers.forEach(o => {
+          const audienceOk = offerEngine.matchesAudience(o, context);
+          o._eligible = audienceOk;
+          if (!audienceOk) {
+            const t = (o.audience && o.audience.type) || (o.isFirstOrderOnly ? 'first_order' : 'all');
+            o._eligibilityReason = t === 'first_order' ? 'First-order customers only'
+              : t === 'groups' ? 'Not in a qualifying customer group'
+              : t === 'customers' ? 'Not on the eligible customer list'
+              : 'Not eligible';
+          }
+        });
+      }
+    } catch (enrichErr) {
+      console.error('[offerEngine] eligibility enrichment failed:', enrichErr);
+    }
+
     res.json({ offers });
   } catch (error) {
     console.error('Get offers error:', error);
     res.status(500).json({ error: 'Failed to fetch offers' });
+  }
+});
+
+// Preview applicable offers and best offer for a given cart/customer (Phase 2)
+app.post('/api/offers/preview', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId, cart = [], subtotal = 0, customerId, customerPhone, isFirstOrder } = req.body || {};
+    if (!restaurantId) {
+      return res.status(400).json({ success: false, error: 'restaurantId required' });
+    }
+
+    // Load active offers for restaurant
+    const snap = await db.collection('offers')
+      .where('restaurantId', '==', restaurantId)
+      .where('isActive', '==', true)
+      .get();
+    const offers = [];
+    snap.forEach(doc => offers.push({ id: doc.id, ...doc.data() }));
+
+    // Build customer context: fetch customer groups
+    let customerGroupIds = [];
+    if (customerId || customerPhone) {
+      try {
+        const groupsSnap = await db.collection('customerGroups')
+          .where('restaurantId', '==', restaurantId)
+          .get();
+        const normPhone = offerEngine.normalizePhone(customerPhone);
+        groupsSnap.forEach(doc => {
+          const data = doc.data() || {};
+          const members = data.customerIds || data.members || [];
+          const memberPhones = (data.customerPhones || []).map(offerEngine.normalizePhone).filter(Boolean);
+          if ((customerId && members.includes(customerId)) || (normPhone && memberPhones.includes(normPhone))) {
+            customerGroupIds.push(doc.id);
+          }
+        });
+      } catch (e) {
+        console.error('[offerEngine] preview: customerGroups lookup failed', e);
+      }
+    }
+
+    const context = { customerId, customerPhone, customerGroupIds, isFirstOrder: !!isFirstOrder };
+    const now = new Date();
+
+    let applicable = offerEngine.filterApplicableOffers(offers, { subtotal, cart, context, now });
+
+    // Per-customer usage enforcement
+    const customerKey = offerEngine.buildCustomerKey(customerId, customerPhone);
+    if (customerKey) {
+      const offerIdsToCheck = applicable.filter(o => o.usageLimitPerCustomer).map(o => o.id);
+      if (offerIdsToCheck.length > 0) {
+        const usageMap = await offerEngine.getCustomerUsageMap(db, offerIdsToCheck, customerKey);
+        applicable = applicable.filter(o => {
+          if (!o.usageLimitPerCustomer) return true;
+          return (usageMap[o.id] || 0) < Number(o.usageLimitPerCustomer);
+        });
+      }
+    }
+
+    const applicableResults = applicable.map(offer => {
+      const result = offerEngine.calculateDiscountForOffer(offer, subtotal, cart, context);
+      return {
+        offer,
+        discount: result.discount,
+        freeItems: result.freeItems,
+        appliedTier: result.appliedTier,
+      };
+    });
+
+    const bestOffer = offerEngine.pickBestOffer(applicable, subtotal, cart, context);
+    let best = null;
+    if (bestOffer) {
+      const r = offerEngine.calculateDiscountForOffer(bestOffer, subtotal, cart, context);
+      best = { offerId: bestOffer.id, discount: r.discount };
+    }
+
+    res.json({ success: true, applicable: applicableResults, best });
+  } catch (error) {
+    console.error('[offerEngine] preview error:', error);
+    res.status(500).json({ success: false, error: 'Failed to preview offers' });
   }
 });
 
@@ -23404,6 +23547,41 @@ app.get('/api/offers/:restaurantId/active', authenticateToken, async (req, res) 
 // Get active offers for a restaurant (public endpoint for Crave app)
 // Query params:
 // - isFirstOrder=true/false - Filter first-order-only offers based on customer status
+// Public customer-groups lookup — returns only the groups a phone/customerId belongs to.
+// Used by the public /placeorder page to unlock targeted offers without exposing PII.
+app.get('/api/public/customer-groups/lookup/:restaurantId', vercelSecurityMiddleware.publicAPI, async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+    const rawPhone = req.query.phone;
+    const customerId = req.query.customerId || null;
+    const normalizePhone = (raw) => {
+      if (!raw) return '';
+      const digits = String(raw).replace(/\D/g, '');
+      return digits.length > 10 ? digits.slice(-10) : digits;
+    };
+    const phone = normalizePhone(rawPhone);
+    if (!phone && !customerId) {
+      return res.status(400).json({ success: false, error: 'phone or customerId required' });
+    }
+    const snap = await db.collection('customerGroups')
+      .where('restaurantId', '==', restaurantId)
+      .get();
+    const groups = [];
+    snap.forEach(doc => {
+      const d = doc.data();
+      const inIds = customerId && Array.isArray(d.customerIds) && d.customerIds.includes(customerId);
+      const inPhones = phone && Array.isArray(d.customerPhones) && d.customerPhones.includes(phone);
+      if (inIds || inPhones) groups.push({ id: doc.id, name: d.name, color: d.color });
+    });
+    // Short edge cache; groups rarely change
+    res.set('Cache-Control', 'public, s-maxage=60, stale-while-revalidate=30');
+    res.json({ success: true, groups });
+  } catch (err) {
+    console.error('[public customerGroups lookup] error', err);
+    res.status(500).json({ success: false, error: 'Lookup failed' });
+  }
+});
+
 app.get('/api/public/offers/:restaurantId', vercelSecurityMiddleware.publicAPI, async (req, res) => {
   try {
     const { restaurantId } = req.params;
@@ -23465,7 +23643,12 @@ app.get('/api/public/offers/:restaurantId', vercelSecurityMiddleware.publicAPI, 
           schedule: offer.schedule || null,
           promotionType: offer.promotionType || 'discount',
           bogoConfig: offer.bogoConfig || null,
-          eventLabel: offer.eventLabel || null
+          eventLabel: offer.eventLabel || null,
+          // Phase 4: extended offer engine fields
+          audience: offer.audience || null,
+          tiers: offer.tiers || null,
+          crossItemBogo: offer.crossItemBogo || null,
+          perCustomerUsageLimit: offer.perCustomerUsageLimit || null
         });
       });
 
@@ -23522,7 +23705,13 @@ app.post('/api/offers/:restaurantId', authenticateToken, async (req, res) => {
       promotionType = 'discount',
       bogoConfig = null,
       eventLabel = null,
-      targetRestaurants = 'all'
+      targetRestaurants = 'all',
+      // Phase 2 additions (all optional, back-compat)
+      audience = null,
+      tiers = null,
+      crossItemBogo = null,
+      usageLimitPerCustomer = null,
+      priority = 0
     } = req.body;
 
     // Verify user has access to this restaurant
@@ -23573,6 +23762,12 @@ app.post('/api/offers/:restaurantId', authenticateToken, async (req, res) => {
       } : null,
       eventLabel: eventLabel || null,
       targetRestaurants: targetRestaurants || 'all',
+      // Phase 2 additions
+      audience: audience && typeof audience === 'object' ? audience : null,
+      tiers: Array.isArray(tiers) ? tiers : null,
+      crossItemBogo: crossItemBogo && typeof crossItemBogo === 'object' ? crossItemBogo : null,
+      usageLimitPerCustomer: usageLimitPerCustomer ? Number(usageLimitPerCustomer) : null,
+      priority: Number(priority) || 0,
       createdAt: new Date(),
       updatedAt: new Date()
     };
