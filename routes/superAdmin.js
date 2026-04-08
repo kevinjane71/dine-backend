@@ -641,4 +641,55 @@ router.post('/orders/soft-delete', authenticateSuperAdmin, async (req, res) => {
   }
 });
 
+// POST /api/super-admin/orders/soft-delete-by-id
+// Body: { restaurantId: string, orderId: string }
+// Soft-deletes a single order. Verifies it belongs to the given restaurant.
+router.post('/orders/soft-delete-by-id', authenticateSuperAdmin, async (req, res) => {
+  try {
+    const { restaurantId, orderId } = req.body || {};
+    if (!restaurantId || typeof restaurantId !== 'string') {
+      return res.status(400).json({ success: false, error: 'restaurantId is required' });
+    }
+    if (!orderId || typeof orderId !== 'string') {
+      return res.status(400).json({ success: false, error: 'orderId is required' });
+    }
+
+    const ref = db.collection(collections.orders).doc(orderId);
+    const snap = await ref.get();
+    if (!snap.exists) {
+      return res.status(404).json({ success: false, error: 'Order not found' });
+    }
+    const data = snap.data();
+    if (data.restaurantId !== restaurantId) {
+      return res.status(403).json({ success: false, error: 'Order does not belong to this restaurant' });
+    }
+    if (data.status === 'deleted') {
+      return res.json({ success: true, orderId, alreadyDeleted: true });
+    }
+
+    const { FieldValue } = require('firebase-admin/firestore');
+    const adminUserId = req.admin?.id || req.admin?.email || 'super-admin';
+
+    await ref.update({
+      status: 'deleted',
+      lastStatus: data.status || 'pending',
+      deletedAt: FieldValue.serverTimestamp(),
+      deletedBy: adminUserId,
+      deleteReason: 'Single delete by super admin',
+      updatedAt: FieldValue.serverTimestamp(),
+    });
+
+    console.log(`🗑️ Super admin soft-deleted order ${orderId} for restaurant ${restaurantId}`);
+    res.json({
+      success: true,
+      orderId,
+      restaurantId,
+      previousStatus: data.status || 'pending',
+    });
+  } catch (error) {
+    console.error('Super admin soft-delete order by id error:', error);
+    res.status(500).json({ success: false, error: error.message || 'Failed to soft-delete order' });
+  }
+});
+
 module.exports = router;
