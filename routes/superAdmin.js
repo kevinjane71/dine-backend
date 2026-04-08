@@ -535,4 +535,110 @@ router.get('/orders/summary', authenticateSuperAdmin, async (req, res) => {
   }
 });
 
+// ─── Soft-delete orders for a restaurant on a specific date ──────────
+// POST /api/super-admin/orders/soft-delete
+// Body: { restaurantId: string, date: 'YYYY-MM-DD' | 'today' | 'yesterday' }
+// Soft-deletes (status='deleted') all orders for that restaurant created on that calendar day (server local time).
+// Idempotent: orders already marked deleted are skipped.
+router.post('/orders/soft-delete', authenticateSuperAdmin, async (req, res) => {
+  try {
+    const { restaurantId, date } = req.body || {};
+    if (!restaurantId || typeof restaurantId !== 'string') {
+      return res.status(400).json({ success: false, error: 'restaurantId is required' });
+    }
+    if (!date || typeof date !== 'string') {
+      return res.status(400).json({ success: false, error: 'date is required (YYYY-MM-DD, "today", or "yesterday")' });
+    }
+
+    // Resolve date → [start, end) day bounds
+    let dayStart;
+    if (date === 'today') {
+      const n = new Date();
+      dayStart = new Date(n.getFullYear(), n.getMonth(), n.getDate());
+    } else if (date === 'yesterday') {
+      const n = new Date();
+      dayStart = new Date(n.getFullYear(), n.getMonth(), n.getDate() - 1);
+    } else {
+      const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(date);
+      if (!m) return res.status(400).json({ success: false, error: 'Invalid date format. Use YYYY-MM-DD' });
+      dayStart = new Date(parseInt(m[1]), parseInt(m[2]) - 1, parseInt(m[3]));
+      if (isNaN(dayStart.getTime())) {
+        return res.status(400).json({ success: false, error: 'Invalid date' });
+      }
+    }
+    const dayEnd = new Date(dayStart);
+    dayEnd.setDate(dayEnd.getDate() + 1);
+
+    // Verify restaurant exists (so admin doesn't blindly nuke a typo'd id)
+    const restDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
+    if (!restDoc.exists) {
+      return res.status(404).json({ success: false, error: 'Restaurant not found' });
+    }
+    const restaurantName = restDoc.data().name || restaurantId;
+
+    // Query orders for that restaurant on that day
+    const snapshot = await db.collection(collections.orders)
+      .where('restaurantId', '==', restaurantId)
+      .where('createdAt', '>=', dayStart)
+      .where('createdAt', '<', dayEnd)
+      .get();
+
+    const { FieldValue } = require('firebase-admin/firestore');
+    const adminUserId = req.admin?.id || req.admin?.email || 'super-admin';
+
+    let deletedCount = 0;
+    let alreadyDeletedCount = 0;
+    let totalOrders = snapshot.size;
+
+    // Batch updates (Firestore batch max 500)
+    const batches = [];
+    let batch = db.batch();
+    let opsInBatch = 0;
+
+    snapshot.forEach(doc => {
+      const data = doc.data();
+      if (data.status === 'deleted') {
+        alreadyDeletedCount++;
+        return;
+      }
+      batch.update(doc.ref, {
+        status: 'deleted',
+        lastStatus: data.status || 'pending',
+        deletedAt: FieldValue.serverTimestamp(),
+        deletedBy: adminUserId,
+        deleteReason: 'Bulk delete by super admin',
+        updatedAt: FieldValue.serverTimestamp(),
+      });
+      deletedCount++;
+      opsInBatch++;
+      if (opsInBatch >= 450) {
+        batches.push(batch);
+        batch = db.batch();
+        opsInBatch = 0;
+      }
+    });
+    if (opsInBatch > 0) batches.push(batch);
+
+    for (const b of batches) {
+      await b.commit();
+    }
+
+    const dayStr = `${dayStart.getFullYear()}-${String(dayStart.getMonth() + 1).padStart(2, '0')}-${String(dayStart.getDate()).padStart(2, '0')}`;
+    console.log(`🗑️ Super admin soft-deleted ${deletedCount}/${totalOrders} orders for ${restaurantName} (${restaurantId}) on ${dayStr}`);
+
+    res.json({
+      success: true,
+      restaurantId,
+      restaurantName,
+      date: dayStr,
+      totalOrders,
+      deletedCount,
+      alreadyDeletedCount,
+    });
+  } catch (error) {
+    console.error('Super admin soft-delete orders error:', error);
+    res.status(500).json({ success: false, error: error.message || 'Failed to soft-delete orders' });
+  }
+});
+
 module.exports = router;
