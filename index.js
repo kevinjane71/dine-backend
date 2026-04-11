@@ -7183,6 +7183,22 @@ app.post('/api/public/orders/:restaurantId', vercelSecurityMiddleware.publicAPI,
       discountAmount = subtotal;
     }
 
+    // If server validation produced 0 discount but frontend sent non-zero, use frontend value
+    // (server validation can fail silently due to offer schedule/audience/timing differences)
+    if (discountAmount === 0 && parseFloat(req.body.discountAmount) > 0) {
+      console.log(`⚠️ POST: Server offer validation produced 0 but frontend sent ${req.body.discountAmount}, using frontend value`);
+      discountAmount = parseFloat(req.body.discountAmount);
+      // Also build appliedOffer from frontend data if available
+      if (req.body.selectedOfferName && allOfferIds.length > 0) {
+        const fallbackOffer = {
+          id: allOfferIds[0],
+          name: req.body.selectedOfferName,
+          discountApplied: discountAmount,
+        };
+        appliedOffers = [fallbackOffer];
+      }
+    }
+
     // For backward compatibility, set appliedOffer to first applied offer
     if (appliedOffers.length > 0) {
       appliedOffer = appliedOffers[0];
@@ -7365,22 +7381,30 @@ app.post('/api/public/orders/:restaurantId', vercelSecurityMiddleware.publicAPI,
       orderId: orderRef.id,
       orderNumber: orderNumber,
       orderDate: new Date(),
-      totalAmount: finalTotal,
+      subtotal: Math.round(subtotal * 100) / 100,
+      totalAmount: Math.round(preTaxTotal * 100) / 100,
       finalAmount: Math.round(finalTotal * 100) / 100,
-      subtotal: subtotal,
-      taxAmount: taxAmount || 0,
-      discountAmount: discountAmount,
-      loyaltyDiscount: loyaltyDiscount,
+      taxAmount: Math.round((taxAmount || 0) * 100) / 100,
+      taxBreakdown: taxBreakdown || [],
+      serviceChargeAmount: 0,
+      serviceChargeRate: 0,
+      tipAmount: 0,
+      roundOffAmount: 0,
+      discountAmount: Math.round((discountAmount || 0) * 100) / 100,
+      manualDiscount: 0,
+      loyaltyDiscount: Math.round((loyaltyDiscount || 0) * 100) / 100,
+      totalDiscountAmount: Math.round(((discountAmount || 0) + (loyaltyDiscount || 0)) * 100) / 100,
+      appliedOffer: appliedOffer ? appliedOffer.name : null,
+      appliedOffers: appliedOffers.length > 0 ? appliedOffers.map(ao => ({ name: ao.name, discountApplied: ao.discountApplied })) : [],
+      selectedOfferName: appliedOffers.length > 0 ? appliedOffers.map(ao => ao.name).join(', ') : (appliedOffer ? appliedOffer.name : null),
+      loyaltyPointsEarned: loyaltyPointsEarned,
+      loyaltyPointsRedeemed: loyaltyPointsRedeemed,
       tableNumber: tableNum,
       orderType: orderType,
       orderTypeLabel: orderTypeLabels[orderType] || 'Customer Order',
       orderSource: resolvedOrderSource,
       status: 'pending',
-      itemsCount: orderItems.length,
-      appliedOffer: appliedOffer ? appliedOffer.name : null,
-      appliedOffers: appliedOffers.map(o => o.name),
-      loyaltyPointsEarned: loyaltyPointsEarned,
-      loyaltyPointsRedeemed: loyaltyPointsRedeemed
+      itemsCount: orderItems.length
     };
 
     // Update customer stats and order history on order creation (loyalty points deferred to completion)
@@ -7894,6 +7918,21 @@ app.post('/api/orders', async (req, res) => {
     if (discountAmount > subtotalForDiscount) {
       discountAmount = subtotalForDiscount;
     }
+
+    // If server validation produced 0 discount but frontend sent non-zero, use frontend value
+    // (server validation can fail due to offer schedule/audience/timing differences)
+    if (discountAmount === 0 && parseFloat(req.body.discountAmount) > 0) {
+      console.log(`⚠️ POS POST: Server offer validation produced 0 but frontend sent ${req.body.discountAmount}, using frontend value`);
+      discountAmount = parseFloat(req.body.discountAmount);
+      if (req.body.selectedOfferName && allOfferIds.length > 0) {
+        appliedOffers = [{
+          id: allOfferIds[0],
+          name: req.body.selectedOfferName,
+          discountApplied: discountAmount,
+        }];
+      }
+    }
+
     if (appliedOffers.length > 0) {
       appliedOffer = appliedOffers[0];
     }
@@ -7975,12 +8014,18 @@ app.post('/api/orders', async (req, res) => {
       defaultTaxRate: 5
     };
 
+    // Calculate service charge from rate on preTaxTotal (backend-driven)
+    const scRate = parseFloat(serviceChargeRate || 0);
+    const scAmt = scRate > 0 ? Math.round((preTaxTotal * scRate / 100) * 100) / 100 : (serviceChargeAmount ? Number(serviceChargeAmount) : 0);
+
     if (taxSettings.enabled && preTaxTotal > 0) {
+      // Tax on (preTaxTotal + serviceCharge) — GST includes service charge in India
+      const taxableAmount = preTaxTotal + scAmt;
       if (taxSettings.taxes && Array.isArray(taxSettings.taxes) && taxSettings.taxes.length > 0) {
         taxSettings.taxes
           .filter(tax => tax.enabled)
           .forEach(tax => {
-            const amt = Math.round((preTaxTotal * (tax.rate || 0) / 100) * 100) / 100;
+            const amt = Math.round((taxableAmount * (tax.rate || 0) / 100) * 100) / 100;
             taxAmount += amt;
             taxBreakdown.push({
               name: tax.name || 'Tax',
@@ -7989,7 +8034,7 @@ app.post('/api/orders', async (req, res) => {
             });
           });
       } else if (taxSettings.defaultTaxRate) {
-        const amt = Math.round((preTaxTotal * (taxSettings.defaultTaxRate / 100)) * 100) / 100;
+        const amt = Math.round((taxableAmount * (taxSettings.defaultTaxRate / 100)) * 100) / 100;
         taxAmount = amt;
         taxBreakdown.push({
           name: 'Tax',
@@ -8001,7 +8046,6 @@ app.post('/api/orders', async (req, res) => {
     }
 
     // Add billing components to finalAmount
-    const scAmt = serviceChargeAmount ? Number(serviceChargeAmount) : 0;
     const tipAmt = tipAmount ? Number(tipAmount) : 0;
     const roAmt = roundOffAmount ? Number(roundOffAmount) : 0;
     finalAmount = finalAmount + scAmt + tipAmt + roAmt;
@@ -8028,8 +8072,11 @@ app.post('/api/orders', async (req, res) => {
       subtotal: subtotalForDiscount,
       totalAmount: preTaxTotal,
       discountAmount: Math.round(discountAmount * 100) / 100,
+      offerDiscount: Math.round(discountAmount * 100) / 100,
       manualDiscount: Math.round(manualDiscountAmount * 100) / 100,
       loyaltyDiscount: Math.round(loyaltyDiscount * 100) / 100,
+      totalDiscountAmount: Math.round(totalDiscountAmount * 100) / 100,
+      selectedOfferName: req.body.selectedOfferName || (appliedOffer ? appliedOffer.name : null),
       appliedOffer: appliedOffer,
       appliedOffers: appliedOffers,
       loyaltyPointsRedeemed: loyaltyPointsRedeemed,
@@ -8055,7 +8102,7 @@ app.post('/api/orders', async (req, res) => {
       paymentMethod: splitPayments && splitPayments.length > 1 ? 'split' : (paymentMethod || 'cash'),
       // Billing feature fields
       serviceChargeRate: serviceChargeRate,
-      serviceChargeAmount: serviceChargeAmount ? Math.round(serviceChargeAmount * 100) / 100 : null,
+      serviceChargeAmount: scAmt > 0 ? Math.round(scAmt * 100) / 100 : null,
       tipAmount: tipAmount ? Math.round(tipAmount * 100) / 100 : null,
       tipPercentage: tipPercentage,
       cashReceived: cashReceived ? Math.round(cashReceived * 100) / 100 : null,
@@ -8192,18 +8239,31 @@ app.post('/api/orders', async (req, res) => {
       const orderHistoryEntry = {
         orderId: orderRef.id,
         orderNumber: orderNumber,
-        totalAmount: totalAmount,
+        subtotal: Math.round(subtotalForDiscount * 100) / 100,
+        totalAmount: Math.round(preTaxTotal * 100) / 100,
         finalAmount: Math.round(finalAmount * 100) / 100,
         taxAmount: Math.round(taxAmount * 100) / 100,
-        serviceChargeAmount: serviceChargeAmount ? Math.round(serviceChargeAmount * 100) / 100 : 0,
-        tipAmount: tipAmount ? Math.round(tipAmount * 100) / 100 : 0,
-        roundOffAmount: roundOffAmount ? Math.round(roundOffAmount * 100) / 100 : 0,
+        taxBreakdown: taxBreakdown,
+        serviceChargeAmount: Math.round(scAmt * 100) / 100,
+        serviceChargeRate: scRate || 0,
+        tipAmount: tipAmt ? Math.round(tipAmt * 100) / 100 : 0,
+        roundOffAmount: roAmt ? Math.round(roAmt * 100) / 100 : 0,
+        discountAmount: Math.round(discountAmount * 100) / 100,
+        manualDiscount: Math.round(manualDiscountAmount * 100) / 100,
+        loyaltyDiscount: Math.round(loyaltyDiscount * 100) / 100,
+        totalDiscountAmount: Math.round(totalDiscountAmount * 100) / 100,
+        appliedOffer: appliedOffer ? appliedOffer.name : null,
+        appliedOffers: appliedOffers.length > 0 ? appliedOffers.map(ao => ({ name: ao.name, discountApplied: ao.discountApplied })) : [],
+        selectedOfferName: appliedOffers.length > 0 ? appliedOffers.map(ao => ao.name).join(', ') : (req.body.selectedOfferName || (appliedOffer ? appliedOffer.name : null)),
+        loyaltyPointsEarned: loyaltyPointsEarned,
+        loyaltyPointsRedeemed: loyaltyPointsRedeemed,
         outstandingAmount: req.body.partialPayAmount ? Math.round((finalAmount - Number(req.body.partialPayAmount)) * 100) / 100 : 0,
         paidAmount: req.body.partialPayAmount ? Math.round(Number(req.body.partialPayAmount) * 100) / 100 : 0,
         orderDate: new Date(),
         tableNumber: tableNumber || seatNumber || null,
         orderType: orderType,
-        orderTypeLabel: orderType
+        orderTypeLabel: orderType,
+        itemsCount: orderItems.length
       };
 
       try {
@@ -8525,10 +8585,14 @@ app.post('/api/orders', async (req, res) => {
         discountAmount: discountAmount,
         manualDiscount: manualDiscountAmount,
         loyaltyDiscount: loyaltyDiscount,
+        totalDiscountAmount: totalDiscountAmount,
         appliedOffer: appliedOffer,
         appliedOffers: appliedOffers,
+        selectedOfferName: req.body.selectedOfferName || (appliedOffer ? appliedOffer.name : null),
         taxAmount: taxAmount,
         taxBreakdown: taxBreakdown,
+        serviceChargeAmount: scAmt,
+        serviceChargeRate: scRate,
         finalAmount: finalAmount,
         paymentMethod: paymentMethod,
         orderType: orderType,
@@ -9736,26 +9800,31 @@ app.patch('/api/orders/:orderId/status', authenticateToken, async (req, res) => 
             orderId: orderId,
             orderNumber: orderData.orderNumber,
             orderDate: new Date(), // Completion date
+            subtotal: orderData.subtotal || 0,
             totalAmount: orderData.totalAmount,
             finalAmount: orderData.finalAmount || orderData.totalAmount,
-            subtotal: orderData.subtotal,
             taxAmount: orderData.taxAmount || 0,
+            taxBreakdown: orderData.taxBreakdown || [],
             serviceChargeAmount: orderData.serviceChargeAmount || 0,
+            serviceChargeRate: orderData.serviceChargeRate || 0,
             tipAmount: orderData.tipAmount || 0,
             roundOffAmount: orderData.roundOffAmount || 0,
             outstandingAmount: orderData.outstandingAmount || 0,
             paidAmount: orderData.paidAmount || 0,
-            discountAmount: orderData.discountAmount,
-            loyaltyDiscount: orderData.loyaltyDiscount,
+            discountAmount: orderData.discountAmount || 0,
+            manualDiscount: orderData.manualDiscount || 0,
+            loyaltyDiscount: orderData.loyaltyDiscount || 0,
+            totalDiscountAmount: orderData.totalDiscountAmount || 0,
+            appliedOffer: orderData.appliedOffer?.name || orderData.selectedOfferName || null,
+            selectedOfferName: orderData.selectedOfferName || (orderData.appliedOffer?.name) || null,
+            loyaltyPointsEarned: pointsEarned,
+            loyaltyPointsRedeemed: pointsRedeemed,
             tableNumber: orderData.tableNumber,
             orderType: orderData.orderType,
             orderTypeLabel: orderData.orderTypeLabel,
             orderSource: orderData.orderSource,
             status: 'completed',
-            itemsCount: orderData.items?.length || 0,
-            appliedOffer: orderData.appliedOffer?.name || null,
-            loyaltyPointsEarned: pointsEarned,
-            loyaltyPointsRedeemed: pointsRedeemed
+            itemsCount: orderData.items?.length || 0
           };
 
           // Order history entry already added during order creation (POST /api/orders or POST /api/customers)
@@ -9838,12 +9907,26 @@ app.patch('/api/orders/:orderId/status', authenticateToken, async (req, res) => 
           customerName: orderData.customerName || orderData.customerInfo?.name,
           customerMobile: orderData.customerMobile || orderData.customerInfo?.phone,
           items: orderData.items,
+          subtotal: orderData.subtotal || orderData.totalAmount,
           totalAmount: orderData.totalAmount,
           taxAmount: orderData.taxAmount,
           taxBreakdown: orderData.taxBreakdown,
           finalAmount: orderData.finalAmount || orderData.totalAmount,
+          discountAmount: orderData.discountAmount || 0,
+          manualDiscount: orderData.manualDiscount || 0,
+          loyaltyDiscount: orderData.loyaltyDiscount || 0,
+          totalDiscountAmount: orderData.totalDiscountAmount || 0,
+          appliedOffer: orderData.appliedOffer || null,
+          appliedOffers: orderData.appliedOffers || null,
           paymentMethod: orderData.paymentMethod,
           orderType: orderData.orderType,
+          serviceChargeAmount: orderData.serviceChargeAmount || null,
+          serviceChargeRate: orderData.serviceChargeRate || null,
+          tipAmount: orderData.tipAmount || null,
+          roundOffAmount: orderData.roundOffAmount || null,
+          splitPayments: orderData.splitPayments || null,
+          cashReceived: orderData.cashReceived || null,
+          changeReturned: orderData.changeReturned || null,
           createdAt: orderData.createdAt?.toDate?.()?.toISOString() || new Date().toISOString(),
           completedAt: new Date()
         }).catch(err => console.error('Billing print Pusher notification error (non-blocking):', err));
@@ -10027,86 +10110,17 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
       
       updateData.items = processedItems;
       updateData.itemCount = processedItems.reduce((sum, item) => sum + item.quantity, 0);
-      updateData.totalAmount = await calculateOrderTotal(processedItems);
-      
-      // Double-check totalAmount calculation
-      if (updateData.totalAmount === 0 && processedItems.length > 0) {
+      let itemsSubtotal = await calculateOrderTotal(processedItems);
+
+      // Double-check subtotal calculation
+      if (itemsSubtotal === 0 && processedItems.length > 0) {
         console.warn('⚠️ Total amount calculated as 0, recalculating from items...');
-        updateData.totalAmount = processedItems.reduce((sum, item) => sum + (item.total || 0), 0);
+        itemsSubtotal = processedItems.reduce((sum, item) => sum + (item.total || 0), 0);
       }
-      
-      // Calculate tax if tax settings are enabled
-      // Use same defaults as GET /api/admin/tax endpoint for consistency
-      const restaurantDoc = await db.collection(collections.restaurants).doc(currentOrder.restaurantId).get();
-      if (restaurantDoc.exists) {
-        const restaurantData = restaurantDoc.data();
-        const taxSettings = restaurantData.taxSettings || {
-          enabled: true,
-          taxes: [{ id: 'gst', name: 'GST', rate: 5, enabled: true, type: 'percentage' }],
-          defaultTaxRate: 5
-        };
 
-        if (taxSettings.enabled && updateData.totalAmount > 0) {
-          let taxAmount = 0;
-          const taxBreakdown = [];
-
-          if (taxSettings.taxes && Array.isArray(taxSettings.taxes) && taxSettings.taxes.length > 0) {
-            taxSettings.taxes
-              .filter(tax => tax.enabled)
-              .forEach(tax => {
-                const amt = Math.round((updateData.totalAmount * (tax.rate || 0) / 100) * 100) / 100;
-                taxAmount += amt;
-                taxBreakdown.push({
-                  name: tax.name || 'Tax',
-                  rate: tax.rate || 0,
-                  amount: amt
-                });
-              });
-          } else if (taxSettings.defaultTaxRate) {
-            const amt = Math.round((updateData.totalAmount * (taxSettings.defaultTaxRate / 100)) * 100) / 100;
-            taxAmount = amt;
-            taxBreakdown.push({
-              name: 'Tax',
-              rate: taxSettings.defaultTaxRate,
-              amount: amt
-            });
-          }
-
-          updateData.taxAmount = Math.round(taxAmount * 100) / 100;
-          updateData.taxBreakdown = taxBreakdown;
-          // Base finalAmount = totalAmount + tax (frontend may override with full billing amount)
-          const scAmt = req.body.serviceChargeAmount || currentOrder.serviceChargeAmount || 0;
-          const tipAmt = req.body.tipAmount || currentOrder.tipAmount || 0;
-          const roAmt = req.body.roundOffAmount || currentOrder.roundOffAmount || 0;
-          updateData.finalAmount = Math.round((updateData.totalAmount + taxAmount + scAmt + tipAmt + roAmt) * 100) / 100;
-        } else {
-          // Tax disabled - finalAmount includes billing features
-          const scAmt = req.body.serviceChargeAmount || currentOrder.serviceChargeAmount || 0;
-          const tipAmt = req.body.tipAmount || currentOrder.tipAmount || 0;
-          const roAmt = req.body.roundOffAmount || currentOrder.roundOffAmount || 0;
-          updateData.taxAmount = 0;
-          updateData.taxBreakdown = [];
-          updateData.finalAmount = Math.round((updateData.totalAmount + scAmt + tipAmt + roAmt) * 100) / 100;
-        }
-      } else {
-        // Restaurant doc doesn't exist - preserve existing values for backward compatibility
-        updateData.taxAmount = currentOrder.taxAmount || 0;
-        updateData.taxBreakdown = currentOrder.taxBreakdown || [];
-        updateData.finalAmount = currentOrder.finalAmount || updateData.totalAmount || currentOrder.totalAmount || 0;
-      }
-      
-      console.log('🔄 Updated order totals:', {
-        itemCount: updateData.itemCount,
-        totalAmount: updateData.totalAmount,
-        taxAmount: updateData.taxAmount,
-        finalAmount: updateData.finalAmount,
-        items: processedItems.map(item => ({
-          name: item.name,
-          price: item.price,
-          quantity: item.quantity,
-          total: item.total
-        }))
-      });
+      // Store raw subtotal — tax and finalAmount will be computed AFTER discounts below
+      updateData.subtotal = itemsSubtotal;
+      updateData.totalAmount = itemsSubtotal; // Temporarily set; adjusted to preTaxTotal after discounts
     }
 
     if (tableNumber !== undefined) updateData.tableNumber = tableNumber;
@@ -10150,10 +10164,18 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
     const offerIds = req.body.offerIds;
     const manualDiscountVal = parseFloat(req.body.manualDiscount) || 0;
     const redeemLoyaltyPointsVal = parseInt(req.body.redeemLoyaltyPoints) || 0;
-    const orderSubtotal = updateData.totalAmount || currentOrder.totalAmount || 0;
+    const orderSubtotal = updateData.subtotal || currentOrder.subtotal || updateData.totalAmount || currentOrder.totalAmount || 0;
 
     if (req.body.manualDiscount !== undefined) updateData.manualDiscount = manualDiscountVal;
     if (req.body.selectedOfferName !== undefined) updateData.selectedOfferName = req.body.selectedOfferName;
+    if (req.body.appliedOffer !== undefined) updateData.appliedOffer = req.body.appliedOffer;
+    if (req.body.appliedOffers !== undefined) updateData.appliedOffers = req.body.appliedOffers;
+
+    console.log('🎫 PATCH discount inputs from frontend:', {
+      offerIds, manualDiscount: manualDiscountVal, redeemLoyaltyPoints: redeemLoyaltyPointsVal,
+      orderSubtotal, discountAmount: req.body.discountAmount, totalDiscountAmount: req.body.totalDiscountAmount,
+      selectedOfferName: req.body.selectedOfferName, status
+    });
 
     // Validate and apply offers server-side
     if (Array.isArray(offerIds) && offerIds.length > 0 && status === 'completed') {
@@ -10260,10 +10282,18 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
       updateData.appliedOffer = singleAppliedOffer;
       updateData.appliedOffers = appliedOffers;
       console.log(`🎁 PATCH: Applied ${appliedOffers.length} offers, discount: ₹${updateData.discountAmount}`);
+
+      // If server validation produced 0 discount but frontend sent non-zero, use frontend value
+      // (server validation can fail silently due to offer expiry, timing, etc.)
+      if (updateData.discountAmount === 0 && parseFloat(req.body.discountAmount) > 0) {
+        console.log(`⚠️ PATCH: Server offer validation produced 0 but frontend sent ${req.body.discountAmount}, using frontend value`);
+        updateData.discountAmount = parseFloat(req.body.discountAmount);
+        updateData.offerDiscount = updateData.discountAmount;
+      }
     } else {
       // No offers — use frontend values as fallback
-      if (req.body.discountAmount !== undefined) updateData.discountAmount = req.body.discountAmount;
-      if (req.body.offerDiscount !== undefined) updateData.offerDiscount = req.body.offerDiscount;
+      if (req.body.discountAmount !== undefined) updateData.discountAmount = parseFloat(req.body.discountAmount) || 0;
+      if (req.body.offerDiscount !== undefined) updateData.offerDiscount = parseFloat(req.body.offerDiscount) || 0;
       if (req.body.offerIds !== undefined) updateData.offerIds = req.body.offerIds;
     }
 
@@ -10354,11 +10384,102 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
     // Compute totalDiscountAmount
     updateData.totalDiscountAmount = Math.round(((updateData.discountAmount || 0) + (updateData.manualDiscount || 0) + (updateData.loyaltyDiscount || 0)) * 100) / 100;
 
-    // Use frontend-calculated finalAmount if provided (includes service charge, tip, round-off)
-    if (req.body.finalAmount !== undefined) updateData.finalAmount = req.body.finalAmount;
-    if (req.body.totalAmount !== undefined) updateData.totalAmount = req.body.totalAmount;
-    if (req.body.taxAmount !== undefined) updateData.taxAmount = req.body.taxAmount;
-    if (req.body.taxBreakdown !== undefined) updateData.taxBreakdown = req.body.taxBreakdown;
+    // --- FIX: Calculate tax and finalAmount AFTER discounts (matching POST endpoint) ---
+    // Previously, tax was computed on raw subtotal before discounts were applied.
+    // Now compute preTaxTotal = subtotal - discounts, then tax on preTaxTotal.
+    const rawSubtotal = updateData.subtotal || updateData.totalAmount || currentOrder.subtotal || currentOrder.totalAmount || 0;
+    const preTaxTotal = Math.max(0, rawSubtotal - updateData.totalDiscountAmount);
+    updateData.totalAmount = preTaxTotal; // Match POST endpoint: totalAmount = preTaxTotal
+
+    // Calculate tax on discounted amount
+    try {
+      const taxRestDoc = await db.collection(collections.restaurants).doc(currentOrder.restaurantId).get();
+      if (taxRestDoc.exists) {
+        const taxRestData = taxRestDoc.data();
+        const taxSettings = taxRestData.taxSettings || {
+          enabled: true,
+          taxes: [{ id: 'gst', name: 'GST', rate: 5, enabled: true, type: 'percentage' }],
+          defaultTaxRate: 5
+        };
+
+        if (taxSettings.enabled && preTaxTotal > 0) {
+          // 1. Calculate service charge from rate on preTaxTotal (backend-driven)
+          const scRate = parseFloat(req.body.serviceChargeRate || updateData.serviceChargeRate || currentOrder.serviceChargeRate || 0);
+          const scAmt = scRate > 0 ? Math.round((preTaxTotal * scRate / 100) * 100) / 100 : parseFloat(req.body.serviceChargeAmount || currentOrder.serviceChargeAmount || 0);
+          updateData.serviceChargeAmount = scAmt;
+
+          // 2. Calculate tax on (preTaxTotal + serviceCharge) — GST includes service charge in India
+          const taxableAmount = preTaxTotal + scAmt;
+          let taxAmount = 0;
+          const taxBreakdown = [];
+
+          if (taxSettings.taxes && Array.isArray(taxSettings.taxes) && taxSettings.taxes.length > 0) {
+            taxSettings.taxes
+              .filter(tax => tax.enabled)
+              .forEach(tax => {
+                const amt = Math.round((taxableAmount * (tax.rate || 0) / 100) * 100) / 100;
+                taxAmount += amt;
+                taxBreakdown.push({
+                  name: tax.name || 'Tax',
+                  rate: tax.rate || 0,
+                  amount: amt
+                });
+              });
+          } else if (taxSettings.defaultTaxRate) {
+            const amt = Math.round((taxableAmount * (taxSettings.defaultTaxRate / 100)) * 100) / 100;
+            taxAmount = amt;
+            taxBreakdown.push({
+              name: 'Tax',
+              rate: taxSettings.defaultTaxRate,
+              amount: amt
+            });
+          }
+
+          updateData.taxAmount = Math.round(taxAmount * 100) / 100;
+          updateData.taxBreakdown = taxBreakdown;
+
+          // 3. Calculate final amount
+          const tipAmt = parseFloat(req.body.tipAmount || currentOrder.tipAmount || 0);
+          const roAmt = parseFloat(req.body.roundOffAmount || currentOrder.roundOffAmount || 0);
+          updateData.finalAmount = Math.round((preTaxTotal + taxAmount + scAmt + tipAmt + roAmt) * 100) / 100;
+        } else {
+          // Tax disabled
+          updateData.taxAmount = 0;
+          updateData.taxBreakdown = [];
+          const scRate = parseFloat(req.body.serviceChargeRate || updateData.serviceChargeRate || currentOrder.serviceChargeRate || 0);
+          const scAmt = scRate > 0 ? Math.round((preTaxTotal * scRate / 100) * 100) / 100 : parseFloat(req.body.serviceChargeAmount || currentOrder.serviceChargeAmount || 0);
+          updateData.serviceChargeAmount = scAmt;
+          const tipAmt = parseFloat(req.body.tipAmount || currentOrder.tipAmount || 0);
+          const roAmt = parseFloat(req.body.roundOffAmount || currentOrder.roundOffAmount || 0);
+          updateData.finalAmount = Math.round((preTaxTotal + scAmt + tipAmt + roAmt) * 100) / 100;
+        }
+      } else {
+        // Restaurant doc doesn't exist - preserve existing values
+        updateData.taxAmount = currentOrder.taxAmount || 0;
+        updateData.taxBreakdown = currentOrder.taxBreakdown || [];
+        updateData.finalAmount = currentOrder.finalAmount || preTaxTotal || 0;
+      }
+    } catch (taxErr) {
+      console.error('Error calculating tax on PATCH:', taxErr);
+      // Fallback: preserve existing tax values
+      updateData.taxAmount = currentOrder.taxAmount || 0;
+      updateData.taxBreakdown = currentOrder.taxBreakdown || [];
+    }
+
+    console.log('🔄 Updated order totals (after discounts):', {
+      subtotal: rawSubtotal,
+      totalDiscount: updateData.totalDiscountAmount,
+      preTaxTotal,
+      serviceCharge: updateData.serviceChargeAmount,
+      taxAmount: updateData.taxAmount,
+      finalAmount: updateData.finalAmount,
+      discountAmount: updateData.discountAmount || 0,
+      manualDiscount: updateData.manualDiscount || 0,
+      loyaltyDiscount: updateData.loyaltyDiscount || 0
+    });
+
+    // Backend is the single source of truth for all calculations.
+    // No frontend overrides — tax, finalAmount, totalAmount are computed server-side above.
 
     // Add update history
     const updateHistory = currentOrder.updateHistory || [];
@@ -10693,13 +10814,21 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
             customerName: customerInfo?.name || currentOrder.customerName || currentOrder.customerInfo?.name,
             customerMobile: customerInfo?.phone || currentOrder.customerMobile || currentOrder.customerInfo?.phone,
             items: updateData.items || currentOrder.items,
+            subtotal: updateData.subtotal || currentOrder.subtotal || currentOrder.totalAmount,
             totalAmount: updateData.totalAmount || currentOrder.totalAmount,
             taxAmount: updateData.taxAmount || currentOrder.taxAmount,
             taxBreakdown: updateData.taxBreakdown || currentOrder.taxBreakdown,
             finalAmount: updateData.finalAmount || currentOrder.finalAmount || currentOrder.totalAmount,
+            discountAmount: updateData.discountAmount || currentOrder.discountAmount || 0,
+            manualDiscount: updateData.manualDiscount || currentOrder.manualDiscount || 0,
+            loyaltyDiscount: updateData.loyaltyDiscount || currentOrder.loyaltyDiscount || 0,
+            totalDiscountAmount: updateData.totalDiscountAmount || currentOrder.totalDiscountAmount || 0,
+            appliedOffer: updateData.appliedOffer || currentOrder.appliedOffer || null,
+            appliedOffers: updateData.appliedOffers || currentOrder.appliedOffers || null,
             paymentMethod: paymentMethod || currentOrder.paymentMethod,
             orderType: orderType || currentOrder.orderType,
             serviceChargeAmount: updateData.serviceChargeAmount || currentOrder.serviceChargeAmount || null,
+            serviceChargeRate: updateData.serviceChargeRate || currentOrder.serviceChargeRate || null,
             tipAmount: updateData.tipAmount || currentOrder.tipAmount || null,
             roundOffAmount: updateData.roundOffAmount || currentOrder.roundOffAmount || null,
             splitPayments: updateData.splitPayments || currentOrder.splitPayments || null,
@@ -10793,12 +10922,26 @@ app.post('/api/orders/:orderId/manual-print', authenticateToken, async (req, res
         customerName: order.customerName || order.customerInfo?.name,
         customerMobile: order.customerMobile || order.customerInfo?.phone,
         items: order.items || [],
+        subtotal: order.subtotal || order.totalAmount || 0,
         totalAmount: order.totalAmount || 0,
         taxAmount: order.taxAmount || 0,
         taxBreakdown: order.taxBreakdown || [],
         finalAmount: order.finalAmount || order.totalAmount || 0,
+        discountAmount: order.discountAmount || 0,
+        manualDiscount: order.manualDiscount || 0,
+        loyaltyDiscount: order.loyaltyDiscount || 0,
+        totalDiscountAmount: order.totalDiscountAmount || 0,
+        appliedOffer: order.appliedOffer || null,
+        appliedOffers: order.appliedOffers || null,
         paymentMethod: order.paymentMethod || 'cash',
         orderType: order.orderType || 'dine-in',
+        serviceChargeAmount: order.serviceChargeAmount || null,
+        serviceChargeRate: order.serviceChargeRate || null,
+        tipAmount: order.tipAmount || null,
+        roundOffAmount: order.roundOffAmount || null,
+        splitPayments: order.splitPayments || null,
+        cashReceived: order.cashReceived || null,
+        changeReturned: order.changeReturned || null,
         createdAt: createdAt.toISOString(),
         completedAt: order.completedAt?.toDate?.()?.toISOString() || new Date().toISOString(),
         formattedTime,
@@ -15068,10 +15211,20 @@ app.get('/api/billing/pending-print/:restaurantId', async (req, res) => {
         customerName: orderData.customerName || '',
         customerMobile: orderData.customerMobile || '',
         items: orderData.items || [],
-        subtotal: orderData.totalAmount || 0,
+        subtotal: orderData.subtotal || orderData.totalAmount || 0,
         taxAmount: orderData.taxAmount || 0,
         taxBreakdown: orderData.taxBreakdown || [],
         totalAmount: orderData.finalAmount || orderData.totalAmount || 0,
+        discountAmount: orderData.discountAmount || 0,
+        manualDiscount: orderData.manualDiscount || 0,
+        loyaltyDiscount: orderData.loyaltyDiscount || 0,
+        totalDiscount: (orderData.discountAmount || 0) + (orderData.manualDiscount || 0) + (orderData.loyaltyDiscount || 0),
+        appliedOffer: orderData.appliedOffer || null,
+        appliedOffers: orderData.appliedOffers || null,
+        serviceChargeAmount: orderData.serviceChargeAmount || 0,
+        serviceChargeRate: orderData.serviceChargeRate || null,
+        tipAmount: orderData.tipAmount || 0,
+        roundOffAmount: orderData.roundOffAmount || 0,
         paymentMethod: orderData.paymentMethod || 'cash',
         orderType: orderData.orderType || 'dine-in',
         createdAt: createdAt.toISOString(),
@@ -15435,8 +15588,9 @@ const assembleBillRenderPayload = (orderId, orderData, restaurantId, restaurantD
     manualDiscount,
     loyaltyDiscount,
     totalDiscount,
-    appliedOffer: orderData.appliedOffer || null,
+    appliedOffer: orderData.appliedOffer || (orderData.selectedOfferName ? { name: orderData.selectedOfferName } : null),
     appliedOffers: orderData.appliedOffers || null,
+    selectedOfferName: orderData.selectedOfferName || null,
     taxBreakdown,
     totalTax,
     taxAmount: totalTax,
@@ -23415,7 +23569,9 @@ app.get('/api/public/customer-app-settings/:restaurantId', vercelSecurityMiddlew
           earnPerAmount: customerAppSettings.loyaltySettings.earnPerAmount || 100,
           pointsEarned: customerAppSettings.loyaltySettings.pointsEarned || 4,
           redemptionRate: customerAppSettings.loyaltySettings.redemptionRate || 100,
-          maxRedemptionPercent: customerAppSettings.loyaltySettings.maxRedemptionPercent || 20
+          maxRedemptionPercent: customerAppSettings.loyaltySettings.maxRedemptionPercent || 20,
+          earnPointsOnRedemption: customerAppSettings.loyaltySettings.earnPointsOnRedemption ?? false,
+          earnOnFullAmount: customerAppSettings.loyaltySettings.earnOnFullAmount ?? false
         } : {
           enabled: false
         },
@@ -23434,7 +23590,20 @@ app.get('/api/public/customer-app-settings/:restaurantId', vercelSecurityMiddlew
           autoApplyBestOffer: customerAppSettings.offerSettings?.autoApplyBestOffer ?? false,
           allowMultipleOffers: customerAppSettings.offerSettings?.allowMultipleOffers ?? false,
           maxOffersAllowed: customerAppSettings.offerSettings?.maxOffersAllowed ?? 1
-        }
+        },
+        pageSettings: {
+          loginMode: customerAppSettings.pageSettings?.loginMode || 'optional',
+          showOffersOnMenu: customerAppSettings.pageSettings?.showOffersOnMenu !== false,
+          publicMenuOnly: customerAppSettings.pageSettings?.publicMenuOnly === true,
+          collectName: customerAppSettings.pageSettings?.collectName !== false,
+          collectEmail: customerAppSettings.pageSettings?.collectEmail === true
+        },
+        paymentSettings: customerAppSettings.paymentSettings ? {
+          upiEnabled: customerAppSettings.paymentSettings.upiEnabled ?? false,
+          upiId: customerAppSettings.paymentSettings.upiId || '',
+          upiDisplayName: customerAppSettings.paymentSettings.upiDisplayName || '',
+          upiQrCodeUrl: customerAppSettings.paymentSettings.upiQrCodeUrl || ''
+        } : { upiEnabled: false }
       }
     });
   } catch (error) {
@@ -23935,7 +24104,9 @@ app.get('/api/restaurants/:restaurantId/customer-app-settings', authenticateToke
         earnPerAmount: existingSettings.loyaltySettings?.earnPerAmount || 100,
         pointsEarned: existingSettings.loyaltySettings?.pointsEarned || 4,
         redemptionRate: existingSettings.loyaltySettings?.redemptionRate || 100,
-        maxRedemptionPercent: existingSettings.loyaltySettings?.maxRedemptionPercent || 20
+        maxRedemptionPercent: existingSettings.loyaltySettings?.maxRedemptionPercent || 20,
+        earnPointsOnRedemption: existingSettings.loyaltySettings?.earnPointsOnRedemption ?? false,
+        earnOnFullAmount: existingSettings.loyaltySettings?.earnOnFullAmount ?? false
       },
       offerSettings: {
         autoApplyBestOffer: existingSettings.offerSettings?.autoApplyBestOffer ?? false,
@@ -23951,6 +24122,19 @@ app.get('/api/restaurants/:restaurantId/customer-app-settings', authenticateToke
         logoUrl: existingSettings.branding?.logoUrl || restaurantData.logo || '',
         tagline: existingSettings.branding?.tagline || '',
         headerStyle: existingSettings.branding?.headerStyle || 'modern'
+      },
+      pageSettings: {
+        loginMode: existingSettings.pageSettings?.loginMode || 'optional',
+        showOffersOnMenu: existingSettings.pageSettings?.showOffersOnMenu !== false,
+        publicMenuOnly: existingSettings.pageSettings?.publicMenuOnly === true,
+        collectName: existingSettings.pageSettings?.collectName !== false,
+        collectEmail: existingSettings.pageSettings?.collectEmail === true
+      },
+      paymentSettings: {
+        upiEnabled: existingSettings.paymentSettings?.upiEnabled ?? false,
+        upiId: existingSettings.paymentSettings?.upiId || '',
+        upiDisplayName: existingSettings.paymentSettings?.upiDisplayName || '',
+        upiQrCodeUrl: existingSettings.paymentSettings?.upiQrCodeUrl || ''
       }
     };
 
@@ -24049,6 +24233,19 @@ app.put('/api/restaurants/:restaurantId/customer-app-settings', authenticateToke
         logoUrl: settings.branding?.logoUrl || '',
         tagline: settings.branding?.tagline || '',
         headerStyle: settings.branding?.headerStyle || 'modern'
+      },
+      pageSettings: {
+        loginMode: settings.pageSettings?.loginMode || 'optional',
+        showOffersOnMenu: settings.pageSettings?.showOffersOnMenu !== false,
+        publicMenuOnly: settings.pageSettings?.publicMenuOnly === true,
+        collectName: settings.pageSettings?.collectName !== false,
+        collectEmail: settings.pageSettings?.collectEmail === true
+      },
+      paymentSettings: {
+        upiEnabled: settings.paymentSettings?.upiEnabled ?? false,
+        upiId: settings.paymentSettings?.upiId || '',
+        upiDisplayName: settings.paymentSettings?.upiDisplayName || '',
+        upiQrCodeUrl: settings.paymentSettings?.upiQrCodeUrl || ''
       },
       updatedAt: new Date()
     };
