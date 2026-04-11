@@ -6881,19 +6881,7 @@ app.post('/api/public/orders/:restaurantId', vercelSecurityMiddleware.publicAPI,
       return res.status(400).json({ error: 'Restaurant ID and items are required' });
     }
 
-    if (!customerPhone) {
-      return res.status(400).json({ error: 'Customer phone number is required' });
-    }
-
-    if (!otp || !verificationId) {
-      return res.status(400).json({ error: 'OTP verification is required' });
-    }
-
-    // Verify OTP with Firebase (this would need to be implemented)
-    // For now, we'll skip OTP verification and proceed with order creation
-    // In production, you would verify the OTP with Firebase here
-
-    // Check if restaurant exists
+    // Check if restaurant exists (need this early for loginMode check)
     const restaurantDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
     if (!restaurantDoc.exists) {
       return res.status(404).json({ error: 'Restaurant not found' });
@@ -6902,6 +6890,17 @@ app.post('/api/public/orders/:restaurantId', vercelSecurityMiddleware.publicAPI,
     const restaurantData = restaurantDoc.data();
     const customerAppSettings = restaurantData.customerAppSettings || {};
     const loyaltySettings = customerAppSettings.loyaltySettings || {};
+    const loginMode = customerAppSettings.pageSettings?.loginMode || 'optional';
+
+    // Phone is required unless loginMode is 'none'
+    if (loginMode !== 'none' && !customerPhone) {
+      return res.status(400).json({ error: 'Customer phone number is required' });
+    }
+
+    // OTP is only required when loginMode is 'required'
+    if (loginMode === 'required' && (!otp || otp === 'skipped' || !verificationId)) {
+      return res.status(400).json({ error: 'OTP verification is required' });
+    }
 
     // Validate order type based on restaurant settings
     if (orderType === 'dine_in' && customerAppSettings.allowDineIn === false) {
@@ -23603,7 +23602,14 @@ app.get('/api/public/customer-app-settings/:restaurantId', vercelSecurityMiddlew
           upiId: customerAppSettings.paymentSettings.upiId || '',
           upiDisplayName: customerAppSettings.paymentSettings.upiDisplayName || '',
           upiQrCodeUrl: customerAppSettings.paymentSettings.upiQrCodeUrl || ''
-        } : { upiEnabled: false }
+        } : { upiEnabled: false },
+        billingSettings: {
+          tipsEnabled: customerAppSettings.billingSettings?.tipsEnabled ?? false,
+          tipPresets: customerAppSettings.billingSettings?.tipPresets || [5, 10, 15],
+          serviceChargeEnabled: customerAppSettings.billingSettings?.serviceChargeEnabled ?? false,
+          serviceChargeRate: customerAppSettings.billingSettings?.serviceChargeRate || 0,
+          serviceChargeLabel: customerAppSettings.billingSettings?.serviceChargeLabel || 'Service Charge',
+        }
       }
     });
   } catch (error) {
@@ -24135,6 +24141,13 @@ app.get('/api/restaurants/:restaurantId/customer-app-settings', authenticateToke
         upiId: existingSettings.paymentSettings?.upiId || '',
         upiDisplayName: existingSettings.paymentSettings?.upiDisplayName || '',
         upiQrCodeUrl: existingSettings.paymentSettings?.upiQrCodeUrl || ''
+      },
+      billingSettings: {
+        tipsEnabled: existingSettings.billingSettings?.tipsEnabled ?? false,
+        tipPresets: existingSettings.billingSettings?.tipPresets || [5, 10, 15],
+        serviceChargeEnabled: existingSettings.billingSettings?.serviceChargeEnabled ?? false,
+        serviceChargeRate: existingSettings.billingSettings?.serviceChargeRate || 0,
+        serviceChargeLabel: existingSettings.billingSettings?.serviceChargeLabel || 'Service Charge',
       }
     };
 
