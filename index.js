@@ -8314,11 +8314,11 @@ app.post('/api/orders', async (req, res) => {
             updatedAt: new Date()
           });
           console.log(`👤 Existing customer updated: ${customerId} — now ${newHistory.length} orders`);
-        } else {
-          // Create new customer
+        } else if (customerInfo.phone) {
+          // Only create new customer when phone number is provided
           const newCustData = {
-            name: customerInfo.name || 'Walk-in Customer',
-            phone: customerInfo.phone || null,
+            name: customerInfo.name || 'Customer',
+            phone: customerInfo.phone,
             email: customerInfo.email || null,
             city: customerInfo.city || null,
             dob: customerInfo.dob || null,
@@ -8333,6 +8333,8 @@ app.post('/api/orders', async (req, res) => {
           const newCustRef = await db.collection(collections.customers).add(newCustData);
           customerId = newCustRef.id;
           console.log(`👤 New customer created: ${customerId}`);
+        } else {
+          console.log(`⏭️ Skipping customer creation — no phone number provided (walk-in order)`);
         }
 
         // Write customerId back to order document
@@ -8344,6 +8346,21 @@ app.post('/api/orders', async (req, res) => {
       } catch (error) {
         console.error('Customer creation/update error:', error);
         // Don't fail the order if customer creation fails
+      }
+    }
+
+    // Award loyalty points when order is created as 'completed' (direct billing flow)
+    if (orderData.status === 'completed' && customerId && (loyaltyPointsEarned > 0 || loyaltyPointsRedeemed > 0)) {
+      const netPointsChange = loyaltyPointsEarned - loyaltyPointsRedeemed;
+      if (netPointsChange !== 0) {
+        try {
+          await db.collection('customers').doc(customerId).update({
+            loyaltyPoints: FieldValue.increment(netPointsChange)
+          });
+          console.log(`💎 POST: Customer ${customerId} loyalty updated: ${netPointsChange > 0 ? '+' : ''}${netPointsChange} points`);
+        } catch (loyaltyErr) {
+          console.error('Error updating customer loyalty on POST:', loyaltyErr);
+        }
       }
     }
 
@@ -9735,9 +9752,10 @@ app.patch('/api/orders/:orderId/status', authenticateToken, async (req, res) => 
               lastOrderDate: new Date(),
               updatedAt: new Date()
             });
-          } else {
+          } else if (customerPhone) {
+            // Only create new customer when phone number is provided
             const newRef = await db.collection(collections.customers).add({
-              name: customerName || 'Walk-in Customer',
+              name: customerName || 'Customer',
               phone: customerPhone,
               restaurantId: orderData.restaurantId,
               orderHistory: [histEntry],
@@ -9748,6 +9766,8 @@ app.patch('/api/orders/:orderId/status', authenticateToken, async (req, res) => 
               updatedAt: new Date()
             });
             customerId = newRef.id;
+          } else {
+            console.log(`⏭️ Skipping customer creation on completion — no phone number provided`);
           }
           try { await db.collection('orders').doc(orderId).update({ customerId }); } catch (e) {}
           console.log(`👤 Customer processed on completion: ${customerId}`);
@@ -10499,6 +10519,84 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
 
     console.log('🔄 Backend - Updating order:', orderId, 'with data:', updateData);
     await db.collection(collections.orders).doc(orderId).update(updateData);
+
+    // Award loyalty points on completion (dashboard billing flow)
+    if (status === 'completed' && currentOrder.status !== 'completed') {
+      const custId = req.body.customerId || currentOrder.customerId;
+      const pointsEarned = updateData.loyaltyPointsEarned || 0;
+      const pointsRedeemed = updateData.loyaltyPointsRedeemed || 0;
+      const netPointsChange = pointsEarned - pointsRedeemed;
+
+      if (custId && netPointsChange !== 0) {
+        try {
+          await db.collection('customers').doc(custId).update({
+            loyaltyPoints: FieldValue.increment(netPointsChange)
+          });
+          console.log(`💎 PATCH: Customer ${custId} loyalty updated: ${netPointsChange > 0 ? '+' : ''}${netPointsChange} points`);
+        } catch (loyaltyErr) {
+          console.error('Error updating customer loyalty on PATCH:', loyaltyErr);
+        }
+      }
+
+      // Also update customer order history and stats on completion
+      if (custId) {
+        try {
+          const orderFinalAmount = updateData.finalAmount || currentOrder.finalAmount || 0;
+          const custDoc = await db.collection('customers').doc(custId).get();
+          if (custDoc.exists) {
+            const custData = custDoc.data();
+            const existingHistory = custData.orderHistory || [];
+            // Check if this order is already in history (from POST creation)
+            const alreadyInHistory = existingHistory.some(h => h.orderId === orderId);
+            if (!alreadyInHistory) {
+              const histEntry = {
+                orderId,
+                orderNumber: currentOrder.orderNumber,
+                totalAmount: updateData.totalAmount || currentOrder.totalAmount || 0,
+                finalAmount: Math.round(orderFinalAmount * 100) / 100,
+                taxAmount: updateData.taxAmount || currentOrder.taxAmount || 0,
+                orderDate: new Date(),
+                tableNumber: currentOrder.tableNumber || null,
+                orderType: currentOrder.orderType,
+                loyaltyPointsEarned: pointsEarned,
+                loyaltyPointsRedeemed: pointsRedeemed,
+              };
+              const newHistory = [...existingHistory, histEntry];
+              await db.collection('customers').doc(custId).update({
+                orderHistory: newHistory,
+                totalOrders: newHistory.length,
+                totalSpent: newHistory.reduce((s, o) => s + (o.finalAmount || o.totalAmount || 0), 0),
+                lastOrderDate: new Date(),
+                updatedAt: new Date()
+              });
+            }
+          }
+        } catch (custErr) {
+          console.error('Error updating customer history on PATCH completion:', custErr);
+        }
+      }
+
+      // Increment offer usage for applied offers
+      const offersToUpdate = updateData.appliedOffers && updateData.appliedOffers.length > 0
+        ? updateData.appliedOffers
+        : (currentOrder.appliedOffers && currentOrder.appliedOffers.length > 0
+          ? currentOrder.appliedOffers
+          : (currentOrder.appliedOffer && currentOrder.appliedOffer.id ? [currentOrder.appliedOffer] : []));
+
+      for (const appliedOfferItem of offersToUpdate) {
+        if (appliedOfferItem && appliedOfferItem.id) {
+          try {
+            await db.collection('offers').doc(appliedOfferItem.id).update({
+              usageCount: FieldValue.increment(1),
+              updatedAt: new Date()
+            });
+            console.log(`🎁 PATCH: Offer usage incremented for ${appliedOfferItem.id}`);
+          } catch (err) {
+            console.error('Error updating offer usage on PATCH:', err);
+          }
+        }
+      }
+    }
 
     // Update daily analytics stats (fire-and-forget)
     const nonCountedStatuses = ['saved', 'cancelled', 'deleted'];
@@ -22880,6 +22978,82 @@ app.delete('/api/customers/:customerId', authenticateToken, async (req, res) => 
   }
 });
 
+// Bulk delete customers
+app.post('/api/customers/bulk-delete', authenticateToken, async (req, res) => {
+  try {
+    if (!(await checkFeaturePermission(req, 'customers', 'delete'))) {
+      return res.status(403).json({ error: 'Access denied. Customers delete permission required.' });
+    }
+    const { userId } = req.user;
+    const { customerIds, reason } = req.body;
+
+    if (!Array.isArray(customerIds) || customerIds.length === 0) {
+      return res.status(400).json({ error: 'customerIds array is required' });
+    }
+    if (customerIds.length > 200) {
+      return res.status(400).json({ error: 'Maximum 200 customers can be deleted at once' });
+    }
+
+    // Verify user role and resolve restaurantId
+    const userDoc = await db.collection(collections.users).doc(userId).get();
+    const userData = userDoc.data();
+
+    // Check role — only owner/admin can bulk delete
+    if (!['owner', 'admin'].includes(userData.role)) {
+      return res.status(403).json({ error: 'Only admin or owner can bulk delete customers.' });
+    }
+
+    // Resolve restaurantId: staff have it on user doc, owners need to derive from first customer
+    let restaurantId = userData.restaurantId;
+    if (!restaurantId) {
+      const firstCustDoc = await db.collection(collections.customers).doc(customerIds[0]).get();
+      if (!firstCustDoc.exists) return res.status(404).json({ error: 'Customer not found' });
+      restaurantId = firstCustDoc.data().restaurantId;
+      // Verify owner owns this restaurant
+      const restDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
+      if (!restDoc.exists || restDoc.data().ownerId !== userId) {
+        return res.status(403).json({ error: 'Access denied' });
+      }
+    }
+
+    // Delete in batches of 10
+    let deletedCount = 0;
+    const batchSize = 10;
+    for (let i = 0; i < customerIds.length; i += batchSize) {
+      const batch = db.batch();
+      const chunk = customerIds.slice(i, i + batchSize);
+      for (const custId of chunk) {
+        const custRef = db.collection(collections.customers).doc(custId);
+        const custDoc = await custRef.get();
+        if (custDoc.exists && custDoc.data().restaurantId === restaurantId) {
+          batch.delete(custRef);
+          deletedCount++;
+        }
+      }
+      await batch.commit();
+    }
+
+    // Also remove deleted customer IDs from any customer groups
+    const groupsSnap = await db.collection('customerGroups').where('restaurantId', '==', restaurantId).get();
+    if (!groupsSnap.empty) {
+      for (const groupDoc of groupsSnap.docs) {
+        const gData = groupDoc.data();
+        const existingIds = gData.customerIds || [];
+        const filtered = existingIds.filter(id => !customerIds.includes(id));
+        if (filtered.length !== existingIds.length) {
+          await groupDoc.ref.update({ customerIds: filtered, customerCount: filtered.length, updatedAt: new Date() });
+        }
+      }
+    }
+
+    console.log(`🗑️ Bulk deleted ${deletedCount} customers for restaurant ${restaurantId}. Reason: ${reason || 'not specified'}`);
+    res.json({ message: `${deletedCount} customers deleted successfully`, deletedCount });
+  } catch (error) {
+    console.error('Bulk delete customers error:', error);
+    res.status(500).json({ error: 'Failed to bulk delete customers' });
+  }
+});
+
 // Helper function to get next open time
 function getNextOpenTime(operatingHours, currentTime) {
   const days = ['sunday', 'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday'];
@@ -23701,7 +23875,9 @@ app.get('/api/offers/:restaurantId/active', authenticateToken, async (req, res) 
           promotionType: offer.promotionType || 'discount',
           bogoConfig: offer.bogoConfig || null,
           eventLabel: offer.eventLabel || null,
-          targetRestaurants: offer.targetRestaurants || 'all'
+          targetRestaurants: offer.targetRestaurants || 'all',
+          audience: offer.audience || null,
+          tiers: offer.tiers || null,
         });
       }
     };
