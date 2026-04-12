@@ -13596,7 +13596,7 @@ app.delete('/api/staff/:staffId', authenticateToken, requireOwnerRole, async (re
 
 // Role-based default page access for staff creation
 const ROLE_DEFAULT_PAGE_ACCESS = {
-  admin:    { dashboard:true, history:true, tables:true, menu:true, analytics:true, inventory:true, kot:true, admin:true, completeBill:true, invoice:true, customers:true, offers:true },
+  admin:    { dashboard:true, history:true, tables:true, menu:true, analytics:true, inventory:true, kot:true, admin:{ settings:true, tax:true, pricing:true, payments:true, billingSettings:true, currency:true, print:true, features:true, restaurants:true, staff:true, orderManagement:true, offers:true, loyalty:true, googleReviews:true }, completeBill:true, invoice:true, customers:true, offers:true },
   manager:  { dashboard:true, history:true, tables:true, menu:true, analytics:true, inventory:true, kot:true, admin:false, completeBill:true, invoice:true, customers:true, offers:true },
   waiter:   { dashboard:true, history:true, tables:true, menu:true, analytics:false, inventory:false, kot:false, admin:false, completeBill:false, invoice:false, customers:false, offers:false },
   cashier:  { dashboard:true, history:true, tables:false, menu:true, analytics:false, inventory:false, kot:false, admin:false, completeBill:true, invoice:true, customers:false, offers:false },
@@ -14310,6 +14310,11 @@ app.get('/api/admin/tax/:restaurantId', authenticateToken, async (req, res) => {
       console.log(`✅ Access granted via restaurant owner check: userId=${userId}, ownerId=${restaurant.ownerId}`);
     }
 
+    // Check granular admin tab permission
+    if (!(await checkFeaturePermission(req, 'admin', 'tax'))) {
+      return res.status(403).json({ error: 'Access denied to Tax settings.' });
+    }
+
     // Get restaurant to verify it exists
     const restaurantRef = db.collection(collections.restaurants).doc(restaurantId);
     const restaurantDoc = await restaurantRef.get();
@@ -14392,6 +14397,11 @@ app.put('/api/admin/tax/:restaurantId', authenticateToken, async (req, res) => {
       }
 
       console.log(`✅ Access granted via restaurant owner check: userId=${userId}, ownerId=${restaurant.ownerId}`);
+    }
+
+    // Check granular admin tab permission
+    if (!(await checkFeaturePermission(req, 'admin', 'tax'))) {
+      return res.status(403).json({ error: 'Access denied to Tax settings.' });
     }
 
     // Validate tax settings
@@ -14508,6 +14518,11 @@ app.get('/api/admin/business/:restaurantId', authenticateToken, async (req, res)
       }
     }
 
+    // Check granular admin tab permission (business settings = billingSettings tab)
+    if (!(await checkFeaturePermission(req, 'admin', 'billingSettings'))) {
+      return res.status(403).json({ error: 'Access denied to Billing settings.' });
+    }
+
     // Get restaurant data
     const restaurantRef = db.collection(collections.restaurants).doc(restaurantId);
     const restaurantDoc = await restaurantRef.get();
@@ -14576,6 +14591,11 @@ app.put('/api/admin/business/:restaurantId', authenticateToken, async (req, res)
       if (restaurant.ownerId !== userId) {
         return res.status(403).json({ error: 'Access denied' });
       }
+    }
+
+    // Check granular admin tab permission (business settings = billingSettings tab)
+    if (!(await checkFeaturePermission(req, 'admin', 'billingSettings'))) {
+      return res.status(403).json({ error: 'Access denied to Billing settings.' });
     }
 
     // Validate GSTIN format if provided
@@ -14704,6 +14724,11 @@ app.get('/api/admin/print-settings/:restaurantId', authenticateToken, async (req
   try {
     const { restaurantId } = req.params;
 
+    // Check granular admin tab permission
+    if (!(await checkFeaturePermission(req, 'admin', 'print'))) {
+      return res.status(403).json({ error: 'Access denied to Print settings.' });
+    }
+
     const restaurantDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
     if (!restaurantDoc.exists) {
       return res.status(404).json({ error: 'Restaurant not found' });
@@ -14752,6 +14777,11 @@ app.put('/api/admin/print-settings/:restaurantId', authenticateToken, async (req
   try {
     const { restaurantId } = req.params;
     const { printSettings } = req.body;
+
+    // Check granular admin tab permission
+    if (!(await checkFeaturePermission(req, 'admin', 'print'))) {
+      return res.status(403).json({ error: 'Access denied to Print settings.' });
+    }
 
     if (!printSettings || typeof printSettings !== 'object') {
       return res.status(400).json({ error: 'Invalid print settings' });
@@ -16905,13 +16935,20 @@ app.get('/api/smart-suggestions/:restaurantId', authenticateToken, async (req, r
 // ========================================
 
 // Generic feature permission helpers
+const ADMIN_TAB_OPS = [
+  'settings', 'tax', 'pricing', 'payments', 'billingSettings',
+  'currency', 'print', 'features', 'restaurants', 'staff',
+  'orderManagement', 'offers', 'loyalty', 'googleReviews'
+];
+
 const FEATURE_OPS = {
   inventory: ['read', 'add', 'update', 'delete'],
   menu: ['read', 'add', 'update', 'delete', 'markOutOfStock'],
   orders: ['read', 'update', 'cancel', 'refund', 'completeBill'],
   tables: ['read', 'add', 'update', 'delete', 'reset'],
   customers: ['read', 'add', 'update', 'delete'],
-  offers: ['read', 'add', 'update', 'delete']
+  offers: ['read', 'add', 'update', 'delete'],
+  admin: ADMIN_TAB_OPS
 };
 
 function resolveFeaturePerms(pageAccess, feature) {
@@ -22424,11 +22461,16 @@ app.get('/api/admin/settings/:restaurantId', authenticateToken, async (req, res)
     const userRestaurantSnapshot = await db.collection(collections.userRestaurants)
       .where('userId', '==', userId)
       .where('restaurantId', '==', restaurantId)
-      .where('role', 'in', ['owner', 'manager'])
+      .where('role', 'in', ['owner', 'manager', 'admin'])
       .get();
 
     if (userRestaurantSnapshot.empty) {
       return res.status(403).json({ error: 'Access denied. Admin role required.' });
+    }
+
+    // Check granular admin tab permission
+    if (!(await checkFeaturePermission(req, 'admin', 'settings'))) {
+      return res.status(403).json({ error: 'Access denied to General settings.' });
     }
 
     // Get restaurant settings
@@ -22541,11 +22583,16 @@ app.put('/api/admin/settings/:restaurantId', authenticateToken, async (req, res)
     const userRestaurantSnapshot = await db.collection(collections.userRestaurants)
       .where('userId', '==', userId)
       .where('restaurantId', '==', restaurantId)
-      .where('role', 'in', ['owner', 'manager'])
+      .where('role', 'in', ['owner', 'manager', 'admin'])
       .get();
 
     if (userRestaurantSnapshot.empty) {
       return res.status(403).json({ error: 'Access denied. Admin role required.' });
+    }
+
+    // Check granular admin tab permission
+    if (!(await checkFeaturePermission(req, 'admin', 'settings'))) {
+      return res.status(403).json({ error: 'Access denied to General settings.' });
     }
 
     // Validate settings data
@@ -22617,11 +22664,16 @@ app.post('/api/admin/settings/:restaurantId/apply-discount', authenticateToken, 
     const userRestaurantSnapshot = await db.collection(collections.userRestaurants)
       .where('userId', '==', userId)
       .where('restaurantId', '==', restaurantId)
-      .where('role', 'in', ['owner', 'manager'])
+      .where('role', 'in', ['owner', 'manager', 'admin'])
       .get();
 
     if (userRestaurantSnapshot.empty) {
       return res.status(403).json({ error: 'Access denied. Admin role required.' });
+    }
+
+    // Check granular admin tab permission
+    if (!(await checkFeaturePermission(req, 'admin', 'settings'))) {
+      return res.status(403).json({ error: 'Access denied to General settings.' });
     }
 
     // Validate discount data
@@ -22663,11 +22715,16 @@ app.get('/api/admin/settings/:restaurantId/status', authenticateToken, async (re
     const userRestaurantSnapshot = await db.collection(collections.userRestaurants)
       .where('userId', '==', userId)
       .where('restaurantId', '==', restaurantId)
-      .where('role', 'in', ['owner', 'manager'])
+      .where('role', 'in', ['owner', 'manager', 'admin'])
       .get();
 
     if (userRestaurantSnapshot.empty) {
       return res.status(403).json({ error: 'Access denied. Admin role required.' });
+    }
+
+    // Check granular admin tab permission
+    if (!(await checkFeaturePermission(req, 'admin', 'settings'))) {
+      return res.status(403).json({ error: 'Access denied to General settings.' });
     }
 
     // Get current settings
@@ -22723,11 +22780,16 @@ app.put('/api/admin/settings/:restaurantId/status', authenticateToken, async (re
     const userRestaurantSnapshot = await db.collection(collections.userRestaurants)
       .where('userId', '==', userId)
       .where('restaurantId', '==', restaurantId)
-      .where('role', 'in', ['owner', 'manager'])
+      .where('role', 'in', ['owner', 'manager', 'admin'])
       .get();
 
     if (userRestaurantSnapshot.empty) {
       return res.status(403).json({ error: 'Access denied. Admin role required.' });
+    }
+
+    // Check granular admin tab permission
+    if (!(await checkFeaturePermission(req, 'admin', 'settings'))) {
+      return res.status(403).json({ error: 'Access denied to General settings.' });
     }
 
     // Update restaurant status
@@ -26199,6 +26261,10 @@ app.get('/api/automation/test', (req, res) => {
 // Get automations
 app.get('/api/automation/:restaurantId/automations', authenticateToken, async (req, res) => {
   try {
+    // Check granular admin tab permission for loyalty
+    if (!(await checkFeaturePermission(req, 'admin', 'loyalty'))) {
+      return res.status(403).json({ error: 'Access denied to Loyalty settings.' });
+    }
     const { restaurantId } = req.params;
     const snapshot = await db.collection(collections.automations)
       .where('restaurantId', '==', restaurantId)
@@ -26219,6 +26285,10 @@ app.get('/api/automation/:restaurantId/automations', authenticateToken, async (r
 // Create automation
 app.post('/api/automation/:restaurantId/automations', authenticateToken, async (req, res) => {
   try {
+    // Check granular admin tab permission for loyalty
+    if (!(await checkFeaturePermission(req, 'admin', 'loyalty'))) {
+      return res.status(403).json({ error: 'Access denied to Loyalty settings.' });
+    }
     const { restaurantId } = req.params;
     const automationData = {
       restaurantId,
