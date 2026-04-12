@@ -1015,7 +1015,7 @@ const authenticateToken = (req, res, next) => {
 
     // Staff/employee: if marked inactive, reject all requests (revoke access)
     // Uses KV cache (5 min TTL) to avoid Firestore read on every request
-    const staffRoles = ['waiter', 'manager', 'employee', 'cashier', 'sales'];
+    const staffRoles = ['waiter', 'manager', 'employee', 'cashier', 'sales', 'admin'];
     if (user.userId) {
       try {
         const userCacheKey = `user:${user.userId}`;
@@ -1141,7 +1141,7 @@ async function findStaffDoc(staffId) {
 
 // Find staff by loginId or username — checks staffUsers first, falls back to users
 async function findStaffByLogin(identifier) {
-  const staffRoles = ['waiter', 'manager', 'employee', 'cashier', 'sales'];
+  const staffRoles = ['waiter', 'manager', 'employee', 'cashier', 'sales', 'admin'];
   const idLower = identifier.toLowerCase();
 
   // Try staffUsers by loginId
@@ -1774,10 +1774,11 @@ function generateFallbackResponse(query, data, restaurantData, intent) {
 
 // ==================== END DINEBOT FUNCTIONS ====================
 
+const DUMMY_PHONES = ['+919000000000', '9000000000', '+919000000001', '9000000001'];
 const generateOTP = (phone) => {
-  // Only use hardcoded OTP for dummy account
-  if (phone === '+919000000000' || phone === '9000000000') {
-  return "1234";
+  // Use hardcoded OTP for dummy/test accounts
+  if (DUMMY_PHONES.includes(phone)) {
+    return "1234";
   }
   // For real numbers, generate random OTP (this won't be used since we're using Firebase)
   return Math.floor(100000 + Math.random() * 900000).toString();
@@ -4396,8 +4397,8 @@ app.post('/api/auth/phone/verify-otp', async (req, res) => {
       return res.status(400).json({ error: 'Phone and OTP are required' });
     }
 
-    // Check if this is a demo account
-    const isDemoAccount = phone === '+919000000000' && otp === '1234';
+    // Check if this is a demo/test account
+    const isDemoAccount = DUMMY_PHONES.includes(phone) && otp === '1234';
     let otpDoc = null;
     
     if (isDemoAccount) {
@@ -5259,12 +5260,36 @@ app.get('/api/restaurants', authenticateToken, async (req, res) => {
 
     let query = db.collection(collections.restaurants);
 
-    // Staff users (from staffUsers collection) should only see their assigned restaurant
-    // regardless of their role (admin, manager, employee, etc.)
+    // Staff users (from staffUsers collection) — handle restaurant visibility
     const isStaffUser = req.user.source === 'staffUsers';
 
-    if (isStaffUser && restaurantId) {
-      // Staff members see only their assigned restaurant
+    if (isStaffUser && role === 'admin') {
+      // Admin staff can be assigned to multiple restaurants via userRestaurants collection
+      const urSnapshot = await db.collection(collections.userRestaurants)
+        .where('userId', '==', userId).get();
+      const assignedRestaurantIds = urSnapshot.docs.map(d => d.data().restaurantId).filter(Boolean);
+      // Also include the primary restaurantId from staff doc if not already in list
+      if (restaurantId && !assignedRestaurantIds.includes(restaurantId)) {
+        assignedRestaurantIds.push(restaurantId);
+      }
+      for (const rid of assignedRestaurantIds) {
+        const rDoc = await db.collection(collections.restaurants).doc(rid).get();
+        if (rDoc.exists) {
+          const { qrCode, menu, ...rest } = rDoc.data();
+          restaurants.push({ id: rDoc.id, ...rest });
+        }
+      }
+      // Resolve default
+      let defaultRestaurantId = restaurantId;
+      try {
+        const staffDoc = await db.collection(collections.staffUsers).doc(userId).get();
+        if (staffDoc.exists && staffDoc.data().defaultRestaurantId) {
+          defaultRestaurantId = staffDoc.data().defaultRestaurantId;
+        }
+      } catch (e) {}
+      return res.json({ restaurants, defaultRestaurantId });
+    } else if (isStaffUser && restaurantId) {
+      // Non-admin staff see only their single assigned restaurant
       const restaurantDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
       if (restaurantDoc.exists) {
         const restaurantData = restaurantDoc.data();
@@ -11341,27 +11366,19 @@ app.post('/api/upload/image', authenticateToken, upload.single('image'), async (
     });
 
     stream.on('finish', async () => {
-      try {
-        // Make the file publicly accessible
-        await fileUpload.makePublic();
-        
-        // Get the public URL
-        const imageUrl = `https://storage.googleapis.com/${bucket.name}/${fileName}`;
-        
-        console.log('✅ Image uploaded successfully:', imageUrl);
-        
-        res.json({
-          success: true,
-          imageUrl: imageUrl,
-          fileName: fileName,
-          originalName: file.originalname,
-          size: file.size,
-          message: 'Image uploaded successfully'
-        });
-      } catch (error) {
-        console.error('Error making file public:', error);
-        res.status(500).json({ error: 'Failed to process uploaded image' });
-      }
+      // Bucket uses uniform bucket-level access — objects are public via IAM, no per-object ACL needed
+      const imageUrl = `https://storage.googleapis.com/${bucket.name}/${fileName}`;
+
+      console.log('✅ Image uploaded successfully:', imageUrl);
+
+      res.json({
+        success: true,
+        imageUrl: imageUrl,
+        fileName: fileName,
+        originalName: file.originalname,
+        size: file.size,
+        message: 'Image uploaded successfully'
+      });
     });
 
     stream.end(file.buffer);
@@ -13577,6 +13594,16 @@ app.delete('/api/staff/:staffId', authenticateToken, requireOwnerRole, async (re
   }
 });
 
+// Role-based default page access for staff creation
+const ROLE_DEFAULT_PAGE_ACCESS = {
+  admin:    { dashboard:true, history:true, tables:true, menu:true, analytics:true, inventory:true, kot:true, admin:true, completeBill:true, invoice:true, customers:true, offers:true },
+  manager:  { dashboard:true, history:true, tables:true, menu:true, analytics:true, inventory:true, kot:true, admin:false, completeBill:true, invoice:true, customers:true, offers:true },
+  waiter:   { dashboard:true, history:true, tables:true, menu:true, analytics:false, inventory:false, kot:false, admin:false, completeBill:false, invoice:false, customers:false, offers:false },
+  cashier:  { dashboard:true, history:true, tables:false, menu:true, analytics:false, inventory:false, kot:false, admin:false, completeBill:true, invoice:true, customers:false, offers:false },
+  employee: { dashboard:true, history:true, tables:true, menu:true, analytics:false, inventory:false, kot:false, admin:false, completeBill:false, invoice:false, customers:false, offers:false },
+  sales:    { dashboard:true, history:true, tables:false, menu:true, analytics:false, inventory:false, kot:false, admin:false, completeBill:false, invoice:false, customers:true, offers:true },
+};
+
 // Add new staff member
 app.post('/api/staff/:restaurantId', authenticateToken, requireOwnerRole, async (req, res) => {
   try {
@@ -13585,6 +13612,15 @@ app.post('/api/staff/:restaurantId', authenticateToken, requireOwnerRole, async 
 
     if (!name || !phone) {
       return res.status(400).json({ error: 'Name and phone are required' });
+    }
+
+    // Only owner can create admin staff
+    if (role === 'admin' && req.user.role !== 'owner') {
+      return res.status(403).json({ error: 'Only the account owner can create admin staff.' });
+    }
+    // Cannot create owner role via staff API
+    if (role === 'owner') {
+      return res.status(400).json({ error: 'Cannot create owner role via staff API.' });
     }
 
     // Optional username: validate format and uniqueness (case-insensitive)
@@ -13651,17 +13687,10 @@ app.post('/api/staff/:restaurantId', authenticateToken, requireOwnerRole, async 
       temporaryPassword: true, // Flag to indicate password needs to be changed
       loginId: userId, // Use the generated 5-digit numeric ID
       ...(username != null && { username, usernameLower }),
-      // Use pageAccess from request if provided, otherwise use defaults
-      pageAccess: requestedPageAccess || {
-        dashboard: true,
-        history: true,
-        tables: true,
-        menu: true,
-        analytics: false,
-        inventory: false,
-        kot: false,
-        admin: false,
-        completeBill: false
+      // Use pageAccess from request if provided, otherwise use role-based defaults
+      pageAccess: requestedPageAccess || ROLE_DEFAULT_PAGE_ACCESS[role] || {
+        dashboard: true, history: true, tables: true, menu: true,
+        analytics: false, inventory: false, kot: false, admin: false, completeBill: false
       }
     };
 
@@ -13727,6 +13756,14 @@ app.patch('/api/staff/:staffId', authenticateToken, requireOwnerRole, async (req
     const { staffId } = req.params;
     const { name, phone, email, role, status, pageAccess } = req.body;
 
+    // Only owner can set role to admin
+    if (role === 'admin' && req.user.role !== 'owner') {
+      return res.status(403).json({ error: 'Only the account owner can assign admin role.' });
+    }
+    if (role === 'owner') {
+      return res.status(400).json({ error: 'Cannot assign owner role to staff.' });
+    }
+
     // Find staff in the correct collection
     const { doc: staffDoc, collection: staffColl } = await findStaffDoc(staffId);
     if (!staffDoc || !staffDoc.exists) {
@@ -13761,6 +13798,116 @@ app.patch('/api/staff/:staffId', authenticateToken, requireOwnerRole, async (req
 });
 
 // (Duplicate DELETE /api/staff/:staffId removed — handled above with findStaffDoc)
+
+// Assign admin staff to an additional restaurant
+app.post('/api/staff/:staffId/restaurants', authenticateToken, requireOwnerRole, async (req, res) => {
+  try {
+    const { staffId } = req.params;
+    const { restaurantId } = req.body;
+    if (!restaurantId) return res.status(400).json({ error: 'restaurantId is required' });
+
+    // Verify staff exists and is admin
+    const staffDoc = await db.collection(collections.staffUsers).doc(staffId).get();
+    if (!staffDoc.exists) return res.status(404).json({ error: 'Staff member not found' });
+    if (staffDoc.data().role !== 'admin') {
+      return res.status(400).json({ error: 'Multi-restaurant assignment is only available for admin staff.' });
+    }
+
+    // Verify restaurant belongs to this owner
+    const restDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
+    if (!restDoc.exists) return res.status(404).json({ error: 'Restaurant not found' });
+    if (restDoc.data().ownerId !== req.user.userId) {
+      return res.status(403).json({ error: 'Restaurant does not belong to you.' });
+    }
+
+    // Check if already assigned
+    const existing = await db.collection(collections.userRestaurants)
+      .where('userId', '==', staffId).where('restaurantId', '==', restaurantId).get();
+    if (!existing.empty) return res.status(400).json({ error: 'Staff is already assigned to this restaurant.' });
+
+    await db.collection(collections.userRestaurants).add({
+      userId: staffId,
+      restaurantId,
+      role: 'admin',
+      pageAccess: staffDoc.data().pageAccess || ROLE_DEFAULT_PAGE_ACCESS.admin,
+      createdAt: new Date(),
+      updatedAt: new Date()
+    });
+
+    res.json({ success: true, message: 'Restaurant assigned to admin staff.' });
+  } catch (error) {
+    console.error('Assign staff restaurant error:', error);
+    res.status(500).json({ error: 'Failed to assign restaurant' });
+  }
+});
+
+// Remove admin staff from a restaurant
+app.delete('/api/staff/:staffId/restaurants/:restaurantId', authenticateToken, requireOwnerRole, async (req, res) => {
+  try {
+    const { staffId, restaurantId } = req.params;
+
+    // Verify staff exists and is admin
+    const staffDoc = await db.collection(collections.staffUsers).doc(staffId).get();
+    if (!staffDoc.exists) return res.status(404).json({ error: 'Staff member not found' });
+    if (staffDoc.data().role !== 'admin') {
+      return res.status(400).json({ error: 'Multi-restaurant management is only for admin staff.' });
+    }
+
+    // Check how many restaurants are assigned
+    const allAssignments = await db.collection(collections.userRestaurants)
+      .where('userId', '==', staffId).get();
+    if (allAssignments.size <= 1) {
+      return res.status(400).json({ error: 'Admin must have at least one restaurant assigned.' });
+    }
+
+    // Find and delete the assignment
+    const assignment = await db.collection(collections.userRestaurants)
+      .where('userId', '==', staffId).where('restaurantId', '==', restaurantId).get();
+    if (assignment.empty) return res.status(404).json({ error: 'Assignment not found.' });
+
+    const batch = db.batch();
+    assignment.docs.forEach(doc => batch.delete(doc.ref));
+    await batch.commit();
+
+    // If removed restaurant was the primary, update primary to first remaining
+    if (staffDoc.data().restaurantId === restaurantId) {
+      const remaining = allAssignments.docs.find(d => d.data().restaurantId !== restaurantId);
+      if (remaining) {
+        await db.collection(collections.staffUsers).doc(staffId).update({
+          restaurantId: remaining.data().restaurantId,
+          updatedAt: new Date()
+        });
+      }
+    }
+
+    res.json({ success: true, message: 'Restaurant removed from admin staff.' });
+  } catch (error) {
+    console.error('Remove staff restaurant error:', error);
+    res.status(500).json({ error: 'Failed to remove restaurant' });
+  }
+});
+
+// Get restaurants assigned to a staff member
+app.get('/api/staff/:staffId/restaurants', authenticateToken, requireOwnerRole, async (req, res) => {
+  try {
+    const { staffId } = req.params;
+    const assignments = await db.collection(collections.userRestaurants)
+      .where('userId', '==', staffId).get();
+    const restaurantIds = assignments.docs.map(d => d.data().restaurantId).filter(Boolean);
+    const restaurants = [];
+    for (const rid of restaurantIds) {
+      const rDoc = await db.collection(collections.restaurants).doc(rid).get();
+      if (rDoc.exists) {
+        const { qrCode, menu, ...rest } = rDoc.data();
+        restaurants.push({ id: rDoc.id, ...rest });
+      }
+    }
+    res.json({ restaurants });
+  } catch (error) {
+    console.error('Get staff restaurants error:', error);
+    res.status(500).json({ error: 'Failed to get staff restaurants' });
+  }
+});
 
 // Get user page access
 app.get('/api/user/page-access', authenticateToken, async (req, res) => {
