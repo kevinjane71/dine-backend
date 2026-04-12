@@ -5295,8 +5295,12 @@ app.get('/api/restaurants', authenticateToken, async (req, res) => {
       if (restaurants.length === 0 && restaurantId) {
         const rDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
         if (rDoc.exists) {
-          const { qrCode, menu, ...rest } = rDoc.data();
-          restaurants.push({ id: rDoc.id, ...rest });
+          const rData = rDoc.data();
+          // Safety: only add if restaurant belongs to same owner
+          if (!staffOwnerId || !rData.ownerId || rData.ownerId === staffOwnerId) {
+            const { qrCode, menu, ...rest } = rData;
+            restaurants.push({ id: rDoc.id, ...rest });
+          }
         }
       }
 
