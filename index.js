@@ -5259,20 +5259,30 @@ app.get('/api/restaurants', authenticateToken, async (req, res) => {
 
     let query = db.collection(collections.restaurants);
 
-    if (role === 'admin') {
-      // Admin can see all restaurants
-      query = query;
-    } else if (role === 'owner' || role === 'customer') {
-      // Owners and customers see their own restaurants
-      query = query.where('ownerId', '==', userId);
-    } else if (restaurantId) {
+    // Staff users (from staffUsers collection) should only see their assigned restaurant
+    // regardless of their role (admin, manager, employee, etc.)
+    const isStaffUser = req.user.source === 'staffUsers';
+
+    if (isStaffUser && restaurantId) {
       // Staff members see only their assigned restaurant
       const restaurantDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
       if (restaurantDoc.exists) {
         const restaurantData = restaurantDoc.data();
-        // Remove qrCode (large base64 string) and menu (huge data) to reduce payload size
-        // QR code can be generated on-demand via separate endpoint or client-side
-        // Menu items are fetched separately via /api/menus/:restaurantId
+        const { qrCode, menu, ...restaurantWithoutLargeData } = restaurantData;
+        restaurants.push({
+          id: restaurantDoc.id,
+          ...restaurantWithoutLargeData
+        });
+      }
+      return res.json({ restaurants, defaultRestaurantId: restaurantId });
+    } else if (role === 'owner' || role === 'customer') {
+      // Owners and customers see their own restaurants
+      query = query.where('ownerId', '==', userId);
+    } else if (restaurantId) {
+      // Non-staff users with a restaurantId see only that restaurant
+      const restaurantDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
+      if (restaurantDoc.exists) {
+        const restaurantData = restaurantDoc.data();
         const { qrCode, menu, ...restaurantWithoutLargeData } = restaurantData;
         restaurants.push({
           id: restaurantDoc.id,
