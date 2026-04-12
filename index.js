@@ -5260,30 +5260,57 @@ app.get('/api/restaurants', authenticateToken, async (req, res) => {
 
     let query = db.collection(collections.restaurants);
 
-    // Staff users (from staffUsers collection) — handle restaurant visibility
-    const isStaffUser = req.user.source === 'staffUsers';
+    // Staff users — handle restaurant visibility
+    const isStaffUser = req.user.source === 'staffUsers' || (role && !['owner', 'customer'].includes(role));
 
     if (isStaffUser && role === 'admin') {
-      // Admin staff can be assigned to multiple restaurants via userRestaurants collection
+      // Admin staff: use their primary restaurantId from JWT + any explicitly assigned via userRestaurants
+      // First get the staff doc to find their ownerId for safety filtering
+      const staffOwnerId = req.user.ownerId;
+
+      // Query userRestaurants for this admin staff — only entries with admin/manager role
       const urSnapshot = await db.collection(collections.userRestaurants)
         .where('userId', '==', userId).get();
-      const assignedRestaurantIds = urSnapshot.docs.map(d => d.data().restaurantId).filter(Boolean);
-      // Also include the primary restaurantId from staff doc if not already in list
+      const assignedRestaurantIds = urSnapshot.docs
+        .map(d => d.data().restaurantId)
+        .filter(Boolean);
+      // Also include the primary restaurantId from JWT if not already in list
       if (restaurantId && !assignedRestaurantIds.includes(restaurantId)) {
         assignedRestaurantIds.push(restaurantId);
       }
+
+      // Fetch each restaurant but verify it belongs to the same owner (safety check)
       for (const rid of assignedRestaurantIds) {
         const rDoc = await db.collection(collections.restaurants).doc(rid).get();
+        if (rDoc.exists) {
+          const rData = rDoc.data();
+          // Only include if restaurant belongs to the admin's owner
+          if (staffOwnerId && rData.ownerId && rData.ownerId !== staffOwnerId) continue;
+          const { qrCode, menu, ...rest } = rData;
+          restaurants.push({ id: rDoc.id, ...rest });
+        }
+      }
+
+      // If no restaurants found via userRestaurants, fall back to primary restaurantId
+      if (restaurants.length === 0 && restaurantId) {
+        const rDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
         if (rDoc.exists) {
           const { qrCode, menu, ...rest } = rDoc.data();
           restaurants.push({ id: rDoc.id, ...rest });
         }
       }
+
       // Resolve default
       let defaultRestaurantId = restaurantId;
       try {
         const staffDoc = await db.collection(collections.staffUsers).doc(userId).get();
-        if (staffDoc.exists && staffDoc.data().defaultRestaurantId) {
+        if (!staffDoc.exists) {
+          // Try users collection
+          const userDoc = await db.collection(collections.users).doc(userId).get();
+          if (userDoc.exists && userDoc.data().defaultRestaurantId) {
+            defaultRestaurantId = userDoc.data().defaultRestaurantId;
+          }
+        } else if (staffDoc.data().defaultRestaurantId) {
           defaultRestaurantId = staffDoc.data().defaultRestaurantId;
         }
       } catch (e) {}
@@ -13596,7 +13623,7 @@ app.delete('/api/staff/:staffId', authenticateToken, requireOwnerRole, async (re
 
 // Role-based default page access for staff creation
 const ROLE_DEFAULT_PAGE_ACCESS = {
-  admin:    { dashboard:true, history:true, tables:true, menu:true, analytics:true, inventory:true, kot:true, admin:{ settings:true, tax:true, pricing:true, payments:true, billingSettings:true, currency:true, print:true, features:true, restaurants:true, staff:true, orderManagement:true, offers:true, loyalty:true, googleReviews:true }, completeBill:true, invoice:true, customers:true, offers:true },
+  admin:    { dashboard:true, history:true, tables:true, menu:true, analytics:true, inventory:true, kot:true, admin:{ settings:true, tax:true, pricing:true, payments:true, billingSettings:true, currency:true, print:true, features:true, restaurants:true, staff:true, orderManagement:true, offers:true, loyalty:true, googleReviews:true, whatsapp:true }, completeBill:true, invoice:true, customers:true, offers:true },
   manager:  { dashboard:true, history:true, tables:true, menu:true, analytics:true, inventory:true, kot:true, admin:false, completeBill:true, invoice:true, customers:true, offers:true },
   waiter:   { dashboard:true, history:true, tables:true, menu:true, analytics:false, inventory:false, kot:false, admin:false, completeBill:false, invoice:false, customers:false, offers:false },
   cashier:  { dashboard:true, history:true, tables:false, menu:true, analytics:false, inventory:false, kot:false, admin:false, completeBill:true, invoice:true, customers:false, offers:false },
@@ -16938,7 +16965,7 @@ app.get('/api/smart-suggestions/:restaurantId', authenticateToken, async (req, r
 const ADMIN_TAB_OPS = [
   'settings', 'tax', 'pricing', 'payments', 'billingSettings',
   'currency', 'print', 'features', 'restaurants', 'staff',
-  'orderManagement', 'offers', 'loyalty', 'googleReviews'
+  'orderManagement', 'offers', 'loyalty', 'googleReviews', 'whatsapp'
 ];
 
 const FEATURE_OPS = {
@@ -27012,26 +27039,39 @@ app.post('/api/automation/webhook/whatsapp', async (req, res) => {
                   text: processedMessage.text?.substring(0, 50) || 'N/A'
                 });
 
-                // Find restaurant by phone number or business account
+                // Find restaurant by phoneNumberId from webhook metadata
                 try {
-                  // Try to find restaurant settings that might match
-                  // This is a simplified approach - you might want to store phone mapping
-                  const settingsSnapshot = await db.collection(collections.automationSettings)
-                    .where('type', '==', 'whatsapp')
-                    .where('connected', '==', true)
-                    .get();
+                  const incomingPhoneNumberId = value?.metadata?.phone_number_id;
+                  let settingsSnapshot;
 
-                  // Log incoming message for all connected restaurants
-                  // In production, you'd want to match by phone number or business account ID
+                  if (incomingPhoneNumberId) {
+                    // Match by specific phone number ID
+                    settingsSnapshot = await db.collection(collections.automationSettings)
+                      .where('type', '==', 'whatsapp')
+                      .where('connected', '==', true)
+                      .where('phoneNumberId', '==', incomingPhoneNumberId)
+                      .get();
+                  }
+
+                  // Fallback: get all connected restaurants (for dineopen mode)
+                  if (!settingsSnapshot || settingsSnapshot.empty) {
+                    settingsSnapshot = await db.collection(collections.automationSettings)
+                      .where('type', '==', 'whatsapp')
+                      .where('connected', '==', true)
+                      .get();
+                  }
+
                   for (const settingDoc of settingsSnapshot.docs) {
                     const setting = settingDoc.data();
-                    
-                    // Log incoming message
+
                     await db.collection(collections.automationLogs).add({
                       restaurantId: setting.restaurantId,
                       type: 'incoming',
+                      direction: 'incoming',
                       phone: processedMessage.from,
+                      contactName: processedMessage.contactName || '',
                       message: processedMessage.text,
+                      messageType: processedMessage.type,
                       messageId: processedMessage.messageId,
                       timestamp: new Date(),
                       status: 'received'
@@ -27056,6 +27096,246 @@ app.post('/api/automation/webhook/whatsapp', async (req, res) => {
     console.error('❌ Webhook processing error:', error);
     // Still return 200 to prevent Meta from retrying
     res.sendStatus(200);
+  }
+});
+
+// ==================== WhatsApp Bill Sending & Messages ====================
+
+// Send bill via WhatsApp
+app.post('/api/automation/:restaurantId/whatsapp/send-bill', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+    const { customerPhone, customerName, amount, orderId, invoiceText, restaurantName } = req.body;
+
+    if (!customerPhone) {
+      return res.status(400).json({ error: 'Customer phone number is required' });
+    }
+
+    // Get WhatsApp settings
+    const snapshot = await db.collection(collections.automationSettings)
+      .where('restaurantId', '==', restaurantId)
+      .where('type', '==', 'whatsapp')
+      .limit(1)
+      .get();
+
+    if (snapshot.empty || !snapshot.docs[0].data().connected) {
+      return res.status(400).json({ error: 'WhatsApp not connected. Please connect WhatsApp first from Admin settings.' });
+    }
+
+    const whatsappSettings = snapshot.docs[0].data();
+
+    // Get credentials based on mode
+    let credentials;
+    if (whatsappSettings.mode === 'dineopen') {
+      credentials = {
+        accessToken: process.env.DINEOPEN_WHATSAPP_ACCESS_TOKEN,
+        phoneNumberId: whatsappSettings.phoneNumberId || '879916941871710',
+        businessAccountId: process.env.DINEOPEN_WHATSAPP_BUSINESS_ACCOUNT_ID
+      };
+    } else {
+      credentials = {
+        accessToken: whatsappSettings.accessToken,
+        phoneNumberId: whatsappSettings.phoneNumberId || '879916941871710',
+        businessAccountId: whatsappSettings.businessAccountId
+      };
+    }
+
+    if (!credentials.accessToken) {
+      return res.status(400).json({ error: 'WhatsApp access token not configured' });
+    }
+
+    await whatsappService.initialize(restaurantId, credentials);
+
+    // Build bill message
+    const billMessage = invoiceText ||
+      `🧾 *Bill from ${restaurantName || 'Restaurant'}*\n\n` +
+      (customerName ? `Customer: ${customerName}\n` : '') +
+      (orderId ? `Order: #${orderId}\n` : '') +
+      `*Total: ₹${Number(amount || 0).toFixed(2)}*\n\n` +
+      `Thank you for dining with us! 🙏\n\n` +
+      `_Powered by DineOpen_`;
+
+    const sendResult = await whatsappService.sendTextMessage(customerPhone, billMessage);
+
+    if (sendResult.success) {
+      // Log the sent bill
+      await db.collection(collections.automationLogs).add({
+        restaurantId,
+        type: 'bill_sent',
+        phone: customerPhone,
+        customerName: customerName || '',
+        message: billMessage,
+        messageId: sendResult.messageId,
+        orderId: orderId || '',
+        amount: amount || 0,
+        direction: 'outgoing',
+        status: 'sent',
+        timestamp: new Date()
+      });
+
+      res.json({ success: true, messageId: sendResult.messageId, message: 'Bill sent on WhatsApp!' });
+    } else {
+      res.status(500).json({ success: false, error: sendResult.error || 'Failed to send bill' });
+    }
+  } catch (error) {
+    console.error('Send bill WhatsApp error:', error);
+    res.status(500).json({ error: 'Failed to send bill: ' + error.message });
+  }
+});
+
+// Get WhatsApp messages/conversations for a restaurant
+app.get('/api/automation/:restaurantId/whatsapp/messages', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+    const { page = 1, limit = 50, phone } = req.query;
+    const pageNum = parseInt(page);
+    const limitNum = Math.min(parseInt(limit) || 50, 200);
+
+    let query = db.collection(collections.automationLogs)
+      .where('restaurantId', '==', restaurantId)
+      .orderBy('timestamp', 'desc')
+      .limit(limitNum);
+
+    // Filter by phone if provided
+    if (phone) {
+      query = db.collection(collections.automationLogs)
+        .where('restaurantId', '==', restaurantId)
+        .where('phone', '==', phone)
+        .orderBy('timestamp', 'desc')
+        .limit(limitNum);
+    }
+
+    const snapshot = await query.get();
+    const messages = snapshot.docs.map(doc => ({
+      id: doc.id,
+      ...doc.data(),
+      timestamp: doc.data().timestamp?.toDate?.() || doc.data().timestamp
+    }));
+
+    // Group by phone number for conversation view
+    const conversations = {};
+    for (const msg of messages) {
+      const phoneKey = msg.phone || 'unknown';
+      if (!conversations[phoneKey]) {
+        conversations[phoneKey] = {
+          phone: phoneKey,
+          customerName: msg.customerName || msg.contactName || '',
+          messages: [],
+          lastMessage: msg.message || '',
+          lastTimestamp: msg.timestamp,
+          unreadCount: 0
+        };
+      }
+      conversations[phoneKey].messages.push(msg);
+      if (msg.type === 'incoming' && msg.status !== 'read_by_staff') {
+        conversations[phoneKey].unreadCount++;
+      }
+    }
+
+    res.json({
+      success: true,
+      messages,
+      conversations: Object.values(conversations),
+      total: messages.length
+    });
+  } catch (error) {
+    console.error('Get WhatsApp messages error:', error);
+    res.status(500).json({ error: 'Failed to get messages' });
+  }
+});
+
+// Reply to a WhatsApp message (free-form text within 24h window)
+app.post('/api/automation/:restaurantId/whatsapp/reply', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+    const { phone, message } = req.body;
+
+    if (!phone || !message) {
+      return res.status(400).json({ error: 'Phone and message are required' });
+    }
+
+    // Get WhatsApp settings
+    const snapshot = await db.collection(collections.automationSettings)
+      .where('restaurantId', '==', restaurantId)
+      .where('type', '==', 'whatsapp')
+      .limit(1)
+      .get();
+
+    if (snapshot.empty || !snapshot.docs[0].data().connected) {
+      return res.status(400).json({ error: 'WhatsApp not connected' });
+    }
+
+    const whatsappSettings = snapshot.docs[0].data();
+    let credentials;
+    if (whatsappSettings.mode === 'dineopen') {
+      credentials = {
+        accessToken: process.env.DINEOPEN_WHATSAPP_ACCESS_TOKEN,
+        phoneNumberId: whatsappSettings.phoneNumberId || '879916941871710',
+        businessAccountId: process.env.DINEOPEN_WHATSAPP_BUSINESS_ACCOUNT_ID
+      };
+    } else {
+      credentials = {
+        accessToken: whatsappSettings.accessToken,
+        phoneNumberId: whatsappSettings.phoneNumberId || '879916941871710',
+        businessAccountId: whatsappSettings.businessAccountId
+      };
+    }
+
+    if (!credentials.accessToken) {
+      return res.status(400).json({ error: 'WhatsApp access token not configured' });
+    }
+
+    await whatsappService.initialize(restaurantId, credentials);
+    const sendResult = await whatsappService.sendTextMessage(phone, message);
+
+    if (sendResult.success) {
+      await db.collection(collections.automationLogs).add({
+        restaurantId,
+        type: 'reply',
+        phone,
+        message,
+        messageId: sendResult.messageId,
+        direction: 'outgoing',
+        status: 'sent',
+        timestamp: new Date()
+      });
+
+      res.json({ success: true, messageId: sendResult.messageId });
+    } else {
+      res.status(500).json({ success: false, error: sendResult.error || 'Failed to send reply' });
+    }
+  } catch (error) {
+    console.error('WhatsApp reply error:', error);
+    res.status(500).json({ error: 'Failed to send reply' });
+  }
+});
+
+// Mark messages as read by staff
+app.post('/api/automation/:restaurantId/whatsapp/mark-read', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+    const { phone } = req.body;
+
+    if (!phone) {
+      return res.status(400).json({ error: 'Phone is required' });
+    }
+
+    const snapshot = await db.collection(collections.automationLogs)
+      .where('restaurantId', '==', restaurantId)
+      .where('phone', '==', phone)
+      .where('type', '==', 'incoming')
+      .get();
+
+    const batch = db.batch();
+    snapshot.docs.forEach(doc => {
+      batch.update(doc.ref, { status: 'read_by_staff' });
+    });
+    await batch.commit();
+
+    res.json({ success: true, markedCount: snapshot.docs.length });
+  } catch (error) {
+    console.error('Mark read error:', error);
+    res.status(500).json({ error: 'Failed to mark messages as read' });
   }
 });
 
