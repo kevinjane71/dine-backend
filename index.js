@@ -13847,6 +13847,10 @@ app.get('/api/auth/me', authenticateToken, async (req, res) => {
     const userData = userDoc.data();
     console.log('✅ User found, data keys:', Object.keys(userData));
     
+    // Staff users should always default to their assigned restaurant
+    const isStaffUser = req.user.source === 'staffUsers';
+    const staffDefaultRestaurantId = isStaffUser ? (userData.restaurantId || null) : (userData.defaultRestaurantId || null);
+
     const responseData = {
       id: userDoc.id,
       userId: userId,
@@ -13855,7 +13859,7 @@ app.get('/api/auth/me', authenticateToken, async (req, res) => {
       phone: userData.phone || null,
       role: userData.role || null,
       restaurantId: userData.restaurantId || null,
-      defaultRestaurantId: userData.defaultRestaurantId || null,
+      defaultRestaurantId: staffDefaultRestaurantId,
       language: userData.language || null,
       permissions: userData.permissions || {},
       pageAccess: userData.pageAccess || null,
@@ -13897,9 +13901,11 @@ app.patch('/api/user/preferences', authenticateToken, async (req, res) => {
 app.get('/api/user/profile', authenticateToken, async (req, res) => {
   try {
     const userId = req.user.userId;
-    
-    const userDoc = await db.collection(collections.users).doc(userId).get();
-    
+
+    // Check the right collection based on JWT source
+    const collName = req.user.source === 'staffUsers' ? collections.staffUsers : collections.users;
+    const userDoc = await db.collection(collName).doc(userId).get();
+
     if (!userDoc.exists) {
       return res.status(404).json({ error: 'User not found' });
     }
