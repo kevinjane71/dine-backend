@@ -5413,6 +5413,24 @@ app.post('/api/restaurants', authenticateToken, async (req, res) => {
       return res.status(400).json({ error: 'Restaurant name is required' });
     }
 
+    // Duplicate check: if user already has a restaurant with the same name, return it
+    const existingQuery = await db.collection(collections.restaurants)
+      .where('ownerId', '==', userId)
+      .where('name', '==', name.trim())
+      .limit(1)
+      .get();
+
+    if (!existingQuery.empty) {
+      const existingDoc = existingQuery.docs[0];
+      const existingData = existingDoc.data();
+      const { qrCode, menu, ...safeData } = existingData;
+      return res.status(200).json({
+        message: 'Restaurant already exists',
+        restaurant: { id: existingDoc.id, ...safeData },
+        existing: true
+      });
+    }
+
     // Generate subdomain for the restaurant
     const subdomain = await generateSubdomain(name, 'temp'); // We'll update with actual ID after creation
     
