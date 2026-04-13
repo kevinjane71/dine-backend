@@ -5,8 +5,14 @@ const { authenticateToken, requireOwnerRole } = require('../middleware/auth');
 
 // ============================================
 // OWNER CHAIN DASHBOARD APIs
-// All endpoints require owner role
+// All endpoints require owner (or admin co-owner) role
 // ============================================
+
+// Admin staff have ownerId in JWT pointing to their owner's userId.
+// Owner users use their own userId. This helper resolves the correct ownerId for queries.
+function getOwnerId(req) {
+  return req.user.role === 'admin' ? req.user.ownerId : (req.user.userId || req.user.id);
+}
 
 /**
  * GET /api/owner/dashboard
@@ -14,7 +20,7 @@ const { authenticateToken, requireOwnerRole } = require('../middleware/auth');
  */
 router.get('/dashboard', authenticateToken, requireOwnerRole, async (req, res) => {
   try {
-    const userId = req.user.userId || req.user.id;
+    const userId = getOwnerId(req);
 
     console.log(`📊 Owner Dashboard: Fetching data for owner ${userId}`);
 
@@ -230,7 +236,7 @@ router.get('/dashboard', authenticateToken, requireOwnerRole, async (req, res) =
  */
 router.get('/analytics', authenticateToken, requireOwnerRole, async (req, res) => {
   try {
-    const userId = req.user.userId || req.user.id;
+    const userId = getOwnerId(req);
     const { period = '7d', startDate, endDate } = req.query;
     let restaurantIds = req.query.restaurantIds || req.query['restaurantIds[]'];
 
@@ -479,7 +485,7 @@ router.get('/analytics', authenticateToken, requireOwnerRole, async (req, res) =
  */
 router.get('/staff', authenticateToken, requireOwnerRole, async (req, res) => {
   try {
-    const userId = req.user.userId || req.user.id;
+    const userId = getOwnerId(req);
     const { role, status, search, page = 1, limit = 50 } = req.query; // Default 50 for scalability
     let restaurantIds = req.query.restaurantIds || req.query['restaurantIds[]'];
 
@@ -620,7 +626,7 @@ router.get('/staff', authenticateToken, requireOwnerRole, async (req, res) => {
  */
 router.get('/menu-items', authenticateToken, requireOwnerRole, async (req, res) => {
   try {
-    const userId = req.user.userId || req.user.id;
+    const userId = getOwnerId(req);
     const { category, search, page = 1, limit = 100 } = req.query; // Default 100 for menu items
     let restaurantIds = req.query.restaurantIds || req.query['restaurantIds[]'];
 
@@ -730,7 +736,7 @@ router.get('/menu-items', authenticateToken, requireOwnerRole, async (req, res) 
  */
 router.get('/inventory', authenticateToken, requireOwnerRole, async (req, res) => {
   try {
-    const userId = req.user.userId || req.user.id;
+    const userId = getOwnerId(req);
     const { stockStatus, category, search, page = 1, limit = 50 } = req.query; // Default 50 for pagination
     let restaurantIds = req.query.restaurantIds || req.query['restaurantIds[]'];
 
@@ -879,7 +885,7 @@ router.get('/inventory', authenticateToken, requireOwnerRole, async (req, res) =
  */
 router.patch('/staff/:staffId/status', authenticateToken, requireOwnerRole, async (req, res) => {
   try {
-    const userId = req.user.userId || req.user.id;
+    const userId = getOwnerId(req);
     const { staffId } = req.params;
     const { status } = req.body;
 

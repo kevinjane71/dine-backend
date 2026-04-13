@@ -244,7 +244,7 @@ const requireManagerRole = (req, res, next) => {
  * Require owner role
  */
 const requireOwnerRole = (req, res, next) => {
-  if (req.userRole !== 'owner') {
+  if (req.userRole !== 'owner' && req.userRole !== 'admin') {
     return res.status(403).json({
       success: false,
       error: 'Access denied: Owner role required'

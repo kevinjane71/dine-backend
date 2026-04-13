@@ -270,6 +270,70 @@ router.get('/users', authenticateSuperAdmin, async (req, res) => {
   }
 });
 
+// ─── Lookup user by email or phone ──────────────────────────────────
+// Must be BEFORE /users/:userId so Express doesn't match "lookup" as a userId
+router.get('/users/lookup', authenticateSuperAdmin, async (req, res) => {
+  try {
+    const { email, phone } = req.query;
+    if (!email && !phone) {
+      return res.status(400).json({ success: false, error: 'Provide email or phone to search' });
+    }
+
+    let userDoc = null;
+
+    if (email) {
+      const snap = await db.collection(collections.users)
+        .where('email', '==', email.trim())
+        .limit(1)
+        .get();
+      if (!snap.empty) userDoc = snap.docs[0];
+    }
+
+    if (!userDoc && phone) {
+      const phoneTrimmed = phone.trim();
+      const snap = await db.collection(collections.users)
+        .where('phone', '==', phoneTrimmed)
+        .limit(1)
+        .get();
+      if (!snap.empty) userDoc = snap.docs[0];
+    }
+
+    if (!userDoc) {
+      return res.status(404).json({ success: false, error: 'User not found' });
+    }
+
+    const userData = userDoc.data();
+    const user = {
+      id: userDoc.id,
+      name: userData.name || '',
+      email: userData.email || '',
+      phone: userData.phone || '',
+      role: userData.role || '',
+      createdAt: toISO(userData.createdAt),
+    };
+
+    // Fetch restaurants
+    const restaurantsSnap = await db.collection(collections.restaurants)
+      .where('ownerId', '==', userDoc.id)
+      .get();
+
+    const restaurants = restaurantsSnap.docs.map(doc => {
+      const d = doc.data();
+      return {
+        id: doc.id,
+        name: d.name || '',
+        subdomain: d.subdomain || '',
+        createdAt: toISO(d.createdAt),
+      };
+    });
+
+    res.json({ success: true, user, restaurants });
+  } catch (error) {
+    console.error('Super admin user lookup error:', error);
+    res.status(500).json({ success: false, error: 'Failed to lookup user' });
+  }
+});
+
 // ─── User Detail ─────────────────────────────────────────────────────
 // Paginated orders with limit+cursor
 router.get('/users/:userId', authenticateSuperAdmin, async (req, res) => {
@@ -357,6 +421,157 @@ router.get('/users/:userId', authenticateSuperAdmin, async (req, res) => {
   } catch (error) {
     console.error('Super admin user detail error:', error);
     res.status(500).json({ success: false, error: 'Failed to fetch user details' });
+  }
+});
+
+// ─── Delete User + Associated Restaurants ────────────────────────────
+// Step 1: Preview — GET /users/:userId/delete-preview
+// Returns the user and all owned restaurants so admin can confirm
+router.get('/users/:userId/delete-preview', authenticateSuperAdmin, async (req, res) => {
+  try {
+    const { userId } = req.params;
+
+    const userDoc = await db.collection(collections.users).doc(userId).get();
+    if (!userDoc.exists) {
+      return res.status(404).json({ success: false, error: 'User not found' });
+    }
+
+    const userData = userDoc.data();
+    const user = {
+      id: userDoc.id,
+      name: userData.name || '',
+      email: userData.email || '',
+      phone: userData.phone || '',
+      role: userData.role || '',
+      createdAt: toISO(userData.createdAt),
+    };
+
+    // Fetch all restaurants owned by this user
+    const restaurantsSnap = await db.collection(collections.restaurants)
+      .where('ownerId', '==', userId)
+      .get();
+
+    const restaurants = restaurantsSnap.docs.map(doc => {
+      const d = doc.data();
+      return {
+        id: doc.id,
+        name: d.name || '',
+        subdomain: d.subdomain || '',
+        createdAt: toISO(d.createdAt),
+      };
+    });
+
+    res.json({ success: true, user, restaurants });
+  } catch (error) {
+    console.error('Super admin delete preview error:', error);
+    res.status(500).json({ success: false, error: 'Failed to fetch delete preview' });
+  }
+});
+
+// Step 2: Execute delete — DELETE /users/:userId
+// Hard-deletes the user and all associated data (restaurants, orders, staff, menus, etc.)
+router.delete('/users/:userId', authenticateSuperAdmin, async (req, res) => {
+  try {
+    const { userId } = req.params;
+
+    const userDoc = await db.collection(collections.users).doc(userId).get();
+    if (!userDoc.exists) {
+      return res.status(404).json({ success: false, error: 'User not found' });
+    }
+
+    const userData = userDoc.data();
+    const userName = userData.name || userData.email || userId;
+
+    // Get all restaurants owned by this user
+    const restaurantsSnap = await db.collection(collections.restaurants)
+      .where('ownerId', '==', userId)
+      .get();
+
+    const restaurantIds = restaurantsSnap.docs.map(doc => doc.id);
+    const restaurantNames = restaurantsSnap.docs.map(doc => doc.data().name || doc.id);
+
+    // Collections that reference restaurantId
+    const restaurantLinkedCollections = [
+      collections.orders,
+      collections.menuItems,
+      collections.tables,
+      collections.floors,
+      collections.staffUsers,
+      collections.restaurantSettings,
+      collections.customers,
+      collections.bookings,
+      'dailyStats',
+      collections.savedCarts,
+    ];
+
+    let totalDeleted = 0;
+    const deletionLog = {};
+
+    // Delete all restaurant-linked data
+    for (const restaurantId of restaurantIds) {
+      for (const collName of restaurantLinkedCollections) {
+        try {
+          const snap = await db.collection(collName)
+            .where('restaurantId', '==', restaurantId)
+            .select()  // Don't fetch full docs, just IDs
+            .get();
+
+          if (snap.empty) continue;
+
+          // Batch delete (max 500 per batch)
+          const docs = snap.docs;
+          for (let i = 0; i < docs.length; i += 450) {
+            const batch = db.batch();
+            const chunk = docs.slice(i, i + 450);
+            chunk.forEach(doc => batch.delete(doc.ref));
+            await batch.commit();
+          }
+
+          const count = docs.length;
+          totalDeleted += count;
+          if (!deletionLog[collName]) deletionLog[collName] = 0;
+          deletionLog[collName] += count;
+        } catch (err) {
+          console.warn(`Warning: Failed to delete from ${collName} for restaurant ${restaurantId}:`, err.message);
+        }
+      }
+    }
+
+    // Delete the restaurant documents themselves
+    for (const doc of restaurantsSnap.docs) {
+      await doc.ref.delete();
+      totalDeleted++;
+    }
+
+    // Delete userRestaurants mapping docs for this user
+    try {
+      const userRestSnap = await db.collection(collections.userRestaurants)
+        .where('userId', '==', userId)
+        .get();
+      for (const doc of userRestSnap.docs) {
+        await doc.ref.delete();
+        totalDeleted++;
+      }
+    } catch (err) {
+      console.warn('Warning: Failed to delete userRestaurants:', err.message);
+    }
+
+    // Finally, delete the user document
+    await db.collection(collections.users).doc(userId).delete();
+    totalDeleted++;
+
+    console.log(`🗑️ Super admin DELETED user "${userName}" (${userId}) + ${restaurantIds.length} restaurants. Total docs deleted: ${totalDeleted}`);
+
+    res.json({
+      success: true,
+      deletedUser: { id: userId, name: userName },
+      deletedRestaurants: restaurantNames,
+      totalDocsDeleted: totalDeleted,
+      deletionLog,
+    });
+  } catch (error) {
+    console.error('Super admin delete user error:', error);
+    res.status(500).json({ success: false, error: error.message || 'Failed to delete user' });
   }
 });
 

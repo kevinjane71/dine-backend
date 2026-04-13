@@ -11203,6 +11203,14 @@ app.delete('/api/orders/:orderId', authenticateToken, async (req, res) => {
       }
     }
 
+    // For admin (co-owner), verify the order's restaurant belongs to their owner
+    if (role === 'admin') {
+      const restaurant = await db.collection(collections.restaurants).doc(order.restaurantId).get();
+      if (!restaurant.exists || restaurant.data().ownerId !== req.user.ownerId) {
+        hasAccess = false;
+      }
+    }
+
     // For staff roles (manager, cashier), verify they belong to the restaurant
     if (['manager', 'cashier'].includes(role?.toLowerCase())) {
       const userDoc = await db.collection(collections.users).doc(userId).get();
@@ -12448,6 +12456,11 @@ app.post('/api/tables/:restaurantId/bulk', authenticateToken, async (req, res) =
 
 app.patch('/api/tables/:tableId/status', authenticateToken, async (req, res) => {
   try {
+    // Permission: tables.update
+    if (!(await checkFeaturePermission(req, 'tables', 'update'))) {
+      return res.status(403).json({ error: 'Access denied. Tables update permission required.' });
+    }
+
     const { tableId } = req.params;
     const { status, orderId, restaurantId } = req.body;
 
@@ -12796,6 +12809,11 @@ app.get('/api/floors/:restaurantId', async (req, res) => {
 // Create new floor (creates floor implicitly when adding tables)
 app.post('/api/floors/:restaurantId', authenticateToken, async (req, res) => {
   try {
+    // Permission: tables.add (floors are part of table/layout management)
+    if (!(await checkFeaturePermission(req, 'tables', 'add'))) {
+      return res.status(403).json({ error: 'Access denied. Tables add permission required.' });
+    }
+
     const { restaurantId } = req.params;
     const { name, description, section, areaChargeType, areaChargeValue } = req.body;
 
@@ -12850,6 +12868,11 @@ app.post('/api/floors/:restaurantId', authenticateToken, async (req, res) => {
 // Update floor (rename all tables on this floor)
 app.patch('/api/floors/:floorId', authenticateToken, async (req, res) => {
   try {
+    // Permission: tables.update (floors are part of table/layout management)
+    if (!(await checkFeaturePermission(req, 'tables', 'update'))) {
+      return res.status(403).json({ error: 'Access denied. Tables update permission required.' });
+    }
+
     const { floorId } = req.params;
     const { name, restaurantId, description, section, areaChargeType, areaChargeValue } = req.body;
 
@@ -12932,6 +12955,11 @@ app.patch('/api/floors/:floorId', authenticateToken, async (req, res) => {
 // Delete floor (delete all tables on this floor)
 app.delete('/api/floors/:floorId', authenticateToken, async (req, res) => {
   try {
+    // Permission: tables.delete (floors are part of table/layout management)
+    if (!(await checkFeaturePermission(req, 'tables', 'delete'))) {
+      return res.status(403).json({ error: 'Access denied. Tables delete permission required.' });
+    }
+
     const { floorId } = req.params;
     const { restaurantId } = req.query;
 
@@ -13437,7 +13465,7 @@ app.get('/api/analytics/:restaurantId', authenticateToken, async (req, res) => {
 
 // Staff Management APIs
 const requireOwnerRole = (req, res, next) => {
-  if (req.user.role !== 'owner') {
+  if (req.user.role !== 'owner' && req.user.role !== 'admin') {
     return res.status(403).json({ error: 'Access denied. Owner role required.' });
   }
   next();
@@ -13644,6 +13672,10 @@ app.delete('/api/staff/:staffId', authenticateToken, requireOwnerRole, async (re
 });
 
 // Role-based default page access for staff creation
+// SYNC: This object is duplicated in 3 places — keep all in sync:
+//   1. dine-backend/index.js (HERE — canonical source, used for staff creation)
+//   2. dine-frontend/src/app/(dashboard)/admin/page.js (used for role change UI)
+//   3. dine-app/components/StaffManagement.js (used for mobile staff management)
 const ROLE_DEFAULT_PAGE_ACCESS = {
   admin:    { dashboard:true, history:true, tables:true, menu:true, analytics:true, inventory:true, kot:true, admin:{ settings:true, tax:true, pricing:true, payments:true, billingSettings:true, currency:true, print:true, features:true, restaurants:true, staff:true, orderManagement:true, offers:true, loyalty:true, googleReviews:true, whatsapp:true }, completeBill:true, invoice:true, customers:true, offers:true },
   manager:  { dashboard:true, history:true, tables:true, menu:true, analytics:true, inventory:true, kot:true, admin:false, completeBill:true, invoice:true, customers:true, offers:true },
@@ -13862,10 +13894,11 @@ app.post('/api/staff/:staffId/restaurants', authenticateToken, requireOwnerRole,
       return res.status(400).json({ error: 'Multi-restaurant assignment is only available for admin staff.' });
     }
 
-    // Verify restaurant belongs to this owner
+    // Verify restaurant belongs to this owner (admin uses ownerId from JWT)
     const restDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
     if (!restDoc.exists) return res.status(404).json({ error: 'Restaurant not found' });
-    if (restDoc.data().ownerId !== req.user.userId) {
+    const callerOwnerId = req.user.role === 'admin' ? req.user.ownerId : req.user.userId;
+    if (restDoc.data().ownerId !== callerOwnerId) {
       return res.status(403).json({ error: 'Restaurant does not belong to you.' });
     }
 
@@ -14913,6 +14946,11 @@ app.put('/api/admin/print-settings/:restaurantId', authenticateToken, async (req
 // Generate invoice for an order
 app.post('/api/invoice/generate/:orderId', authenticateToken, async (req, res) => {
   try {
+    // Permission: orders.completeBill (invoice generation is part of billing)
+    if (!(await checkFeaturePermission(req, 'orders', 'completeBill'))) {
+      return res.status(403).json({ error: 'Access denied. Complete bill permission required.' });
+    }
+
     const { orderId } = req.params;
     const userId = req.user.userId;
 
@@ -17024,7 +17062,7 @@ async function checkFeaturePermission(req, feature, operation) {
     if (!userDoc.exists) userDoc = await db.collection(collections.users).doc(userId).get();
 
     if (!userDoc.exists) {
-      return role === 'manager'; // manager default: allow
+      return false; // no user doc = no access (secure by default)
     }
 
     const pageAccess = userDoc.data()?.pageAccess;
@@ -17040,17 +17078,14 @@ async function checkFeaturePermission(req, feature, operation) {
     const perms = resolveFeaturePerms(pageAccess, feature);
     if (perms[operation]) return true;
 
-    // Manager fallback: if feature key not present at all, allow
-    if (role === 'manager' && pageAccess?.[feature] === undefined) return true;
-
     return false;
-  } catch {
-    return role === 'manager'; // on error, managers allowed
+  } catch (err) {
+    console.error(`Permission check error for ${feature}.${operation}:`, err.message);
+    return false; // on error, deny access (secure by default)
   }
 }
 
-// Backward-compatible aliases
-function resolveInventoryPerms(pageAccess) { return resolveFeaturePerms(pageAccess, 'inventory'); }
+// Convenience alias for inventory permission checks
 async function checkInventoryPermission(req, operation) { return checkFeaturePermission(req, 'inventory', operation); }
 
 // Get all inventory items for a restaurant
@@ -18156,6 +18191,11 @@ app.get('/api/inventory/:restaurantId/wastage', authenticateToken, async (req, r
 // POST - Log a waste entry (manual, or called internally by audit/production/expiry)
 app.post('/api/inventory/:restaurantId/waste-entries', authenticateToken, async (req, res) => {
   try {
+    // Permission: inventory.update (waste modifies stock levels)
+    if (!(await checkFeaturePermission(req, 'inventory', 'update'))) {
+      return res.status(403).json({ error: 'Access denied. Inventory update permission required.' });
+    }
+
     const { restaurantId } = req.params;
     const { userId } = req.user;
     const { itemId, itemName, quantity, unit, reason, notes, source, costPerUnit, batchId } = req.body;
@@ -18318,6 +18358,11 @@ app.get('/api/inventory/:restaurantId/waste-entries', authenticateToken, async (
 // POST - Submit stock audit (physical count)
 app.post('/api/inventory/:restaurantId/stock-audits', authenticateToken, async (req, res) => {
   try {
+    // Permission: inventory.update (audits adjust stock levels)
+    if (!(await checkFeaturePermission(req, 'inventory', 'update'))) {
+      return res.status(403).json({ error: 'Access denied. Inventory update permission required.' });
+    }
+
     const { restaurantId } = req.params;
     const { userId } = req.user;
     const { items, notes } = req.body;
@@ -18463,6 +18508,11 @@ app.get('/api/inventory/:restaurantId/stock-audits', authenticateToken, async (r
 // POST - Log production entry (morning prep)
 app.post('/api/inventory/:restaurantId/production-entries', authenticateToken, async (req, res) => {
   try {
+    // Permission: inventory.add (production creates stock)
+    if (!(await checkFeaturePermission(req, 'inventory', 'add'))) {
+      return res.status(403).json({ error: 'Access denied. Inventory add permission required.' });
+    }
+
     const { restaurantId } = req.params;
     const { userId } = req.user;
     const { itemId, itemName, producedQty, unit, costPerUnit, recipeId, notes } = req.body;
@@ -18543,6 +18593,11 @@ app.post('/api/inventory/:restaurantId/production-entries', authenticateToken, a
 // PUT - Close production entry (EOD: enter closing stock → compute waste)
 app.put('/api/inventory/:restaurantId/production-entries/:entryId/close', authenticateToken, async (req, res) => {
   try {
+    // Permission: inventory.update (closing production adjusts stock)
+    if (!(await checkFeaturePermission(req, 'inventory', 'update'))) {
+      return res.status(403).json({ error: 'Access denied. Inventory update permission required.' });
+    }
+
     const { restaurantId, entryId } = req.params;
     const { userId } = req.user;
     const { closingStock, notes } = req.body;
@@ -19524,7 +19579,7 @@ app.post('/api/suppliers/:restaurantId', authenticateToken, async (req, res) => 
     const { restaurantId } = req.params;
     const { userId, role } = req.user;
     
-    if (role !== 'owner' && role !== 'manager') {
+    if (role !== 'owner' && role !== 'admin' && role !== 'manager') {
       return res.status(403).json({ error: 'Access denied. Owner or manager privileges required.' });
     }
 
@@ -19599,7 +19654,7 @@ app.post('/api/recipes/:restaurantId', authenticateToken, async (req, res) => {
     const { restaurantId } = req.params;
     const { userId, role } = req.user;
     
-    if (role !== 'owner' && role !== 'manager') {
+    if (role !== 'owner' && role !== 'admin' && role !== 'manager') {
       return res.status(403).json({ error: 'Access denied. Owner or manager privileges required.' });
     }
 
@@ -19697,7 +19752,7 @@ app.patch('/api/recipes/:restaurantId/:recipeId', authenticateToken, async (req,
     const { restaurantId, recipeId } = req.params;
     const { userId, role } = req.user;
     
-    if (role !== 'owner' && role !== 'manager') {
+    if (role !== 'owner' && role !== 'admin' && role !== 'manager') {
       return res.status(403).json({ error: 'Access denied. Owner or manager privileges required.' });
     }
 
@@ -19727,7 +19782,7 @@ app.delete('/api/recipes/:restaurantId/:recipeId', authenticateToken, async (req
     const { restaurantId, recipeId } = req.params;
     const { userId, role } = req.user;
     
-    if (role !== 'owner' && role !== 'manager') {
+    if (role !== 'owner' && role !== 'admin' && role !== 'manager') {
       return res.status(403).json({ error: 'Access denied. Owner or manager privileges required.' });
     }
 
@@ -19788,7 +19843,7 @@ app.post('/api/purchase-orders/:restaurantId', authenticateToken, async (req, re
     const { restaurantId } = req.params;
     const { userId, role } = req.user;
     
-    if (role !== 'owner' && role !== 'manager') {
+    if (role !== 'owner' && role !== 'admin' && role !== 'manager') {
       return res.status(403).json({ error: 'Access denied. Owner or manager privileges required.' });
     }
 
@@ -19838,7 +19893,7 @@ app.patch('/api/purchase-orders/:restaurantId/:orderId', authenticateToken, asyn
     const { restaurantId, orderId } = req.params;
     const { userId, role } = req.user;
     
-    if (role !== 'owner' && role !== 'manager') {
+    if (role !== 'owner' && role !== 'admin' && role !== 'manager') {
       return res.status(403).json({ error: 'Access denied. Owner or manager privileges required.' });
     }
 
@@ -20038,7 +20093,7 @@ app.post('/api/purchase-orders/:restaurantId/:orderId/email', authenticateToken,
     const { userId, role } = req.user;
     const { supplierEmail, supplierName } = req.body;
     
-    if (role !== 'owner' && role !== 'manager') {
+    if (role !== 'owner' && role !== 'admin' && role !== 'manager') {
       return res.status(403).json({ error: 'Access denied. Owner or manager privileges required.' });
     }
 
@@ -20176,7 +20231,7 @@ app.post('/api/grn/:restaurantId', authenticateToken, async (req, res) => {
     const { restaurantId } = req.params;
     const { userId, role } = req.user;
     
-    if (role !== 'owner' && role !== 'manager' && role !== 'staff') {
+    if (role !== 'owner' && role !== 'admin' && role !== 'manager' && role !== 'staff') {
       return res.status(403).json({ error: 'Access denied' });
     }
 
@@ -20290,7 +20345,7 @@ app.patch('/api/grn/:restaurantId/:grnId', authenticateToken, async (req, res) =
     const { restaurantId, grnId } = req.params;
     const { userId, role } = req.user;
     
-    if (role !== 'owner' && role !== 'manager') {
+    if (role !== 'owner' && role !== 'admin' && role !== 'manager') {
       return res.status(403).json({ error: 'Access denied' });
     }
 
@@ -20427,7 +20482,7 @@ app.patch('/api/purchase-requisitions/:restaurantId/:reqId', authenticateToken, 
     const { restaurantId, reqId } = req.params;
     const { userId, role } = req.user;
     
-    if (role !== 'owner' && role !== 'manager') {
+    if (role !== 'owner' && role !== 'admin' && role !== 'manager') {
       return res.status(403).json({ error: 'Access denied. Owner or manager privileges required.' });
     }
 
@@ -20532,7 +20587,7 @@ app.post('/api/purchase-requisitions/:restaurantId/:reqId/convert-to-po', authen
     const { restaurantId, reqId } = req.params;
     const { userId, role } = req.user;
     
-    if (role !== 'owner' && role !== 'manager') {
+    if (role !== 'owner' && role !== 'admin' && role !== 'manager') {
       return res.status(403).json({ error: 'Access denied' });
     }
 
@@ -20670,7 +20725,7 @@ app.post('/api/supplier-invoices/:restaurantId', authenticateToken, upload.singl
     const { restaurantId } = req.params;
     const { userId, role } = req.user;
     
-    if (role !== 'owner' && role !== 'manager') {
+    if (role !== 'owner' && role !== 'admin' && role !== 'manager') {
       return res.status(403).json({ error: 'Access denied' });
     }
 
@@ -20780,7 +20835,7 @@ app.post('/api/supplier-invoices/:restaurantId/generate-from-po', authenticateTo
     const { userId, role } = req.user;
     const { purchaseOrderId } = req.body;
     
-    if (role !== 'owner' && role !== 'manager') {
+    if (role !== 'owner' && role !== 'admin' && role !== 'manager') {
       return res.status(403).json({ error: 'Access denied' });
     }
 
@@ -20893,7 +20948,7 @@ app.post('/api/supplier-invoices/:restaurantId/:invoiceId/match', authenticateTo
     const { restaurantId, invoiceId } = req.params;
     const { userId, role } = req.user;
     
-    if (role !== 'owner' && role !== 'manager') {
+    if (role !== 'owner' && role !== 'admin' && role !== 'manager') {
       return res.status(403).json({ error: 'Access denied' });
     }
 
@@ -20999,7 +21054,7 @@ app.patch('/api/supplier-invoices/:restaurantId/:invoiceId', authenticateToken, 
     const { restaurantId, invoiceId } = req.params;
     const { userId, role } = req.user;
     
-    if (role !== 'owner' && role !== 'manager') {
+    if (role !== 'owner' && role !== 'admin' && role !== 'manager') {
       return res.status(403).json({ error: 'Access denied' });
     }
 
@@ -21066,7 +21121,7 @@ app.patch('/api/suppliers/:restaurantId/:supplierId', authenticateToken, async (
     const { restaurantId, supplierId } = req.params;
     const { userId, role } = req.user;
     
-    if (role !== 'owner' && role !== 'manager') {
+    if (role !== 'owner' && role !== 'admin' && role !== 'manager') {
       return res.status(403).json({ error: 'Access denied' });
     }
 
@@ -21105,7 +21160,7 @@ app.delete('/api/suppliers/:restaurantId/:supplierId', authenticateToken, async 
     const { restaurantId, supplierId } = req.params;
     const { userId, role } = req.user;
     
-    if (role !== 'owner' && role !== 'manager') {
+    if (role !== 'owner' && role !== 'admin' && role !== 'manager') {
       return res.status(403).json({ error: 'Access denied' });
     }
 
@@ -21377,7 +21432,7 @@ app.post('/api/ai/invoice-ocr/:restaurantId', authenticateToken, async (req, res
     const { restaurantId } = req.params;
     const { userId, role } = req.user;
     
-    if (role !== 'owner' && role !== 'manager') {
+    if (role !== 'owner' && role !== 'admin' && role !== 'manager') {
       return res.status(403).json({ error: 'Access denied' });
     }
 
@@ -21553,7 +21608,7 @@ app.post('/api/supplier-returns/:restaurantId', authenticateToken, async (req, r
     const { restaurantId } = req.params;
     const { userId, role } = req.user;
     
-    if (role !== 'owner' && role !== 'manager') {
+    if (role !== 'owner' && role !== 'admin' && role !== 'manager') {
       return res.status(403).json({ error: 'Access denied' });
     }
 
@@ -21607,7 +21662,7 @@ app.patch('/api/supplier-returns/:restaurantId/:returnId', authenticateToken, as
     const { restaurantId, returnId } = req.params;
     const { userId, role } = req.user;
     
-    if (role !== 'owner' && role !== 'manager') {
+    if (role !== 'owner' && role !== 'admin' && role !== 'manager') {
       return res.status(403).json({ error: 'Access denied' });
     }
 
@@ -21667,7 +21722,7 @@ app.delete('/api/supplier-returns/:restaurantId/:returnId', authenticateToken, a
     const { restaurantId, returnId } = req.params;
     const { userId, role } = req.user;
     
-    if (role !== 'owner' && role !== 'manager') {
+    if (role !== 'owner' && role !== 'admin' && role !== 'manager') {
       return res.status(403).json({ error: 'Access denied' });
     }
 
@@ -21753,7 +21808,7 @@ app.post('/api/stock-transfers/:restaurantId', authenticateToken, async (req, re
     const { restaurantId } = req.params;
     const { userId, role } = req.user;
     
-    if (role !== 'owner' && role !== 'manager') {
+    if (role !== 'owner' && role !== 'admin' && role !== 'manager') {
       return res.status(403).json({ error: 'Access denied' });
     }
 
@@ -21817,7 +21872,7 @@ app.patch('/api/stock-transfers/:restaurantId/:transferId', authenticateToken, a
     const { restaurantId, transferId } = req.params;
     const { userId, role } = req.user;
     
-    if (role !== 'owner' && role !== 'manager') {
+    if (role !== 'owner' && role !== 'admin' && role !== 'manager') {
       return res.status(403).json({ error: 'Access denied' });
     }
 
@@ -21908,7 +21963,7 @@ app.delete('/api/stock-transfers/:restaurantId/:transferId', authenticateToken, 
     const { restaurantId, transferId } = req.params;
     const { userId, role } = req.user;
     
-    if (role !== 'owner' && role !== 'manager') {
+    if (role !== 'owner' && role !== 'admin' && role !== 'manager') {
       return res.status(403).json({ error: 'Access denied' });
     }
 
@@ -22162,6 +22217,12 @@ app.get('/api/books/:restaurantId/expenses', authenticateToken, async (req, res)
 
 app.post('/api/books/:restaurantId/expenses', authenticateToken, async (req, res) => {
   try {
+    // Only owner, admin, and manager can manage expenses
+    const { role } = req.user;
+    if (role !== 'owner' && role !== 'admin' && role !== 'manager') {
+      return res.status(403).json({ error: 'Access denied. Only owners, admins, and managers can manage expenses.' });
+    }
+
     const { restaurantId } = req.params;
     const { category, amount, date, description, paymentMethod, receiptUrl, isRecurring, recurringFrequency, vendor } = req.body;
 
@@ -22195,6 +22256,12 @@ app.post('/api/books/:restaurantId/expenses', authenticateToken, async (req, res
 
 app.patch('/api/books/:restaurantId/expenses/:expenseId', authenticateToken, async (req, res) => {
   try {
+    // Only owner, admin, and manager can manage expenses
+    const { role } = req.user;
+    if (role !== 'owner' && role !== 'admin' && role !== 'manager') {
+      return res.status(403).json({ error: 'Access denied. Only owners, admins, and managers can manage expenses.' });
+    }
+
     const { restaurantId, expenseId } = req.params;
     const updates = req.body;
 
@@ -22222,6 +22289,12 @@ app.patch('/api/books/:restaurantId/expenses/:expenseId', authenticateToken, asy
 
 app.delete('/api/books/:restaurantId/expenses/:expenseId', authenticateToken, async (req, res) => {
   try {
+    // Only owner, admin, and manager can manage expenses
+    const { role } = req.user;
+    if (role !== 'owner' && role !== 'admin' && role !== 'manager') {
+      return res.status(403).json({ error: 'Access denied. Only owners, admins, and managers can manage expenses.' });
+    }
+
     const { restaurantId, expenseId } = req.params;
     const docRef = db.collection(collections.expenses).doc(expenseId);
     const doc = await docRef.get();
@@ -25035,6 +25108,11 @@ app.post('/api/orders/:orderId/refund', authenticateToken, async (req, res) => {
 // Record partial payment for an order
 app.post('/api/orders/:orderId/partial-payment', authenticateToken, async (req, res) => {
   try {
+    // Permission: orders.completeBill (partial payment is part of billing)
+    if (!(await checkFeaturePermission(req, 'orders', 'completeBill'))) {
+      return res.status(403).json({ error: 'Access denied. Complete bill permission required.' });
+    }
+
     const { orderId } = req.params;
     const { paidAmount, customerId, paymentMethod } = req.body;
 
@@ -25542,6 +25620,11 @@ app.get('/api/categories/:restaurantId', authenticateToken, async (req, res) => 
 // Create new category
 app.post('/api/categories/:restaurantId', authenticateToken, async (req, res) => {
   try {
+    // Permission: menu.add (categories are part of menu management)
+    if (!(await checkFeaturePermission(req, 'menu', 'add'))) {
+      return res.status(403).json({ error: 'Access denied. Menu add permission required.' });
+    }
+
     const { restaurantId } = req.params;
     const { name, emoji = '🍽️', description = '' } = req.body;
 
@@ -25597,6 +25680,11 @@ app.post('/api/categories/:restaurantId', authenticateToken, async (req, res) =>
 // Update category
 app.patch('/api/categories/:restaurantId/:categoryId', authenticateToken, async (req, res) => {
   try {
+    // Permission: menu.update
+    if (!(await checkFeaturePermission(req, 'menu', 'update'))) {
+      return res.status(403).json({ error: 'Access denied. Menu update permission required.' });
+    }
+
     const { restaurantId, categoryId } = req.params;
     const { name, emoji, description } = req.body;
 
@@ -25646,6 +25734,11 @@ app.patch('/api/categories/:restaurantId/:categoryId', authenticateToken, async 
 // Delete category
 app.delete('/api/categories/:restaurantId/:categoryId', authenticateToken, async (req, res) => {
   try {
+    // Permission: menu.delete
+    if (!(await checkFeaturePermission(req, 'menu', 'delete'))) {
+      return res.status(403).json({ error: 'Access denied. Menu delete permission required.' });
+    }
+
     const { restaurantId, categoryId } = req.params;
 
     // Get restaurant document
