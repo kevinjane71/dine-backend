@@ -31,68 +31,185 @@ class EmailService {
     this.templates = {
       // Welcome email for new users
       welcome: {
-        subject: 'Welcome to DineOpen - Your AI-Powered Restaurant Management System',
-        
+        getSubject: (userData) => `Hey ${userData.name} — Welcome aboard! Let's set up your restaurant`,
+
         text: (userData) => `
-Dear ${userData.name},
+Hey ${userData.name}!
 
-Welcome to DineOpen! 🎉
+I'm personally reaching out to welcome you to DineOpen.
 
-You've made the right choice. Your restaurant is about to become smarter, more efficient, and more profitable.
+You're not just another sign-up — you're special to us. We built DineOpen because we believe restaurant owners like you should focus on great food and happy customers, not wrestle with complicated tech.
 
-Get started by setting up your first restaurant and watch your business transform.
+Quick favor — reply to this email with your restaurant menu (photo, PDF, or even a screenshot). Our AI will digitize it in seconds and we'll get your account fully set up.
 
-Best regards,
-The DineOpen Team`,
+Here's what you now have access to:
+
+- AI-Powered POS & Billing
+- WhatsApp Ordering (customers order via WhatsApp!)
+- Smart Inventory Management
+- Kitchen Display System (KDS)
+- QR Code Digital Menu
+- GST-Compliant Invoicing
+- Customer Loyalty Programs
+- AI Insights & Analytics
+
+Simple pricing for everything you need — no hidden fees, no surprises.
+See plans: https://www.dineopen.com/pricing
+
+Need anything at all? We're here for you:
+Email: Reply to this email
+Call/WhatsApp: +91 95286 32779
+
+Let's make your restaurant management effortless.
+
+Cheers,
+Vivek & Team DineOpen
+https://www.dineopen.com`,
 
         html: (userData) => `
 <!DOCTYPE html>
 <html>
-<body style="font-family: 'Segoe UI', Arial, sans-serif; line-height: 1.6; color: #333; margin: 0; padding: 0; background-color: #f5f7fa;">
-  <div style="max-width: 600px; margin: 0 auto; background-color: #ffffff; border-radius: 12px; overflow: hidden; box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1);">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"></head>
+<body style="margin:0;padding:0;background-color:#f3f4f6;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;">
+  <div style="max-width:540px;margin:24px auto;background:white;border-radius:20px;overflow:hidden;box-shadow:0 4px 24px rgba(0,0,0,0.08);">
+
     <!-- Header -->
-    <div style="background: linear-gradient(135deg, #ef4444 0%, #dc2626 100%); padding: 40px 20px; text-align: center;">
-      <h1 style="color: #ffffff; margin: 0; font-size: 28px; letter-spacing: 0.5px;">Welcome to DineOpen</h1>
-      <p style="color: #fecaca; margin-top: 10px; font-size: 16px;">
-        Your AI-Powered Restaurant Management System
+    <div style="background:linear-gradient(135deg,#ef4444,#dc2626);padding:36px 28px 32px;text-align:center;">
+      <div style="display:inline-block;background:white;width:52px;height:52px;border-radius:14px;line-height:52px;margin-bottom:16px;">
+        <span style="color:#ef4444;font-weight:800;font-size:22px;">DO</span>
+      </div>
+      <h1 style="margin:0;color:white;font-size:26px;font-weight:800;letter-spacing:-0.5px;">Hey ${userData.name}!</h1>
+      <p style="margin:8px 0 0;color:rgba(255,255,255,0.9);font-size:15px;">Welcome to DineOpen — we're thrilled to have you</p>
+    </div>
+
+    <!-- Personal Note -->
+    <div style="padding:28px 28px 0;">
+      <p style="margin:0 0 16px;color:#1f2937;font-size:16px;line-height:1.7;">
+        I'm personally reaching out because <strong>you're not just another sign-up</strong> — you're special to us.
+      </p>
+      <p style="margin:0 0 16px;color:#4b5563;font-size:15px;line-height:1.7;">
+        We built DineOpen so restaurant owners like you can <strong style="color:#1f2937;">focus on great food and happy customers</strong>, not wrestle with complicated software and expensive tech.
+      </p>
+      <p style="margin:0;color:#4b5563;font-size:15px;line-height:1.7;">
+        We want to upload your menu and make your restaurant management seamless — so you can focus on day-to-day operations rather than dealing with tech issues.
       </p>
     </div>
 
-    <!-- Main Content -->
-    <div style="padding: 40px 30px;">
-      <h2 style="color: #dc2626; margin: 0 0 20px 0; font-size: 24px; font-weight: 600;">
-        Dear ${userData.name},
-      </h2>
-      
-      <div style="background: linear-gradient(135deg, #fef2f2 0%, #fef7f7 100%); border-left: 4px solid #dc2626; padding: 25px; border-radius: 8px; margin: 25px 0;">
-        <p style="margin: 0; font-size: 18px; color: #374151; font-weight: 500;">
-          🎉 <strong>You've made the right choice.</strong>
+    <!-- Send Menu CTA -->
+    <div style="padding:24px 28px;">
+      <div style="background:linear-gradient(135deg,#fef2f2,#fff7ed);border:2px solid #fecaca;border-radius:16px;padding:24px;text-align:center;">
+        <div style="font-size:32px;margin-bottom:10px;">📸</div>
+        <p style="margin:0 0 6px;color:#1f2937;font-size:17px;font-weight:700;">Share your restaurant menu</p>
+        <p style="margin:0 0 16px;color:#6b7280;font-size:14px;line-height:1.5;">Just reply to this email with a photo, PDF, or screenshot of your menu. Our AI will digitize it in seconds!</p>
+        <a href="mailto:info@dineopen.com?subject=Menu%20for%20${encodeURIComponent(userData.name)}" style="text-decoration:none;display:inline-block;background:linear-gradient(135deg,#ef4444,#dc2626);color:white;padding:12px 28px;border-radius:10px;font-size:15px;font-weight:700;box-shadow:0 4px 12px rgba(239,68,68,0.3);">Reply with My Menu</a>
+      </div>
+    </div>
+
+    <!-- Features Grid -->
+    <div style="padding:0 28px 24px;">
+      <p style="margin:0 0 16px;color:#1f2937;font-size:16px;font-weight:700;">Everything you get with DineOpen:</p>
+      <table width="100%" cellpadding="0" cellspacing="0" style="border-collapse:separate;border-spacing:8px;">
+        <tr>
+          <td style="background:#f9fafb;border-radius:10px;padding:14px 16px;width:50%;vertical-align:top;">
+            <div style="font-size:18px;margin-bottom:4px;">🧾</div>
+            <div style="font-size:13px;font-weight:600;color:#1f2937;">AI-Powered Billing</div>
+            <div style="font-size:11px;color:#6b7280;margin-top:2px;">GST-ready invoices</div>
+          </td>
+          <td style="background:#f9fafb;border-radius:10px;padding:14px 16px;width:50%;vertical-align:top;">
+            <div style="font-size:18px;margin-bottom:4px;">💬</div>
+            <div style="font-size:13px;font-weight:600;color:#1f2937;">WhatsApp Ordering</div>
+            <div style="font-size:11px;color:#6b7280;margin-top:2px;">Customers order via chat</div>
+          </td>
+        </tr>
+        <tr>
+          <td style="background:#f9fafb;border-radius:10px;padding:14px 16px;vertical-align:top;">
+            <div style="font-size:18px;margin-bottom:4px;">📦</div>
+            <div style="font-size:13px;font-weight:600;color:#1f2937;">Smart Inventory</div>
+            <div style="font-size:11px;color:#6b7280;margin-top:2px;">Auto stock tracking</div>
+          </td>
+          <td style="background:#f9fafb;border-radius:10px;padding:14px 16px;vertical-align:top;">
+            <div style="font-size:18px;margin-bottom:4px;">🍳</div>
+            <div style="font-size:13px;font-weight:600;color:#1f2937;">Kitchen Display</div>
+            <div style="font-size:11px;color:#6b7280;margin-top:2px;">Real-time KDS</div>
+          </td>
+        </tr>
+        <tr>
+          <td style="background:#f9fafb;border-radius:10px;padding:14px 16px;vertical-align:top;">
+            <div style="font-size:18px;margin-bottom:4px;">📱</div>
+            <div style="font-size:13px;font-weight:600;color:#1f2937;">QR Code Menu</div>
+            <div style="font-size:11px;color:#6b7280;margin-top:2px;">Digital menu for tables</div>
+          </td>
+          <td style="background:#f9fafb;border-radius:10px;padding:14px 16px;vertical-align:top;">
+            <div style="font-size:18px;margin-bottom:4px;">❤️</div>
+            <div style="font-size:13px;font-weight:600;color:#1f2937;">Loyalty Program</div>
+            <div style="font-size:11px;color:#6b7280;margin-top:2px;">Keep customers coming back</div>
+          </td>
+        </tr>
+        <tr>
+          <td style="background:#f9fafb;border-radius:10px;padding:14px 16px;vertical-align:top;">
+            <div style="font-size:18px;margin-bottom:4px;">🤖</div>
+            <div style="font-size:13px;font-weight:600;color:#1f2937;">AI Insights</div>
+            <div style="font-size:11px;color:#6b7280;margin-top:2px;">Smart analytics daily</div>
+          </td>
+          <td style="background:#f9fafb;border-radius:10px;padding:14px 16px;vertical-align:top;">
+            <div style="font-size:18px;margin-bottom:4px;">🏪</div>
+            <div style="font-size:13px;font-weight:600;color:#1f2937;">Multi-Outlet</div>
+            <div style="font-size:11px;color:#6b7280;margin-top:2px;">Manage all locations</div>
+          </td>
+        </tr>
+      </table>
+    </div>
+
+    <!-- Pricing Teaser -->
+    <div style="padding:0 28px 24px;">
+      <div style="background:linear-gradient(135deg,#1f2937,#111827);border-radius:14px;padding:24px;text-align:center;">
+        <p style="margin:0 0 6px;color:rgba(255,255,255,0.7);font-size:12px;text-transform:uppercase;letter-spacing:1px;font-weight:600;">Simple pricing</p>
+        <p style="margin:0 0 4px;color:white;font-size:18px;font-weight:700;">Everything you need. One plan. No surprises.</p>
+        <p style="margin:0 0 16px;color:rgba(255,255,255,0.6);font-size:13px;">Zero transaction fees. Zero hidden costs.</p>
+        <a href="https://www.dineopen.com/pricing" style="text-decoration:none;display:inline-block;background:white;color:#ef4444;padding:10px 24px;border-radius:8px;font-size:14px;font-weight:700;">See Pricing →</a>
+      </div>
+    </div>
+
+    <!-- Divider -->
+    <div style="height:1px;background:#f1f5f9;margin:0 28px;"></div>
+
+    <!-- Support Section -->
+    <div style="padding:24px 28px;">
+      <p style="margin:0 0 12px;color:#1f2937;font-size:15px;font-weight:600;">Need anything? Count on us.</p>
+      <table width="100%" cellpadding="0" cellspacing="0">
+        <tr>
+          <td style="padding:8px 0;">
+            <span style="color:#6b7280;font-size:14px;">📧 Email:</span>
+            <span style="color:#1f2937;font-size:14px;font-weight:500;margin-left:8px;">Just reply to this email</span>
+          </td>
+        </tr>
+        <tr>
+          <td style="padding:8px 0;">
+            <span style="color:#6b7280;font-size:14px;">📞 Call/WhatsApp:</span>
+            <a href="tel:+919528632779" style="color:#ef4444;font-size:14px;font-weight:700;text-decoration:none;margin-left:8px;">+91 95286 32779</a>
+          </td>
+        </tr>
+      </table>
+    </div>
+
+    <!-- Personal Sign-off -->
+    <div style="padding:0 28px 28px;">
+      <div style="background:#f9fafb;border-radius:12px;padding:20px;">
+        <p style="margin:0;color:#4b5563;font-size:14px;line-height:1.6;font-style:italic;">
+          "We built DineOpen to make restaurant tech affordable and simple. You focus on your food — we'll handle the rest."
         </p>
-        <p style="margin: 15px 0 0 0; font-size: 16px; color: #6b7280;">
-          Your restaurant is about to become smarter, more efficient, and more profitable.
+        <p style="margin:12px 0 0;color:#1f2937;font-size:14px;font-weight:700;">
+          Cheers,<br>Vivek & Team DineOpen
         </p>
       </div>
-
-      <div style="text-align: center; margin: 35px 0;">
-        <div style="background: linear-gradient(135deg, #dc2626 0%, #b91c1c 100%); color: white; padding: 15px 30px; border-radius: 25px; display: inline-block; font-weight: 600; font-size: 16px; text-decoration: none; box-shadow: 0 4px 12px rgba(220, 38, 38, 0.3);">
-          Get Started Now →
-        </div>
-      </div>
-
-      <p style="text-align: center; margin: 30px 0 0 0; font-size: 14px; color: #9ca3af;">
-        Watch your business transform with AI-powered insights and automation.
-      </p>
     </div>
 
     <!-- Footer -->
-    <div style="background-color: #F3F4F6; padding: 24px; text-align: center; border-top: 1px solid #E5E7EB;">
-      <p style="color: #6B7280; margin: 0; font-size: 14px;">© ${new Date().getFullYear()} DineOpen. AI-Powered Restaurant Management.</p>
-      <div style="margin-top: 16px;">
-        <a href="https://www.dineopen.com/help" style="color: #ef4444; text-decoration: none; margin: 0 8px; font-size: 14px;">Help Center</a>
-        <a href="https://www.dineopen.com/privacy" style="color: #ef4444; text-decoration: none; margin: 0 8px; font-size: 14px;">Privacy Policy</a>
-        <a href="https://www.dineopen.com/support" style="color: #ef4444; text-decoration: none; margin: 0 8px; font-size: 14px;">Support</a>
-      </div>
+    <div style="padding:20px 28px;background:#f9fafb;border-top:1px solid #f1f5f9;text-align:center;">
+      <a href="https://www.dineopen.com" style="color:#ef4444;text-decoration:none;font-weight:700;font-size:13px;">dineopen.com</a>
+      <p style="margin:6px 0 0;font-size:11px;color:#9ca3af;">© ${new Date().getFullYear()} DineOpen. AI-Powered Restaurant Management.</p>
     </div>
+
   </div>
 </body>
 </html>`
@@ -526,7 +643,7 @@ DineOpen Analytics Team`,
     const template = this.templates.welcome;
     return this.sendEmail({
       to: userData.email,
-      subject: template.subject,
+      subject: template.getSubject(userData),
       text: template.text(userData),
       html: template.html(userData)
     });
