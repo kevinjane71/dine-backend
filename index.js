@@ -4085,10 +4085,147 @@ app.post('/api/auth/google', async (req, res) => {
   }
 });
 
+// ==================== APPLE SIGN-IN ====================
+app.post('/api/auth/apple', async (req, res) => {
+  try {
+    const { uid, email, name, picture } = req.body;
+
+    console.log('🍎 Apple login debug:');
+    console.log('🍎 UID:', uid);
+    console.log('🍎 Email:', email);
+    console.log('🍎 Name:', name);
+
+    if (!uid || !email) {
+      return res.status(400).json({ error: 'Missing required user data' });
+    }
+
+    // Trust Firebase Auth - Apple identity token already verified by Firebase
+    // Smart linking: Check by email first
+    let userDoc = await db.collection(collections.users)
+      .where('email', '==', email)
+      .get();
+
+    let userId;
+    let isNewUser = false;
+    let hasRestaurants = false;
+
+    console.log('🍎 Apple login debug - User exists by email:', !userDoc.empty);
+
+    if (userDoc.empty) {
+      console.log('🆕 NEW Apple user detected - will send welcome email');
+      // New Apple user - assume restaurant owner
+      const newUser = {
+        email,
+        name: name || 'Restaurant Owner',
+        picture: picture || '',
+        appleUid: uid, // Store Apple UID for future reference
+        role: 'owner',
+        emailVerified: true, // Apple verifies email
+        phoneVerified: false,
+        provider: 'apple',
+        setupComplete: false,
+        createdAt: new Date(),
+        updatedAt: new Date()
+      };
+
+      const userRef = await db.collection(collections.users).add(newUser);
+      userId = userRef.id;
+      isNewUser = true;
+
+      console.log('✅ New Apple user created:', userId);
+      hasRestaurants = false;
+
+      // Create default free-trial subscription for new user
+      await createDefaultSubscription(userId, email, null, 'owner');
+
+      // Send welcome email to new Apple users
+      try {
+        if (emailService && emailService.sendWelcomeEmail) {
+          const userData = {
+            email: email,
+            name: name || 'Restaurant Owner',
+            userId: userId
+          };
+          const emailResult = await emailService.sendWelcomeEmail(userData);
+          console.log(`✅ Welcome email sent successfully to ${email}:`, emailResult);
+        }
+      } catch (emailError) {
+        console.error('❌ Apple welcome email error:', emailError.message);
+        // Don't fail the login if email sending fails
+      }
+    } else {
+      // Existing user login - smart linking
+      userId = userDoc.docs[0].id;
+      const userData = userDoc.docs[0].data();
+
+      // Update user with Apple info - smart linking
+      const updateData = {
+        updatedAt: new Date(),
+        appleUid: uid // Store Apple UID for future reference
+      };
+
+      // Update picture only if user doesn't have one (Apple rarely provides pictures)
+      if (picture && !userData.picture) {
+        updateData.picture = picture;
+      }
+
+      // Ensure email is set and verified
+      if (!userData.email) {
+        updateData.email = email.toLowerCase().trim();
+        updateData.emailVerified = true;
+      } else if (userData.email.toLowerCase().trim() === email.toLowerCase().trim()) {
+        if (!userData.emailVerified) {
+          updateData.emailVerified = true;
+        }
+      }
+
+      await userDoc.docs[0].ref.update(updateData);
+
+      // Check if owner has restaurants
+      const restaurantsQuery = await db.collection(collections.restaurants)
+        .where('ownerId', '==', userId)
+        .limit(1)
+        .get();
+
+      hasRestaurants = !restaurantsQuery.empty;
+    }
+
+    const userRole = userDoc.empty ? 'owner' : userDoc.docs[0].data().role;
+
+    const jwtToken = jwt.sign(
+      { userId, email, role: userRole },
+      process.env.JWT_SECRET,
+      { expiresIn: '30d' }
+    );
+
+    res.json({
+      success: true,
+      message: isNewUser ? 'Welcome! Account created successfully.' : 'Apple login successful',
+      token: jwtToken,
+      user: {
+        id: userId,
+        email,
+        name: name || (userDoc.empty ? 'Restaurant Owner' : userDoc.docs[0].data().name),
+        picture: picture || (userDoc.empty ? '' : userDoc.docs[0].data().picture || ''),
+        role: userRole,
+        setupComplete: userDoc.empty ? true : userDoc.docs[0].data().setupComplete || false
+      },
+      firstTimeUser: isNewUser,
+      isNewUser,
+      hasRestaurants,
+      redirectTo: hasRestaurants ? '/home' : '/admin'
+    });
+
+  } catch (error) {
+    console.error('Apple auth error:', error);
+    res.status(500).json({ error: 'Apple authentication failed' });
+  }
+});
+
 // Health check endpoint
 app.get('/api/health', (req, res) => {
-  res.json({ 
-    status: 'OK', 
+  res.json({
+    status: 'OK',
     timestamp: new Date().toISOString(),
     environment: process.env.NODE_ENV || 'development',
     uptime: process.uptime()
@@ -8164,6 +8301,7 @@ app.post('/api/orders', async (req, res) => {
       appliedOffer: appliedOffer,
       appliedOffers: appliedOffers,
       loyaltyPointsRedeemed: loyaltyPointsRedeemed,
+      redeemLoyaltyPoints: redeemLoyaltyPoints || 0,
       loyaltyPointsEarned: loyaltyPointsEarned,
       taxAmount: Math.round(taxAmount * 100) / 100,
       taxBreakdown: taxBreakdown, // Save individual tax lines for historical accuracy
@@ -8384,21 +8522,36 @@ app.post('/api/orders', async (req, res) => {
           }
         }
 
+        const isCompletedOrder = orderData.status === 'completed';
+
         if (existingCustomer) {
           // Update existing customer
           customerId = existingCustomer.id;
           const custData = existingCustomer.data();
-          const existingHistory = custData.orderHistory || [];
-          const newHistory = [...existingHistory, orderHistoryEntry];
-          await existingCustomer.ref.update({
-            name: customerInfo.name || custData.name,
-            orderHistory: newHistory,
-            totalOrders: newHistory.length,
-            totalSpent: newHistory.reduce((s, o) => s + (o.finalAmount || o.totalAmount || 0), 0),
-            lastOrderDate: new Date(),
-            updatedAt: new Date()
-          });
-          console.log(`👤 Existing customer updated: ${customerId} — now ${newHistory.length} orders`);
+
+          if (isCompletedOrder) {
+            // Direct billing — add to order history and update stats immediately
+            const existingHistory = custData.orderHistory || [];
+            const newHistory = [...existingHistory, orderHistoryEntry];
+            await existingCustomer.ref.update({
+              name: customerInfo.name || custData.name,
+              orderHistory: newHistory,
+              totalOrders: newHistory.length,
+              totalSpent: newHistory.reduce((s, o) => s + (o.finalAmount || o.totalAmount || 0), 0),
+              lastOrderDate: new Date(),
+              updatedAt: new Date()
+            });
+            console.log(`👤 Existing customer updated (completed): ${customerId} — now ${newHistory.length} orders`);
+          } else {
+            // Kitchen order — only link customer (name update), don't add to stats
+            // Stats will be updated when billing is completed via PATCH endpoint
+            await existingCustomer.ref.update({
+              name: customerInfo.name || custData.name,
+              lastOrderDate: new Date(),
+              updatedAt: new Date()
+            });
+            console.log(`👤 Existing customer linked (kitchen order): ${customerId} — stats deferred to billing`);
+          }
         } else if (customerInfo.phone) {
           // Only create new customer when phone number is provided
           const newCustData = {
@@ -8408,16 +8561,22 @@ app.post('/api/orders', async (req, res) => {
             city: customerInfo.city || null,
             dob: customerInfo.dob || null,
             restaurantId,
-            orderHistory: [orderHistoryEntry],
-            totalOrders: 1,
-            totalSpent: Math.round(finalAmount * 100) / 100,
+            ...(isCompletedOrder ? {
+              orderHistory: [orderHistoryEntry],
+              totalOrders: 1,
+              totalSpent: Math.round(finalAmount * 100) / 100,
+            } : {
+              orderHistory: [],
+              totalOrders: 0,
+              totalSpent: 0,
+            }),
             lastOrderDate: new Date(),
             createdAt: new Date(),
             updatedAt: new Date()
           };
           const newCustRef = await db.collection(collections.customers).add(newCustData);
           customerId = newCustRef.id;
-          console.log(`👤 New customer created: ${customerId}`);
+          console.log(`👤 New customer created: ${customerId}${isCompletedOrder ? ' (with stats)' : ' (kitchen order, stats deferred)'}`);
         } else {
           console.log(`⏭️ Skipping customer creation — no phone number provided (walk-in order)`);
         }
@@ -10035,6 +10194,13 @@ app.patch('/api/orders/:orderId/status', authenticateToken, async (req, res) => 
           completedAt: new Date()
         }).catch(err => console.error('Billing print Pusher notification error (non-blocking):', err));
       }
+    }
+
+    // Fire-and-forget: send invoice email to customer if enabled
+    if (status === 'completed') {
+      const invoiceEmailService = require('./invoiceEmailService');
+      invoiceEmailService.sendInvoiceEmail({ orderId, restaurantId: orderData.restaurantId })
+        .catch(err => console.error('Invoice email error (non-blocking):', err.message));
     }
 
     res.json({ message: 'Order status updated successfully' });
@@ -24950,6 +25116,7 @@ app.get('/api/restaurants/:restaurantId/billing-settings', authenticateToken, as
       managerPin: existing.managerPin || '',
       refundsEnabled: existing.refundsEnabled ?? false,
       refundsRequireApproval: existing.refundsRequireApproval ?? true,
+      emailInvoiceEnabled: existing.emailInvoiceEnabled ?? false,
     };
 
     res.json({ settings: billingSettings });
@@ -24997,6 +25164,7 @@ app.put('/api/restaurants/:restaurantId/billing-settings', authenticateToken, as
       managerPin: settings.managerPin || '',
       refundsEnabled: settings.refundsEnabled ?? false,
       refundsRequireApproval: settings.refundsRequireApproval ?? true,
+      emailInvoiceEnabled: settings.emailInvoiceEnabled ?? false,
       updatedAt: new Date(),
     };
 
