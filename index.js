@@ -27215,7 +27215,7 @@ app.post('/api/automation/:restaurantId/whatsapp/connect', authenticateToken, as
       // Get DineOpen's WhatsApp credentials from environment or config
       const dineopenAccessToken = process.env.DINEOPEN_WHATSAPP_ACCESS_TOKEN;
       // Use hardcoded phone number ID for now
-      const dineopenPhoneNumberId = '879916941871710';
+      const dineopenPhoneNumberId = '1031077533431121';
       const dineopenBusinessAccountId = process.env.DINEOPEN_WHATSAPP_BUSINESS_ACCOUNT_ID;
 
       if (!dineopenAccessToken) {
@@ -27297,13 +27297,13 @@ app.post('/api/automation/:restaurantId/whatsapp/test', authenticateToken, async
     if (whatsappSettings.mode === 'dineopen') {
       credentials = {
         accessToken: process.env.DINEOPEN_WHATSAPP_ACCESS_TOKEN,
-        phoneNumberId: '879916941871710', // Hardcoded
+        phoneNumberId: '1031077533431121', // Hardcoded
         businessAccountId: process.env.DINEOPEN_WHATSAPP_BUSINESS_ACCOUNT_ID
       };
     } else {
       credentials = {
         accessToken: whatsappSettings.accessToken,
-        phoneNumberId: '879916941871710', // Hardcoded
+        phoneNumberId: '1031077533431121', // Hardcoded
         businessAccountId: whatsappSettings.businessAccountId
       };
     }
@@ -27415,13 +27415,13 @@ app.post('/api/automation/:restaurantId/whatsapp/send-bill', authenticateToken, 
     if (whatsappSettings.mode === 'dineopen') {
       credentials = {
         accessToken: process.env.DINEOPEN_WHATSAPP_ACCESS_TOKEN,
-        phoneNumberId: whatsappSettings.phoneNumberId || '879916941871710',
+        phoneNumberId: whatsappSettings.phoneNumberId || '1031077533431121',
         businessAccountId: process.env.DINEOPEN_WHATSAPP_BUSINESS_ACCOUNT_ID
       };
     } else {
       credentials = {
         accessToken: whatsappSettings.accessToken,
-        phoneNumberId: whatsappSettings.phoneNumberId || '879916941871710',
+        phoneNumberId: whatsappSettings.phoneNumberId || '1031077533431121',
         businessAccountId: whatsappSettings.businessAccountId
       };
     }
@@ -27556,13 +27556,13 @@ app.post('/api/automation/:restaurantId/whatsapp/reply', authenticateToken, asyn
     if (whatsappSettings.mode === 'dineopen') {
       credentials = {
         accessToken: process.env.DINEOPEN_WHATSAPP_ACCESS_TOKEN,
-        phoneNumberId: whatsappSettings.phoneNumberId || '879916941871710',
+        phoneNumberId: whatsappSettings.phoneNumberId || '1031077533431121',
         businessAccountId: process.env.DINEOPEN_WHATSAPP_BUSINESS_ACCOUNT_ID
       };
     } else {
       credentials = {
         accessToken: whatsappSettings.accessToken,
-        phoneNumberId: whatsappSettings.phoneNumberId || '879916941871710',
+        phoneNumberId: whatsappSettings.phoneNumberId || '1031077533431121',
         businessAccountId: whatsappSettings.businessAccountId
       };
     }

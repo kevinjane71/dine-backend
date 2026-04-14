@@ -10,7 +10,7 @@ class WhatsAppService {
     this.baseURL = 'https://graph.facebook.com/v22.0';
     this.accessToken = null;
     // Hardcoded phone number ID for now
-    this.phoneNumberId = '879916941871710';
+    this.phoneNumberId = '1031077533431121';
     this.businessAccountId = null;
   }
 
@@ -20,7 +20,7 @@ class WhatsAppService {
   async initialize(restaurantId, credentials) {
     this.accessToken = credentials.accessToken;
     // Use hardcoded phone number ID, or override if provided
-    this.phoneNumberId = credentials.phoneNumberId || '879916941871710';
+    this.phoneNumberId = credentials.phoneNumberId || '1031077533431121';
     this.businessAccountId = credentials.businessAccountId;
     this.restaurantId = restaurantId;
   }
