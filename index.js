@@ -7296,8 +7296,8 @@ app.post('/api/public/orders/:restaurantId', vercelSecurityMiddleware.publicAPI,
       const pointsToRedeem = Math.min(redeemLoyaltyPoints, availablePoints);
 
       if (pointsToRedeem > 0) {
-        // Calculate discount value from points
-        const redemptionRate = loyaltySettings.redemptionRate || 100; // 100 points = Rs 1
+        // Dynamic: points / redemptionRate = discount (1=1pt:₹1, 10=10pts:₹1, 100=100pts:₹1)
+        const redemptionRate = loyaltySettings.redemptionRate || 1;
         loyaltyDiscount = pointsToRedeem / redemptionRate;
 
         // Cap at max redemption percent of subtotal
@@ -7362,7 +7362,7 @@ app.post('/api/public/orders/:restaurantId', vercelSecurityMiddleware.publicAPI,
       const normalizedLoyalty = {
         earnPerAmount: Number(loyaltySettings.earnPerAmount) || 100,
         pointsEarned: Number(loyaltySettings.pointsEarned) || 4,
-        redemptionRate: Number(loyaltySettings.redemptionRate) || 100,
+        redemptionRate: Number(loyaltySettings.redemptionRate) || 1,
         maxRedemptionPercent: Number(loyaltySettings.maxRedemptionPercent) || 20,
         earnPointsOnRedemption: loyaltySettings.earnPointsOnRedemption === true,
         earnOnFullAmount: loyaltySettings.earnOnFullAmount === true // default false
@@ -8045,7 +8045,8 @@ app.post('/api/orders', async (req, res) => {
           const pointsToRedeem = Math.min(redeemLoyaltyPoints, availablePoints);
 
           if (pointsToRedeem > 0) {
-            const redemptionRate = posLoyaltySettings.redemptionRate || 100;
+            // Dynamic: points / redemptionRate = discount
+            const redemptionRate = posLoyaltySettings.redemptionRate || 1;
             loyaltyDiscount = pointsToRedeem / redemptionRate;
 
             const maxRedemptionPercent = posLoyaltySettings.maxRedemptionPercent || 20;
@@ -10417,7 +10418,7 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
           }
 
           const pointsToRedeem = Math.min(redeemLoyaltyPointsVal, custPoints);
-          const redemptionRate = loyaltySettings.redemptionRate || 100;
+          const redemptionRate = loyaltySettings.redemptionRate || 1;
           let loyaltyDiscount = pointsToRedeem / redemptionRate;
           const maxPct = loyaltySettings.maxRedemptionPercent || 20;
           const discAmount = updateData.discountAmount || 0;
@@ -24088,7 +24089,7 @@ app.get('/api/public/customer-app-settings/:restaurantId', vercelSecurityMiddlew
           enabled: true,
           earnPerAmount: customerAppSettings.loyaltySettings.earnPerAmount || 100,
           pointsEarned: customerAppSettings.loyaltySettings.pointsEarned || 4,
-          redemptionRate: customerAppSettings.loyaltySettings.redemptionRate || 100,
+          redemptionRate: customerAppSettings.loyaltySettings.redemptionRate || 1,
           maxRedemptionPercent: customerAppSettings.loyaltySettings.maxRedemptionPercent || 20,
           earnPointsOnRedemption: customerAppSettings.loyaltySettings.earnPointsOnRedemption ?? false,
           earnOnFullAmount: customerAppSettings.loyaltySettings.earnOnFullAmount ?? false
@@ -24632,7 +24633,7 @@ app.get('/api/restaurants/:restaurantId/customer-app-settings', authenticateToke
         enabled: existingSettings.loyaltySettings?.enabled ?? false,
         earnPerAmount: existingSettings.loyaltySettings?.earnPerAmount || 100,
         pointsEarned: existingSettings.loyaltySettings?.pointsEarned || 4,
-        redemptionRate: existingSettings.loyaltySettings?.redemptionRate || 100,
+        redemptionRate: existingSettings.loyaltySettings?.redemptionRate || 1,
         maxRedemptionPercent: existingSettings.loyaltySettings?.maxRedemptionPercent || 20,
         earnPointsOnRedemption: existingSettings.loyaltySettings?.earnPointsOnRedemption ?? false,
         earnOnFullAmount: existingSettings.loyaltySettings?.earnOnFullAmount ?? false
@@ -24752,7 +24753,7 @@ app.put('/api/restaurants/:restaurantId/customer-app-settings', authenticateToke
         enabled: settings.loyaltySettings?.enabled ?? false,
         earnPerAmount: Number(settings.loyaltySettings?.earnPerAmount) || 100,
         pointsEarned: Number(settings.loyaltySettings?.pointsEarned) || 4,
-        redemptionRate: Number(settings.loyaltySettings?.redemptionRate) || 100,
+        redemptionRate: Number(settings.loyaltySettings?.redemptionRate) || 1,
         maxRedemptionPercent: Number(settings.loyaltySettings?.maxRedemptionPercent) || 20
       },
       offerSettings: {
