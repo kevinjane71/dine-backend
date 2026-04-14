@@ -26569,6 +26569,236 @@ app.get('/api/automation/test', (req, res) => {
   res.json({ success: true, message: 'Automation routes are loaded' });
 });
 
+// Webhook for WhatsApp (for receiving messages and status updates)
+// IMPORTANT: These must be defined BEFORE any /api/automation/:restaurantId routes
+// otherwise Express matches "webhook" as the :restaurantId param and requires auth
+// GET endpoint for webhook verification
+app.get('/api/automation/webhook/whatsapp', async (req, res) => {
+  try {
+    const mode = req.query['hub.mode'];
+    const token = req.query['hub.verify_token'];
+    const challenge = req.query['hub.challenge'];
+
+    console.log('🔍 Webhook verification request:', { mode, hasToken: !!token, hasChallenge: !!challenge });
+
+    // Meta sends 'subscribe' mode during webhook setup
+    if (mode === 'subscribe') {
+      // Try to match token against restaurant settings or default token
+      let tokenMatched = false;
+
+      // First, try default token from environment
+      if (token === process.env.WHATSAPP_WEBHOOK_VERIFY_TOKEN) {
+        tokenMatched = true;
+        console.log('✅ Webhook verified with default token');
+      } else {
+        // Try to find restaurant with matching verify token
+        const settingsSnapshot = await db.collection(collections.automationSettings)
+          .where('type', '==', 'whatsapp')
+          .where('webhookVerifyToken', '==', token)
+          .limit(1)
+          .get();
+
+        if (!settingsSnapshot.empty) {
+          tokenMatched = true;
+          console.log('✅ Webhook verified with restaurant token:', settingsSnapshot.docs[0].data().restaurantId);
+        }
+      }
+
+      if (tokenMatched && challenge) {
+        console.log('✅ WhatsApp webhook verified successfully');
+        res.status(200).send(challenge);
+      } else {
+        console.log('❌ Webhook verification failed - token mismatch');
+        res.sendStatus(403);
+      }
+    } else {
+      // Not a subscription request
+      res.sendStatus(200);
+    }
+  } catch (error) {
+    console.error('Webhook verification error:', error);
+    res.sendStatus(500);
+  }
+});
+
+// POST endpoint for receiving webhook events
+app.post('/api/automation/webhook/whatsapp', async (req, res) => {
+  try {
+    const body = req.body;
+    const signature = req.headers['x-hub-signature-256'];
+
+    console.log('📨 WhatsApp webhook received:', {
+      object: body.object,
+      entryCount: body.entry?.length || 0,
+      hasSignature: !!signature
+    });
+
+    // Verify webhook signature if provided (for security)
+    if (signature && process.env.WHATSAPP_WEBHOOK_SECRET) {
+      const crypto = require('crypto');
+      const expectedSignature = 'sha256=' + crypto
+        .createHmac('sha256', process.env.WHATSAPP_WEBHOOK_SECRET)
+        .update(JSON.stringify(body))
+        .digest('hex');
+
+      if (signature !== expectedSignature) {
+        console.error('❌ Webhook signature verification failed');
+        return res.sendStatus(403);
+      }
+      console.log('✅ Webhook signature verified');
+    }
+
+    // Handle incoming events
+    if (body.object === 'whatsapp_business_account') {
+      for (const entry of body.entry || []) {
+        const changes = entry.changes || [];
+
+        for (const change of changes) {
+          const value = change.value;
+
+          // Handle message status updates (delivered, read, sent, failed)
+          if (value?.statuses && Array.isArray(value.statuses)) {
+            for (const statusUpdate of value.statuses) {
+              const messageId = statusUpdate.id;
+              const status = statusUpdate.status; // sent, delivered, read, failed
+              const timestamp = statusUpdate.timestamp;
+
+              console.log('📊 Message status update:', { messageId, status, timestamp });
+
+              // Find and update message log
+              try {
+                const logsSnapshot = await db.collection(collections.automationLogs)
+                  .where('messageId', '==', messageId)
+                  .limit(1)
+                  .get();
+
+                if (!logsSnapshot.empty) {
+                  const logDoc = logsSnapshot.docs[0];
+                  const logData = logDoc.data();
+
+                  // Update status
+                  await logDoc.ref.update({
+                    status: status,
+                    statusUpdatedAt: new Date(),
+                    ...(status === 'read' && { readAt: new Date() }),
+                    ...(status === 'delivered' && { deliveredAt: new Date() }),
+                    ...(status === 'failed' && {
+                      error: statusUpdate.errors?.[0]?.message || 'Message failed',
+                      failedAt: new Date()
+                    })
+                  });
+
+                  // Update automation stats
+                  if (logData.automationId) {
+                    const automationRef = db.collection(collections.automations).doc(logData.automationId);
+                    const automationDoc = await automationRef.get();
+
+                    if (automationDoc.exists) {
+                      const stats = automationDoc.data().stats || { sent: 0, delivered: 0, read: 0, failed: 0 };
+
+                      if (status === 'delivered' && logData.status !== 'delivered') {
+                        stats.delivered = (stats.delivered || 0) + 1;
+                      }
+                      if (status === 'read' && logData.status !== 'read') {
+                        stats.read = (stats.read || 0) + 1;
+                      }
+                      if (status === 'failed' && logData.status !== 'failed') {
+                        stats.failed = (stats.failed || 0) + 1;
+                      }
+
+                      await automationRef.update({ stats });
+                    }
+                  }
+
+                  console.log('✅ Message status updated in logs');
+                }
+              } catch (error) {
+                console.error('Error updating message status:', error);
+              }
+            }
+          }
+
+          // Handle incoming messages from customers
+          if (value?.messages && Array.isArray(value.messages)) {
+            for (const message of value.messages) {
+              const processedMessage = whatsappService.handleIncomingMessage({
+                entry: [{
+                  changes: [{
+                    value: {
+                      messages: [message],
+                      contacts: value.contacts || []
+                    }
+                  }]
+                }]
+              });
+
+              if (processedMessage) {
+                console.log('📨 Incoming WhatsApp message:', {
+                  from: processedMessage.from,
+                  type: processedMessage.type,
+                  text: processedMessage.text?.substring(0, 50) || 'N/A'
+                });
+
+                // Find restaurant by phoneNumberId from webhook metadata
+                try {
+                  const incomingPhoneNumberId = value?.metadata?.phone_number_id;
+                  let settingsSnapshot;
+
+                  if (incomingPhoneNumberId) {
+                    // Match by specific phone number ID
+                    settingsSnapshot = await db.collection(collections.automationSettings)
+                      .where('type', '==', 'whatsapp')
+                      .where('connected', '==', true)
+                      .where('phoneNumberId', '==', incomingPhoneNumberId)
+                      .get();
+                  }
+
+                  // Fallback: get all connected restaurants (for dineopen mode)
+                  if (!settingsSnapshot || settingsSnapshot.empty) {
+                    settingsSnapshot = await db.collection(collections.automationSettings)
+                      .where('type', '==', 'whatsapp')
+                      .where('connected', '==', true)
+                      .get();
+                  }
+
+                  for (const settingDoc of settingsSnapshot.docs) {
+                    const setting = settingDoc.data();
+
+                    await db.collection(collections.automationLogs).add({
+                      restaurantId: setting.restaurantId,
+                      type: 'incoming',
+                      direction: 'incoming',
+                      phone: processedMessage.from,
+                      contactName: processedMessage.contactName || '',
+                      message: processedMessage.text,
+                      messageType: processedMessage.type,
+                      messageId: processedMessage.messageId,
+                      timestamp: new Date(),
+                      status: 'received'
+                    });
+                  }
+                } catch (error) {
+                  console.error('Error logging incoming message:', error);
+                }
+
+                // TODO: Could trigger automation based on incoming message
+                // e.g., customer replies "STOP" to unsubscribe
+              }
+            }
+          }
+        }
+      }
+    }
+
+    // Always return 200 to acknowledge receipt
+    res.sendStatus(200);
+  } catch (error) {
+    console.error('❌ Webhook processing error:', error);
+    // Still return 200 to prevent Meta from retrying
+    res.sendStatus(200);
+  }
+});
+
 // Get automations
 app.get('/api/automation/:restaurantId/automations', authenticateToken, async (req, res) => {
   try {
@@ -27152,234 +27382,6 @@ app.post('/api/automation/:restaurantId/whatsapp/disconnect', authenticateToken,
   } catch (error) {
     console.error('Disconnect WhatsApp error:', error);
     res.status(500).json({ error: 'Failed to disconnect WhatsApp' });
-  }
-});
-
-// Webhook for WhatsApp (for receiving messages and status updates)
-// GET endpoint for webhook verification
-app.get('/api/automation/webhook/whatsapp', async (req, res) => {
-  try {
-    const mode = req.query['hub.mode'];
-    const token = req.query['hub.verify_token'];
-    const challenge = req.query['hub.challenge'];
-
-    console.log('🔍 Webhook verification request:', { mode, hasToken: !!token, hasChallenge: !!challenge });
-
-    // Meta sends 'subscribe' mode during webhook setup
-    if (mode === 'subscribe') {
-      // Try to match token against restaurant settings or default token
-      let tokenMatched = false;
-
-      // First, try default token from environment
-      if (token === process.env.WHATSAPP_WEBHOOK_VERIFY_TOKEN) {
-        tokenMatched = true;
-        console.log('✅ Webhook verified with default token');
-      } else {
-        // Try to find restaurant with matching verify token
-        const settingsSnapshot = await db.collection(collections.automationSettings)
-          .where('type', '==', 'whatsapp')
-          .where('webhookVerifyToken', '==', token)
-          .limit(1)
-          .get();
-
-        if (!settingsSnapshot.empty) {
-          tokenMatched = true;
-          console.log('✅ Webhook verified with restaurant token:', settingsSnapshot.docs[0].data().restaurantId);
-        }
-      }
-
-      if (tokenMatched && challenge) {
-        console.log('✅ WhatsApp webhook verified successfully');
-        res.status(200).send(challenge);
-      } else {
-        console.log('❌ Webhook verification failed - token mismatch');
-        res.sendStatus(403);
-      }
-    } else {
-      // Not a subscription request
-      res.sendStatus(200);
-    }
-  } catch (error) {
-    console.error('Webhook verification error:', error);
-    res.sendStatus(500);
-  }
-});
-
-// POST endpoint for receiving webhook events
-app.post('/api/automation/webhook/whatsapp', async (req, res) => {
-  try {
-    const body = req.body;
-    const signature = req.headers['x-hub-signature-256'];
-
-    console.log('📨 WhatsApp webhook received:', {
-      object: body.object,
-      entryCount: body.entry?.length || 0,
-      hasSignature: !!signature
-    });
-
-    // Verify webhook signature if provided (for security)
-    if (signature && process.env.WHATSAPP_WEBHOOK_SECRET) {
-      const crypto = require('crypto');
-      const expectedSignature = 'sha256=' + crypto
-        .createHmac('sha256', process.env.WHATSAPP_WEBHOOK_SECRET)
-        .update(JSON.stringify(body))
-        .digest('hex');
-
-      if (signature !== expectedSignature) {
-        console.error('❌ Webhook signature verification failed');
-        return res.sendStatus(403);
-      }
-      console.log('✅ Webhook signature verified');
-    }
-
-    // Handle incoming events
-    if (body.object === 'whatsapp_business_account') {
-      for (const entry of body.entry || []) {
-        const changes = entry.changes || [];
-        
-        for (const change of changes) {
-          const value = change.value;
-
-          // Handle message status updates (delivered, read, sent, failed)
-          if (value?.statuses && Array.isArray(value.statuses)) {
-            for (const statusUpdate of value.statuses) {
-              const messageId = statusUpdate.id;
-              const status = statusUpdate.status; // sent, delivered, read, failed
-              const timestamp = statusUpdate.timestamp;
-
-              console.log('📊 Message status update:', { messageId, status, timestamp });
-
-              // Find and update message log
-              try {
-                const logsSnapshot = await db.collection(collections.automationLogs)
-                  .where('messageId', '==', messageId)
-                  .limit(1)
-                  .get();
-
-                if (!logsSnapshot.empty) {
-                  const logDoc = logsSnapshot.docs[0];
-                  const logData = logDoc.data();
-
-                  // Update status
-                  await logDoc.ref.update({
-                    status: status,
-                    statusUpdatedAt: new Date(),
-                    ...(status === 'read' && { readAt: new Date() }),
-                    ...(status === 'delivered' && { deliveredAt: new Date() }),
-                    ...(status === 'failed' && { 
-                      error: statusUpdate.errors?.[0]?.message || 'Message failed',
-                      failedAt: new Date()
-                    })
-                  });
-
-                  // Update automation stats
-                  if (logData.automationId) {
-                    const automationRef = db.collection(collections.automations).doc(logData.automationId);
-                    const automationDoc = await automationRef.get();
-                    
-                    if (automationDoc.exists) {
-                      const stats = automationDoc.data().stats || { sent: 0, delivered: 0, read: 0, failed: 0 };
-                      
-                      if (status === 'delivered' && logData.status !== 'delivered') {
-                        stats.delivered = (stats.delivered || 0) + 1;
-                      }
-                      if (status === 'read' && logData.status !== 'read') {
-                        stats.read = (stats.read || 0) + 1;
-                      }
-                      if (status === 'failed' && logData.status !== 'failed') {
-                        stats.failed = (stats.failed || 0) + 1;
-                      }
-
-                      await automationRef.update({ stats });
-                    }
-                  }
-
-                  console.log('✅ Message status updated in logs');
-                }
-              } catch (error) {
-                console.error('Error updating message status:', error);
-              }
-            }
-          }
-
-          // Handle incoming messages from customers
-          if (value?.messages && Array.isArray(value.messages)) {
-            for (const message of value.messages) {
-              const processedMessage = whatsappService.handleIncomingMessage({
-                entry: [{
-                  changes: [{
-                    value: {
-                      messages: [message],
-                      contacts: value.contacts || []
-                    }
-                  }]
-                }]
-              });
-
-              if (processedMessage) {
-                console.log('📨 Incoming WhatsApp message:', {
-                  from: processedMessage.from,
-                  type: processedMessage.type,
-                  text: processedMessage.text?.substring(0, 50) || 'N/A'
-                });
-
-                // Find restaurant by phoneNumberId from webhook metadata
-                try {
-                  const incomingPhoneNumberId = value?.metadata?.phone_number_id;
-                  let settingsSnapshot;
-
-                  if (incomingPhoneNumberId) {
-                    // Match by specific phone number ID
-                    settingsSnapshot = await db.collection(collections.automationSettings)
-                      .where('type', '==', 'whatsapp')
-                      .where('connected', '==', true)
-                      .where('phoneNumberId', '==', incomingPhoneNumberId)
-                      .get();
-                  }
-
-                  // Fallback: get all connected restaurants (for dineopen mode)
-                  if (!settingsSnapshot || settingsSnapshot.empty) {
-                    settingsSnapshot = await db.collection(collections.automationSettings)
-                      .where('type', '==', 'whatsapp')
-                      .where('connected', '==', true)
-                      .get();
-                  }
-
-                  for (const settingDoc of settingsSnapshot.docs) {
-                    const setting = settingDoc.data();
-
-                    await db.collection(collections.automationLogs).add({
-                      restaurantId: setting.restaurantId,
-                      type: 'incoming',
-                      direction: 'incoming',
-                      phone: processedMessage.from,
-                      contactName: processedMessage.contactName || '',
-                      message: processedMessage.text,
-                      messageType: processedMessage.type,
-                      messageId: processedMessage.messageId,
-                      timestamp: new Date(),
-                      status: 'received'
-                    });
-                  }
-                } catch (error) {
-                  console.error('Error logging incoming message:', error);
-                }
-
-                // TODO: Could trigger automation based on incoming message
-                // e.g., customer replies "STOP" to unsubscribe
-              }
-            }
-          }
-        }
-      }
-    }
-
-    // Always return 200 to acknowledge receipt
-    res.sendStatus(200);
-  } catch (error) {
-    console.error('❌ Webhook processing error:', error);
-    // Still return 200 to prevent Meta from retrying
-    res.sendStatus(200);
   }
 });
 
