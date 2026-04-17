@@ -123,14 +123,14 @@ class AutomationService {
         // Use DineOpen's shared WhatsApp credentials
         credentials = {
           accessToken: process.env.DINEOPEN_WHATSAPP_ACCESS_TOKEN,
-          phoneNumberId: '879916941871710', // Hardcoded for now
+          phoneNumberId: whatsappSettings.phoneNumberId || process.env.DINEOPEN_WHATSAPP_PHONE_NUMBER_ID
           businessAccountId: process.env.DINEOPEN_WHATSAPP_BUSINESS_ACCOUNT_ID
         };
       } else {
         // Use restaurant's own WhatsApp credentials
         credentials = {
           accessToken: whatsappSettings.accessToken,
-          phoneNumberId: '879916941871710', // Hardcoded for now
+          phoneNumberId: whatsappSettings.phoneNumberId || process.env.DINEOPEN_WHATSAPP_PHONE_NUMBER_ID
           businessAccountId: whatsappSettings.businessAccountId
         };
       }
@@ -410,13 +410,13 @@ class AutomationService {
       if (whatsappSettings.mode === 'dineopen') {
         credentials = {
           accessToken: process.env.DINEOPEN_WHATSAPP_ACCESS_TOKEN,
-          phoneNumberId: '879916941871710', // Hardcoded for now
+          phoneNumberId: whatsappSettings.phoneNumberId || process.env.DINEOPEN_WHATSAPP_PHONE_NUMBER_ID
           businessAccountId: process.env.DINEOPEN_WHATSAPP_BUSINESS_ACCOUNT_ID
         };
       } else {
         credentials = {
           accessToken: whatsappSettings.accessToken,
-          phoneNumberId: '879916941871710', // Hardcoded for now
+          phoneNumberId: whatsappSettings.phoneNumberId || process.env.DINEOPEN_WHATSAPP_PHONE_NUMBER_ID
           businessAccountId: whatsappSettings.businessAccountId
         };
       }
