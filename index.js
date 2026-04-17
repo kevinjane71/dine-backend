@@ -14965,9 +14965,13 @@ app.get('/api/admin/business/:restaurantId', authenticateToken, async (req, res)
       }
     }
 
-    // Check granular admin tab permission (business settings = billingSettings tab)
-    if (!(await checkFeaturePermission(req, 'admin', 'billingSettings'))) {
-      return res.status(403).json({ error: 'Access denied to Billing settings.' });
+    // Check permission: cashier/manager need business info for GST invoices,
+    // so allow them directly; others need admin.billingSettings permission
+    const userRole = req.user.role?.toLowerCase();
+    if (!['cashier', 'manager'].includes(userRole)) {
+      if (!(await checkFeaturePermission(req, 'admin', 'billingSettings'))) {
+        return res.status(403).json({ error: 'Access denied to Billing settings.' });
+      }
     }
 
     // Get restaurant data
@@ -15040,9 +15044,13 @@ app.put('/api/admin/business/:restaurantId', authenticateToken, async (req, res)
       }
     }
 
-    // Check granular admin tab permission (business settings = billingSettings tab)
-    if (!(await checkFeaturePermission(req, 'admin', 'billingSettings'))) {
-      return res.status(403).json({ error: 'Access denied to Billing settings.' });
+    // Check permission: cashier/manager need business info for GST invoices,
+    // so allow them directly; others need admin.billingSettings permission
+    const userRole = req.user.role?.toLowerCase();
+    if (!['cashier', 'manager'].includes(userRole)) {
+      if (!(await checkFeaturePermission(req, 'admin', 'billingSettings'))) {
+        return res.status(403).json({ error: 'Access denied to Billing settings.' });
+      }
     }
 
     // Validate GSTIN format if provided
