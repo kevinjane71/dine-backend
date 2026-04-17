@@ -632,6 +632,39 @@ async function getNextTabNumber(restaurantId) {
   }
 }
 
+// Helper: build plain-text invoice for WhatsApp bill sending
+function buildInvoiceText(order, restaurant) {
+  const lines = [];
+  lines.push('================================');
+  lines.push(`  ${restaurant.name || 'Restaurant'}`);
+  if (restaurant.legalName) lines.push(`  ${restaurant.legalName}`);
+  if (restaurant.showGstOnInvoice && restaurant.gstin) lines.push(`GSTIN: ${restaurant.gstin}`);
+  if (restaurant.address) lines.push(restaurant.address);
+  lines.push('================================');
+  lines.push(`Order #${order.dailyOrderId || order.orderNumber || (order.id || '').slice(-6)}`);
+  lines.push(`Date: ${new Date().toLocaleString('en-IN')}`);
+  if (order.tableNumber) lines.push(`Table: ${order.tableNumber}`);
+  lines.push('--------------------------------');
+  (order.items || []).forEach(item => {
+    const total = (item.price * item.quantity).toFixed(2);
+    lines.push(`${item.name} x${item.quantity}  ₹${total}`);
+  });
+  lines.push('--------------------------------');
+  const subtotal = order.totalAmount || order.subtotal || 0;
+  lines.push(`Subtotal: ₹${Number(subtotal).toFixed(2)}`);
+  if (order.discountAmount > 0) lines.push(`Discount: -₹${Number(order.discountAmount).toFixed(2)}`);
+  if (order.taxAmount > 0) lines.push(`Tax: ₹${Number(order.taxAmount).toFixed(2)}`);
+  if (order.serviceChargeAmount > 0) lines.push(`Service Charge: ₹${Number(order.serviceChargeAmount).toFixed(2)}`);
+  if (order.tipAmount > 0) lines.push(`Tip: ₹${Number(order.tipAmount).toFixed(2)}`);
+  if (order.roundOffAmount) lines.push(`Round Off: ₹${Number(order.roundOffAmount).toFixed(2)}`);
+  lines.push('================================');
+  lines.push(`TOTAL: ₹${Number(order.finalAmount || order.totalAmount || 0).toFixed(2)}`);
+  lines.push(`Payment: ${(order.paymentMethod || 'cash').toUpperCase()}`);
+  lines.push('================================');
+  lines.push('Thank you for your visit!');
+  return lines.join('\n');
+}
+
 // Helper function to create default free-trial subscription for new users
 async function createDefaultSubscription(userId, email, phone, role) {
   try {
@@ -7074,6 +7107,85 @@ app.delete('/api/menus/:restaurantId/bulk-delete', authenticateToken, async (req
   }
 });
 
+// Public API - Get invoice by share token (no auth required)
+app.get('/api/public/bill/:token', vercelSecurityMiddleware.publicAPI, async (req, res) => {
+  try {
+    const { token } = req.params;
+    if (!token || token.length < 16) {
+      return res.status(400).json({ error: 'Invalid token' });
+    }
+
+    // Find order by shareToken
+    const orderSnap = await db.collection(collections.orders)
+      .where('shareToken', '==', token)
+      .limit(1)
+      .get();
+
+    if (orderSnap.empty) {
+      return res.status(404).json({ error: 'Invoice not found' });
+    }
+
+    const orderDoc = orderSnap.docs[0];
+    const order = orderDoc.data();
+
+    // Get restaurant info
+    const restDoc = await db.collection(collections.restaurants).doc(order.restaurantId).get();
+    const restaurant = restDoc.exists ? restDoc.data() : {};
+
+    // Return only safe public fields (no internal IDs, no customer email, etc.)
+    res.json({
+      success: true,
+      invoice: {
+        orderNumber: order.dailyOrderId || order.orderNumber || orderDoc.id.slice(-6).toUpperCase(),
+        orderType: order.orderType || 'dine-in',
+        tableNumber: order.tableNumber || null,
+        items: (order.items || []).map(item => ({
+          name: item.name,
+          quantity: item.quantity || 1,
+          price: item.price || 0,
+          variant: item.variant || null,
+          customizations: item.customizations || null,
+        })),
+        subtotal: order.subtotal || order.totalAmount || 0,
+        discountAmount: order.discountAmount || 0,
+        manualDiscount: order.manualDiscount || 0,
+        loyaltyDiscount: order.loyaltyDiscount || 0,
+        totalDiscountAmount: order.totalDiscountAmount || 0,
+        appliedOffer: order.appliedOffer || null,
+        selectedOfferName: order.selectedOfferName || (order.appliedOffer?.name) || null,
+        taxAmount: order.taxAmount || 0,
+        taxBreakdown: order.taxBreakdown || [],
+        serviceChargeAmount: order.serviceChargeAmount || 0,
+        serviceChargeRate: order.serviceChargeRate || null,
+        tipAmount: order.tipAmount || 0,
+        roundOffAmount: order.roundOffAmount || 0,
+        finalAmount: order.finalAmount || order.totalAmount || 0,
+        paymentMethod: order.paymentMethod || 'cash',
+        splitPayments: order.splitPayments || null,
+        cashReceived: order.cashReceived || null,
+        changeReturned: order.changeReturned || null,
+        completedAt: order.completedAt || order.updatedAt || order.createdAt || null,
+        createdAt: order.createdAt || null,
+        customerName: order.customerInfo?.name || order.customerName || null,
+      },
+      restaurant: {
+        name: restaurant.name || 'Restaurant',
+        legalName: restaurant.legalBusinessName || restaurant.legalName || null,
+        address: restaurant.address || null,
+        phone: restaurant.phone || null,
+        gstin: restaurant.showGstOnInvoice ? (restaurant.gstin || null) : null,
+        fssai: restaurant.fssai || null,
+        logo: restaurant.logo || null,
+        currencySymbol: restaurant.currencySymbol || '₹',
+        taxSettings: restaurant.taxSettings || null,
+      }
+    });
+  } catch (error) {
+    console.error('Public bill fetch error:', error);
+    res.status(500).json({ error: 'Failed to load invoice' });
+  }
+});
+
 // Public API - Place order with OTP verification
 app.post('/api/public/orders/:restaurantId', vercelSecurityMiddleware.publicAPI, async (req, res) => {
   try {
@@ -10100,10 +10212,13 @@ app.patch('/api/orders/:orderId/status', authenticateToken, async (req, res) => 
       }
     }
 
-    await db.collection(collections.orders).doc(orderId).update({
-      status,
-      updatedAt: new Date()
-    });
+    const orderUpdateData = { status, updatedAt: new Date() };
+    // Generate a shareToken for public invoice link when order is completed
+    if (status === 'completed' && !orderData.shareToken) {
+      const crypto = require('crypto');
+      orderUpdateData.shareToken = crypto.randomBytes(16).toString('hex');
+    }
+    await db.collection(collections.orders).doc(orderId).update(orderUpdateData);
 
     // Update daily analytics stats for status transitions (fire-and-forget)
     const _nonCounted = ['saved', 'cancelled', 'deleted'];
@@ -10201,6 +10316,89 @@ app.patch('/api/orders/:orderId/status', authenticateToken, async (req, res) => 
       const invoiceEmailService = require('./invoiceEmailService');
       invoiceEmailService.sendInvoiceEmail({ orderId, restaurantId: orderData.restaurantId })
         .catch(err => console.error('Invoice email error (non-blocking):', err.message));
+    }
+
+    // Fire-and-forget: send bill on WhatsApp if enabled
+    if (status === 'completed') {
+      (async () => {
+        try {
+          const restDoc = await db.collection(collections.restaurants).doc(orderData.restaurantId).get();
+          const bSettings = restDoc.exists ? (restDoc.data().billingSettings || {}) : {};
+          if (!bSettings.whatsappBillingEnabled) return;
+
+          const waSnap = await db.collection(collections.automationSettings)
+            .where('restaurantId', '==', orderData.restaurantId)
+            .where('type', '==', 'whatsapp')
+            .where('connected', '==', true)
+            .limit(1).get();
+          if (waSnap.empty) return;
+
+          const custPhone = orderData.customerPhone || orderData.customerInfo?.phone || orderData.customerMobile;
+          if (!custPhone) return;
+
+          // Normalize phone for customer lookup
+          const normPhone = custPhone.replace(/[\s\-\(\)\+]/g, '').replace(/^(\+?91)/, '').slice(-10);
+          const custSnap = await db.collection(collections.customers)
+            .where('restaurantId', '==', orderData.restaurantId)
+            .where('phone', '==', normPhone)
+            .limit(1).get();
+          if (!custSnap.empty && custSnap.docs[0].data().whatsappBillEnabled === false) return;
+
+          // Build short WhatsApp message with invoice link
+          const restaurantName = restDoc.data().name || 'Restaurant';
+          const customerName = orderData.customerInfo?.name || orderData.customerName || 'there';
+          const totalAmount = Number(orderData.finalAmount || orderData.totalAmount || 0).toFixed(2);
+          const currencySymbol = restDoc.data().currencySymbol || '₹';
+          const orderNum = orderData.dailyOrderId || orderData.orderNumber || (orderId || '').slice(-6);
+          const completedAt = new Date();
+          const dateStr = completedAt.toLocaleDateString('en-IN', { day: '2-digit', month: '2-digit', year: 'numeric', timeZone: 'Asia/Kolkata' });
+          const timeStr = completedAt.toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', hour12: true, timeZone: 'Asia/Kolkata' });
+
+          const shareToken = orderUpdateData.shareToken || orderData.shareToken;
+          const baseUrl = process.env.FRONTEND_URL || 'https://www.dineopen.com';
+          const invoiceLink = shareToken ? `${baseUrl}/bill/${shareToken}` : '';
+
+          let message = `Dear ${customerName},\n\n` +
+            `Thank you for your visit at *${restaurantName}*! Your invoice is ready.\n\n` +
+            `💰 Amount: *${currencySymbol}${totalAmount}*\n` +
+            `🧾 Order: #${orderNum}\n` +
+            `📅 Date: ${dateStr}, ${timeStr}`;
+
+          if (invoiceLink) {
+            message += `\n\n🔗 View Invoice: ${invoiceLink}`;
+          }
+
+          message += `\n\nThank you for choosing ${restaurantName}! 🙏`;
+
+          const waSettings = waSnap.docs[0].data();
+          const credentials = waSettings.mode === 'dineopen' ? {
+            accessToken: process.env.DINEOPEN_WHATSAPP_ACCESS_TOKEN,
+            phoneNumberId: waSettings.phoneNumberId || process.env.DINEOPEN_WHATSAPP_PHONE_NUMBER_ID,
+            businessAccountId: process.env.DINEOPEN_WHATSAPP_BUSINESS_ACCOUNT_ID
+          } : {
+            accessToken: waSettings.accessToken,
+            phoneNumberId: waSettings.phoneNumberId || process.env.DINEOPEN_WHATSAPP_PHONE_NUMBER_ID,
+            businessAccountId: waSettings.businessAccountId
+          };
+
+          const whatsappSvc = require('./services/whatsappService');
+          await whatsappSvc.initialize(orderData.restaurantId, credentials);
+          const formatted = custPhone.replace(/[\s\-\(\)\+]/g, '');
+          const result = await whatsappSvc.sendTextMessage(formatted, message);
+
+          await db.collection(collections.automationLogs).add({
+            restaurantId: orderData.restaurantId, type: 'whatsapp_bill',
+            phone: formatted, customerName: customerName,
+            message, messageId: result?.messageId || null,
+            orderId, amount: orderData.finalAmount || orderData.totalAmount,
+            direction: 'outgoing', status: result?.success ? 'sent' : 'failed',
+            timestamp: new Date()
+          });
+          console.log(`📱 WhatsApp bill sent for order ${orderId}`);
+        } catch (err) {
+          console.error('📱 WhatsApp bill error (non-blocking):', err.message);
+        }
+      })();
     }
 
     res.json({ message: 'Order status updated successfully' });
