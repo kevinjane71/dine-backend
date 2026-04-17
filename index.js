@@ -25315,6 +25315,7 @@ app.get('/api/restaurants/:restaurantId/billing-settings', authenticateToken, as
       refundsEnabled: existing.refundsEnabled ?? false,
       refundsRequireApproval: existing.refundsRequireApproval ?? true,
       emailInvoiceEnabled: existing.emailInvoiceEnabled ?? false,
+      whatsappBillingEnabled: existing.whatsappBillingEnabled ?? false,
     };
 
     res.json({ settings: billingSettings });
@@ -25363,6 +25364,7 @@ app.put('/api/restaurants/:restaurantId/billing-settings', authenticateToken, as
       refundsEnabled: settings.refundsEnabled ?? false,
       refundsRequireApproval: settings.refundsRequireApproval ?? true,
       emailInvoiceEnabled: settings.emailInvoiceEnabled ?? false,
+      whatsappBillingEnabled: settings.whatsappBillingEnabled ?? false,
       updatedAt: new Date(),
     };
 
