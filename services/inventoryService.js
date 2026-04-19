@@ -242,14 +242,14 @@ class InventoryService {
                       console.warn(`⚠️ Not enough non-expired stock in batches for ${inventoryItem.name}. Short by ${remaining} ${inventoryItem.unit || ''}`);
                     }
 
-                    newStock = inventoryItem.currentStock - deductionAmount;
+                    newStock = Math.max(0, inventoryItem.currentStock - deductionAmount);
                   } else {
                     // No batches — backward-compatible simple deduction
-                    newStock = (inventoryItem.currentStock || 0) - deductionAmount;
+                    newStock = Math.max(0, (inventoryItem.currentStock || 0) - deductionAmount);
                   }
                 } catch (batchErr) {
                   console.warn(`⚠️ FIFO batch query failed for ${inventoryItem.name}, using simple deduction:`, batchErr.message);
-                  newStock = (inventoryItem.currentStock || 0) - deductionAmount;
+                  newStock = Math.max(0, (inventoryItem.currentStock || 0) - deductionAmount);
                 }
 
                 // Update Inventory

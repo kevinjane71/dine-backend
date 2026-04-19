@@ -268,9 +268,73 @@ router.get('/:restaurantId/export/:type', async (req, res) => {
       });
       data = rows.map(r => r.join(',')).join('\n');
     } else if (type === 'gstr3b') {
-      data = 'Section,Taxable Value,CGST,SGST,IGST,Total Tax\nPlease use the GSTR-3B API for detailed data';
+      // Outward supplies (from orders)
+      const gstr3bSnap = await db.collection('orders')
+        .where('restaurantId', '==', restaurantId)
+        .where('createdAt', '>=', start)
+        .where('createdAt', '<=', end)
+        .get();
+      let outTaxable = 0, outTax = 0;
+      gstr3bSnap.docs.forEach(doc => {
+        const o = doc.data();
+        if (o.status === 'cancelled') return;
+        const tax = o.taxAmount || 0;
+        outTaxable += (o.finalAmount || o.totalAmount || 0) - tax;
+        outTax += tax;
+      });
+      // Inward supplies (from supplier invoices)
+      const invSnap = await db.collection('supplier-invoices')
+        .where('restaurantId', '==', restaurantId)
+        .where('invoiceDate', '>=', start)
+        .where('invoiceDate', '<=', end)
+        .get();
+      let inTaxable = 0, inTax = 0;
+      invSnap.docs.forEach(doc => {
+        const inv = doc.data();
+        inTaxable += inv.subtotal || 0;
+        inTax += inv.taxAmount || 0;
+      });
+      const netPayable = Math.max(0, outTax - inTax);
+      const rows3b = [
+        ['Section', 'Taxable Value', 'CGST', 'SGST', 'IGST', 'Total Tax'],
+        ['Outward Supplies (Sales)', outTaxable.toFixed(2), (outTax / 2).toFixed(2), (outTax / 2).toFixed(2), '0.00', outTax.toFixed(2)],
+        ['Inward Supplies (Purchases)', inTaxable.toFixed(2), (inTax / 2).toFixed(2), (inTax / 2).toFixed(2), '0.00', inTax.toFixed(2)],
+        ['ITC Available', '', (inTax / 2).toFixed(2), (inTax / 2).toFixed(2), '0.00', inTax.toFixed(2)],
+        ['Net Tax Payable', '', (netPayable / 2).toFixed(2), (netPayable / 2).toFixed(2), '0.00', netPayable.toFixed(2)],
+      ];
+      data = rows3b.map(r => r.join(',')).join('\n');
     } else if (type === 'hsn') {
-      data = 'HSN Code,Description,Qty,Taxable Value,CGST,SGST,IGST,Total Tax,Total Value\nPlease use the HSN Summary API for detailed data';
+      const hsnSnap = await db.collection('orders')
+        .where('restaurantId', '==', restaurantId)
+        .where('createdAt', '>=', start)
+        .where('createdAt', '<=', end)
+        .get();
+      const hsnMap = {};
+      hsnSnap.docs.forEach(doc => {
+        const order = doc.data();
+        if (order.status === 'cancelled') return;
+        const gstRate = order.taxBreakdown?.[0]?.rate || order.taxRate || 5;
+        (order.items || []).forEach(item => {
+          const hsn = item.hsnCode || item.hsn || '9963';
+          const qty = item.quantity || 1;
+          const value = (item.price || 0) * qty;
+          const taxOnItem = value * (gstRate / 100);
+          if (!hsnMap[hsn]) {
+            hsnMap[hsn] = { hsn, desc: item.name || '', qty: 0, taxable: 0, cgst: 0, sgst: 0, totalTax: 0, total: 0 };
+          }
+          hsnMap[hsn].qty += qty;
+          hsnMap[hsn].taxable += value;
+          hsnMap[hsn].cgst += taxOnItem / 2;
+          hsnMap[hsn].sgst += taxOnItem / 2;
+          hsnMap[hsn].totalTax += taxOnItem;
+          hsnMap[hsn].total += value + taxOnItem;
+        });
+      });
+      const hsnRows = [['HSN Code', 'Description', 'Qty', 'Taxable Value', 'CGST', 'SGST', 'IGST', 'Total Tax', 'Total Value']];
+      Object.values(hsnMap).forEach(h => {
+        hsnRows.push([h.hsn, `"${h.desc}"`, h.qty, h.taxable.toFixed(2), h.cgst.toFixed(2), h.sgst.toFixed(2), '0.00', h.totalTax.toFixed(2), h.total.toFixed(2)]);
+      });
+      data = hsnRows.map(r => r.join(',')).join('\n');
     } else {
       return res.status(400).json({ error: 'Invalid export type. Use: gstr1, gstr3b, hsn' });
     }

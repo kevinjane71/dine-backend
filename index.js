@@ -10401,6 +10401,158 @@ app.patch('/api/orders/:orderId/status', authenticateToken, async (req, res) => 
       })();
     }
 
+    // ── Auto-sync completed order to Invoice module (fire-and-forget) ──
+    if (status === 'completed') {
+      (async () => {
+        try {
+          const restDoc2 = await db.collection(collections.restaurants).doc(orderData.restaurantId).get();
+          if (!restDoc2.exists) return;
+          const ownerId = restDoc2.data().ownerId;
+          if (!ownerId) return;
+
+          const orgSnap2 = await db.collection(collections.invOrganizations)
+            .where('userId', '==', ownerId).limit(1).get();
+          if (orgSnap2.empty) return; // Invoice module not set up
+
+          const orgId = orgSnap2.docs[0].id;
+
+          // Duplicate check
+          const dupCheck = await db.collection(collections.invInvoices)
+            .where('orgId', '==', orgId)
+            .where('sourceRef', '==', orderId)
+            .limit(1).get();
+          if (!dupCheck.empty) return;
+
+          // Find or create inv_customer
+          const custPhone = orderData.customerInfo?.phone || orderData.customerPhone || orderData.customerMobile;
+          const custName = orderData.customerInfo?.name || orderData.customerName || 'Walk-in';
+          let invCustomerId = null;
+
+          if (custPhone) {
+            const normP = String(custPhone).replace(/\D/g, '').slice(-10);
+            const cSnap = await db.collection(collections.invCustomers)
+              .where('orgId', '==', orgId)
+              .where('mobile', '==', normP)
+              .limit(1).get();
+            if (!cSnap.empty) {
+              invCustomerId = cSnap.docs[0].id;
+            } else {
+              const newCRef = await db.collection(collections.invCustomers).add({
+                orgId, type: 'individual', salutation: '',
+                firstName: custName, lastName: '', companyName: '', displayName: custName,
+                email: '', workPhone: '', mobile: normP,
+                pan: '', gstin: '', currency: 'INR', paymentTerms: 'due_on_receipt',
+                language: 'English',
+                billingAddress: { street: '', city: '', state: '', zip: '', country: '' },
+                shippingAddress: { street: '', city: '', state: '', zip: '', country: '' },
+                contactPersons: [], notes: '', customFields: {},
+                status: 'active', sourceApp: 'dineopen', sourceRef: orderData.restaurantId,
+                createdAt: new Date(), updatedAt: new Date()
+              });
+              invCustomerId = newCRef.id;
+            }
+          } else {
+            // Walk-in customer
+            const walkSnap = await db.collection(collections.invCustomers)
+              .where('orgId', '==', orgId)
+              .where('displayName', '==', 'Walk-in')
+              .where('sourceApp', '==', 'dineopen')
+              .limit(1).get();
+            if (!walkSnap.empty) {
+              invCustomerId = walkSnap.docs[0].id;
+            } else {
+              const wRef = await db.collection(collections.invCustomers).add({
+                orgId, type: 'individual', salutation: '',
+                firstName: 'Walk-in', lastName: '', companyName: '', displayName: 'Walk-in',
+                email: '', workPhone: '', mobile: '',
+                pan: '', gstin: '', currency: 'INR', paymentTerms: 'due_on_receipt',
+                language: 'English',
+                billingAddress: { street: '', city: '', state: '', zip: '', country: '' },
+                shippingAddress: { street: '', city: '', state: '', zip: '', country: '' },
+                contactPersons: [], notes: '', customFields: {},
+                status: 'active', sourceApp: 'dineopen', sourceRef: orderData.restaurantId,
+                createdAt: new Date(), updatedAt: new Date()
+              });
+              invCustomerId = wRef.id;
+            }
+          }
+
+          // Get next invoice number
+          const { getNextNumber } = require('./invoice/services/numberingService');
+          const invNumber = await getNextNumber(db, collections, orgId, 'invoice');
+
+          // Map order items to inv_invoice items
+          const orderItems = orderData.items || [];
+          const grandTotal = Number(orderData.finalAmount || orderData.totalAmount || 0);
+          const today = new Date().toISOString().split('T')[0];
+
+          const lineItems = orderItems.map(item => ({
+            itemId: item.menuItemId || '',
+            name: item.name || item.itemName || '',
+            description: item.variant || '',
+            quantity: item.quantity || 1,
+            rate: item.price || item.unitPrice || 0,
+            taxRate: 0,
+            amount: (item.quantity || 1) * (item.price || item.unitPrice || 0),
+          }));
+
+          const invRef = await db.collection(collections.invInvoices).add({
+            orgId,
+            customerId: invCustomerId,
+            customerName: custName,
+            invoiceNumber: invNumber,
+            referenceNumber: orderData.orderNumber || String(orderData.dailyOrderId || orderId.slice(-6)),
+            invoiceDate: today,
+            dueDate: today,
+            paymentTerms: 'due_on_receipt',
+            salesperson: '',
+            items: lineItems.length > 0 ? lineItems : [{
+              itemId: '', name: `POS Order #${orderData.dailyOrderId || orderId.slice(-6)}`,
+              description: '', quantity: 1, rate: grandTotal, taxRate: 0, amount: grandTotal
+            }],
+            subtotal: grandTotal - (orderData.taxAmount || 0),
+            discountType: 'fixed',
+            discountValue: (orderData.discountAmount || 0) + (orderData.manualDiscount || 0) + (orderData.loyaltyDiscount || 0),
+            discountAmount: (orderData.discountAmount || 0) + (orderData.manualDiscount || 0) + (orderData.loyaltyDiscount || 0),
+            taxAmount: orderData.taxAmount || 0,
+            taxBreakdown: orderData.taxBreakdown || [],
+            adjustments: 0,
+            total: grandTotal,
+            customerNotes: '',
+            termsAndConditions: '',
+            status: 'paid',
+            paidAmount: grandTotal,
+            balanceDue: 0,
+            paidAt: new Date(),
+            attachments: [],
+            sourceApp: 'dineopen_pos',
+            sourceRef: orderId,
+            createdAt: new Date(),
+            updatedAt: new Date()
+          });
+
+          // Create payment record
+          const payNumber = await getNextNumber(db, collections, orgId, 'payment');
+          await db.collection(collections.invPayments).add({
+            orgId,
+            customerId: invCustomerId,
+            invoiceId: invRef.id,
+            paymentNumber: payNumber,
+            paymentDate: today,
+            amount: grandTotal,
+            paymentMode: orderData.paymentMethod || 'cash',
+            referenceNumber: String(orderData.dailyOrderId || orderId.slice(-6)),
+            notes: `POS order #${orderData.dailyOrderId || orderId.slice(-6)}`,
+            createdAt: new Date()
+          });
+
+          console.log(`✅ inv_invoice ${invNumber} auto-created for POS order ${orderId}`);
+        } catch (err) {
+          console.error('POS→Invoice sync error (non-blocking):', err.message);
+        }
+      })();
+    }
+
     res.json({ message: 'Order status updated successfully' });
 
   } catch (error) {
@@ -14043,7 +14195,7 @@ app.delete('/api/staff/:staffId', authenticateToken, requireOwnerRole, async (re
 //   3. dine-app/components/StaffManagement.js (used for mobile staff management)
 const ROLE_DEFAULT_PAGE_ACCESS = {
   admin:    { dashboard:true, history:true, tables:true, menu:true, analytics:true, inventory:true, kot:true, admin:{ settings:true, tax:true, pricing:true, payments:true, billingSettings:true, currency:true, print:true, features:true, restaurants:true, staff:true, orderManagement:true, offers:true, loyalty:true, googleReviews:true, whatsapp:true }, completeBill:true, invoice:true, customers:true, offers:true },
-  manager:  { dashboard:true, history:true, tables:true, menu:true, analytics:true, inventory:true, kot:true, admin:false, completeBill:true, invoice:true, customers:true, offers:true },
+  manager:  { dashboard:true, history:true, tables:true, menu:true, analytics:true, inventory:{ read:true, add:true, update:true, delete:false }, kot:true, admin:false, completeBill:true, invoice:true, customers:true, offers:true },
   waiter:   { dashboard:true, history:true, tables:true, menu:true, analytics:false, inventory:false, kot:false, admin:false, completeBill:false, invoice:false, customers:false, offers:false },
   cashier:  { dashboard:true, history:true, tables:false, menu:true, analytics:false, inventory:false, kot:false, admin:false, completeBill:true, invoice:true, customers:false, offers:false },
   employee: { dashboard:true, history:true, tables:true, menu:true, analytics:false, inventory:false, kot:false, admin:false, completeBill:false, invoice:false, customers:false, offers:false },
@@ -18290,7 +18442,8 @@ app.patch('/api/inventory/:restaurantId/:itemId', authenticateToken, async (req,
             field === 'supplier' || field === 'description' || field === 'barcode' || field === 'location') {
           updateData[field] = req.body[field]?.trim() || '';
         } else if (field === 'currentStock' || field === 'minStock' || field === 'maxStock' || field === 'costPerUnit') {
-          updateData[field] = parseFloat(req.body[field]) || 0;
+          const parsed = parseFloat(req.body[field]);
+          updateData[field] = isNaN(parsed) ? 0 : Math.max(0, parsed);
         } else if (field === 'expiryDate' || field === 'mfgDate') {
           updateData[field] = req.body[field] || null;
         } else if (field === 'expiryDays') {
@@ -19950,10 +20103,10 @@ app.get('/api/suppliers/:restaurantId', authenticateToken, async (req, res) => {
 app.post('/api/suppliers/:restaurantId', authenticateToken, async (req, res) => {
   try {
     const { restaurantId } = req.params;
-    const { userId, role } = req.user;
-    
-    if (role !== 'owner' && role !== 'admin' && role !== 'manager') {
-      return res.status(403).json({ error: 'Access denied. Owner or manager privileges required.' });
+    const { userId } = req.user;
+
+    if (!(await checkFeaturePermission(req, 'inventory', 'add'))) {
+      return res.status(403).json({ error: 'Access denied. Inventory add permission required.' });
     }
 
     const { name, contact, email, address, paymentTerms, notes } = req.body;
@@ -20025,10 +20178,10 @@ app.get('/api/recipes/:restaurantId', authenticateToken, async (req, res) => {
 app.post('/api/recipes/:restaurantId', authenticateToken, async (req, res) => {
   try {
     const { restaurantId } = req.params;
-    const { userId, role } = req.user;
-    
-    if (role !== 'owner' && role !== 'admin' && role !== 'manager') {
-      return res.status(403).json({ error: 'Access denied. Owner or manager privileges required.' });
+    const { userId } = req.user;
+
+    if (!(await checkFeaturePermission(req, 'inventory', 'add'))) {
+      return res.status(403).json({ error: 'Access denied. Inventory add permission required.' });
     }
 
     const { name, description, ingredients, instructions, servings, prepTime, cookTime, category } = req.body;
@@ -20123,10 +20276,10 @@ Example: {"steps": ["Boil water in a saucepan over medium heat.", "Add tea leave
 app.patch('/api/recipes/:restaurantId/:recipeId', authenticateToken, async (req, res) => {
   try {
     const { restaurantId, recipeId } = req.params;
-    const { userId, role } = req.user;
-    
-    if (role !== 'owner' && role !== 'admin' && role !== 'manager') {
-      return res.status(403).json({ error: 'Access denied. Owner or manager privileges required.' });
+    const { userId } = req.user;
+
+    if (!(await checkFeaturePermission(req, 'inventory', 'update'))) {
+      return res.status(403).json({ error: 'Access denied. Inventory update permission required.' });
     }
 
     const updateData = { ...req.body, updatedAt: new Date(), updatedBy: userId };
@@ -20153,10 +20306,10 @@ app.patch('/api/recipes/:restaurantId/:recipeId', authenticateToken, async (req,
 app.delete('/api/recipes/:restaurantId/:recipeId', authenticateToken, async (req, res) => {
   try {
     const { restaurantId, recipeId } = req.params;
-    const { userId, role } = req.user;
-    
-    if (role !== 'owner' && role !== 'admin' && role !== 'manager') {
-      return res.status(403).json({ error: 'Access denied. Owner or manager privileges required.' });
+    const { userId } = req.user;
+
+    if (!(await checkFeaturePermission(req, 'inventory', 'delete'))) {
+      return res.status(403).json({ error: 'Access denied. Inventory delete permission required.' });
     }
 
     const recipeDoc = await db.collection(collections.recipes).doc(recipeId).get();
@@ -20214,10 +20367,10 @@ app.get('/api/purchase-orders/:restaurantId', authenticateToken, async (req, res
 app.post('/api/purchase-orders/:restaurantId', authenticateToken, async (req, res) => {
   try {
     const { restaurantId } = req.params;
-    const { userId, role } = req.user;
-    
-    if (role !== 'owner' && role !== 'admin' && role !== 'manager') {
-      return res.status(403).json({ error: 'Access denied. Owner or manager privileges required.' });
+    const { userId } = req.user;
+
+    if (!(await checkFeaturePermission(req, 'inventory', 'add'))) {
+      return res.status(403).json({ error: 'Access denied. Inventory add permission required.' });
     }
 
     const { supplierId, items, notes, expectedDeliveryDate } = req.body;
@@ -20264,10 +20417,10 @@ app.post('/api/purchase-orders/:restaurantId', authenticateToken, async (req, re
 app.patch('/api/purchase-orders/:restaurantId/:orderId', authenticateToken, async (req, res) => {
   try {
     const { restaurantId, orderId } = req.params;
-    const { userId, role } = req.user;
-    
-    if (role !== 'owner' && role !== 'admin' && role !== 'manager') {
-      return res.status(403).json({ error: 'Access denied. Owner or manager privileges required.' });
+    const { userId } = req.user;
+
+    if (!(await checkFeaturePermission(req, 'inventory', 'update'))) {
+      return res.status(403).json({ error: 'Access denied. Inventory update permission required.' });
     }
 
     const { status, receivedItems, notes } = req.body;
@@ -20463,11 +20616,11 @@ function generatePurchaseOrderInvoice(orderData, restaurantData, supplierName) {
 app.post('/api/purchase-orders/:restaurantId/:orderId/email', authenticateToken, async (req, res) => {
   try {
     const { restaurantId, orderId } = req.params;
-    const { userId, role } = req.user;
+    const { userId } = req.user;
     const { supplierEmail, supplierName } = req.body;
-    
-    if (role !== 'owner' && role !== 'admin' && role !== 'manager') {
-      return res.status(403).json({ error: 'Access denied. Owner or manager privileges required.' });
+
+    if (!(await checkFeaturePermission(req, 'inventory', 'read'))) {
+      return res.status(403).json({ error: 'Access denied. Inventory read permission required.' });
     }
 
     if (!supplierEmail) {
@@ -20602,10 +20755,10 @@ app.get('/api/grn/:restaurantId/:grnId', authenticateToken, async (req, res) => 
 app.post('/api/grn/:restaurantId', authenticateToken, async (req, res) => {
   try {
     const { restaurantId } = req.params;
-    const { userId, role } = req.user;
-    
-    if (role !== 'owner' && role !== 'admin' && role !== 'manager' && role !== 'staff') {
-      return res.status(403).json({ error: 'Access denied' });
+    const { userId } = req.user;
+
+    if (!(await checkFeaturePermission(req, 'inventory', 'add'))) {
+      return res.status(403).json({ error: 'Access denied. Inventory add permission required.' });
     }
 
     const { purchaseOrderId, items, notes, receivedBy } = req.body;
@@ -20716,10 +20869,10 @@ app.post('/api/grn/:restaurantId', authenticateToken, async (req, res) => {
 app.patch('/api/grn/:restaurantId/:grnId', authenticateToken, async (req, res) => {
   try {
     const { restaurantId, grnId } = req.params;
-    const { userId, role } = req.user;
-    
-    if (role !== 'owner' && role !== 'admin' && role !== 'manager') {
-      return res.status(403).json({ error: 'Access denied' });
+    const { userId } = req.user;
+
+    if (!(await checkFeaturePermission(req, 'inventory', 'update'))) {
+      return res.status(403).json({ error: 'Access denied. Inventory update permission required.' });
     }
 
     const grnDoc = await db.collection(collections.goodsReceiptNotes).doc(grnId).get();
@@ -20853,10 +21006,10 @@ app.post('/api/purchase-requisitions/:restaurantId', authenticateToken, async (r
 app.patch('/api/purchase-requisitions/:restaurantId/:reqId', authenticateToken, async (req, res) => {
   try {
     const { restaurantId, reqId } = req.params;
-    const { userId, role } = req.user;
-    
-    if (role !== 'owner' && role !== 'admin' && role !== 'manager') {
-      return res.status(403).json({ error: 'Access denied. Owner or manager privileges required.' });
+    const { userId } = req.user;
+
+    if (!(await checkFeaturePermission(req, 'inventory', 'update'))) {
+      return res.status(403).json({ error: 'Access denied. Inventory update permission required.' });
     }
 
     const { status, notes, autoCreatePO, supplierId, expectedDeliveryDate } = req.body; // status: 'approved', 'rejected'
@@ -20958,10 +21111,10 @@ app.patch('/api/purchase-requisitions/:restaurantId/:reqId', authenticateToken, 
 app.post('/api/purchase-requisitions/:restaurantId/:reqId/convert-to-po', authenticateToken, async (req, res) => {
   try {
     const { restaurantId, reqId } = req.params;
-    const { userId, role } = req.user;
-    
-    if (role !== 'owner' && role !== 'admin' && role !== 'manager') {
-      return res.status(403).json({ error: 'Access denied' });
+    const { userId } = req.user;
+
+    if (!(await checkFeaturePermission(req, 'inventory', 'add'))) {
+      return res.status(403).json({ error: 'Access denied. Inventory add permission required.' });
     }
 
     const { supplierId, expectedDeliveryDate, notes } = req.body;
@@ -21096,10 +21249,10 @@ app.get('/api/supplier-invoices/:restaurantId', authenticateToken, async (req, r
 app.post('/api/supplier-invoices/:restaurantId', authenticateToken, upload.single('invoiceFile'), async (req, res) => {
   try {
     const { restaurantId } = req.params;
-    const { userId, role } = req.user;
-    
-    if (role !== 'owner' && role !== 'admin' && role !== 'manager') {
-      return res.status(403).json({ error: 'Access denied' });
+    const { userId } = req.user;
+
+    if (!(await checkFeaturePermission(req, 'inventory', 'add'))) {
+      return res.status(403).json({ error: 'Access denied. Inventory add permission required.' });
     }
 
     const { 
@@ -21205,11 +21358,11 @@ app.post('/api/supplier-invoices/:restaurantId', authenticateToken, upload.singl
 app.post('/api/supplier-invoices/:restaurantId/generate-from-po', authenticateToken, async (req, res) => {
   try {
     const { restaurantId } = req.params;
-    const { userId, role } = req.user;
+    const { userId } = req.user;
     const { purchaseOrderId } = req.body;
-    
-    if (role !== 'owner' && role !== 'admin' && role !== 'manager') {
-      return res.status(403).json({ error: 'Access denied' });
+
+    if (!(await checkFeaturePermission(req, 'inventory', 'add'))) {
+      return res.status(403).json({ error: 'Access denied. Inventory add permission required.' });
     }
 
     if (!purchaseOrderId) {
@@ -21319,10 +21472,10 @@ app.post('/api/supplier-invoices/:restaurantId/generate-from-po', authenticateTo
 app.post('/api/supplier-invoices/:restaurantId/:invoiceId/match', authenticateToken, async (req, res) => {
   try {
     const { restaurantId, invoiceId } = req.params;
-    const { userId, role } = req.user;
-    
-    if (role !== 'owner' && role !== 'admin' && role !== 'manager') {
-      return res.status(403).json({ error: 'Access denied' });
+    const { userId } = req.user;
+
+    if (!(await checkFeaturePermission(req, 'inventory', 'update'))) {
+      return res.status(403).json({ error: 'Access denied. Inventory update permission required.' });
     }
 
     const invoiceDoc = await db.collection(collections.supplierInvoices).doc(invoiceId).get();
@@ -21425,10 +21578,10 @@ app.post('/api/supplier-invoices/:restaurantId/:invoiceId/match', authenticateTo
 app.patch('/api/supplier-invoices/:restaurantId/:invoiceId', authenticateToken, async (req, res) => {
   try {
     const { restaurantId, invoiceId } = req.params;
-    const { userId, role } = req.user;
-    
-    if (role !== 'owner' && role !== 'admin' && role !== 'manager') {
-      return res.status(403).json({ error: 'Access denied' });
+    const { userId } = req.user;
+
+    if (!(await checkFeaturePermission(req, 'inventory', 'update'))) {
+      return res.status(403).json({ error: 'Access denied. Inventory update permission required.' });
     }
 
     const { status, paidAmount, paidDate, paymentMethod, paymentStatus, receivedMethod, receivedDate } = req.body;
@@ -21492,10 +21645,10 @@ app.patch('/api/supplier-invoices/:restaurantId/:invoiceId', authenticateToken, 
 app.patch('/api/suppliers/:restaurantId/:supplierId', authenticateToken, async (req, res) => {
   try {
     const { restaurantId, supplierId } = req.params;
-    const { userId, role } = req.user;
-    
-    if (role !== 'owner' && role !== 'admin' && role !== 'manager') {
-      return res.status(403).json({ error: 'Access denied' });
+    const { userId } = req.user;
+
+    if (!(await checkFeaturePermission(req, 'inventory', 'update'))) {
+      return res.status(403).json({ error: 'Access denied. Inventory update permission required.' });
     }
 
     const supplierDoc = await db.collection(collections.suppliers).doc(supplierId).get();
@@ -21531,10 +21684,10 @@ app.patch('/api/suppliers/:restaurantId/:supplierId', authenticateToken, async (
 app.delete('/api/suppliers/:restaurantId/:supplierId', authenticateToken, async (req, res) => {
   try {
     const { restaurantId, supplierId } = req.params;
-    const { userId, role } = req.user;
-    
-    if (role !== 'owner' && role !== 'admin' && role !== 'manager') {
-      return res.status(403).json({ error: 'Access denied' });
+    const { userId } = req.user;
+
+    if (!(await checkFeaturePermission(req, 'inventory', 'delete'))) {
+      return res.status(403).json({ error: 'Access denied. Inventory delete permission required.' });
     }
 
     const supplierDoc = await db.collection(collections.suppliers).doc(supplierId).get();
@@ -21803,10 +21956,10 @@ app.get('/api/ai/waste-summary/:restaurantId', authenticateToken, async (req, re
 app.post('/api/ai/invoice-ocr/:restaurantId', authenticateToken, async (req, res) => {
   try {
     const { restaurantId } = req.params;
-    const { userId, role } = req.user;
-    
-    if (role !== 'owner' && role !== 'admin' && role !== 'manager') {
-      return res.status(403).json({ error: 'Access denied' });
+    const { userId } = req.user;
+
+    if (!(await checkFeaturePermission(req, 'inventory', 'add'))) {
+      return res.status(403).json({ error: 'Access denied. Inventory add permission required.' });
     }
 
     const { imageUrl } = req.body;
@@ -21979,10 +22132,10 @@ app.get('/api/supplier-returns/:restaurantId', authenticateToken, async (req, re
 app.post('/api/supplier-returns/:restaurantId', authenticateToken, async (req, res) => {
   try {
     const { restaurantId } = req.params;
-    const { userId, role } = req.user;
-    
-    if (role !== 'owner' && role !== 'admin' && role !== 'manager') {
-      return res.status(403).json({ error: 'Access denied' });
+    const { userId } = req.user;
+
+    if (!(await checkFeaturePermission(req, 'inventory', 'add'))) {
+      return res.status(403).json({ error: 'Access denied. Inventory add permission required.' });
     }
 
     const { purchaseOrderId, supplierId, items, returnType, reason, notes } = req.body;
@@ -22033,10 +22186,10 @@ app.post('/api/supplier-returns/:restaurantId', authenticateToken, async (req, r
 app.patch('/api/supplier-returns/:restaurantId/:returnId', authenticateToken, async (req, res) => {
   try {
     const { restaurantId, returnId } = req.params;
-    const { userId, role } = req.user;
-    
-    if (role !== 'owner' && role !== 'admin' && role !== 'manager') {
-      return res.status(403).json({ error: 'Access denied' });
+    const { userId } = req.user;
+
+    if (!(await checkFeaturePermission(req, 'inventory', 'update'))) {
+      return res.status(403).json({ error: 'Access denied. Inventory update permission required.' });
     }
 
     const { status, creditNoteNumber, notes } = req.body;
@@ -22093,10 +22246,10 @@ app.patch('/api/supplier-returns/:restaurantId/:returnId', authenticateToken, as
 app.delete('/api/supplier-returns/:restaurantId/:returnId', authenticateToken, async (req, res) => {
   try {
     const { restaurantId, returnId } = req.params;
-    const { userId, role } = req.user;
-    
-    if (role !== 'owner' && role !== 'admin' && role !== 'manager') {
-      return res.status(403).json({ error: 'Access denied' });
+    const { userId } = req.user;
+
+    if (!(await checkFeaturePermission(req, 'inventory', 'delete'))) {
+      return res.status(403).json({ error: 'Access denied. Inventory delete permission required.' });
     }
 
     const returnDoc = await db.collection(collections.supplierReturns).doc(returnId).get();
@@ -22179,10 +22332,10 @@ app.get('/api/stock-transfers/:restaurantId', authenticateToken, async (req, res
 app.post('/api/stock-transfers/:restaurantId', authenticateToken, async (req, res) => {
   try {
     const { restaurantId } = req.params;
-    const { userId, role } = req.user;
-    
-    if (role !== 'owner' && role !== 'admin' && role !== 'manager') {
-      return res.status(403).json({ error: 'Access denied' });
+    const { userId } = req.user;
+
+    if (!(await checkFeaturePermission(req, 'inventory', 'add'))) {
+      return res.status(403).json({ error: 'Access denied. Inventory add permission required.' });
     }
 
     const { fromLocation, toLocation, items, reason, notes } = req.body;
@@ -22243,10 +22396,10 @@ app.post('/api/stock-transfers/:restaurantId', authenticateToken, async (req, re
 app.patch('/api/stock-transfers/:restaurantId/:transferId', authenticateToken, async (req, res) => {
   try {
     const { restaurantId, transferId } = req.params;
-    const { userId, role } = req.user;
-    
-    if (role !== 'owner' && role !== 'admin' && role !== 'manager') {
-      return res.status(403).json({ error: 'Access denied' });
+    const { userId } = req.user;
+
+    if (!(await checkFeaturePermission(req, 'inventory', 'update'))) {
+      return res.status(403).json({ error: 'Access denied. Inventory update permission required.' });
     }
 
     const { status } = req.body;
@@ -22334,10 +22487,10 @@ app.patch('/api/stock-transfers/:restaurantId/:transferId', authenticateToken, a
 app.delete('/api/stock-transfers/:restaurantId/:transferId', authenticateToken, async (req, res) => {
   try {
     const { restaurantId, transferId } = req.params;
-    const { userId, role } = req.user;
-    
-    if (role !== 'owner' && role !== 'admin' && role !== 'manager') {
-      return res.status(403).json({ error: 'Access denied' });
+    const { userId } = req.user;
+
+    if (!(await checkFeaturePermission(req, 'inventory', 'delete'))) {
+      return res.status(403).json({ error: 'Access denied. Inventory delete permission required.' });
     }
 
     const transferDoc = await db.collection(collections.stockTransfers).doc(transferId).get();
@@ -22521,7 +22674,9 @@ app.get('/api/books/:restaurantId/cogs', authenticateToken, async (req, res) => 
       const itemId = tx.inventoryItemId;
       const qty = Math.abs(tx.quantityChange || 0);
       // Use stored costPerUnit if available, otherwise look up from inventory
-      const cost = tx.costPerUnit || tx.totalCost / qty || invMap[itemId]?.costPerUnit || 0;
+      const cost = (typeof tx.costPerUnit === 'number' ? tx.costPerUnit : null)
+        ?? (qty > 0 && typeof tx.totalCost === 'number' ? tx.totalCost / qty : null)
+        ?? invMap[itemId]?.costPerUnit ?? 0;
       const itemCost = qty * cost;
       totalCOGS += itemCost;
 
@@ -23318,6 +23473,66 @@ app.put('/api/admin/settings/:restaurantId/status', authenticateToken, async (re
   }
 });
 
+// ── Helper: Sync POS customer to Invoice module (inv_customers) ──
+async function syncCustomerToInvModule(db, collections, { restaurantId, name, phone, email }) {
+  try {
+    const restDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
+    if (!restDoc.exists) return;
+    const ownerId = restDoc.data().ownerId;
+    if (!ownerId) return;
+
+    const orgSnap = await db.collection(collections.invOrganizations)
+      .where('userId', '==', ownerId).limit(1).get();
+    if (orgSnap.empty) return; // Invoice module not set up — skip
+
+    const orgId = orgSnap.docs[0].id;
+    const normalizedPhone = phone ? String(phone).replace(/\D/g, '').slice(-10) : null;
+    let existingInvCust = null;
+
+    if (normalizedPhone) {
+      const phoneSnap = await db.collection(collections.invCustomers)
+        .where('orgId', '==', orgId)
+        .where('mobile', '==', normalizedPhone)
+        .limit(1).get();
+      if (!phoneSnap.empty) existingInvCust = phoneSnap.docs[0];
+    }
+    if (!existingInvCust && email) {
+      const emailSnap = await db.collection(collections.invCustomers)
+        .where('orgId', '==', orgId)
+        .where('email', '==', email)
+        .limit(1).get();
+      if (!emailSnap.empty) existingInvCust = emailSnap.docs[0];
+    }
+
+    const displayName = name || (normalizedPhone ? `Customer ${normalizedPhone}` : 'Walk-in');
+
+    if (existingInvCust) {
+      await existingInvCust.ref.update({
+        displayName,
+        mobile: normalizedPhone || existingInvCust.data().mobile,
+        email: email || existingInvCust.data().email,
+        sourceApp: 'dineopen',
+        updatedAt: new Date()
+      });
+    } else {
+      await db.collection(collections.invCustomers).add({
+        orgId, type: 'individual', salutation: '',
+        firstName: name || '', lastName: '', companyName: '', displayName,
+        email: email || '', workPhone: '', mobile: normalizedPhone || '',
+        pan: '', gstin: '', currency: 'INR', paymentTerms: 'due_on_receipt',
+        language: 'English',
+        billingAddress: { street: '', city: '', state: '', zip: '', country: '' },
+        shippingAddress: { street: '', city: '', state: '', zip: '', country: '' },
+        contactPersons: [], notes: '', customFields: {},
+        status: 'active', sourceApp: 'dineopen', sourceRef: restaurantId,
+        createdAt: new Date(), updatedAt: new Date()
+      });
+    }
+  } catch (err) {
+    console.error('Customer inv sync error (non-blocking):', err.message);
+  }
+}
+
 // Customer Management APIs
 app.post('/api/customers', authenticateToken, async (req, res) => {
   try {
@@ -23457,6 +23672,9 @@ app.post('/api/customers', authenticateToken, async (req, res) => {
 
       await existingCustomer.ref.update(updatedData);
 
+      // Sync to Invoice module (fire-and-forget)
+      syncCustomerToInvModule(db, collections, { restaurantId, name: updatedData.name, phone: updatedData.phone, email: updatedData.email }).catch(() => {});
+
       res.json({
         message: 'Customer updated successfully',
         customer: {
@@ -23488,6 +23706,9 @@ app.post('/api/customers', authenticateToken, async (req, res) => {
 
       const customerRef = await db.collection(collections.customers).add(customerData);
       console.log(`✅ New customer created: ${customerRef.id} with phone: ${phone}`);
+
+      // Sync to Invoice module (fire-and-forget)
+      syncCustomerToInvModule(db, collections, { restaurantId, name, phone, email }).catch(() => {});
 
       res.status(201).json({
         message: 'Customer created successfully',
@@ -23650,6 +23871,14 @@ app.patch('/api/customers/:customerId', authenticateToken, async (req, res) => {
     };
 
     await customerDoc.ref.update(updatedData);
+
+    // Sync to Invoice module (fire-and-forget)
+    syncCustomerToInvModule(db, collections, {
+      restaurantId: customerData.restaurantId,
+      name: updateData.name || customerData.name,
+      phone: updateData.phone || customerData.phone,
+      email: updateData.email || customerData.email
+    }).catch(() => {});
 
     res.json({
       message: 'Customer updated successfully',
