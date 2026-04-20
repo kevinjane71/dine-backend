@@ -9582,6 +9582,9 @@ app.get('/api/orders/:restaurantId', authenticateToken, async (req, res) => {
 // Analytics endpoints
 app.get('/api/analytics/:restaurantId', authenticateToken, async (req, res) => {
   try {
+    if (!(await checkFeaturePermission(req, 'analytics', 'read'))) {
+      return res.status(403).json({ error: 'Access denied. You do not have permission to view analytics.' });
+    }
     const { restaurantId } = req.params;
     const { period = '7d', startDate, endDate } = req.query;
 
@@ -9878,6 +9881,9 @@ function calculateAnalytics(orders, period) {
 // Sales Summary — supports single date, period presets, and custom date ranges
 app.get('/api/analytics/:restaurantId/daily-summary', authenticateToken, async (req, res) => {
   try {
+    if (!(await checkFeaturePermission(req, 'analytics', 'read'))) {
+      return res.status(403).json({ error: 'Access denied. You do not have permission to view analytics.' });
+    }
     const { restaurantId } = req.params;
     const { date, period, startDate, endDate } = req.query;
 
@@ -13976,6 +13982,9 @@ app.delete('/api/bookings/:bookingId', authenticateToken, async (req, res) => {
 
 app.get('/api/analytics/:restaurantId', authenticateToken, async (req, res) => {
   try {
+    if (!(await checkFeaturePermission(req, 'analytics', 'read'))) {
+      return res.status(403).json({ error: 'Access denied. You do not have permission to view analytics.' });
+    }
     const { restaurantId } = req.params;
     const { period = '7d' } = req.query;
 
@@ -22623,6 +22632,9 @@ function getPreviousRange(start, end) {
 // --- Revenue Aggregation ---
 app.get('/api/books/:restaurantId/revenue', authenticateToken, async (req, res) => {
   try {
+    if (!(await checkFeaturePermission(req, 'admin', 'read'))) {
+      return res.status(403).json({ error: 'Access denied. You do not have permission to view books.' });
+    }
     const { restaurantId } = req.params;
     const { period = 'this_month', startDate, endDate } = req.query;
     const { start, end } = getDateRange(period, startDate, endDate);
@@ -22691,6 +22703,9 @@ app.get('/api/books/:restaurantId/revenue', authenticateToken, async (req, res) 
 // --- COGS Aggregation ---
 app.get('/api/books/:restaurantId/cogs', authenticateToken, async (req, res) => {
   try {
+    if (!(await checkFeaturePermission(req, 'admin', 'read'))) {
+      return res.status(403).json({ error: 'Access denied. You do not have permission to view books.' });
+    }
     const { restaurantId } = req.params;
     const { period = 'this_month', startDate, endDate } = req.query;
     const { start, end } = getDateRange(period, startDate, endDate);
@@ -22745,6 +22760,9 @@ app.get('/api/books/:restaurantId/cogs', authenticateToken, async (req, res) => 
 // --- Expenses CRUD ---
 app.get('/api/books/:restaurantId/expenses', authenticateToken, async (req, res) => {
   try {
+    if (!(await checkFeaturePermission(req, 'admin', 'read'))) {
+      return res.status(403).json({ error: 'Access denied. You do not have permission to view books.' });
+    }
     const { restaurantId } = req.params;
     const { period = 'this_month', startDate, endDate, category } = req.query;
     const { start, end } = getDateRange(period, startDate, endDate);
@@ -22880,6 +22898,9 @@ app.delete('/api/books/:restaurantId/expenses/:expenseId', authenticateToken, as
 // --- Supplier Dues ---
 app.get('/api/books/:restaurantId/supplier-dues', authenticateToken, async (req, res) => {
   try {
+    if (!(await checkFeaturePermission(req, 'admin', 'read'))) {
+      return res.status(403).json({ error: 'Access denied. You do not have permission to view books.' });
+    }
     const { restaurantId } = req.params;
     const now = new Date();
 
@@ -22947,6 +22968,9 @@ app.get('/api/books/:restaurantId/supplier-dues', authenticateToken, async (req,
 // --- Profit & Loss ---
 app.get('/api/books/:restaurantId/pnl', authenticateToken, async (req, res) => {
   try {
+    if (!(await checkFeaturePermission(req, 'admin', 'read'))) {
+      return res.status(403).json({ error: 'Access denied. You do not have permission to view books.' });
+    }
     const { restaurantId } = req.params;
     const { period = 'this_month', startDate, endDate } = req.query;
     const { start, end } = getDateRange(period, startDate, endDate);
@@ -23041,6 +23065,9 @@ app.get('/api/books/:restaurantId/pnl', authenticateToken, async (req, res) => {
 // --- Overview Dashboard ---
 app.get('/api/books/:restaurantId/overview', authenticateToken, async (req, res) => {
   try {
+    if (!(await checkFeaturePermission(req, 'admin', 'read'))) {
+      return res.status(403).json({ error: 'Access denied. You do not have permission to view books.' });
+    }
     const { restaurantId } = req.params;
     const { period = 'this_month', startDate, endDate } = req.query;
     const { start, end } = getDateRange(period, startDate, endDate);
@@ -23766,6 +23793,9 @@ app.post('/api/customers', authenticateToken, async (req, res) => {
 
 app.get('/api/customers/:restaurantId', authenticateToken, async (req, res) => {
   try {
+    if (!(await checkFeaturePermission(req, 'customers', 'read'))) {
+      return res.status(403).json({ error: 'Access denied. You do not have permission to view customers.' });
+    }
     const { restaurantId } = req.params;
     const { userId } = req.user;
     const page = Math.max(1, parseInt(req.query.page) || 1);
@@ -23860,6 +23890,9 @@ app.get('/api/customers/:restaurantId', authenticateToken, async (req, res) => {
 // Get single customer by ID
 app.get('/api/customers/detail/:customerId', authenticateToken, async (req, res) => {
   try {
+    if (!(await checkFeaturePermission(req, 'customers', 'read'))) {
+      return res.status(403).json({ error: 'Access denied. You do not have permission to view customers.' });
+    }
     const { customerId } = req.params;
     const { userId } = req.user;
 
@@ -25444,6 +25477,9 @@ app.put('/api/restaurants/:restaurantId/customer-app-settings', authenticateToke
     // Invalidate Redis cache so public endpoints serve fresh data
     invalidateRestaurantCache(restaurantId);
 
+    // Notify all connected clients about offer settings change
+    pusherService.triggerOrderEvent(restaurantId, 'offer-updated', { action: 'settings-updated' });
+
     res.json({
       message: 'Customer app settings updated successfully',
       settings: customerAppSettings
@@ -25863,6 +25899,9 @@ app.post('/api/orders/:orderId/comp-void', authenticateToken, async (req, res) =
 // Get customer credit history
 app.get('/api/customers/:customerId/credit-history', authenticateToken, async (req, res) => {
   try {
+    if (!(await checkFeaturePermission(req, 'customers', 'read'))) {
+      return res.status(403).json({ error: 'Access denied. You do not have permission to view customers.' });
+    }
     const { customerId } = req.params;
     const customerDoc = await db.collection(collections.customers).doc(customerId).get();
     if (!customerDoc.exists) {
@@ -27342,6 +27381,9 @@ app.post('/api/automation/:restaurantId/automations', authenticateToken, async (
 // Update automation
 app.patch('/api/automation/:restaurantId/automations/:automationId', authenticateToken, async (req, res) => {
   try {
+    if (!(await checkFeaturePermission(req, 'admin', 'read'))) {
+      return res.status(403).json({ error: 'Access denied. You do not have permission to manage automation.' });
+    }
     const { restaurantId, automationId } = req.params;
     const updateData = {
       ...req.body,
@@ -27359,6 +27401,9 @@ app.patch('/api/automation/:restaurantId/automations/:automationId', authenticat
 // Delete automation
 app.delete('/api/automation/:restaurantId/automations/:automationId', authenticateToken, async (req, res) => {
   try {
+    if (!(await checkFeaturePermission(req, 'admin', 'read'))) {
+      return res.status(403).json({ error: 'Access denied. You do not have permission to manage automation.' });
+    }
     const { automationId } = req.params;
     await db.collection(collections.automations).doc(automationId).delete();
     res.json({ success: true });
@@ -27371,6 +27416,9 @@ app.delete('/api/automation/:restaurantId/automations/:automationId', authentica
 // Get templates
 app.get('/api/automation/:restaurantId/templates', authenticateToken, async (req, res) => {
   try {
+    if (!(await checkFeaturePermission(req, 'admin', 'read'))) {
+      return res.status(403).json({ error: 'Access denied. You do not have permission to manage automation.' });
+    }
     const { restaurantId } = req.params;
     const snapshot = await db.collection(collections.automationTemplates)
       .where('restaurantId', '==', restaurantId)
@@ -27391,6 +27439,9 @@ app.get('/api/automation/:restaurantId/templates', authenticateToken, async (req
 // Create template
 app.post('/api/automation/:restaurantId/templates', authenticateToken, async (req, res) => {
   try {
+    if (!(await checkFeaturePermission(req, 'admin', 'read'))) {
+      return res.status(403).json({ error: 'Access denied. You do not have permission to manage automation.' });
+    }
     const { restaurantId } = req.params;
     const templateData = {
       restaurantId,
@@ -27411,6 +27462,9 @@ app.post('/api/automation/:restaurantId/templates', authenticateToken, async (re
 // Update template
 app.patch('/api/automation/:restaurantId/templates/:templateId', authenticateToken, async (req, res) => {
   try {
+    if (!(await checkFeaturePermission(req, 'admin', 'read'))) {
+      return res.status(403).json({ error: 'Access denied. You do not have permission to manage automation.' });
+    }
     const { templateId } = req.params;
     const updateData = {
       ...req.body,
@@ -27428,6 +27482,9 @@ app.patch('/api/automation/:restaurantId/templates/:templateId', authenticateTok
 // Delete template
 app.delete('/api/automation/:restaurantId/templates/:templateId', authenticateToken, async (req, res) => {
   try {
+    if (!(await checkFeaturePermission(req, 'admin', 'read'))) {
+      return res.status(403).json({ error: 'Access denied. You do not have permission to manage automation.' });
+    }
     const { templateId } = req.params;
     await db.collection(collections.automationTemplates).doc(templateId).delete();
     res.json({ success: true });
@@ -27440,6 +27497,9 @@ app.delete('/api/automation/:restaurantId/templates/:templateId', authenticateTo
 // Get analytics
 app.get('/api/automation/:restaurantId/analytics', authenticateToken, async (req, res) => {
   try {
+    if (!(await checkFeaturePermission(req, 'admin', 'read'))) {
+      return res.status(403).json({ error: 'Access denied. You do not have permission to manage automation.' });
+    }
     const { restaurantId } = req.params;
     const { period = '30d' } = req.query;
 
@@ -27498,6 +27558,9 @@ app.get('/api/automation/:restaurantId/analytics', authenticateToken, async (req
 // Get coupons
 app.get('/api/automation/:restaurantId/coupons', authenticateToken, async (req, res) => {
   try {
+    if (!(await checkFeaturePermission(req, 'admin', 'read'))) {
+      return res.status(403).json({ error: 'Access denied. You do not have permission to manage automation.' });
+    }
     const { restaurantId } = req.params;
     const snapshot = await db.collection(collections.coupons)
       .where('restaurantId', '==', restaurantId)
@@ -27518,6 +27581,9 @@ app.get('/api/automation/:restaurantId/coupons', authenticateToken, async (req, 
 // Create coupon
 app.post('/api/automation/:restaurantId/coupons', authenticateToken, async (req, res) => {
   try {
+    if (!(await checkFeaturePermission(req, 'admin', 'read'))) {
+      return res.status(403).json({ error: 'Access denied. You do not have permission to manage automation.' });
+    }
     const { restaurantId } = req.params;
     const couponData = {
       restaurantId,
@@ -27538,6 +27604,9 @@ app.post('/api/automation/:restaurantId/coupons', authenticateToken, async (req,
 // Update coupon
 app.patch('/api/automation/:restaurantId/coupons/:couponId', authenticateToken, async (req, res) => {
   try {
+    if (!(await checkFeaturePermission(req, 'admin', 'read'))) {
+      return res.status(403).json({ error: 'Access denied. You do not have permission to manage automation.' });
+    }
     const { couponId } = req.params;
     const updateData = {
       ...req.body,
@@ -27555,6 +27624,9 @@ app.patch('/api/automation/:restaurantId/coupons/:couponId', authenticateToken, 
 // Delete coupon
 app.delete('/api/automation/:restaurantId/coupons/:couponId', authenticateToken, async (req, res) => {
   try {
+    if (!(await checkFeaturePermission(req, 'admin', 'read'))) {
+      return res.status(403).json({ error: 'Access denied. You do not have permission to manage automation.' });
+    }
     const { couponId } = req.params;
     await db.collection(collections.coupons).doc(couponId).delete();
     res.json({ success: true });
@@ -27567,6 +27639,9 @@ app.delete('/api/automation/:restaurantId/coupons/:couponId', authenticateToken,
 // Get WhatsApp settings
 app.get('/api/automation/:restaurantId/whatsapp', authenticateToken, async (req, res) => {
   try {
+    if (!(await checkFeaturePermission(req, 'admin', 'read'))) {
+      return res.status(403).json({ error: 'Access denied. You do not have permission to manage automation.' });
+    }
     const { restaurantId } = req.params;
     const snapshot = await db.collection(collections.automationSettings)
       .where('restaurantId', '==', restaurantId)
@@ -27622,6 +27697,9 @@ app.get('/api/automation/webhook/url', (req, res) => {
 // Connect WhatsApp
 app.post('/api/automation/:restaurantId/whatsapp/connect', authenticateToken, async (req, res) => {
   try {
+    if (!(await checkFeaturePermission(req, 'admin', 'read'))) {
+      return res.status(403).json({ error: 'Access denied. You do not have permission to manage automation.' });
+    }
     const { restaurantId } = req.params;
     const { mode, accessToken, phoneNumberId, businessAccountId, webhookVerifyToken } = req.body;
 
@@ -27752,6 +27830,9 @@ app.post('/api/automation/:restaurantId/whatsapp/connect', authenticateToken, as
 // Send test WhatsApp message
 app.post('/api/automation/:restaurantId/whatsapp/test', authenticateToken, async (req, res) => {
   try {
+    if (!(await checkFeaturePermission(req, 'admin', 'read'))) {
+      return res.status(403).json({ error: 'Access denied. You do not have permission to manage automation.' });
+    }
     const { restaurantId } = req.params;
     const { phoneNumber, message, templateName, templateLanguage } = req.body;
 
@@ -27846,6 +27927,9 @@ app.post('/api/automation/:restaurantId/whatsapp/test', authenticateToken, async
 // Disconnect WhatsApp
 app.post('/api/automation/:restaurantId/whatsapp/disconnect', authenticateToken, async (req, res) => {
   try {
+    if (!(await checkFeaturePermission(req, 'admin', 'read'))) {
+      return res.status(403).json({ error: 'Access denied. You do not have permission to manage automation.' });
+    }
     const { restaurantId } = req.params;
     const snapshot = await db.collection(collections.automationSettings)
       .where('restaurantId', '==', restaurantId)
@@ -27872,6 +27956,9 @@ app.post('/api/automation/:restaurantId/whatsapp/disconnect', authenticateToken,
 // Send bill via WhatsApp
 app.post('/api/automation/:restaurantId/whatsapp/send-bill', authenticateToken, async (req, res) => {
   try {
+    if (!(await checkFeaturePermission(req, 'admin', 'read'))) {
+      return res.status(403).json({ error: 'Access denied. You do not have permission to manage automation.' });
+    }
     const { restaurantId } = req.params;
     const { customerPhone, customerName, amount, orderId, invoiceText, restaurantName } = req.body;
 
@@ -27954,6 +28041,9 @@ app.post('/api/automation/:restaurantId/whatsapp/send-bill', authenticateToken, 
 // Get WhatsApp messages/conversations for a restaurant
 app.get('/api/automation/:restaurantId/whatsapp/messages', authenticateToken, async (req, res) => {
   try {
+    if (!(await checkFeaturePermission(req, 'admin', 'read'))) {
+      return res.status(403).json({ error: 'Access denied. You do not have permission to manage automation.' });
+    }
     const { restaurantId } = req.params;
     const { page = 1, limit = 50, phone } = req.query;
     const pageNum = parseInt(page);
@@ -28015,6 +28105,9 @@ app.get('/api/automation/:restaurantId/whatsapp/messages', authenticateToken, as
 // Reply to a WhatsApp message (free-form text within 24h window)
 app.post('/api/automation/:restaurantId/whatsapp/reply', authenticateToken, async (req, res) => {
   try {
+    if (!(await checkFeaturePermission(req, 'admin', 'read'))) {
+      return res.status(403).json({ error: 'Access denied. You do not have permission to manage automation.' });
+    }
     const { restaurantId } = req.params;
     const { phone, message } = req.body;
 
@@ -28081,6 +28174,9 @@ app.post('/api/automation/:restaurantId/whatsapp/reply', authenticateToken, asyn
 // Mark messages as read by staff
 app.post('/api/automation/:restaurantId/whatsapp/mark-read', authenticateToken, async (req, res) => {
   try {
+    if (!(await checkFeaturePermission(req, 'admin', 'read'))) {
+      return res.status(403).json({ error: 'Access denied. You do not have permission to manage automation.' });
+    }
     const { restaurantId } = req.params;
     const { phone } = req.body;
 
@@ -28110,6 +28206,9 @@ app.post('/api/automation/:restaurantId/whatsapp/mark-read', authenticateToken, 
 // Trigger automation manually (for testing)
 app.post('/api/automation/:restaurantId/trigger', authenticateToken, async (req, res) => {
   try {
+    if (!(await checkFeaturePermission(req, 'admin', 'read'))) {
+      return res.status(403).json({ error: 'Access denied. You do not have permission to manage automation.' });
+    }
     const { restaurantId } = req.params;
     const { triggerType, triggerData } = req.body;
 
@@ -28124,6 +28223,9 @@ app.post('/api/automation/:restaurantId/trigger', authenticateToken, async (req,
 // Sync customer from order (called when order is created)
 app.post('/api/automation/:restaurantId/sync-customer', authenticateToken, async (req, res) => {
   try {
+    if (!(await checkFeaturePermission(req, 'admin', 'read'))) {
+      return res.status(403).json({ error: 'Access denied. You do not have permission to manage automation.' });
+    }
     const { restaurantId } = req.params;
     const { order } = req.body;
 
