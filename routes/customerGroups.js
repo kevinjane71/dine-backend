@@ -39,6 +39,34 @@ async function ensureRestaurantOwnership(req, restaurantId) {
   return { ok: true };
 }
 
+// ─── Lookup: which groups does a customer belong to? ──────────────────
+// GET /lookup/:restaurantId?phone=98xxxx&customerId=...
+// NOTE: Must be declared BEFORE /:restaurantId to avoid Express matching "lookup" as restaurantId
+router.get('/lookup/:restaurantId', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+    const phone = normalizePhone(req.query.phone);
+    const customerId = req.query.customerId || null;
+    if (!phone && !customerId) {
+      return res.status(400).json({ success: false, error: 'phone or customerId required' });
+    }
+    const snap = await db.collection(COLLECTION)
+      .where('restaurantId', '==', restaurantId)
+      .get();
+    const groups = [];
+    snap.forEach(doc => {
+      const d = doc.data();
+      const inIds = customerId && Array.isArray(d.customerIds) && d.customerIds.includes(customerId);
+      const inPhones = phone && Array.isArray(d.customerPhones) && d.customerPhones.includes(phone);
+      if (inIds || inPhones) groups.push({ id: doc.id, name: d.name, color: d.color });
+    });
+    res.json({ success: true, groups });
+  } catch (err) {
+    console.error('[customerGroups] lookup error', err);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
 // ─── LIST groups ──────────────────────────────────────────────────────
 router.get('/:restaurantId', authenticateToken, async (req, res) => {
   try {
@@ -216,33 +244,6 @@ router.delete('/:restaurantId/:groupId/members', authenticateToken, async (req, 
     res.json({ success: true, group: { id: groupId, ...data } });
   } catch (err) {
     console.error('[customerGroups] remove members error', err);
-    res.status(500).json({ success: false, error: err.message });
-  }
-});
-
-// ─── Lookup: which groups does a customer belong to? ──────────────────
-// GET /lookup/:restaurantId?phone=98xxxx&customerId=...
-router.get('/lookup/:restaurantId', authenticateToken, async (req, res) => {
-  try {
-    const { restaurantId } = req.params;
-    const phone = normalizePhone(req.query.phone);
-    const customerId = req.query.customerId || null;
-    if (!phone && !customerId) {
-      return res.status(400).json({ success: false, error: 'phone or customerId required' });
-    }
-    const snap = await db.collection(COLLECTION)
-      .where('restaurantId', '==', restaurantId)
-      .get();
-    const groups = [];
-    snap.forEach(doc => {
-      const d = doc.data();
-      const inIds = customerId && Array.isArray(d.customerIds) && d.customerIds.includes(customerId);
-      const inPhones = phone && Array.isArray(d.customerPhones) && d.customerPhones.includes(phone);
-      if (inIds || inPhones) groups.push({ id: doc.id, name: d.name, color: d.color });
-    });
-    res.json({ success: true, groups });
-  } catch (err) {
-    console.error('[customerGroups] lookup error', err);
     res.status(500).json({ success: false, error: err.message });
   }
 });

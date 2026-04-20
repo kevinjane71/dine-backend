@@ -186,11 +186,20 @@ const calculateDiscountForOffer = (offer, subtotal, cart = [], context = {}) => 
   }
 
   // Resolve tier (if any). When tiers match, tier overrides discountType/discountValue.
+  // If offer has tiers defined but none match (subtotal below all tiers), discount is 0.
   const appliedTier = resolveTier(offer, subtotal);
+  const hasTiers = Array.isArray(offer.tiers) && offer.tiers.length > 0;
+  if (hasTiers && !appliedTier) return { discount: 0, freeItems: [], appliedTier: null };
   const effectiveDiscountType = appliedTier ? appliedTier.discountType : offer.discountType;
   const effectiveDiscountValue = appliedTier ? Number(appliedTier.discountValue) : (offer.discountValue || 0);
 
   let baseDiscount = 0;
+
+  // Cross-item BOGO: when enabled, ONLY use free-item discount (no base discount)
+  const cross = calculateCrossItemBogo(offer, cart);
+  if (cross.discount > 0) {
+    return { discount: cross.discount, freeItems: cross.freeItems, appliedTier };
+  }
 
   // Legacy simple BOGO (same-item)
   if (offer.promotionType === 'bogo' && offer.bogoConfig) {
@@ -216,9 +225,7 @@ const calculateDiscountForOffer = (offer, subtotal, cart = [], context = {}) => 
     }
   }
 
-  // Cross-item BOGO adds on top of base discount
-  const cross = calculateCrossItemBogo(offer, cart);
-  const totalDiscount = Math.round((baseDiscount + cross.discount) * 100) / 100;
+  const totalDiscount = baseDiscount;
 
   return {
     discount: totalDiscount,
@@ -250,6 +257,11 @@ const filterApplicableOffers = (offers, { subtotal, cart, context, now }) => {
     if (!isScheduleValid(offer, n)) return false;
     if (!isDateValid(offer, n)) return false;
     if (offer.minOrderValue && subtotal < offer.minOrderValue) return false;
+    // Tiered offers: must meet at least the lowest tier's minSubtotal
+    if (Array.isArray(offer.tiers) && offer.tiers.length > 0) {
+      const lowestMin = Math.min(...offer.tiers.filter(t => t && typeof t.minSubtotal === 'number').map(t => t.minSubtotal));
+      if (subtotal < lowestMin) return false;
+    }
     if (!hasScopeMatchingCart(offer, cart)) return false;
     if (!matchesAudience(offer, context || {})) return false;
     return true;

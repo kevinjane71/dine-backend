@@ -3720,7 +3720,7 @@ app.post('/api/user/link-phone', authenticateToken, async (req, res) => {
     // If OTP provided, verify it using the same OTP verification as login
     if (otp) {
       // Check if this is a demo account
-      const isDemoAccount = normalizedPhone === '+919000000000' && otp === '1234';
+      const isDemoAccount = DUMMY_PHONES.includes(normalizedPhone) && otp === '1234';
       let otpValid = false;
 
       if (isDemoAccount) {
