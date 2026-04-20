@@ -25117,6 +25117,9 @@ app.post('/api/offers/:restaurantId', authenticateToken, async (req, res) => {
     // Invalidate offers cache so public endpoint serves fresh data
     kvDel(`offers:${restaurantId}`).catch(() => {});
 
+    // Notify all connected clients (POS, dashboard) about offer change
+    pusherService.triggerOrderEvent(restaurantId, 'offer-updated', { offerId: offerRef.id, action: 'created' });
+
     res.status(201).json({
       message: 'Offer created successfully',
       offer: {
@@ -25186,6 +25189,9 @@ app.put('/api/offers/:restaurantId/:offerId', authenticateToken, async (req, res
     // Invalidate offers cache so public endpoint serves fresh data
     kvDel(`offers:${restaurantId}`).catch(() => {});
 
+    // Notify all connected clients (POS, dashboard) about offer change
+    pusherService.triggerOrderEvent(restaurantId, 'offer-updated', { offerId, action: 'updated' });
+
     res.json({
       message: 'Offer updated successfully',
       offer: {
@@ -25230,6 +25236,9 @@ app.delete('/api/offers/:restaurantId/:offerId', authenticateToken, async (req, 
 
     // Invalidate offers cache so public endpoint serves fresh data
     kvDel(`offers:${restaurantId}`).catch(() => {});
+
+    // Notify all connected clients (POS, dashboard) about offer change
+    pusherService.triggerOrderEvent(restaurantId, 'offer-updated', { offerId, action: 'deleted' });
 
     res.json({
       message: 'Offer deleted successfully'

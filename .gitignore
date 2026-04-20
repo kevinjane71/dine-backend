@@ -134,3 +134,6 @@ dist/
 # package-lock.json
 .vercel
 .env*.local
+
+# Database backups
+backups/
