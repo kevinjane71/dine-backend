@@ -3851,6 +3851,46 @@ app.post('/api/user/change-password', authenticateToken, async (req, res) => {
   }
 });
 
+// Delete user account (Apple App Store Guideline 5.1.1v compliance)
+app.post('/api/user/delete-account', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const source = req.user.source;
+
+    // Determine which Firestore collection the user lives in
+    const collName = source === 'staffUsers' ? collections.staffUsers : collections.users;
+
+    // Verify user exists
+    const userDoc = await db.collection(collName).doc(userId).get();
+    if (!userDoc.exists) {
+      return res.status(404).json({ error: 'Account not found' });
+    }
+
+    // Delete the user document
+    await db.collection(collName).doc(userId).delete();
+
+    // Also remove any userRestaurants associations
+    try {
+      const urSnap = await db.collection(collections.userRestaurants)
+        .where('userId', '==', userId)
+        .get();
+      const batch = db.batch();
+      urSnap.forEach(doc => batch.delete(doc.ref));
+      if (!urSnap.empty) await batch.commit();
+    } catch (urErr) {
+      console.error('Error cleaning up userRestaurants:', urErr);
+      // Non-fatal: user account is already deleted
+    }
+
+    console.log(`Account deleted: ${userId} from ${collName}`);
+    res.json({ success: true, message: 'Account deleted successfully' });
+
+  } catch (error) {
+    console.error('Delete account error:', error);
+    res.status(500).json({ error: 'Failed to delete account. Please try again.' });
+  }
+});
+
 // Change password for staff members (loginId-based)
 app.post('/api/staff/change-password', authenticateToken, async (req, res) => {
   try {

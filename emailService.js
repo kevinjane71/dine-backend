@@ -38,7 +38,7 @@ Hey ${userData.name}!
 
 I'm personally reaching out to welcome you to DineOpen.
 
-You're not just another sign-up — you're special to us. We built DineOpen because we believe restaurant owners like you should focus on great food and happy customers, not wrestle with complicated tech.
+You're not just another sign-up, you're special to us. We built DineOpen because we believe restaurant owners like you should focus on great food and happy customers, not wrestle with complicated tech.
 
 Quick favor — reply to this email with your restaurant menu (photo, PDF, or even a screenshot). Our AI will digitize it in seconds and we'll get your account fully set up.
 
