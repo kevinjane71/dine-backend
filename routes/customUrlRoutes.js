@@ -45,11 +45,6 @@ router.get('/public/restaurant-by-slug/:slug', async (req, res) => {
     const restaurantDoc = restaurantsSnapshot.docs[0];
     const restaurantData = restaurantDoc.data();
 
-    // Check if customer app is enabled
-    if (!restaurantData.customerAppSettings?.enabled) {
-      return res.status(404).json({ error: 'Restaurant online ordering not enabled' });
-    }
-
     res.json({
       restaurantId: restaurantDoc.id,
       name: restaurantData.name,

@@ -5681,7 +5681,28 @@ app.post('/api/restaurants', authenticateToken, async (req, res) => {
     
     // Update subdomain with actual restaurant ID for uniqueness
     const finalSubdomain = await generateSubdomain(name, restaurantRef.id);
-    await restaurantRef.update({ subdomain: finalSubdomain });
+
+    // Auto-generate urlSlug from restaurant name (for pretty URLs like dineopen.com/restaurant-name)
+    let urlSlug = name.toLowerCase().trim()
+      .replace(/[^a-z0-9\s-]/g, '')
+      .replace(/\s+/g, '-')
+      .replace(/-+/g, '-')
+      .replace(/^-|-$/g, '');
+    if (urlSlug.length < 3) urlSlug = `restaurant-${restaurantRef.id.slice(-6)}`;
+    if (urlSlug.length > 30) urlSlug = urlSlug.slice(0, 30).replace(/-$/, '');
+    // Check uniqueness
+    let slugCounter = 1;
+    let candidateSlug = urlSlug;
+    while (true) {
+      const existingSlug = await db.collection(collections.restaurants).where('urlSlug', '==', candidateSlug).limit(1).get();
+      if (existingSlug.empty) break;
+      candidateSlug = `${urlSlug.slice(0, 26)}-${slugCounter}`;
+      slugCounter++;
+      if (slugCounter > 50) { candidateSlug = `${urlSlug.slice(0, 20)}-${restaurantRef.id.slice(-6)}`; break; }
+    }
+    urlSlug = candidateSlug;
+
+    await restaurantRef.update({ subdomain: finalSubdomain, urlSlug });
 
     // Create user-restaurant relationship
     await db.collection(collections.userRestaurants).add({
@@ -5692,9 +5713,9 @@ app.post('/api/restaurants', authenticateToken, async (req, res) => {
       updatedAt: new Date()
     });
 
-    // Store qrData for reference, but don't generate qrCode here to save bandwidth
-    // QR code can be generated on-demand client-side or via separate endpoint
-    const qrData = `${process.env.FRONTEND_URL || 'https://www.dineopen.com'}/placeorder?restaurant=${restaurantRef.id}`;
+    // Store qrData using the pretty URL slug
+    const frontendUrl = process.env.FRONTEND_URL || 'https://www.dineopen.com';
+    const qrData = `${frontendUrl}/${urlSlug}`;
     await restaurantRef.update({ qrData });
 
     res.status(201).json({
@@ -5702,9 +5723,10 @@ app.post('/api/restaurants', authenticateToken, async (req, res) => {
       restaurant: {
         id: restaurantRef.id,
         ...restaurantData,
-        subdomain: finalSubdomain, // Include the final subdomain
+        subdomain: finalSubdomain,
+        urlSlug,
         subdomainUrl: SUBDOMAIN_FEATURE_ENABLED ? getSubdomainUrl(finalSubdomain) : null,
-        qrData // Include qrData but not qrCode (large base64 string)
+        qrData
       }
     });
 
