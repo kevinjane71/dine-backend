@@ -15010,6 +15010,14 @@ app.get('/api/admin/tax/:restaurantId', authenticateToken, async (req, res) => {
     const { restaurantId } = req.params;
     const userId = req.user.userId;
 
+    // KV cache: return cached tax settings if available (3 min TTL)
+    const taxCacheKey = `tax-settings:${restaurantId}`;
+    const cachedTax = await kvGet(taxCacheKey);
+    if (cachedTax) {
+
+      return res.json({ success: true, taxSettings: cachedTax });
+    }
+
     console.log(`📊 Getting tax settings for restaurant: ${restaurantId}, userId: ${userId}`);
 
     // Verify user has access to this restaurant (owner, manager, admin, cashier)
@@ -15082,6 +15090,10 @@ app.get('/api/admin/tax/:restaurantId', authenticateToken, async (req, res) => {
       ],
       defaultTaxRate: 5
     };
+
+    // Cache for 3 minutes in KV
+    kvSet(taxCacheKey, taxSettings, 180).catch(() => {});
+    // Browser cache 60s — tax settings rarely change mid-shift
 
     res.json({
       success: true,
@@ -15178,6 +15190,7 @@ app.put('/api/admin/tax/:restaurantId', authenticateToken, async (req, res) => {
 
     // Invalidate Redis cache so public endpoints serve fresh data
     invalidateRestaurantCache(restaurantId);
+    kvDel(`tax-settings:${restaurantId}`).catch(() => {});
 
     res.json({
       success: true,
@@ -24820,12 +24833,11 @@ app.get('/api/public/customer-app-settings/:restaurantId', vercelSecurityMiddlew
   try {
     const { restaurantId } = req.params;
 
-    const restaurantDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
-    if (!restaurantDoc.exists) {
+    // Use KV-cached restaurant data
+    const { data: restaurantData } = await getCachedRestaurant(db, collections.restaurants, restaurantId);
+    if (!restaurantData) {
       return res.status(404).json({ error: 'Restaurant not found' });
     }
-
-    const restaurantData = restaurantDoc.data();
     const customerAppSettings = restaurantData.customerAppSettings || {};
     const taxSettings = restaurantData.taxSettings || {};
 
@@ -24846,6 +24858,8 @@ app.get('/api/public/customer-app-settings/:restaurantId', vercelSecurityMiddlew
     }
 
     // Only return settings that are relevant to customers
+    // CDN cache 60s — settings rarely change; invalidated by PUT via KV cache bust
+    res.set('Cache-Control', 'public, s-maxage=60, stale-while-revalidate=30');
     res.json({
       settings: {
         enabled: customerAppSettings.enabled ?? false,
@@ -25385,17 +25399,15 @@ app.get('/api/restaurants/:restaurantId/customer-app-settings', authenticateToke
     const { restaurantId } = req.params;
     const { userId } = req.user;
 
-    // Verify user has access to this restaurant
-    const restaurantDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
-    if (!restaurantDoc.exists) {
+    // Use KV-cached restaurant data instead of direct Firestore read
+    const { data: restaurantData } = await getCachedRestaurant(db, collections.restaurants, restaurantId);
+    if (!restaurantData) {
       return res.status(404).json({ error: 'Restaurant not found' });
     }
 
-    if (restaurantDoc.data().ownerId !== userId) {
+    if (restaurantData.ownerId !== userId) {
       return res.status(403).json({ error: 'Access denied' });
     }
-
-    const restaurantData = restaurantDoc.data();
 
     // Return existing settings or defaults
     const existingSettings = restaurantData.customerAppSettings || {};
@@ -25453,6 +25465,7 @@ app.get('/api/restaurants/:restaurantId/customer-app-settings', authenticateToke
       }
     };
 
+
     res.json({ settings: customerAppSettings });
   } catch (error) {
     console.error('Get customer app settings error:', error);
@@ -25470,6 +25483,7 @@ app.get('/api/restaurants/:restaurantId', authenticateToken, async (req, res) =>
     if (!restaurant) {
       return res.status(404).json({ error: 'Restaurant not found' });
     }
+
 
     res.json({ restaurant: { id: restaurantId, ...restaurant } });
   } catch (error) {
@@ -25618,6 +25632,7 @@ app.get('/api/restaurants/:restaurantId/pricing-settings', authenticateToken, as
       }
     };
 
+
     res.json({ settings: pricingSettings });
   } catch (error) {
     console.error('Get pricing settings error:', error);
@@ -25703,15 +25718,16 @@ app.get('/api/restaurants/:restaurantId/billing-settings', authenticateToken, as
     const { restaurantId } = req.params;
     const { userId } = req.user;
 
-    const restaurantDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
-    if (!restaurantDoc.exists) {
+    // Use KV-cached restaurant data instead of direct Firestore read
+    const { data: restaurantData } = await getCachedRestaurant(db, collections.restaurants, restaurantId);
+    if (!restaurantData) {
       return res.status(404).json({ error: 'Restaurant not found' });
     }
-    if (restaurantDoc.data().ownerId !== userId) {
+    if (restaurantData.ownerId !== userId) {
       return res.status(403).json({ error: 'Access denied' });
     }
 
-    const existing = restaurantDoc.data().billingSettings || {};
+    const existing = restaurantData.billingSettings || {};
     const billingSettings = {
       serviceChargeEnabled: existing.serviceChargeEnabled ?? false,
       serviceChargeRate: existing.serviceChargeRate ?? 10,
@@ -25734,6 +25750,7 @@ app.get('/api/restaurants/:restaurantId/billing-settings', authenticateToken, as
       emailInvoiceEnabled: existing.emailInvoiceEnabled ?? false,
       whatsappBillingEnabled: existing.whatsappBillingEnabled ?? false,
     };
+
 
     res.json({ settings: billingSettings });
   } catch (error) {
