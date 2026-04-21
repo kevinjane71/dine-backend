@@ -5750,7 +5750,7 @@ app.patch('/api/restaurants/:restaurantId', authenticateToken, async (req, res) 
     }
 
     // Update allowed basic fields
-    const allowedFields = ['name', 'address', 'city', 'phone', 'email', 'cuisine', 'description', 'logo', 'coverImage', 'openingHours', 'isActive', 'legalBusinessName', 'gstin', 'businessType', 'staffCount', 'seatingCapacity', 'pricingSettings'];
+    const allowedFields = ['name', 'address', 'city', 'phone', 'email', 'cuisine', 'description', 'logo', 'coverImage', 'openingHours', 'isActive', 'legalBusinessName', 'gstin', 'businessType', 'staffCount', 'seatingCapacity', 'pricingSettings', 'onboardingStep'];
     allowedFields.forEach(field => {
       if (req.body[field] !== undefined) {
         updateData[field] = req.body[field];
@@ -14716,11 +14716,12 @@ app.get('/api/auth/me', authenticateToken, async (req, res) => {
 app.patch('/api/user/preferences', authenticateToken, async (req, res) => {
   try {
     const userId = req.user.userId;
-    const { defaultRestaurantId, language } = req.body;
+    const { defaultRestaurantId, language, setupComplete } = req.body;
 
     const updateData = { updatedAt: new Date() };
     if (defaultRestaurantId !== undefined) updateData.defaultRestaurantId = defaultRestaurantId;
     if (language !== undefined) updateData.language = language;
+    if (setupComplete === true) updateData.setupComplete = true;
 
     const collName = req.user.source === 'staffUsers' ? collections.staffUsers : collections.users;
     await db.collection(collName).doc(userId).update(updateData);
