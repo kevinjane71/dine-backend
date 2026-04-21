@@ -3544,10 +3544,13 @@ app.post('/api/auth/email/login', async (req, res) => {
       }
     }
 
+    const firstTimeUser = !userData.setupComplete && !hasRestaurants;
+
     res.json({
       success: true,
       message: 'Login successful',
       token,
+      firstTimeUser,
       user: {
         id: userId,
         email: normalizedEmail,
@@ -3560,7 +3563,7 @@ app.post('/api/auth/email/login', async (req, res) => {
       },
       hasRestaurants,
       subdomainUrl,
-      redirectTo: subdomainUrl || (hasRestaurants ? '/home' : '/admin')
+      redirectTo: firstTimeUser ? '/onboarding' : (subdomainUrl || (hasRestaurants ? '/home' : '/admin'))
     });
 
   } catch (error) {
@@ -4146,7 +4149,7 @@ app.post('/api/auth/google', async (req, res) => {
         role: userRole,
         setupComplete: userDoc.empty ? true : userDoc.docs[0].data().setupComplete || false
       },
-      firstTimeUser: isNewUser,
+      firstTimeUser: isNewUser || (!userDoc.empty && !userDoc.docs[0].data().setupComplete && !hasRestaurants),
       isNewUser, // Keep for backward compatibility
       hasRestaurants,
       redirectTo: hasRestaurants ? '/home' : '/admin'
@@ -4283,7 +4286,7 @@ app.post('/api/auth/apple', async (req, res) => {
         role: userRole,
         setupComplete: userDoc.empty ? true : userDoc.docs[0].data().setupComplete || false
       },
-      firstTimeUser: isNewUser,
+      firstTimeUser: isNewUser || (!userDoc.empty && !userDoc.docs[0].data().setupComplete && !hasRestaurants),
       isNewUser,
       hasRestaurants,
       redirectTo: hasRestaurants ? '/home' : '/admin'
@@ -4581,7 +4584,7 @@ app.post('/api/auth/firebase/verify', async (req, res) => {
         restaurant: userRestaurants.length > 0 ? userRestaurants[0] : null,
         setupComplete: userDoc ? userDoc.data().setupComplete || false : false
       },
-      firstTimeUser: isNewUser,
+      firstTimeUser: isNewUser || (userDoc && !userDoc.data().setupComplete && !hasRestaurants),
       isNewUser, // Keep for backward compatibility
       hasRestaurants,
       restaurants: userRestaurants,
@@ -4730,7 +4733,7 @@ app.post('/api/auth/phone/verify-otp', async (req, res) => {
         restaurant: firstRestaurant || null,
         setupComplete: userData.setupComplete || false
       },
-      firstTimeUser: isNewUser,
+      firstTimeUser: isNewUser || (!userData.setupComplete && !hasRestaurants),
       isNewUser,
       hasRestaurants,
       restaurants: userRestaurants,
@@ -4995,11 +4998,13 @@ app.post('/api/auth/pin/login', async (req, res) => {
     }
 
     const firstRestaurant = userRestaurants.length > 0 ? userRestaurants[0] : null;
+    const firstTimeUser = !userData.setupComplete && !hasRestaurants;
 
     res.json({
       success: true,
       message: 'PIN login successful',
       token,
+      firstTimeUser,
       user: {
         id: userId,
         phone: userData.phone || null,
@@ -5015,7 +5020,7 @@ app.post('/api/auth/pin/login', async (req, res) => {
       hasRestaurants,
       restaurants: userRestaurants,
       subdomainUrl,
-      redirectTo: subdomainUrl || (hasRestaurants ? '/home' : '/admin')
+      redirectTo: firstTimeUser ? '/onboarding' : (subdomainUrl || (hasRestaurants ? '/home' : '/admin'))
     });
 
   } catch (error) {
@@ -5390,7 +5395,7 @@ app.post('/api/auth/local-login', async (req, res) => {
       message: isNewUser ? 'Welcome! Account created successfully.' : 'Login successful',
       token,
       user: userResponse,
-      firstTimeUser: isNewUser,
+      firstTimeUser: !isStaff && (isNewUser || (!actualUserData?.setupComplete && !hasRestaurants)),
       isNewUser,
       hasRestaurants: isStaff ? !!staffRestaurantId : hasRestaurants,
       subdomainUrl,
