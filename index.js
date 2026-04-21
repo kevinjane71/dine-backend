@@ -9234,7 +9234,8 @@ app.get('/api/orders/:restaurantId', authenticateToken, async (req, res) => {
       orderType,
       todayOnly,
       paymentMethod,
-      paymentStatus
+      paymentStatus,
+      myOrdersOnly
     } = req.query;
 
     console.log(`🔍 Orders API - Restaurant: ${restaurantId}, Page: ${page}, Limit: ${limit}, Status: ${status || 'all'}, Search: ${search || 'none'}, Waiter: ${waiterId || 'all'}, TodayOnly: ${todayOnly}, PaymentMethod: ${paymentMethod || 'all'}`);
@@ -9348,6 +9349,11 @@ app.get('/api/orders/:restaurantId', authenticateToken, async (req, res) => {
 
       if (waiterId && waiterId !== 'all') {
         fastQuery = fastQuery.where('staffInfo.userId', '==', waiterId);
+      }
+
+      // "Mine" filter — show only orders created by this user
+      if (myOrdersOnly) {
+        fastQuery = fastQuery.where('staffInfo.userId', '==', myOrdersOnly);
       }
 
       if (todayOnly === 'true') {
@@ -9484,6 +9490,12 @@ app.get('/api/orders/:restaurantId', authenticateToken, async (req, res) => {
         return order.staffInfo && order.staffInfo.userId === waiterId;
       });
       console.log(`Filtered by waiter ${waiterId}: ${allOrders.length} orders found`);
+    }
+
+    // Apply "Mine" filter in memory (when on search path)
+    if (myOrdersOnly) {
+      allOrders = allOrders.filter(order => order.staffInfo && order.staffInfo.userId === myOrdersOnly);
+      console.log(`Filtered by myOrdersOnly ${myOrdersOnly}: ${allOrders.length} orders found`);
     }
 
     // Apply payment method filter in memory
@@ -14132,6 +14144,7 @@ app.get('/api/staff/:restaurantId', authenticateToken, requireOwnerRole, async (
         updatedAt: userData.updatedAt,
         loginId: userData.loginId,
         username: userData.username || null,
+        pageAccess: userData.pageAccess || null,
         tempPassword: tempPassword, // Include actual temporary password
         hasTemporaryPassword: hasTemporaryPassword
       });
