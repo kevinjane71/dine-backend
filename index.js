@@ -5892,7 +5892,9 @@ app.post('/api/restaurants/:restaurantId/seed-default', authenticateToken, async
 
     // ===== Business-type-specific demo menus =====
     const businessType = restaurantData.businessType || 'restaurant';
-    const img = (id) => `https://images.unsplash.com/${id}?w=400&h=300&fit=crop&q=80`;
+    // No image URLs — frontend getDisplayImage() auto-matches item names
+    // to local placeholder images via keyword mapping (placeholderImages.js)
+    const img = () => null;
 
     // --- BAR / PUB ---
     const barMenuItems = [
