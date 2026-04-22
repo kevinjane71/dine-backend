@@ -7493,6 +7493,8 @@ app.post('/api/public/orders/:restaurantId', vercelSecurityMiddleware.publicAPI,
         price: menuItem.price,
         quantity: item.quantity,
         total: itemTotal,
+        category: menuItem.category || '',
+        categoryId: menuItem.categoryId || menuItem.category || '',
         shortCode: menuItem.shortCode || null,
         notes: item.notes || '',
         // Type-specific display fields
@@ -7636,20 +7638,9 @@ app.post('/api/public/orders/:restaurantId', vercelSecurityMiddleware.publicAPI,
       discountAmount = subtotal;
     }
 
-    // If server validation produced 0 discount but frontend sent non-zero, use frontend value
-    // (server validation can fail silently due to offer schedule/audience/timing differences)
+    // Log when server and frontend disagree (for debugging, but trust server calculation)
     if (discountAmount === 0 && parseFloat(req.body.discountAmount) > 0) {
-      console.log(`⚠️ POST: Server offer validation produced 0 but frontend sent ${req.body.discountAmount}, using frontend value`);
-      discountAmount = parseFloat(req.body.discountAmount);
-      // Also build appliedOffer from frontend data if available
-      if (req.body.selectedOfferName && allOfferIds.length > 0) {
-        const fallbackOffer = {
-          id: allOfferIds[0],
-          name: req.body.selectedOfferName,
-          discountApplied: discountAmount,
-        };
-        appliedOffers = [fallbackOffer];
-      }
+      console.log(`⚠️ POST: Server offer validation produced 0 but frontend sent ${req.body.discountAmount}. Using server value (0).`);
     }
 
     // For backward compatibility, set appliedOffer to first applied offer
@@ -8279,16 +8270,8 @@ app.post('/api/orders', async (req, res) => {
           const isUnderUsageLimit = !offer.usageLimit || (offer.usageCount || 0) < offer.usageLimit;
           const meetsMinOrder = subtotalForDiscount >= (offer.minOrderValue || offer.minimumOrder || 0);
 
-          // Check schedule (happy hour / time-based)
-          let isValidSchedule = true;
-          if (offer.schedule && offer.schedule.type === 'recurring') {
-            const currentDay = now.getDay();
-            const currentTime = `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`;
-            const scheduleDays = offer.schedule.days || [];
-            const startTime = offer.schedule.startTime || '00:00';
-            const endTime = offer.schedule.endTime || '23:59';
-            isValidSchedule = scheduleDays.includes(currentDay) && currentTime >= startTime && currentTime <= endTime;
-          }
+          // Check schedule (happy hour / time-based) — use centralized engine for overnight support
+          const isValidSchedule = offerEngine.isScheduleValid(offer, now);
 
           // Check targetRestaurants
           const offerTargetRestaurants = offer.targetRestaurants || 'all';
@@ -8312,42 +8295,27 @@ app.post('/api/orders', async (req, res) => {
             } catch (e) { /* ignore lookup error */ }
           }
 
-          if (offer.isActive && isTargetedRestaurant && isValidDate && isUnderUsageLimit && meetsMinOrder && isValidSchedule && passesFirstOrderCheck) {
-            let offerDiscount = 0;
+          // Build audience context for proper validation
+          const offerContext = { isFirstOrder: !passesFirstOrderCheck ? false : undefined };
+          if (customerPhone) offerContext.customerPhone = customerPhone;
+
+          // Use centralized matchesAudience for full audience validation
+          const audienceOk = offerEngine.matchesAudience(offer, offerContext);
+
+          if (offer.isActive && isTargetedRestaurant && isValidDate && isUnderUsageLimit && meetsMinOrder && isValidSchedule && passesFirstOrderCheck && audienceOk) {
+            // Delegate discount calc to centralized engine (handles tiered, BOGO, cross-BOGO, category normalization)
+            const cartForEngine = (orderItems || []).map(oi => ({
+              id: oi.menuItemId,
+              menuItemId: oi.menuItemId,
+              name: oi.name,
+              price: oi.price,
+              quantity: oi.quantity,
+              category: oi.category,
+              total: oi.total,
+            }));
+            const result = offerEngine.calculateDiscountForOffer(offer, subtotalForDiscount, cartForEngine, offerContext);
+            const offerDiscount = result.discount || 0;
             const offerScope = offer.scope || 'order';
-
-            let applicableSubtotal = subtotalForDiscount;
-            if (offerScope === 'category' && Array.isArray(offer.targetCategories) && offer.targetCategories.length > 0) {
-              applicableSubtotal = orderItems
-                .filter(oi => offer.targetCategories.some(c => c.toLowerCase() === (oi.category || '').toLowerCase()))
-                .reduce((sum, oi) => sum + (oi.total || oi.price * oi.quantity), 0);
-            } else if (offerScope === 'item' && Array.isArray(offer.targetItems) && offer.targetItems.length > 0) {
-              applicableSubtotal = orderItems
-                .filter(oi => offer.targetItems.includes(oi.menuItemId))
-                .reduce((sum, oi) => sum + (oi.total || oi.price * oi.quantity), 0);
-            }
-
-            if (offer.promotionType === 'bogo' && offer.bogoConfig) {
-              const bogoItems = offerScope === 'item' && offer.targetItems?.length > 0
-                ? orderItems.filter(oi => offer.targetItems.includes(oi.menuItemId))
-                : orderItems;
-              const totalQty = bogoItems.reduce((sum, oi) => sum + oi.quantity, 0);
-              const buyQty = offer.bogoConfig.buyQty || 2;
-              const getQty = offer.bogoConfig.getQty || 1;
-              const getDiscount = offer.bogoConfig.getDiscount || 100;
-              const sets = Math.floor(totalQty / (buyQty + getQty));
-              if (sets > 0 && bogoItems.length > 0) {
-                const cheapestPrice = Math.min(...bogoItems.map(oi => oi.price));
-                offerDiscount = sets * getQty * cheapestPrice * (getDiscount / 100);
-              }
-            } else if (offer.discountType === 'percentage') {
-              offerDiscount = (applicableSubtotal * offer.discountValue) / 100;
-              if (offer.maxDiscount && offerDiscount > offer.maxDiscount) {
-                offerDiscount = offer.maxDiscount;
-              }
-            } else {
-              offerDiscount = Math.min(offer.discountValue, applicableSubtotal);
-            }
 
             appliedOffers.push({
               id: currentOfferId,
@@ -8372,18 +8340,9 @@ app.post('/api/orders', async (req, res) => {
       discountAmount = subtotalForDiscount;
     }
 
-    // If server validation produced 0 discount but frontend sent non-zero, use frontend value
-    // (server validation can fail due to offer schedule/audience/timing differences)
+    // Log when server and frontend disagree (for debugging, but trust server calculation)
     if (discountAmount === 0 && parseFloat(req.body.discountAmount) > 0) {
-      console.log(`⚠️ POS POST: Server offer validation produced 0 but frontend sent ${req.body.discountAmount}, using frontend value`);
-      discountAmount = parseFloat(req.body.discountAmount);
-      if (req.body.selectedOfferName && allOfferIds.length > 0) {
-        appliedOffers = [{
-          id: allOfferIds[0],
-          name: req.body.selectedOfferName,
-          discountApplied: discountAmount,
-        }];
-      }
+      console.log(`⚠️ POS POST: Server offer validation produced 0 but frontend sent ${req.body.discountAmount}. Using server value (0).`);
     }
 
     if (appliedOffers.length > 0) {
@@ -10968,62 +10927,32 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
           if (offer.usageLimit && (offer.usageCount || 0) >= offer.usageLimit) continue;
           if (offer.minOrderValue && orderSubtotal < offer.minOrderValue) continue;
 
-          // Schedule validation
-          if (offer.schedule?.type === 'recurring') {
-            const now = new Date();
-            const day = now.getDay();
-            const timeStr = `${String(now.getHours()).padStart(2,'0')}:${String(now.getMinutes()).padStart(2,'0')}`;
-            const days = offer.schedule.days || [];
-            const startT = offer.schedule.startTime || '00:00';
-            const endT = offer.schedule.endTime || '23:59';
-            if (!days.includes(day) || timeStr < startT || timeStr > endT) continue;
-          }
+          // Use centralized schedule validation (handles overnight ranges)
+          if (!offerEngine.isScheduleValid(offer)) continue;
 
-          // Calculate discount (scope-aware)
-          const offerScope = offer.scope || 'order';
+          // Use centralized audience validation
+          if (!offerEngine.matchesAudience(offer, {})) continue;
+
+          // Delegate discount calc to centralized engine (handles tiered, BOGO, cross-BOGO, category normalization)
           const orderItems = updateData.items || currentOrder.items || [];
-          let applicableSubtotal = orderSubtotal;
+          const cartForEngine = orderItems.map(item => ({
+            id: item.menuItemId || item.id,
+            menuItemId: item.menuItemId || item.id,
+            name: item.name,
+            price: item.price || 0,
+            quantity: item.quantity || 1,
+            category: item.category || '',
+            total: item.total || (item.price || 0) * (item.quantity || 1),
+          }));
+          const result = offerEngine.calculateDiscountForOffer(offer, orderSubtotal, cartForEngine, {});
+          const offerDisc = Math.round((result.discount || 0) * 100) / 100;
 
-          if (offerScope === 'category' && Array.isArray(offer.targetCategories) && offer.targetCategories.length > 0) {
-            applicableSubtotal = orderItems
-              .filter(item => offer.targetCategories.some(c => c.toLowerCase() === (item.category || '').toLowerCase()))
-              .reduce((sum, item) => sum + ((item.price || 0) * (item.quantity || 1)), 0);
-          } else if (offerScope === 'item' && Array.isArray(offer.targetItems) && offer.targetItems.length > 0) {
-            applicableSubtotal = orderItems
-              .filter(item => offer.targetItems.includes(item.menuItemId || item.id))
-              .reduce((sum, item) => sum + ((item.price || 0) * (item.quantity || 1)), 0);
-          }
-
-          if (applicableSubtotal <= 0) continue;
-
-          let offerDisc = 0;
-          if (offer.promotionType === 'bogo' && offer.bogoConfig) {
-            const bogoItems = offerScope === 'item' && offer.targetItems?.length > 0
-              ? orderItems.filter(item => offer.targetItems.includes(item.menuItemId || item.id))
-              : orderItems;
-            const totalQty = bogoItems.reduce((sum, item) => sum + (item.quantity || 1), 0);
-            const buyQty = offer.bogoConfig.buyQty || 2;
-            const getQty = offer.bogoConfig.getQty || 1;
-            const getDiscount = offer.bogoConfig.getDiscount || 100;
-            const sets = Math.floor(totalQty / (buyQty + getQty));
-            if (sets > 0 && bogoItems.length > 0) {
-              const cheapest = Math.min(...bogoItems.map(item => item.price || 0));
-              offerDisc = sets * getQty * cheapest * (getDiscount / 100);
-            }
-          } else if (offer.discountType === 'percentage') {
-            offerDisc = (applicableSubtotal * (offer.discountValue || 0)) / 100;
-            if (offer.maxDiscount && offerDisc > offer.maxDiscount) offerDisc = offer.maxDiscount;
-          } else {
-            offerDisc = Math.min(offer.discountValue || 0, applicableSubtotal);
-          }
-
-          offerDisc = Math.round(offerDisc * 100) / 100;
           if (offerDisc > 0) {
             serverDiscountAmount += offerDisc;
             const offerEntry = {
               id: offer.id, name: offer.name,
               discountType: offer.discountType, discountValue: offer.discountValue,
-              discountApplied: offerDisc, scope: offerScope
+              discountApplied: offerDisc, scope: offer.scope || 'order'
             };
             appliedOffers.push(offerEntry);
             if (!singleAppliedOffer) singleAppliedOffer = offerEntry;
@@ -11042,18 +10971,14 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
       updateData.appliedOffers = appliedOffers;
       console.log(`🎁 PATCH: Applied ${appliedOffers.length} offers, discount: ₹${updateData.discountAmount}`);
 
-      // If server validation produced 0 discount but frontend sent non-zero, use frontend value
-      // (server validation can fail silently due to offer expiry, timing, etc.)
+      // Log when server and frontend disagree (for debugging, but trust server calculation)
       if (updateData.discountAmount === 0 && parseFloat(req.body.discountAmount) > 0) {
-        console.log(`⚠️ PATCH: Server offer validation produced 0 but frontend sent ${req.body.discountAmount}, using frontend value`);
-        updateData.discountAmount = parseFloat(req.body.discountAmount);
-        updateData.offerDiscount = updateData.discountAmount;
+        console.log(`⚠️ PATCH: Server offer validation produced 0 but frontend sent ${req.body.discountAmount}. Using server value (0).`);
       }
     } else {
-      // No offers — use frontend values as fallback
-      if (req.body.discountAmount !== undefined) updateData.discountAmount = parseFloat(req.body.discountAmount) || 0;
-      if (req.body.offerDiscount !== undefined) updateData.offerDiscount = parseFloat(req.body.offerDiscount) || 0;
-      if (req.body.offerIds !== undefined) updateData.offerIds = req.body.offerIds;
+      // No offer IDs provided — only accept manual discount (not offer discount)
+      updateData.discountAmount = 0;
+      updateData.offerDiscount = 0;
     }
 
     // Loyalty points — server-side calculation when completing order
@@ -24431,6 +24356,7 @@ app.post('/api/public/customer/lookup', vercelSecurityMiddleware.publicAPI, asyn
         customer: {
           id: existingCustomer.id,
           name: customerData.name || 'Customer',
+          phone: customerData.phone || normalizedPhone || phone,
           loyaltyPoints: customerData.loyaltyPoints || 0,
           totalOrders: totalOrders,
           totalSpent: customerData.totalSpent || 0,

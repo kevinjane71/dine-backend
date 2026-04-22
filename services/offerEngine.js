@@ -25,6 +25,9 @@ const getItemId = (item) => item.menuItemId || item.id;
 const getItemCategory = (item) => (item.category || item.categoryId || '').toString();
 const getItemLineTotal = (item) => item.total || (item.price || 0) * (item.quantity || 1);
 
+// Normalize category names for comparison — "Hot beverages", "Hot-Beverages", "hot_beverages" all match
+const normalizeCategory = (cat) => String(cat || '').toLowerCase().replace(/[-_\s]+/g, '');
+
 // ---------- schedule & date validation ----------
 
 const isScheduleValid = (offer, now = new Date()) => {
@@ -34,6 +37,13 @@ const isScheduleValid = (offer, now = new Date()) => {
   const scheduleDays = offer.schedule.days || [];
   const startTime = offer.schedule.startTime || '00:00';
   const endTime = offer.schedule.endTime || '23:59';
+  // Handle overnight ranges (e.g., 22:00–02:00)
+  if (endTime < startTime) {
+    // After start today OR before end (started previous day)
+    const prevDay = (currentDay + 6) % 7;
+    return (scheduleDays.includes(currentDay) && currentTime >= startTime) ||
+           (scheduleDays.includes(prevDay) && currentTime <= endTime);
+  }
   return scheduleDays.includes(currentDay) && currentTime >= startTime && currentTime <= endTime;
 };
 
@@ -127,7 +137,7 @@ const calculateCrossItemBogo = (offer, cart) => {
     const cat = getItemCategory(item);
     const qty = item.quantity || 0;
     const matchById = buyItemIds.length > 0 && buyItemIds.includes(id);
-    const matchByCat = buyCategoryIds.length > 0 && buyCategoryIds.includes(cat);
+    const matchByCat = buyCategoryIds.length > 0 && buyCategoryIds.some(bc => normalizeCategory(bc) === normalizeCategory(cat));
     if (matchById || matchByCat) buyUnits += qty;
   }
 
@@ -175,9 +185,9 @@ const calculateDiscountForOffer = (offer, subtotal, cart = [], context = {}) => 
 
   // Scope filtering (category / item) — identical to legacy logic
   if (offerScope === 'category' && Array.isArray(offer.targetCategories) && offer.targetCategories.length > 0) {
-    const lowered = offer.targetCategories.map(c => String(c).toLowerCase());
+    const normalizedTargets = offer.targetCategories.map(normalizeCategory);
     applicableSubtotal = cart
-      .filter(item => lowered.includes(getItemCategory(item).toLowerCase()))
+      .filter(item => normalizedTargets.includes(normalizeCategory(getItemCategory(item))))
       .reduce((sum, item) => sum + getItemLineTotal(item), 0);
   } else if (offerScope === 'item' && Array.isArray(offer.targetItems) && offer.targetItems.length > 0) {
     applicableSubtotal = cart
@@ -203,9 +213,13 @@ const calculateDiscountForOffer = (offer, subtotal, cart = [], context = {}) => 
 
   // Legacy simple BOGO (same-item)
   if (offer.promotionType === 'bogo' && offer.bogoConfig) {
-    const bogoItems = offerScope === 'item' && offer.targetItems?.length > 0
-      ? cart.filter(item => offer.targetItems.includes(getItemId(item)))
-      : cart;
+    let bogoItems = cart;
+    if (offerScope === 'item' && offer.targetItems?.length > 0) {
+      bogoItems = cart.filter(item => offer.targetItems.includes(getItemId(item)));
+    } else if (offerScope === 'category' && offer.targetCategories?.length > 0) {
+      const normalizedTargets = offer.targetCategories.map(normalizeCategory);
+      bogoItems = cart.filter(item => normalizedTargets.includes(normalizeCategory(getItemCategory(item))));
+    }
     const totalQty = bogoItems.reduce((sum, item) => sum + (item.quantity || 1), 0);
     const buyQty = offer.bogoConfig.buyQty || 2;
     const getQty = offer.bogoConfig.getQty || 1;
@@ -239,8 +253,8 @@ const calculateDiscountForOffer = (offer, subtotal, cart = [], context = {}) => 
 const hasScopeMatchingCart = (offer, cart) => {
   const scope = offer.scope || 'order';
   if (scope === 'category' && Array.isArray(offer.targetCategories) && offer.targetCategories.length > 0) {
-    const lowered = offer.targetCategories.map(c => String(c).toLowerCase());
-    return cart.some(item => lowered.includes(getItemCategory(item).toLowerCase()));
+    const normalizedTargets = offer.targetCategories.map(normalizeCategory);
+    return cart.some(item => normalizedTargets.includes(normalizeCategory(getItemCategory(item))));
   }
   if (scope === 'item' && Array.isArray(offer.targetItems) && offer.targetItems.length > 0) {
     return cart.some(item => offer.targetItems.includes(getItemId(item)));
