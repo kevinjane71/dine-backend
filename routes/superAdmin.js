@@ -177,6 +177,7 @@ router.get('/demo-requests', authenticateSuperAdmin, async (req, res) => {
         comment: d.comment || '',
         status: d.status || 'pending',
         createdAt: toISO(d.createdAt),
+        adminNote: d.adminNote || '',
       };
     });
 
@@ -242,6 +243,7 @@ router.get('/users', authenticateSuperAdmin, async (req, res) => {
         lastLogin: toISO(data.lastLogin),
         emailVerified: data.emailVerified || false,
         phoneVerified: data.phoneVerified || false,
+        adminNote: data.adminNote || '',
       };
     });
 
@@ -358,6 +360,7 @@ router.get('/users/:userId', authenticateSuperAdmin, async (req, res) => {
       emailVerified: userData.emailVerified || false,
       phoneVerified: userData.phoneVerified || false,
       restaurantName: userData.restaurantName || '',
+      adminNote: userData.adminNote || '',
     };
 
     // Fetch restaurants (usually a small number per user, no pagination needed)
@@ -665,6 +668,7 @@ router.get('/restaurants', authenticateSuperAdmin, async (req, res) => {
         createdAt: toISO(d.createdAt),
         orders24h: stats.orders24h || 0,
         lastOrderDate: stats.lastOrderDate || null,
+        adminNote: d.adminNote || '',
       };
     });
 
@@ -904,6 +908,50 @@ router.post('/orders/soft-delete-by-id', authenticateSuperAdmin, async (req, res
   } catch (error) {
     console.error('Super admin soft-delete order by id error:', error);
     res.status(500).json({ success: false, error: error.message || 'Failed to soft-delete order' });
+  }
+});
+
+// ─── Admin Notes ──────────────────────────────────────────────────────
+// Save admin notes on demo requests, users, or restaurants.
+// PATCH /api/super-admin/notes/:collection/:docId
+// Body: { note: string }
+// Stores adminNote + adminNoteUpdatedAt on the Firestore document.
+router.patch('/notes/:collection/:docId', authenticateSuperAdmin, async (req, res) => {
+  try {
+    const { collection, docId } = req.params;
+    const { note } = req.body || {};
+
+    if (typeof note !== 'string') {
+      return res.status(400).json({ success: false, error: 'note (string) is required' });
+    }
+
+    // Map allowed collection keys to Firestore collection names
+    const collectionMap = {
+      'demo-requests': 'demoRequests',
+      'users': collections.users,
+      'restaurants': collections.restaurants,
+    };
+
+    const firestoreCollection = collectionMap[collection];
+    if (!firestoreCollection) {
+      return res.status(400).json({ success: false, error: 'Invalid collection. Use: demo-requests, users, restaurants' });
+    }
+
+    const docRef = db.collection(firestoreCollection).doc(docId);
+    const doc = await docRef.get();
+    if (!doc.exists) {
+      return res.status(404).json({ success: false, error: 'Document not found' });
+    }
+
+    await docRef.update({
+      adminNote: note.trim(),
+      adminNoteUpdatedAt: new Date(),
+    });
+
+    res.json({ success: true, docId, adminNote: note.trim() });
+  } catch (error) {
+    console.error('Super admin save note error:', error);
+    res.status(500).json({ success: false, error: 'Failed to save note' });
   }
 });
 
