@@ -6581,7 +6581,7 @@ app.get('/api/menus/:restaurantId', async (req, res) => {
 
     // Cache at Vercel Edge for 1 min, serve stale for 30s while revalidating
     res.set('Cache-Control', 'public, s-maxage=60, stale-while-revalidate=30');
-    res.json({ menuItems });
+    res.json({ menuItems, hasDefaultMenu: !!restaurantData.hasDefaultMenu });
 
   } catch (error) {
     console.error('Get menu error:', error);
