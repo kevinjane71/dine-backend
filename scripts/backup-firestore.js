@@ -5,7 +5,7 @@
  * Exports all collections from the 'dine' named database to local JSON files.
  *
  * Usage:
- *   node scripts/backup-firestore.js              # Backup all collections
+ *   node scripts/backup-firestore.js              # Backup all collections s
  *   node scripts/backup-firestore.js orders users  # Backup specific collections
  *   node scripts/backup-firestore.js --email       # Backup + email zip (needs config)
  *
