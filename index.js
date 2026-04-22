@@ -1807,10 +1807,16 @@ function generateFallbackResponse(query, data, restaurantData, intent) {
 
 // ==================== END DINEBOT FUNCTIONS ====================
 
+const DUMMY_PHONES_LIST = ['9000000000','9000000001','9000000002','9000000003','9000000004','9000000005','9000000006','9000000007','9000000008','9000000009','9000000010'];
+const isDummyPhone = (phone) => {
+  const cleaned = phone.replace(/\D/g, '');
+  const last10 = cleaned.length > 10 ? cleaned.slice(-10) : cleaned;
+  return DUMMY_PHONES_LIST.includes(last10);
+};
 const DUMMY_PHONES = ['+919000000000', '9000000000', '+919000000001', '9000000001'];
 const generateOTP = (phone) => {
-  // Use hardcoded OTP for dummy/test accounts
-  if (DUMMY_PHONES.includes(phone)) {
+  // Use hardcoded OTP for dummy/test accounts (9000000000 - 9000000010)
+  if (isDummyPhone(phone)) {
     return "1234";
   }
   // For real numbers, generate random OTP (this won't be used since we're using Firebase)
@@ -3723,7 +3729,7 @@ app.post('/api/user/link-phone', authenticateToken, async (req, res) => {
     // If OTP provided, verify it using the same OTP verification as login
     if (otp) {
       // Check if this is a demo account
-      const isDemoAccount = DUMMY_PHONES.includes(normalizedPhone) && otp === '1234';
+      const isDemoAccount = isDummyPhone(normalizedPhone) && otp === '1234';
       let otpValid = false;
 
       if (isDemoAccount) {
@@ -4611,7 +4617,7 @@ app.post('/api/auth/phone/verify-otp', async (req, res) => {
     }
 
     // Check if this is a demo/test account
-    const isDemoAccount = DUMMY_PHONES.includes(phone) && otp === '1234';
+    const isDemoAccount = isDummyPhone(phone) && otp === '1234';
     let otpDoc = null;
     
     if (isDemoAccount) {
