@@ -260,6 +260,81 @@ function findDineInRule(rules) {
   return (rules || []).find(r => r.isActive && DINEIN_NAMES.includes((r.name || '').toLowerCase().trim()));
 }
 
+// --- Per-Item Tax Resolution ---
+// Resolves which taxes apply to a given order item based on:
+//   Priority 1: item.taxGroupId (item-level override)
+//   Priority 2: category.taxGroupId (category-level)
+//   Priority 3: restaurant default taxes (taxSettings.taxes)
+function resolveTaxesForItem(item, taxSettings, categories) {
+  if (!taxSettings?.enabled) return [];
+  const groups = taxSettings.taxGroups || [];
+
+  // Priority 1: Item-level tax group
+  if (item.taxGroupId) {
+    const group = groups.find(g => g.id === item.taxGroupId);
+    if (group) return group.taxes || [];
+  }
+
+  // Priority 2: Category-level tax group
+  const catId = item.category || item.categoryId;
+  if (catId && categories && categories.length > 0) {
+    const cat = categories.find(c => c.id === catId || c.name === catId);
+    if (cat?.taxGroupId) {
+      const group = groups.find(g => g.id === cat.taxGroupId);
+      if (group) return group.taxes || [];
+    }
+  }
+
+  // Priority 3: Restaurant default taxes
+  if (taxSettings.taxes && taxSettings.taxes.length > 0) {
+    return taxSettings.taxes.filter(t => t.enabled);
+  }
+  if (taxSettings.defaultTaxRate) {
+    return [{ name: 'Tax', rate: taxSettings.defaultTaxRate, type: 'percentage' }];
+  }
+  return [];
+}
+
+// Calculate per-item tax and aggregate by (name, rate)
+function calculatePerItemTax(orderItems, taxSettings, categories, totalDiscount, serviceChargeAmount) {
+  const subtotal = orderItems.reduce((sum, item) => sum + (item.total || item.price * item.quantity), 0);
+  const taxTotals = {}; // key: "name|rate" => { name, rate, amount }
+  let totalTaxAmount = 0;
+
+  for (const item of orderItems) {
+    const itemTotal = item.total || item.price * item.quantity;
+    // Proportional discount share for this item
+    const itemDiscShare = subtotal > 0 ? (itemTotal / subtotal) * totalDiscount : 0;
+    const itemTaxable = Math.max(0, itemTotal - itemDiscShare);
+    // Proportional service charge share
+    const itemSCShare = subtotal > 0 ? (itemTotal / subtotal) * (serviceChargeAmount || 0) : 0;
+    const itemTaxableWithSC = itemTaxable + itemSCShare;
+
+    const itemTaxes = resolveTaxesForItem(item, taxSettings, categories);
+    let itemTaxAmount = 0;
+
+    for (const tax of itemTaxes) {
+      const amt = Math.round((itemTaxableWithSC * (tax.rate || 0) / 100) * 100) / 100;
+      const key = `${tax.name || 'Tax'}|${tax.rate || 0}`;
+      if (!taxTotals[key]) taxTotals[key] = { name: tax.name || 'Tax', rate: tax.rate || 0, amount: 0 };
+      taxTotals[key].amount += amt;
+      itemTaxAmount += amt;
+      totalTaxAmount += amt;
+    }
+
+    // Store per-item tax amount for audit trail
+    item.itemTaxAmount = Math.round(itemTaxAmount * 100) / 100;
+    item.taxGroupId = item.taxGroupId || null;
+  }
+
+  const taxBreakdown = Object.values(taxTotals).map(t => ({
+    ...t,
+    amount: Math.round(t.amount * 100) / 100
+  }));
+
+  return { taxBreakdown, totalTaxAmount: Math.round(totalTaxAmount * 100) / 100 };
+}
+
 // --- Menu Item ↔ Inventory Linkage Helpers ---
 
 function getInventoryUnitForMenuItem(menuItem) {
@@ -6321,8 +6396,9 @@ app.get('/api/public/menu/:restaurantId', vercelSecurityMiddleware.publicAPI, as
         spiceLevel: item.spiceLevel || 'medium',
         shortCode: item.shortCode || item.name.substring(0, 3).toUpperCase(),
         image: item.image || null,
-        images: item.images || [], // Add images array
-        allergens: item.allergens || []
+        images: item.images || [],
+        allergens: item.allergens || [],
+        ...(item.taxGroupId && { taxGroupId: item.taxGroupId })
       }));
 
     // Cache at Vercel Edge for 3 min, serve stale for 1 min while revalidating
@@ -6836,7 +6912,7 @@ app.patch('/api/menus/item/:id', authenticateToken, async (req, res) => {
       'availableFrom', 'availableUntil', 'variants', 'customizations',
       'spiritCategory', 'ingredients', 'abv', 'servingUnit', 'bottleSize',
       'unit', 'weight', 'shelfLife', 'mfgDate', 'expiryDate',
-      'servingSize', 'scoopOptions', 'pricingRules'
+      'servingSize', 'scoopOptions', 'pricingRules', 'taxGroupId'
     ];
     
     allowedFields.forEach(field => {
@@ -7687,39 +7763,25 @@ app.post('/api/public/orders/:restaurantId', vercelSecurityMiddleware.publicAPI,
     // Calculate pre-tax total (subtotal minus discounts)
     const preTaxTotal = Math.max(0, subtotal - discountAmount - loyaltyDiscount);
 
-    // Calculate tax if enabled
-    // Use same defaults as GET /api/admin/tax endpoint for consistency
-    let taxAmount = 0;
-    const taxBreakdown = [];
+    // Calculate tax using per-item tax resolution (supports tax groups)
     const taxSettings = restaurantData.taxSettings || {
       enabled: true,
       taxes: [{ id: 'gst', name: 'GST', rate: 5, enabled: true, type: 'percentage' }],
       defaultTaxRate: 5
     };
+    const categories = restaurantData.categories || [];
+    const totalDiscount = discountAmount + loyaltyDiscount;
 
-    if (taxSettings.enabled && preTaxTotal > 0) {
-      if (taxSettings.taxes && Array.isArray(taxSettings.taxes) && taxSettings.taxes.length > 0) {
-        taxSettings.taxes
-          .filter(tax => tax.enabled)
-          .forEach(tax => {
-            const amt = Math.round((preTaxTotal * (tax.rate || 0) / 100) * 100) / 100;
-            taxAmount += amt;
-            taxBreakdown.push({
-              name: tax.name || 'Tax',
-              rate: tax.rate || 0,
-              amount: amt
-            });
-          });
-      } else if (taxSettings.defaultTaxRate) {
-        const amt = Math.round((preTaxTotal * (taxSettings.defaultTaxRate / 100)) * 100) / 100;
-        taxAmount = amt;
-        taxBreakdown.push({
-          name: 'Tax',
-          rate: taxSettings.defaultTaxRate,
-          amount: amt
-        });
-      }
+    // Enrich orderItems with taxGroupId from menu items for per-item tax resolution
+    const menuItemsForTax = restaurantData.menu?.items || [];
+    for (const oi of orderItems) {
+      const mi = menuItemsForTax.find(m => m.id === oi.menuItemId);
+      if (mi?.taxGroupId) oi.taxGroupId = mi.taxGroupId;
     }
+
+    const { taxBreakdown, totalTaxAmount: taxAmount } = calculatePerItemTax(
+      orderItems, taxSettings, categories, totalDiscount, 0 // no service charge for public orders
+    );
 
     // Calculate final total (pre-tax total + tax)
     const finalTotal = preTaxTotal + taxAmount;
@@ -8208,6 +8270,7 @@ app.post('/api/orders', async (req, res) => {
         price: unitPrice,
         quantity: itemQuantity,
         total: itemTotal,
+        category: menuItem.category || '',
         shortCode: menuItem.shortCode || null,
         notes: item.notes || '',
         // Persist kitchen-facing details
@@ -8423,48 +8486,31 @@ app.post('/api/orders', async (req, res) => {
 
     console.log(`💰 POS Order pricing: Subtotal ₹${subtotalForDiscount}, Offers -₹${discountAmount}, Manual -₹${manualDiscountAmount}, Loyalty -₹${loyaltyDiscount}, PreTax ₹${preTaxTotal}`);
 
-    // Calculate tax if tax settings are enabled
-    // Save tax breakdown so order history shows exact tax at time of order
-    let taxAmount = 0;
-    let finalAmount = preTaxTotal;
-    const taxBreakdown = []; // Store individual tax lines for historical accuracy
-    // Use same defaults as GET /api/admin/tax endpoint for consistency
+    // Calculate tax using per-item tax resolution (supports tax groups)
     const taxSettings = restaurantData.taxSettings || {
       enabled: true,
       taxes: [{ id: 'gst', name: 'GST', rate: 5, enabled: true, type: 'percentage' }],
       defaultTaxRate: 5
     };
+    const posCategories = restaurantData.categories || [];
 
     // Calculate service charge from rate on preTaxTotal (backend-driven)
     const scRate = parseFloat(serviceChargeRate || 0);
     const scAmt = scRate > 0 ? Math.round((preTaxTotal * scRate / 100) * 100) / 100 : (serviceChargeAmount ? Number(serviceChargeAmount) : 0);
 
-    if (taxSettings.enabled && preTaxTotal > 0) {
-      // Tax on (preTaxTotal + serviceCharge) — GST includes service charge in India
-      const taxableAmount = preTaxTotal + scAmt;
-      if (taxSettings.taxes && Array.isArray(taxSettings.taxes) && taxSettings.taxes.length > 0) {
-        taxSettings.taxes
-          .filter(tax => tax.enabled)
-          .forEach(tax => {
-            const amt = Math.round((taxableAmount * (tax.rate || 0) / 100) * 100) / 100;
-            taxAmount += amt;
-            taxBreakdown.push({
-              name: tax.name || 'Tax',
-              rate: tax.rate || 0,
-              amount: amt
-            });
-          });
-      } else if (taxSettings.defaultTaxRate) {
-        const amt = Math.round((taxableAmount * (taxSettings.defaultTaxRate / 100)) * 100) / 100;
-        taxAmount = amt;
-        taxBreakdown.push({
-          name: 'Tax',
-          rate: taxSettings.defaultTaxRate,
-          amount: amt
-        });
-      }
-      finalAmount = preTaxTotal + taxAmount;
+    // Enrich orderItems with taxGroupId from menu items
+    const menuItemsForTax = restaurantData.menu?.items || [];
+    for (const oi of orderItems) {
+      const mi = menuItemsForTax.find(m => m.id === oi.menuItemId);
+      if (mi?.taxGroupId) oi.taxGroupId = mi.taxGroupId;
     }
+
+    const totalDiscount = discountAmount + manualDiscountAmount + loyaltyDiscount;
+    const { taxBreakdown, totalTaxAmount: taxAmount } = calculatePerItemTax(
+      orderItems, taxSettings, posCategories, totalDiscount, scAmt
+    );
+
+    let finalAmount = preTaxTotal + taxAmount;
 
     // Add billing components to finalAmount
     const tipAmt = tipAmount ? Number(tipAmount) : 0;
@@ -15104,6 +15150,23 @@ app.put('/api/admin/tax/:restaurantId', authenticateToken, async (req, res) => {
       }
     }
 
+    // Validate tax groups if provided
+    if (taxSettings.taxGroups) {
+      if (!Array.isArray(taxSettings.taxGroups)) {
+        return res.status(400).json({ error: 'Invalid taxGroups format' });
+      }
+      for (const group of taxSettings.taxGroups) {
+        if (!group.id || !group.name || !Array.isArray(group.taxes)) {
+          return res.status(400).json({ error: 'Invalid tax group: each group needs id, name, and taxes array' });
+        }
+        for (const gt of group.taxes) {
+          if (!gt.name || typeof gt.rate !== 'number' || gt.rate < 0 || gt.rate > 100) {
+            return res.status(400).json({ error: `Invalid tax in group "${group.name}": needs name and rate 0-100` });
+          }
+        }
+      }
+    }
+
     // Get restaurant to verify it exists
     const restaurantRef = db.collection(collections.restaurants).doc(restaurantId);
     const restaurantDoc = await restaurantRef.get();
@@ -15340,15 +15403,15 @@ app.put('/api/admin/business/:restaurantId', authenticateToken, async (req, res)
   }
 });
 
-// Calculate tax for an order
+// Calculate tax for an order (supports per-item tax groups)
 app.post('/api/tax/calculate/:restaurantId', authenticateToken, async (req, res) => {
   try {
     const { restaurantId } = req.params;
     const { items, subtotal } = req.body;
 
-    console.log(`🧮 Calculating tax for restaurant: ${restaurantId}, subtotal: ${subtotal}`);
+    console.log(`Calculating tax for restaurant: ${restaurantId}, subtotal: ${subtotal}`);
 
-    // Get restaurant tax settings
+    // Get restaurant data
     const restaurantRef = db.collection(collections.restaurants).doc(restaurantId);
     const restaurantDoc = await restaurantRef.get();
 
@@ -15359,15 +15422,7 @@ app.post('/api/tax/calculate/:restaurantId', authenticateToken, async (req, res)
     const restaurant = restaurantDoc.data();
     const taxSettings = restaurant.taxSettings || {
       enabled: true,
-      taxes: [
-        {
-          id: 'gst',
-          name: 'GST',
-          rate: 5,
-          enabled: true,
-          type: 'percentage'
-        }
-      ],
+      taxes: [{ id: 'gst', name: 'GST', rate: 5, enabled: true, type: 'percentage' }],
       defaultTaxRate: 5
     };
 
@@ -15380,7 +15435,21 @@ app.post('/api/tax/calculate/:restaurantId', authenticateToken, async (req, res)
       });
     }
 
-    // Calculate taxes
+    // If items provided with categories, use per-item tax resolution
+    if (items && items.length > 0 && taxSettings.taxGroups?.length > 0) {
+      const categories = restaurant.categories || [];
+      const { taxBreakdown, totalTaxAmount } = calculatePerItemTax(
+        items, taxSettings, categories, 0, 0
+      );
+      return res.json({
+        success: true,
+        taxBreakdown,
+        totalTax: totalTaxAmount,
+        grandTotal: Math.round((subtotal + totalTaxAmount) * 100) / 100
+      });
+    }
+
+    // Fallback: flat tax on subtotal (backward compatible)
     const taxBreakdown = [];
     let totalTax = 0;
 
@@ -26426,7 +26495,7 @@ app.patch('/api/categories/:restaurantId/:categoryId', authenticateToken, async 
     }
 
     const { restaurantId, categoryId } = req.params;
-    const { name, emoji, description } = req.body;
+    const { name, emoji, description, taxGroupId } = req.body;
 
     // Get restaurant document
     const restaurantDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
@@ -26449,6 +26518,7 @@ app.patch('/api/categories/:restaurantId/:categoryId', authenticateToken, async 
       ...(name && { name: name.trim() }),
       ...(emoji && { emoji: emoji.trim() }),
       ...(description !== undefined && { description: description.trim() }),
+      ...(taxGroupId !== undefined && { taxGroupId: taxGroupId || null }),
       updatedAt: new Date()
     };
 
