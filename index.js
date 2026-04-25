@@ -907,7 +907,9 @@ const allowedOrigins = [
   "https://dine-admin.vercel.app",
   'https://dine-invoice-fe.vercel.app',
   'tauri://localhost',
-  'https://tauri.localhost'
+  'https://tauri.localhost',
+  'http://127.0.0.1:1430',
+  'http://localhost:1430'
 ];
 
 // Helper function to check if origin is a valid dineopen.com domain or subdomain
