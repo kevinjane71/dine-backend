@@ -5288,16 +5288,8 @@ app.post('/api/admin/setup-client', async (req, res) => {
 // ============================================================
 // Desktop Auth Session (for Tauri app browser-based login)
 // ============================================================
-// In-memory store for desktop auth sessions (sessionId -> { token, user, expiresAt })
-const desktopAuthSessions = new Map();
-
-// Cleanup expired sessions every 2 minutes
-setInterval(() => {
-  const now = Date.now();
-  for (const [id, session] of desktopAuthSessions) {
-    if (now > session.expiresAt) desktopAuthSessions.delete(id);
-  }
-}, 120000);
+// Desktop auth sessions — stored in Firestore (serverless-safe, persists across instances)
+const DESKTOP_SESSIONS_COLLECTION = 'desktop_auth_sessions';
 
 // POST /api/auth/desktop/session — Browser stores auth result after successful login
 app.post('/api/auth/desktop/session', async (req, res) => {
@@ -5306,11 +5298,12 @@ app.post('/api/auth/desktop/session', async (req, res) => {
     if (!sessionId || !token) {
       return res.status(400).json({ error: 'sessionId and token are required' });
     }
-    // Store with 5-minute TTL
-    desktopAuthSessions.set(sessionId, {
+    // Store in Firestore with 5-minute TTL
+    await db.collection(DESKTOP_SESSIONS_COLLECTION).doc(sessionId).set({
       token,
       user: user || null,
-      expiresAt: Date.now() + 5 * 60 * 1000
+      expiresAt: Date.now() + 5 * 60 * 1000,
+      createdAt: new Date()
     });
     console.log(`🖥️ Desktop auth session stored: ${sessionId}`);
     res.json({ success: true });
@@ -5323,16 +5316,18 @@ app.post('/api/auth/desktop/session', async (req, res) => {
 // GET /api/auth/desktop/session/:id — Tauri app polls for auth result
 app.get('/api/auth/desktop/session/:id', async (req, res) => {
   try {
-    const session = desktopAuthSessions.get(req.params.id);
-    if (!session) {
+    const docRef = db.collection(DESKTOP_SESSIONS_COLLECTION).doc(req.params.id);
+    const doc = await docRef.get();
+    if (!doc.exists) {
       return res.json({ pending: true });
     }
+    const session = doc.data();
     if (Date.now() > session.expiresAt) {
-      desktopAuthSessions.delete(req.params.id);
+      await docRef.delete();
       return res.json({ pending: true, expired: true });
     }
     // Return the token and user, then delete the session (one-time use)
-    desktopAuthSessions.delete(req.params.id);
+    await docRef.delete();
     console.log(`🖥️ Desktop auth session consumed: ${req.params.id}`);
     res.json({ pending: false, token: session.token, user: session.user });
   } catch (error) {
