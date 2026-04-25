@@ -5285,6 +5285,62 @@ app.post('/api/admin/setup-client', async (req, res) => {
   }
 });
 
+// ============================================================
+// Desktop Auth Session (for Tauri app browser-based login)
+// ============================================================
+// In-memory store for desktop auth sessions (sessionId -> { token, user, expiresAt })
+const desktopAuthSessions = new Map();
+
+// Cleanup expired sessions every 2 minutes
+setInterval(() => {
+  const now = Date.now();
+  for (const [id, session] of desktopAuthSessions) {
+    if (now > session.expiresAt) desktopAuthSessions.delete(id);
+  }
+}, 120000);
+
+// POST /api/auth/desktop/session — Browser stores auth result after successful login
+app.post('/api/auth/desktop/session', async (req, res) => {
+  try {
+    const { sessionId, token, user } = req.body;
+    if (!sessionId || !token) {
+      return res.status(400).json({ error: 'sessionId and token are required' });
+    }
+    // Store with 5-minute TTL
+    desktopAuthSessions.set(sessionId, {
+      token,
+      user: user || null,
+      expiresAt: Date.now() + 5 * 60 * 1000
+    });
+    console.log(`🖥️ Desktop auth session stored: ${sessionId}`);
+    res.json({ success: true });
+  } catch (error) {
+    console.error('Desktop session store error:', error);
+    res.status(500).json({ error: 'Failed to store session' });
+  }
+});
+
+// GET /api/auth/desktop/session/:id — Tauri app polls for auth result
+app.get('/api/auth/desktop/session/:id', async (req, res) => {
+  try {
+    const session = desktopAuthSessions.get(req.params.id);
+    if (!session) {
+      return res.json({ pending: true });
+    }
+    if (Date.now() > session.expiresAt) {
+      desktopAuthSessions.delete(req.params.id);
+      return res.json({ pending: true, expired: true });
+    }
+    // Return the token and user, then delete the session (one-time use)
+    desktopAuthSessions.delete(req.params.id);
+    console.log(`🖥️ Desktop auth session consumed: ${req.params.id}`);
+    res.json({ pending: false, token: session.token, user: session.user });
+  } catch (error) {
+    console.error('Desktop session poll error:', error);
+    res.status(500).json({ error: 'Failed to retrieve session' });
+  }
+});
+
 // Local Admin Login - Simple password-based login (bypasses OTP, same flow as OTP verification)
 // POST /api/auth/local-login
 // Body: { phone: '...' OR email: '...', password: '...' }
