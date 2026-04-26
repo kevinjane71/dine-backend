@@ -8118,16 +8118,28 @@ app.post('/api/orders', async (req, res) => {
     const syncSource = req.body.syncSource || 'online';
 
     // Idempotency check: if key provided, check if order already exists
+    // Uses deterministic doc ID for new keys, falls back to query for old keys
     if (idempotencyKey && restaurantId) {
       try {
-        const existingKeySnapshot = await db.collection('idempotency_keys')
-          .where('key', '==', idempotencyKey)
-          .where('restaurantId', '==', restaurantId)
-          .limit(1)
-          .get();
+        let existingData = null;
 
-        if (!existingKeySnapshot.empty) {
-          const existingData = existingKeySnapshot.docs[0].data();
+        // 1. Check new format (deterministic doc ID — fast O(1) lookup)
+        const idempDoc = await db.collection('idempotency_keys').doc(`${restaurantId}_${idempotencyKey}`).get();
+        if (idempDoc.exists) {
+          existingData = idempDoc.data();
+        } else {
+          // 2. Fallback: check old format (query-based — for keys created before this update)
+          const oldSnapshot = await db.collection('idempotency_keys')
+            .where('key', '==', idempotencyKey)
+            .where('restaurantId', '==', restaurantId)
+            .limit(1)
+            .get();
+          if (!oldSnapshot.empty) {
+            existingData = oldSnapshot.docs[0].data();
+          }
+        }
+
+        if (existingData && existingData.orderId) {
           const existingOrderDoc = await db.collection(collections.orders).doc(existingData.orderId).get();
           if (existingOrderDoc.exists) {
             console.log(`🔑 Idempotency key hit: ${idempotencyKey} -> order ${existingData.orderId}`);
@@ -8661,9 +8673,9 @@ app.post('/api/orders', async (req, res) => {
     const orderRef = await db.collection(collections.orders).add(orderData);
     console.log('🛒 Backend Order Creation - Order saved to DB with ID:', orderRef.id);
 
-    // Store idempotency key for deduplication (fire-and-forget)
+    // Store idempotency key for deduplication (use key as doc ID for atomic uniqueness)
     if (idempotencyKey) {
-      db.collection('idempotency_keys').add({
+      db.collection('idempotency_keys').doc(`${restaurantId}_${idempotencyKey}`).set({
         key: idempotencyKey,
         orderId: orderRef.id,
         restaurantId,
@@ -28577,13 +28589,25 @@ app.post('/api/sync/batch', authenticateToken, async (req, res) => {
       try {
         // Check idempotency for all entity types
         if (idempotencyKey) {
-          const existingKeySnapshot = await db.collection('idempotency_keys')
-            .where('key', '==', idempotencyKey)
-            .limit(1)
-            .get();
+          const restaurantId = op.payload?.restaurantId || 'global';
+          let existingData = null;
 
-          if (!existingKeySnapshot.empty) {
-            const existingData = existingKeySnapshot.docs[0].data();
+          // 1. Check new format (deterministic doc ID)
+          const idempDoc = await db.collection('idempotency_keys').doc(`${restaurantId}_${idempotencyKey}`).get();
+          if (idempDoc.exists) {
+            existingData = idempDoc.data();
+          } else {
+            // 2. Fallback: old format (query-based)
+            const oldSnapshot = await db.collection('idempotency_keys')
+              .where('key', '==', idempotencyKey)
+              .limit(1)
+              .get();
+            if (!oldSnapshot.empty) {
+              existingData = oldSnapshot.docs[0].data();
+            }
+          }
+
+          if (existingData) {
             results.push({
               idempotencyKey,
               status: 'duplicate',
@@ -28774,13 +28798,15 @@ app.post('/api/sync/batch', authenticateToken, async (req, res) => {
             continue;
         }
 
-        // Store idempotency key
+        // Store idempotency key (use key as doc ID for atomic uniqueness)
         if (idempotencyKey) {
-          db.collection('idempotency_keys').add({
+          const restaurantId = op.payload?.restaurantId || 'global';
+          db.collection('idempotency_keys').doc(`${restaurantId}_${idempotencyKey}`).set({
             key: idempotencyKey,
             entityType,
             operation,
             responseData: result || {},
+            restaurantId,
             createdAt: new Date(),
           }).catch(err => console.error('Batch idempotency key store error:', err));
         }
