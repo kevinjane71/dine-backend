@@ -560,6 +560,218 @@ router.post('/users/create-owner', authenticateSuperAdmin, async (req, res) => {
   }
 });
 
+// ─── CSV Menu Import ─────────────────────────────────────────────────
+router.post('/menus/csv-import/:restaurantId', authenticateSuperAdmin, async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+    const { menuItems, categories: inputCategories = [], taxConfig = [] } = req.body;
+
+    if (!menuItems || !Array.isArray(menuItems) || menuItems.length === 0) {
+      return res.status(400).json({ success: false, error: 'menuItems array is required' });
+    }
+
+    // Verify restaurant exists
+    const restaurantRef = db.collection(collections.restaurants).doc(restaurantId);
+    const restaurantDoc = await restaurantRef.get();
+    if (!restaurantDoc.exists) {
+      return res.status(404).json({ success: false, error: 'Restaurant not found' });
+    }
+
+    const restaurantData = restaurantDoc.data();
+    const categoryNameToId = (name) => {
+      if (!name || typeof name !== 'string') return 'other';
+      return name.toLowerCase().trim().replace(/\s+/g, '-').replace(/[^a-z0-9-]/g, '');
+    };
+
+    // ── 1. Set up tax groups ──
+    const existingTaxSettings = restaurantData.taxSettings || { enabled: true, taxes: [], taxGroups: [], defaultTaxRate: 0 };
+    const existingTaxGroups = existingTaxSettings.taxGroups || [];
+    const newTaxGroups = [...existingTaxGroups];
+    const taxGroupMap = {}; // "GST|5" → groupId
+
+    // Index existing groups
+    for (const g of existingTaxGroups) {
+      if (g.taxes && g.taxes.length === 1) {
+        const key = `${g.taxes[0].name}|${g.taxes[0].rate}`;
+        taxGroupMap[key] = g.id;
+      }
+    }
+
+    // Create new groups from taxConfig
+    let taxGroupsCreated = 0;
+    for (const tc of taxConfig) {
+      const key = `${tc.name}|${tc.rate}`;
+      if (!taxGroupMap[key]) {
+        const groupId = `group_${tc.name.toLowerCase()}_${tc.rate}`;
+        newTaxGroups.push({
+          id: groupId,
+          name: `${tc.name} ${tc.rate}%`,
+          taxes: [{ name: tc.name, rate: tc.rate }],
+        });
+        taxGroupMap[key] = groupId;
+        taxGroupsCreated++;
+      }
+    }
+
+    // Build category→taxGroupId mapping from taxConfig
+    const categoryTaxMap = {}; // categoryName → taxGroupId
+    for (const tc of taxConfig) {
+      const key = `${tc.name}|${tc.rate}`;
+      const groupId = taxGroupMap[key];
+      for (const catName of (tc.categories || [])) {
+        categoryTaxMap[catName] = groupId;
+      }
+    }
+
+    // ── 2. Build categories ──
+    const existingCategories = restaurantData.categories || [];
+    const existingCatIds = new Set(existingCategories.map(c => c.id));
+    const mergedCategories = [...existingCategories];
+    let categoriesCreated = 0;
+
+    for (const cat of inputCategories) {
+      const catId = categoryNameToId(cat.name);
+      if (!existingCatIds.has(catId)) {
+        mergedCategories.push({
+          id: catId,
+          name: cat.name,
+          emoji: '',
+          description: '',
+          taxGroupId: categoryTaxMap[cat.name] || null,
+          createdAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString(),
+        });
+        existingCatIds.add(catId);
+        categoriesCreated++;
+      } else if (categoryTaxMap[cat.name]) {
+        // Update existing category with taxGroupId if not set
+        const idx = mergedCategories.findIndex(c => c.id === catId);
+        if (idx !== -1 && !mergedCategories[idx].taxGroupId) {
+          mergedCategories[idx].taxGroupId = categoryTaxMap[cat.name];
+          mergedCategories[idx].updatedAt = new Date().toISOString();
+        }
+      }
+    }
+
+    // ── 3. Build menu items ──
+    const existingMenu = restaurantData.menu || { items: [], lastUpdated: null };
+    const existingItems = existingMenu.items || [];
+
+    // Find max shortCode
+    let maxShortCode = 0;
+    for (const item of existingItems) {
+      const sc = parseInt(item.shortCode);
+      if (!isNaN(sc) && sc > maxShortCode) maxShortCode = sc;
+    }
+
+    const now = new Date().toISOString();
+    const savedItems = [];
+    const errors = [];
+
+    for (let i = 0; i < menuItems.length; i++) {
+      const mi = menuItems[i];
+      if (!mi.name || mi.name.trim() === '') {
+        errors.push(`Row ${i + 1}: missing product name`);
+        continue;
+      }
+
+      maxShortCode++;
+      const randomStr = Math.random().toString(36).substring(2, 10);
+      const itemId = `item_${Date.now()}_${randomStr}_${i}`;
+      const catId = categoryNameToId(mi.category);
+
+      // Resolve taxGroupId for this item
+      const taxKey = mi.taxType && mi.taxRate != null ? `${mi.taxType}|${mi.taxRate}` : null;
+      const itemTaxGroupId = taxKey ? (taxGroupMap[taxKey] || null) : null;
+
+      const newItem = {
+        id: itemId,
+        name: mi.name.trim(),
+        description: mi.description || '',
+        price: parseFloat(mi.price) || 0,
+        category: catId,
+        shortCode: String(maxShortCode),
+        status: 'active',
+        order: i,
+        isVeg: !!mi.isVeg,
+        spiceLevel: 'medium',
+        allergens: [],
+        isAvailable: true,
+        isStockManaged: false,
+        stockQuantity: null,
+        lowStockThreshold: 5,
+        availableFrom: null,
+        availableUntil: null,
+        variants: Array.isArray(mi.variants) ? mi.variants.filter(v => v.name && v.price != null).map(v => ({
+          name: v.name,
+          price: parseFloat(v.price) || 0,
+          description: v.description || '',
+        })) : [],
+        customizations: [],
+        pricingRules: {},
+        taxGroupId: itemTaxGroupId,
+        image: null,
+        imageKeyword: mi.name.trim().toLowerCase(),
+        source: 'csv_import',
+        isFavorite: false,
+        createdAt: now,
+        updatedAt: now,
+      };
+
+      savedItems.push(newItem);
+    }
+
+    // ── 4. Save everything to Firestore ──
+    const allItems = [...existingItems, ...savedItems];
+
+    // Determine default tax (most common one)
+    let defaultTaxRate = existingTaxSettings.defaultTaxRate || 0;
+    const defaultTaxes = existingTaxSettings.taxes || [];
+    if (taxConfig.length > 0 && defaultTaxes.length === 0) {
+      // Set up default taxes from taxConfig
+      for (const tc of taxConfig) {
+        const existsInDefaults = defaultTaxes.some(t => t.name === tc.name && t.rate === tc.rate);
+        if (!existsInDefaults) {
+          defaultTaxes.push({
+            id: tc.name.toLowerCase(),
+            name: tc.name,
+            rate: tc.rate,
+            enabled: true,
+            type: 'percentage',
+          });
+        }
+      }
+      defaultTaxRate = taxConfig[0].rate;
+    }
+
+    await restaurantRef.update({
+      'menu.items': allItems,
+      'menu.lastUpdated': now,
+      categories: mergedCategories,
+      'taxSettings.enabled': true,
+      'taxSettings.taxes': defaultTaxes.length > 0 ? defaultTaxes : existingTaxSettings.taxes,
+      'taxSettings.taxGroups': newTaxGroups,
+      'taxSettings.defaultTaxRate': defaultTaxRate || existingTaxSettings.defaultTaxRate,
+      'taxSettings.updatedAt': now,
+    });
+
+    console.log(`[super-admin] CSV import to ${restaurantId}: ${savedItems.length} items, ${categoriesCreated} categories, ${taxGroupsCreated} tax groups`);
+
+    res.json({
+      success: true,
+      savedCount: savedItems.length,
+      errorCount: errors.length,
+      errors,
+      categoriesCreated,
+      taxGroupsCreated,
+      totalItemsNow: allItems.length,
+    });
+  } catch (error) {
+    console.error('Super admin CSV import error:', error);
+    res.status(500).json({ success: false, error: 'CSV import failed: ' + error.message });
+  }
+});
+
 // ─── User Detail ─────────────────────────────────────────────────────
 // Paginated orders with limit+cursor
 router.get('/users/:userId', authenticateSuperAdmin, async (req, res) => {
