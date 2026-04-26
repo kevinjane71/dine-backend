@@ -624,7 +624,12 @@ router.post('/menus/csv-import/:restaurantId', authenticateSuperAdmin, async (re
     }
 
     // ── 2. Build categories ──
-    const existingCategories = restaurantData.categories || [];
+    // If restaurant has default seeded menu, clear it before importing
+    const hasDefaultMenu = !!restaurantData.hasDefaultMenu;
+    const existingCategories = hasDefaultMenu ? [] : (restaurantData.categories || []);
+    if (hasDefaultMenu) {
+      console.log('🔄 Clearing default seeded menu before CSV import');
+    }
     const existingCatIds = new Set(existingCategories.map(c => c.id));
     const mergedCategories = [...existingCategories];
     let categoriesCreated = 0;
@@ -655,7 +660,7 @@ router.post('/menus/csv-import/:restaurantId', authenticateSuperAdmin, async (re
 
     // ── 3. Build menu items ──
     const existingMenu = restaurantData.menu || { items: [], lastUpdated: null };
-    const existingItems = existingMenu.items || [];
+    const existingItems = hasDefaultMenu ? [] : (existingMenu.items || []);
 
     // Find max shortCode
     let maxShortCode = 0;
@@ -744,7 +749,7 @@ router.post('/menus/csv-import/:restaurantId', authenticateSuperAdmin, async (re
       defaultTaxRate = taxConfig[0].rate;
     }
 
-    await restaurantRef.update({
+    const updateData = {
       'menu.items': allItems,
       'menu.lastUpdated': now,
       categories: mergedCategories,
@@ -753,7 +758,14 @@ router.post('/menus/csv-import/:restaurantId', authenticateSuperAdmin, async (re
       'taxSettings.taxGroups': newTaxGroups,
       'taxSettings.defaultTaxRate': defaultTaxRate || existingTaxSettings.defaultTaxRate,
       'taxSettings.updatedAt': now,
-    });
+    };
+
+    // Clear hasDefaultMenu flag when replacing default menu with real items
+    if (hasDefaultMenu) {
+      updateData.hasDefaultMenu = false;
+    }
+
+    await restaurantRef.update(updateData);
 
     console.log(`[super-admin] CSV import to ${restaurantId}: ${savedItems.length} items, ${categoriesCreated} categories, ${taxGroupsCreated} tax groups`);
 
