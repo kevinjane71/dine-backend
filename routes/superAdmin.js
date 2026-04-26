@@ -336,6 +336,104 @@ router.get('/users/lookup', authenticateSuperAdmin, async (req, res) => {
   }
 });
 
+// ─── Merge / Link two user accounts ─────────────────────────────────
+// Moves restaurants + userRestaurants from secondary → primary, copies missing fields, deletes secondary
+router.post('/users/merge', authenticateSuperAdmin, async (req, res) => {
+  try {
+    const { primaryUserId, secondaryUserId } = req.body;
+
+    if (!primaryUserId || !secondaryUserId) {
+      return res.status(400).json({ success: false, error: 'Both primaryUserId and secondaryUserId are required' });
+    }
+    if (primaryUserId === secondaryUserId) {
+      return res.status(400).json({ success: false, error: 'Cannot merge a user with themselves' });
+    }
+
+    // Fetch both users
+    const primaryDoc = await db.collection(collections.users).doc(primaryUserId).get();
+    if (!primaryDoc.exists) {
+      return res.status(404).json({ success: false, error: 'Primary user not found' });
+    }
+    const secondaryDoc = await db.collection(collections.users).doc(secondaryUserId).get();
+    if (!secondaryDoc.exists) {
+      return res.status(404).json({ success: false, error: 'Secondary user not found' });
+    }
+
+    const primaryData = primaryDoc.data();
+    const secondaryData = secondaryDoc.data();
+
+    // Build fields to copy from secondary → primary (only if primary is missing them)
+    const fieldsToCopy = {};
+    const copiedFields = [];
+    const linkableFields = ['phone', 'email', 'googleUid', 'firebaseUid', 'appleUid', 'name'];
+    for (const field of linkableFields) {
+      if ((!primaryData[field] || primaryData[field] === '') && secondaryData[field] && secondaryData[field] !== '') {
+        fieldsToCopy[field] = secondaryData[field];
+        copiedFields.push(field);
+      }
+    }
+    // Also copy verification flags if we're copying the corresponding contact
+    if (fieldsToCopy.phone && secondaryData.phoneVerified) fieldsToCopy.phoneVerified = true;
+    if (fieldsToCopy.email && secondaryData.emailVerified) fieldsToCopy.emailVerified = true;
+
+    // Find restaurants to move
+    const restaurantsSnap = await db.collection(collections.restaurants)
+      .where('ownerId', '==', secondaryUserId)
+      .get();
+
+    // Find userRestaurants to move
+    const userRestSnap = await db.collection(collections.userRestaurants)
+      .where('userId', '==', secondaryUserId)
+      .get();
+
+    // Execute all changes in a batch
+    const batch = db.batch();
+
+    // Move restaurants
+    restaurantsSnap.docs.forEach(doc => {
+      batch.update(doc.ref, { ownerId: primaryUserId, updatedAt: new Date() });
+    });
+
+    // Move userRestaurants
+    userRestSnap.docs.forEach(doc => {
+      batch.update(doc.ref, { userId: primaryUserId, updatedAt: new Date() });
+    });
+
+    // Update primary with copied fields
+    if (Object.keys(fieldsToCopy).length > 0) {
+      batch.update(primaryDoc.ref, { ...fieldsToCopy, updatedAt: new Date() });
+    }
+
+    // Delete secondary user
+    batch.delete(secondaryDoc.ref);
+
+    await batch.commit();
+
+    console.log(`[super-admin] Merged user ${secondaryUserId} into ${primaryUserId}: moved ${restaurantsSnap.size} restaurants, copied [${copiedFields.join(', ')}]`);
+
+    // Return merged user state
+    const mergedUser = {
+      id: primaryUserId,
+      name: fieldsToCopy.name || primaryData.name || '',
+      email: fieldsToCopy.email || primaryData.email || '',
+      phone: fieldsToCopy.phone || primaryData.phone || '',
+      role: primaryData.role || 'owner',
+    };
+
+    res.json({
+      success: true,
+      mergedUser,
+      restaurantsMoved: restaurantsSnap.size,
+      userRestaurantsMoved: userRestSnap.size,
+      fieldsCopied: copiedFields,
+      secondaryDeleted: secondaryUserId,
+    });
+  } catch (error) {
+    console.error('Super admin merge error:', error);
+    res.status(500).json({ success: false, error: 'Failed to merge accounts: ' + error.message });
+  }
+});
+
 // ─── User Detail ─────────────────────────────────────────────────────
 // Paginated orders with limit+cursor
 router.get('/users/:userId', authenticateSuperAdmin, async (req, res) => {
