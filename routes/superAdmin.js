@@ -624,14 +624,11 @@ router.post('/menus/csv-import/:restaurantId', authenticateSuperAdmin, async (re
     }
 
     // ── 2. Build categories ──
-    // If restaurant has default seeded menu, clear it before importing
+    // CSV import always replaces the entire menu (full import, not partial add)
     const hasDefaultMenu = !!restaurantData.hasDefaultMenu;
-    const existingCategories = hasDefaultMenu ? [] : (restaurantData.categories || []);
-    if (hasDefaultMenu) {
-      console.log('🔄 Clearing default seeded menu before CSV import');
-    }
-    const existingCatIds = new Set(existingCategories.map(c => c.id));
-    const mergedCategories = [...existingCategories];
+    console.log(`🔄 CSV import: replacing entire menu for ${restaurantId} (hasDefaultMenu: ${hasDefaultMenu})`);
+    const existingCatIds = new Set();
+    const mergedCategories = [];
     let categoriesCreated = 0;
 
     for (const cat of inputCategories) {
@@ -660,7 +657,7 @@ router.post('/menus/csv-import/:restaurantId', authenticateSuperAdmin, async (re
 
     // ── 3. Build menu items ──
     const existingMenu = restaurantData.menu || { items: [], lastUpdated: null };
-    const existingItems = hasDefaultMenu ? [] : (existingMenu.items || []);
+    const existingItems = []; // CSV import replaces entire menu
 
     // Find max shortCode
     let maxShortCode = 0;
@@ -760,10 +757,8 @@ router.post('/menus/csv-import/:restaurantId', authenticateSuperAdmin, async (re
       'taxSettings.updatedAt': now,
     };
 
-    // Clear hasDefaultMenu flag when replacing default menu with real items
-    if (hasDefaultMenu) {
-      updateData.hasDefaultMenu = false;
-    }
+    // Always clear hasDefaultMenu flag after CSV import
+    updateData.hasDefaultMenu = false;
 
     await restaurantRef.update(updateData);
 
