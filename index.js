@@ -824,6 +824,7 @@ const dinebotConfig = {
 
 const initializePaymentRoutes = require('./payment');
 const initializeDodoPaymentRoutes = require('./dodoPayment');
+const { initializeRazorpayOAuthRoutes, initializeRazorpayPublicRoutes, verifyRazorpaySignature } = require('./razorpayOAuth');
 const emailService = require('./emailService');
 
 // Chatbot RAG routes
@@ -7467,7 +7468,12 @@ app.post('/api/public/orders/:restaurantId', vercelSecurityMiddleware.publicAPI,
       offerIds = [], // Optional multiple offers to apply
       deliveryAddress, // For delivery orders
       redeemLoyaltyPoints = 0, // Loyalty points to redeem
-      orderSource = 'crave_app' // 'crave_app' | 'online_order' – source of the order for order history
+      orderSource = 'crave_app', // 'crave_app' | 'online_order' – source of the order for order history
+      // Razorpay payment fields (optional — only when razorpayEnabled)
+      paymentMethod, // 'razorpay' | 'cash' | undefined
+      razorpayPaymentId,
+      razorpayOrderId,
+      razorpaySignature,
     } = req.body;
 
     if (!restaurantId || !items || items.length === 0) {
@@ -7881,6 +7887,18 @@ app.post('/api/public/orders/:restaurantId', vercelSecurityMiddleware.publicAPI,
       }
     }
 
+    // Razorpay payment verification (if paymentMethod is 'razorpay')
+    if (paymentMethod === 'razorpay') {
+      if (!razorpayPaymentId || !razorpayOrderId || !razorpaySignature) {
+        return res.status(400).json({ error: 'Razorpay payment details are required for online payment' });
+      }
+      // Verify signature directly (no self-referential fetch — works on serverless)
+      const verifyResult = await verifyRazorpaySignature(db, restaurantId, { razorpayOrderId, razorpayPaymentId, razorpaySignature });
+      if (!verifyResult.verified) {
+        return res.status(400).json({ error: verifyResult.error || 'Payment verification failed' });
+      }
+    }
+
     // Generate order number and daily/sequential order ID (based on restaurant orderSettings.sequentialOrderIdEnabled)
     const orderNumber = `ORD-${Date.now()}-${Math.random().toString(36).substr(2, 4).toUpperCase()}`;
     const dailyOrderId = await getNextOrderId(restaurantId, restaurantData);
@@ -7925,7 +7943,11 @@ app.post('/api/public/orders/:restaurantId', vercelSecurityMiddleware.publicAPI,
         tableNumber: tableNum
       },
       deliveryAddress: orderType === 'delivery' ? deliveryAddress : null,
-      paymentMethod: 'cash',
+      paymentMethod: paymentMethod || 'cash',
+      ...(paymentMethod === 'razorpay' && {
+        razorpayPaymentId,
+        razorpayOrderId,
+      }),
       staffInfo: {
         waiterId: null,
         waiterName: 'Customer Self-Order',
@@ -7936,7 +7958,7 @@ app.post('/api/public/orders/:restaurantId', vercelSecurityMiddleware.publicAPI,
       notes: notes || (resolvedOrderSource === 'online_order' ? `${orderTypeLabels[orderType] || 'Customer order'} order via public online order` : `${orderTypeLabels[orderType] || 'Customer order'} order via Crave App`),
       status: 'pending',
       kotSent: false,
-      paymentStatus: 'pending',
+      paymentStatus: paymentMethod === 'razorpay' ? 'paid' : 'pending',
       otpVerified: true,
       verificationId: verificationId,
       createdAt: new Date(),
@@ -12038,6 +12060,12 @@ app.use('/api/payments', paymentRoutes);
 // Initialize Dodo Payments routes (international payments)
 const dodoPaymentRoutes = initializeDodoPaymentRoutes(db);
 app.use('/api/dodo-payments', dodoPaymentRoutes);
+
+// Initialize Razorpay OAuth routes (restaurant payment gateway via OAuth — separate from DineOpen billing)
+const razorpayOAuthRoutes = initializeRazorpayOAuthRoutes(db, authenticateToken);
+app.use('/api/razorpay-oauth', razorpayOAuthRoutes);
+const razorpayPublicRoutes = initializeRazorpayPublicRoutes(db);
+app.use('/api/public/razorpay', vercelSecurityMiddleware.publicAPI, razorpayPublicRoutes);
 
 // Initialize chatbot RAG routes
 app.use('/api', chatbotRoutes);
@@ -24976,8 +25004,10 @@ app.get('/api/public/customer-app-settings/:restaurantId', vercelSecurityMiddlew
           upiEnabled: customerAppSettings.paymentSettings.upiEnabled ?? false,
           upiId: customerAppSettings.paymentSettings.upiId || '',
           upiDisplayName: customerAppSettings.paymentSettings.upiDisplayName || '',
-          upiQrCodeUrl: customerAppSettings.paymentSettings.upiQrCodeUrl || ''
-        } : { upiEnabled: false },
+          upiQrCodeUrl: customerAppSettings.paymentSettings.upiQrCodeUrl || '',
+          razorpayEnabled: customerAppSettings.paymentSettings.razorpayEnabled ?? false,
+          razorpayConnected: customerAppSettings.paymentSettings.razorpayConnected ?? false,
+        } : { upiEnabled: false, razorpayEnabled: false, razorpayConnected: false },
         billingSettings: {
           tipsEnabled: customerAppSettings.billingSettings?.tipsEnabled ?? false,
           tipPresets: customerAppSettings.billingSettings?.tipPresets || [5, 10, 15],
@@ -25524,7 +25554,10 @@ app.get('/api/restaurants/:restaurantId/customer-app-settings', authenticateToke
         upiEnabled: existingSettings.paymentSettings?.upiEnabled ?? false,
         upiId: existingSettings.paymentSettings?.upiId || '',
         upiDisplayName: existingSettings.paymentSettings?.upiDisplayName || '',
-        upiQrCodeUrl: existingSettings.paymentSettings?.upiQrCodeUrl || ''
+        upiQrCodeUrl: existingSettings.paymentSettings?.upiQrCodeUrl || '',
+        razorpayEnabled: existingSettings.paymentSettings?.razorpayEnabled ?? false,
+        razorpayConnected: existingSettings.paymentSettings?.razorpayConnected ?? false,
+        razorpayAccountId: existingSettings.paymentSettings?.razorpayAccountId || '',
       },
       billingSettings: {
         tipsEnabled: existingSettings.billingSettings?.tipsEnabled ?? false,
@@ -25644,10 +25677,19 @@ app.put('/api/restaurants/:restaurantId/customer-app-settings', authenticateToke
         upiEnabled: settings.paymentSettings?.upiEnabled ?? false,
         upiId: settings.paymentSettings?.upiId || '',
         upiDisplayName: settings.paymentSettings?.upiDisplayName || '',
-        upiQrCodeUrl: settings.paymentSettings?.upiQrCodeUrl || ''
+        upiQrCodeUrl: settings.paymentSettings?.upiQrCodeUrl || '',
+        razorpayEnabled: settings.paymentSettings?.razorpayEnabled ?? false,
+        // Preserve OAuth-managed fields from existing data (set by OAuth callback, not settings form)
+        razorpayConnected: restaurantDoc.data().customerAppSettings?.paymentSettings?.razorpayConnected ?? false,
+        razorpayAccountId: restaurantDoc.data().customerAppSettings?.paymentSettings?.razorpayAccountId || '',
       },
       updatedAt: new Date()
     };
+
+    // Don't allow enabling razorpay if not connected
+    if (customerAppSettings.paymentSettings.razorpayEnabled && !customerAppSettings.paymentSettings.razorpayConnected) {
+      customerAppSettings.paymentSettings.razorpayEnabled = false;
+    }
 
     await restaurantDoc.ref.update({
       customerAppSettings: customerAppSettings

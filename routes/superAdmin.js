@@ -434,6 +434,132 @@ router.post('/users/merge', authenticateSuperAdmin, async (req, res) => {
   }
 });
 
+// ─── Create Owner Account (or set temp password for existing) ────────
+router.post('/users/create-owner', authenticateSuperAdmin, async (req, res) => {
+  try {
+    const { email } = req.body;
+
+    if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+      return res.status(400).json({ success: false, error: 'A valid email is required' });
+    }
+
+    const normalizedEmail = email.toLowerCase().trim();
+
+    // Generate 8-char alphanumeric temp password (excludes ambiguous chars)
+    const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789';
+    let tempPassword = '';
+    for (let i = 0; i < 8; i++) {
+      tempPassword += chars.charAt(Math.floor(Math.random() * chars.length));
+    }
+    const hashedPassword = await bcrypt.hash(tempPassword, 10);
+
+    // Check if user already exists
+    const existingSnap = await db.collection(collections.users)
+      .where('email', '==', normalizedEmail)
+      .limit(1)
+      .get();
+
+    if (!existingSnap.empty) {
+      // ── Existing user: set temp password so they can login with email ──
+      const existingDoc = existingSnap.docs[0];
+      const existingData = existingDoc.data();
+      const userId = existingDoc.id;
+
+      await existingDoc.ref.update({
+        password: hashedPassword,
+        emailVerified: true,
+        temporaryPassword: true,
+        updatedAt: new Date(),
+      });
+
+      // Check restaurants
+      const restSnap = await db.collection(collections.restaurants)
+        .where('ownerId', '==', userId)
+        .limit(1)
+        .get();
+
+      console.log(`[super-admin] Set temp password for existing user ${userId} (${normalizedEmail})`);
+
+      return res.json({
+        success: true,
+        isExisting: true,
+        userId,
+        email: normalizedEmail,
+        name: existingData.name || '',
+        phone: existingData.phone || '',
+        provider: existingData.provider || 'unknown',
+        hasRestaurants: !restSnap.empty,
+        temporaryPassword: tempPassword,
+      });
+    }
+
+    // ── New user: create account with same fields as normal registration ──
+    const userDoc = await db.collection(collections.users).add({
+      email: normalizedEmail,
+      password: hashedPassword,
+      name: '',
+      role: 'owner',
+      emailVerified: true,
+      phoneVerified: false,
+      provider: 'email',
+      temporaryPassword: true,
+      setupComplete: false,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+      createdBy: 'admin',
+    });
+
+    const userId = userDoc.id;
+
+    // Create default subscription (same as registration flow in index.js)
+    const currentDate = new Date();
+    await db.collection('dine_user_data').doc(userId).set({
+      uid: userId,
+      email: normalizedEmail,
+      phone: '',
+      role: 'owner',
+      restaurantInfo: {},
+      createdAt: currentDate.toISOString(),
+      lastUpdated: currentDate.toISOString(),
+      app: 'Dine',
+      subscription: {
+        planId: 'free-trial',
+        planName: 'Free Trial',
+        status: 'active',
+        startDate: currentDate.toISOString(),
+        endDate: null,
+        features: {
+          maxProducts: 200,
+          maxLocations: 1,
+          maxTransactions: 'unlimited',
+          inventoryTracking: true,
+          multiStore: false,
+          advancedReports: false,
+          prioritySupport: false,
+          backupEnabled: false,
+          staffAccounts: 1,
+          tableManagement: 100,
+        },
+        lastUpdated: currentDate.toISOString(),
+        app: 'Dine',
+      },
+    });
+
+    console.log(`[super-admin] Created owner account ${userId} for ${normalizedEmail} with subscription`);
+
+    res.json({
+      success: true,
+      isExisting: false,
+      userId,
+      email: normalizedEmail,
+      temporaryPassword: tempPassword,
+    });
+  } catch (error) {
+    console.error('Super admin create-owner error:', error);
+    res.status(500).json({ success: false, error: 'Failed to create account: ' + error.message });
+  }
+});
+
 // ─── User Detail ─────────────────────────────────────────────────────
 // Paginated orders with limit+cursor
 router.get('/users/:userId', authenticateSuperAdmin, async (req, res) => {
