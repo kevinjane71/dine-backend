@@ -2121,6 +2121,99 @@ const parseDocumentToText = async (buffer, fileName) => {
   return buffer.toString('utf-8');
 };
 
+// Try to parse a structured CSV directly without AI (e.g. Petpooja exports with known column headers)
+// Returns { categories, menuItems } or null if not a recognized structured format
+const tryParseStructuredCSV = (buffer, fileName) => {
+  try {
+    const XLSX = require('xlsx');
+    const workbook = XLSX.read(buffer, { type: 'buffer' });
+    const sheet = workbook.Sheets[workbook.SheetNames[0]];
+    const rows = XLSX.utils.sheet_to_json(sheet, { defval: '' });
+    if (!rows || rows.length === 0) return null;
+
+    const headers = Object.keys(rows[0]).map(h => h.toLowerCase().trim());
+
+    // Detect known column patterns
+    const nameCol = headers.find(h => /^(product_?name|item_?name|name|dish_?name|menu_?item)$/i.test(h));
+    const priceCol = headers.find(h => /^(product_?price|price|item_?price|rate|mrp)$/i.test(h));
+    if (!nameCol || !priceCol) return null; // Not a structured menu CSV
+
+    // Find original header names (case-preserving)
+    const origHeaders = Object.keys(rows[0]);
+    const findOrig = (lc) => origHeaders.find(h => h.toLowerCase().trim() === lc);
+    const nameKey = findOrig(nameCol);
+    const priceKey = findOrig(priceCol);
+    const catCol = headers.find(h => /^(category_?name|category|type|group|section)$/i.test(h));
+    const catKey = catCol ? findOrig(catCol) : null;
+
+    // Detect variant columns (variant1_name, variant1_price, variant2_name, etc.)
+    const variantSets = [];
+    for (let i = 1; i <= 5; i++) {
+      const vNameCol = origHeaders.find(h => new RegExp(`variant${i}[_]?name`, 'i').test(h));
+      const vPriceCol = origHeaders.find(h => new RegExp(`variant${i}[_]?price`, 'i').test(h));
+      if (vNameCol && vPriceCol) variantSets.push({ nameKey: vNameCol, priceKey: vPriceCol });
+    }
+
+    // Detect veg/non-veg heuristic keywords
+    const nonVegKeywords = /chicken|mutton|fish|prawn|egg|lamb|pork|beef|meat|keema|gosht|surmai|pomfret|rawas|crab|lobster|shrimp|bacon|sausage|ham|salami|pepperoni/i;
+
+    console.log(`📊 Structured CSV detected: ${rows.length} rows, name="${nameKey}", price="${priceKey}", category="${catKey || 'none'}", variants=${variantSets.length}`);
+
+    const categoriesMap = new Map();
+    const menuItems = [];
+    let shortCode = 1;
+
+    for (const row of rows) {
+      const name = String(row[nameKey] || '').trim();
+      if (!name) continue;
+
+      const price = parseFloat(row[priceKey]) || 0;
+      const categoryName = catKey ? String(row[catKey] || '').trim() : 'Other';
+
+      // Collect categories
+      if (categoryName && !categoriesMap.has(categoryName)) {
+        categoriesMap.set(categoryName, { name: categoryName, order: categoriesMap.size + 1 });
+      }
+
+      // Collect variants from variant columns
+      const variants = [];
+      for (const vs of variantSets) {
+        const vName = String(row[vs.nameKey] || '').trim();
+        const vPrice = parseFloat(row[vs.priceKey]);
+        if (vName && !isNaN(vPrice) && vPrice > 0) {
+          variants.push({ name: vName, price: vPrice });
+        }
+      }
+
+      // Determine isVeg
+      const isVeg = !nonVegKeywords.test(name) && !nonVegKeywords.test(categoryName);
+
+      // Generate imageKeyword
+      const imageKeyword = name.toLowerCase().replace(/[^a-z0-9\s]/g, '').trim().split(/\s+/).slice(0, 3).join('-');
+
+      menuItems.push({
+        name,
+        description: '',
+        price,
+        category: categoryName,
+        isVeg,
+        shortCode: String(shortCode++),
+        variants,
+        imageKeyword: imageKeyword || 'food-dish',
+      });
+    }
+
+    console.log(`✅ Structured CSV parsed: ${menuItems.length} items, ${categoriesMap.size} categories`);
+    return {
+      categories: Array.from(categoriesMap.values()),
+      menuItems,
+    };
+  } catch (err) {
+    console.log('⚠️ Structured CSV parse failed, falling back to AI:', err.message);
+    return null;
+  }
+};
+
 // Extract menu from CSV/Excel. Downloads file, parses to text, sends to GPT-4o.
 const extractMenuFromCSV = async (csvUrl, businessType = 'restaurant') => {
   try {
@@ -2128,6 +2221,14 @@ const extractMenuFromCSV = async (csvUrl, businessType = 'restaurant') => {
     console.log('📥 Downloading file...');
     const buffer = await downloadFileBuffer(csvUrl);
     const fileName = csvUrl.split('/').pop().split('?')[0];
+
+    // Try structured parsing first (fast, no AI cost, handles large files)
+    const structured = tryParseStructuredCSV(buffer, fileName);
+    if (structured && structured.menuItems.length > 0) {
+      console.log(`✅ Used structured CSV parsing — ${structured.menuItems.length} items extracted without AI`);
+      return structured;
+    }
+
     const textContent = parseSpreadsheetToText(buffer, fileName);
     console.log(`📄 Parsed spreadsheet to text (${textContent.length} chars)`);
 
@@ -2141,15 +2242,15 @@ const extractMenuFromCSV = async (csvUrl, businessType = 'restaurant') => {
       messages: [
         {
           role: "user",
-          content: `This is the content of a CSV/Excel file that may contain a restaurant menu:\n\n${textContent.substring(0, 15000)}\n\n1) If there is a Category/Type column, collect unique values as "categories":[{"name":"X","order":1},...]. If no category column, use "categories":[].
+          content: `This is the content of a CSV/Excel file that may contain a restaurant menu:\n\n${textContent.substring(0, 30000)}\n\n1) If there is a Category/Type column, collect unique values as "categories":[{"name":"X","order":1},...]. If no category column, use "categories":[].
 2) Extract ALL rows as menu items. For "category" use the row's Category/Type value if present, else "Other".
-3) VARIANTS: If price column shows multiple values (e.g., "110/180", "Half/Full"), extract as "variants":[{"name":"Half","price":110},{"name":"Full","price":180}]. Otherwise use "variants":[].
+3) VARIANTS: If there are variant columns (variant1_name, variant1_price, variant2_name, variant2_price, etc.) OR if price column shows multiple values (e.g., "110/180", "Half/Full"), extract as "variants":[{"name":"Half","price":110},{"name":"Full","price":180}]. Otherwise use "variants":[].
 4) For each item add "imageKeyword": a specific hyphen-separated keyword (1-3 words) that uniquely identifies this dish. Make each keyword DIFFERENT from similar items: "egg-thali" not "thali", "chicken-biryani" not "biryani", "masala-dosa" not "dosa", "chocolate-icecream" not "icecream", "chicken-burger" not "burger". Use the protein/variant as prefix (e.g. "mutton-thali", "veg-fried-rice", "strawberry-shake", "cheese-naan").
 Return JSON: {"categories":[...],"menuItems":[{"name":"","description":"","price":0,"category":"...","isVeg":true,"shortCode":"1","variants":[],"imageKeyword":""}]}
 shortCode: 1,2,3... If NOT a menu: {"categories":[],"menuItems":[]}`
         }
       ],
-      max_tokens: 8000,
+      max_tokens: 16000,
       temperature: 0.1
     });
     const content = response.choices[0].message.content;
