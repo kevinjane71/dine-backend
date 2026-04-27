@@ -21183,9 +21183,70 @@ app.patch('/api/purchase-orders/:restaurantId/:orderId', authenticateToken, asyn
     }
 
     await db.collection(collections.purchaseOrders).doc(orderId).update(updateData);
-    
+
+    // Auto-generate supplier invoice when PO is received
+    if (status === 'received' || status === 'delivered') {
+      try {
+        // Check if invoice already exists for this PO
+        const existingInvSnap = await db.collection(collections.supplierInvoices)
+          .where('restaurantId', '==', restaurantId)
+          .where('purchaseOrderId', '==', orderId)
+          .limit(1)
+          .get();
+
+        if (existingInvSnap.empty) {
+          // Generate invoice number
+          const invCountSnap = await db.collection(collections.supplierInvoices)
+            .where('restaurantId', '==', restaurantId)
+            .get();
+          const invoiceNumber = `INV-${new Date().getFullYear()}-${String(invCountSnap.size + 1).padStart(4, '0')}`;
+
+          // Convert PO items to invoice items
+          const invoiceItems = (currentOrder.items || []).map(item => ({
+            inventoryItemId: item.inventoryItemId,
+            inventoryItemName: item.inventoryItemName,
+            quantity: item.quantity || 0,
+            unitPrice: item.unitPrice || 0,
+            tax: 0,
+            total: (item.quantity || 0) * (item.unitPrice || 0),
+          }));
+
+          const subtotal = invoiceItems.reduce((sum, item) => sum + item.total, 0);
+          const totalAmount = currentOrder.totalAmount || subtotal;
+
+          const invoiceData = {
+            restaurantId,
+            purchaseOrderId: orderId,
+            supplierId: currentOrder.supplierId || null,
+            invoiceNumber,
+            invoiceDate: new Date(),
+            items: invoiceItems,
+            subtotal,
+            taxAmount: 0,
+            totalAmount,
+            paymentTerms: currentOrder.paymentTerms || 'Net 30',
+            dueDate: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000),
+            status: 'pending',
+            matchStatus: 'matched',
+            paymentStatus: 'unpaid',
+            paidAmount: 0,
+            receivedMethod: 'generated',
+            receivedDate: new Date(),
+            createdAt: new Date(),
+            updatedAt: new Date(),
+            createdBy: userId,
+          };
+
+          await db.collection(collections.supplierInvoices).add(invoiceData);
+        }
+      } catch (invoiceErr) {
+        console.error('Auto-generate supplier invoice error (non-fatal):', invoiceErr);
+        // Non-fatal — PO status was already updated, invoice generation failure shouldn't block
+      }
+    }
+
     const updatedOrder = { id: orderId, ...currentOrder, ...updateData };
-    
+
     res.json({
       message: 'Purchase order updated successfully',
       order: updatedOrder
