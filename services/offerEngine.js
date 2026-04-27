@@ -130,9 +130,10 @@ const calculateCrossItemBogo = (offer, cart) => {
     return { discount: 0, freeItems: [] };
   }
 
-  // Count qualifying buy units
+  // Count qualifying buy units (skip non-discountable items)
   let buyUnits = 0;
   for (const item of cart) {
+    if (item.discountApplicable === false) continue;
     const id = getItemId(item);
     const cat = getItemCategory(item);
     const qty = item.quantity || 0;
@@ -147,6 +148,7 @@ const calculateCrossItemBogo = (offer, cart) => {
   // Build available "get" units pool (sorted by price asc — pick cheapest free units)
   const pool = [];
   for (const item of cart) {
+    if (item.discountApplicable === false) continue;
     const id = getItemId(item);
     if (!getItemIds.includes(id)) continue;
     const qty = item.quantity || 0;
@@ -183,15 +185,22 @@ const calculateDiscountForOffer = (offer, subtotal, cart = [], context = {}) => 
   const offerScope = offer.scope || 'order';
   let applicableSubtotal = subtotal;
 
-  // Scope filtering (category / item) — identical to legacy logic
+  // Scope filtering (category / item) — also exclude non-discountable items
   if (offerScope === 'category' && Array.isArray(offer.targetCategories) && offer.targetCategories.length > 0) {
     const normalizedTargets = offer.targetCategories.map(normalizeCategory);
     applicableSubtotal = cart
+      .filter(item => item.discountApplicable !== false)
       .filter(item => normalizedTargets.includes(normalizeCategory(getItemCategory(item))))
       .reduce((sum, item) => sum + getItemLineTotal(item), 0);
   } else if (offerScope === 'item' && Array.isArray(offer.targetItems) && offer.targetItems.length > 0) {
     applicableSubtotal = cart
+      .filter(item => item.discountApplicable !== false)
       .filter(item => offer.targetItems.includes(getItemId(item)))
+      .reduce((sum, item) => sum + getItemLineTotal(item), 0);
+  } else {
+    // Order-level scope: filter out non-discountable items
+    applicableSubtotal = cart
+      .filter(item => item.discountApplicable !== false)
       .reduce((sum, item) => sum + getItemLineTotal(item), 0);
   }
 
@@ -211,14 +220,14 @@ const calculateDiscountForOffer = (offer, subtotal, cart = [], context = {}) => 
     return { discount: cross.discount, freeItems: cross.freeItems, appliedTier };
   }
 
-  // Legacy simple BOGO (same-item)
+  // Legacy simple BOGO (same-item) — skip non-discountable items
   if (offer.promotionType === 'bogo' && offer.bogoConfig) {
-    let bogoItems = cart;
+    let bogoItems = cart.filter(item => item.discountApplicable !== false);
     if (offerScope === 'item' && offer.targetItems?.length > 0) {
-      bogoItems = cart.filter(item => offer.targetItems.includes(getItemId(item)));
+      bogoItems = bogoItems.filter(item => offer.targetItems.includes(getItemId(item)));
     } else if (offerScope === 'category' && offer.targetCategories?.length > 0) {
       const normalizedTargets = offer.targetCategories.map(normalizeCategory);
-      bogoItems = cart.filter(item => normalizedTargets.includes(normalizeCategory(getItemCategory(item))));
+      bogoItems = bogoItems.filter(item => normalizedTargets.includes(normalizeCategory(getItemCategory(item))));
     }
     const totalQty = bogoItems.reduce((sum, item) => sum + (item.quantity || 1), 0);
     const buyQty = offer.bogoConfig.buyQty || 2;
