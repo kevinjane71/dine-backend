@@ -909,6 +909,7 @@ const allowedOrigins = [
   'https://dine-invoice-fe.vercel.app',
   'tauri://localhost',
   'https://tauri.localhost',
+  'http://tauri.localhost',
   'http://127.0.0.1:1430',
   'http://localhost:1430'
 ];
