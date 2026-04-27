@@ -131,6 +131,58 @@ router.post('/:restaurantId/runs', async (req, res) => {
     const batch = db.batch();
     const userId = req.user?.userId || req.user?.id;
 
+    // Fetch attendance data for this month (if available)
+    const [year, mon] = month.split('-').map(Number);
+    const startDate = `${month}-01`;
+    const lastDay = new Date(year, mon, 0).getDate();
+    const endDate = `${month}-${String(lastDay).padStart(2, '0')}`;
+
+    // Calculate working days (exclude weekly offs)
+    let leaveConfig = null;
+    try {
+      const lcDoc = await db.collection('leaveConfig').doc(restaurantId).get();
+      if (lcDoc.exists) leaveConfig = lcDoc.data();
+    } catch (e) { /* no leave config, skip attendance integration */ }
+
+    const weeklyOff = leaveConfig?.weeklyOff || [0]; // default Sunday
+    const holidays = (leaveConfig?.holidays || []).map(h => h.date);
+    let workingDays = 0;
+    for (let d = 1; d <= lastDay; d++) {
+      const date = new Date(year, mon - 1, d);
+      const dayOfWeek = date.getDay();
+      const dateStr = `${month}-${String(d).padStart(2, '0')}`;
+      if (!weeklyOff.includes(dayOfWeek) && !holidays.includes(dateStr)) {
+        workingDays++;
+      }
+    }
+
+    // Fetch attendance records for the month
+    const attendanceSnap = await db.collection('attendance')
+      .where('restaurantId', '==', restaurantId)
+      .where('date', '>=', startDate)
+      .where('date', '<=', endDate)
+      .get();
+
+    // Build attendance map: staffId -> { presentDays, paidLeaveDays, overtimeHours }
+    const attendanceMap = {};
+    attendanceSnap.docs.forEach(doc => {
+      const a = doc.data();
+      if (!attendanceMap[a.staffId]) {
+        attendanceMap[a.staffId] = { presentDays: 0, paidLeaveDays: 0, overtimeHours: 0 };
+      }
+      const entry = attendanceMap[a.staffId];
+      if (a.status === 'present') {
+        entry.presentDays++;
+        entry.overtimeHours += (a.overtimeHours || 0);
+      } else if (a.status === 'half_day') {
+        entry.presentDays += 0.5;
+      } else if (a.status === 'leave') {
+        entry.paidLeaveDays++;
+      }
+    });
+
+    const hasAttendanceData = attendanceSnap.docs.length > 0;
+
     // Create run doc
     let totalGross = 0, totalDeductions = 0, totalNet = 0;
     const slips = [];
@@ -151,6 +203,8 @@ router.post('/:restaurantId/runs', async (req, res) => {
       totalDeductions,
       totalNet,
       staffCount: slips.length,
+      workingDays,
+      hasAttendanceData,
       status: 'draft',
       createdBy: userId,
       createdAt: new Date(),
@@ -161,7 +215,7 @@ router.post('/:restaurantId/runs', async (req, res) => {
     // Create pay slips for each staff
     slips.forEach(cfg => {
       const slipRef = db.collection('paySlips').doc();
-      batch.set(slipRef, {
+      const slipData = {
         restaurantId,
         runId: runRef.id,
         staffId: cfg.staffId,
@@ -175,7 +229,34 @@ router.post('/:restaurantId/runs', async (req, res) => {
         netPay: cfg.netPay,
         status: 'generated',
         createdAt: new Date(),
-      });
+      };
+
+      // Add attendance summary if attendance data exists
+      if (hasAttendanceData) {
+        const att = attendanceMap[cfg.staffId] || { presentDays: 0, paidLeaveDays: 0, overtimeHours: 0 };
+        const lopDays = Math.max(0, workingDays - att.presentDays - att.paidLeaveDays);
+        const dailyRate = workingDays > 0 ? cfg.grossPay / workingDays : 0;
+        const lopDeduction = Math.round(dailyRate * lopDays * 100) / 100;
+        const overtimePay = leaveConfig?.overtimeEnabled
+          ? Math.round((dailyRate / (leaveConfig.overtimeAfterHours || 9)) * 1.5 * att.overtimeHours * 100) / 100
+          : 0;
+
+        slipData.attendanceSummary = {
+          workingDays,
+          presentDays: att.presentDays,
+          paidLeaveDays: att.paidLeaveDays,
+          lopDays,
+          overtimeHours: att.overtimeHours,
+          lopDeduction,
+          overtimePay,
+        };
+        // Adjust net pay
+        slipData.netPay = Math.round((cfg.netPay - lopDeduction + overtimePay) * 100) / 100;
+        slipData.lopDeduction = lopDeduction;
+        slipData.overtimePay = overtimePay;
+      }
+
+      batch.set(slipRef, slipData);
     });
 
     await batch.commit();

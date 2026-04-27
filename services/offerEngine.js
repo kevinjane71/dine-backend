@@ -28,6 +28,18 @@ const getItemLineTotal = (item) => item.total || (item.price || 0) * (item.quant
 // Normalize category names for comparison — "Hot beverages", "Hot-Beverages", "hot_beverages" all match
 const normalizeCategory = (cat) => String(cat || '').toLowerCase().replace(/[-_\s]+/g, '');
 
+// Check if an item is excluded from a specific offer
+const isItemExcluded = (item, offer) => {
+  if (Array.isArray(offer.excludedItems) && offer.excludedItems.length > 0) {
+    if (offer.excludedItems.includes(getItemId(item))) return true;
+  }
+  if (Array.isArray(offer.excludedCategories) && offer.excludedCategories.length > 0) {
+    const normalizedExcluded = offer.excludedCategories.map(normalizeCategory);
+    if (normalizedExcluded.includes(normalizeCategory(getItemCategory(item)))) return true;
+  }
+  return false;
+};
+
 // ---------- schedule & date validation ----------
 
 const isScheduleValid = (offer, now = new Date()) => {
@@ -130,10 +142,11 @@ const calculateCrossItemBogo = (offer, cart) => {
     return { discount: 0, freeItems: [] };
   }
 
-  // Count qualifying buy units (skip non-discountable items)
+  // Count qualifying buy units (skip non-discountable and excluded items)
   let buyUnits = 0;
   for (const item of cart) {
     if (item.discountApplicable === false) continue;
+    if (isItemExcluded(item, offer)) continue;
     const id = getItemId(item);
     const cat = getItemCategory(item);
     const qty = item.quantity || 0;
@@ -149,6 +162,7 @@ const calculateCrossItemBogo = (offer, cart) => {
   const pool = [];
   for (const item of cart) {
     if (item.discountApplicable === false) continue;
+    if (isItemExcluded(item, offer)) continue;
     const id = getItemId(item);
     if (!getItemIds.includes(id)) continue;
     const qty = item.quantity || 0;
@@ -185,22 +199,25 @@ const calculateDiscountForOffer = (offer, subtotal, cart = [], context = {}) => 
   const offerScope = offer.scope || 'order';
   let applicableSubtotal = subtotal;
 
-  // Scope filtering (category / item) — also exclude non-discountable items
+  // Scope filtering (category / item) — also exclude non-discountable and offer-excluded items
   if (offerScope === 'category' && Array.isArray(offer.targetCategories) && offer.targetCategories.length > 0) {
     const normalizedTargets = offer.targetCategories.map(normalizeCategory);
     applicableSubtotal = cart
       .filter(item => item.discountApplicable !== false)
+      .filter(item => !isItemExcluded(item, offer))
       .filter(item => normalizedTargets.includes(normalizeCategory(getItemCategory(item))))
       .reduce((sum, item) => sum + getItemLineTotal(item), 0);
   } else if (offerScope === 'item' && Array.isArray(offer.targetItems) && offer.targetItems.length > 0) {
     applicableSubtotal = cart
       .filter(item => item.discountApplicable !== false)
+      .filter(item => !isItemExcluded(item, offer))
       .filter(item => offer.targetItems.includes(getItemId(item)))
       .reduce((sum, item) => sum + getItemLineTotal(item), 0);
   } else {
-    // Order-level scope: filter out non-discountable items
+    // Order-level scope: filter out non-discountable and offer-excluded items
     applicableSubtotal = cart
       .filter(item => item.discountApplicable !== false)
+      .filter(item => !isItemExcluded(item, offer))
       .reduce((sum, item) => sum + getItemLineTotal(item), 0);
   }
 
@@ -220,9 +237,9 @@ const calculateDiscountForOffer = (offer, subtotal, cart = [], context = {}) => 
     return { discount: cross.discount, freeItems: cross.freeItems, appliedTier };
   }
 
-  // Legacy simple BOGO (same-item) — skip non-discountable items
+  // Legacy simple BOGO (same-item) — skip non-discountable and excluded items
   if (offer.promotionType === 'bogo' && offer.bogoConfig) {
-    let bogoItems = cart.filter(item => item.discountApplicable !== false);
+    let bogoItems = cart.filter(item => item.discountApplicable !== false && !isItemExcluded(item, offer));
     if (offerScope === 'item' && offer.targetItems?.length > 0) {
       bogoItems = bogoItems.filter(item => offer.targetItems.includes(getItemId(item)));
     } else if (offerScope === 'category' && offer.targetCategories?.length > 0) {

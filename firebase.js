@@ -131,6 +131,12 @@ const collections = {
   paySlips: 'paySlips',
   chartOfAccounts: 'chartOfAccounts',
   journalEntries: 'journalEntries',
+  // Attendance & Leave Collections
+  attendance: 'attendance',
+  leaveRequests: 'leaveRequests',
+  leaveConfig: 'leaveConfig',
+  leaveBalances: 'leaveBalances',
+  staffLocations: 'staffLocations',
   // Waste Tracking Collections
   wasteEntries: 'wasteEntries',
   stockAudits: 'stockAudits',

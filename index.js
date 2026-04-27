@@ -899,6 +899,9 @@ const publicToolsRoutes = require('./routes/publicTools');
 const initializeInvoiceRoutes = require('./invoice');
 const invoiceRoutes = initializeInvoiceRoutes(db, collections);
 
+// Attendance Module
+const attendanceRoutes = require('./routes/attendance');
+
 // Books Module (separate route files)
 const payrollRoutes = require('./routes/payroll');
 const gstRoutes = require('./routes/gstReports');
@@ -15451,6 +15454,9 @@ app.use('/api/super-admin', superAdminRoutes);
 // ==================== INVOICE MODULE ====================
 app.use('/api/invoice', invoiceRoutes);
 
+// ==================== ATTENDANCE MODULE ====================
+app.use('/api/attendance', attendanceRoutes);
+
 // ==================== BOOKS MODULE (Payroll, GST, Ledger) ====================
 app.use('/api/payroll', payrollRoutes);
 app.use('/api/gst', gstRoutes);
@@ -18776,6 +18782,24 @@ app.post('/api/inventory/:restaurantId', authenticateToken, async (req, res) => 
         createdAt: new Date(),
         updatedAt: new Date()
       });
+      // Log initial stock transaction with price
+      await db.collection(collections.inventoryTransactions).add({
+        restaurantId,
+        inventoryItemId: itemRef.id,
+        inventoryItemName: itemData.name,
+        type: 'ADDITION',
+        source: 'INITIAL',
+        quantityChange: stockQty,
+        previousStock: 0,
+        newStock: stockQty,
+        unit: itemData.unit,
+        costPerUnit: itemData.costPerUnit,
+        previousCostPerUnit: 0,
+        totalCost: stockQty * (itemData.costPerUnit || 0),
+        date: new Date(),
+        performedBy: userId,
+        notes: 'Initial stock on item creation'
+      });
     }
 
     console.log(`📦 Inventory item created: ${itemRef.id} - ${itemData.name}`);
@@ -18898,6 +18922,8 @@ app.patch('/api/inventory/:restaurantId/:itemId', authenticateToken, async (req,
 
     // Log manual stock changes as transactions
     if (stockIncrease !== 0) {
+      const newCostPerUnit = updateData.costPerUnit !== undefined ? parseFloat(updateData.costPerUnit) : (currentItem.costPerUnit || 0);
+      const prevCostPerUnit = currentItem.costPerUnit || 0;
       await db.collection(collections.inventoryTransactions).add({
         restaurantId,
         inventoryItemId: itemId,
@@ -18908,6 +18934,9 @@ app.patch('/api/inventory/:restaurantId/:itemId', authenticateToken, async (req,
         previousStock: oldStock,
         newStock: updatedStock,
         unit: updateData.unit || currentItem.unit,
+        costPerUnit: newCostPerUnit,
+        previousCostPerUnit: prevCostPerUnit,
+        totalCost: Math.abs(stockIncrease) * newCostPerUnit,
         date: new Date(),
         performedBy: userId,
         notes: stockIncrease > 0 ? `Manual stock addition of ${stockIncrease}` : `Manual stock adjustment of ${stockIncrease}`
@@ -20054,8 +20083,9 @@ app.post('/api/inventory/:restaurantId/confirm-leftover-waste', authenticateToke
 app.post('/api/inventory/:restaurantId/smart-import/parse', authenticateToken, aiUsageLimiter.middleware(), upload.single('image'), async (req, res) => {
   try {
     const { restaurantId } = req.params;
-    const { text } = req.body;
+    const { text, mode } = req.body;
     const imageFile = req.file;
+    const isInvoiceMode = mode === 'invoice' || (imageFile && !text);
 
     if (!text && !imageFile) {
       return res.status(400).json({ error: 'Either text or image is required' });
@@ -20080,7 +20110,58 @@ app.post('/api/inventory/:restaurantId/smart-import/parse', authenticateToken, a
     const existingMenuItems = hasDefaultMenu ? [] : (restaurantData.menu?.items || []).filter(i => i.status === 'active' || i.active === true);
     const existingCategories = hasDefaultMenu ? [] : (restaurantData.categories || []);
 
-    const existingContext = `
+    let systemPrompt;
+    let userMessage;
+
+    if (isInvoiceMode) {
+      // Invoice/purchase bill parsing mode
+      const existingInvContext = existingInventory.length > 0
+        ? `\nEXISTING INVENTORY ITEMS (set "isDuplicate": true if item matches):\n${existingInventory.map(i => `- ${i.name} (${i.unit}, category: ${i.category})`).join('\n')}`
+        : '';
+
+      systemPrompt = `You are analyzing a supplier invoice, purchase bill, or delivery receipt for a restaurant. Extract ALL line items from this document.
+
+${existingInvContext}
+
+Return a JSON object with this exact structure:
+{
+  "supplierInfo": {
+    "name": "Supplier Company Name",
+    "invoiceNumber": "INV-12345",
+    "date": "2025-04-28",
+    "total": 15000
+  },
+  "inventoryItems": [
+    {
+      "name": "Tomatoes",
+      "unit": "kg",
+      "category": "Vegetables",
+      "quantity": 10,
+      "costPerUnit": 40,
+      "totalCost": 400,
+      "isNew": true
+    }
+  ]
+}
+
+RULES:
+1. Extract EVERY line item from the invoice/bill, no matter how small.
+2. For each item: extract name, quantity purchased, unit (kg/g/L/ml/pcs/dozen/bottle/can/bag/box/pack), cost per unit, and total cost.
+3. Categorize items: Vegetables, Fruits, Dairy, Meat & Poultry, Seafood, Spices & Masala, Beverages, Dry Goods & Grains, Oils & Ghee, Bakery, Cleaning & Supplies, Packaging, Other.
+4. Extract supplier info from the invoice header/footer: supplier name, invoice number, date, total amount.
+5. If an item already exists in EXISTING INVENTORY ITEMS, set "isDuplicate": true (case-insensitive match). Otherwise set "isNew": true.
+6. Parse Hindi, regional, or abbreviated item names correctly (e.g., "Aalu" = "Potato", "Desi Ghee" = "Desi Ghee").
+7. If cost per unit is not directly visible but total cost and quantity are, calculate it.
+8. All monetary values should be in INR (₹).
+9. Return valid JSON only — no markdown, no explanation.`;
+
+      userMessage = imageFile
+        ? 'Extract all items, quantities, costs, and supplier details from this invoice/bill image.'
+        : `Extract all items, quantities, costs, and supplier details from this invoice text:\n\n${text}`;
+
+    } else {
+      // Original recipe/menu parsing mode
+      const existingContext = `
 EXISTING INVENTORY ITEMS (do NOT re-create these, reference them by name):
 ${existingInventory.map(i => `- ${i.name} (${i.unit}, category: ${i.category})`).join('\n') || 'None'}
 
@@ -20090,7 +20171,7 @@ ${existingMenuItems.map(i => `- ${i.name} (₹${i.price}, category: ${i.category
 EXISTING MENU CATEGORIES:
 ${existingCategories.map(c => c.name).join(', ') || 'None'}`;
 
-    const systemPrompt = `You are a restaurant setup assistant. Parse the provided text (or image) which contains recipes, ingredient lists, or menu items. Extract structured data to set up the restaurant's inventory, menu, and recipes.
+      systemPrompt = `You are a restaurant setup assistant. Parse the provided text (or image) which contains recipes, ingredient lists, or menu items. Extract structured data to set up the restaurant's inventory, menu, and recipes.
 
 ${existingContext}
 
@@ -20130,6 +20211,11 @@ RULES:
 9. If the text has multiple recipes, extract ALL of them.
 10. Return valid JSON only.`;
 
+      userMessage = imageFile
+        ? 'Extract all recipes, ingredients, and menu items from this image.'
+        : text;
+    }
+
     let aiResponse;
 
     if (imageFile) {
@@ -20143,7 +20229,7 @@ RULES:
           {
             role: 'user',
             content: [
-              { type: 'text', text: 'Extract all recipes, ingredients, and menu items from this image.' },
+              { type: 'text', text: userMessage },
               { type: 'image_url', image_url: { url: `data:${imageMimeType};base64,${imageBase64}` } }
             ]
           }
@@ -20157,7 +20243,7 @@ RULES:
         model: 'gpt-4o-mini',
         messages: [
           { role: 'system', content: systemPrompt },
-          { role: 'user', content: text }
+          { role: 'user', content: userMessage }
         ],
         temperature: 0.2,
         max_tokens: 4000,
@@ -20183,6 +20269,8 @@ RULES:
         unit: (item.unit || 'g').trim(),
         category: (item.category || 'General').trim(),
         costPerUnit: parseFloat(item.costPerUnit) || 0,
+        quantity: parseFloat(item.quantity) || 0,
+        totalCost: parseFloat(item.totalCost) || 0,
         isNew: item.isNew !== false,
         isDuplicate: existingInventory.some(e => e.name.toLowerCase() === (item.name || '').toLowerCase().trim()),
         existingId: existingInventory.find(e => e.name.toLowerCase() === (item.name || '').toLowerCase().trim())?.id || null,
@@ -20209,7 +20297,17 @@ RULES:
       })),
     };
 
-    console.log(`🧠 Smart import parsed: ${result.inventoryItems.length} inventory, ${result.menuItems.length} menu, ${result.recipes.length} recipes`);
+    // Include supplier info for invoice mode
+    if (isInvoiceMode && parsed.supplierInfo) {
+      result.supplierInfo = {
+        name: (parsed.supplierInfo.name || '').trim(),
+        invoiceNumber: (parsed.supplierInfo.invoiceNumber || '').trim(),
+        date: (parsed.supplierInfo.date || '').trim(),
+        total: parseFloat(parsed.supplierInfo.total) || 0,
+      };
+    }
+
+    console.log(`🧠 Smart import parsed (${isInvoiceMode ? 'invoice' : 'text'}): ${result.inventoryItems.length} inventory, ${result.menuItems.length} menu, ${result.recipes.length} recipes`);
 
     res.json({ success: true, data: result });
 
@@ -20223,7 +20321,7 @@ app.post('/api/inventory/:restaurantId/smart-import/confirm', authenticateToken,
   try {
     const { restaurantId } = req.params;
     const { userId, role } = req.user;
-    const { inventoryItems = [], menuCategories = [], menuItems = [], recipes = [] } = req.body;
+    const { inventoryItems = [], menuCategories = [], menuItems = [], recipes = [], supplierInfo } = req.body;
 
     if (!inventoryItems.length && !menuItems.length && !recipes.length) {
       return res.status(400).json({ error: 'Nothing to import' });
@@ -20246,22 +20344,81 @@ app.post('/api/inventory/:restaurantId/smart-import/confirm', authenticateToken,
       if (item.isDuplicate || !item.isNew) {
         // Use existing item's ID
         if (item.existingId) inventoryMap[item.name.toLowerCase()] = item.existingId;
+        // If invoice mode and item has quantity, update existing item's stock
+        const addQty = parseFloat(item.quantity) || 0;
+        if (addQty > 0 && item.existingId) {
+          try {
+            const existDoc = await db.collection(collections.inventory).doc(item.existingId).get();
+            if (existDoc.exists) {
+              const existData = existDoc.data();
+              const oldStock = existData.currentStock || 0;
+              const newStock = oldStock + addQty;
+              const newCostPerUnit = parseFloat(item.costPerUnit) || existData.costPerUnit || 0;
+              const prevCostPerUnit = existData.costPerUnit || 0;
+              await db.collection(collections.inventory).doc(item.existingId).update({
+                currentStock: newStock,
+                costPerUnit: newCostPerUnit,
+                supplier: supplierInfo?.name || existData.supplier || '',
+                updatedAt: new Date(),
+                updatedBy: userId,
+              });
+              // Create stock batch for FIFO tracking
+              await db.collection(collections.stockBatches).add({
+                restaurantId,
+                inventoryItemId: item.existingId,
+                inventoryItemName: existData.name,
+                quantity: addQty,
+                remainingQty: addQty,
+                unit: existData.unit || item.unit || '',
+                costPerUnit: newCostPerUnit,
+                supplier: supplierInfo?.name || '',
+                addedBy: userId,
+                source: 'smart-import',
+                status: 'active',
+                createdAt: new Date(),
+                updatedAt: new Date()
+              });
+              // Log transaction with price info
+              await db.collection(collections.inventoryTransactions).add({
+                restaurantId,
+                inventoryItemId: item.existingId,
+                inventoryItemName: existData.name,
+                type: 'ADDITION',
+                source: 'SMART_IMPORT',
+                quantityChange: addQty,
+                previousStock: oldStock,
+                newStock: newStock,
+                unit: existData.unit || item.unit || '',
+                costPerUnit: newCostPerUnit,
+                previousCostPerUnit: prevCostPerUnit,
+                totalCost: addQty * newCostPerUnit,
+                date: new Date(),
+                performedBy: userId,
+                notes: supplierInfo?.name ? `Smart import from ${supplierInfo.name}` : 'Smart import stock addition'
+              });
+              summary.inventoryItems++;
+            }
+          } catch (e) {
+            errors.push(`Failed to update stock for ${item.name}: ${e.message}`);
+          }
+        }
         continue;
       }
       try {
         // Check if already exists (safety check)
         if (inventoryMap[item.name.toLowerCase()]) continue;
 
+        const importedQty = parseFloat(item.quantity) || 0;
         const itemData = {
           restaurantId,
           name: item.name.trim(),
           category: item.category.trim(),
           unit: item.unit.trim(),
-          currentStock: 0,
+          currentStock: importedQty,
           minStock: 0,
           maxStock: 0,
           costPerUnit: parseFloat(item.costPerUnit) || 0,
-          supplier: '',
+          supplier: supplierInfo?.name || '',
           description: '',
           barcode: '',
           expiryDate: null,
@@ -20277,6 +20434,44 @@ app.post('/api/inventory/:restaurantId/smart-import/confirm', authenticateToken,
 
         const ref = await db.collection(collections.inventory).add(itemData);
         inventoryMap[item.name.toLowerCase()] = ref.id;
+
+        // Create initial stock batch if quantity > 0
+        if (importedQty > 0) {
+          await db.collection(collections.stockBatches).add({
+            restaurantId,
+            inventoryItemId: ref.id,
+            inventoryItemName: item.name.trim(),
+            quantity: importedQty,
+            remainingQty: importedQty,
+            unit: item.unit.trim(),
+            costPerUnit: parseFloat(item.costPerUnit) || 0,
+            supplier: supplierInfo?.name || '',
+            addedBy: userId,
+            source: 'smart-import',
+            status: 'active',
+            createdAt: new Date(),
+            updatedAt: new Date()
+          });
+          // Log initial stock transaction
+          await db.collection(collections.inventoryTransactions).add({
+            restaurantId,
+            inventoryItemId: ref.id,
+            inventoryItemName: item.name.trim(),
+            type: 'ADDITION',
+            source: 'SMART_IMPORT',
+            quantityChange: importedQty,
+            previousStock: 0,
+            newStock: importedQty,
+            unit: item.unit.trim(),
+            costPerUnit: parseFloat(item.costPerUnit) || 0,
+            previousCostPerUnit: 0,
+            totalCost: importedQty * (parseFloat(item.costPerUnit) || 0),
+            date: new Date(),
+            performedBy: userId,
+            notes: supplierInfo?.name ? `Smart import from ${supplierInfo.name}` : 'Initial stock from smart import'
+          });
+        }
+
         summary.inventoryItems++;
       } catch (e) {
         errors.push(`Inventory "${item.name}": ${e.message}`);
@@ -20660,6 +20855,100 @@ Example: {"steps": ["Boil water in a saucepan over medium heat.", "Add tea leave
   } catch (error) {
     console.error('Generate recipe steps error:', error);
     res.status(500).json({ error: 'Failed to generate recipe steps' });
+  }
+});
+
+// Generate full recipe with AI
+app.post('/api/recipes/:restaurantId/generate-full', authenticateToken, aiUsageLimiter.middleware(), async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+    const { name, servings: requestedServings } = req.body;
+
+    if (!name) {
+      return res.status(400).json({ error: 'Recipe name is required' });
+    }
+
+    const servingsCount = parseInt(requestedServings) || 4;
+
+    // Load existing inventory items for ingredient matching
+    const inventorySnap = await db.collection(collections.inventory)
+      .where('restaurantId', '==', restaurantId).get();
+    const existingItems = [];
+    inventorySnap.forEach(doc => existingItems.push({ id: doc.id, name: doc.data().name, unit: doc.data().unit }));
+
+    const inventoryContext = existingItems.length > 0
+      ? `\nAvailable inventory items (use these exact names for ingredients when they match):\n${existingItems.map(i => `- ${i.name} (${i.unit})`).join('\n')}`
+      : '';
+
+    const prompt = `Generate a complete restaurant recipe for: "${name}" for ${servingsCount} servings/people.
+${inventoryContext}
+
+IMPORTANT: Calculate ingredient quantities accurately for exactly ${servingsCount} servings. Use realistic restaurant-standard quantities.
+
+Return a JSON object with this exact structure:
+{
+  "category": "Main Course",
+  "servings": ${servingsCount},
+  "prepTime": 15,
+  "cookTime": 30,
+  "description": "A brief 1-2 sentence description of the dish.",
+  "ingredients": [
+    { "itemName": "Paneer", "quantity": 250, "unit": "g" },
+    { "itemName": "Butter", "quantity": 50, "unit": "g" }
+  ],
+  "instructions": [
+    "Step 1 description.",
+    "Step 2 description.",
+    "Step 3 description."
+  ]
+}
+
+RULES:
+1. Category must be one of: Main Course, Starter, Appetizer, Dessert, Beverage, Snack, Bread, Side Dish, Soup, Salad, Breakfast, Rice & Biryani, Curry, Chinese, South Indian.
+2. Use existing inventory items by EXACT name where they match.
+3. All ingredient quantities MUST be calculated for ${servingsCount} servings. Be precise — e.g. 250g paneer for 4 people, scale accordingly.
+4. Use standard Indian restaurant quantities — use g, kg, ml, L, pcs, tsp, tbsp as units.
+5. Generate 4-8 clear, concise cooking instructions.
+6. Prep time and cook time should be realistic (in minutes).
+7. Description should mention the servings count and be appetizing.
+8. Return valid JSON only — no markdown or explanation.`;
+
+    const response = await openai.chat.completions.create({
+      model: 'gpt-4o-mini',
+      messages: [{ role: 'user', content: prompt }],
+      temperature: 0.5,
+      max_tokens: 1000,
+      response_format: { type: 'json_object' },
+    });
+
+    const content = response.choices[0]?.message?.content || '{}';
+    let parsed;
+    try {
+      parsed = JSON.parse(content);
+    } catch {
+      return res.status(500).json({ error: 'AI returned invalid response. Please try again.' });
+    }
+
+    // Validate and clean up response
+    const result = {
+      category: (parsed.category || 'Main Course').trim(),
+      servings: parseInt(parsed.servings) || 4,
+      prepTime: parseInt(parsed.prepTime) || 0,
+      cookTime: parseInt(parsed.cookTime) || 0,
+      description: (parsed.description || '').trim(),
+      ingredients: (parsed.ingredients || []).map(ing => ({
+        itemName: (ing.itemName || ing.name || '').trim(),
+        quantity: parseFloat(ing.quantity || ing.qty) || 0,
+        unit: (ing.unit || 'g').trim(),
+      })),
+      instructions: Array.isArray(parsed.instructions) ? parsed.instructions :
+                    Array.isArray(parsed.steps) ? parsed.steps : [],
+    };
+
+    res.json(result);
+  } catch (error) {
+    console.error('Generate full recipe error:', error);
+    res.status(500).json({ error: 'Failed to generate recipe' });
   }
 });
 
