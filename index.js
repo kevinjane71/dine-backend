@@ -23671,6 +23671,42 @@ app.delete('/api/books/:restaurantId/expenses/:expenseId', authenticateToken, as
   }
 });
 
+// --- Expense Categories (custom) ---
+app.get('/api/books/:restaurantId/expense-categories', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+    const doc = await db.collection(collections.restaurantSettings).doc(`${restaurantId}_expenseCategories`).get();
+    const categories = doc.exists ? (doc.data().categories || []) : [];
+    res.json({ success: true, categories });
+  } catch (error) {
+    console.error('Get expense categories error:', error);
+    res.status(500).json({ error: 'Failed to get expense categories' });
+  }
+});
+
+app.put('/api/books/:restaurantId/expense-categories', authenticateToken, async (req, res) => {
+  try {
+    const { role } = req.user;
+    if (role !== 'owner' && role !== 'admin' && role !== 'manager') {
+      return res.status(403).json({ error: 'Access denied' });
+    }
+    const { restaurantId } = req.params;
+    const { categories } = req.body; // [{ value: 'transport', label: 'Transport', color: '#...' }, ...]
+    if (!Array.isArray(categories)) {
+      return res.status(400).json({ error: 'categories must be an array' });
+    }
+    await db.collection(collections.restaurantSettings).doc(`${restaurantId}_expenseCategories`).set({
+      restaurantId,
+      categories,
+      updatedAt: new Date().toISOString(),
+    }, { merge: true });
+    res.json({ success: true, categories });
+  } catch (error) {
+    console.error('Save expense categories error:', error);
+    res.status(500).json({ error: 'Failed to save expense categories' });
+  }
+});
+
 // --- Supplier Dues ---
 app.get('/api/books/:restaurantId/supplier-dues', authenticateToken, async (req, res) => {
   try {
