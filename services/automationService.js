@@ -391,6 +391,14 @@ class AutomationService {
    */
   async sendOrderConfirmationMessage(restaurantId, order) {
     try {
+      // Check if WhatsApp billing is enabled for this restaurant
+      const restDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
+      const bSettings = restDoc.exists ? (restDoc.data().billingSettings || {}) : {};
+      if (!bSettings.whatsappBillingEnabled) {
+        console.log('📱 WhatsApp billing not enabled, skipping order confirmation');
+        return { success: false, error: 'WhatsApp billing not enabled' };
+      }
+
       // Get customer phone from order
       const phone = order.customerInfo?.phone || order.customerDisplay?.phone || order.customer?.phone;
       if (!phone) {

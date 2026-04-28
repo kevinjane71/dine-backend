@@ -9333,6 +9333,90 @@ app.post('/api/orders', async (req, res) => {
       }).catch(err => console.error('Billing print Pusher notification error (non-blocking):', err));
     }
 
+    // Generate shareToken and send WhatsApp bill_notification for direct billing (order created as completed)
+    if (orderData.status === 'completed') {
+      const crypto = require('crypto');
+      const shareToken = crypto.randomBytes(16).toString('hex');
+      orderRef.update({ shareToken }).catch(err => console.error('ShareToken update error:', err));
+
+      // Fire-and-forget: send bill_notification template on WhatsApp
+      (async () => {
+        try {
+          const bSettings = restaurantData.billingSettings || {};
+          if (!bSettings.whatsappBillingEnabled) return;
+
+          const waSnap = await db.collection(collections.automationSettings)
+            .where('restaurantId', '==', restaurantId)
+            .where('type', '==', 'whatsapp')
+            .where('connected', '==', true)
+            .limit(1).get();
+          if (waSnap.empty) return;
+
+          const custPhone = orderData.customerInfo?.phone || orderData.customerInfo?.mobile;
+          if (!custPhone) return;
+
+          // Check customer opt-out
+          const normPhone = custPhone.replace(/[\s\-\(\)\+]/g, '').replace(/^(\+?91)/, '').slice(-10);
+          const custSnap = await db.collection(collections.customers)
+            .where('restaurantId', '==', restaurantId)
+            .where('phone', '==', normPhone)
+            .limit(1).get();
+          if (!custSnap.empty && custSnap.docs[0].data().whatsappBillEnabled === false) return;
+
+          const customerName = orderData.customerInfo?.name || 'Customer';
+          const billTotal = Number(orderData.finalAmount || 0).toFixed(2);
+          const orderNum = String(dailyOrderId || orderNumber || orderRef.id.slice(-6));
+          const baseUrl = process.env.FRONTEND_URL || 'https://www.dineopen.com';
+          const billUrl = `${baseUrl}/bill/${shareToken}`;
+
+          const waSettings = waSnap.docs[0].data();
+          const credentials = waSettings.mode === 'dineopen' ? {
+            accessToken: process.env.DINEOPEN_WHATSAPP_ACCESS_TOKEN,
+            phoneNumberId: waSettings.phoneNumberId || process.env.DINEOPEN_WHATSAPP_PHONE_NUMBER_ID,
+            businessAccountId: process.env.DINEOPEN_WHATSAPP_BUSINESS_ACCOUNT_ID
+          } : {
+            accessToken: waSettings.accessToken,
+            phoneNumberId: waSettings.phoneNumberId || process.env.DINEOPEN_WHATSAPP_PHONE_NUMBER_ID,
+            businessAccountId: waSettings.businessAccountId
+          };
+
+          const whatsappSvc = require('./services/whatsappService');
+          await whatsappSvc.initialize(restaurantId, credentials);
+          const formatted = custPhone.replace(/[\s\-\(\)\+]/g, '');
+
+          const templateParams = [
+            customerName,
+            orderNum,
+            String(billTotal),
+            billUrl,
+          ];
+
+          let result;
+          try {
+            result = await whatsappSvc.sendTemplateMessage(formatted, 'bill_notification', 'en', templateParams);
+          } catch (templateErr) {
+            console.warn('📱 Template send failed, falling back to text:', templateErr.message);
+            const currencySymbol = restaurantData.currencySymbol || '₹';
+            const message = `Dear ${customerName},\n\nYour bill for Order #${orderNum} is ready.\n\n💰 Amount: *${currencySymbol}${billTotal}*\n\n🔗 View Invoice: ${billUrl}\n\nThank you for choosing ${restaurantData.name || 'us'}! 🙏`;
+            result = await whatsappSvc.sendTextMessage(formatted, message);
+          }
+
+          await db.collection(collections.automationLogs).add({
+            restaurantId, type: 'whatsapp_bill',
+            phone: formatted, customerName,
+            message: `Bill #${orderNum} - ${billTotal} - ${billUrl}`,
+            messageId: result?.messageId || null,
+            orderId: orderRef.id, amount: orderData.finalAmount,
+            direction: 'outgoing', status: result?.success ? 'sent' : 'failed',
+            timestamp: new Date()
+          });
+          console.log(`📱 WhatsApp bill sent for direct billing order ${orderRef.id}`);
+        } catch (err) {
+          console.error('📱 WhatsApp bill error (direct billing, non-blocking):', err.message);
+        }
+      })();
+    }
+
     res.status(201).json({
       message: 'Order created successfully',
       order: {
