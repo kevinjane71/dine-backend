@@ -93,6 +93,13 @@ function buildInvoiceData(orderId, order, restaurant, restaurantId) {
     restaurantEmail: restaurant.email || '',
     restaurantGstin: restaurant.gstin || '',
     restaurantFssai: restaurant.fssai || '',
+    restaurantVatNumber: restaurant.vatNumber || '',
+    restaurantTaxId: restaurant.taxId || '',
+    restaurantBusinessRegistrationNumber: restaurant.businessRegistrationNumber || '',
+    showFssaiOnInvoice: restaurant.showFssaiOnInvoice === true,
+    showTaxIdOnInvoice: restaurant.showTaxIdOnInvoice === true,
+    showGstOnInvoice: restaurant.showGstOnInvoice === true,
+    countryCode: restaurant.currencySettings?.countryCode || restaurant.countryCode || 'IN',
     customerName: order.customerInfo?.name || 'Valued Customer',
     customerPhone: order.customerInfo?.phone || '',
     tableNumber: order.tableNumber || '',
@@ -175,8 +182,11 @@ function generateInvoiceEmailHtml(inv) {
           <p style="margin:0;font-size:15px;font-weight:700;color:#1f2937;">${inv.restaurantName}</p>
           ${inv.restaurantAddress ? `<p style="margin:2px 0 0;font-size:12px;color:#6b7280;">${inv.restaurantAddress}</p>` : ''}
           ${inv.restaurantPhone ? `<p style="margin:2px 0 0;font-size:12px;color:#6b7280;">Tel: ${inv.restaurantPhone}</p>` : ''}
-          ${inv.restaurantGstin ? `<p style="margin:2px 0 0;font-size:12px;color:#6b7280;">GSTIN: ${inv.restaurantGstin}</p>` : ''}
-          ${inv.restaurantFssai ? `<p style="margin:2px 0 0;font-size:12px;color:#6b7280;">FSSAI: ${inv.restaurantFssai}</p>` : ''}
+          ${inv.showGstOnInvoice && inv.restaurantGstin ? `<p style="margin:2px 0 0;font-size:12px;color:#6b7280;">GSTIN: ${inv.restaurantGstin}</p>` : ''}
+          ${inv.showFssaiOnInvoice && inv.restaurantFssai ? `<p style="margin:2px 0 0;font-size:12px;color:#6b7280;">FSSAI: ${inv.restaurantFssai}</p>` : ''}
+          ${inv.showTaxIdOnInvoice && inv.restaurantVatNumber ? `<p style="margin:2px 0 0;font-size:12px;color:#6b7280;">${inv.countryCode === 'AE' || inv.countryCode === 'SA' ? 'TRN' : inv.countryCode === 'CA' ? 'GST/HST' : 'VAT'}: ${inv.restaurantVatNumber}</p>` : ''}
+          ${inv.showTaxIdOnInvoice && inv.restaurantTaxId ? `<p style="margin:2px 0 0;font-size:12px;color:#6b7280;">${inv.countryCode === 'AU' ? 'ABN' : 'Tax ID'}: ${inv.restaurantTaxId}</p>` : ''}
+          ${inv.showTaxIdOnInvoice && inv.restaurantBusinessRegistrationNumber ? `<p style="margin:2px 0 0;font-size:12px;color:#6b7280;">Reg No: ${inv.restaurantBusinessRegistrationNumber}</p>` : ''}
         </div>
         <div style="text-align:right;">
           <p style="margin:0;font-size:12px;color:#9ca3af;">Order #</p>
@@ -343,8 +353,11 @@ function generateInvoiceAttachmentHtml(inv) {
     <h1>${inv.restaurantName}</h1>
     ${inv.restaurantAddress ? `<p>${inv.restaurantAddress}</p>` : ''}
     ${inv.restaurantPhone ? `<p>Tel: ${inv.restaurantPhone}</p>` : ''}
-    ${inv.restaurantGstin ? `<p>GSTIN: ${inv.restaurantGstin}</p>` : ''}
-    ${inv.restaurantFssai ? `<p>FSSAI: ${inv.restaurantFssai}</p>` : ''}
+    ${inv.showGstOnInvoice && inv.restaurantGstin ? `<p>GSTIN: ${inv.restaurantGstin}</p>` : ''}
+    ${inv.showFssaiOnInvoice && inv.restaurantFssai ? `<p>FSSAI: ${inv.restaurantFssai}</p>` : ''}
+    ${inv.showTaxIdOnInvoice && inv.restaurantVatNumber ? `<p>${inv.countryCode === 'AE' || inv.countryCode === 'SA' ? 'TRN' : inv.countryCode === 'CA' ? 'GST/HST' : 'VAT'}: ${inv.restaurantVatNumber}</p>` : ''}
+    ${inv.showTaxIdOnInvoice && inv.restaurantTaxId ? `<p>${inv.countryCode === 'AU' ? 'ABN' : 'Tax ID'}: ${inv.restaurantTaxId}</p>` : ''}
+    ${inv.showTaxIdOnInvoice && inv.restaurantBusinessRegistrationNumber ? `<p>Reg No: ${inv.restaurantBusinessRegistrationNumber}</p>` : ''}
   </div>
 
   <div class="info-row">

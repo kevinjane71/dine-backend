@@ -13630,11 +13630,24 @@ app.get('/api/floors/:restaurantId', async (req, res) => {
       floors.push({
         id: floorDoc.id,
         name: floorData.name,
+        description: floorData.description || '',
+        section: floorData.section || null,
+        areaChargeType: floorData.areaChargeType || 'none',
+        areaChargeValue: floorData.areaChargeValue || 0,
+        order: floorData.order !== undefined ? floorData.order : Infinity,
         restaurantId,
         tables: tables
       });
     }
-    
+
+    // Sort floors by order field (ascending), floors without order go last
+    floors.sort((a, b) => {
+      if (a.order === Infinity && b.order === Infinity) return 0;
+      if (a.order === Infinity) return 1;
+      if (b.order === Infinity) return -1;
+      return a.order - b.order;
+    });
+
     // If no floors exist, create default floor structure
     if (floors.length === 0) {
       console.log(`🔄 No floors found, creating default "Ground Floor" for restaurant ${restaurantId}`);
@@ -13815,6 +13828,35 @@ app.patch('/api/floors/:floorId', authenticateToken, async (req, res) => {
   } catch (error) {
     console.error('Update floor error:', error);
     res.status(500).json({ error: 'Failed to update floor' });
+  }
+});
+
+// Reorder floors
+app.patch('/api/floors/reorder/:restaurantId', authenticateToken, async (req, res) => {
+  try {
+    if (!(await checkFeaturePermission(req, 'tables', 'update'))) {
+      return res.status(403).json({ error: 'Access denied. Tables update permission required.' });
+    }
+
+    const { restaurantId } = req.params;
+    const { floorOrder } = req.body;
+
+    if (!Array.isArray(floorOrder) || floorOrder.length === 0) {
+      return res.status(400).json({ error: 'floorOrder array is required' });
+    }
+
+    const batch = db.batch();
+    floorOrder.forEach((floorId, index) => {
+      const floorRef = db.collection('restaurants').doc(restaurantId).collection('floors').doc(floorId);
+      batch.update(floorRef, { order: index, updatedAt: new Date() });
+    });
+
+    await batch.commit();
+    res.json({ message: 'Floor order updated successfully' });
+
+  } catch (error) {
+    console.error('Reorder floors error:', error);
+    res.status(500).json({ error: 'Failed to reorder floors' });
   }
 });
 
@@ -15531,8 +15573,15 @@ app.get('/api/admin/business/:restaurantId', authenticateToken, async (req, res)
       businessSettings: {
         legalBusinessName: restaurant.legalBusinessName || '',
         gstin: restaurant.gstin || '',
+        fssai: restaurant.fssai || '',
         address: restaurant.address || '',
-        showGstOnInvoice: restaurant.showGstOnInvoice === true, // Default false
+        showGstOnInvoice: restaurant.showGstOnInvoice === true,
+        showFssaiOnInvoice: restaurant.showFssaiOnInvoice === true,
+        // International tax/identity fields
+        vatNumber: restaurant.vatNumber || '',
+        taxId: restaurant.taxId || '',
+        businessRegistrationNumber: restaurant.businessRegistrationNumber || '',
+        showTaxIdOnInvoice: restaurant.showTaxIdOnInvoice === true,
       }
     });
 
@@ -15547,7 +15596,7 @@ app.put('/api/admin/business/:restaurantId', authenticateToken, async (req, res)
   try {
     const { restaurantId } = req.params;
     const userId = req.user.userId;
-    const { legalBusinessName, gstin, showGstOnInvoice } = req.body;
+    const { legalBusinessName, gstin, fssai, showGstOnInvoice, showFssaiOnInvoice, vatNumber, taxId, businessRegistrationNumber, showTaxIdOnInvoice } = req.body;
 
     console.log(`📊 Updating business settings for restaurant: ${restaurantId}, userId: ${userId}`);
 
@@ -15616,8 +15665,27 @@ app.put('/api/admin/business/:restaurantId', authenticateToken, async (req, res)
     if (gstin !== undefined) {
       updateData.gstin = gstin.trim().toUpperCase();
     }
+    if (fssai !== undefined) {
+      updateData.fssai = fssai.trim();
+    }
     if (showGstOnInvoice !== undefined) {
       updateData.showGstOnInvoice = showGstOnInvoice === true;
+    }
+    if (showFssaiOnInvoice !== undefined) {
+      updateData.showFssaiOnInvoice = showFssaiOnInvoice === true;
+    }
+    // International fields
+    if (vatNumber !== undefined) {
+      updateData.vatNumber = vatNumber.trim().toUpperCase();
+    }
+    if (taxId !== undefined) {
+      updateData.taxId = taxId.trim();
+    }
+    if (businessRegistrationNumber !== undefined) {
+      updateData.businessRegistrationNumber = businessRegistrationNumber.trim();
+    }
+    if (showTaxIdOnInvoice !== undefined) {
+      updateData.showTaxIdOnInvoice = showTaxIdOnInvoice === true;
     }
 
     await restaurantRef.update(updateData);
@@ -15628,11 +15696,6 @@ app.put('/api/admin/business/:restaurantId', authenticateToken, async (req, res)
     res.json({
       success: true,
       message: 'Business settings updated successfully',
-      businessSettings: {
-        legalBusinessName: updateData.legalBusinessName || '',
-        gstin: updateData.gstin || '',
-        showGstOnInvoice: updateData.showGstOnInvoice === true,
-      }
     });
 
   } catch (error) {
@@ -16798,6 +16861,13 @@ const buildRestaurantBlock = (restaurantId, data) => ({
   gstin: data.gstin || '',
   fssai: data.fssai || '',
   showGstOnInvoice: data.showGstOnInvoice === true,
+  showFssaiOnInvoice: data.showFssaiOnInvoice === true,
+  // International identity fields
+  vatNumber: data.vatNumber || '',
+  taxId: data.taxId || '',
+  businessRegistrationNumber: data.businessRegistrationNumber || '',
+  showTaxIdOnInvoice: data.showTaxIdOnInvoice === true,
+  countryCode: data.currencySettings?.countryCode || data.countryCode || 'IN',
   businessType: data.businessType || 'restaurant',
   cuisine: data.cuisine || '',
   logo: data.logo || '',
@@ -16872,9 +16942,19 @@ const assembleBillRenderPayload = (orderId, orderData, restaurantId, restaurantD
     orderNumber: orderData.orderNumber || null,
     restaurantId,
     restaurantName: restaurant.name,
+    restaurantLegalName: restaurant.legalBusinessName || '',
     restaurantAddress: restaurant.address,
     restaurantPhone: restaurant.phone,
     restaurantEmail: restaurant.email,
+    gstin: restaurant.gstin || '',
+    fssai: restaurant.fssai || '',
+    showGstOnInvoice: restaurant.showGstOnInvoice === true,
+    showFssaiOnInvoice: restaurant.showFssaiOnInvoice === true,
+    vatNumber: restaurant.vatNumber || '',
+    taxId: restaurant.taxId || '',
+    businessRegistrationNumber: restaurant.businessRegistrationNumber || '',
+    showTaxIdOnInvoice: restaurant.showTaxIdOnInvoice === true,
+    countryCode: restaurant.countryCode || 'IN',
     customerName: orderData.customerInfo?.name || orderData.customerName || 'Walk-in Customer',
     customerPhone: orderData.customerInfo?.phone || orderData.customerMobile || '',
     customerEmail: orderData.customerInfo?.email || '',
@@ -28714,16 +28794,25 @@ app.post('/api/automation/:restaurantId/whatsapp/send-bill', authenticateToken, 
 
     await whatsappService.initialize(restaurantId, credentials);
 
-    // Build bill message
-    const billMessage = invoiceText ||
-      `🧾 *Bill from ${restaurantName || 'Restaurant'}*\n\n` +
-      (customerName ? `Customer: ${customerName}\n` : '') +
-      (orderId ? `Order: #${orderId}\n` : '') +
-      `*Total: ₹${Number(amount || 0).toFixed(2)}*\n\n` +
-      `Thank you for dining with us! 🙏\n\n` +
-      `_Powered by DineOpen_`;
+    // Send bill using approved template (works outside 24h window)
+    // Template: bill_notification — {{1}}=name, {{2}}=orderId, {{3}}=amount, {{4}}=billUrl
+    const billUrl = orderId ? `https://dineopen.com/bill/${orderId}` : 'https://dineopen.com';
+    const templateParams = [
+      customerName || 'Customer',
+      String(orderId || ''),
+      String(Number(amount || 0).toFixed(2)),
+      billUrl
+    ];
 
-    const sendResult = await whatsappService.sendTextMessage(customerPhone, billMessage);
+    const sendResult = await whatsappService.sendTemplateMessage(
+      customerPhone,
+      'bill_notification',
+      'en',
+      templateParams
+    );
+
+    // Fallback text for logging
+    const billMessage = `Hi ${customerName || 'Customer'}, Your bill for Order #${orderId || ''} is ready. Amount: ₹${Number(amount || 0).toFixed(2)}. View: ${billUrl}`;
 
     if (sendResult.success) {
       // Log the sent bill
