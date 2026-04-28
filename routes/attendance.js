@@ -2,6 +2,7 @@ const express = require('express');
 const router = express.Router();
 const { db } = require('../firebase');
 const { authenticateToken } = require('../middleware/auth');
+const pusherService = require('../services/pusherService');
 
 router.use(authenticateToken);
 
@@ -144,7 +145,23 @@ router.post('/:restaurantId/clock-in', async (req, res) => {
 
     await db.collection('attendance').doc(docId).set(attendanceData, { merge: true });
 
-    res.json({ id: docId, ...attendanceData });
+    // Check if continuous tracking is enabled for this staff
+    const trackingConfig = leaveConfig.trackingConfig || {};
+    const enabledStaffIds = trackingConfig.enabledStaffIds || [];
+    const enabledRoles = trackingConfig.enabledRoles || [];
+    // Get staff role
+    let staffRole = '';
+    try {
+      const staffDoc = await db.collection('staffUsers').doc(staffId).get();
+      if (staffDoc.exists) staffRole = staffDoc.data().role || '';
+      else {
+        const userDoc = await db.collection('users').doc(staffId).get();
+        if (userDoc.exists) staffRole = userDoc.data().role || '';
+      }
+    } catch (e) { /* ignore */ }
+    const trackingEnabled = enabledStaffIds.includes(staffId) || enabledRoles.includes(staffRole);
+
+    res.json({ id: docId, ...attendanceData, trackingEnabled });
   } catch (err) {
     console.error('Clock-in error:', err);
     res.status(500).json({ error: 'Failed to clock in' });
@@ -206,6 +223,11 @@ router.post('/:restaurantId/clock-out', async (req, res) => {
     };
 
     await db.collection('attendance').doc(docId).update(updateData);
+
+    // Remove from live locations when clocking out
+    try {
+      await db.collection('staffLocations_latest').doc(staffId).delete();
+    } catch (e) { /* ignore if doesn't exist */ }
 
     res.json({ id: docId, ...data, ...updateData });
   } catch (err) {
@@ -792,6 +814,179 @@ router.get('/:restaurantId/payroll-data', async (req, res) => {
   } catch (err) {
     console.error('Payroll data error:', err);
     res.status(500).json({ error: 'Failed to fetch payroll data' });
+  }
+});
+
+// ── 16. POST /:restaurantId/location-ping ────────────────────────
+// Receives periodic GPS pings from mobile app during active shift
+router.post('/:restaurantId/location-ping', async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+    const { staffId, staffName, lat, lng, accuracy, speed, heading, timestamp } = req.body;
+
+    if (!staffId || lat == null || lng == null) {
+      return res.status(400).json({ error: 'staffId, lat, and lng are required' });
+    }
+
+    const now = new Date();
+    const dateStr = (timestamp ? new Date(timestamp) : now).toISOString().split('T')[0];
+    const ts = timestamp || now.toISOString();
+
+    // Store in location history
+    const historyDocId = `${staffId}_${dateStr}_${now.getTime()}`;
+    const locationData = {
+      staffId,
+      staffName: staffName || '',
+      restaurantId,
+      date: dateStr,
+      lat, lng,
+      accuracy: accuracy || null,
+      speed: speed || null,
+      heading: heading || null,
+      timestamp: ts,
+      createdAt: now.toISOString(),
+    };
+    await db.collection('staffLocations').doc(historyDocId).set(locationData);
+
+    // Update latest location (for live map)
+    await db.collection('staffLocations_latest').doc(staffId).set({
+      staffId,
+      staffName: staffName || '',
+      restaurantId,
+      lat, lng,
+      accuracy: accuracy || null,
+      speed: speed || null,
+      heading: heading || null,
+      timestamp: ts,
+      updatedAt: now.toISOString(),
+    });
+
+    // Push real-time update via Pusher
+    try {
+      await pusherService.triggerOrderEvent(restaurantId, 'staff-location-updated', {
+        staffId, staffName: staffName || '', lat, lng, speed, heading,
+      });
+    } catch (e) { /* Pusher failure shouldn't block response */ }
+
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('Location ping error:', err);
+    res.status(500).json({ error: 'Failed to store location ping' });
+  }
+});
+
+// ── 17. GET /:restaurantId/live-locations ────────────────────────
+// Returns latest location of all currently tracked staff (for live map)
+router.get('/:restaurantId/live-locations', async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+    const userRole = req.user?.role;
+
+    if (!isAdminRole(userRole)) {
+      return res.status(403).json({ error: 'Only owner, admin, or manager can view live locations' });
+    }
+
+    const snap = await db.collection('staffLocations_latest')
+      .where('restaurantId', '==', restaurantId)
+      .get();
+
+    const locations = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+
+    res.json({ locations });
+  } catch (err) {
+    console.error('Live locations error:', err);
+    res.status(500).json({ error: 'Failed to fetch live locations' });
+  }
+});
+
+// ── 18. GET /:restaurantId/location-history/:staffId ─────────────
+// Returns full location trail for a staff member on a given date (for route replay)
+router.get('/:restaurantId/location-history/:staffId', async (req, res) => {
+  try {
+    const { restaurantId, staffId } = req.params;
+    const { date } = req.query;
+    const userRole = req.user?.role;
+
+    if (!isAdminRole(userRole)) {
+      return res.status(403).json({ error: 'Only owner, admin, or manager can view location history' });
+    }
+
+    if (!date) {
+      return res.status(400).json({ error: 'date query param is required (YYYY-MM-DD)' });
+    }
+
+    const snap = await db.collection('staffLocations')
+      .where('restaurantId', '==', restaurantId)
+      .where('staffId', '==', staffId)
+      .where('date', '==', date)
+      .orderBy('timestamp', 'asc')
+      .get();
+
+    const locations = snap.docs.map(d => {
+      const data = d.data();
+      return {
+        lat: data.lat,
+        lng: data.lng,
+        accuracy: data.accuracy,
+        speed: data.speed,
+        heading: data.heading,
+        timestamp: data.timestamp,
+      };
+    });
+
+    res.json({ staffId, date, locations, count: locations.length });
+  } catch (err) {
+    console.error('Location history error:', err);
+    res.status(500).json({ error: 'Failed to fetch location history' });
+  }
+});
+
+// ── 19. GET /:restaurantId/tracking-config ───────────────────────
+// Returns which staff/roles have continuous tracking enabled
+router.get('/:restaurantId/tracking-config', async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+    const config = await getLeaveConfig(restaurantId);
+    const trackingConfig = config.trackingConfig || {
+      enabledStaffIds: [],
+      enabledRoles: [],
+    };
+    res.json(trackingConfig);
+  } catch (err) {
+    console.error('Tracking config fetch error:', err);
+    res.status(500).json({ error: 'Failed to fetch tracking config' });
+  }
+});
+
+// ── 20. PUT /:restaurantId/tracking-config ───────────────────────
+// Admin updates which staff/roles should be continuously tracked
+router.put('/:restaurantId/tracking-config', async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+    const userRole = req.user?.role;
+
+    if (!isAdminRole(userRole)) {
+      return res.status(403).json({ error: 'Only owner, admin, or manager can update tracking config' });
+    }
+
+    const { enabledStaffIds, enabledRoles } = req.body;
+
+    const trackingConfig = {
+      enabledStaffIds: enabledStaffIds || [],
+      enabledRoles: enabledRoles || [],
+      updatedAt: new Date().toISOString(),
+      updatedBy: req.user?.userId || req.user?.id,
+    };
+
+    await db.collection('leaveConfig').doc(restaurantId).set(
+      { trackingConfig },
+      { merge: true }
+    );
+
+    res.json(trackingConfig);
+  } catch (err) {
+    console.error('Tracking config update error:', err);
+    res.status(500).json({ error: 'Failed to update tracking config' });
   }
 });
 
