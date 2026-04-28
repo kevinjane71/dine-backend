@@ -906,6 +906,7 @@ const attendanceRoutes = require('./routes/attendance');
 const payrollRoutes = require('./routes/payroll');
 const gstRoutes = require('./routes/gstReports');
 const ledgerRoutes = require('./routes/ledger');
+const spaceBookingRoutes = require('./routes/spaceBooking');
 
 // Debug email service initialization
 console.log('📧 Email service loaded:', !!emailService);
@@ -12219,6 +12220,9 @@ app.use('/api', hotelManagementRoutes);
 // Initialize hotel PMS routes (deprecated - kept for backward compatibility)
 app.use('/api/hotel', hotelRoutes);
 app.use('/api', roomManagementRoutes);
+
+// Initialize space booking routes
+app.use('/api/space-booking', spaceBookingRoutes);
 
 // Initialize shift scheduling routes
 app.use('/api/shift-scheduling', shiftSchedulingRoutes);

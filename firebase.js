@@ -140,7 +140,9 @@ const collections = {
   // Waste Tracking Collections
   wasteEntries: 'wasteEntries',
   stockAudits: 'stockAudits',
-  productionEntries: 'productionEntries'
+  productionEntries: 'productionEntries',
+  // Space Booking Collections
+  spaceBookings: 'spaceBookings'
 };
 
 const admin = null; // We don't need the legacy admin object anymore
