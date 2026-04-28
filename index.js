@@ -10736,18 +10736,6 @@ app.patch('/api/orders/:orderId/status', authenticateToken, async (req, res) => 
           const baseUrl = process.env.FRONTEND_URL || 'https://www.dineopen.com';
           const invoiceLink = shareToken ? `${baseUrl}/bill/${shareToken}` : '';
 
-          let message = `Dear ${customerName},\n\n` +
-            `Thank you for your visit at *${restaurantName}*! Your invoice is ready.\n\n` +
-            `💰 Amount: *${currencySymbol}${totalAmount}*\n` +
-            `🧾 Order: #${orderNum}\n` +
-            `📅 Date: ${dateStr}, ${timeStr}`;
-
-          if (invoiceLink) {
-            message += `\n\n🔗 View Invoice: ${invoiceLink}`;
-          }
-
-          message += `\n\nThank you for choosing ${restaurantName}! 🙏`;
-
           const waSettings = waSnap.docs[0].data();
           const credentials = waSettings.mode === 'dineopen' ? {
             accessToken: process.env.DINEOPEN_WHATSAPP_ACCESS_TOKEN,
@@ -10762,12 +10750,37 @@ app.patch('/api/orders/:orderId/status', authenticateToken, async (req, res) => 
           const whatsappSvc = require('./services/whatsappService');
           await whatsappSvc.initialize(orderData.restaurantId, credentials);
           const formatted = custPhone.replace(/[\s\-\(\)\+]/g, '');
-          const result = await whatsappSvc.sendTextMessage(formatted, message);
 
+          // Use the approved bill_notification template: {{1}}=name, {{2}}=orderId, {{3}}=amount, {{4}}=billUrl
+          const billUrl = shareToken ? `${baseUrl}/bill/${shareToken}` : baseUrl;
+          const templateParams = [
+            customerName || 'Customer',
+            String(orderNum),
+            String(totalAmount),
+            billUrl,
+          ];
+
+          let result;
+          try {
+            result = await whatsappSvc.sendTemplateMessage(formatted, 'bill_notification', 'en', templateParams);
+          } catch (templateErr) {
+            // Fallback to text message if template fails
+            console.warn('📱 Template send failed, falling back to text:', templateErr.message);
+            const message = `Dear ${customerName},\n\n` +
+              `Thank you for your visit at *${restaurantName}*! Your invoice is ready.\n\n` +
+              `💰 Amount: *${currencySymbol}${totalAmount}*\n` +
+              `🧾 Order: #${orderNum}\n` +
+              `📅 Date: ${dateStr}, ${timeStr}` +
+              (invoiceLink ? `\n\n🔗 View Invoice: ${invoiceLink}` : '') +
+              `\n\nThank you for choosing ${restaurantName}! 🙏`;
+            result = await whatsappSvc.sendTextMessage(formatted, message);
+          }
+
+          const logMessage = `Hi ${customerName}, Your bill for Order #${orderNum} is ready. Amount: ${currencySymbol}${totalAmount}. View: ${billUrl}`;
           await db.collection(collections.automationLogs).add({
             restaurantId: orderData.restaurantId, type: 'whatsapp_bill',
             phone: formatted, customerName: customerName,
-            message, messageId: result?.messageId || null,
+            message: logMessage, messageId: result?.messageId || null,
             orderId, amount: orderData.finalAmount || orderData.totalAmount,
             direction: 'outgoing', status: result?.success ? 'sent' : 'failed',
             timestamp: new Date()
@@ -28834,9 +28847,28 @@ app.post('/api/automation/:restaurantId/whatsapp/send-bill', authenticateToken, 
 
     await whatsappService.initialize(restaurantId, credentials);
 
+    // Look up order shareToken for bill link
+    const baseUrl = process.env.FRONTEND_URL || 'https://www.dineopen.com';
+    let billUrl = baseUrl;
+    if (orderId) {
+      // Try to find order by dailyOrderId or doc id to get shareToken
+      let orderSnap = await db.collection(collections.orders)
+        .where('restaurantId', '==', restaurantId)
+        .where('dailyOrderId', '==', Number(orderId) || orderId)
+        .orderBy('createdAt', 'desc')
+        .limit(1).get();
+      if (orderSnap.empty) {
+        orderSnap = await db.collection(collections.orders).doc(orderId).get();
+        if (orderSnap.exists && orderSnap.data().shareToken) {
+          billUrl = `${baseUrl}/bill/${orderSnap.data().shareToken}`;
+        }
+      } else if (orderSnap.docs[0].data().shareToken) {
+        billUrl = `${baseUrl}/bill/${orderSnap.docs[0].data().shareToken}`;
+      }
+    }
+
     // Send bill using approved template (works outside 24h window)
     // Template: bill_notification — {{1}}=name, {{2}}=orderId, {{3}}=amount, {{4}}=billUrl
-    const billUrl = orderId ? `https://dineopen.com/bill/${orderId}` : 'https://dineopen.com';
     const templateParams = [
       customerName || 'Customer',
       String(orderId || ''),

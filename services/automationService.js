@@ -439,17 +439,18 @@ class AutomationService {
       // Format order details
       const orderNumber = order.dailyOrderId || order.orderNumber || order.id?.slice(-6) || 'N/A';
       const orderItems = order.items || [];
-      const totalAmount = order.totalAmount || 0;
+      const totalAmount = order.finalAmount || order.grandTotal || order.totalAmount || 0;
       const tableNumber = order.tableNumber || null;
+      const currencySymbol = restaurantDoc.exists ? (restaurantDoc.data().currencySymbol || '₹') : '₹';
 
       // Build order details text
       let orderDetailsText = '';
       orderItems.forEach((item, index) => {
         const itemName = item.name || 'Item';
         const quantity = item.quantity || 1;
-        const price = item.price || 0;
+        const price = item.finalPrice || item.price || 0;
         const itemTotal = price * quantity;
-        orderDetailsText += `${index + 1}. ${itemName} x${quantity} - ₹${itemTotal}\n`;
+        orderDetailsText += `${index + 1}. ${itemName} x${quantity} - ${currencySymbol}${itemTotal}\n`;
       });
 
       // Build welcome message with order details
@@ -459,7 +460,7 @@ class AutomationService {
         `Order #: ${orderNumber}\n` +
         (tableNumber ? `Table: ${tableNumber}\n` : '') +
         `\nItems:\n${orderDetailsText}\n` +
-        `💰 Total: ₹${totalAmount}\n\n` +
+        `💰 Total: ${currencySymbol}${Number(totalAmount).toFixed(2)}\n\n` +
         `Your order has been confirmed and is being prepared. We'll notify you once it's ready!\n\n` +
         `Thank you for choosing ${restaurantName}! 🙏`;
 
