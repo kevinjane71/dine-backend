@@ -28592,16 +28592,17 @@ app.post('/api/automation/:restaurantId/whatsapp/test', authenticateToken, async
 
     // Send message
     let sendResult;
-    if (templateName && message) {
-      // Send as template message
+    if (templateName) {
+      // Send as template message (works outside 24h window)
+      const params = message ? [message] : [];
       sendResult = await whatsappService.sendTemplateMessage(
         phoneNumber,
         templateName,
         templateLanguage || 'en_US',
-        [message] // Use message as template parameter
+        params
       );
     } else if (message) {
-      // Send as text message
+      // Send as text message (only within 24h window)
       sendResult = await whatsappService.sendTextMessage(phoneNumber, message);
     } else {
       return res.status(400).json({ error: 'Message or template name is required' });
