@@ -377,11 +377,20 @@ router.get('/analytics', authenticateToken, requireOwnerRole, async (req, res) =
       });
     });
 
-    // Calculate revenue by day
+    // Calculate revenue by day (or by hour for "today")
+    const isToday = period === 'today';
     const revenueByDay = {};
     allOrders.forEach(order => {
       const orderDate = order.createdAt?.toDate ? order.createdAt.toDate() : new Date(order.createdAt);
-      const dateKey = orderDate.toISOString().split('T')[0];
+      let dateKey;
+      if (isToday) {
+        // Group by hour — use ISO string with hour to keep sortable
+        const hour = orderDate.getHours();
+        const dayStr = orderDate.toISOString().split('T')[0];
+        dateKey = `${dayStr}T${String(hour).padStart(2, '0')}:00:00`;
+      } else {
+        dateKey = orderDate.toISOString().split('T')[0];
+      }
       if (!revenueByDay[dateKey]) {
         revenueByDay[dateKey] = { date: dateKey, revenue: 0, orders: 0 };
       }
