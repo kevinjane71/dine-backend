@@ -11,7 +11,7 @@ const { FieldValue } = require('firebase-admin/firestore');
  * - Professional: 1000 credits/month
  * - Enterprise: 2000 credits/month
  * 
- * Resets automatically when month changes
+ * Resets automatically when month changes dd
  */
 class AIUsageLimiter {
   constructor() {
