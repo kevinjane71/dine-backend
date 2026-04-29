@@ -7180,12 +7180,33 @@ app.patch('/api/menus/item/:id', authenticateToken, async (req, res) => {
     });
     invalidateRestaurantCache(foundRestaurant.id);
 
-    // AUTO-LINK to inventory if stock tracking enabled or stock changed
+    // AUTO-LINK/UNLINK inventory when stock tracking changes
     const updatedMenuItem = updatedItems.find(i => i.id === id);
-    if (updatedMenuItem && (updateData.isStockManaged || updateData.stockQuantity !== undefined)) {
+    if (updatedMenuItem && (updateData.isStockManaged !== undefined || updateData.stockQuantity !== undefined)) {
       if (updatedMenuItem.isStockManaged) {
+        // Stock tracking enabled → link to inventory
         linkMenuItemToInventory(foundRestaurant.id, updatedMenuItem, req.user.uid)
           .catch(err => console.error('Menu→Inventory link error:', err));
+      } else if (foundItem.isStockManaged && updateData.isStockManaged === false) {
+        // Stock tracking was ON, now turned OFF → unlink inventory item
+        (async () => {
+          try {
+            const linkedSnap = await db.collection(collections.inventory)
+              .where('restaurantId', '==', foundRestaurant.id)
+              .where('linkedMenuItemId', '==', id)
+              .get();
+            if (!linkedSnap.empty) {
+              const batch = db.batch();
+              linkedSnap.forEach(doc => {
+                batch.update(doc.ref, { linkedMenuItemId: null, linkedMenuItemName: null, updatedAt: new Date() });
+              });
+              await batch.commit();
+              console.log(`🔓 Unlinked ${linkedSnap.size} inventory item(s) from menu item ${id} (stock tracking disabled)`);
+            }
+          } catch (err) {
+            console.error('Menu→Inventory unlink error:', err);
+          }
+        })();
       }
     }
 
@@ -7408,6 +7429,28 @@ app.delete('/api/menus/item/:id', authenticateToken, async (req, res) => {
       }
     });
     invalidateRestaurantCache(foundRestaurant.id);
+
+    // Unlink any linked inventory items (fire-and-forget)
+    if (foundItem.isStockManaged) {
+      (async () => {
+        try {
+          const linkedSnap = await db.collection(collections.inventory)
+            .where('restaurantId', '==', foundRestaurant.id)
+            .where('linkedMenuItemId', '==', id)
+            .get();
+          if (!linkedSnap.empty) {
+            const batch = db.batch();
+            linkedSnap.forEach(doc => {
+              batch.update(doc.ref, { linkedMenuItemId: null, linkedMenuItemName: null, updatedAt: new Date() });
+            });
+            await batch.commit();
+            console.log(`🔓 Unlinked ${linkedSnap.size} inventory item(s) from deleted menu item ${id}`);
+          }
+        } catch (err) {
+          console.error('Menu delete→Inventory unlink error:', err);
+        }
+      })();
+    }
 
     res.json({
       message: 'Menu item deleted successfully',
@@ -21023,15 +21066,19 @@ app.post('/api/recipes/:restaurantId', authenticateToken, async (req, res) => {
       return res.status(400).json({ error: 'Recipe name and ingredients are required' });
     }
 
+    const { menuItemId, menuItemName } = req.body;
+
     const recipeData = {
       restaurantId,
       name: name.trim(),
       description: description?.trim() || '',
       ingredients: ingredients.map(ing => ({
-        inventoryItemId: ing.inventoryItemId,
-        inventoryItemName: ing.inventoryItemName,
+        inventoryItemId: ing.inventoryItemId || null,
+        inventoryItemName: ing.inventoryItemName || '',
         quantity: parseFloat(ing.quantity) || 0,
-        unit: ing.unit || 'g'
+        unit: ing.unit || 'g',
+        type: ing.type || 'inventory',
+        subRecipeId: ing.subRecipeId || null,
       })),
       instructions: Array.isArray(instructions) ? instructions.filter(s => typeof s === 'string' && s.trim()).map(s => s.trim()) : (typeof instructions === 'string' ? instructions.trim() : ''),
       servings: parseInt(servings) || 1,
@@ -21039,13 +21086,66 @@ app.post('/api/recipes/:restaurantId', authenticateToken, async (req, res) => {
       cookTime: parseInt(cookTime) || 0,
       category: category?.trim() || 'Main Course',
       isActive: true,
-      createdAt: new Date(),
       updatedAt: new Date(),
-      createdBy: userId
     };
 
+    if (menuItemId) recipeData.menuItemId = menuItemId;
+    if (menuItemName) recipeData.menuItemName = menuItemName;
+
+    // Circular dependency check for sub-recipe ingredients
+    const subRecipeIds = recipeData.ingredients.filter(i => i.type === 'recipe' && i.subRecipeId).map(i => i.subRecipeId);
+    if (subRecipeIds.length > 0) {
+      const allRecipesSnap = await db.collection(collections.recipes).where('restaurantId', '==', restaurantId).get();
+      const recipeMap = {};
+      allRecipesSnap.forEach(doc => { recipeMap[doc.id] = doc.data(); });
+      // BFS to detect cycles — targetId is the recipe being saved (may not exist yet for POST)
+      const targetId = menuItemId ? (await (async () => {
+        const existSnap = await db.collection(collections.recipes).where('restaurantId', '==', restaurantId).where('menuItemId', '==', menuItemId).limit(1).get();
+        return existSnap.empty ? null : existSnap.docs[0].id;
+      })()) : null;
+      if (targetId) {
+        const visited = new Set();
+        const queue = [...subRecipeIds];
+        while (queue.length > 0) {
+          const id = queue.shift();
+          if (id === targetId) {
+            return res.status(400).json({ error: 'Circular dependency: a sub-recipe references this recipe.' });
+          }
+          if (visited.has(id)) continue;
+          visited.add(id);
+          const sub = recipeMap[id];
+          if (sub) {
+            (sub.ingredients || []).filter(i => i.type === 'recipe' && i.subRecipeId).forEach(i => queue.push(i.subRecipeId));
+          }
+        }
+      }
+    }
+
+    // If menuItemId provided, check for existing recipe and replace it
+    let recipeId;
+    if (menuItemId) {
+      const existingSnap = await db.collection(collections.recipes)
+        .where('restaurantId', '==', restaurantId)
+        .where('menuItemId', '==', menuItemId)
+        .limit(1)
+        .get();
+
+      if (!existingSnap.empty) {
+        // Update existing recipe instead of creating duplicate
+        recipeId = existingSnap.docs[0].id;
+        recipeData.updatedBy = userId;
+        await db.collection(collections.recipes).doc(recipeId).update(recipeData);
+        return res.status(200).json({
+          message: 'Recipe updated (replaced existing)',
+          recipe: { id: recipeId, ...existingSnap.docs[0].data(), ...recipeData }
+        });
+      }
+    }
+
+    recipeData.createdAt = new Date();
+    recipeData.createdBy = userId;
     const recipeRef = await db.collection(collections.recipes).add(recipeData);
-    
+
     res.status(201).json({
       message: 'Recipe created successfully',
       recipe: { id: recipeRef.id, ...recipeData }
@@ -21214,6 +21314,28 @@ app.patch('/api/recipes/:restaurantId/:recipeId', authenticateToken, async (req,
     const recipeDoc = await db.collection(collections.recipes).doc(recipeId).get();
     if (!recipeDoc.exists || recipeDoc.data().restaurantId !== restaurantId) {
       return res.status(404).json({ error: 'Recipe not found' });
+    }
+
+    // Circular dependency check for sub-recipe ingredients
+    if (updateData.ingredients) {
+      const subIds = updateData.ingredients.filter(i => i.type === 'recipe' && i.subRecipeId).map(i => i.subRecipeId);
+      if (subIds.length > 0) {
+        const allSnap = await db.collection(collections.recipes).where('restaurantId', '==', restaurantId).get();
+        const rMap = {};
+        allSnap.forEach(doc => { rMap[doc.id] = doc.data(); });
+        const visited = new Set();
+        const queue = [...subIds];
+        while (queue.length > 0) {
+          const id = queue.shift();
+          if (id === recipeId) {
+            return res.status(400).json({ error: 'Circular dependency: a sub-recipe references this recipe.' });
+          }
+          if (visited.has(id)) continue;
+          visited.add(id);
+          const sub = rMap[id];
+          if (sub) (sub.ingredients || []).filter(i => i.type === 'recipe' && i.subRecipeId).forEach(i => queue.push(i.subRecipeId));
+        }
+      }
     }
 
     await db.collection(collections.recipes).doc(recipeId).update(updateData);
