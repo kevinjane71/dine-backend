@@ -1200,36 +1200,57 @@ router.get('/orders/summary', authenticateSuperAdmin, async (req, res) => {
 // ─── Soft-delete orders for a restaurant on a specific date ──────────
 // POST /api/super-admin/orders/soft-delete
 // Body: { restaurantId: string, date: 'YYYY-MM-DD' | 'today' | 'yesterday' }
-// Soft-deletes (status='deleted') all orders for that restaurant created on that calendar day (server local time).
+//   OR: { restaurantId: string, startDate: 'YYYY-MM-DD', endDate: 'YYYY-MM-DD' }
+// Soft-deletes (status='deleted') all orders for that restaurant in the date range (server local time).
 // Idempotent: orders already marked deleted are skipped.
 router.post('/orders/soft-delete', authenticateSuperAdmin, async (req, res) => {
   try {
-    const { restaurantId, date } = req.body || {};
+    const { restaurantId, date, startDate, endDate } = req.body || {};
     if (!restaurantId || typeof restaurantId !== 'string') {
       return res.status(400).json({ success: false, error: 'restaurantId is required' });
     }
-    if (!date || typeof date !== 'string') {
-      return res.status(400).json({ success: false, error: 'date is required (YYYY-MM-DD, "today", or "yesterday")' });
-    }
 
-    // Resolve date → [start, end) day bounds
-    let dayStart;
-    if (date === 'today') {
-      const n = new Date();
-      dayStart = new Date(n.getFullYear(), n.getMonth(), n.getDate());
-    } else if (date === 'yesterday') {
-      const n = new Date();
-      dayStart = new Date(n.getFullYear(), n.getMonth(), n.getDate() - 1);
-    } else {
-      const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(date);
-      if (!m) return res.status(400).json({ success: false, error: 'Invalid date format. Use YYYY-MM-DD' });
-      dayStart = new Date(parseInt(m[1]), parseInt(m[2]) - 1, parseInt(m[3]));
-      if (isNaN(dayStart.getTime())) {
-        return res.status(400).json({ success: false, error: 'Invalid date' });
+    const parseDateStr = (str) => {
+      const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(str);
+      if (!m) return null;
+      const d = new Date(parseInt(m[1]), parseInt(m[2]) - 1, parseInt(m[3]));
+      return isNaN(d.getTime()) ? null : d;
+    };
+
+    let dayStart, dayEnd;
+
+    if (startDate && endDate) {
+      // Date range mode
+      if (typeof startDate !== 'string' || typeof endDate !== 'string') {
+        return res.status(400).json({ success: false, error: 'startDate and endDate must be strings in YYYY-MM-DD format' });
       }
+      dayStart = parseDateStr(startDate);
+      if (!dayStart) return res.status(400).json({ success: false, error: 'Invalid startDate format. Use YYYY-MM-DD' });
+      const endParsed = parseDateStr(endDate);
+      if (!endParsed) return res.status(400).json({ success: false, error: 'Invalid endDate format. Use YYYY-MM-DD' });
+      if (endParsed < dayStart) {
+        return res.status(400).json({ success: false, error: 'endDate must be on or after startDate' });
+      }
+      // endDate is inclusive — set dayEnd to start of the next day
+      dayEnd = new Date(endParsed);
+      dayEnd.setDate(dayEnd.getDate() + 1);
+    } else if (date && typeof date === 'string') {
+      // Single date mode (backward compatible)
+      if (date === 'today') {
+        const n = new Date();
+        dayStart = new Date(n.getFullYear(), n.getMonth(), n.getDate());
+      } else if (date === 'yesterday') {
+        const n = new Date();
+        dayStart = new Date(n.getFullYear(), n.getMonth(), n.getDate() - 1);
+      } else {
+        dayStart = parseDateStr(date);
+        if (!dayStart) return res.status(400).json({ success: false, error: 'Invalid date format. Use YYYY-MM-DD' });
+      }
+      dayEnd = new Date(dayStart);
+      dayEnd.setDate(dayEnd.getDate() + 1);
+    } else {
+      return res.status(400).json({ success: false, error: 'Provide either "date" (YYYY-MM-DD / today / yesterday) or "startDate" + "endDate" (YYYY-MM-DD)' });
     }
-    const dayEnd = new Date(dayStart);
-    dayEnd.setDate(dayEnd.getDate() + 1);
 
     // Verify restaurant exists (so admin doesn't blindly nuke a typo'd id)
     const restDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
@@ -1285,14 +1306,20 @@ router.post('/orders/soft-delete', authenticateSuperAdmin, async (req, res) => {
       await b.commit();
     }
 
-    const dayStr = `${dayStart.getFullYear()}-${String(dayStart.getMonth() + 1).padStart(2, '0')}-${String(dayStart.getDate()).padStart(2, '0')}`;
-    console.log(`🗑️ Super admin soft-deleted ${deletedCount}/${totalOrders} orders for ${restaurantName} (${restaurantId}) on ${dayStr}`);
+    const fmtDate = (d) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+    const startStr = fmtDate(dayStart);
+    const endActual = new Date(dayEnd);
+    endActual.setDate(endActual.getDate() - 1);
+    const endStr = fmtDate(endActual);
+    const dateLabel = startStr === endStr ? startStr : `${startStr} to ${endStr}`;
+    console.log(`🗑️ Super admin soft-deleted ${deletedCount}/${totalOrders} orders for ${restaurantName} (${restaurantId}) on ${dateLabel}`);
 
     res.json({
       success: true,
       restaurantId,
       restaurantName,
-      date: dayStr,
+      date: startStr,
+      ...(startStr !== endStr && { endDate: endStr }),
       totalOrders,
       deletedCount,
       alreadyDeletedCount,
