@@ -120,6 +120,46 @@ function invalidateUserCache(userId) {
   kvDel(`user:${userId}`).catch(() => {});
 }
 
+/**
+ * Normalize phone number for cache key consistency
+ */
+function normalizePhoneForCache(phone) {
+  if (!phone) return null;
+  const digits = String(phone).replace(/\D/g, '');
+  if (digits.length === 12 && digits.startsWith('91')) return digits.substring(2);
+  if (digits.length === 11 && digits.startsWith('0')) return digits.substring(1);
+  if (digits.length === 10) return digits;
+  return digits;
+}
+
+/**
+ * Cache customer lookup by normalized phone (5 min TTL).
+ * Stores minimal data: { id, phone } — enough to do a direct doc read.
+ */
+async function cacheCustomerByPhone(restaurantId, normalizedPhone, customerData) {
+  if (!normalizedPhone) return;
+  const key = `customer:${restaurantId}:${normalizedPhone}`;
+  await kvSet(key, customerData, 300); // 5 min TTL
+}
+
+/**
+ * Get cached customer by normalized phone. Returns { id, phone } or null.
+ */
+async function getCachedCustomerByPhone(restaurantId, normalizedPhone) {
+  if (!normalizedPhone) return null;
+  const key = `customer:${restaurantId}:${normalizedPhone}`;
+  return await kvGet(key);
+}
+
+/**
+ * Invalidate customer cache entry when customer is created/updated.
+ */
+function invalidateCustomerCache(restaurantId, phone) {
+  const normalized = normalizePhoneForCache(phone);
+  if (!normalized) return;
+  kvDel(`customer:${restaurantId}:${normalized}`).catch(() => {});
+}
+
 module.exports = {
   kvGet,
   kvSet,
@@ -127,4 +167,8 @@ module.exports = {
   getCachedRestaurant,
   invalidateRestaurantCache,
   invalidateUserCache,
+  cacheCustomerByPhone,
+  getCachedCustomerByPhone,
+  invalidateCustomerCache,
+  normalizePhoneForCache,
 };

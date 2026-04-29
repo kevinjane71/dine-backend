@@ -1417,6 +1417,16 @@ router.post('/reset-restaurant-data', authenticateSuperAdmin, async (req, res) =
       chartOfAccounts: { name: 'chartOfAccounts', queryMode: 'restaurantId' },
       customers: { name: collections.customers, queryMode: 'restaurantId' },
       bookings: { name: collections.bookings, queryMode: 'restaurantId' },
+      recipes: { name: collections.recipes, queryMode: 'restaurantId' },
+      payments: { name: collections.payments, queryMode: 'restaurantId' },
+      // Invoice module collections (use orgId, resolved from restaurant owner)
+      invInvoices: { name: collections.invInvoices, queryMode: 'orgId' },
+      invPayments: { name: collections.invPayments, queryMode: 'orgId' },
+      invExpenses: { name: collections.invExpenses, queryMode: 'orgId' },
+      invCustomers: { name: collections.invCustomers, queryMode: 'orgId' },
+      invQuotes: { name: collections.invQuotes, queryMode: 'orgId' },
+      invChallans: { name: collections.invChallans, queryMode: 'orgId' },
+      invNumberSequences: { name: collections.invNumberSequences, queryMode: 'orgIdPrefix' },
     };
 
     const invalid = collectionsToReset.filter(c => !allowedCollections[c]);
@@ -1427,15 +1437,50 @@ router.post('/reset-restaurant-data', authenticateSuperAdmin, async (req, res) =
     const { FieldValue, FieldPath } = require('firebase-admin/firestore');
     const results = {};
 
+    // Resolve orgId for invoice collections if needed
+    const needsOrgId = collectionsToReset.some(c => {
+      const mode = allowedCollections[c]?.queryMode;
+      return mode === 'orgId' || mode === 'orgIdPrefix';
+    });
+    let orgId = null;
+    if (needsOrgId) {
+      // Find restaurant owner → their inv_organizations doc
+      const ownerSnap = await db.collection(collections.userRestaurants)
+        .where('restaurantId', '==', restaurantId)
+        .where('role', '==', 'owner')
+        .limit(1)
+        .get();
+      if (!ownerSnap.empty) {
+        const ownerId = ownerSnap.docs[0].data().userId;
+        const orgSnap = await db.collection(collections.invOrganizations)
+          .where('userId', '==', ownerId)
+          .limit(1)
+          .get();
+        if (!orgSnap.empty) orgId = orgSnap.docs[0].id;
+      }
+    }
+
     for (const colKey of collectionsToReset) {
       const colConfig = allowedCollections[colKey];
       let snapshot;
 
       if (colConfig.queryMode === 'docIdPrefix') {
-        // dailyStats uses doc ID pattern: {restaurantId}_{YYYY-MM-DD}
+        // dailyStats uses doc ID pattern: {restaurantId}_{date}
         snapshot = await db.collection(colConfig.name)
           .where(FieldPath.documentId(), '>=', `${restaurantId}_`)
           .where(FieldPath.documentId(), '<', `${restaurantId}` + '\uf8ff')
+          .get();
+      } else if (colConfig.queryMode === 'orgId') {
+        if (!orgId) { results[colKey] = 0; continue; }
+        snapshot = await db.collection(colConfig.name)
+          .where('orgId', '==', orgId)
+          .get();
+      } else if (colConfig.queryMode === 'orgIdPrefix') {
+        if (!orgId) { results[colKey] = 0; continue; }
+        // inv_number_sequences doc IDs: {orgId}_{type}
+        snapshot = await db.collection(colConfig.name)
+          .where(FieldPath.documentId(), '>=', `${orgId}_`)
+          .where(FieldPath.documentId(), '<', `${orgId}` + '\uf8ff')
           .get();
       } else {
         snapshot = await db.collection(colConfig.name)

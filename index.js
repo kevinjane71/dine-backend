@@ -7675,7 +7675,7 @@ app.post('/api/public/orders/:restaurantId', vercelSecurityMiddleware.publicAPI,
     let customerData = null;
     let isFirstOrder = false;
 
-    // First try exact match
+    // Step 1: Try exact Firestore match (fast, indexed)
     const customerQuery = await db.collection('customers')
       .where('restaurantId', '==', restaurantId)
       .where('phone', '==', customerPhone)
@@ -7684,17 +7684,36 @@ app.post('/api/public/orders/:restaurantId', vercelSecurityMiddleware.publicAPI,
     if (!customerQuery.empty) {
       existingCustomer = customerQuery.docs[0];
     } else {
-      // Try normalized phone match
       const normalizedPhone = normalizePhone(customerPhone);
       if (normalizedPhone) {
-        const allCustomers = await db.collection('customers')
-          .where('restaurantId', '==', restaurantId)
-          .get();
+        // Step 2: Try Redis cache before full collection scan
+        const { getCachedCustomerByPhone, cacheCustomerByPhone } = require('./utils/kvCache');
+        const cached = await getCachedCustomerByPhone(restaurantId, normalizedPhone);
+        if (cached && cached.id) {
+          const cachedDoc = await db.collection('customers').doc(cached.id).get();
+          if (cachedDoc.exists) {
+            existingCustomer = cachedDoc;
+          }
+        }
 
-        existingCustomer = allCustomers.docs.find(doc => {
-          const custPhone = normalizePhone(doc.data().phone);
-          return custPhone === normalizedPhone;
-        });
+        // Step 3: Full scan only if both exact match and cache miss
+        if (!existingCustomer) {
+          const allCustomers = await db.collection('customers')
+            .where('restaurantId', '==', restaurantId)
+            .get();
+
+          existingCustomer = allCustomers.docs.find(doc => {
+            const custPhone = normalizePhone(doc.data().phone);
+            return custPhone === normalizedPhone;
+          });
+
+          // Cache the result for future lookups
+          if (existingCustomer) {
+            cacheCustomerByPhone(restaurantId, normalizedPhone, {
+              id: existingCustomer.id, phone: existingCustomer.data().phone
+            }).catch(() => {});
+          }
+        }
       }
     }
 
@@ -8171,41 +8190,43 @@ app.post('/api/public/orders/:restaurantId', vercelSecurityMiddleware.publicAPI,
         .then(() => syncInventoryStockToMenuItems(restaurantId))
         .catch(err => console.error('Inventory Deduction Error:', err));
 
-    // Trigger Pusher notification for real-time updates (public/online orders)
-    // NOTE: awaited so it doesn't race with the KOT print trigger below — when
-    // fire-and-forget, one of two back-to-back pusher.trigger HTTPS calls can
-    // be aborted by the runtime after res.json(), breaking dashboard sync.
-    await pusherService.notifyOrderCreated(restaurantId, {
-      id: orderRef.id,
-      orderNumber: orderData.orderNumber,
-      dailyOrderId: orderData.dailyOrderId,
-      status: orderData.status,
-      totalAmount: finalTotal,
-      tableNumber: tableNum,
-      orderType: orderType,
-      orderSource: resolvedOrderSource
-    }).catch(err => console.error('Pusher notification error (non-blocking):', err));
-
     // Update daily analytics stats (fire-and-forget)
     updateDailyStats(restaurantId, orderData, 'add');
 
-    // Trigger KOT print notification if Pusher printing is enabled
+    // Run all Pusher notifications in parallel (saves 1-3s vs sequential awaits).
+    // Still awaited before res.json() to prevent Vercel runtime from aborting them.
+    const pusherPromises = [];
+    pusherPromises.push(
+      pusherService.notifyOrderCreated(restaurantId, {
+        id: orderRef.id,
+        orderNumber: orderData.orderNumber,
+        dailyOrderId: orderData.dailyOrderId,
+        status: orderData.status,
+        totalAmount: finalTotal,
+        tableNumber: tableNum,
+        orderType: orderType,
+        orderSource: resolvedOrderSource
+      }).catch(err => console.error('Pusher notification error (non-blocking):', err))
+    );
     const printSettings = restaurantData.printSettings || {};
     if (printSettings.kotPrinterEnabled !== false && printSettings.usePusherForKOT === true) {
-      await pusherService.notifyKOTPrintRequest(restaurantId, {
-        id: orderRef.id,
-        dailyOrderId: orderData.dailyOrderId,
-        orderNumber: orderData.orderNumber,
-        tableNumber: tableNum,
-        roomNumber: orderData.roomNumber,
-        items: orderItems,
-        notes: orderData.notes,
-        specialInstructions: orderData.specialInstructions,
-        staffInfo: orderData.staffInfo,
-        orderType: orderType,
-        createdAt: orderData.createdAt?.toISOString() || new Date().toISOString()
-      }).catch(err => console.error('KOT print Pusher notification error (non-blocking):', err));
+      pusherPromises.push(
+        pusherService.notifyKOTPrintRequest(restaurantId, {
+          id: orderRef.id,
+          dailyOrderId: orderData.dailyOrderId,
+          orderNumber: orderData.orderNumber,
+          tableNumber: tableNum,
+          roomNumber: orderData.roomNumber,
+          items: orderItems,
+          notes: orderData.notes,
+          specialInstructions: orderData.specialInstructions,
+          staffInfo: orderData.staffInfo,
+          orderType: orderType,
+          createdAt: orderData.createdAt?.toISOString() || new Date().toISOString()
+        }).catch(err => console.error('KOT print Pusher notification error (non-blocking):', err))
+      );
     }
+    await Promise.allSettled(pusherPromises);
 
     res.status(201).json({
       message: 'Order placed successfully',
@@ -8986,10 +9007,30 @@ app.post('/api/orders', async (req, res) => {
             // Try normalized phone match
             const normalizedPhone = normalizePhone(customerInfo.phone);
             if (normalizedPhone) {
-              const allCusts = await db.collection(collections.customers)
-                .where('restaurantId', '==', restaurantId)
-                .get();
-              existingCustomer = allCusts.docs.find(doc => normalizePhone(doc.data().phone) === normalizedPhone) || null;
+              // Step 2: Try Redis cache before full collection scan
+              const { getCachedCustomerByPhone, cacheCustomerByPhone } = require('./utils/kvCache');
+              const cached = await getCachedCustomerByPhone(restaurantId, normalizedPhone);
+              if (cached && cached.id) {
+                const cachedDoc = await db.collection(collections.customers).doc(cached.id).get();
+                if (cachedDoc.exists) {
+                  existingCustomer = cachedDoc;
+                }
+              }
+
+              // Step 3: Full scan only if both exact match and cache miss
+              if (!existingCustomer) {
+                const allCusts = await db.collection(collections.customers)
+                  .where('restaurantId', '==', restaurantId)
+                  .get();
+                existingCustomer = allCusts.docs.find(doc => normalizePhone(doc.data().phone) === normalizedPhone) || null;
+
+                // Cache the result for future lookups
+                if (existingCustomer) {
+                  cacheCustomerByPhone(restaurantId, normalizedPhone, {
+                    id: existingCustomer.id, phone: existingCustomer.data().phone
+                  }).catch(() => {});
+                }
+              }
             }
           }
         }
@@ -9266,72 +9307,76 @@ app.post('/api/orders', async (req, res) => {
       // Don't fail order creation if automation fails
     }
 
-    // Trigger Pusher notification for real-time updates
-    // NOTE: awaited to prevent race with the KOT/Billing print triggers below.
-    await pusherService.notifyOrderCreated(restaurantId, {
-      id: orderRef.id,
-      orderNumber: orderNumber,
-      dailyOrderId: dailyOrderId,
-      status: orderData.status,
-      totalAmount: totalAmount,
-      tableNumber: tableNumber,
-      orderType: orderType
-    }).catch(err => console.error('Pusher notification error (non-blocking):', err));
-
     // Update daily analytics stats (fire-and-forget) — skip 'saved' orders (counted when placed)
     if (orderData.status !== 'saved') {
       updateDailyStats(restaurantId, orderData, 'add');
     }
 
-    // Trigger KOT print notification if order is confirmed and Pusher printing is enabled
+    // Run all Pusher notifications in parallel (saves 1-3s vs sequential awaits).
+    // Still awaited before res.json() to prevent Vercel runtime from aborting them.
+    const pusherPromises = [];
+    pusherPromises.push(
+      pusherService.notifyOrderCreated(restaurantId, {
+        id: orderRef.id,
+        orderNumber: orderNumber,
+        dailyOrderId: dailyOrderId,
+        status: orderData.status,
+        totalAmount: totalAmount,
+        tableNumber: tableNumber,
+        orderType: orderType
+      }).catch(err => console.error('Pusher notification error (non-blocking):', err))
+    );
     const printSettings = restaurantData.printSettings || {};
     if (orderData.status === 'confirmed' && printSettings.kotPrinterEnabled !== false && printSettings.usePusherForKOT === true) {
-      await pusherService.notifyKOTPrintRequest(restaurantId, {
-        id: orderRef.id,
-        dailyOrderId: dailyOrderId,
-        orderNumber: orderNumber,
-        tableNumber: tableNumber,
-        roomNumber: roomNumber,
-        items: orderItems,
-        notes: notes,
-        specialInstructions: orderData.specialInstructions,
-        staffInfo: orderData.staffInfo,
-        orderType: orderType,
-        createdAt: orderData.createdAt?.toISOString() || new Date().toISOString()
-      }).catch(err => console.error('KOT print Pusher notification error (non-blocking):', err));
+      pusherPromises.push(
+        pusherService.notifyKOTPrintRequest(restaurantId, {
+          id: orderRef.id,
+          dailyOrderId: dailyOrderId,
+          orderNumber: orderNumber,
+          tableNumber: tableNumber,
+          roomNumber: roomNumber,
+          items: orderItems,
+          notes: notes,
+          specialInstructions: orderData.specialInstructions,
+          staffInfo: orderData.staffInfo,
+          orderType: orderType,
+          createdAt: orderData.createdAt?.toISOString() || new Date().toISOString()
+        }).catch(err => console.error('KOT print Pusher notification error (non-blocking):', err))
+      );
     }
-
-    // Trigger Billing print notification if order is created as completed directly (Complete Billing clicked)
     if (orderData.status === 'completed' && printSettings.kotPrinterEnabled !== false && printSettings.usePusherForKOT === true) {
-      await pusherService.notifyBillingPrintRequest(restaurantId, {
-        id: orderRef.id,
-        dailyOrderId: dailyOrderId,
-        orderNumber: orderNumber,
-        tableNumber: tableNumber,
-        roomNumber: roomNumber,
-        customerName: orderData.customerInfo?.name || '',
-        customerMobile: orderData.customerInfo?.phone || '',
-        items: orderItems,
-        subtotal: subtotalForDiscount,
-        totalAmount: preTaxTotal,
-        discountAmount: discountAmount,
-        manualDiscount: manualDiscountAmount,
-        loyaltyDiscount: loyaltyDiscount,
-        totalDiscountAmount: totalDiscountAmount,
-        appliedOffer: appliedOffer,
-        appliedOffers: appliedOffers,
-        selectedOfferName: req.body.selectedOfferName || (appliedOffer ? appliedOffer.name : null),
-        taxAmount: taxAmount,
-        taxBreakdown: taxBreakdown,
-        serviceChargeAmount: scAmt,
-        serviceChargeRate: scRate,
-        finalAmount: finalAmount,
-        paymentMethod: paymentMethod,
-        orderType: orderType,
-        createdAt: orderData.createdAt?.toISOString() || new Date().toISOString(),
-        completedAt: new Date()
-      }).catch(err => console.error('Billing print Pusher notification error (non-blocking):', err));
+      pusherPromises.push(
+        pusherService.notifyBillingPrintRequest(restaurantId, {
+          id: orderRef.id,
+          dailyOrderId: dailyOrderId,
+          orderNumber: orderNumber,
+          tableNumber: tableNumber,
+          roomNumber: roomNumber,
+          customerName: orderData.customerInfo?.name || '',
+          customerMobile: orderData.customerInfo?.phone || '',
+          items: orderItems,
+          subtotal: subtotalForDiscount,
+          totalAmount: preTaxTotal,
+          discountAmount: discountAmount,
+          manualDiscount: manualDiscountAmount,
+          loyaltyDiscount: loyaltyDiscount,
+          totalDiscountAmount: totalDiscountAmount,
+          appliedOffer: appliedOffer,
+          appliedOffers: appliedOffers,
+          selectedOfferName: req.body.selectedOfferName || (appliedOffer ? appliedOffer.name : null),
+          taxAmount: taxAmount,
+          taxBreakdown: taxBreakdown,
+          serviceChargeAmount: scAmt,
+          serviceChargeRate: scRate,
+          finalAmount: finalAmount,
+          paymentMethod: paymentMethod,
+          orderType: orderType,
+          createdAt: orderData.createdAt?.toISOString() || new Date().toISOString(),
+          completedAt: new Date()
+        }).catch(err => console.error('Billing print Pusher notification error (non-blocking):', err))
+      );
     }
+    await Promise.allSettled(pusherPromises);
 
     // Generate shareToken and send WhatsApp bill_notification for direct billing (order created as completed)
     if (orderData.status === 'completed') {
@@ -10043,13 +10088,15 @@ app.get('/api/analytics/:restaurantId', authenticateToken, async (req, res) => {
         .where('restaurantId', '==', restaurantId)
         .where('createdAt', '>=', startDate)
         .where('createdAt', '<=', now)
+        .limit(2000)
         .get();
 
       const orders = ordersQuery.docs.map(doc => ({ id: doc.id, ...doc.data() }));
-      console.log(`📊 Found ${orders.length} raw orders for analytics (${period})`);
+      const limitReached = orders.length >= 2000;
+      console.log(`📊 Found ${orders.length} raw orders for analytics (${period})${limitReached ? ' (limit reached)' : ''}`);
 
       const analytics = calculateAnalytics(orders, period);
-      return res.json({ success: true, analytics, period, totalOrders: orders.length });
+      return res.json({ success: true, analytics, period, totalOrders: orders.length, limitReached });
     }
 
     // For 7d/30d/all: read pre-computed dailyStats docs
@@ -10084,11 +10131,13 @@ app.get('/api/analytics/:restaurantId', authenticateToken, async (req, res) => {
         .where('restaurantId', '==', restaurantId)
         .where('createdAt', '>=', startDate)
         .where('createdAt', '<=', now)
+        .limit(2000)
         .get();
       const orders = ordersQuery.docs.map(doc => ({ id: doc.id, ...doc.data() }));
-      console.log(`📊 Fallback: found ${orders.length} raw orders`);
+      const limitReached = orders.length >= 2000;
+      console.log(`📊 Fallback: found ${orders.length} raw orders${limitReached ? ' (limit reached)' : ''}`);
       const analytics = calculateAnalytics(orders, period);
-      return res.json({ success: true, analytics, period, totalOrders: orders.length });
+      return res.json({ success: true, analytics, period, totalOrders: orders.length, limitReached });
     }
 
     const analytics = aggregateDailyStats(dailyDocs, dateStrings);
@@ -10332,11 +10381,9 @@ app.get('/api/analytics/:restaurantId/daily-summary', authenticateToken, async (
 
     console.log(`📊 daily-summary: restaurantId=${restaurantId}, dates=${JSON.stringify(dates)}, period=${period}`);
 
-    // Batch-read dailyStats docs
-    const docRefs = dates.map(d => db.collection('dailyStats').doc(`${restaurantId}_${d}`));
-    const docs = docRefs.length > 0 ? await db.getAll(...docRefs) : [];
-
-    console.log(`📊 daily-summary: found ${docs.filter(d => d.exists).length}/${docs.length} dailyStats docs`);
+    // For today, always use raw orders for real-time accuracy (dailyStats may be stale)
+    const todayStr = new Date().toISOString().split('T')[0];
+    const isTodayOnly = dates.length === 1 && dates[0] === todayStr;
 
     // Aggregate across all dates
     let totalOrders = 0, totalRevenue = 0, totalRevenueWithTax = 0;
@@ -10346,6 +10393,14 @@ app.get('/api/analytics/:restaurantId/daily-summary', authenticateToken, async (
     const customerSet = new Set();
     const dailyRevenue = []; // for trend chart
     let hasItemCounts = false;
+    let usedDailyStats = false;
+
+    if (!isTodayOnly) {
+      // Batch-read dailyStats docs for historical dates
+      const docRefs = dates.map(d => db.collection('dailyStats').doc(`${restaurantId}_${d}`));
+      const docs = docRefs.length > 0 ? await db.getAll(...docRefs) : [];
+
+      console.log(`📊 daily-summary: found ${docs.filter(d => d.exists).length}/${docs.length} dailyStats docs`);
 
     docs.forEach((doc, idx) => {
       if (!doc.exists) {
@@ -10353,6 +10408,7 @@ app.get('/api/analytics/:restaurantId/daily-summary', authenticateToken, async (
         return;
       }
       const data = doc.data();
+      usedDailyStats = true;
       totalOrders += (data.totalOrders || 0);
       totalRevenue += (data.totalRevenue || 0);
       totalRevenueWithTax += (data.totalRevenueWithTax || 0);
@@ -10386,6 +10442,7 @@ app.get('/api/analytics/:restaurantId/daily-summary', authenticateToken, async (
 
       (data.customerIds || []).forEach(id => customerSet.add(id));
     });
+    } // end if (!isTodayOnly)
 
     // Build items array from aggregated map
     let items = [];
@@ -10400,14 +10457,14 @@ app.get('/api/analytics/:restaurantId/daily-summary', authenticateToken, async (
       }
     }
 
-    // Fallback: if no itemCounts in dailyStats (or no dailyStats docs found), aggregate from raw orders
-    if (items.length === 0) {
+    // For today or when dailyStats had no data, aggregate from raw orders for accuracy
+    if (isTodayOnly || items.length === 0) {
       // Use local timezone (matching how orders are created with new Date())
       const [sy, sm, sd] = dates[0].split('-').map(Number);
       const [ey, em, ed] = dates[dates.length - 1].split('-').map(Number);
       const rangeStart = new Date(sy, sm - 1, sd, 0, 0, 0, 0);
       const rangeEnd = new Date(ey, em - 1, ed, 23, 59, 59, 999);
-      console.log(`📊 daily-summary fallback: querying raw orders from ${rangeStart.toISOString()} to ${rangeEnd.toISOString()}`);
+      console.log(`📊 daily-summary ${isTodayOnly ? '(today live)' : '(fallback)'}: querying raw orders from ${rangeStart.toISOString()} to ${rangeEnd.toISOString()}`);
       const ordersSnap = await db.collection(collections.orders)
         .where('restaurantId', '==', restaurantId)
         .where('createdAt', '>=', rangeStart)
@@ -10426,6 +10483,15 @@ app.get('/api/analytics/:restaurantId/daily-summary', authenticateToken, async (
 
         const type = (order.orderType || 'dine_in').toLowerCase().replace(/[\s-]+/g, '_');
         ordersByType[type] = (ordersByType[type] || 0) + 1;
+
+        // Hourly breakdown
+        const createdAt = order.createdAt?.toDate ? order.createdAt.toDate() : new Date(order.createdAt);
+        const hour = String(createdAt.getHours()).padStart(2, '0');
+        hourlyBreakdown[hour] = (hourlyBreakdown[hour] || 0) + 1;
+
+        // Unique customers
+        if (order.customerId) customerSet.add(order.customerId);
+        else if (order.customerInfo?.phone) customerSet.add(order.customerInfo.phone);
 
         if (order.items && Array.isArray(order.items)) {
           order.items.forEach(item => {
@@ -10694,84 +10760,82 @@ app.patch('/api/orders/:orderId/status', authenticateToken, async (req, res) => 
       updateDailyStats(orderData.restaurantId, orderData, 'add');
     }
 
-    // Trigger Pusher notification for real-time updates
-    // NOTE: awaited to prevent race with KOT/Billing print triggers below.
-    await pusherService.notifyOrderStatusUpdated(orderData.restaurantId, orderId, status, {
-      orderNumber: orderData.orderNumber,
-      dailyOrderId: orderData.dailyOrderId,
-      totalAmount: orderData.totalAmount,
-      tableNumber: orderData.tableNumber
-    }).catch(err => console.error('Pusher notification error (non-blocking):', err));
+    // Run all Pusher notifications in parallel (saves 1-3s vs sequential awaits).
+    // Still awaited before res.json() to prevent Vercel runtime from aborting them.
+    const pusherPromises = [];
+    pusherPromises.push(
+      pusherService.notifyOrderStatusUpdated(orderData.restaurantId, orderId, status, {
+        orderNumber: orderData.orderNumber,
+        dailyOrderId: orderData.dailyOrderId,
+        totalAmount: orderData.totalAmount,
+        tableNumber: orderData.tableNumber
+      }).catch(err => console.error('Pusher notification error (non-blocking):', err))
+    );
 
-    // Trigger KOT print notification when order is confirmed (sent to kitchen)
-    if (status === 'confirmed') {
-      // Check if Pusher KOT printing is enabled
+    if (status === 'confirmed' || status === 'completed') {
       const restaurantDoc = await db.collection(collections.restaurants).doc(orderData.restaurantId).get();
       const printSettings = restaurantDoc.exists ? (restaurantDoc.data().printSettings || {}) : {};
 
-      if (printSettings.kotPrinterEnabled !== false && printSettings.usePusherForKOT === true) {
-        await pusherService.notifyKOTPrintRequest(orderData.restaurantId, {
-          id: orderId,
-          dailyOrderId: orderData.dailyOrderId,
-          orderNumber: orderData.orderNumber,
-          tableNumber: orderData.tableNumber,
-          roomNumber: orderData.roomNumber,
-          items: orderData.items,
-          notes: orderData.notes,
-          specialInstructions: orderData.specialInstructions,
-          staffInfo: orderData.staffInfo,
-          orderType: orderData.orderType,
-          createdAt: orderData.createdAt?.toDate?.()?.toISOString() || new Date().toISOString()
-        }).catch(err => console.error('KOT print Pusher notification error (non-blocking):', err));
+      if (status === 'confirmed' && printSettings.kotPrinterEnabled !== false && printSettings.usePusherForKOT === true) {
+        pusherPromises.push(
+          pusherService.notifyKOTPrintRequest(orderData.restaurantId, {
+            id: orderId,
+            dailyOrderId: orderData.dailyOrderId,
+            orderNumber: orderData.orderNumber,
+            tableNumber: orderData.tableNumber,
+            roomNumber: orderData.roomNumber,
+            items: orderData.items,
+            notes: orderData.notes,
+            specialInstructions: orderData.specialInstructions,
+            staffInfo: orderData.staffInfo,
+            orderType: orderData.orderType,
+            createdAt: orderData.createdAt?.toDate?.()?.toISOString() || new Date().toISOString()
+          }).catch(err => console.error('KOT print Pusher notification error (non-blocking):', err))
+        );
       }
-    }
 
-    // Trigger Billing print notification when order is completed
-    if (status === 'completed') {
-      // Check if Pusher billing printing is enabled
-      const restaurantDoc = await db.collection(collections.restaurants).doc(orderData.restaurantId).get();
-      const printSettings = restaurantDoc.exists ? (restaurantDoc.data().printSettings || {}) : {};
-
-      if (printSettings.kotPrinterEnabled !== false && printSettings.usePusherForKOT === true) {
-        // Reset billPrinted flag so it can be printed
+      if (status === 'completed' && printSettings.kotPrinterEnabled !== false && printSettings.usePusherForKOT === true) {
+        // Reset billPrinted flag before sending billing print notification
         await db.collection(collections.orders).doc(orderId).update({
           billPrinted: false
         });
-
-        await pusherService.notifyBillingPrintRequest(orderData.restaurantId, {
-          id: orderId,
-          dailyOrderId: orderData.dailyOrderId,
-          orderNumber: orderData.orderNumber,
-          tableNumber: orderData.tableNumber,
-          roomNumber: orderData.roomNumber,
-          customerName: orderData.customerName || orderData.customerInfo?.name,
-          customerMobile: orderData.customerMobile || orderData.customerInfo?.phone,
-          items: orderData.items,
-          subtotal: orderData.subtotal || orderData.totalAmount,
-          totalAmount: orderData.totalAmount,
-          taxAmount: orderData.taxAmount,
-          taxBreakdown: orderData.taxBreakdown,
-          finalAmount: orderData.finalAmount || orderData.totalAmount,
-          discountAmount: orderData.discountAmount || 0,
-          manualDiscount: orderData.manualDiscount || 0,
-          loyaltyDiscount: orderData.loyaltyDiscount || 0,
-          totalDiscountAmount: orderData.totalDiscountAmount || 0,
-          appliedOffer: orderData.appliedOffer || null,
-          appliedOffers: orderData.appliedOffers || null,
-          paymentMethod: orderData.paymentMethod,
-          orderType: orderData.orderType,
-          serviceChargeAmount: orderData.serviceChargeAmount || null,
-          serviceChargeRate: orderData.serviceChargeRate || null,
-          tipAmount: orderData.tipAmount || null,
-          roundOffAmount: orderData.roundOffAmount || null,
-          splitPayments: orderData.splitPayments || null,
-          cashReceived: orderData.cashReceived || null,
-          changeReturned: orderData.changeReturned || null,
-          createdAt: orderData.createdAt?.toDate?.()?.toISOString() || new Date().toISOString(),
-          completedAt: new Date()
-        }).catch(err => console.error('Billing print Pusher notification error (non-blocking):', err));
+        pusherPromises.push(
+          pusherService.notifyBillingPrintRequest(orderData.restaurantId, {
+            id: orderId,
+            dailyOrderId: orderData.dailyOrderId,
+            orderNumber: orderData.orderNumber,
+            tableNumber: orderData.tableNumber,
+            roomNumber: orderData.roomNumber,
+            customerName: orderData.customerName || orderData.customerInfo?.name,
+            customerMobile: orderData.customerMobile || orderData.customerInfo?.phone,
+            items: orderData.items,
+            subtotal: orderData.subtotal || orderData.totalAmount,
+            totalAmount: orderData.totalAmount,
+            taxAmount: orderData.taxAmount,
+            taxBreakdown: orderData.taxBreakdown,
+            finalAmount: orderData.finalAmount || orderData.totalAmount,
+            discountAmount: orderData.discountAmount || 0,
+            manualDiscount: orderData.manualDiscount || 0,
+            loyaltyDiscount: orderData.loyaltyDiscount || 0,
+            totalDiscountAmount: orderData.totalDiscountAmount || 0,
+            appliedOffer: orderData.appliedOffer || null,
+            appliedOffers: orderData.appliedOffers || null,
+            paymentMethod: orderData.paymentMethod,
+            orderType: orderData.orderType,
+            serviceChargeAmount: orderData.serviceChargeAmount || null,
+            serviceChargeRate: orderData.serviceChargeRate || null,
+            tipAmount: orderData.tipAmount || null,
+            roundOffAmount: orderData.roundOffAmount || null,
+            splitPayments: orderData.splitPayments || null,
+            cashReceived: orderData.cashReceived || null,
+            changeReturned: orderData.changeReturned || null,
+            createdAt: orderData.createdAt?.toDate?.()?.toISOString() || new Date().toISOString(),
+            completedAt: new Date()
+          }).catch(err => console.error('Billing print Pusher notification error (non-blocking):', err))
+        );
       }
     }
+    await Promise.allSettled(pusherPromises);
 
     // Fire-and-forget: send invoice email to customer if enabled
     if (status === 'completed') {
@@ -11850,25 +11914,26 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
       }
     }
 
-    // Trigger Pusher notification for real-time updates
-    // NOTE: awaited to prevent race with KOT/Billing print triggers below.
-    await pusherService.notifyOrderUpdated(currentOrder.restaurantId, orderId, {
-      status: status || currentOrder.status,
-      orderNumber: currentOrder.orderNumber,
-      dailyOrderId: currentOrder.dailyOrderId,
-      totalAmount: updateData.totalAmount || currentOrder.totalAmount,
-      items: updateData.items || currentOrder.items,
-      tableNumber: currentOrder.tableNumber
-    }).catch(err => console.error('Pusher notification error (non-blocking):', err));
+    // Run all Pusher notifications in parallel (saves 1-3s vs sequential awaits).
+    // Firestore prerequisite writes (kotPrinted/billPrinted reset) run first, then Pusher calls are collected and awaited together.
+    const pusherPromises = [];
+    pusherPromises.push(
+      pusherService.notifyOrderUpdated(currentOrder.restaurantId, orderId, {
+        status: status || currentOrder.status,
+        orderNumber: currentOrder.orderNumber,
+        dailyOrderId: currentOrder.dailyOrderId,
+        totalAmount: updateData.totalAmount || currentOrder.totalAmount,
+        items: updateData.items || currentOrder.items,
+        tableNumber: currentOrder.tableNumber
+      }).catch(err => console.error('Pusher notification error (non-blocking):', err))
+    );
 
-    // If items were updated and order is NOT completed/cancelled/deleted/saved, trigger KOT reprint (Pusher and/or polling)
-    // This covers: pending, confirmed, preparing, ready, serving statuses
-    // Note: 'saved' orders should NOT trigger KOT print until they are explicitly placed (status changed to confirmed)
+    // If items were updated and order is NOT completed/cancelled/deleted/saved, trigger KOT reprint
     const orderStatus = status || currentOrder.status;
     const nonKitchenStatuses = ['completed', 'cancelled', 'deleted', 'saved'];
     if (items && items.length > 0 && !nonKitchenStatuses.includes(orderStatus)) {
       try {
-        // Always reset kotPrinted so pending-print API returns this order (polling mode) and KOT app can reprint
+        // Reset kotPrinted so pending-print API returns this order (polling mode)
         await db.collection(collections.orders).doc(orderId).update({
           kotPrinted: false
         });
@@ -11878,20 +11943,22 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
 
         if (printSettings.kotPrinterEnabled !== false && printSettings.usePusherForKOT === true) {
           console.log('🖨️ Order items updated, triggering KOT reprint for order:', orderId);
-          await pusherService.notifyKOTPrintRequest(currentOrder.restaurantId, {
-            id: orderId,
-            dailyOrderId: currentOrder.dailyOrderId,
-            orderNumber: currentOrder.orderNumber,
-            tableNumber: tableNumber || currentOrder.tableNumber,
-            roomNumber: currentOrder.roomNumber,
-            items: updateData.items || items,
-            notes: currentOrder.notes,
-            specialInstructions: updateData.specialInstructions || currentOrder.specialInstructions,
-            staffInfo: currentOrder.staffInfo,
-            orderType: orderType || currentOrder.orderType,
-            createdAt: currentOrder.createdAt?.toDate?.()?.toISOString() || new Date().toISOString(),
-            isReprint: true  // Flag to tell printer app this is a reprint (items updated)
-          }).catch(err => console.error('KOT reprint Pusher notification error (non-blocking):', err));
+          pusherPromises.push(
+            pusherService.notifyKOTPrintRequest(currentOrder.restaurantId, {
+              id: orderId,
+              dailyOrderId: currentOrder.dailyOrderId,
+              orderNumber: currentOrder.orderNumber,
+              tableNumber: tableNumber || currentOrder.tableNumber,
+              roomNumber: currentOrder.roomNumber,
+              items: updateData.items || items,
+              notes: currentOrder.notes,
+              specialInstructions: updateData.specialInstructions || currentOrder.specialInstructions,
+              staffInfo: currentOrder.staffInfo,
+              orderType: orderType || currentOrder.orderType,
+              createdAt: currentOrder.createdAt?.toDate?.()?.toISOString() || new Date().toISOString(),
+              isReprint: true
+            }).catch(err => console.error('KOT reprint Pusher notification error (non-blocking):', err))
+          );
         }
       } catch (kotError) {
         console.error('KOT reprint error (non-blocking):', kotError);
@@ -11905,7 +11972,7 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
         const printSettings = restaurantDoc.exists ? (restaurantDoc.data().printSettings || {}) : {};
 
         if (printSettings.kotPrinterEnabled !== false && printSettings.usePusherForKOT === true) {
-          // Reset billPrinted flag so it can be printed
+          // Reset billPrinted flag before sending billing print notification
           await db.collection(collections.orders).doc(orderId).update({
             billPrinted: false
           });
@@ -11944,43 +12011,46 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
           }
 
           console.log('🧾 Order completed, triggering billing print for order:', orderId);
-          await pusherService.notifyBillingPrintRequest(currentOrder.restaurantId, {
-            id: orderId,
-            dailyOrderId: currentOrder.dailyOrderId,
-            orderNumber: currentOrder.orderNumber,
-            tableNumber: tableNumber || currentOrder.tableNumber,
-            roomNumber: currentOrder.roomNumber,
-            customerName: customerInfo?.name || currentOrder.customerName || currentOrder.customerInfo?.name,
-            customerMobile: customerInfo?.phone || currentOrder.customerMobile || currentOrder.customerInfo?.phone,
-            items: updateData.items || currentOrder.items,
-            subtotal: updateData.subtotal || currentOrder.subtotal || currentOrder.totalAmount,
-            totalAmount: updateData.totalAmount || currentOrder.totalAmount,
-            taxAmount: updateData.taxAmount || currentOrder.taxAmount,
-            taxBreakdown: updateData.taxBreakdown || currentOrder.taxBreakdown,
-            finalAmount: updateData.finalAmount || currentOrder.finalAmount || currentOrder.totalAmount,
-            discountAmount: updateData.discountAmount || currentOrder.discountAmount || 0,
-            manualDiscount: updateData.manualDiscount || currentOrder.manualDiscount || 0,
-            loyaltyDiscount: updateData.loyaltyDiscount || currentOrder.loyaltyDiscount || 0,
-            totalDiscountAmount: updateData.totalDiscountAmount || currentOrder.totalDiscountAmount || 0,
-            appliedOffer: updateData.appliedOffer || currentOrder.appliedOffer || null,
-            appliedOffers: updateData.appliedOffers || currentOrder.appliedOffers || null,
-            paymentMethod: paymentMethod || currentOrder.paymentMethod,
-            orderType: orderType || currentOrder.orderType,
-            serviceChargeAmount: updateData.serviceChargeAmount || currentOrder.serviceChargeAmount || null,
-            serviceChargeRate: updateData.serviceChargeRate || currentOrder.serviceChargeRate || null,
-            tipAmount: updateData.tipAmount || currentOrder.tipAmount || null,
-            roundOffAmount: updateData.roundOffAmount || currentOrder.roundOffAmount || null,
-            splitPayments: updateData.splitPayments || currentOrder.splitPayments || null,
-            cashReceived: updateData.cashReceived || currentOrder.cashReceived || null,
-            changeReturned: updateData.changeReturned || currentOrder.changeReturned || null,
-            createdAt: currentOrder.createdAt?.toDate?.()?.toISOString() || new Date().toISOString(),
-            completedAt: new Date()
-          }).catch(err => console.error('Billing print Pusher notification error (non-blocking):', err));
+          pusherPromises.push(
+            pusherService.notifyBillingPrintRequest(currentOrder.restaurantId, {
+              id: orderId,
+              dailyOrderId: currentOrder.dailyOrderId,
+              orderNumber: currentOrder.orderNumber,
+              tableNumber: tableNumber || currentOrder.tableNumber,
+              roomNumber: currentOrder.roomNumber,
+              customerName: customerInfo?.name || currentOrder.customerName || currentOrder.customerInfo?.name,
+              customerMobile: customerInfo?.phone || currentOrder.customerMobile || currentOrder.customerInfo?.phone,
+              items: updateData.items || currentOrder.items,
+              subtotal: updateData.subtotal || currentOrder.subtotal || currentOrder.totalAmount,
+              totalAmount: updateData.totalAmount || currentOrder.totalAmount,
+              taxAmount: updateData.taxAmount || currentOrder.taxAmount,
+              taxBreakdown: updateData.taxBreakdown || currentOrder.taxBreakdown,
+              finalAmount: updateData.finalAmount || currentOrder.finalAmount || currentOrder.totalAmount,
+              discountAmount: updateData.discountAmount || currentOrder.discountAmount || 0,
+              manualDiscount: updateData.manualDiscount || currentOrder.manualDiscount || 0,
+              loyaltyDiscount: updateData.loyaltyDiscount || currentOrder.loyaltyDiscount || 0,
+              totalDiscountAmount: updateData.totalDiscountAmount || currentOrder.totalDiscountAmount || 0,
+              appliedOffer: updateData.appliedOffer || currentOrder.appliedOffer || null,
+              appliedOffers: updateData.appliedOffers || currentOrder.appliedOffers || null,
+              paymentMethod: paymentMethod || currentOrder.paymentMethod,
+              orderType: orderType || currentOrder.orderType,
+              serviceChargeAmount: updateData.serviceChargeAmount || currentOrder.serviceChargeAmount || null,
+              serviceChargeRate: updateData.serviceChargeRate || currentOrder.serviceChargeRate || null,
+              tipAmount: updateData.tipAmount || currentOrder.tipAmount || null,
+              roundOffAmount: updateData.roundOffAmount || currentOrder.roundOffAmount || null,
+              splitPayments: updateData.splitPayments || currentOrder.splitPayments || null,
+              cashReceived: updateData.cashReceived || currentOrder.cashReceived || null,
+              changeReturned: updateData.changeReturned || currentOrder.changeReturned || null,
+              createdAt: currentOrder.createdAt?.toDate?.()?.toISOString() || new Date().toISOString(),
+              completedAt: new Date()
+            }).catch(err => console.error('Billing print Pusher notification error (non-blocking):', err))
+          );
         }
       } catch (billingError) {
         console.error('Billing print error (non-blocking):', billingError);
       }
     }
+    await Promise.allSettled(pusherPromises);
 
     res.json({
       message: 'Order updated successfully',
@@ -12953,13 +13023,9 @@ app.post('/api/menus/bulk-save/:restaurantId', authenticateToken, async (req, re
     }
     console.log(`📊 Current max shortCode: ${maxShortCode}`);
 
-    // Fetch AI-suggested images from Pexels in parallel while processing items
-    let imageMap = {};
-    try {
-      imageMap = await fetchFoodImagesBatch(menuItems);
-    } catch (err) {
-      console.log('⚠️ Image fetch failed, continuing without images:', err.message);
-    }
+    // Skip Pexels image fetch — frontend uses local placeholder images based on imageKeyword.
+    // This saves 10-20s of Pexels API calls per bulk-save. imageKeyword is still preserved on each item.
+    const imageMap = {};
 
     // Merge extracted categories into restaurant.categories (by unique id)
     for (const c of extractedCategories) {
@@ -23999,11 +24065,12 @@ app.get('/api/books/:restaurantId/overview', authenticateToken, async (req, res)
     ]);
 
     // Revenue
-    let revenue = 0, prevRevenue = 0;
+    let revenue = 0, prevRevenue = 0, activeOrderCount = 0;
     const dailyCashFlow = {};
     orderSnap.forEach(doc => {
       const o = doc.data();
       if (o.status === 'cancelled' || o.status === 'deleted') return;
+      activeOrderCount++;
       const amt = o.finalAmount || o.totalAmount || 0;
       revenue += amt;
       const dk = (o.createdAt?.toDate ? o.createdAt.toDate() : new Date(o.createdAt)).toISOString().split('T')[0];
@@ -24069,7 +24136,7 @@ app.get('/api/books/:restaurantId/overview', authenticateToken, async (req, res)
         supplierDuesTotal,
         cashFlowData,
         topExpenseCategories,
-        orderCount: orderSnap.size
+        orderCount: activeOrderCount
       }
     });
   } catch (error) {
