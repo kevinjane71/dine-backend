@@ -1381,6 +1381,107 @@ router.post('/orders/soft-delete-by-id', authenticateSuperAdmin, async (req, res
   }
 });
 
+// ─── Reset Restaurant Data (for pre-launch cleanup) ──────────────────
+// POST /api/super-admin/reset-restaurant-data
+// Body: { restaurantId: string, collections: string[] }
+// Hard-deletes documents from selected collections for a restaurant.
+// Used to wipe test data before a restaurant goes live.
+router.post('/reset-restaurant-data', authenticateSuperAdmin, async (req, res) => {
+  try {
+    const { restaurantId, collections: collectionsToReset } = req.body || {};
+    if (!restaurantId || typeof restaurantId !== 'string') {
+      return res.status(400).json({ success: false, error: 'restaurantId is required' });
+    }
+    if (!Array.isArray(collectionsToReset) || collectionsToReset.length === 0) {
+      return res.status(400).json({ success: false, error: 'collections array is required' });
+    }
+
+    // Verify restaurant exists
+    const restDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
+    if (!restDoc.exists) {
+      return res.status(404).json({ success: false, error: 'Restaurant not found' });
+    }
+    const restaurantName = restDoc.data().name || restaurantId;
+
+    // Allowed collections to reset (never allow users, restaurants, menus, menuItems, etc.)
+    const allowedCollections = {
+      dailyStats: { name: 'dailyStats', queryMode: 'docIdPrefix' },
+      expenses: { name: 'expenses', queryMode: 'restaurantId' },
+      inventoryTransactions: { name: collections.inventoryTransactions, queryMode: 'restaurantId' },
+      supplierInvoices: { name: collections.supplierInvoices, queryMode: 'restaurantId' },
+      supplierReturns: { name: collections.supplierReturns, queryMode: 'restaurantId' },
+      payrollRuns: { name: 'payrollRuns', queryMode: 'restaurantId' },
+      paySlips: { name: 'paySlips', queryMode: 'restaurantId' },
+      payrollConfig: { name: 'payrollConfig', queryMode: 'restaurantId' },
+      journalEntries: { name: 'journalEntries', queryMode: 'restaurantId' },
+      chartOfAccounts: { name: 'chartOfAccounts', queryMode: 'restaurantId' },
+      customers: { name: collections.customers, queryMode: 'restaurantId' },
+      bookings: { name: collections.bookings, queryMode: 'restaurantId' },
+    };
+
+    const invalid = collectionsToReset.filter(c => !allowedCollections[c]);
+    if (invalid.length > 0) {
+      return res.status(400).json({ success: false, error: `Invalid collections: ${invalid.join(', ')}. Allowed: ${Object.keys(allowedCollections).join(', ')}` });
+    }
+
+    const { FieldValue, FieldPath } = require('firebase-admin/firestore');
+    const results = {};
+
+    for (const colKey of collectionsToReset) {
+      const colConfig = allowedCollections[colKey];
+      let snapshot;
+
+      if (colConfig.queryMode === 'docIdPrefix') {
+        // dailyStats uses doc ID pattern: {restaurantId}_{YYYY-MM-DD}
+        snapshot = await db.collection(colConfig.name)
+          .where(FieldPath.documentId(), '>=', `${restaurantId}_`)
+          .where(FieldPath.documentId(), '<', `${restaurantId}` + '\uf8ff')
+          .get();
+      } else {
+        snapshot = await db.collection(colConfig.name)
+          .where('restaurantId', '==', restaurantId)
+          .get();
+      }
+
+      let deletedCount = 0;
+      const batches = [];
+      let batch = db.batch();
+      let opsInBatch = 0;
+
+      snapshot.forEach(doc => {
+        batch.delete(doc.ref);
+        deletedCount++;
+        opsInBatch++;
+        if (opsInBatch >= 450) {
+          batches.push(batch);
+          batch = db.batch();
+          opsInBatch = 0;
+        }
+      });
+      if (opsInBatch > 0) batches.push(batch);
+
+      for (const b of batches) {
+        await b.commit();
+      }
+
+      results[colKey] = deletedCount;
+    }
+
+    const adminUserId = req.admin?.id || req.admin?.email || 'super-admin';
+    console.log(`🔄 Super admin reset data for ${restaurantName} (${restaurantId}): ${JSON.stringify(results)} by ${adminUserId}`);
+
+    res.json({
+      success: true,
+      restaurantId,
+      restaurantName,
+      deletedCounts: results,
+    });
+  } catch (error) {
+    console.error('Super admin reset restaurant data error:', error);
+    res.status(500).json({ success: false, error: error.message || 'Failed to reset restaurant data' });
+  }
+});
+
 // ─── Admin Notes ──────────────────────────────────────────────────────
 // Save admin notes on demo requests, users, or restaurants.
 // PATCH /api/super-admin/notes/:collection/:docId

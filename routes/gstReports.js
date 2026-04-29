@@ -43,7 +43,7 @@ router.get('/:restaurantId/gstr1', async (req, res) => {
 
     orderSnap.docs.forEach(doc => {
       const order = doc.data();
-      if (order.status === 'cancelled') return;
+      if (order.status === 'cancelled' || order.status === 'deleted') return;
 
       const taxAmount = order.taxAmount || 0;
       const taxableValue = (order.finalAmount || order.totalAmount || 0) - taxAmount;
@@ -113,7 +113,7 @@ router.get('/:restaurantId/gstr3b', async (req, res) => {
     let outwardTaxable = 0, outwardTax = 0;
     orderSnap.docs.forEach(doc => {
       const o = doc.data();
-      if (o.status === 'cancelled') return;
+      if (o.status === 'cancelled' || o.status === 'deleted') return;
       const tax = o.taxAmount || 0;
       outwardTaxable += (o.finalAmount || o.totalAmount || 0) - tax;
       outwardTax += tax;
@@ -183,7 +183,7 @@ router.get('/:restaurantId/hsn-summary', async (req, res) => {
 
     orderSnap.docs.forEach(doc => {
       const order = doc.data();
-      if (order.status === 'cancelled') return;
+      if (order.status === 'cancelled' || order.status === 'deleted') return;
       const items = order.items || [];
       const gstRate = order.taxBreakdown?.[0]?.rate || order.taxRate || 5;
 
@@ -249,7 +249,7 @@ router.get('/:restaurantId/export/:type', async (req, res) => {
       const rows = [['Order#', 'Date', 'Customer', 'Type', 'Taxable Value', 'CGST', 'SGST', 'IGST', 'Total', 'Payment']];
       orderSnap.docs.forEach(doc => {
         const o = doc.data();
-        if (o.status === 'cancelled') return;
+        if (o.status === 'cancelled' || o.status === 'deleted') return;
         const tax = o.taxAmount || 0;
         const taxable = (o.finalAmount || o.totalAmount || 0) - tax;
         const rate = o.taxBreakdown?.[0]?.rate || 5;
@@ -277,7 +277,7 @@ router.get('/:restaurantId/export/:type', async (req, res) => {
       let outTaxable = 0, outTax = 0;
       gstr3bSnap.docs.forEach(doc => {
         const o = doc.data();
-        if (o.status === 'cancelled') return;
+        if (o.status === 'cancelled' || o.status === 'deleted') return;
         const tax = o.taxAmount || 0;
         outTaxable += (o.finalAmount || o.totalAmount || 0) - tax;
         outTax += tax;
@@ -312,7 +312,7 @@ router.get('/:restaurantId/export/:type', async (req, res) => {
       const hsnMap = {};
       hsnSnap.docs.forEach(doc => {
         const order = doc.data();
-        if (order.status === 'cancelled') return;
+        if (order.status === 'cancelled' || order.status === 'deleted') return;
         const gstRate = order.taxBreakdown?.[0]?.rate || order.taxRate || 5;
         (order.items || []).forEach(item => {
           const hsn = item.hsnCode || item.hsn || '9963';

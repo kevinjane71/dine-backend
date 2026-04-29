@@ -23528,7 +23528,7 @@ app.get('/api/books/:restaurantId/revenue', authenticateToken, async (req, res) 
 
     currentSnap.forEach(doc => {
       const o = doc.data();
-      if (o.status === 'cancelled') return;
+      if (o.status === 'cancelled' || o.status === 'deleted') return;
       const amount = o.finalAmount || o.totalAmount || 0;
       totalRevenue += amount;
       totalTax += o.taxAmount || 0;
@@ -23552,7 +23552,7 @@ app.get('/api/books/:restaurantId/revenue', authenticateToken, async (req, res) 
     let prevRevenue = 0;
     prevSnap.forEach(doc => {
       const o = doc.data();
-      if (o.status !== 'cancelled') prevRevenue += o.finalAmount || o.totalAmount || 0;
+      if (o.status !== 'cancelled' && o.status !== 'deleted') prevRevenue += o.finalAmount || o.totalAmount || 0;
     });
 
     const dailyBreakdown = Object.values(dailyMap).sort((a, b) => a.date.localeCompare(b.date));
@@ -23904,12 +23904,14 @@ app.get('/api/books/:restaurantId/pnl', authenticateToken, async (req, res) => {
     let revenue = 0;
     orderSnap.forEach(doc => {
       const o = doc.data();
-      if (o.status !== 'cancelled') revenue += o.finalAmount || o.totalAmount || 0;
+      if (o.status === 'cancelled' || o.status === 'deleted') return;
+      revenue += o.finalAmount || o.totalAmount || 0;
     });
     let prevRevenue = 0;
     prevOrderSnap.forEach(doc => {
       const o = doc.data();
-      if (o.status !== 'cancelled') prevRevenue += o.finalAmount || o.totalAmount || 0;
+      if (o.status === 'cancelled' || o.status === 'deleted') return;
+      prevRevenue += o.finalAmount || o.totalAmount || 0;
     });
 
     // COGS
@@ -24001,7 +24003,7 @@ app.get('/api/books/:restaurantId/overview', authenticateToken, async (req, res)
     const dailyCashFlow = {};
     orderSnap.forEach(doc => {
       const o = doc.data();
-      if (o.status === 'cancelled') return;
+      if (o.status === 'cancelled' || o.status === 'deleted') return;
       const amt = o.finalAmount || o.totalAmount || 0;
       revenue += amt;
       const dk = (o.createdAt?.toDate ? o.createdAt.toDate() : new Date(o.createdAt)).toISOString().split('T')[0];
@@ -24010,7 +24012,8 @@ app.get('/api/books/:restaurantId/overview', authenticateToken, async (req, res)
     });
     prevOrderSnap.forEach(doc => {
       const o = doc.data();
-      if (o.status !== 'cancelled') prevRevenue += o.finalAmount || o.totalAmount || 0;
+      if (o.status === 'cancelled' || o.status === 'deleted') return;
+      prevRevenue += o.finalAmount || o.totalAmount || 0;
     });
 
     // COGS
