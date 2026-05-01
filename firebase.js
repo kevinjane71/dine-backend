@@ -142,7 +142,16 @@ const collections = {
   stockAudits: 'stockAudits',
   productionEntries: 'productionEntries',
   // Space Booking Collections
-  spaceBookings: 'spaceBookings'
+  spaceBookings: 'spaceBookings',
+  // Chain / Enterprise Collections
+  organizations: 'organizations',
+  orgMenuTemplates: 'orgMenuTemplates',
+  orgMenuItems: 'orgMenuItems',
+  indentRequests: 'indentRequests',
+  productionOrders: 'productionOrders',
+  distributionPlans: 'distributionPlans',
+  orgAuditLog: 'orgAuditLog',
+  orgSettings: 'orgSettings'
 };
 
 const admin = null; // We don't need the legacy admin object anymore

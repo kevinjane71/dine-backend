@@ -908,6 +908,13 @@ const gstRoutes = require('./routes/gstReports');
 const ledgerRoutes = require('./routes/ledger');
 const spaceBookingRoutes = require('./routes/spaceBooking');
 
+// Chain / Enterprise Module
+const organizationRoutes = require('./routes/organizationRoutes');
+const centralMenuRoutes = require('./routes/centralMenuRoutes');
+const warehouseRoutes = require('./routes/warehouseRoutes');
+const centralKitchenRoutes = require('./routes/centralKitchenRoutes');
+const hqReportsRoutes = require('./routes/hqReportsRoutes');
+
 // Debug email service initialization
 console.log('📧 Email service loaded:', !!emailService);
 if (emailService) {
@@ -15713,6 +15720,13 @@ app.use('/api/attendance', attendanceRoutes);
 app.use('/api/payroll', payrollRoutes);
 app.use('/api/gst', gstRoutes);
 app.use('/api/ledger', ledgerRoutes);
+
+// ==================== CHAIN / ENTERPRISE MODULE ====================
+app.use('/api/organizations', organizationRoutes);
+app.use('/api/org-menu', centralMenuRoutes);
+app.use('/api/warehouse', warehouseRoutes);
+app.use('/api/central-kitchen', centralKitchenRoutes);
+app.use('/api/hq-reports', hqReportsRoutes);
 
 // ==================== BUSINESS SETTINGS (for GST invoices) ====================
 
