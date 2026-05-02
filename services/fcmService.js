@@ -202,6 +202,10 @@ async function sendKOTPrintNotification(restaurantId, orderData) {
     orderType: orderData.orderType || 'dine-in',
     itemsCount: orderData.items?.length || 0,
     createdAt: orderData.createdAt || new Date().toISOString(),
+    isReprint: orderData.isReprint ? 'true' : 'false',
+    forcePrint: orderData.forcePrint ? 'true' : 'false',
+    printStationId: orderData.printStationId || '',
+    printStationName: orderData.printStationName || '',
   });
 }
 

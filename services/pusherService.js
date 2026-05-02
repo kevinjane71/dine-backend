@@ -100,7 +100,10 @@ const notifyKOTPrintRequest = async (restaurantId, orderData) => {
     createdAt: orderData.createdAt || new Date().toISOString(),
     // Pass through reprint/force flags so printer app knows to skip dedup cache
     isReprint: orderData.isReprint || false,
-    forcePrint: orderData.forcePrint || false
+    forcePrint: orderData.forcePrint || false,
+    // Print station routing
+    printStationId: orderData.printStationId || null,
+    printStationName: orderData.printStationName || null
   });
   // Fire-and-forget FCM fan-out. Never blocks or throws — failures are
   // logged inside fcmService. Printer clients in 'fcm' mode receive this.

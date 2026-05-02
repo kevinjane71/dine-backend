@@ -8285,21 +8285,26 @@ app.post('/api/public/orders/:restaurantId', vercelSecurityMiddleware.publicAPI,
     );
     const printSettings = restaurantData.printSettings || {};
     if (printSettings.kotPrinterEnabled !== false && printSettings.usePusherForKOT === true) {
-      pusherPromises.push(
-        pusherService.notifyKOTPrintRequest(restaurantId, {
-          id: orderRef.id,
-          dailyOrderId: orderData.dailyOrderId,
-          orderNumber: orderData.orderNumber,
-          tableNumber: tableNum,
-          roomNumber: orderData.roomNumber,
-          items: orderItems,
-          notes: orderData.notes,
-          specialInstructions: orderData.specialInstructions,
-          staffInfo: orderData.staffInfo,
-          orderType: orderType,
-          createdAt: orderData.createdAt?.toISOString() || new Date().toISOString()
-        }).catch(err => console.error('KOT print Pusher notification error (non-blocking):', err))
-      );
+      const stationGroups = splitOrderByPrintStation(orderItems, restaurantData.printStations, restaurantData.categories);
+      for (const group of stationGroups) {
+        pusherPromises.push(
+          pusherService.notifyKOTPrintRequest(restaurantId, {
+            id: orderRef.id,
+            dailyOrderId: orderData.dailyOrderId,
+            orderNumber: orderData.orderNumber,
+            tableNumber: tableNum,
+            roomNumber: orderData.roomNumber,
+            items: group.items,
+            notes: orderData.notes,
+            specialInstructions: orderData.specialInstructions,
+            staffInfo: orderData.staffInfo,
+            orderType: orderType,
+            createdAt: orderData.createdAt?.toISOString() || new Date().toISOString(),
+            printStationId: group.stationId,
+            printStationName: group.stationName
+          }).catch(err => console.error('KOT print Pusher notification error (non-blocking):', err))
+        );
+      }
     }
     await Promise.allSettled(pusherPromises);
 
@@ -9403,21 +9408,26 @@ app.post('/api/orders', async (req, res) => {
     );
     const printSettings = restaurantData.printSettings || {};
     if (orderData.status === 'confirmed' && printSettings.kotPrinterEnabled !== false && printSettings.usePusherForKOT === true) {
-      pusherPromises.push(
-        pusherService.notifyKOTPrintRequest(restaurantId, {
-          id: orderRef.id,
-          dailyOrderId: dailyOrderId,
-          orderNumber: orderNumber,
-          tableNumber: tableNumber,
-          roomNumber: roomNumber,
-          items: orderItems,
-          notes: notes,
-          specialInstructions: orderData.specialInstructions,
-          staffInfo: orderData.staffInfo,
-          orderType: orderType,
-          createdAt: orderData.createdAt?.toISOString() || new Date().toISOString()
-        }).catch(err => console.error('KOT print Pusher notification error (non-blocking):', err))
-      );
+      const stationGroups = splitOrderByPrintStation(orderItems, restaurantData.printStations, restaurantData.categories);
+      for (const group of stationGroups) {
+        pusherPromises.push(
+          pusherService.notifyKOTPrintRequest(restaurantId, {
+            id: orderRef.id,
+            dailyOrderId: dailyOrderId,
+            orderNumber: orderNumber,
+            tableNumber: tableNumber,
+            roomNumber: roomNumber,
+            items: group.items,
+            notes: notes,
+            specialInstructions: orderData.specialInstructions,
+            staffInfo: orderData.staffInfo,
+            orderType: orderType,
+            createdAt: orderData.createdAt?.toISOString() || new Date().toISOString(),
+            printStationId: group.stationId,
+            printStationName: group.stationName
+          }).catch(err => console.error('KOT print Pusher notification error (non-blocking):', err))
+        );
+      }
     }
     if (orderData.status === 'completed' && printSettings.kotPrinterEnabled !== false && printSettings.usePusherForKOT === true) {
       pusherPromises.push(
@@ -10852,21 +10862,27 @@ app.patch('/api/orders/:orderId/status', authenticateToken, async (req, res) => 
       const printSettings = restaurantDoc.exists ? (restaurantDoc.data().printSettings || {}) : {};
 
       if (status === 'confirmed' && printSettings.kotPrinterEnabled !== false && printSettings.usePusherForKOT === true) {
-        pusherPromises.push(
-          pusherService.notifyKOTPrintRequest(orderData.restaurantId, {
-            id: orderId,
-            dailyOrderId: orderData.dailyOrderId,
-            orderNumber: orderData.orderNumber,
-            tableNumber: orderData.tableNumber,
-            roomNumber: orderData.roomNumber,
-            items: orderData.items,
-            notes: orderData.notes,
-            specialInstructions: orderData.specialInstructions,
-            staffInfo: orderData.staffInfo,
-            orderType: orderData.orderType,
-            createdAt: orderData.createdAt?.toDate?.()?.toISOString() || new Date().toISOString()
-          }).catch(err => console.error('KOT print Pusher notification error (non-blocking):', err))
-        );
+        const restaurantFullData = restaurantDoc.data();
+        const stationGroups = splitOrderByPrintStation(orderData.items, restaurantFullData.printStations, restaurantFullData.categories);
+        for (const group of stationGroups) {
+          pusherPromises.push(
+            pusherService.notifyKOTPrintRequest(orderData.restaurantId, {
+              id: orderId,
+              dailyOrderId: orderData.dailyOrderId,
+              orderNumber: orderData.orderNumber,
+              tableNumber: orderData.tableNumber,
+              roomNumber: orderData.roomNumber,
+              items: group.items,
+              notes: orderData.notes,
+              specialInstructions: orderData.specialInstructions,
+              staffInfo: orderData.staffInfo,
+              orderType: orderData.orderType,
+              createdAt: orderData.createdAt?.toDate?.()?.toISOString() || new Date().toISOString(),
+              printStationId: group.stationId,
+              printStationName: group.stationName
+            }).catch(err => console.error('KOT print Pusher notification error (non-blocking):', err))
+          );
+        }
       }
 
       if (status === 'completed' && printSettings.kotPrinterEnabled !== false && printSettings.usePusherForKOT === true) {
@@ -12018,22 +12034,29 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
 
         if (printSettings.kotPrinterEnabled !== false && printSettings.usePusherForKOT === true) {
           console.log('🖨️ Order items updated, triggering KOT reprint for order:', orderId);
-          pusherPromises.push(
-            pusherService.notifyKOTPrintRequest(currentOrder.restaurantId, {
-              id: orderId,
-              dailyOrderId: currentOrder.dailyOrderId,
-              orderNumber: currentOrder.orderNumber,
-              tableNumber: tableNumber || currentOrder.tableNumber,
-              roomNumber: currentOrder.roomNumber,
-              items: updateData.items || items,
-              notes: currentOrder.notes,
-              specialInstructions: updateData.specialInstructions || currentOrder.specialInstructions,
-              staffInfo: currentOrder.staffInfo,
-              orderType: orderType || currentOrder.orderType,
-              createdAt: currentOrder.createdAt?.toDate?.()?.toISOString() || new Date().toISOString(),
-              isReprint: true
-            }).catch(err => console.error('KOT reprint Pusher notification error (non-blocking):', err))
-          );
+          const restaurantFullData = restaurantDoc.data();
+          const reprintItems = updateData.items || items;
+          const stationGroups = splitOrderByPrintStation(reprintItems, restaurantFullData.printStations, restaurantFullData.categories);
+          for (const group of stationGroups) {
+            pusherPromises.push(
+              pusherService.notifyKOTPrintRequest(currentOrder.restaurantId, {
+                id: orderId,
+                dailyOrderId: currentOrder.dailyOrderId,
+                orderNumber: currentOrder.orderNumber,
+                tableNumber: tableNumber || currentOrder.tableNumber,
+                roomNumber: currentOrder.roomNumber,
+                items: group.items,
+                notes: currentOrder.notes,
+                specialInstructions: updateData.specialInstructions || currentOrder.specialInstructions,
+                staffInfo: currentOrder.staffInfo,
+                orderType: orderType || currentOrder.orderType,
+                createdAt: currentOrder.createdAt?.toDate?.()?.toISOString() || new Date().toISOString(),
+                isReprint: true,
+                printStationId: group.stationId,
+                printStationName: group.stationName
+              }).catch(err => console.error('KOT reprint Pusher notification error (non-blocking):', err))
+            );
+          }
         }
       } catch (kotError) {
         console.error('KOT reprint error (non-blocking):', kotError);
@@ -12242,24 +12265,30 @@ app.post('/api/orders/:orderId/manual-print', authenticateToken, async (req, res
       // Print KOT
       console.log('🖨️ Manual KOT print request for order:', orderId);
 
-      await pusherService.notifyKOTPrintRequest(order.restaurantId, {
-        id: orderId,
-        kotId: `KOT-${orderId.slice(-6).toUpperCase()}`,
-        dailyOrderId: order.dailyOrderId,
-        orderNumber: order.orderNumber,
-        tableNumber: order.tableNumber,
-        roomNumber: order.roomNumber,
-        items: order.items || [],
-        notes: order.notes || '',
-        specialInstructions: order.specialInstructions || '',
-        staffInfo: order.staffInfo || {},
-        orderType: order.orderType || 'dine-in',
-        createdAt: createdAt.toISOString(),
-        formattedTime,
-        formattedDate,
-        forcePrint: true,  // Force print flag - bypasses local cache check in printer app
-        isReprint: true    // Mark as reprint to bypass duplicate check
-      });
+      const stationGroups = splitOrderByPrintStation(order.items || [], restaurantData.printStations, restaurantData.categories);
+      const kotPromises = stationGroups.map(group =>
+        pusherService.notifyKOTPrintRequest(order.restaurantId, {
+          id: orderId,
+          kotId: `KOT-${orderId.slice(-6).toUpperCase()}`,
+          dailyOrderId: order.dailyOrderId,
+          orderNumber: order.orderNumber,
+          tableNumber: order.tableNumber,
+          roomNumber: order.roomNumber,
+          items: group.items,
+          notes: order.notes || '',
+          specialInstructions: order.specialInstructions || '',
+          staffInfo: order.staffInfo || {},
+          orderType: order.orderType || 'dine-in',
+          createdAt: createdAt.toISOString(),
+          formattedTime,
+          formattedDate,
+          forcePrint: true,
+          isReprint: true,
+          printStationId: group.stationId,
+          printStationName: group.stationName
+        }).catch(err => console.error('KOT manual print error (non-blocking):', err))
+      );
+      await Promise.allSettled(kotPromises);
 
       res.json({
         success: true,
@@ -16195,6 +16224,99 @@ app.put('/api/admin/print-settings/:restaurantId', authenticateToken, async (req
   }
 });
 
+// ============================================================================
+// Print Station CRUD — Manage kitchen/bar/expo print stations
+// ============================================================================
+
+// Get print stations for a restaurant
+app.get('/api/admin/print-stations/:restaurantId', authenticateToken, async (req, res) => {
+  try {
+    if (!(await checkFeaturePermission(req, 'admin', 'print'))) {
+      return res.status(403).json({ error: 'Access denied. Print settings permission required.' });
+    }
+    const { restaurantId } = req.params;
+    const restaurantDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
+    if (!restaurantDoc.exists) {
+      return res.status(404).json({ error: 'Restaurant not found' });
+    }
+    const data = restaurantDoc.data();
+    res.json({
+      success: true,
+      printStations: data.printStations || [],
+      categories: data.categories || []
+    });
+  } catch (error) {
+    console.error('Get print stations error:', error);
+    res.status(500).json({ error: 'Failed to get print stations' });
+  }
+});
+
+// Save print stations for a restaurant (replace-all pattern)
+app.put('/api/admin/print-stations/:restaurantId', authenticateToken, async (req, res) => {
+  try {
+    if (!(await checkFeaturePermission(req, 'admin', 'print'))) {
+      return res.status(403).json({ error: 'Access denied. Print settings permission required.' });
+    }
+    const { restaurantId } = req.params;
+    const { printStations } = req.body;
+
+    if (!Array.isArray(printStations)) {
+      return res.status(400).json({ error: 'printStations must be an array' });
+    }
+
+    const validTypes = ['kitchen', 'bar', 'expo', 'pastry', 'other'];
+    const now = new Date();
+
+    // Sanitize and validate each station
+    const sanitized = printStations.map(station => {
+      const s = {
+        id: (typeof station.id === 'string' && station.id.trim()) ? station.id.trim() : `ps_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+        name: typeof station.name === 'string' ? station.name.trim().slice(0, 50) : 'Unnamed Station',
+        type: validTypes.includes(station.type) ? station.type : 'kitchen',
+        categoryIds: Array.isArray(station.categoryIds) ? station.categoryIds.filter(c => typeof c === 'string') : [],
+        isDefault: Boolean(station.isDefault),
+        enabled: station.enabled !== false,
+        createdAt: station.createdAt || now.toISOString(),
+        updatedAt: now.toISOString()
+      };
+      return s;
+    });
+
+    // Ensure at most one default; if none, mark first as default
+    const defaultCount = sanitized.filter(s => s.isDefault).length;
+    if (defaultCount === 0 && sanitized.length > 0) {
+      sanitized[0].isDefault = true;
+    } else if (defaultCount > 1) {
+      let foundFirst = false;
+      for (const s of sanitized) {
+        if (s.isDefault && !foundFirst) { foundFirst = true; }
+        else if (s.isDefault) { s.isDefault = false; }
+      }
+    }
+
+    await db.collection(collections.restaurants).doc(restaurantId).update({
+      printStations: sanitized,
+      updatedAt: now
+    });
+
+    // Invalidate cache if function exists
+    if (typeof invalidateRestaurantCache === 'function') {
+      invalidateRestaurantCache(restaurantId);
+    }
+
+    console.log(`🖨️ Print stations updated for restaurant ${restaurantId}: ${sanitized.length} stations`);
+
+    res.json({
+      success: true,
+      message: 'Print stations updated successfully',
+      printStations: sanitized
+    });
+  } catch (error) {
+    console.error('Update print stations error:', error);
+    res.status(500).json({ error: 'Failed to update print stations' });
+  }
+});
+
 // Generate invoice for an order
 app.post('/api/invoice/generate/:orderId', authenticateToken, async (req, res) => {
   try {
@@ -16439,6 +16561,56 @@ app.get('/api/invoices/:restaurantId', authenticateToken, async (req, res) => {
   }
 });
 
+// ============================================================================
+// Print Station Routing — Split order items by category → print station
+// ============================================================================
+
+/**
+ * Given order items and print stations, returns an array of
+ * { stationId, stationName, items } groups.
+ * If no print stations configured, returns single group with all items.
+ */
+function splitOrderByPrintStation(orderItems, printStations, restaurantCategories) {
+  if (!printStations || printStations.length === 0 || !orderItems || orderItems.length === 0) {
+    return [{ stationId: null, stationName: null, items: orderItems || [] }];
+  }
+
+  const enabledStations = printStations.filter(s => s.enabled);
+  if (enabledStations.length === 0) {
+    return [{ stationId: null, stationName: null, items: orderItems }];
+  }
+
+  // Build category name → ID lookup
+  const nameToId = {};
+  for (const cat of (restaurantCategories || [])) {
+    if (cat.name) nameToId[cat.name.toLowerCase().trim()] = cat.id;
+  }
+
+  // Build categoryId → station lookup
+  const catToStation = {};
+  let defaultStation = enabledStations.find(s => s.isDefault) || enabledStations[0];
+  for (const station of enabledStations) {
+    for (const catId of (station.categoryIds || [])) {
+      catToStation[catId] = station;
+    }
+  }
+
+  // Group items by resolved station
+  const groups = {};
+  for (const item of orderItems) {
+    const catId = item.categoryId || nameToId[item.category?.toLowerCase()?.trim()] || item.category;
+    const station = catToStation[catId] || defaultStation;
+    if (!station) continue;
+    if (!groups[station.id]) {
+      groups[station.id] = { stationId: station.id, stationName: station.name, items: [] };
+    }
+    groups[station.id].items.push(item);
+  }
+
+  const result = Object.values(groups);
+  return result.length > 0 ? result : [{ stationId: null, stationName: null, items: orderItems }];
+}
+
 // KOT (Kitchen Order Ticket) Management APIs
 
 // Get KOT orders for kitchen - only orders with status 'confirmed' or later, not 'cancelled'
@@ -16632,7 +16804,7 @@ app.patch('/api/kot/:orderId/status', async (req, res) => {
 app.get('/api/kot/pending-print/:restaurantId', async (req, res) => {
   try {
     const { restaurantId } = req.params;
-    const { lastPrintedAt, maxHours } = req.query; // Optional: to get orders after a specific time, and limit fetch window
+    const { lastPrintedAt, maxHours, stationId } = req.query; // Optional: stationId filters items by print station
 
     console.log(`🖨️ KOT Print API - Getting pending print orders for restaurant: ${restaurantId}, maxHours: ${maxHours || 4}`);
 
@@ -16668,11 +16840,32 @@ app.get('/api/kot/pending-print/:restaurantId', async (req, res) => {
 
     const pendingOrders = [];
 
+    // Build print-station filter context if stationId provided
+    const restaurantData = restaurantDoc.exists ? restaurantDoc.data() : {};
+    const printStations = restaurantData.printStations || [];
+    const restaurantCategories = restaurantData.categories || [];
+    let stationFilter = null;
+    if (stationId && printStations.length > 0) {
+      const station = printStations.find(s => s.id === stationId && s.enabled);
+      if (station) {
+        // Build category name → ID lookup
+        const nameToId = {};
+        for (const cat of restaurantCategories) {
+          if (cat.name) nameToId[cat.name.toLowerCase().trim()] = cat.id;
+        }
+        stationFilter = { station, nameToId };
+      }
+    }
+
     for (const doc of ordersSnapshot.docs) {
       const orderData = doc.data();
 
-      // Skip already printed orders
-      if (orderData.kotPrinted === true) {
+      // Per-station printed check: if stationId given, check kotPrintedStations
+      if (stationId && orderData.kotPrintedStations?.[stationId]) {
+        continue;
+      }
+      // Skip already printed orders (backward compat — no station)
+      if (!stationId && orderData.kotPrinted === true) {
         continue;
       }
 
@@ -16683,6 +16876,28 @@ app.get('/api/kot/pending-print/:restaurantId', async (req, res) => {
         if (orderTime <= lastTime) {
           continue;
         }
+      }
+
+      // Filter items by station if requested
+      let items = orderData.items || [];
+      if (stationFilter) {
+        const { station, nameToId } = stationFilter;
+        const stationCatIds = new Set(station.categoryIds || []);
+        items = items.filter(item => {
+          const catId = item.categoryId || nameToId[item.category?.toLowerCase()?.trim()] || item.category;
+          if (stationCatIds.has(catId)) return true;
+          // Default station also gets unassigned items
+          if (station.isDefault) {
+            const allAssigned = new Set();
+            for (const s of printStations.filter(ps => ps.enabled)) {
+              for (const cid of (s.categoryIds || [])) allAssigned.add(cid);
+            }
+            return !allAssigned.has(catId);
+          }
+          return false;
+        });
+        // Skip order entirely if no items match this station
+        if (items.length === 0) continue;
       }
 
       // Format order for printing
@@ -16699,7 +16914,7 @@ app.get('/api/kot/pending-print/:restaurantId', async (req, res) => {
         orderNumber: orderData.orderNumber,
         tableNumber: orderData.tableNumber || '',
         roomNumber: orderData.roomNumber || '',
-        items: orderData.items || [],
+        items,
         notes: orderData.notes || '',
         staffInfo: orderData.staffInfo || {},
         orderType: orderData.orderType || 'dine-in',
@@ -16738,7 +16953,11 @@ app.get('/api/kot/pending-print/:restaurantId', async (req, res) => {
         printBillCopy,                 // Number of bill copies
         billFontScale: printSettings.billFontScale || 100,      // Font scale 50-150
         billFontFamily: printSettings.billFontFamily || 'default' // Font family id
-      }
+      },
+      // Print stations for KOT printer station selector dropdown
+      printStations: printStations.filter(s => s.enabled).map(s => ({
+        id: s.id, name: s.name, type: s.type, isDefault: s.isDefault || false
+      }))
     });
 
   } catch (error) {
@@ -16747,13 +16966,13 @@ app.get('/api/kot/pending-print/:restaurantId', async (req, res) => {
   }
 });
 
-// Mark KOT as printed
+// Mark KOT as printed (supports per-station tracking)
 app.patch('/api/kot/:orderId/printed', async (req, res) => {
   try {
     const { orderId } = req.params;
-    const { printedAt, printedBy } = req.body;
+    const { printedAt, printedBy, stationId } = req.body;
 
-    console.log(`🖨️ Marking order ${orderId} as printed`);
+    console.log(`🖨️ Marking order ${orderId} as printed${stationId ? ` (station: ${stationId})` : ''}`);
 
     const orderRef = db.collection(collections.orders).doc(orderId);
     const orderDoc = await orderRef.get();
@@ -16762,19 +16981,44 @@ app.patch('/api/kot/:orderId/printed', async (req, res) => {
       return res.status(404).json({ error: 'Order not found' });
     }
 
-    await orderRef.update({
-      kotPrinted: true,
-      kotPrintedAt: printedAt ? new Date(printedAt) : new Date(),
+    const now = printedAt ? new Date(printedAt) : new Date();
+    const updateData = {
+      kotPrintedAt: now,
       kotPrintedBy: printedBy || 'kiosk',
       updatedAt: new Date()
-    });
+    };
 
-    console.log(`✅ Order ${orderId} marked as printed`);
+    if (stationId) {
+      // Per-station tracking — mark this station as printed
+      updateData[`kotPrintedStations.${stationId}`] = true;
+
+      // Check if ALL enabled stations are now printed
+      const orderData = orderDoc.data();
+      const restaurantDoc = await db.collection(collections.restaurants).doc(orderData.restaurantId).get();
+      const printStations = restaurantDoc.exists ? (restaurantDoc.data().printStations || []) : [];
+      const enabledStations = printStations.filter(s => s.enabled);
+
+      if (enabledStations.length > 0) {
+        const printedStations = { ...(orderData.kotPrintedStations || {}), [stationId]: true };
+        const allPrinted = enabledStations.every(s => printedStations[s.id]);
+        updateData.kotPrinted = allPrinted;
+      } else {
+        updateData.kotPrinted = true;
+      }
+    } else {
+      // No station — backward compatible, mark entire order as printed
+      updateData.kotPrinted = true;
+    }
+
+    await orderRef.update(updateData);
+
+    console.log(`✅ Order ${orderId} marked as printed${stationId ? ` (station: ${stationId})` : ''}`);
 
     res.json({
       success: true,
       message: 'KOT marked as printed',
-      orderId
+      orderId,
+      stationId: stationId || null
     });
 
   } catch (error) {
@@ -17334,6 +17578,36 @@ app.get('/api/kot/render/:restaurantId/:orderId', async (req, res) => {
     const restaurant = buildRestaurantBlock(restaurantId, restaurantData);
     const kotId = `KOT-${orderDoc.id.slice(-6).toUpperCase()}`;
 
+    // Filter items by print station if stationId provided
+    const { stationId } = req.query;
+    let items = orderData.items || [];
+    let printStationName = null;
+    if (stationId && restaurantData.printStations && restaurantData.printStations.length > 0) {
+      const station = restaurantData.printStations.find(s => s.id === stationId);
+      if (station) {
+        printStationName = station.name;
+        const stationCatIds = new Set(station.categoryIds || []);
+        // Build name→id lookup
+        const nameToId = {};
+        for (const cat of (restaurantData.categories || [])) {
+          if (cat.name) nameToId[cat.name.toLowerCase().trim()] = cat.id;
+        }
+        // Collect all assigned category IDs across all stations
+        const allAssignedCatIds = new Set();
+        for (const s of restaurantData.printStations) {
+          for (const cId of (s.categoryIds || [])) allAssignedCatIds.add(cId);
+        }
+        items = items.filter(item => {
+          const catId = item.categoryId || nameToId[item.category?.toLowerCase()?.trim()] || item.category;
+          // Include if category matches this station
+          if (stationCatIds.has(catId)) return true;
+          // Include unassigned categories if this is the default station
+          if (station.isDefault && !allAssignedCatIds.has(catId)) return true;
+          return false;
+        });
+      }
+    }
+
     res.json({
       success: true,
       restaurant,
@@ -17348,14 +17622,16 @@ app.get('/api/kot/render/:restaurantId/:orderId', async (req, res) => {
         tableNumber: orderData.tableNumber || '',
         roomNumber: orderData.roomNumber || '',
         orderType: orderData.orderType || 'dine-in',
-        items: orderData.items || [],
+        items,
         notes: orderData.notes || '',
         specialInstructions: orderData.specialInstructions || '',
         staffInfo: orderData.staffInfo || null,
         createdAt: createdAtIso,
         formattedDate,
         formattedTime,
-        isReprint: orderData.kotPrinted === true
+        isReprint: orderData.kotPrinted === true,
+        printStationId: stationId || null,
+        printStationName
       }
     });
   } catch (error) {
