@@ -8,7 +8,7 @@ router.use(authenticateToken);
 
 // Helper to categorize a payment method into sales buckets
 function categorizePayment(method, amount, order, buckets) {
-  const isAggregator = ['zomato', 'swiggy', 'aggregator', 'online'].includes(method) || order.orderSource === 'online_order';
+  const isAggregator = ['zomato', 'swiggy', 'aggregator', 'online', 'talabat', 'deliveroo', 'noon_food', 'careem'].includes(method) || ['online_order', 'talabat', 'deliveroo', 'noon_food', 'careem'].includes(order.orderSource);
   const orderTip = parseFloat(order.tipAmount || 0);
 
   if (isAggregator) {
@@ -231,7 +231,7 @@ router.post('/:registerId/close', async (req, res) => {
         });
       } else {
         const method = (order.paymentMethod || 'cash').toLowerCase();
-        const isAggregator = ['zomato', 'swiggy', 'aggregator', 'online'].includes(method) || order.orderSource === 'online_order';
+        const isAggregator = ['zomato', 'swiggy', 'aggregator', 'online', 'talabat', 'deliveroo', 'noon_food', 'careem'].includes(method) || ['online_order', 'talabat', 'deliveroo', 'noon_food', 'careem'].includes(order.orderSource);
 
         if (isAggregator) {
           buckets.aggregatorSales += amount;
@@ -315,6 +315,106 @@ router.get('/:restaurantId/history', async (req, res) => {
   } catch (err) {
     console.error('Register history error:', err);
     res.status(500).json({ error: 'Failed to fetch register history' });
+  }
+});
+
+// ── GET /api/register/:registerId/x-report ────────────────────────
+// Mid-shift X-report — read-only snapshot without closing the register
+router.get('/:registerId/x-report', async (req, res) => {
+  try {
+    const { registerId } = req.params;
+
+    const registerRef = db.collection(collections.cashRegisters).doc(registerId);
+    const registerDoc = await registerRef.get();
+
+    if (!registerDoc.exists) {
+      return res.status(404).json({ error: 'Register not found' });
+    }
+
+    const registerData = registerDoc.data();
+    if (registerData.status !== 'open') {
+      return res.status(400).json({ error: 'Register is not open' });
+    }
+
+    // Fetch orders and compute same buckets as close endpoint
+    const ordersSnap = await db.collection(collections.orders)
+      .where('restaurantId', '==', registerData.restaurantId)
+      .get();
+
+    const buckets = {
+      totalSales: 0, cashSales: 0, cardSales: 0, upiSales: 0,
+      aggregatorSales: 0, otherSales: 0, orderCount: 0,
+      cardTips: 0, serviceChargeCollected: 0,
+    };
+
+    ordersSnap.docs.forEach(doc => {
+      const order = doc.data();
+      if (['cancelled', 'refunded'].includes(order.status)) return;
+
+      let orderTime;
+      if (order.createdAt?.toDate) {
+        orderTime = order.createdAt.toDate();
+      } else if (order.createdAt) {
+        orderTime = new Date(order.createdAt);
+      } else {
+        return;
+      }
+
+      const openedTime = new Date(registerData.openedAt);
+      if (orderTime < openedTime) return;
+
+      const amount = parseFloat(order.finalAmount || order.totalAmount || 0);
+      buckets.totalSales += amount;
+      buckets.orderCount++;
+
+      buckets.serviceChargeCollected += parseFloat(order.serviceChargeAmount || 0);
+
+      if (order.splitPayments && Array.isArray(order.splitPayments) && order.splitPayments.length > 0) {
+        order.splitPayments.forEach(sp => {
+          const method = (sp.method || sp.paymentMethod || 'cash').toLowerCase();
+          const spAmount = parseFloat(sp.amount || 0);
+          categorizePayment(method, spAmount, order, buckets);
+        });
+      } else {
+        const method = (order.paymentMethod || 'cash').toLowerCase();
+        const orderTip = parseFloat(order.tipAmount || 0);
+        const isAggregator = ['zomato', 'swiggy', 'aggregator', 'online', 'talabat', 'deliveroo', 'noon_food', 'careem'].includes(method) || ['online_order', 'talabat', 'deliveroo', 'noon_food', 'careem'].includes(order.orderSource);
+
+        if (isAggregator) {
+          buckets.aggregatorSales += amount;
+        } else if (method === 'cash') {
+          buckets.cashSales += amount;
+        } else if (method === 'card' || method === 'credit_card' || method === 'debit_card') {
+          buckets.cardSales += amount;
+          buckets.cardTips += orderTip;
+        } else if (method === 'upi' || method === 'razorpay') {
+          buckets.upiSales += amount;
+          buckets.cardTips += orderTip;
+        } else {
+          buckets.otherSales += amount;
+        }
+      }
+    });
+
+    const expectedCash = registerData.openingCash + buckets.cashSales + (registerData.cashIn || 0) - (registerData.cashOut || 0);
+
+    res.json({
+      success: true,
+      summary: {
+        ...buckets,
+        openingCash: registerData.openingCash,
+        cashIn: registerData.cashIn || 0,
+        cashOut: registerData.cashOut || 0,
+        cashDrops: registerData.cashDrops || 0,
+        expectedCash,
+        reportGeneratedAt: new Date().toISOString(),
+        operatorName: registerData.operatorName || registerData.openedByName,
+        openedAt: registerData.openedAt,
+      },
+    });
+  } catch (err) {
+    console.error('X-report error:', err);
+    res.status(500).json({ error: 'Failed to generate X-report' });
   }
 });
 

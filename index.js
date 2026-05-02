@@ -388,6 +388,7 @@ function calculatePerItemTax(orderItems, taxSettings, categories, totalDiscount,
 // --- Menu Item ↔ Inventory Linkage Helpers ---
 
 function getInventoryUnitForMenuItem(menuItem) {
+  if (menuItem.stockUnit) return menuItem.stockUnit;
   if (menuItem.bottleSize) return 'bottle';
   if (menuItem.servingUnit) return menuItem.servingUnit;
   if (menuItem.unit) return menuItem.unit;
@@ -914,6 +915,9 @@ const currencyRoutes = require('./routes/currencyRoutes');
 
 // Owner chain dashboard routes
 const ownerDashboardRoutes = require('./routes/ownerDashboard');
+
+// Aggregator integration routes (Talabat, Deliveroo, etc.)
+const aggregatorRoutes = require('./routes/aggregatorRoutes');
 const customerGroupsRoutes = require('./routes/customerGroups');
 const aiInsightsRoutes = require('./routes/aiInsights');
 const superAdminRoutes = require('./routes/superAdmin');
@@ -15784,6 +15788,7 @@ app.use('/api/org-menu', centralMenuRoutes);
 app.use('/api/warehouse', warehouseRoutes);
 app.use('/api/central-kitchen', centralKitchenRoutes);
 app.use('/api/hq-reports', hqReportsRoutes);
+app.use('/api/aggregators', aggregatorRoutes);
 
 // ==================== BUSINESS SETTINGS (for GST invoices) ====================
 
