@@ -16153,6 +16153,21 @@ app.put('/api/admin/print-settings/:restaurantId', authenticateToken, async (req
       const val = parseInt(printSettings.billFontScale);
       sanitizedSettings.billFontScale = isNaN(val) ? 100 : Math.max(50, Math.min(val, 150));
     }
+    // receiptLogo: object with url, position, size, nameAlignment, enabled
+    if (printSettings.receiptLogo !== undefined) {
+      const logo = printSettings.receiptLogo;
+      if (logo && typeof logo === 'object') {
+        sanitizedSettings.receiptLogo = {
+          url: typeof logo.url === 'string' ? logo.url : '',
+          position: ['left', 'center', 'right'].includes(logo.position) ? logo.position : 'center',
+          size: Math.max(40, Math.min(120, parseInt(logo.size) || 60)),
+          nameAlignment: ['left', 'center', 'right'].includes(logo.nameAlignment) ? logo.nameAlignment : 'center',
+          enabled: Boolean(logo.enabled)
+        };
+      } else {
+        sanitizedSettings.receiptLogo = null;
+      }
+    }
 
     const restaurantDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
     if (!restaurantDoc.exists) {
