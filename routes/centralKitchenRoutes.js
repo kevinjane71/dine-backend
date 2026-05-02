@@ -1,16 +1,16 @@
 const express = require('express');
 const router = express.Router();
 const { db, collections } = require('../firebase');
-const { authenticateToken, requireOwnerRole } = require('../middleware/auth');
-const { requireOrgAccess, requireOrgFeature, isRestaurantInOrg, getOrgOutlets, getOwnerId } = require('../middleware/orgAccess');
+const { authenticateToken } = require('../middleware/auth');
+const { requireOrgFeature, isRestaurantInOrg, requireOrgMember, getActorId } = require('../middleware/orgAccess');
 
 // ============================================
 // CENTRAL KITCHEN PRODUCTION & DISTRIBUTION APIs
 // Mounted at /api/central-kitchen
-// All endpoints require owner role + org access + centralKitchen feature
+// All endpoints require authenticateToken + org membership (manager+) + centralKitchen feature
 // ============================================
 
-const ckMiddleware = [authenticateToken, requireOwnerRole, requireOrgAccess, requireOrgFeature('centralKitchen')];
+const ckMiddleware = [authenticateToken, requireOrgMember({ minRole: 'manager' }), requireOrgFeature('centralKitchen')];
 
 // ─── Helper: Generate next production order number ───────────────────────────
 async function generateOrderNumber(orgId) {
@@ -65,7 +65,7 @@ async function createInventoryTransaction(txData) {
  */
 router.post('/:orgId/production-orders', ...ckMiddleware, async (req, res) => {
   try {
-    const userId = getOwnerId(req);
+    const userId = getActorId(req);
     const { orgId } = req.params;
     const { centralKitchenId, recipeId, targetQuantity, unit, scheduledDate, notes } = req.body;
 
@@ -248,7 +248,7 @@ router.patch('/:orgId/production-orders/:orderId/start', ...ckMiddleware, async 
  */
 router.patch('/:orgId/production-orders/:orderId/complete', ...ckMiddleware, async (req, res) => {
   try {
-    const userId = getOwnerId(req);
+    const userId = getActorId(req);
     const { orgId, orderId } = req.params;
     const { producedQuantity } = req.body;
 
@@ -437,7 +437,7 @@ router.patch('/:orgId/production-orders/:orderId/complete', ...ckMiddleware, asy
  */
 router.patch('/:orgId/production-orders/:orderId/cancel', ...ckMiddleware, async (req, res) => {
   try {
-    const userId = getOwnerId(req);
+    const userId = getActorId(req);
     const { orgId, orderId } = req.params;
 
     const doc = await db.collection(collections.productionOrders).doc(orderId).get();
@@ -497,22 +497,26 @@ router.patch('/:orgId/production-orders/:orderId/cancel', ...ckMiddleware, async
  */
 router.post('/:orgId/distribution-plans', ...ckMiddleware, async (req, res) => {
   try {
-    const userId = getOwnerId(req);
+    const userId = getActorId(req);
     const { orgId } = req.params;
     const { productionOrderId, itemName, totalQuantity, unit, allocations } = req.body;
 
-    if (!productionOrderId || !itemName || !totalQuantity || !unit || !allocations || !allocations.length) {
-      return res.status(400).json({ error: 'productionOrderId, itemName, totalQuantity, unit, and allocations are required' });
+    if (!itemName || !totalQuantity || !unit || !allocations || !allocations.length) {
+      return res.status(400).json({ error: 'itemName, totalQuantity, unit, and allocations are required' });
     }
 
-    // Validate production order
-    const poDoc = await db.collection(collections.productionOrders).doc(productionOrderId).get();
-    if (!poDoc.exists) {
-      return res.status(404).json({ error: 'Production order not found' });
-    }
-    const po = poDoc.data();
-    if (po.organizationId !== orgId) {
-      return res.status(403).json({ error: 'Production order does not belong to this organization' });
+    // Validate production order if provided
+    let centralKitchenIdFromPO = null;
+    if (productionOrderId) {
+      const poDoc = await db.collection(collections.productionOrders).doc(productionOrderId).get();
+      if (!poDoc.exists) {
+        return res.status(404).json({ error: 'Production order not found' });
+      }
+      const po = poDoc.data();
+      if (po.organizationId !== orgId) {
+        return res.status(403).json({ error: 'Production order does not belong to this organization' });
+      }
+      centralKitchenIdFromPO = po.centralKitchenId;
     }
 
     // Validate allocation quantities
@@ -531,8 +535,8 @@ router.post('/:orgId/distribution-plans', ...ckMiddleware, async (req, res) => {
 
     const planData = {
       organizationId: orgId,
-      productionOrderId,
-      centralKitchenId: po.centralKitchenId,
+      productionOrderId: productionOrderId || null,
+      centralKitchenId: centralKitchenIdFromPO || req.body.centralKitchenId || null,
       itemName,
       totalQuantity: Number(totalQuantity),
       unit,
@@ -554,11 +558,13 @@ router.post('/:orgId/distribution-plans', ...ckMiddleware, async (req, res) => {
 
     const ref = await db.collection(collections.distributionPlans).add(planData);
 
-    // Link distribution plan to production order
-    await db.collection(collections.productionOrders).doc(productionOrderId).update({
-      distributionPlanId: ref.id,
-      updatedAt: new Date()
-    });
+    // Link distribution plan to production order if provided
+    if (productionOrderId) {
+      await db.collection(collections.productionOrders).doc(productionOrderId).update({
+        distributionPlanId: ref.id,
+        updatedAt: new Date()
+      });
+    }
 
     res.status(201).json({ id: ref.id, ...planData });
   } catch (error) {
@@ -638,7 +644,7 @@ router.get('/:orgId/distribution-plans/:planId', ...ckMiddleware, async (req, re
  */
 router.patch('/:orgId/distribution-plans/:planId/dispatch/:outletId', ...ckMiddleware, async (req, res) => {
   try {
-    const userId = getOwnerId(req);
+    const userId = getActorId(req);
     const { orgId, planId, outletId } = req.params;
 
     const doc = await db.collection(collections.distributionPlans).doc(planId).get();
@@ -732,7 +738,7 @@ router.patch('/:orgId/distribution-plans/:planId/dispatch/:outletId', ...ckMiddl
  */
 router.patch('/:orgId/distribution-plans/:planId/receive/:outletId', ...ckMiddleware, async (req, res) => {
   try {
-    const userId = getOwnerId(req);
+    const userId = getActorId(req);
     const { orgId, planId, outletId } = req.params;
     const { actualReceivedQty } = req.body;
 

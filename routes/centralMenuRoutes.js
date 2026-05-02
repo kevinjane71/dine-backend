@@ -216,7 +216,14 @@ router.delete('/:orgId/templates/:templateId', async (req, res) => {
 router.post('/:orgId/templates/:templateId/items', async (req, res) => {
   try {
     const { orgId, templateId } = req.params;
-    const { name, description, category, basePrice, variants, image, isVeg, tags, isLocked, lockFields, sortOrder } = req.body;
+    const {
+      name, description, category, basePrice, variants, image, images, isVeg, tags,
+      isLocked, lockFields, sortOrder, shortCode, customizations,
+      dineInPrice, takeawayPrice, deliveryPrice, allergens,
+      spiritCategory, ingredients, abv, servingUnit, bottleSize,
+      unit, weight, shelfLife, mfgDate, expiryDate, servingSize, scoopOptions,
+      isStockManaged, stockQuantity, lowStockThreshold,
+    } = req.body;
 
     // Validate template exists and belongs to org
     const templateDoc = await db.collection(collections.orgMenuTemplates).doc(templateId).get();
@@ -256,11 +263,33 @@ router.post('/:orgId/templates/:templateId/items', async (req, res) => {
       basePrice: Number(basePrice),
       variants: variants || [],
       image: image || '',
+      images: images || [],
       isVeg: isVeg !== undefined ? isVeg : true,
       tags: tags || [],
       isLocked: isLocked || false,
       lockFields: lockFields || [],
       sortOrder: sortOrder !== undefined ? sortOrder : 0,
+      shortCode: shortCode || '',
+      customizations: customizations || [],
+      dineInPrice: dineInPrice != null ? Number(dineInPrice) : null,
+      takeawayPrice: takeawayPrice != null ? Number(takeawayPrice) : null,
+      deliveryPrice: deliveryPrice != null ? Number(deliveryPrice) : null,
+      allergens: allergens || [],
+      spiritCategory: spiritCategory || '',
+      ingredients: ingredients || '',
+      abv: abv || '',
+      servingUnit: servingUnit || '',
+      bottleSize: bottleSize || '',
+      unit: unit || '',
+      weight: weight || '',
+      shelfLife: shelfLife || '',
+      mfgDate: mfgDate || null,
+      expiryDate: expiryDate || null,
+      servingSize: servingSize || '',
+      scoopOptions: scoopOptions || '',
+      isStockManaged: isStockManaged || false,
+      stockQuantity: stockQuantity != null ? Number(stockQuantity) : null,
+      lowStockThreshold: lowStockThreshold != null ? Number(lowStockThreshold) : 5,
       status: 'active',
       createdAt: now,
       updatedAt: now,
@@ -295,7 +324,14 @@ router.patch('/:orgId/templates/:templateId/items/:itemId', async (req, res) => 
       return res.status(403).json({ success: false, error: 'Item does not belong to this template or organization' });
     }
 
-    const allowedFields = ['name', 'description', 'category', 'basePrice', 'variants', 'image', 'isVeg', 'tags', 'isLocked', 'lockFields', 'sortOrder'];
+    const allowedFields = [
+      'name', 'description', 'category', 'basePrice', 'variants', 'image', 'images',
+      'isVeg', 'tags', 'isLocked', 'lockFields', 'sortOrder',
+      'shortCode', 'customizations', 'dineInPrice', 'takeawayPrice', 'deliveryPrice',
+      'allergens', 'spiritCategory', 'ingredients', 'abv', 'servingUnit', 'bottleSize',
+      'unit', 'weight', 'shelfLife', 'mfgDate', 'expiryDate', 'servingSize', 'scoopOptions',
+      'isStockManaged', 'stockQuantity', 'lowStockThreshold',
+    ];
     const updates = { updatedAt: new Date().toISOString() };
 
     for (const field of allowedFields) {
@@ -360,6 +396,160 @@ router.delete('/:orgId/templates/:templateId/items/:itemId', async (req, res) =>
 });
 
 // ============================================================
+// Reusable helper: push template items to outlets
+// ============================================================
+async function pushTemplateToOutlets(templateId, outletIds, overwriteExisting = false) {
+  const templateRef = db.collection(collections.orgMenuTemplates).doc(templateId);
+  const templateDoc = await templateRef.get();
+
+  if (!templateDoc.exists) {
+    throw new Error('Template not found');
+  }
+
+  const template = templateDoc.data();
+
+  // Get all active items for this template
+  const itemsSnap = await db.collection(collections.orgMenuItems)
+    .where('templateId', '==', templateId)
+    .where('status', '==', 'active')
+    .get();
+
+  const masterItems = itemsSnap.docs.map(doc => doc.data());
+
+  const results = [];
+  const now = new Date().toISOString();
+
+  for (const outletId of outletIds) {
+    const restaurantRef = db.collection(collections.restaurants).doc(outletId);
+    const restaurantDoc = await restaurantRef.get();
+
+    if (!restaurantDoc.exists) {
+      results.push({ outletId, status: 'error', error: 'Restaurant not found' });
+      continue;
+    }
+
+    const restaurant = restaurantDoc.data();
+    const menuItems = (restaurant.menu && restaurant.menu.items) ? [...restaurant.menu.items] : [];
+
+    let added = 0;
+    let updated = 0;
+    let skipped = 0;
+
+    for (const masterItem of masterItems) {
+      const existingIndex = menuItems.findIndex(mi => mi.orgMenuItemId === masterItem.id);
+
+      if (existingIndex !== -1) {
+        // Item already exists in outlet
+        if (!overwriteExisting) {
+          skipped++;
+          continue;
+        }
+
+        // Overwrite, but keep local price if isLocalOverride is true
+        const existingItem = menuItems[existingIndex];
+        const updatedItem = {
+          ...existingItem,
+          name: masterItem.name,
+          description: masterItem.description,
+          category: masterItem.category,
+          price: existingItem.isLocalOverride ? existingItem.price : masterItem.basePrice,
+          variants: masterItem.variants,
+          image: masterItem.image,
+          images: masterItem.images || [],
+          isVeg: masterItem.isVeg,
+          tags: masterItem.tags,
+          shortCode: masterItem.shortCode || existingItem.shortCode || '',
+          customizations: masterItem.customizations || [],
+          dineInPrice: masterItem.dineInPrice ?? existingItem.dineInPrice ?? null,
+          takeawayPrice: masterItem.takeawayPrice ?? existingItem.takeawayPrice ?? null,
+          deliveryPrice: masterItem.deliveryPrice ?? existingItem.deliveryPrice ?? null,
+          allergens: masterItem.allergens || [],
+          spiritCategory: masterItem.spiritCategory || '',
+          ingredients: masterItem.ingredients || '',
+          abv: masterItem.abv || '',
+          servingUnit: masterItem.servingUnit || '',
+          bottleSize: masterItem.bottleSize || '',
+          unit: masterItem.unit || '',
+          weight: masterItem.weight || '',
+          shelfLife: masterItem.shelfLife || '',
+          mfgDate: masterItem.mfgDate || null,
+          expiryDate: masterItem.expiryDate || null,
+          servingSize: masterItem.servingSize || '',
+          scoopOptions: masterItem.scoopOptions || '',
+          orgMenuItemId: masterItem.id,
+          templateId: templateId,
+          syncedAt: now,
+          localOnly: false,
+        };
+
+        menuItems[existingIndex] = updatedItem;
+        updated++;
+      } else {
+        // New item — add to outlet menu
+        const newItem = {
+          id: masterItem.id + '_' + outletId.substring(0, 6),
+          name: masterItem.name,
+          description: masterItem.description,
+          category: masterItem.category,
+          price: masterItem.basePrice,
+          variants: masterItem.variants,
+          image: masterItem.image,
+          images: masterItem.images || [],
+          isVeg: masterItem.isVeg,
+          tags: masterItem.tags,
+          shortCode: masterItem.shortCode || '',
+          customizations: masterItem.customizations || [],
+          dineInPrice: masterItem.dineInPrice ?? null,
+          takeawayPrice: masterItem.takeawayPrice ?? null,
+          deliveryPrice: masterItem.deliveryPrice ?? null,
+          allergens: masterItem.allergens || [],
+          spiritCategory: masterItem.spiritCategory || '',
+          ingredients: masterItem.ingredients || '',
+          abv: masterItem.abv || '',
+          servingUnit: masterItem.servingUnit || '',
+          bottleSize: masterItem.bottleSize || '',
+          unit: masterItem.unit || '',
+          weight: masterItem.weight || '',
+          shelfLife: masterItem.shelfLife || '',
+          mfgDate: masterItem.mfgDate || null,
+          expiryDate: masterItem.expiryDate || null,
+          servingSize: masterItem.servingSize || '',
+          scoopOptions: masterItem.scoopOptions || '',
+          isAvailable: true,
+          orgMenuItemId: masterItem.id,
+          templateId: templateId,
+          syncedAt: now,
+          localOnly: false,
+        };
+
+        menuItems.push(newItem);
+        added++;
+      }
+    }
+
+    // Write updated menu back to restaurant
+    await restaurantRef.update({
+      'menu.items': menuItems,
+      'menu.lastUpdated': now,
+    });
+
+    results.push({ outletId, status: 'success', added, updated, skipped });
+  }
+
+  // Update template metadata
+  const existingOutlets = template.assignedOutlets || [];
+  const allOutlets = [...new Set([...existingOutlets, ...outletIds])];
+
+  await templateRef.update({
+    assignedOutlets: allOutlets,
+    lastPushedAt: now,
+    updatedAt: now,
+  });
+
+  return { results, template };
+}
+
+// ============================================================
 // 9. POST /:orgId/templates/:templateId/push — Push template to outlets (CORE)
 // ============================================================
 router.post('/:orgId/templates/:templateId/push', async (req, res) => {
@@ -371,127 +561,24 @@ router.post('/:orgId/templates/:templateId/push', async (req, res) => {
       return res.status(400).json({ success: false, error: 'outletIds array is required and must not be empty' });
     }
 
-    // Validate template
-    const templateRef = db.collection(collections.orgMenuTemplates).doc(templateId);
-    const templateDoc = await templateRef.get();
-
+    // Validate template belongs to org
+    const templateDoc = await db.collection(collections.orgMenuTemplates).doc(templateId).get();
     if (!templateDoc.exists) {
       return res.status(404).json({ success: false, error: 'Template not found' });
     }
-
-    const template = templateDoc.data();
-
-    if (template.organizationId !== orgId) {
+    if (templateDoc.data().organizationId !== orgId) {
       return res.status(403).json({ success: false, error: 'Template does not belong to this organization' });
     }
 
     // Validate all outlets belong to org
     for (const outletId of outletIds) {
-      const belongs = await isRestaurantInOrg(outletId, orgId);
+      const belongs = await isRestaurantInOrg(orgId, outletId);
       if (!belongs) {
         return res.status(403).json({ success: false, error: `Outlet ${outletId} does not belong to this organization` });
       }
     }
 
-    // Get all active items for this template
-    const itemsSnap = await db.collection(collections.orgMenuItems)
-      .where('templateId', '==', templateId)
-      .where('status', '==', 'active')
-      .get();
-
-    const masterItems = itemsSnap.docs.map(doc => doc.data());
-
-    const results = [];
-    const now = new Date().toISOString();
-
-    for (const outletId of outletIds) {
-      const restaurantRef = db.collection(collections.restaurants).doc(outletId);
-      const restaurantDoc = await restaurantRef.get();
-
-      if (!restaurantDoc.exists) {
-        results.push({ outletId, status: 'error', error: 'Restaurant not found' });
-        continue;
-      }
-
-      const restaurant = restaurantDoc.data();
-      const menuItems = (restaurant.menu && restaurant.menu.items) ? [...restaurant.menu.items] : [];
-
-      let added = 0;
-      let updated = 0;
-      let skipped = 0;
-
-      for (const masterItem of masterItems) {
-        const existingIndex = menuItems.findIndex(mi => mi.orgMenuItemId === masterItem.id);
-
-        if (existingIndex !== -1) {
-          // Item already exists in outlet
-          if (!overwriteExisting) {
-            skipped++;
-            continue;
-          }
-
-          // Overwrite, but keep local price if isLocalOverride is true
-          const existingItem = menuItems[existingIndex];
-          const updatedItem = {
-            ...existingItem,
-            name: masterItem.name,
-            description: masterItem.description,
-            category: masterItem.category,
-            price: existingItem.isLocalOverride ? existingItem.price : masterItem.basePrice,
-            variants: masterItem.variants,
-            image: masterItem.image,
-            isVeg: masterItem.isVeg,
-            tags: masterItem.tags,
-            orgMenuItemId: masterItem.id,
-            templateId: templateId,
-            syncedAt: now,
-            localOnly: false,
-          };
-
-          menuItems[existingIndex] = updatedItem;
-          updated++;
-        } else {
-          // New item — add to outlet menu
-          const newItem = {
-            id: masterItem.id + '_' + outletId.substring(0, 6),
-            name: masterItem.name,
-            description: masterItem.description,
-            category: masterItem.category,
-            price: masterItem.basePrice,
-            variants: masterItem.variants,
-            image: masterItem.image,
-            isVeg: masterItem.isVeg,
-            tags: masterItem.tags,
-            isAvailable: true,
-            orgMenuItemId: masterItem.id,
-            templateId: templateId,
-            syncedAt: now,
-            localOnly: false,
-          };
-
-          menuItems.push(newItem);
-          added++;
-        }
-      }
-
-      // Write updated menu back to restaurant
-      await restaurantRef.update({
-        'menu.items': menuItems,
-        'menu.lastUpdated': now,
-      });
-
-      results.push({ outletId, status: 'success', added, updated, skipped });
-    }
-
-    // Update template metadata
-    const existingOutlets = template.assignedOutlets || [];
-    const allOutlets = [...new Set([...existingOutlets, ...outletIds])];
-
-    await templateRef.update({
-      assignedOutlets: allOutlets,
-      lastPushedAt: now,
-      updatedAt: now,
-    });
+    const { results, template } = await pushTemplateToOutlets(templateId, outletIds, overwriteExisting);
 
     // Log to audit
     const auditRef = db.collection(collections.orgAuditLog).doc();
@@ -505,7 +592,7 @@ router.post('/:orgId/templates/:templateId/push', async (req, res) => {
       overwriteExisting: overwriteExisting || false,
       results,
       performedBy: req.user.uid,
-      performedAt: now,
+      performedAt: new Date().toISOString(),
     });
 
     return res.json({
@@ -591,8 +678,27 @@ router.post('/:orgId/templates/:templateId/sync', async (req, res) => {
             price: (existingItem.isLocalOverride && !masterItem.isLocked) ? existingItem.price : masterItem.basePrice,
             variants: masterItem.variants,
             image: masterItem.image,
+            images: masterItem.images || [],
             isVeg: masterItem.isVeg,
             tags: masterItem.tags,
+            shortCode: masterItem.shortCode || existingItem.shortCode || '',
+            customizations: masterItem.customizations || [],
+            dineInPrice: masterItem.dineInPrice ?? existingItem.dineInPrice ?? null,
+            takeawayPrice: masterItem.takeawayPrice ?? existingItem.takeawayPrice ?? null,
+            deliveryPrice: masterItem.deliveryPrice ?? existingItem.deliveryPrice ?? null,
+            allergens: masterItem.allergens || [],
+            spiritCategory: masterItem.spiritCategory || '',
+            ingredients: masterItem.ingredients || '',
+            abv: masterItem.abv || '',
+            servingUnit: masterItem.servingUnit || '',
+            bottleSize: masterItem.bottleSize || '',
+            unit: masterItem.unit || '',
+            weight: masterItem.weight || '',
+            shelfLife: masterItem.shelfLife || '',
+            mfgDate: masterItem.mfgDate || null,
+            expiryDate: masterItem.expiryDate || null,
+            servingSize: masterItem.servingSize || '',
+            scoopOptions: masterItem.scoopOptions || '',
             syncedAt: now,
           };
 
@@ -670,7 +776,9 @@ router.get('/:orgId/sync-status', async (req, res) => {
     const outlets = await getOrgOutlets(orgId);
     const outletStatuses = [];
 
-    for (const outletId of outlets) {
+    for (const outlet of outlets) {
+      const outletId = outlet.id;
+      if (!outletId) continue;
       const restaurantDoc = await db.collection(collections.restaurants).doc(outletId).get();
 
       if (!restaurantDoc.exists) {
@@ -768,7 +876,7 @@ router.post('/:orgId/import-from-outlet/:restaurantId', async (req, res) => {
     const { orgId, restaurantId } = req.params;
 
     // Validate restaurant belongs to org
-    const belongs = await isRestaurantInOrg(restaurantId, orgId);
+    const belongs = await isRestaurantInOrg(orgId, restaurantId);
     if (!belongs) {
       return res.status(403).json({ success: false, error: 'Restaurant does not belong to this organization' });
     }
@@ -834,8 +942,30 @@ router.post('/:orgId/import-from-outlet/:restaurantId', async (req, res) => {
         basePrice: menuItem.price || 0,
         variants: menuItem.variants || [],
         image: menuItem.image || '',
+        images: menuItem.images || [],
         isVeg: menuItem.isVeg !== undefined ? menuItem.isVeg : true,
         tags: menuItem.tags || [],
+        shortCode: menuItem.shortCode || '',
+        customizations: menuItem.customizations || [],
+        dineInPrice: menuItem.dineInPrice ?? null,
+        takeawayPrice: menuItem.takeawayPrice ?? null,
+        deliveryPrice: menuItem.deliveryPrice ?? null,
+        allergens: menuItem.allergens || [],
+        spiritCategory: menuItem.spiritCategory || '',
+        ingredients: menuItem.ingredients || '',
+        abv: menuItem.abv || '',
+        servingUnit: menuItem.servingUnit || '',
+        bottleSize: menuItem.bottleSize || '',
+        unit: menuItem.unit || '',
+        weight: menuItem.weight || '',
+        shelfLife: menuItem.shelfLife || '',
+        mfgDate: menuItem.mfgDate || null,
+        expiryDate: menuItem.expiryDate || null,
+        servingSize: menuItem.servingSize || '',
+        scoopOptions: menuItem.scoopOptions || '',
+        isStockManaged: menuItem.isStockManaged || false,
+        stockQuantity: menuItem.stockQuantity ?? null,
+        lowStockThreshold: menuItem.lowStockThreshold ?? 5,
         isLocked: false,
         lockFields: [],
         sortOrder: menuItem.sortOrder || 0,
@@ -876,3 +1006,4 @@ router.post('/:orgId/import-from-outlet/:restaurantId', async (req, res) => {
 });
 
 module.exports = router;
+module.exports.pushTemplateToOutlets = pushTemplateToOutlets;

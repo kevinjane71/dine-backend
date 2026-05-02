@@ -2,7 +2,8 @@ const express = require('express');
 const router = express.Router();
 const { db, collections } = require('../firebase');
 const { authenticateToken, requireOwnerRole } = require('../middleware/auth');
-const { requireOrgAccess, getOwnerId, getOrgOutlets } = require('../middleware/orgAccess');
+const { requireOrgAccess, getOwnerId, getOrgOutlets, requireOrgMember } = require('../middleware/orgAccess');
+const { pushTemplateToOutlets } = require('./centralMenuRoutes');
 
 // ============================================
 // ORGANIZATION / CHAIN MANAGEMENT APIs
@@ -124,7 +125,7 @@ router.get('/', authenticateToken, requireOwnerRole, async (req, res) => {
  * GET /api/organizations/:orgId
  * Get organization detail with outlet information
  */
-router.get('/:orgId', authenticateToken, requireOwnerRole, requireOrgAccess, async (req, res) => {
+router.get('/:orgId', authenticateToken, requireOrgMember({ minRole: 'manager' }), async (req, res) => {
   try {
     const outlets = await getOrgOutlets(req.org.id);
 
@@ -245,9 +246,52 @@ router.post('/:orgId/outlets', authenticateToken, requireOwnerRole, requireOrgAc
       createdAt: new Date()
     });
 
+    // Auto-push: find org's active template and push to the new outlet
+    let menuAutoPushed = false;
+    let templateName = null;
+    try {
+      const templatesSnap = await db.collection(collections.orgMenuTemplates)
+        .where('organizationId', '==', req.org.id)
+        .where('status', '==', 'active')
+        .limit(1)
+        .get();
+
+      if (!templatesSnap.empty) {
+        const templateDoc = templatesSnap.docs[0];
+        const templateId = templateDoc.id;
+        templateName = templateDoc.data().name;
+        const hasDefaultMenu = restaurant.hasDefaultMenu === true;
+
+        const { results } = await pushTemplateToOutlets(templateId, [restaurantId], hasDefaultMenu);
+
+        // Clear hasDefaultMenu flag if it was set
+        if (hasDefaultMenu) {
+          await db.collection(collections.restaurants).doc(restaurantId).update({
+            hasDefaultMenu: false,
+          });
+        }
+
+        menuAutoPushed = true;
+
+        // Audit log for auto-push
+        await db.collection(collections.orgAuditLog).add({
+          organizationId: req.org.id,
+          action: 'MENU_AUTO_PUSHED',
+          performedBy: userId,
+          details: { restaurantId, templateId, templateName, results, hadDefaultMenu: hasDefaultMenu },
+          createdAt: new Date()
+        });
+      }
+    } catch (pushErr) {
+      console.error('Auto-push menu failed (non-blocking):', pushErr);
+      // Auto-push failure is non-blocking — outlet is still added
+    }
+
     res.json({
       success: true,
-      message: `${restaurant.name} added as ${type}`
+      message: `${restaurant.name} added as ${type}`,
+      menuAutoPushed,
+      templateName,
     });
   } catch (error) {
     console.error('Add outlet error:', error);
@@ -355,7 +399,7 @@ router.patch('/:orgId/outlets/:restaurantId/type', authenticateToken, requireOwn
  * GET /api/organizations/:orgId/outlets
  * List all outlets grouped by type
  */
-router.get('/:orgId/outlets', authenticateToken, requireOwnerRole, requireOrgAccess, async (req, res) => {
+router.get('/:orgId/outlets', authenticateToken, requireOrgMember({ minRole: 'manager' }), async (req, res) => {
   try {
     const outlets = await getOrgOutlets(req.org.id);
 

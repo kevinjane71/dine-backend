@@ -1,16 +1,16 @@
 const express = require('express');
 const router = express.Router();
 const { db, collections } = require('../firebase');
-const { authenticateToken, requireOwnerRole } = require('../middleware/auth');
-const { requireOrgAccess, requireOrgFeature, isRestaurantInOrg, getOrgOutlets, getOwnerId } = require('../middleware/orgAccess');
+const { authenticateToken } = require('../middleware/auth');
+const { requireOrgFeature, isRestaurantInOrg, requireOrgMember, getActorId } = require('../middleware/orgAccess');
 
 // ============================================
 // CENTRAL WAREHOUSE + INDENT SYSTEM
 // Mounted at /api/warehouse
-// All endpoints require authenticateToken, requireOwnerRole, requireOrgAccess, requireOrgFeature('centralWarehouse')
+// All endpoints require authenticateToken + org membership (manager+) + centralWarehouse feature
 // ============================================
 
-const commonMiddleware = [authenticateToken, requireOwnerRole, requireOrgAccess, requireOrgFeature('centralWarehouse')];
+const commonMiddleware = [authenticateToken, requireOrgMember({ minRole: 'manager' }), requireOrgFeature('centralWarehouse')];
 
 // -------------------------------------------------------
 // Helper: Generate sequential indent number
@@ -44,7 +44,7 @@ async function generateIndentNumber(orgId) {
 router.post('/:orgId/indents', ...commonMiddleware, async (req, res) => {
   try {
     const { orgId } = req.params;
-    const userId = getOwnerId(req);
+    const userId = getActorId(req);
     const { requestingOutletId, warehouseId, items, priority, deliveryNotes } = req.body;
 
     // Validate required fields
@@ -215,7 +215,7 @@ router.get('/:orgId/indents/:indentId', ...commonMiddleware, async (req, res) =>
 router.patch('/:orgId/indents/:indentId/receive', ...commonMiddleware, async (req, res) => {
   try {
     const { orgId, indentId } = req.params;
-    const userId = getOwnerId(req);
+    const userId = getActorId(req);
     const { items } = req.body;
 
     if (!items || !Array.isArray(items) || items.length === 0) {
@@ -370,7 +370,7 @@ router.patch('/:orgId/indents/:indentId/receive', ...commonMiddleware, async (re
 router.delete('/:orgId/indents/:indentId', ...commonMiddleware, async (req, res) => {
   try {
     const { orgId, indentId } = req.params;
-    const userId = getOwnerId(req);
+    const userId = getActorId(req);
 
     const indentDoc = await db.collection(collections.indentRequests).doc(indentId).get();
     if (!indentDoc.exists) {
@@ -416,7 +416,7 @@ router.delete('/:orgId/indents/:indentId', ...commonMiddleware, async (req, res)
 router.patch('/:orgId/indents/:indentId/approve', ...commonMiddleware, async (req, res) => {
   try {
     const { orgId, indentId } = req.params;
-    const userId = getOwnerId(req);
+    const userId = getActorId(req);
     const { items } = req.body;
 
     if (!items || !Array.isArray(items) || items.length === 0) {
@@ -487,7 +487,7 @@ router.patch('/:orgId/indents/:indentId/approve', ...commonMiddleware, async (re
 router.patch('/:orgId/indents/:indentId/reject', ...commonMiddleware, async (req, res) => {
   try {
     const { orgId, indentId } = req.params;
-    const userId = getOwnerId(req);
+    const userId = getActorId(req);
     const { reason } = req.body;
 
     if (!reason || !reason.trim()) {
@@ -539,7 +539,7 @@ router.patch('/:orgId/indents/:indentId/reject', ...commonMiddleware, async (req
 router.patch('/:orgId/indents/:indentId/pick', ...commonMiddleware, async (req, res) => {
   try {
     const { orgId, indentId } = req.params;
-    const userId = getOwnerId(req);
+    const userId = getActorId(req);
 
     const indentDoc = await db.collection(collections.indentRequests).doc(indentId).get();
     if (!indentDoc.exists) {
@@ -585,7 +585,7 @@ router.patch('/:orgId/indents/:indentId/pick', ...commonMiddleware, async (req, 
 router.patch('/:orgId/indents/:indentId/dispatch', ...commonMiddleware, async (req, res) => {
   try {
     const { orgId, indentId } = req.params;
-    const userId = getOwnerId(req);
+    const userId = getActorId(req);
     const { items } = req.body;
 
     if (!items || !Array.isArray(items) || items.length === 0) {

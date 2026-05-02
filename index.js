@@ -78,22 +78,46 @@ const upload = lazyInit(() => {
 const bucket = lazyInit(() => {
   const { Storage } = require('@google-cloud/storage');
   let storage;
-  try {
-    const credentialsJson = process.env.GOOGLE_APPLICATION_CREDENTIALS_JSON;
-    if (credentialsJson && credentialsJson !== 'undefined') {
-      const serviceAccount = JSON.parse(credentialsJson);
+
+  // Try multiple credential sources in order of preference
+  const credentialsJson = process.env.GOOGLE_APPLICATION_CREDENTIALS_JSON;
+  const fbClientEmail = process.env.FIREBASE_CLIENT_EMAIL;
+  const fbPrivateKey = process.env.FIREBASE_PRIVATE_KEY;
+  const fbProjectId = process.env.FIREBASE_PROJECT_ID;
+
+  if (credentialsJson && credentialsJson !== 'undefined') {
+    try {
+      const cleaned = credentialsJson.trim().replace(/^["']|["']$/g, '');
+      const serviceAccount = JSON.parse(cleaned);
+      console.log('✅ GCS Storage initialized with GOOGLE_APPLICATION_CREDENTIALS_JSON');
       storage = new Storage({
         projectId: serviceAccount.project_id,
         credentials: { client_email: serviceAccount.client_email, private_key: serviceAccount.private_key }
       });
-    } else {
-      // Fall back to ADC (works in production via GOOGLE_APPLICATION_CREDENTIALS file)
-      storage = new Storage();
+    } catch (e) {
+      console.warn('⚠️ Failed to parse GOOGLE_APPLICATION_CREDENTIALS_JSON:', e.message);
+      // Fall through to try FIREBASE_* env vars
     }
-  } catch (e) {
-    console.error('⚠️ Failed to init Storage with JSON creds, falling back to ADC:', e.message);
+  }
+
+  // Fallback: use individual FIREBASE_CLIENT_EMAIL + FIREBASE_PRIVATE_KEY env vars
+  if (!storage && fbClientEmail && fbPrivateKey) {
+    console.log('✅ GCS Storage initialized with FIREBASE_CLIENT_EMAIL/FIREBASE_PRIVATE_KEY');
+    storage = new Storage({
+      projectId: fbProjectId || 'ascendant-idea-443107-f8',
+      credentials: {
+        client_email: fbClientEmail,
+        private_key: fbPrivateKey.replace(/\\n/g, '\n'),
+      }
+    });
+  }
+
+  // Last resort: ADC (only works locally or on GCP)
+  if (!storage) {
+    console.warn('⚠️ No GCS credentials found, falling back to ADC');
     storage = new Storage();
   }
+
   return storage.bucket(process.env.FIREBASE_STORAGE_BUCKET || 'dine-menu-uploads');
 });
 
@@ -907,6 +931,7 @@ const payrollRoutes = require('./routes/payroll');
 const gstRoutes = require('./routes/gstReports');
 const ledgerRoutes = require('./routes/ledger');
 const spaceBookingRoutes = require('./routes/spaceBooking');
+const registerRoutes = require('./routes/registerRoutes');
 
 // Chain / Enterprise Module
 const organizationRoutes = require('./routes/organizationRoutes');
@@ -15720,6 +15745,9 @@ app.use('/api/attendance', attendanceRoutes);
 app.use('/api/payroll', payrollRoutes);
 app.use('/api/gst', gstRoutes);
 app.use('/api/ledger', ledgerRoutes);
+
+// ==================== CASH REGISTER / SHIFT MANAGEMENT ====================
+app.use('/api/register', registerRoutes);
 
 // ==================== CHAIN / ENTERPRISE MODULE ====================
 app.use('/api/organizations', organizationRoutes);

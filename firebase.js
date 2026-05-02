@@ -151,7 +151,9 @@ const collections = {
   productionOrders: 'productionOrders',
   distributionPlans: 'distributionPlans',
   orgAuditLog: 'orgAuditLog',
-  orgSettings: 'orgSettings'
+  orgSettings: 'orgSettings',
+  // Cash Register / Shift Management
+  cashRegisters: 'cashRegisters'
 };
 
 const admin = null; // We don't need the legacy admin object anymore

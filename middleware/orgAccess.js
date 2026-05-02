@@ -60,6 +60,91 @@ function requireOrgFeature(featureKey) {
 }
 
 /**
+ * Returns the acting user's ID for audit/createdBy fields.
+ * Unlike getOwnerId (which returns the actual owner for admin co-owners),
+ * this always returns the person performing the action.
+ */
+function getActorId(req) {
+  return req.user.userId || req.user.id;
+}
+
+/**
+ * Middleware factory: Verify user is a member of the organization.
+ * Replaces requireOwnerRole + requireOrgAccess for routes that staff should access.
+ *
+ * - Owner/admin: checks org.ownerId match (same as requireOrgAccess)
+ * - Staff (manager+): checks their restaurant belongs to this org
+ *
+ * Sets req.org, and for staff also sets req.staffRestaurantId + req.staffOutletType.
+ *
+ * @param {Object} options
+ * @param {string} options.minRole - Minimum role required (default: 'manager')
+ */
+function requireOrgMember(options = {}) {
+  const minRole = options.minRole || 'manager';
+  const roleLevels = { owner: 4, admin: 3, manager: 2, cashier: 1, waiter: 1, employee: 1, sales: 1 };
+
+  return async (req, res, next) => {
+    try {
+      const orgId = req.params.orgId;
+      if (!orgId) {
+        return res.status(400).json({ error: 'Organization ID required' });
+      }
+
+      const orgDoc = await db.collection(collections.organizations).doc(orgId).get();
+      if (!orgDoc.exists) {
+        return res.status(404).json({ error: 'Organization not found' });
+      }
+
+      const org = orgDoc.data();
+      const userRole = req.user.role;
+
+      // Owner/admin path — same as existing requireOrgAccess
+      if (userRole === 'owner' || userRole === 'admin') {
+        const ownerId = getOwnerId(req);
+        if (org.ownerId !== ownerId) {
+          return res.status(403).json({ error: 'Access denied. Not a member of this organization.' });
+        }
+        req.org = { id: orgDoc.id, ...org };
+        return next();
+      }
+
+      // Staff path — check role level
+      const userLevel = roleLevels[userRole] || 0;
+      const minLevel = roleLevels[minRole] || 2;
+      if (userLevel < minLevel) {
+        return res.status(403).json({ error: `Access denied. Minimum role '${minRole}' required.` });
+      }
+
+      // Staff must have a restaurant assignment
+      const staffRestaurantId = req.user.restaurantId;
+      if (!staffRestaurantId) {
+        return res.status(403).json({ error: 'Access denied. No restaurant assignment found.' });
+      }
+
+      // Verify staff's restaurant belongs to this org
+      const restaurantDoc = await db.collection(collections.restaurants).doc(staffRestaurantId).get();
+      if (!restaurantDoc.exists) {
+        return res.status(403).json({ error: 'Access denied. Restaurant not found.' });
+      }
+
+      const restaurantData = restaurantDoc.data();
+      if (restaurantData.organizationId !== orgId) {
+        return res.status(403).json({ error: 'Access denied. Your restaurant is not part of this organization.' });
+      }
+
+      req.org = { id: orgDoc.id, ...org };
+      req.staffRestaurantId = staffRestaurantId;
+      req.staffOutletType = restaurantData.outletType || 'outlet';
+      return next();
+    } catch (error) {
+      console.error('Org member check error:', error.message);
+      return res.status(500).json({ error: 'Failed to verify organization membership' });
+    }
+  };
+}
+
+/**
  * Helper: Verify that a restaurant belongs to the organization.
  * @param {string} orgId
  * @param {string} restaurantId
@@ -99,7 +184,9 @@ async function getOrgOutlets(orgId) {
 module.exports = {
   requireOrgAccess,
   requireOrgFeature,
+  requireOrgMember,
   isRestaurantInOrg,
   getOrgOutlets,
-  getOwnerId
+  getOwnerId,
+  getActorId
 };

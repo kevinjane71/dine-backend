@@ -702,8 +702,594 @@ router.get('/:orgId/outlet-ranking', ...reportMiddleware, async (req, res) => {
   }
 });
 
+// ─── Helper: Normalize payment method to bucket ─────────────────────────────
+function normalizePaymentMethod(method, order) {
+  const m = (method || 'cash').toLowerCase();
+  const isAgg = ['zomato', 'swiggy', 'aggregator', 'online'].includes(m) || order.orderSource === 'online_order';
+  if (isAgg) return 'aggregator';
+  if (m === 'cash') return 'cash';
+  if (['card', 'credit_card', 'debit_card'].includes(m)) return 'card';
+  if (['upi', 'razorpay', 'phonepe', 'gpay', 'paytm'].includes(m)) return 'upi';
+  return 'other';
+}
+
+// ─── Helper: Normalize order/service type ────────────────────────────────────
+function normalizeServiceType(order) {
+  const t = (order.orderType || order.type || 'dine_in').toLowerCase();
+  if (['dine_in', 'dine-in', 'dinein'].includes(t)) return 'dine_in';
+  if (['takeaway', 'take_away', 'take-away', 'pickup'].includes(t)) return 'takeaway';
+  if (['delivery', 'home_delivery'].includes(t)) return 'delivery';
+  if (order.orderSource === 'online_order') return 'aggregator';
+  return 'dine_in';
+}
+
 // ═══════════════════════════════════════════════
-//  8. GET /:orgId/export/:reportType
+//  8. GET /:orgId/sales-summary
+//     Comprehensive sales breakdown
+// ═══════════════════════════════════════════════
+router.get('/:orgId/sales-summary', ...reportMiddleware, async (req, res) => {
+  try {
+    const { orgId } = req.params;
+    const { startDate, endDate } = parseDateRange(req.query);
+    const outlets = await getOrgOutlets(orgId);
+
+    const paymentBuckets = { cash: { count: 0, amount: 0 }, card: { count: 0, amount: 0 }, upi: { count: 0, amount: 0 }, aggregator: { count: 0, amount: 0 }, other: { count: 0, amount: 0 } };
+    const serviceBuckets = { dine_in: { count: 0, amount: 0 }, takeaway: { count: 0, amount: 0 }, delivery: { count: 0, amount: 0 }, aggregator: { count: 0, amount: 0 } };
+    const dailyMap = {};
+    const hourMap = {};
+    let totalRevenue = 0, totalOrders = 0, totalTips = 0, totalServiceCharge = 0;
+    const outletResults = [];
+
+    const outletPromises = outlets.map(async (outlet) => {
+      const orders = await getOutletOrders(outlet.id, startDate, endDate);
+      let outletRevenue = 0, outletOrders = orders.length;
+
+      orders.forEach(order => {
+        const revenue = getOrderRevenue(order);
+        totalRevenue += revenue;
+        outletRevenue += revenue;
+        totalOrders++;
+        totalTips += Number(order.tipAmount) || 0;
+        totalServiceCharge += Number(order.serviceChargeAmount) || 0;
+
+        // Payment breakdown
+        if (order.splitPayments && Array.isArray(order.splitPayments) && order.splitPayments.length > 0) {
+          order.splitPayments.forEach(sp => {
+            const bucket = normalizePaymentMethod(sp.method || sp.paymentMethod, order);
+            paymentBuckets[bucket].count++;
+            paymentBuckets[bucket].amount += Number(sp.amount) || 0;
+          });
+        } else {
+          const bucket = normalizePaymentMethod(order.paymentMethod, order);
+          paymentBuckets[bucket].count++;
+          paymentBuckets[bucket].amount += revenue;
+        }
+
+        // Service type
+        const svcType = normalizeServiceType(order);
+        serviceBuckets[svcType].count++;
+        serviceBuckets[svcType].amount += revenue;
+
+        // Daily trend
+        const orderDate = order.createdAt ? (order.createdAt.toDate ? order.createdAt.toDate() : new Date(order.createdAt)) : null;
+        if (orderDate) {
+          const dayKey = `${orderDate.getFullYear()}-${String(orderDate.getMonth() + 1).padStart(2, '0')}-${String(orderDate.getDate()).padStart(2, '0')}`;
+          if (!dailyMap[dayKey]) dailyMap[dayKey] = { date: dayKey, revenue: 0, orderCount: 0 };
+          dailyMap[dayKey].revenue += revenue;
+          dailyMap[dayKey].orderCount++;
+
+          // Peak hours
+          const hour = orderDate.getHours();
+          const hourKey = `${String(hour).padStart(2, '0')}:00`;
+          if (!hourMap[hourKey]) hourMap[hourKey] = { hour: hourKey, orderCount: 0, revenue: 0 };
+          hourMap[hourKey].orderCount++;
+          hourMap[hourKey].revenue += revenue;
+        }
+      });
+
+      outletResults.push({
+        outletId: outlet.id,
+        outletName: outlet.name,
+        revenue: Math.round(outletRevenue * 100) / 100,
+        orderCount: outletOrders,
+        avgTicketSize: outletOrders > 0 ? Math.round((outletRevenue / outletOrders) * 100) / 100 : 0,
+      });
+    });
+
+    await Promise.all(outletPromises);
+
+    const round = v => Math.round(v * 100) / 100;
+    const paymentBreakdown = Object.entries(paymentBuckets).map(([method, d]) => ({
+      method, count: d.count, amount: round(d.amount), percentage: totalRevenue > 0 ? round((d.amount / totalRevenue) * 100) : 0,
+    })).filter(p => p.count > 0 || p.amount > 0);
+
+    const serviceTypeBreakdown = Object.entries(serviceBuckets).map(([type, d]) => ({
+      type, count: d.count, amount: round(d.amount), percentage: totalRevenue > 0 ? round((d.amount / totalRevenue) * 100) : 0,
+    })).filter(s => s.count > 0);
+
+    const dailyTrend = Object.values(dailyMap).map(d => ({ ...d, revenue: round(d.revenue) })).sort((a, b) => a.date.localeCompare(b.date));
+    const peakHours = Object.values(hourMap).map(h => ({ ...h, revenue: round(h.revenue) })).sort((a, b) => b.orderCount - a.orderCount).slice(0, 8);
+    outletResults.sort((a, b) => b.revenue - a.revenue);
+
+    return res.json({
+      success: true,
+      startDate: startDate.toISOString(),
+      endDate: endDate.toISOString(),
+      summary: { totalRevenue: round(totalRevenue), totalOrders, avgTicketSize: totalOrders > 0 ? round(totalRevenue / totalOrders) : 0, totalTips: round(totalTips), totalServiceCharge: round(totalServiceCharge) },
+      paymentBreakdown,
+      serviceTypeBreakdown,
+      dailyTrend,
+      peakHours,
+      outletBreakdown: outletResults,
+    });
+  } catch (error) {
+    console.error('Sales summary error:', error.message);
+    return res.status(500).json({ success: false, error: 'Failed to generate sales summary' });
+  }
+});
+
+// ═══════════════════════════════════════════════
+//  9. GET /:orgId/staff-performance
+//     Per-staff sales, orders, tips
+// ═══════════════════════════════════════════════
+router.get('/:orgId/staff-performance', ...reportMiddleware, async (req, res) => {
+  try {
+    const { orgId } = req.params;
+    const { startDate, endDate } = parseDateRange(req.query);
+    const outlets = await getOrgOutlets(orgId);
+
+    const staffMap = {};
+    const outletStaffMap = {};
+
+    const outletPromises = outlets.map(async (outlet) => {
+      const orders = await getOutletOrders(outlet.id, startDate, endDate);
+      outletStaffMap[outlet.id] = { outletId: outlet.id, outletName: outlet.name, staff: {} };
+
+      orders.forEach(order => {
+        const staffId = order.waiterId || order.staffId || order.createdBy || 'unknown';
+        const staffName = order.waiterName || order.staffName || order.createdByName || 'Unknown Staff';
+        const revenue = getOrderRevenue(order);
+        const tip = Number(order.tipAmount) || 0;
+
+        if (!staffMap[staffId]) {
+          staffMap[staffId] = { staffId, staffName, ordersHandled: 0, totalSales: 0, tipsEarned: 0, outlets: new Set() };
+        }
+        staffMap[staffId].ordersHandled++;
+        staffMap[staffId].totalSales += revenue;
+        staffMap[staffId].tipsEarned += tip;
+        staffMap[staffId].outlets.add(outlet.name);
+
+        if (!outletStaffMap[outlet.id].staff[staffId]) {
+          outletStaffMap[outlet.id].staff[staffId] = { staffId, staffName, ordersHandled: 0, totalSales: 0, tipsEarned: 0 };
+        }
+        outletStaffMap[outlet.id].staff[staffId].ordersHandled++;
+        outletStaffMap[outlet.id].staff[staffId].totalSales += revenue;
+        outletStaffMap[outlet.id].staff[staffId].tipsEarned += tip;
+      });
+    });
+
+    await Promise.all(outletPromises);
+
+    const round = v => Math.round(v * 100) / 100;
+    const staffRankings = Object.values(staffMap)
+      .filter(s => s.staffId !== 'unknown')
+      .map(s => ({
+        staffId: s.staffId,
+        staffName: s.staffName,
+        ordersHandled: s.ordersHandled,
+        totalSales: round(s.totalSales),
+        avgTicketSize: s.ordersHandled > 0 ? round(s.totalSales / s.ordersHandled) : 0,
+        tipsEarned: round(s.tipsEarned),
+        outlets: Array.from(s.outlets),
+      }))
+      .sort((a, b) => b.totalSales - a.totalSales)
+      .map((s, idx) => ({ rank: idx + 1, ...s }));
+
+    const outletBreakdown = Object.values(outletStaffMap).map(o => ({
+      outletId: o.outletId,
+      outletName: o.outletName,
+      staff: Object.values(o.staff).map(s => ({
+        ...s, totalSales: round(s.totalSales), avgTicketSize: s.ordersHandled > 0 ? round(s.totalSales / s.ordersHandled) : 0, tipsEarned: round(s.tipsEarned),
+      })).sort((a, b) => b.totalSales - a.totalSales),
+    }));
+
+    return res.json({
+      success: true,
+      startDate: startDate.toISOString(),
+      endDate: endDate.toISOString(),
+      totalStaff: staffRankings.length,
+      staffRankings,
+      outletBreakdown,
+    });
+  } catch (error) {
+    console.error('Staff performance error:', error.message);
+    return res.status(500).json({ success: false, error: 'Failed to generate staff performance report' });
+  }
+});
+
+// ═══════════════════════════════════════════════
+//  10. GET /:orgId/category-sales
+//      Revenue by menu category
+// ═══════════════════════════════════════════════
+router.get('/:orgId/category-sales', ...reportMiddleware, async (req, res) => {
+  try {
+    const { orgId } = req.params;
+    const { startDate, endDate } = parseDateRange(req.query);
+    const outlets = await getOrgOutlets(orgId);
+
+    const categoryMap = {};
+
+    const outletPromises = outlets.map(async (outlet) => {
+      const orders = await getOutletOrders(outlet.id, startDate, endDate);
+
+      orders.forEach(order => {
+        const items = order.items || order.cartItems || [];
+        items.forEach(item => {
+          const category = item.category || item.menuCategory || 'Uncategorized';
+          const qty = Number(item.quantity) || Number(item.qty) || 1;
+          const price = Number(item.price) || Number(item.itemPrice) || 0;
+          const itemRevenue = qty * price;
+          const itemName = item.name || item.itemName || 'Unknown';
+
+          if (!categoryMap[category]) {
+            categoryMap[category] = { category, totalQuantity: 0, totalRevenue: 0, uniqueItems: new Set(), outletMap: {} };
+          }
+          categoryMap[category].totalQuantity += qty;
+          categoryMap[category].totalRevenue += itemRevenue;
+          categoryMap[category].uniqueItems.add(itemName);
+
+          if (!categoryMap[category].outletMap[outlet.id]) {
+            categoryMap[category].outletMap[outlet.id] = { outletId: outlet.id, outletName: outlet.name, quantity: 0, revenue: 0 };
+          }
+          categoryMap[category].outletMap[outlet.id].quantity += qty;
+          categoryMap[category].outletMap[outlet.id].revenue += itemRevenue;
+        });
+      });
+    });
+
+    await Promise.all(outletPromises);
+
+    const round = v => Math.round(v * 100) / 100;
+    const grandTotal = Object.values(categoryMap).reduce((s, c) => s + c.totalRevenue, 0);
+
+    const categories = Object.values(categoryMap)
+      .map(c => ({
+        category: c.category,
+        totalQuantity: c.totalQuantity,
+        totalRevenue: round(c.totalRevenue),
+        revenuePercentage: grandTotal > 0 ? round((c.totalRevenue / grandTotal) * 100) : 0,
+        uniqueItems: c.uniqueItems.size,
+        outletBreakdown: Object.values(c.outletMap).map(o => ({ ...o, revenue: round(o.revenue) })),
+      }))
+      .sort((a, b) => b.totalRevenue - a.totalRevenue);
+
+    return res.json({
+      success: true,
+      startDate: startDate.toISOString(),
+      endDate: endDate.toISOString(),
+      totalCategories: categories.length,
+      categories,
+    });
+  } catch (error) {
+    console.error('Category sales error:', error.message);
+    return res.status(500).json({ success: false, error: 'Failed to generate category sales report' });
+  }
+});
+
+// ═══════════════════════════════════════════════
+//  11. GET /:orgId/discount-report
+//      Discount usage and impact analysis
+// ═══════════════════════════════════════════════
+router.get('/:orgId/discount-report', ...reportMiddleware, async (req, res) => {
+  try {
+    const { orgId } = req.params;
+    const { startDate, endDate } = parseDateRange(req.query);
+    const outlets = await getOrgOutlets(orgId);
+
+    let totalDiscountGiven = 0, discountedOrderCount = 0, nonDiscountedOrderCount = 0;
+    let discountedRevenue = 0, nonDiscountedRevenue = 0;
+    const sourceMap = {};
+    const outletResults = [];
+
+    const outletPromises = outlets.map(async (outlet) => {
+      const orders = await getOutletOrders(outlet.id, startDate, endDate);
+      let outletDiscount = 0, outletDiscounted = 0;
+
+      orders.forEach(order => {
+        const revenue = getOrderRevenue(order);
+        const discount = Number(order.discountAmount) || 0;
+        const manualDiscount = Number(order.manualDiscount) || 0;
+        const loyaltyDiscount = Number(order.loyaltyDiscount) || 0;
+        const totalDiscount = discount + manualDiscount + loyaltyDiscount;
+
+        if (totalDiscount > 0) {
+          discountedOrderCount++;
+          outletDiscounted++;
+          discountedRevenue += revenue;
+          totalDiscountGiven += totalDiscount;
+          outletDiscount += totalDiscount;
+
+          // Track by source
+          if (discount > 0) {
+            const offerName = order.selectedOfferName || order.appliedOffer || 'Offer Discount';
+            if (!sourceMap[offerName]) sourceMap[offerName] = { source: 'offer', name: offerName, count: 0, totalDiscount: 0 };
+            sourceMap[offerName].count++;
+            sourceMap[offerName].totalDiscount += discount;
+          }
+          if (manualDiscount > 0) {
+            if (!sourceMap['__manual']) sourceMap['__manual'] = { source: 'manual', name: 'Manual Discount', count: 0, totalDiscount: 0 };
+            sourceMap['__manual'].count++;
+            sourceMap['__manual'].totalDiscount += manualDiscount;
+          }
+          if (loyaltyDiscount > 0) {
+            if (!sourceMap['__loyalty']) sourceMap['__loyalty'] = { source: 'loyalty', name: 'Loyalty Discount', count: 0, totalDiscount: 0 };
+            sourceMap['__loyalty'].count++;
+            sourceMap['__loyalty'].totalDiscount += loyaltyDiscount;
+          }
+        } else {
+          nonDiscountedOrderCount++;
+          nonDiscountedRevenue += revenue;
+        }
+      });
+
+      outletResults.push({
+        outletId: outlet.id,
+        outletName: outlet.name,
+        totalDiscount: Math.round(outletDiscount * 100) / 100,
+        discountedOrders: outletDiscounted,
+        totalOrders: orders.length,
+      });
+    });
+
+    await Promise.all(outletPromises);
+
+    const round = v => Math.round(v * 100) / 100;
+    const totalOrders = discountedOrderCount + nonDiscountedOrderCount;
+
+    return res.json({
+      success: true,
+      startDate: startDate.toISOString(),
+      endDate: endDate.toISOString(),
+      summary: {
+        totalDiscountGiven: round(totalDiscountGiven),
+        discountedOrderCount,
+        nonDiscountedOrderCount,
+        discountedOrderPercentage: totalOrders > 0 ? round((discountedOrderCount / totalOrders) * 100) : 0,
+        avgTicketWithDiscount: discountedOrderCount > 0 ? round(discountedRevenue / discountedOrderCount) : 0,
+        avgTicketWithoutDiscount: nonDiscountedOrderCount > 0 ? round(nonDiscountedRevenue / nonDiscountedOrderCount) : 0,
+      },
+      discountSourceBreakdown: Object.values(sourceMap).map(s => ({ ...s, totalDiscount: round(s.totalDiscount) })).sort((a, b) => b.totalDiscount - a.totalDiscount),
+      outletBreakdown: outletResults,
+    });
+  } catch (error) {
+    console.error('Discount report error:', error.message);
+    return res.status(500).json({ success: false, error: 'Failed to generate discount report' });
+  }
+});
+
+// ═══════════════════════════════════════════════
+//  12. GET /:orgId/tax-summary
+//      Tax collected, breakdown, monthly trend
+// ═══════════════════════════════════════════════
+router.get('/:orgId/tax-summary', ...reportMiddleware, async (req, res) => {
+  try {
+    const { orgId } = req.params;
+    const { startDate, endDate } = parseDateRange(req.query);
+    const outlets = await getOrgOutlets(orgId);
+
+    let totalTaxCollected = 0, totalTaxableAmount = 0, totalNonTaxableOrders = 0, totalOrdersWithTax = 0;
+    const taxTypeMap = {};
+    const monthlyMap = {};
+    const outletResults = [];
+
+    const outletPromises = outlets.map(async (outlet) => {
+      const orders = await getOutletOrders(outlet.id, startDate, endDate);
+      let outletTax = 0, outletTaxable = 0;
+
+      orders.forEach(order => {
+        const taxAmount = Number(order.taxAmount) || 0;
+        const subtotal = Number(order.subtotal) || Number(order.totalBeforeTax) || getOrderRevenue(order);
+
+        if (taxAmount > 0) {
+          totalTaxCollected += taxAmount;
+          outletTax += taxAmount;
+          totalTaxableAmount += subtotal;
+          outletTaxable += subtotal;
+          totalOrdersWithTax++;
+
+          // Tax type breakdown
+          if (order.taxBreakdown && Array.isArray(order.taxBreakdown)) {
+            order.taxBreakdown.forEach(tb => {
+              const taxName = tb.name || tb.taxName || 'Tax';
+              const rate = tb.rate || tb.taxRate || 0;
+              const key = `${taxName}_${rate}`;
+              if (!taxTypeMap[key]) taxTypeMap[key] = { taxName, rate, totalAmount: 0, orderCount: 0 };
+              taxTypeMap[key].totalAmount += Number(tb.amount) || 0;
+              taxTypeMap[key].orderCount++;
+            });
+          } else if (order.taxes && Array.isArray(order.taxes)) {
+            order.taxes.forEach(tb => {
+              const taxName = tb.name || tb.taxName || 'Tax';
+              const rate = tb.rate || tb.taxRate || 0;
+              const key = `${taxName}_${rate}`;
+              if (!taxTypeMap[key]) taxTypeMap[key] = { taxName, rate, totalAmount: 0, orderCount: 0 };
+              taxTypeMap[key].totalAmount += Number(tb.amount) || Number(tb.taxAmount) || 0;
+              taxTypeMap[key].orderCount++;
+            });
+          } else {
+            if (!taxTypeMap['Tax_0']) taxTypeMap['Tax_0'] = { taxName: 'Tax', rate: 0, totalAmount: 0, orderCount: 0 };
+            taxTypeMap['Tax_0'].totalAmount += taxAmount;
+            taxTypeMap['Tax_0'].orderCount++;
+          }
+        } else {
+          totalNonTaxableOrders++;
+        }
+
+        // Monthly trend
+        const orderDate = order.createdAt ? (order.createdAt.toDate ? order.createdAt.toDate() : new Date(order.createdAt)) : null;
+        if (orderDate && taxAmount > 0) {
+          const monthKey = `${orderDate.getFullYear()}-${String(orderDate.getMonth() + 1).padStart(2, '0')}`;
+          if (!monthlyMap[monthKey]) monthlyMap[monthKey] = { month: monthKey, taxCollected: 0, orderCount: 0 };
+          monthlyMap[monthKey].taxCollected += taxAmount;
+          monthlyMap[monthKey].orderCount++;
+        }
+      });
+
+      outletResults.push({
+        outletId: outlet.id,
+        outletName: outlet.name,
+        totalTax: Math.round(outletTax * 100) / 100,
+        taxableAmount: Math.round(outletTaxable * 100) / 100,
+        orderCount: orders.length,
+      });
+    });
+
+    await Promise.all(outletPromises);
+
+    const round = v => Math.round(v * 100) / 100;
+
+    return res.json({
+      success: true,
+      startDate: startDate.toISOString(),
+      endDate: endDate.toISOString(),
+      summary: {
+        totalTaxCollected: round(totalTaxCollected),
+        totalTaxableAmount: round(totalTaxableAmount),
+        totalNonTaxableOrders,
+        avgTaxPerOrder: totalOrdersWithTax > 0 ? round(totalTaxCollected / totalOrdersWithTax) : 0,
+      },
+      taxBreakdown: Object.values(taxTypeMap).map(t => ({ ...t, totalAmount: round(t.totalAmount) })).sort((a, b) => b.totalAmount - a.totalAmount),
+      monthlyTrend: Object.values(monthlyMap).map(m => ({ ...m, taxCollected: round(m.taxCollected) })).sort((a, b) => a.month.localeCompare(b.month)),
+      outletBreakdown: outletResults,
+    });
+  } catch (error) {
+    console.error('Tax summary error:', error.message);
+    return res.status(500).json({ success: false, error: 'Failed to generate tax summary' });
+  }
+});
+
+// ═══════════════════════════════════════════════
+//  13. GET /:orgId/customer-insights
+//      Customer analysis with privacy masking
+// ═══════════════════════════════════════════════
+router.get('/:orgId/customer-insights', ...reportMiddleware, async (req, res) => {
+  try {
+    const { orgId } = req.params;
+    const { startDate, endDate } = parseDateRange(req.query);
+    const outlets = await getOrgOutlets(orgId);
+
+    const customerMap = {};
+    let anonymousOrders = 0;
+    const outletResults = [];
+
+    const outletPromises = outlets.map(async (outlet) => {
+      const orders = await getOutletOrders(outlet.id, startDate, endDate);
+      const outletCustomers = new Set();
+      let outletNew = 0;
+
+      orders.forEach(order => {
+        const phone = order.customerInfo?.phone || order.customerInfo?.mobile || order.customerPhone;
+        if (!phone) {
+          anonymousOrders++;
+          return;
+        }
+
+        const key = String(phone).replace(/\D/g, '').slice(-10); // normalize to last 10 digits
+        if (!customerMap[key]) {
+          customerMap[key] = {
+            phone: key,
+            name: order.customerInfo?.name || order.customerName || '',
+            visitCount: 0,
+            totalSpend: 0,
+            firstVisit: null,
+            lastVisit: null,
+            outlets: new Set(),
+          };
+        }
+
+        customerMap[key].visitCount++;
+        customerMap[key].totalSpend += getOrderRevenue(order);
+        customerMap[key].outlets.add(outlet.name);
+        if (!customerMap[key].name && (order.customerInfo?.name || order.customerName)) {
+          customerMap[key].name = order.customerInfo?.name || order.customerName;
+        }
+
+        const orderDate = order.createdAt ? (order.createdAt.toDate ? order.createdAt.toDate() : new Date(order.createdAt)) : null;
+        if (orderDate) {
+          if (!customerMap[key].firstVisit || orderDate < customerMap[key].firstVisit) customerMap[key].firstVisit = orderDate;
+          if (!customerMap[key].lastVisit || orderDate > customerMap[key].lastVisit) customerMap[key].lastVisit = orderDate;
+        }
+
+        outletCustomers.add(key);
+      });
+
+      // Count new vs returning per outlet
+      let outletReturning = 0;
+      outletCustomers.forEach(k => {
+        if (customerMap[k].visitCount === 1) outletNew++;
+        else outletReturning++;
+      });
+
+      outletResults.push({
+        outletId: outlet.id,
+        outletName: outlet.name,
+        totalCustomers: outletCustomers.size,
+        // Note: new/returning counts will be recalculated after all outlets
+      });
+    });
+
+    await Promise.all(outletPromises);
+
+    const round = v => Math.round(v * 100) / 100;
+    const allCustomers = Object.values(customerMap);
+    const newCustomers = allCustomers.filter(c => c.visitCount === 1).length;
+    const returningCustomers = allCustomers.filter(c => c.visitCount > 1).length;
+    const totalSpendAll = allCustomers.reduce((s, c) => s + c.totalSpend, 0);
+
+    // Mask phone numbers and build top customers
+    const topCustomers = allCustomers
+      .sort((a, b) => b.totalSpend - a.totalSpend)
+      .slice(0, 20)
+      .map((c, idx) => ({
+        rank: idx + 1,
+        name: c.name || 'Guest',
+        phone: c.phone.length >= 4 ? '****' + c.phone.slice(-4) : '****',
+        visitCount: c.visitCount,
+        totalSpend: round(c.totalSpend),
+        avgOrderValue: c.visitCount > 0 ? round(c.totalSpend / c.visitCount) : 0,
+        lastVisit: c.lastVisit ? c.lastVisit.toISOString() : null,
+      }));
+
+    // Recalculate outlet new/returning based on global counts
+    const outletBreakdown = outletResults.map(o => ({
+      ...o,
+      newCustomers: 0,  // Simplified: per-outlet new/returning requires cross-referencing
+      returningCustomers: 0,
+    }));
+
+    return res.json({
+      success: true,
+      startDate: startDate.toISOString(),
+      endDate: endDate.toISOString(),
+      summary: {
+        totalCustomers: allCustomers.length,
+        newCustomers,
+        returningCustomers,
+        anonymousOrders,
+        avgLifetimeValue: allCustomers.length > 0 ? round(totalSpendAll / allCustomers.length) : 0,
+        avgVisitFrequency: allCustomers.length > 0 ? round(allCustomers.reduce((s, c) => s + c.visitCount, 0) / allCustomers.length) : 0,
+      },
+      topCustomers,
+      outletBreakdown,
+    });
+  } catch (error) {
+    console.error('Customer insights error:', error.message);
+    return res.status(500).json({ success: false, error: 'Failed to generate customer insights' });
+  }
+});
+
+// ═══════════════════════════════════════════════
+//  14. GET /:orgId/export/:reportType
 //     CSV export for reports
 // ═══════════════════════════════════════════════
 router.get('/:orgId/export/:reportType', ...reportMiddleware, async (req, res) => {
@@ -870,10 +1456,139 @@ router.get('/:orgId/export/:reportType', ...reportMiddleware, async (req, res) =
         break;
       }
 
+      case 'sales-summary': {
+        filename = `sales-summary-${orgId}.csv`;
+        csvContent += 'Outlet Name,Revenue,Orders,Avg Ticket,Cash,Card,UPI,Aggregator,Other\n';
+        const ssPromises = outlets.map(async (outlet) => {
+          const orders = await getOutletOrders(outlet.id, startDate, endDate);
+          const rev = orders.reduce((s, o) => s + getOrderRevenue(o), 0);
+          const pm = { cash: 0, card: 0, upi: 0, aggregator: 0, other: 0 };
+          orders.forEach(o => {
+            const amount = getOrderRevenue(o);
+            if (o.splitPayments && Array.isArray(o.splitPayments) && o.splitPayments.length > 0) {
+              o.splitPayments.forEach(sp => { pm[normalizePaymentMethod(sp.method || sp.paymentMethod, o)] += Number(sp.amount) || 0; });
+            } else {
+              pm[normalizePaymentMethod(o.paymentMethod, o)] += amount;
+            }
+          });
+          return { name: outlet.name, rev: Math.round(rev * 100) / 100, orders: orders.length, avg: orders.length > 0 ? Math.round((rev / orders.length) * 100) / 100 : 0, ...Object.fromEntries(Object.entries(pm).map(([k, v]) => [k, Math.round(v * 100) / 100])) };
+        });
+        const ssResults = await Promise.all(ssPromises);
+        ssResults.sort((a, b) => b.rev - a.rev);
+        ssResults.forEach(r => { csvContent += `${escapeCsvField(r.name)},${r.rev},${r.orders},${r.avg},${r.cash},${r.card},${r.upi},${r.aggregator},${r.other}\n`; });
+        break;
+      }
+
+      case 'staff-performance': {
+        filename = `staff-performance-${orgId}.csv`;
+        csvContent += 'Rank,Staff Name,Outlet(s),Orders,Total Sales,Avg Ticket,Tips\n';
+        const spStaffMap = {};
+        const spPromises = outlets.map(async (outlet) => {
+          const orders = await getOutletOrders(outlet.id, startDate, endDate);
+          orders.forEach(order => {
+            const sid = order.waiterId || order.staffId || order.createdBy || 'unknown';
+            const sname = order.waiterName || order.staffName || order.createdByName || 'Unknown';
+            if (!spStaffMap[sid]) spStaffMap[sid] = { name: sname, orders: 0, sales: 0, tips: 0, outlets: new Set() };
+            spStaffMap[sid].orders++;
+            spStaffMap[sid].sales += getOrderRevenue(order);
+            spStaffMap[sid].tips += Number(order.tipAmount) || 0;
+            spStaffMap[sid].outlets.add(outlet.name);
+          });
+        });
+        await Promise.all(spPromises);
+        const spArr = Object.entries(spStaffMap).filter(([k]) => k !== 'unknown').map(([, v]) => v).sort((a, b) => b.sales - a.sales);
+        spArr.forEach((s, i) => { csvContent += `${i + 1},${escapeCsvField(s.name)},${escapeCsvField(Array.from(s.outlets).join('; '))},${s.orders},${Math.round(s.sales * 100) / 100},${s.orders > 0 ? Math.round((s.sales / s.orders) * 100) / 100 : 0},${Math.round(s.tips * 100) / 100}\n`; });
+        break;
+      }
+
+      case 'category-sales': {
+        filename = `category-sales-${orgId}.csv`;
+        csvContent += 'Category,Qty Sold,Revenue,% of Revenue,Unique Items\n';
+        const csMap = {};
+        const csPromises = outlets.map(async (outlet) => {
+          const orders = await getOutletOrders(outlet.id, startDate, endDate);
+          orders.forEach(order => {
+            (order.items || order.cartItems || []).forEach(item => {
+              const cat = item.category || item.menuCategory || 'Uncategorized';
+              const qty = Number(item.quantity) || Number(item.qty) || 1;
+              const rev = qty * (Number(item.price) || Number(item.itemPrice) || 0);
+              if (!csMap[cat]) csMap[cat] = { qty: 0, rev: 0, items: new Set() };
+              csMap[cat].qty += qty;
+              csMap[cat].rev += rev;
+              csMap[cat].items.add(item.name || item.itemName || 'Unknown');
+            });
+          });
+        });
+        await Promise.all(csPromises);
+        const csTotal = Object.values(csMap).reduce((s, c) => s + c.rev, 0);
+        const csArr = Object.entries(csMap).sort((a, b) => b[1].rev - a[1].rev);
+        csArr.forEach(([cat, d]) => { csvContent += `${escapeCsvField(cat)},${d.qty},${Math.round(d.rev * 100) / 100},${csTotal > 0 ? Math.round((d.rev / csTotal) * 100 * 100) / 100 : 0},${d.items.size}\n`; });
+        break;
+      }
+
+      case 'discount-report': {
+        filename = `discount-report-${orgId}.csv`;
+        csvContent += 'Outlet Name,Total Discount,Discounted Orders,Total Orders,Avg Ticket (Discounted),Avg Ticket (Non-Discounted)\n';
+        const drPromises = outlets.map(async (outlet) => {
+          const orders = await getOutletOrders(outlet.id, startDate, endDate);
+          let disc = 0, dCount = 0, dRev = 0, ndCount = 0, ndRev = 0;
+          orders.forEach(o => {
+            const td = (Number(o.discountAmount) || 0) + (Number(o.manualDiscount) || 0) + (Number(o.loyaltyDiscount) || 0);
+            const rev = getOrderRevenue(o);
+            if (td > 0) { disc += td; dCount++; dRev += rev; } else { ndCount++; ndRev += rev; }
+          });
+          return { name: outlet.name, disc: Math.round(disc * 100) / 100, dCount, total: orders.length, dAvg: dCount > 0 ? Math.round((dRev / dCount) * 100) / 100 : 0, ndAvg: ndCount > 0 ? Math.round((ndRev / ndCount) * 100) / 100 : 0 };
+        });
+        const drResults = await Promise.all(drPromises);
+        drResults.forEach(r => { csvContent += `${escapeCsvField(r.name)},${r.disc},${r.dCount},${r.total},${r.dAvg},${r.ndAvg}\n`; });
+        break;
+      }
+
+      case 'tax-summary': {
+        filename = `tax-summary-${orgId}.csv`;
+        csvContent += 'Outlet Name,Total Tax,Taxable Amount,Orders\n';
+        const tsPromises = outlets.map(async (outlet) => {
+          const orders = await getOutletOrders(outlet.id, startDate, endDate);
+          let tax = 0, taxable = 0;
+          orders.forEach(o => { tax += Number(o.taxAmount) || 0; taxable += Number(o.subtotal) || Number(o.totalBeforeTax) || getOrderRevenue(o); });
+          return { name: outlet.name, tax: Math.round(tax * 100) / 100, taxable: Math.round(taxable * 100) / 100, orders: orders.length };
+        });
+        const tsResults = await Promise.all(tsPromises);
+        tsResults.forEach(r => { csvContent += `${escapeCsvField(r.name)},${r.tax},${r.taxable},${r.orders}\n`; });
+        break;
+      }
+
+      case 'customer-insights': {
+        filename = `customer-insights-${orgId}.csv`;
+        csvContent += 'Rank,Name,Phone,Visits,Total Spend,Avg Order,Last Visit\n';
+        const ciMap = {};
+        const ciPromises = outlets.map(async (outlet) => {
+          const orders = await getOutletOrders(outlet.id, startDate, endDate);
+          orders.forEach(o => {
+            const ph = o.customerInfo?.phone || o.customerInfo?.mobile || o.customerPhone;
+            if (!ph) return;
+            const key = String(ph).replace(/\D/g, '').slice(-10);
+            if (!ciMap[key]) ciMap[key] = { name: '', phone: key, visits: 0, spend: 0, last: null };
+            ciMap[key].visits++;
+            ciMap[key].spend += getOrderRevenue(o);
+            if (!ciMap[key].name) ciMap[key].name = o.customerInfo?.name || o.customerName || '';
+            const d = o.createdAt ? (o.createdAt.toDate ? o.createdAt.toDate() : new Date(o.createdAt)) : null;
+            if (d && (!ciMap[key].last || d > ciMap[key].last)) ciMap[key].last = d;
+          });
+        });
+        await Promise.all(ciPromises);
+        const ciArr = Object.values(ciMap).sort((a, b) => b.spend - a.spend).slice(0, 50);
+        ciArr.forEach((c, i) => {
+          const masked = c.phone.length >= 4 ? '****' + c.phone.slice(-4) : '****';
+          csvContent += `${i + 1},${escapeCsvField(c.name || 'Guest')},${masked},${c.visits},${Math.round(c.spend * 100) / 100},${c.visits > 0 ? Math.round((c.spend / c.visits) * 100) / 100 : 0},${c.last ? c.last.toISOString().split('T')[0] : ''}\n`;
+        });
+        break;
+      }
+
       default:
         return res.status(400).json({
           success: false,
-          error: `Invalid report type: '${reportType}'. Valid types: inventory, pl, indents, outlet-ranking`
+          error: `Invalid report type: '${reportType}'. Valid types: inventory, pl, indents, outlet-ranking, sales-summary, staff-performance, category-sales, discount-report, tax-summary, customer-insights`
         });
     }
 
