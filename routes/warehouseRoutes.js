@@ -85,9 +85,9 @@ router.post('/:orgId/indents', ...commonMiddleware, async (req, res) => {
       warehouseId,
       indentNumber,
       items: items.map(item => ({
-        inventoryItemId: item.inventoryItemId,
-        inventoryItemName: item.inventoryItemName || '',
-        requestedQty: Number(item.requestedQty) || 0,
+        inventoryItemId: item.inventoryItemId || null,
+        inventoryItemName: item.inventoryItemName || item.name || '',
+        requestedQty: Number(item.requestedQty || item.quantity) || 0,
         approvedQty: null,
         pickedQty: null,
         receivedQty: null,
@@ -241,33 +241,48 @@ router.patch('/:orgId/indents/:indentId/receive', ...commonMiddleware, async (re
 
     // Build a map of received items for quick lookup
     const receivedMap = {};
-    for (const item of items) {
-      receivedMap[item.inventoryItemId] = Number(item.receivedQty) || 0;
+    for (let i = 0; i < items.length; i++) {
+      const key = items[i].inventoryItemId || `_idx_${i}`;
+      receivedMap[key] = Number(items[i].receivedQty) || 0;
     }
 
     // Update indent items with receivedQty
-    const updatedItems = indent.items.map(item => {
-      const receivedQty = receivedMap[item.inventoryItemId] !== undefined
-        ? receivedMap[item.inventoryItemId]
+    const updatedItems = indent.items.map((item, idx) => {
+      const key = item.inventoryItemId || `_idx_${idx}`;
+      const receivedQty = receivedMap[key] !== undefined
+        ? receivedMap[key]
         : item.receivedQty;
       return { ...item, receivedQty };
     });
 
     // For each received item, add stock to the requesting outlet's inventory
-    for (const item of items) {
+    for (let i = 0; i < items.length; i++) {
+      const item = items[i];
       const receivedQty = Number(item.receivedQty) || 0;
       if (receivedQty <= 0) continue;
 
       // Find the matching indent item for metadata
-      const indentItem = indent.items.find(i => i.inventoryItemId === item.inventoryItemId);
+      const indentItem = item.inventoryItemId
+        ? indent.items.find(ii => ii.inventoryItemId === item.inventoryItemId)
+        : indent.items[i];
       if (!indentItem) continue;
 
       // Read current inventory for the outlet
-      const invSnapshot = await db.collection(collections.inventory)
-        .where('restaurantId', '==', indent.requestingOutletId)
-        .where('inventoryItemId', '==', item.inventoryItemId)
-        .limit(1)
-        .get();
+      let invSnapshot;
+      if (item.inventoryItemId) {
+        invSnapshot = await db.collection(collections.inventory)
+          .where('restaurantId', '==', indent.requestingOutletId)
+          .where('inventoryItemId', '==', item.inventoryItemId)
+          .limit(1)
+          .get();
+      } else {
+        const itemName = item.inventoryItemName || indentItem.inventoryItemName || '';
+        invSnapshot = await db.collection(collections.inventory)
+          .where('restaurantId', '==', indent.requestingOutletId)
+          .where('name', '==', itemName)
+          .limit(1)
+          .get();
+      }
 
       let previousStock = 0;
       let invDocRef;
@@ -285,8 +300,9 @@ router.patch('/:orgId/indents/:indentId/receive', ...commonMiddleware, async (re
         invDocRef = db.collection(collections.inventory).doc();
         batch.set(invDocRef, {
           restaurantId: indent.requestingOutletId,
-          inventoryItemId: item.inventoryItemId,
-          inventoryItemName: indentItem.inventoryItemName,
+          inventoryItemId: item.inventoryItemId || null,
+          name: indentItem.inventoryItemName || '',
+          inventoryItemName: indentItem.inventoryItemName || '',
           currentStock: receivedQty,
           unit: indentItem.unit,
           createdAt: now,
@@ -609,35 +625,51 @@ router.patch('/:orgId/indents/:indentId/dispatch', ...commonMiddleware, async (r
     const now = new Date();
     const firestoreBatch = db.batch();
 
-    // Build picked qty map
+    // Build picked qty map (by inventoryItemId or by index as fallback)
     const pickedMap = {};
-    for (const item of items) {
-      pickedMap[item.inventoryItemId] = Number(item.pickedQty) || 0;
+    for (let i = 0; i < items.length; i++) {
+      const key = items[i].inventoryItemId || `_idx_${i}`;
+      pickedMap[key] = Number(items[i].pickedQty) || 0;
     }
 
     // Update indent items with pickedQty
-    const updatedItems = indent.items.map(item => {
-      const pickedQty = pickedMap[item.inventoryItemId] !== undefined
-        ? pickedMap[item.inventoryItemId]
+    const updatedItems = indent.items.map((item, idx) => {
+      const key = item.inventoryItemId || `_idx_${idx}`;
+      const pickedQty = pickedMap[key] !== undefined
+        ? pickedMap[key]
         : item.pickedQty;
       return { ...item, pickedQty };
     });
 
     // For each item, deduct pickedQty from warehouse inventory
-    for (const item of items) {
+    for (let i = 0; i < items.length; i++) {
+      const item = items[i];
       const pickedQty = Number(item.pickedQty) || 0;
       if (pickedQty <= 0) continue;
 
       // Find the matching indent item for metadata
-      const indentItem = indent.items.find(i => i.inventoryItemId === item.inventoryItemId);
+      const indentItem = item.inventoryItemId
+        ? indent.items.find(ii => ii.inventoryItemId === item.inventoryItemId)
+        : indent.items[i];
       if (!indentItem) continue;
 
-      // Read current warehouse inventory
-      const invSnapshot = await db.collection(collections.inventory)
-        .where('restaurantId', '==', indent.warehouseId)
-        .where('inventoryItemId', '==', item.inventoryItemId)
-        .limit(1)
-        .get();
+      // Read current warehouse inventory — match by inventoryItemId or by name
+      let invSnapshot;
+      if (item.inventoryItemId) {
+        invSnapshot = await db.collection(collections.inventory)
+          .where('restaurantId', '==', indent.warehouseId)
+          .where('inventoryItemId', '==', item.inventoryItemId)
+          .limit(1)
+          .get();
+      } else {
+        // Fallback: match by item name in warehouse inventory
+        const itemName = item.inventoryItemName || indentItem.inventoryItemName || '';
+        invSnapshot = await db.collection(collections.inventory)
+          .where('restaurantId', '==', indent.warehouseId)
+          .where('name', '==', itemName)
+          .limit(1)
+          .get();
+      }
 
       if (invSnapshot.empty) {
         return res.status(400).json({
