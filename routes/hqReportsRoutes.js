@@ -1585,10 +1585,125 @@ router.get('/:orgId/export/:reportType', ...reportMiddleware, async (req, res) =
         break;
       }
 
+      case 'payment-analytics': {
+        filename = `payment-analytics-${orgId}.csv`;
+        csvContent += 'Payment Method,Transactions,Amount,Percentage,Avg Value\n';
+        const paMethodMap = {};
+        let paTotalRevenue = 0;
+        const paPromises = outlets.map(async (outlet) => {
+          const orders = await getOutletOrders(outlet.id, startDate, endDate);
+          orders.forEach(order => {
+            const revenue = getOrderRevenue(order);
+            paTotalRevenue += revenue;
+            if (order.splitPayments && Array.isArray(order.splitPayments) && order.splitPayments.length > 0) {
+              order.splitPayments.forEach(sp => {
+                const method = normalizePaymentMethod(sp.method || sp.paymentMethod, order);
+                const amount = Number(sp.amount) || 0;
+                if (!paMethodMap[method]) paMethodMap[method] = { count: 0, amount: 0 };
+                paMethodMap[method].count++;
+                paMethodMap[method].amount += amount;
+              });
+            } else {
+              const method = normalizePaymentMethod(order.paymentMethod, order);
+              if (!paMethodMap[method]) paMethodMap[method] = { count: 0, amount: 0 };
+              paMethodMap[method].count++;
+              paMethodMap[method].amount += revenue;
+            }
+          });
+        });
+        await Promise.all(paPromises);
+        Object.entries(paMethodMap).sort((a, b) => b[1].amount - a[1].amount).forEach(([method, d]) => {
+          const pct = paTotalRevenue > 0 ? Math.round((d.amount / paTotalRevenue) * 100 * 100) / 100 : 0;
+          const avg = d.count > 0 ? Math.round((d.amount / d.count) * 100) / 100 : 0;
+          csvContent += `${escapeCsvField(method)},${d.count},${Math.round(d.amount * 100) / 100},${pct},${avg}\n`;
+        });
+        break;
+      }
+
+      case 'order-analytics': {
+        filename = `order-analytics-${orgId}.csv`;
+        csvContent += 'Date,Orders,Revenue,Avg Value\n';
+        const oaDailyMap = {};
+        const oaPromises = outlets.map(async (outlet) => {
+          const orders = await getOutletOrders(outlet.id, startDate, endDate);
+          orders.forEach(order => {
+            const revenue = getOrderRevenue(order);
+            const orderDate = order.createdAt ? (order.createdAt.toDate ? order.createdAt.toDate() : new Date(order.createdAt)) : null;
+            if (orderDate) {
+              const dayKey = `${orderDate.getFullYear()}-${String(orderDate.getMonth() + 1).padStart(2, '0')}-${String(orderDate.getDate()).padStart(2, '0')}`;
+              if (!oaDailyMap[dayKey]) oaDailyMap[dayKey] = { orderCount: 0, revenue: 0 };
+              oaDailyMap[dayKey].orderCount++;
+              oaDailyMap[dayKey].revenue += revenue;
+            }
+          });
+        });
+        await Promise.all(oaPromises);
+        Object.entries(oaDailyMap).sort(([a], [b]) => a.localeCompare(b)).forEach(([date, d]) => {
+          const avg = d.orderCount > 0 ? Math.round((d.revenue / d.orderCount) * 100) / 100 : 0;
+          csvContent += `${date},${d.orderCount},${Math.round(d.revenue * 100) / 100},${avg}\n`;
+        });
+        break;
+      }
+
+      case 'revenue-trends': {
+        filename = `revenue-trends-${orgId}.csv`;
+        csvContent += 'Date,Revenue,Orders,Avg Value\n';
+        const rtDailyMap = {};
+        const rtPromises = outlets.map(async (outlet) => {
+          const orders = await getOutletOrders(outlet.id, startDate, endDate);
+          orders.forEach(order => {
+            const revenue = getOrderRevenue(order);
+            const orderDate = order.createdAt ? (order.createdAt.toDate ? order.createdAt.toDate() : new Date(order.createdAt)) : null;
+            if (orderDate) {
+              const dayKey = `${orderDate.getFullYear()}-${String(orderDate.getMonth() + 1).padStart(2, '0')}-${String(orderDate.getDate()).padStart(2, '0')}`;
+              if (!rtDailyMap[dayKey]) rtDailyMap[dayKey] = { revenue: 0, orderCount: 0 };
+              rtDailyMap[dayKey].revenue += revenue;
+              rtDailyMap[dayKey].orderCount++;
+            }
+          });
+        });
+        await Promise.all(rtPromises);
+        Object.entries(rtDailyMap).sort(([a], [b]) => a.localeCompare(b)).forEach(([date, d]) => {
+          const avg = d.orderCount > 0 ? Math.round((d.revenue / d.orderCount) * 100) / 100 : 0;
+          csvContent += `${date},${Math.round(d.revenue * 100) / 100},${d.orderCount},${avg}\n`;
+        });
+        break;
+      }
+
+      case 'wallet-loyalty': {
+        filename = `wallet-loyalty-${orgId}.csv`;
+        csvContent += 'Metric,Value\n';
+        let wlWalletRedeemed = 0, wlLoyaltyIssued = 0, wlLoyaltyRedeemed = 0;
+        let wlLoyaltyOrders = 0, wlWalletOrders = 0, wlTotalOrders = 0;
+        const wlPromises = outlets.map(async (outlet) => {
+          const orders = await getOutletOrders(outlet.id, startDate, endDate);
+          orders.forEach(order => {
+            wlTotalOrders++;
+            const walletAmt = Number(order.walletRedeemAmount) || 0;
+            const loyaltyEarned = Number(order.loyaltyPointsEarned) || 0;
+            const loyaltyRedeemedAmt = Number(order.loyaltyPointsRedeemed) || 0;
+            const loyaltyDisc = Number(order.loyaltyDiscount) || 0;
+            if (walletAmt > 0) { wlWalletRedeemed += walletAmt; wlWalletOrders++; }
+            wlLoyaltyIssued += loyaltyEarned;
+            wlLoyaltyRedeemed += loyaltyRedeemedAmt;
+            if (loyaltyEarned > 0 || loyaltyRedeemedAmt > 0 || loyaltyDisc > 0) wlLoyaltyOrders++;
+          });
+        });
+        await Promise.all(wlPromises);
+        csvContent += `Total Wallet Redeemed,${Math.round(wlWalletRedeemed * 100) / 100}\n`;
+        csvContent += `Total Loyalty Points Issued,${Math.round(wlLoyaltyIssued * 100) / 100}\n`;
+        csvContent += `Total Loyalty Points Redeemed,${Math.round(wlLoyaltyRedeemed * 100) / 100}\n`;
+        csvContent += `Loyalty Order Count,${wlLoyaltyOrders}\n`;
+        csvContent += `Wallet Order Count,${wlWalletOrders}\n`;
+        csvContent += `Total Orders,${wlTotalOrders}\n`;
+        csvContent += `Loyalty Order Percentage,${wlTotalOrders > 0 ? Math.round((wlLoyaltyOrders / wlTotalOrders) * 100 * 100) / 100 : 0}\n`;
+        break;
+      }
+
       default:
         return res.status(400).json({
           success: false,
-          error: `Invalid report type: '${reportType}'. Valid types: inventory, pl, indents, outlet-ranking, sales-summary, staff-performance, category-sales, discount-report, tax-summary, customer-insights`
+          error: `Invalid report type: '${reportType}'. Valid types: inventory, pl, indents, outlet-ranking, sales-summary, staff-performance, category-sales, discount-report, tax-summary, customer-insights, payment-analytics, order-analytics, revenue-trends, wallet-loyalty`
         });
     }
 
@@ -1610,5 +1725,452 @@ function escapeCsvField(value) {
   }
   return str;
 }
+
+// ═══════════════════════════════════════════════
+//  15. GET /:orgId/payment-analytics
+//     Payment method breakdown & trends
+// ═══════════════════════════════════════════════
+router.get('/:orgId/payment-analytics', ...reportMiddleware, async (req, res) => {
+  try {
+    const { orgId } = req.params;
+    const { startDate, endDate } = parseDateRange(req.query);
+    const outlets = await getOrgOutlets(orgId);
+    const round = v => Math.round(v * 100) / 100;
+
+    const methodMap = {};
+    const hourlyMap = {};
+    const dailyMap = {};
+    let totalTransactions = 0;
+    let totalRevenue = 0;
+    let splitPaymentCount = 0;
+
+    const outletPromises = outlets.map(async (outlet) => {
+      const orders = await getOutletOrders(outlet.id, startDate, endDate);
+
+      orders.forEach(order => {
+        const revenue = getOrderRevenue(order);
+        totalRevenue += revenue;
+        totalTransactions++;
+
+        const orderDate = order.createdAt ? (order.createdAt.toDate ? order.createdAt.toDate() : new Date(order.createdAt)) : null;
+        const hourKey = orderDate ? `${String(orderDate.getHours()).padStart(2, '0')}:00` : null;
+        const dayKey = orderDate ? `${orderDate.getFullYear()}-${String(orderDate.getMonth() + 1).padStart(2, '0')}-${String(orderDate.getDate()).padStart(2, '0')}` : null;
+
+        if (order.splitPayments && Array.isArray(order.splitPayments) && order.splitPayments.length > 0) {
+          splitPaymentCount++;
+          order.splitPayments.forEach(sp => {
+            const method = normalizePaymentMethod(sp.method || sp.paymentMethod, order);
+            const amount = Number(sp.amount) || 0;
+            if (!methodMap[method]) methodMap[method] = { count: 0, amount: 0 };
+            methodMap[method].count++;
+            methodMap[method].amount += amount;
+
+            if (hourKey) {
+              if (!hourlyMap[hourKey]) hourlyMap[hourKey] = { cash: 0, card: 0, upi: 0, other: 0, total: 0 };
+              hourlyMap[hourKey][method] = (hourlyMap[hourKey][method] || 0) + amount;
+              hourlyMap[hourKey].total += amount;
+            }
+            if (dayKey) {
+              if (!dailyMap[dayKey]) dailyMap[dayKey] = { cash: 0, card: 0, upi: 0, total: 0 };
+              dailyMap[dayKey][method] = (dailyMap[dayKey][method] || 0) + amount;
+              dailyMap[dayKey].total += amount;
+            }
+          });
+        } else {
+          const method = normalizePaymentMethod(order.paymentMethod, order);
+          if (!methodMap[method]) methodMap[method] = { count: 0, amount: 0 };
+          methodMap[method].count++;
+          methodMap[method].amount += revenue;
+
+          if (hourKey) {
+            if (!hourlyMap[hourKey]) hourlyMap[hourKey] = { cash: 0, card: 0, upi: 0, other: 0, total: 0 };
+            hourlyMap[hourKey][method] = (hourlyMap[hourKey][method] || 0) + revenue;
+            hourlyMap[hourKey].total += revenue;
+          }
+          if (dayKey) {
+            if (!dailyMap[dayKey]) dailyMap[dayKey] = { cash: 0, card: 0, upi: 0, total: 0 };
+            dailyMap[dayKey][method] = (dailyMap[dayKey][method] || 0) + revenue;
+            dailyMap[dayKey].total += revenue;
+          }
+        }
+      });
+    });
+
+    await Promise.all(outletPromises);
+
+    const methodBreakdown = Object.entries(methodMap).map(([method, d]) => ({
+      method,
+      count: d.count,
+      amount: round(d.amount),
+      percentage: totalRevenue > 0 ? round((d.amount / totalRevenue) * 100) : 0,
+      avgValue: d.count > 0 ? round(d.amount / d.count) : 0,
+    })).sort((a, b) => b.amount - a.amount);
+
+    const hourlyTrend = Object.entries(hourlyMap)
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([hour, d]) => ({ hour, cash: round(d.cash || 0), card: round(d.card || 0), upi: round(d.upi || 0), other: round(d.other || 0), total: round(d.total) }));
+
+    const dailyTrend = Object.entries(dailyMap)
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([date, d]) => ({ date, cash: round(d.cash || 0), card: round(d.card || 0), upi: round(d.upi || 0), total: round(d.total) }));
+
+    return res.json({
+      success: true,
+      summary: {
+        totalTransactions,
+        totalRevenue: round(totalRevenue),
+        avgTransactionValue: totalTransactions > 0 ? round(totalRevenue / totalTransactions) : 0,
+        splitPaymentCount,
+      },
+      methodBreakdown,
+      hourlyTrend,
+      dailyTrend,
+    });
+  } catch (error) {
+    console.error('Payment analytics error:', error.message);
+    return res.status(500).json({ success: false, error: 'Failed to fetch payment analytics' });
+  }
+});
+
+// ═══════════════════════════════════════════════
+//  16. GET /:orgId/order-analytics
+//     Order volume, type & cancellation data
+// ═══════════════════════════════════════════════
+router.get('/:orgId/order-analytics', ...reportMiddleware, async (req, res) => {
+  try {
+    const { orgId } = req.params;
+    const { startDate, endDate } = parseDateRange(req.query);
+    const outlets = await getOrgOutlets(orgId);
+    const round = v => Math.round(v * 100) / 100;
+
+    const typeMap = {};
+    const hourlyMap = {};
+    const dailyMap = {};
+    const dowMap = {};
+    const dayNames = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
+    let totalOrders = 0;
+    let totalRevenue = 0;
+    let totalItems = 0;
+    let cancelledCount = 0;
+
+    const outletPromises = outlets.map(async (outlet) => {
+      const orders = await getOutletOrders(outlet.id, startDate, endDate);
+
+      // Query cancelled orders separately
+      const cancelledSnapshot = await db.collection(collections.orders)
+        .where('restaurantId', '==', outlet.id)
+        .where('status', '==', 'cancelled')
+        .get();
+
+      cancelledSnapshot.forEach(doc => {
+        const data = doc.data();
+        const orderDate = data.createdAt ? (data.createdAt.toDate ? data.createdAt.toDate() : new Date(data.createdAt)) : null;
+        if (orderDate && orderDate >= startDate && orderDate <= endDate) {
+          cancelledCount++;
+        }
+      });
+
+      orders.forEach(order => {
+        const revenue = getOrderRevenue(order);
+        totalRevenue += revenue;
+        totalOrders++;
+        totalItems += (order.items || order.cartItems || []).length || Number(order.itemCount) || 0;
+
+        const svcType = normalizeServiceType(order);
+        if (!typeMap[svcType]) typeMap[svcType] = { count: 0, amount: 0 };
+        typeMap[svcType].count++;
+        typeMap[svcType].amount += revenue;
+
+        const orderDate = order.createdAt ? (order.createdAt.toDate ? order.createdAt.toDate() : new Date(order.createdAt)) : null;
+        if (orderDate) {
+          const hourKey = `${String(orderDate.getHours()).padStart(2, '0')}:00`;
+          if (!hourlyMap[hourKey]) hourlyMap[hourKey] = { orderCount: 0, revenue: 0 };
+          hourlyMap[hourKey].orderCount++;
+          hourlyMap[hourKey].revenue += revenue;
+
+          const dayKey = `${orderDate.getFullYear()}-${String(orderDate.getMonth() + 1).padStart(2, '0')}-${String(orderDate.getDate()).padStart(2, '0')}`;
+          if (!dailyMap[dayKey]) dailyMap[dayKey] = { orderCount: 0, revenue: 0 };
+          dailyMap[dayKey].orderCount++;
+          dailyMap[dayKey].revenue += revenue;
+
+          const dow = dayNames[orderDate.getDay()];
+          if (!dowMap[dow]) dowMap[dow] = { orderCount: 0, revenue: 0 };
+          dowMap[dow].orderCount++;
+          dowMap[dow].revenue += revenue;
+        }
+      });
+    });
+
+    await Promise.all(outletPromises);
+
+    const allOrdersPlusCancelled = totalOrders + cancelledCount;
+
+    const typeBreakdown = Object.entries(typeMap).map(([type, d]) => ({
+      type,
+      count: d.count,
+      amount: round(d.amount),
+      percentage: totalOrders > 0 ? round((d.count / totalOrders) * 100) : 0,
+    })).sort((a, b) => b.count - a.count);
+
+    const hourlyVolume = Object.entries(hourlyMap)
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([hour, d]) => ({ hour, orderCount: d.orderCount, revenue: round(d.revenue) }));
+
+    const dailyVolume = Object.entries(dailyMap)
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([date, d]) => ({ date, orderCount: d.orderCount, revenue: round(d.revenue), avgValue: d.orderCount > 0 ? round(d.revenue / d.orderCount) : 0 }));
+
+    const dayOfWeekAnalysis = dayNames.map(day => {
+      const d = dowMap[day] || { orderCount: 0, revenue: 0 };
+      return { day, orderCount: d.orderCount, revenue: round(d.revenue), avgValue: d.orderCount > 0 ? round(d.revenue / d.orderCount) : 0 };
+    });
+
+    return res.json({
+      success: true,
+      summary: {
+        totalOrders,
+        avgItemsPerOrder: totalOrders > 0 ? round(totalItems / totalOrders) : 0,
+        cancellationRate: allOrdersPlusCancelled > 0 ? round((cancelledCount / allOrdersPlusCancelled) * 100) : 0,
+        avgOrderValue: totalOrders > 0 ? round(totalRevenue / totalOrders) : 0,
+      },
+      typeBreakdown,
+      hourlyVolume,
+      dailyVolume,
+      dayOfWeekAnalysis,
+    });
+  } catch (error) {
+    console.error('Order analytics error:', error.message);
+    return res.status(500).json({ success: false, error: 'Failed to fetch order analytics' });
+  }
+});
+
+// ═══════════════════════════════════════════════
+//  17. GET /:orgId/revenue-trends
+//     Revenue analysis with period comparison
+// ═══════════════════════════════════════════════
+router.get('/:orgId/revenue-trends', ...reportMiddleware, async (req, res) => {
+  try {
+    const { orgId } = req.params;
+    const { startDate, endDate } = parseDateRange(req.query);
+    const outlets = await getOrgOutlets(orgId);
+    const round = v => Math.round(v * 100) / 100;
+
+    // Calculate previous period (same duration before startDate)
+    const periodMs = endDate.getTime() - startDate.getTime();
+    const prevStartDate = new Date(startDate.getTime() - periodMs);
+    const prevEndDate = new Date(startDate.getTime() - 1);
+    prevEndDate.setHours(23, 59, 59, 999);
+
+    const dailyMap = {};
+    const dowMap = {};
+    const dayNames = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
+    let totalRevenue = 0;
+    let totalOrders = 0;
+    const outletTrend = [];
+
+    const outletPromises = outlets.map(async (outlet) => {
+      const orders = await getOutletOrders(outlet.id, startDate, endDate);
+      const prevOrders = await getOutletOrders(outlet.id, prevStartDate, prevEndDate);
+
+      let outletRevenue = 0;
+      let outletPrevRevenue = 0;
+
+      prevOrders.forEach(order => {
+        outletPrevRevenue += getOrderRevenue(order);
+      });
+
+      orders.forEach(order => {
+        const revenue = getOrderRevenue(order);
+        totalRevenue += revenue;
+        outletRevenue += revenue;
+        totalOrders++;
+
+        const orderDate = order.createdAt ? (order.createdAt.toDate ? order.createdAt.toDate() : new Date(order.createdAt)) : null;
+        if (orderDate) {
+          const dayKey = `${orderDate.getFullYear()}-${String(orderDate.getMonth() + 1).padStart(2, '0')}-${String(orderDate.getDate()).padStart(2, '0')}`;
+          if (!dailyMap[dayKey]) dailyMap[dayKey] = { revenue: 0, orderCount: 0 };
+          dailyMap[dayKey].revenue += revenue;
+          dailyMap[dayKey].orderCount++;
+
+          const dow = dayNames[orderDate.getDay()];
+          if (!dowMap[dow]) dowMap[dow] = { totalRevenue: 0, totalOrders: 0, occurrences: new Set() };
+          dowMap[dow].totalRevenue += revenue;
+          dowMap[dow].totalOrders++;
+          dowMap[dow].occurrences.add(dayKey);
+        }
+      });
+
+      outletTrend.push({
+        outletName: outlet.name,
+        revenue: round(outletRevenue),
+        previousRevenue: round(outletPrevRevenue),
+        growth: outletPrevRevenue > 0 ? round(((outletRevenue - outletPrevRevenue) / outletPrevRevenue) * 100) : 0,
+      });
+    });
+
+    await Promise.all(outletPromises);
+
+    // Previous period total
+    let previousPeriodRevenue = outletTrend.reduce((sum, o) => sum + o.previousRevenue, 0);
+
+    const dailyTrend = Object.entries(dailyMap)
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([date, d]) => ({ date, revenue: round(d.revenue), orderCount: d.orderCount, avgValue: d.orderCount > 0 ? round(d.revenue / d.orderCount) : 0 }));
+
+    const numDays = dailyTrend.length || 1;
+
+    let bestDay = { date: '', revenue: 0 };
+    let worstDay = { date: '', revenue: Infinity };
+    dailyTrend.forEach(d => {
+      if (d.revenue > bestDay.revenue) bestDay = { date: d.date, revenue: d.revenue };
+      if (d.revenue < worstDay.revenue) worstDay = { date: d.date, revenue: d.revenue };
+    });
+    if (worstDay.revenue === Infinity) worstDay = { date: '', revenue: 0 };
+
+    const dayOfWeekAvg = dayNames.map(day => {
+      const d = dowMap[day];
+      if (!d) return { day, avgRevenue: 0, avgOrders: 0, totalRevenue: 0, occurrences: 0 };
+      const occ = d.occurrences.size || 1;
+      return {
+        day,
+        avgRevenue: round(d.totalRevenue / occ),
+        avgOrders: round(d.totalOrders / occ),
+        totalRevenue: round(d.totalRevenue),
+        occurrences: occ,
+      };
+    });
+
+    outletTrend.sort((a, b) => b.revenue - a.revenue);
+
+    return res.json({
+      success: true,
+      summary: {
+        totalRevenue: round(totalRevenue),
+        previousPeriodRevenue: round(previousPeriodRevenue),
+        growthRate: previousPeriodRevenue > 0 ? round(((totalRevenue - previousPeriodRevenue) / previousPeriodRevenue) * 100) : 0,
+        avgDailyRevenue: round(totalRevenue / numDays),
+        bestDay,
+        worstDay,
+      },
+      dailyTrend,
+      dayOfWeekAvg,
+      outletTrend,
+    });
+  } catch (error) {
+    console.error('Revenue trends error:', error.message);
+    return res.status(500).json({ success: false, error: 'Failed to fetch revenue trends' });
+  }
+});
+
+// ═══════════════════════════════════════════════
+//  18. GET /:orgId/wallet-loyalty
+//     Wallet & loyalty program analytics
+// ═══════════════════════════════════════════════
+router.get('/:orgId/wallet-loyalty', ...reportMiddleware, async (req, res) => {
+  try {
+    const { orgId } = req.params;
+    const { startDate, endDate } = parseDateRange(req.query);
+    const outlets = await getOrgOutlets(orgId);
+    const round = v => Math.round(v * 100) / 100;
+
+    let totalWalletRedeemed = 0;
+    let totalLoyaltyPointsIssued = 0;
+    let totalLoyaltyPointsRedeemed = 0;
+    let loyaltyOrderCount = 0;
+    let walletOrderCount = 0;
+    let totalOrders = 0;
+    const walletUserMap = {};
+    const loyaltyDailyMap = {};
+
+    const outletPromises = outlets.map(async (outlet) => {
+      const orders = await getOutletOrders(outlet.id, startDate, endDate);
+
+      orders.forEach(order => {
+        totalOrders++;
+
+        const walletAmount = Number(order.walletRedeemAmount) || 0;
+        const loyaltyEarned = Number(order.loyaltyPointsEarned) || 0;
+        const loyaltyRedeemed = Number(order.loyaltyPointsRedeemed) || 0;
+        const loyaltyDiscount = Number(order.loyaltyDiscount) || 0;
+
+        if (walletAmount > 0) {
+          totalWalletRedeemed += walletAmount;
+          walletOrderCount++;
+
+          // Aggregate by customer
+          const phone = order.customerInfo?.phone || order.customerInfo?.mobile || order.customerPhone || '';
+          const custKey = phone ? String(phone).replace(/\D/g, '').slice(-10) : (order.customerId || '');
+          if (custKey) {
+            if (!walletUserMap[custKey]) {
+              walletUserMap[custKey] = {
+                name: order.customerInfo?.name || order.customerName || 'Guest',
+                phone: custKey,
+                totalRedeemed: 0,
+                orderCount: 0,
+              };
+            }
+            walletUserMap[custKey].totalRedeemed += walletAmount;
+            walletUserMap[custKey].orderCount++;
+          }
+        }
+
+        if (loyaltyEarned > 0 || loyaltyRedeemed > 0 || loyaltyDiscount > 0) {
+          loyaltyOrderCount++;
+        }
+
+        totalLoyaltyPointsIssued += loyaltyEarned;
+        totalLoyaltyPointsRedeemed += loyaltyRedeemed;
+
+        // Daily loyalty trend
+        const orderDate = order.createdAt ? (order.createdAt.toDate ? order.createdAt.toDate() : new Date(order.createdAt)) : null;
+        if (orderDate && (loyaltyEarned > 0 || loyaltyRedeemed > 0 || loyaltyDiscount > 0 || walletAmount > 0)) {
+          const dayKey = `${orderDate.getFullYear()}-${String(orderDate.getMonth() + 1).padStart(2, '0')}-${String(orderDate.getDate()).padStart(2, '0')}`;
+          if (!loyaltyDailyMap[dayKey]) loyaltyDailyMap[dayKey] = { pointsIssued: 0, pointsRedeemed: 0, redemptionValue: 0 };
+          loyaltyDailyMap[dayKey].pointsIssued += loyaltyEarned;
+          loyaltyDailyMap[dayKey].pointsRedeemed += loyaltyRedeemed;
+          loyaltyDailyMap[dayKey].redemptionValue += loyaltyDiscount + walletAmount;
+        }
+      });
+    });
+
+    await Promise.all(outletPromises);
+
+    const topWalletUsers = Object.values(walletUserMap)
+      .sort((a, b) => b.totalRedeemed - a.totalRedeemed)
+      .slice(0, 20)
+      .map(u => ({
+        name: u.name,
+        phone: u.phone.length >= 4 ? '****' + u.phone.slice(-4) : '****',
+        totalRedeemed: round(u.totalRedeemed),
+        orderCount: u.orderCount,
+      }));
+
+    const loyaltyTrend = Object.entries(loyaltyDailyMap)
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([date, d]) => ({
+        date,
+        pointsIssued: round(d.pointsIssued),
+        pointsRedeemed: round(d.pointsRedeemed),
+        redemptionValue: round(d.redemptionValue),
+      }));
+
+    return res.json({
+      success: true,
+      summary: {
+        totalWalletRedeemed: round(totalWalletRedeemed),
+        totalLoyaltyPointsIssued: round(totalLoyaltyPointsIssued),
+        totalLoyaltyPointsRedeemed: round(totalLoyaltyPointsRedeemed),
+        loyaltyOrderCount,
+        walletOrderCount,
+        loyaltyOrderPercentage: totalOrders > 0 ? round((loyaltyOrderCount / totalOrders) * 100) : 0,
+      },
+      topWalletUsers,
+      loyaltyTrend,
+    });
+  } catch (error) {
+    console.error('Wallet loyalty error:', error.message);
+    return res.status(500).json({ success: false, error: 'Failed to fetch wallet & loyalty analytics' });
+  }
+});
 
 module.exports = router;

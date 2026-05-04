@@ -8924,9 +8924,39 @@ app.post('/api/orders', async (req, res) => {
       paymentStatus: req.body.partialPayAmount ? 'partial' : (roomNumber ? 'hotel-billing' : 'pending'), // Handle partial payment, hotel billing, or default pending
       syncSource: syncSource, // 'online' | 'offline' — tracks how order was placed
       ...(idempotencyKey ? { idempotencyKey } : {}),
+      walletRedeemAmount: req.body.walletRedeemAmount ? Math.round(Number(req.body.walletRedeemAmount) * 100) / 100 : null,
+      scheduledFor: req.body.scheduledFor || null,
+      isScheduled: req.body.isScheduled || false,
       createdAt: new Date(),
       updatedAt: new Date()
     };
+
+    // Dashboard-originated orders send pre-calculated billing values that the
+    // frontend has already shown to the user. When these are present, override
+    // the server-recalculated fields so the stored order matches what was billed.
+    if (req.body.finalAmount != null && req.body.taxBreakdown && Array.isArray(req.body.taxBreakdown)) {
+      const feDiscount = parseFloat(req.body.discountAmount) || 0;
+      const feManual = parseFloat(req.body.manualDiscount) || 0;
+      const feLoyalty = parseFloat(req.body.loyaltyDiscount) || 0;
+      const feTotalDisc = parseFloat(req.body.totalDiscountAmount) || (feDiscount + feManual + feLoyalty);
+      const feSubtotal = parseFloat(req.body.totalAmount) || subtotalForDiscount;
+      const feTaxAmt = req.body.taxBreakdown.reduce((s, t) => s + (t.amount || 0), 0);
+      orderData.subtotal = Math.round(feSubtotal * 100) / 100;
+      orderData.discountAmount = Math.round(feDiscount * 100) / 100;
+      orderData.offerDiscount = Math.round(feDiscount * 100) / 100;
+      orderData.manualDiscount = Math.round(feManual * 100) / 100;
+      orderData.loyaltyDiscount = Math.round(feLoyalty * 100) / 100;
+      orderData.totalDiscountAmount = Math.round(feTotalDisc * 100) / 100;
+      orderData.totalAmount = Math.round(Math.max(0, feSubtotal - feTotalDisc) * 100) / 100;
+      orderData.taxBreakdown = req.body.taxBreakdown;
+      orderData.taxAmount = Math.round(feTaxAmt * 100) / 100;
+      orderData.finalAmount = Math.round(parseFloat(req.body.finalAmount) * 100) / 100;
+      // Recalculate outstanding if partial
+      if (req.body.partialPayAmount) {
+        orderData.outstandingAmount = Math.round((orderData.finalAmount - Number(req.body.partialPayAmount)) * 100) / 100;
+      }
+      console.log(`📊 POS override: Using frontend billing values (Subtotal: ₹${orderData.subtotal}, Disc: ₹${orderData.totalDiscountAmount}, Tax: ₹${orderData.taxAmount}, Final: ₹${orderData.finalAmount})`);
+    }
 
     console.log('🛒 Backend Order Creation - Status from frontend:', req.body.status);
     console.log('🛒 Backend Order Creation - Final status:', orderData.status);
@@ -9885,6 +9915,10 @@ app.get('/api/orders/:restaurantId', authenticateToken, async (req, res) => {
         fastQuery = fastQuery.where('orderType', '==', orderType);
       }
 
+      if (req.query.isScheduled === 'true') {
+        fastQuery = fastQuery.where('isScheduled', '==', true);
+      }
+
       if (waiterId && waiterId !== 'all') {
         fastQuery = fastQuery.where('staffInfo.userId', '==', waiterId);
       }
@@ -9960,6 +9994,10 @@ app.get('/api/orders/:restaurantId', authenticateToken, async (req, res) => {
 
     if (orderType && orderType !== 'all') {
       searchQuery = searchQuery.where('orderType', '==', orderType);
+    }
+
+    if (req.query.isScheduled === 'true') {
+      searchQuery = searchQuery.where('isScheduled', '==', true);
     }
 
     // Apply date filters
@@ -11698,8 +11736,37 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
       loyaltyDiscount: updateData.loyaltyDiscount || 0
     });
 
-    // Backend is the single source of truth for all calculations.
-    // No frontend overrides — tax, finalAmount, totalAmount are computed server-side above.
+    // Store walletRedeemAmount if provided
+    if (req.body.walletRedeemAmount !== undefined) {
+      updateData.walletRedeemAmount = req.body.walletRedeemAmount ? Math.round(Number(req.body.walletRedeemAmount) * 100) / 100 : null;
+    }
+
+    // Dashboard-originated orders send pre-calculated billing values that the
+    // frontend has already shown to the user. When these are present, override
+    // the server-recalculated fields so the stored order matches what was billed.
+    if (req.body.finalAmount != null && req.body.taxBreakdown && Array.isArray(req.body.taxBreakdown)) {
+      const feDiscount = parseFloat(req.body.discountAmount) || 0;
+      const feManual = parseFloat(req.body.manualDiscount) || 0;
+      const feLoyalty = parseFloat(req.body.loyaltyDiscount) || 0;
+      const feTotalDisc = parseFloat(req.body.totalDiscountAmount) || (feDiscount + feManual + feLoyalty);
+      const feSubtotal = parseFloat(req.body.subtotal || req.body.totalAmount) || rawSubtotal;
+      const feTaxAmt = req.body.taxBreakdown.reduce((s, t) => s + (t.amount || 0), 0);
+      updateData.subtotal = Math.round(feSubtotal * 100) / 100;
+      updateData.discountAmount = Math.round(feDiscount * 100) / 100;
+      updateData.offerDiscount = Math.round(feDiscount * 100) / 100;
+      updateData.manualDiscount = Math.round(feManual * 100) / 100;
+      updateData.loyaltyDiscount = Math.round(feLoyalty * 100) / 100;
+      updateData.totalDiscountAmount = Math.round(feTotalDisc * 100) / 100;
+      updateData.totalAmount = Math.round(Math.max(0, feSubtotal - feTotalDisc) * 100) / 100;
+      updateData.taxBreakdown = req.body.taxBreakdown;
+      updateData.taxAmount = Math.round(feTaxAmt * 100) / 100;
+      updateData.finalAmount = Math.round(parseFloat(req.body.finalAmount) * 100) / 100;
+      // Recalculate outstanding if partial
+      if (req.body.partialPayAmount) {
+        updateData.outstandingAmount = Math.round((updateData.finalAmount - Number(req.body.partialPayAmount)) * 100) / 100;
+      }
+      console.log(`📊 PATCH POS override: Using frontend billing values (Subtotal: ₹${updateData.subtotal}, Disc: ₹${updateData.totalDiscountAmount}, Tax: ₹${updateData.taxAmount}, Final: ₹${updateData.finalAmount})`);
+    }
 
     // Add update history
     const updateHistory = currentOrder.updateHistory || [];
@@ -17503,6 +17570,7 @@ const assembleBillRenderPayload = (orderId, orderData, restaurantId, restaurantD
     changeReturned: orderData.changeReturned ? r2(orderData.changeReturned) : null,
     paidAmount: orderData.paidAmount ? r2(orderData.paidAmount) : null,
     outstandingAmount: orderData.outstandingAmount ? r2(orderData.outstandingAmount) : null,
+    walletRedeemAmount: orderData.walletRedeemAmount ? r2(orderData.walletRedeemAmount) : null,
     notes: orderData.notes || '',
     specialInstructions: orderData.specialInstructions || '',
     staffInfo: orderData.staffInfo || null,
@@ -27435,6 +27503,135 @@ app.post('/api/customers/:customerId/settle-credit', authenticateToken, async (r
   } catch (error) {
     console.error('Error settling credit:', error);
     res.status(500).json({ error: 'Failed to settle credit' });
+  }
+});
+
+// Get customer wallet balance and history
+app.get('/api/customers/:customerId/wallet', authenticateToken, async (req, res) => {
+  try {
+    const { customerId } = req.params;
+    const customerDoc = await db.collection('customers').doc(customerId).get();
+    if (!customerDoc.exists) {
+      return res.status(404).json({ error: 'Customer not found' });
+    }
+    const customer = customerDoc.data();
+    res.json({
+      walletBalance: customer.walletBalance || 0,
+      walletHistory: (customer.walletHistory || []).sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt))
+    });
+  } catch (error) {
+    console.error('Error fetching wallet:', error);
+    res.status(500).json({ error: 'Failed to fetch wallet data' });
+  }
+});
+
+// Add credit to customer wallet
+app.post('/api/customers/:customerId/wallet/credit', authenticateToken, async (req, res) => {
+  try {
+    const { customerId } = req.params;
+    const { amount, reason, notes } = req.body;
+
+    if (!amount || amount <= 0) {
+      return res.status(400).json({ error: 'Amount must be greater than 0' });
+    }
+
+    const customerRef = db.collection('customers').doc(customerId);
+    const customerDoc = await customerRef.get();
+    if (!customerDoc.exists) {
+      return res.status(404).json({ error: 'Customer not found' });
+    }
+
+    const customer = customerDoc.data();
+    const currentBalance = customer.walletBalance || 0;
+    const newBalance = currentBalance + parseFloat(amount);
+
+    const transaction = {
+      id: `txn_${Date.now()}_${Math.random().toString(36).substr(2, 6)}`,
+      type: 'credit',
+      amount: parseFloat(amount),
+      reason: reason || 'advance_payment',
+      notes: notes || '',
+      staffId: req.user?.userId || req.user?.id || null,
+      staffName: req.user?.name || 'Staff',
+      balanceAfter: newBalance,
+      createdAt: new Date().toISOString()
+    };
+
+    const walletHistory = customer.walletHistory || [];
+    walletHistory.push(transaction);
+
+    await customerRef.update({
+      walletBalance: newBalance,
+      walletHistory: walletHistory,
+      updatedAt: new Date().toISOString()
+    });
+
+    res.json({
+      success: true,
+      walletBalance: newBalance,
+      transaction
+    });
+  } catch (error) {
+    console.error('Error adding wallet credit:', error);
+    res.status(500).json({ error: 'Failed to add credit' });
+  }
+});
+
+// Redeem from customer wallet
+app.post('/api/customers/:customerId/wallet/redeem', authenticateToken, async (req, res) => {
+  try {
+    const { customerId } = req.params;
+    const { amount, orderId, notes } = req.body;
+
+    if (!amount || amount <= 0) {
+      return res.status(400).json({ error: 'Amount must be greater than 0' });
+    }
+
+    const customerRef = db.collection('customers').doc(customerId);
+    const customerDoc = await customerRef.get();
+    if (!customerDoc.exists) {
+      return res.status(404).json({ error: 'Customer not found' });
+    }
+
+    const customer = customerDoc.data();
+    const currentBalance = customer.walletBalance || 0;
+
+    if (currentBalance < parseFloat(amount)) {
+      return res.status(400).json({ error: 'Insufficient wallet balance' });
+    }
+
+    const newBalance = currentBalance - parseFloat(amount);
+
+    const transaction = {
+      id: `txn_${Date.now()}_${Math.random().toString(36).substr(2, 6)}`,
+      type: 'redeem',
+      amount: parseFloat(amount),
+      reason: 'redemption',
+      notes: notes || '',
+      orderId: orderId || null,
+      staffId: req.user?.userId || req.user?.id || null,
+      staffName: req.user?.name || 'Staff',
+      balanceAfter: newBalance,
+      createdAt: new Date().toISOString()
+    };
+
+    const walletHistory = customer.walletHistory || [];
+    walletHistory.push(transaction);
+
+    await customerRef.update({
+      walletBalance: newBalance,
+      walletHistory: walletHistory,
+      updatedAt: new Date().toISOString()
+    });
+
+    res.json({
+      success: true,
+      walletBalance: newBalance,
+      transaction
+    });
+  } catch (error) {
+    console.error('Error redeeming wallet:', error);
+    res.status(500).json({ error: 'Failed to redeem from wallet' });
   }
 });
 
