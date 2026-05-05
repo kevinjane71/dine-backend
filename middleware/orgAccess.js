@@ -20,20 +20,43 @@ async function requireOrgAccess(req, res, next) {
       return res.status(400).json({ error: 'Organization ID required' });
     }
 
+    // First try: look up as an organization
     const orgDoc = await db.collection(collections.organizations).doc(orgId).get();
-    if (!orgDoc.exists) {
-      return res.status(404).json({ error: 'Organization not found' });
+    if (orgDoc.exists) {
+      const org = orgDoc.data();
+      const userId = getOwnerId(req);
+
+      if (org.ownerId !== userId) {
+        return res.status(403).json({ error: 'Access denied. Not a member of this organization.' });
+      }
+
+      req.org = { id: orgDoc.id, ...org };
+      return next();
     }
 
-    const org = orgDoc.data();
-    const userId = getOwnerId(req);
+    // Fallback: treat orgId as a restaurantId (single-restaurant, no org setup)
+    // This allows reports to work for users who haven't created an organization
+    const restaurantDoc = await db.collection(collections.restaurants).doc(orgId).get();
+    if (restaurantDoc.exists) {
+      const restaurant = restaurantDoc.data();
+      const userId = getOwnerId(req);
 
-    if (org.ownerId !== userId) {
-      return res.status(403).json({ error: 'Access denied. Not a member of this organization.' });
+      if (restaurant.ownerId !== userId && restaurant.userId !== userId) {
+        return res.status(403).json({ error: 'Access denied. Not the owner of this restaurant.' });
+      }
+
+      // Create a virtual org context from the single restaurant
+      req.org = {
+        id: orgId,
+        name: restaurant.name,
+        ownerId: restaurant.ownerId || restaurant.userId,
+        settings: {},
+        _isSingleRestaurant: true, // Flag for handlers that need to know
+      };
+      return next();
     }
 
-    req.org = { id: orgDoc.id, ...org };
-    next();
+    return res.status(404).json({ error: 'Organization not found' });
   } catch (error) {
     console.error('Org access check error:', error.message);
     return res.status(500).json({ error: 'Failed to verify organization access' });
@@ -178,6 +201,23 @@ async function getOrgOutlets(orgId) {
       status: data.status || 'active'
     });
   });
+
+  // Fallback: if no outlets found via organizationId, the orgId might be a restaurantId itself
+  if (outlets.length === 0) {
+    const restaurantDoc = await db.collection(collections.restaurants).doc(orgId).get();
+    if (restaurantDoc.exists) {
+      const data = restaurantDoc.data();
+      outlets.push({
+        id: restaurantDoc.id,
+        name: data.name,
+        outletType: data.outletType || 'outlet',
+        outletCode: data.outletCode || null,
+        address: data.address || '',
+        status: data.status || 'active'
+      });
+    }
+  }
+
   return outlets;
 }
 
