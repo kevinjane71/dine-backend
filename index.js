@@ -10519,6 +10519,8 @@ app.get('/api/analytics/:restaurantId/daily-summary', authenticateToken, async (
     const hourlyBreakdown = {};
     const customerSet = new Set();
     const dailyRevenue = []; // for trend chart
+    const categoryMap = {};  // category-wise sales breakdown
+    const paymentMap = {};   // payment method breakdown
     let hasItemCounts = false;
     let usedDailyStats = false;
 
@@ -10570,6 +10572,36 @@ app.get('/api/analytics/:restaurantId/daily-summary', authenticateToken, async (
       (data.customerIds || []).forEach(id => customerSet.add(id));
     });
     } // end if (!isTodayOnly)
+
+    // For historical dates, query raw orders to get category/payment breakdown
+    // (dailyStats doesn't store this granularity)
+    if (!isTodayOnly && usedDailyStats && Object.keys(categoryMap).length === 0) {
+      const [sy, sm, sd] = dates[0].split('-').map(Number);
+      const [ey, em, ed] = dates[dates.length - 1].split('-').map(Number);
+      const rangeStart = new Date(sy, sm - 1, sd, 0, 0, 0, 0);
+      const rangeEnd = new Date(ey, em - 1, ed, 23, 59, 59, 999);
+      const catPaySnap = await db.collection(collections.orders)
+        .where('restaurantId', '==', restaurantId)
+        .where('createdAt', '>=', rangeStart)
+        .where('createdAt', '<=', rangeEnd)
+        .get();
+      catPaySnap.docs.forEach(doc => {
+        const order = doc.data();
+        if (['cancelled', 'deleted', 'saved'].includes(order.status)) return;
+        if (order.items && Array.isArray(order.items)) {
+          order.items.forEach(item => {
+            const cat = item.category || 'Uncategorized';
+            if (!categoryMap[cat]) categoryMap[cat] = { itemsSold: 0, revenue: 0 };
+            categoryMap[cat].itemsSold += (item.quantity || 1);
+            categoryMap[cat].revenue += ((item.price || 0) * (item.quantity || 1));
+          });
+        }
+        const pm = (order.paymentMethod || 'cash').toLowerCase();
+        if (!paymentMap[pm]) paymentMap[pm] = { transactions: 0, amount: 0 };
+        paymentMap[pm].transactions++;
+        paymentMap[pm].amount += (order.finalAmount || order.totalAmount || 0);
+      });
+    }
 
     // Build items array from aggregated map
     let items = [];
@@ -10628,8 +10660,19 @@ app.get('/api/analytics/:restaurantId/daily-summary', authenticateToken, async (
               itemMap[name].qty += (item.quantity || 1);
               itemMap[name].revenue += ((item.price || 0) * (item.quantity || 1));
             }
+            // Category breakdown
+            const cat = item.category || 'Uncategorized';
+            if (!categoryMap[cat]) categoryMap[cat] = { itemsSold: 0, revenue: 0 };
+            categoryMap[cat].itemsSold += (item.quantity || 1);
+            categoryMap[cat].revenue += ((item.price || 0) * (item.quantity || 1));
           });
         }
+
+        // Payment method breakdown
+        const pm = (order.paymentMethod || 'cash').toLowerCase();
+        if (!paymentMap[pm]) paymentMap[pm] = { transactions: 0, amount: 0 };
+        paymentMap[pm].transactions++;
+        paymentMap[pm].amount += (order.finalAmount || order.totalAmount || 0);
       });
 
       items = [];
@@ -10654,7 +10697,19 @@ app.get('/api/analytics/:restaurantId/daily-summary', authenticateToken, async (
         ordersByType,
         hourlyBreakdown,
         dailyRevenue: dates.length > 1 ? dailyRevenue : undefined,
-        uniqueCustomers: customerSet.size
+        uniqueCustomers: customerSet.size,
+        categoryBreakdown: Object.entries(categoryMap).map(([name, d]) => ({
+          category: name,
+          itemsSold: d.itemsSold,
+          revenue: Math.round(d.revenue * 100) / 100,
+          percentage: totalRevenueWithTax > 0 ? Math.round((d.revenue / totalRevenueWithTax) * 10000) / 100 : 0
+        })).sort((a, b) => b.revenue - a.revenue),
+        paymentBreakdown: Object.entries(paymentMap).map(([method, d]) => ({
+          method,
+          transactions: d.transactions,
+          amount: Math.round(d.amount * 100) / 100,
+          percentage: totalRevenueWithTax > 0 ? Math.round((d.amount / totalRevenueWithTax) * 10000) / 100 : 0
+        })).sort((a, b) => b.amount - a.amount)
       }
     });
   } catch (error) {
@@ -11248,7 +11303,8 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
       customerInfo,
       specialInstructions,
       updatedAt,
-      lastUpdatedBy
+      lastUpdatedBy,
+      skipKOT
     } = req.body;
 
     // Granular permission check: determine operation type
@@ -12093,7 +12149,7 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
     // If items were updated and order is NOT completed/cancelled/deleted/saved, trigger KOT reprint
     const orderStatus = status || currentOrder.status;
     const nonKitchenStatuses = ['completed', 'cancelled', 'deleted', 'saved'];
-    if (items && items.length > 0 && !nonKitchenStatuses.includes(orderStatus)) {
+    if (items && items.length > 0 && !nonKitchenStatuses.includes(orderStatus) && !skipKOT) {
       try {
         // Reset kotPrinted so pending-print API returns this order (polling mode)
         await db.collection(collections.orders).doc(orderId).update({
@@ -12107,6 +12163,7 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
           console.log('🖨️ Order items updated, triggering KOT reprint for order:', orderId);
           const restaurantFullData = restaurantDoc.data();
           const reprintItems = updateData.items || items;
+          const hasNewItems = reprintItems.some(i => i.isNew || i.isUpdated);
           const stationGroups = splitOrderByPrintStation(reprintItems, restaurantFullData.printStations, restaurantFullData.categories);
           for (const group of stationGroups) {
             pusherPromises.push(
@@ -12123,6 +12180,7 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
                 orderType: orderType || currentOrder.orderType,
                 createdAt: currentOrder.createdAt?.toDate?.()?.toISOString() || new Date().toISOString(),
                 isReprint: true,
+                isIncremental: hasNewItems,
                 printStationId: group.stationId,
                 printStationName: group.stationName
               }).catch(err => console.error('KOT reprint Pusher notification error (non-blocking):', err))
@@ -16176,7 +16234,11 @@ app.get('/api/admin/print-settings/:restaurantId', authenticateToken, async (req
       printBillCopy: 1,                  // Number of bill copies to print
       billFontSize: 'medium',            // Bill print font size preset: small, medium, large, xlarge (legacy)
       billFontScale: 100,                 // Bill print font scale: 50-150 (100 = default medium)
-      billFontFamily: 'default'           // Bill print font family: default, arial, verdana, tahoma, georgia, times
+      billFontFamily: 'default',          // Bill print font family: default, arial, verdana, tahoma, georgia, times
+      tokenBillingEnabled: false,          // Food court: print category-wise token slips after billing
+      enableUpdateWithoutKOT: false,       // Show "Update Order" button (save without KOT)
+      enableKOTAndPrint: false,            // Show "KOT & Print" combined button
+      enableSaveAndPrint: false            // Show "Bill & Print" combined button
     };
 
     const printSettings = { ...defaultSettings, ...(restaurantData.printSettings || {}) };
@@ -16217,7 +16279,11 @@ app.put('/api/admin/print-settings/:restaurantId', authenticateToken, async (req
       'autoPrintOnKOT',
       'autoPrintOnBilling',
       'autoPrintOnOnlineOrder',
-      'autoPrintOnTableCall'
+      'autoPrintOnTableCall',
+      'tokenBillingEnabled',
+      'enableUpdateWithoutKOT',
+      'enableKOTAndPrint',
+      'enableSaveAndPrint'
     ];
 
     // Numeric fields
@@ -17651,9 +17717,14 @@ app.get('/api/kot/render/:restaurantId/:orderId', async (req, res) => {
     const restaurant = buildRestaurantBlock(restaurantId, restaurantData);
     const kotId = `KOT-${orderDoc.id.slice(-6).toUpperCase()}`;
 
-    // Filter items by print station if stationId provided
-    const { stationId } = req.query;
+    // Filter items by newOnly (incremental KOT) and/or print station
+    const { stationId, newOnly } = req.query;
     let items = orderData.items || [];
+
+    // Incremental KOT: only return new/updated items
+    if (newOnly === 'true') {
+      items = items.filter(item => item.isNew === true || item.isUpdated === true);
+    }
     let printStationName = null;
     if (stationId && restaurantData.printStations && restaurantData.printStations.length > 0) {
       const station = restaurantData.printStations.find(s => s.id === stationId);
@@ -17703,6 +17774,7 @@ app.get('/api/kot/render/:restaurantId/:orderId', async (req, res) => {
         formattedDate,
         formattedTime,
         isReprint: orderData.kotPrinted === true,
+        isIncremental: newOnly === 'true',
         printStationId: stationId || null,
         printStationName
       }
@@ -17710,6 +17782,92 @@ app.get('/api/kot/render/:restaurantId/:orderId', async (req, res) => {
   } catch (error) {
     console.error('KOT render error:', error);
     res.status(500).json({ error: 'Failed to render KOT' });
+  }
+});
+
+// GET /api/token/render/:restaurantId/:orderId
+// Returns category-wise token slips for food court counter pickup.
+app.get('/api/token/render/:restaurantId/:orderId', async (req, res) => {
+  try {
+    const { restaurantId, orderId } = req.params;
+
+    const [orderDoc, restaurantDoc] = await Promise.all([
+      db.collection(collections.orders).doc(orderId).get(),
+      db.collection(collections.restaurants).doc(restaurantId).get()
+    ]);
+
+    if (!orderDoc.exists) return res.status(404).json({ error: 'Order not found' });
+    if (!restaurantDoc.exists) return res.status(404).json({ error: 'Restaurant not found' });
+
+    const orderData = orderDoc.data();
+    if (orderData.restaurantId !== restaurantId) {
+      return res.status(403).json({ error: 'Access denied' });
+    }
+
+    const restaurantData = restaurantDoc.data();
+    const printSettings = restaurantData.printSettings || {};
+
+    if (!printSettings.tokenBillingEnabled) {
+      return res.json({ success: true, tokens: [] });
+    }
+
+    const items = orderData.items || [];
+    const dailyOrderId = orderData.dailyOrderId || orderData.orderNumber || orderDoc.id.slice(-6).toUpperCase();
+    const createdAt = orderData.createdAt?.toDate ? orderData.createdAt.toDate() : new Date(orderData.createdAt || Date.now());
+    const time = createdAt.toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', hour12: true });
+
+    // Build category→station lookup from print stations
+    const nameToId = {};
+    for (const cat of (restaurantData.categories || [])) {
+      if (cat.name) nameToId[cat.name.toLowerCase().trim()] = cat.id;
+    }
+    const catIdToStation = {};
+    if (restaurantData.printStations && restaurantData.printStations.length > 0) {
+      for (const station of restaurantData.printStations) {
+        for (const cId of (station.categoryIds || [])) {
+          catIdToStation[cId] = { id: station.id, name: station.name };
+        }
+      }
+    }
+
+    // Group items by category
+    const categoryGroups = {};
+    for (const item of items) {
+      const category = item.category || 'General';
+      if (!categoryGroups[category]) categoryGroups[category] = [];
+      categoryGroups[category].push(item);
+    }
+
+    // Build token objects
+    const tokens = Object.entries(categoryGroups).map(([categoryName, categoryItems]) => {
+      const tokenLabel = `${categoryName.toUpperCase().replace(/\s+/g, '-')}-${dailyOrderId}`;
+
+      // Resolve print station for this category
+      const catId = nameToId[categoryName.toLowerCase().trim()];
+      const station = catId ? catIdToStation[catId] : null;
+
+      return {
+        tokenLabel,
+        categoryName,
+        items: categoryItems.map(i => ({
+          name: i.name || i.itemName || 'Item',
+          quantity: i.quantity || 1,
+          variant: i.selectedVariant?.name || i.variant || null,
+          customizations: i.selectedCustomizations || i.customizations || null
+        })),
+        itemCount: categoryItems.reduce((sum, i) => sum + (i.quantity || 1), 0),
+        orderNumber: dailyOrderId,
+        time,
+        printStationId: station?.id || null,
+        printStationName: station?.name || null,
+        restaurantName: restaurantData.name || ''
+      };
+    });
+
+    res.json({ success: true, tokens });
+  } catch (error) {
+    console.error('Token render error:', error);
+    res.status(500).json({ error: 'Failed to render token slips' });
   }
 });
 
@@ -17786,6 +17944,23 @@ app.patch('/api/orders/:orderId/cancel', authenticateToken, async (req, res) => 
     }
 
     console.log(`✅ Order ${orderId} cancelled successfully`);
+
+    // Send real-time void notification to owner/admin via Pusher
+    try {
+      await pusherService.triggerOrderEvent(orderData.restaurantId, 'order-voided', {
+        orderId,
+        dailyOrderId: orderData.dailyOrderId || null,
+        orderNumber: orderData.orderNumber || null,
+        tableNumber: orderData.tableNumber || null,
+        totalAmount: orderData.finalAmount || orderData.totalAmount || 0,
+        cancelledBy: req.user?.name || req.user?.email || 'Staff',
+        cancelledAt: updateData.cancelledAt.toISOString(),
+        reason: reason || 'No reason provided',
+        itemCount: (orderData.items || []).length
+      });
+    } catch (pusherErr) {
+      console.error('Failed to send void notification:', pusherErr);
+    }
 
     res.json({
       success: true,
@@ -20776,11 +20951,12 @@ app.post('/api/inventory/:restaurantId/confirm-leftover-waste', authenticateToke
 // ══════════════════════════════════════════════════════════════
 // SMART IMPORT — Parse text/image → create inventory + menu + recipes
 // ══════════════════════════════════════════════════════════════
-app.post('/api/inventory/:restaurantId/smart-import/parse', authenticateToken, aiUsageLimiter.middleware(), upload.single('image'), async (req, res) => {
+app.post('/api/inventory/:restaurantId/smart-import/parse', authenticateToken, aiUsageLimiter.middleware(), upload.array('image', 2), async (req, res) => {
   try {
     const { restaurantId } = req.params;
     const { text, mode } = req.body;
-    const imageFile = req.file;
+    const imageFiles = req.files || [];
+    const imageFile = imageFiles.length > 0 ? imageFiles[0] : null;
     const isInvoiceMode = mode === 'invoice' || (imageFile && !text);
 
     if (!text && !imageFile) {
@@ -20915,20 +21091,20 @@ RULES:
     let aiResponse;
 
     if (imageFile) {
-      const imageBase64 = imageFile.buffer.toString('base64');
-      const imageMimeType = imageFile.mimetype;
+      // Build content array with text + all images
+      const contentParts = [
+        { type: 'text', text: imageFiles.length > 1 ? userMessage + ' Multiple pages of the same invoice/document are provided below.' : userMessage }
+      ];
+      for (const img of imageFiles) {
+        const base64 = img.buffer.toString('base64');
+        contentParts.push({ type: 'image_url', image_url: { url: `data:${img.mimetype};base64,${base64}` } });
+      }
 
       const completion = await openai.chat.completions.create({
         model: 'gpt-4o',
         messages: [
           { role: 'system', content: systemPrompt },
-          {
-            role: 'user',
-            content: [
-              { type: 'text', text: userMessage },
-              { type: 'image_url', image_url: { url: `data:${imageMimeType};base64,${imageBase64}` } }
-            ]
-          }
+          { role: 'user', content: contentParts }
         ],
         temperature: 0.2,
         max_tokens: 4000,
