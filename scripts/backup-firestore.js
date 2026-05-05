@@ -9,7 +9,7 @@
  *   node scripts/backup-firestore.js orders users  # Backup specific collections
  *   node scripts/backup-firestore.js --email       # Backup + email zip (needs config)
  *
- * Output: ./backups/backup-YYYY-MM-DD-HHmmss/ dd
+ * Output: ./backups/backup-YYYY-MM-DD-HHmmss/ dds
  */
 
 require('dotenv').config();
