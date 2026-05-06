@@ -1571,4 +1571,93 @@ router.patch('/notes/:collection/:docId', authenticateSuperAdmin, async (req, re
   }
 });
 
+// ─── Reset User MPIN ────────────────────────────────────────────
+router.post('/reset-mpin', authenticateSuperAdmin, async (req, res) => {
+  try {
+    const { phone } = req.body;
+    if (!phone || !phone.trim()) {
+      return res.status(400).json({ success: false, error: 'Phone number is required' });
+    }
+
+    const normalized = phone.trim().replace(/\s+/g, '');
+
+    // Find user by phone
+    const usersSnap = await db.collection(collections.users)
+      .where('phone', '==', normalized)
+      .limit(1)
+      .get();
+
+    if (usersSnap.empty) {
+      // Try with +91 prefix if not already present
+      let altPhone = normalized;
+      if (!normalized.startsWith('+')) {
+        altPhone = '+91' + normalized;
+      } else if (normalized.startsWith('+91')) {
+        altPhone = normalized.replace('+91', '');
+      }
+      const altSnap = await db.collection(collections.users)
+        .where('phone', '==', altPhone)
+        .limit(1)
+        .get();
+
+      if (altSnap.empty) {
+        return res.status(404).json({ success: false, error: `No user found with phone: ${normalized}` });
+      }
+      // Use the alt result
+      const userDoc = altSnap.docs[0];
+      const userData = userDoc.data();
+
+      if (!userData.pinEnabled && !userData.pinHash) {
+        return res.status(400).json({
+          success: false,
+          error: 'This user does not have MPIN enabled',
+          user: { id: userDoc.id, name: userData.name || '', phone: userData.phone || altPhone }
+        });
+      }
+
+      await db.collection(collections.users).doc(userDoc.id).update({
+        pinEnabled: false,
+        pinHash: null,
+        pinUpdatedAt: new Date(),
+        pinAttempts: 0,
+        pinLockedUntil: null,
+      });
+
+      return res.json({
+        success: true,
+        message: 'MPIN has been reset (disabled) successfully',
+        user: { id: userDoc.id, name: userData.name || '', phone: userData.phone || altPhone, email: userData.email || '' }
+      });
+    }
+
+    const userDoc = usersSnap.docs[0];
+    const userData = userDoc.data();
+
+    if (!userData.pinEnabled && !userData.pinHash) {
+      return res.status(400).json({
+        success: false,
+        error: 'This user does not have MPIN enabled',
+        user: { id: userDoc.id, name: userData.name || '', phone: userData.phone || normalized }
+      });
+    }
+
+    await db.collection(collections.users).doc(userDoc.id).update({
+      pinEnabled: false,
+      pinHash: null,
+      pinUpdatedAt: new Date(),
+      pinAttempts: 0,
+      pinLockedUntil: null,
+    });
+
+    res.json({
+      success: true,
+      message: 'MPIN has been reset (disabled) successfully',
+      user: { id: userDoc.id, name: userData.name || '', phone: userData.phone || normalized, email: userData.email || '' }
+    });
+  } catch (error) {
+    console.error('Super admin reset MPIN error:', error);
+    res.status(500).json({ success: false, error: 'Failed to reset MPIN' });
+  }
+});
+
 module.exports = router;

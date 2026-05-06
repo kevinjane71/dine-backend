@@ -9491,7 +9491,8 @@ app.post('/api/orders', async (req, res) => {
           paymentMethod: paymentMethod,
           orderType: orderType,
           createdAt: orderData.createdAt?.toISOString() || new Date().toISOString(),
-          completedAt: new Date()
+          completedAt: new Date(),
+          tokenBillingEnabled: printSettings.tokenBillingEnabled || false
         }).catch(err => console.error('Billing print Pusher notification error (non-blocking):', err))
       );
     }
@@ -11018,7 +11019,8 @@ app.patch('/api/orders/:orderId/status', authenticateToken, async (req, res) => 
             cashReceived: orderData.cashReceived || null,
             changeReturned: orderData.changeReturned || null,
             createdAt: orderData.createdAt?.toDate?.()?.toISOString() || new Date().toISOString(),
-            completedAt: new Date()
+            completedAt: new Date(),
+            tokenBillingEnabled: printSettings.tokenBillingEnabled || false
           }).catch(err => console.error('Billing print Pusher notification error (non-blocking):', err))
         );
       }
@@ -12269,7 +12271,8 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
               cashReceived: updateData.cashReceived || currentOrder.cashReceived || null,
               changeReturned: updateData.changeReturned || currentOrder.changeReturned || null,
               createdAt: currentOrder.createdAt?.toDate?.()?.toISOString() || new Date().toISOString(),
-              completedAt: new Date()
+              completedAt: new Date(),
+              tokenBillingEnabled: printSettings.tokenBillingEnabled || false
             }).catch(err => console.error('Billing print Pusher notification error (non-blocking):', err))
           );
         }
@@ -12382,7 +12385,8 @@ app.post('/api/orders/:orderId/manual-print', authenticateToken, async (req, res
         completedAt: order.completedAt?.toDate?.()?.toISOString() || new Date().toISOString(),
         formattedTime,
         formattedDate,
-        forcePrint: true  // Force print flag - bypasses local cache check in printer app
+        forcePrint: true,  // Force print flag - bypasses local cache check in printer app
+        tokenBillingEnabled: printSettings.tokenBillingEnabled || false
       });
 
       res.json({
@@ -17816,10 +17820,15 @@ app.get('/api/token/render/:restaurantId/:orderId', async (req, res) => {
     const createdAt = orderData.createdAt?.toDate ? orderData.createdAt.toDate() : new Date(orderData.createdAt || Date.now());
     const time = createdAt.toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', hour12: true });
 
-    // Build category→station lookup from print stations
+    // Build category/station lookup from restaurant categories and print stations.
     const nameToId = {};
+    const idToName = {};
     for (const cat of (restaurantData.categories || [])) {
-      if (cat.name) nameToId[cat.name.toLowerCase().trim()] = cat.id;
+      if (!cat) continue;
+      const catId = cat.id || cat.categoryId || cat.name;
+      const catName = cat.name || cat.label || cat.id;
+      if (catName) nameToId[String(catName).toLowerCase().trim()] = catId;
+      if (catId && catName) idToName[catId] = catName;
     }
     const catIdToStation = {};
     if (restaurantData.printStations && restaurantData.printStations.length > 0) {
@@ -17833,18 +17842,29 @@ app.get('/api/token/render/:restaurantId/:orderId', async (req, res) => {
     // Group items by category
     const categoryGroups = {};
     for (const item of items) {
-      const category = item.category || 'General';
-      if (!categoryGroups[category]) categoryGroups[category] = [];
-      categoryGroups[category].push(item);
+      const rawCategoryName = item.categoryName || item.category || item.menuItem?.category || '';
+      const rawCategoryId = item.categoryId || item.menuItem?.categoryId || '';
+      const normalizedCategoryName = rawCategoryName ? String(rawCategoryName).toLowerCase().trim() : '';
+      const categoryId = rawCategoryId || nameToId[normalizedCategoryName] || rawCategoryName || 'general';
+      const categoryName = idToName[categoryId] || rawCategoryName || 'General';
+
+      if (!categoryGroups[categoryId]) {
+        categoryGroups[categoryId] = { categoryId, categoryName, items: [] };
+      }
+      categoryGroups[categoryId].items.push(item);
     }
 
     // Build token objects
-    const tokens = Object.entries(categoryGroups).map(([categoryName, categoryItems]) => {
-      const tokenLabel = `${categoryName.toUpperCase().replace(/\s+/g, '-')}-${dailyOrderId}`;
+    const tokens = Object.values(categoryGroups).map((group) => {
+      const { categoryId, categoryName, items: categoryItems } = group;
+      const categoryLabel = String(categoryName || 'General')
+        .toUpperCase()
+        .replace(/[^A-Z0-9]+/g, '-')
+        .replace(/^-|-$/g, '') || 'GENERAL';
+      const tokenLabel = `${categoryLabel}-${dailyOrderId}`;
 
       // Resolve print station for this category
-      const catId = nameToId[categoryName.toLowerCase().trim()];
-      const station = catId ? catIdToStation[catId] : null;
+      const station = categoryId ? catIdToStation[categoryId] : null;
 
       return {
         tokenLabel,
@@ -30143,6 +30163,49 @@ app.use((req, res) => {
   });
 });
 
+// Desktop app auto-update: proxy latest.json from GitHub Releases (private repo)
+let _updateCache = { data: null, ts: 0 };
+app.get('/api/public/desktop-update', async (req, res) => {
+  try {
+    const CACHE_TTL = 5 * 60 * 1000; // 5 minutes
+    if (_updateCache.data && Date.now() - _updateCache.ts < CACHE_TTL) {
+      return res.json(_updateCache.data);
+    }
+
+    const ghToken = process.env.GITHUB_TOKEN;
+    const repo = 'vivek7189/dine-fe2';
+    const headers = { 'Accept': 'application/vnd.github+json', 'User-Agent': 'DineOpen-Backend' };
+    if (ghToken) headers['Authorization'] = `Bearer ${ghToken}`;
+
+    // Get latest release
+    const releaseRes = await fetch(`https://api.github.com/repos/${repo}/releases/latest`, { headers });
+    if (!releaseRes.ok) {
+      return res.status(502).json({ error: 'Failed to fetch release info' });
+    }
+    const release = await releaseRes.json();
+
+    // Find latest.json asset
+    const latestAsset = release.assets?.find(a => a.name === 'latest.json');
+    if (!latestAsset) {
+      return res.status(404).json({ error: 'No update manifest found' });
+    }
+
+    // Download latest.json content
+    const dlHeaders = { ...headers, 'Accept': 'application/octet-stream' };
+    const assetRes = await fetch(latestAsset.url, { headers: dlHeaders });
+    if (!assetRes.ok) {
+      return res.status(502).json({ error: 'Failed to download update manifest' });
+    }
+    const manifest = await assetRes.json();
+
+    _updateCache = { data: manifest, ts: Date.now() };
+    res.json(manifest);
+  } catch (err) {
+    console.error('Desktop update proxy error:', err.message);
+    res.status(500).json({ error: 'Update check failed' });
+  }
+});
+
 // Start server for both local development and production
 const server = app.listen(PORT, '0.0.0.0', async () => {
     console.log(`🚀 Dine Backend server running on port ${PORT}`);
@@ -30526,4 +30589,3 @@ server.on('error', (error) => {
 });
 
 module.exports = app;
-
