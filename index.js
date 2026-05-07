@@ -29716,11 +29716,9 @@ app.post('/api/automation/:restaurantId/coupons/generate-private', authenticateT
       return res.status(400).json({ error: 'customerPhone and denominations array are required' });
     }
 
-    // Validate total matches denominations sum
+    // Calculate total from denominations — totalAmount is optional
     const denomSum = denominations.reduce((s, d) => s + Number(d), 0);
-    if (totalAmount && Math.abs(denomSum - Number(totalAmount)) > 0.01) {
-      return res.status(400).json({ error: `Denominations sum (${denomSum}) does not match total amount (${totalAmount})` });
-    }
+    const effectiveTotal = totalAmount ? Number(totalAmount) : denomSum;
 
     const batchId = `batch_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
     const generatedCoupons = [];
@@ -30521,7 +30519,9 @@ app.get('/api/public/desktop-downloads', async (req, res) => {
     const assets = release.assets || [];
 
     // Build download URLs - use backend proxy for private repo
-    const baseProxy = `https://dine-backend-lake.vercel.app/api/public/desktop-asset`;
+    const proto = req.headers['x-forwarded-proto'] || 'https';
+    const host = req.headers['x-forwarded-host'] || req.headers['host'];
+    const baseProxy = `${proto}://${host}/api/public/desktop-asset`;
     const windowsExe = assets.find(a => a.name.endsWith('-setup.exe') && !a.name.endsWith('.sig'));
     const windowsMsi = assets.find(a => a.name.endsWith('.msi') && !a.name.endsWith('.sig'));
     const macDmgArm = assets.find(a => a.name.includes('aarch64') && a.name.endsWith('.dmg'));
