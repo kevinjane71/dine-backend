@@ -30469,32 +30469,6 @@ app.post('/api/automation/:restaurantId/sync-customer', authenticateToken, async
 
 // ==================== END AUTOMATION & LOYALTY APIs ====================
 
-// 404 handler - must be last (after all routes)
-app.use((req, res) => {
-  res.status(404).json({ 
-    error: 'Not Found', 
-    message: `Endpoint ${req.originalUrl} not found`,
-    requestId: req.id,
-    available_endpoints: [
-      '/',
-      '/health', 
-      '/api/auth/*',
-      '/api/restaurants/*',
-      '/api/menus/*',
-      '/api/orders/*',
-      '/api/payments/*',
-      '/api/analytics/*',
-      '/api/kot/*',
-      '/api/admin/settings/*',
-      '/api/categories/*',
-      '/api/email/*',
-      '/api/dinebot/*',
-      '/api/hotel/*',
-      '/api/automation/*'
-    ]
-  });
-});
-
 // Desktop app download links: return latest release asset URLs (proxied for private repo)
 let _downloadCache = { data: null, ts: 0 };
 app.get('/api/public/desktop-downloads', async (req, res) => {
@@ -30630,6 +30604,32 @@ app.get('/api/public/desktop-update', async (req, res) => {
     console.error('Desktop update proxy error:', err.message);
     res.status(500).json({ error: 'Update check failed' });
   }
+});
+
+// 404 handler - must be last (after all routes)
+app.use((req, res) => {
+  res.status(404).json({
+    error: 'Not Found',
+    message: `Endpoint ${req.originalUrl} not found`,
+    requestId: req.id,
+    available_endpoints: [
+      '/',
+      '/health',
+      '/api/auth/*',
+      '/api/restaurants/*',
+      '/api/menus/*',
+      '/api/orders/*',
+      '/api/payments/*',
+      '/api/analytics/*',
+      '/api/kot/*',
+      '/api/admin/settings/*',
+      '/api/categories/*',
+      '/api/email/*',
+      '/api/dinebot/*',
+      '/api/hotel/*',
+      '/api/automation/*'
+    ]
+  });
 });
 
 // Start server for both local development and production
