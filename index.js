@@ -30496,10 +30496,15 @@ app.get('/api/public/desktop-downloads', async (req, res) => {
     const proto = req.headers['x-forwarded-proto'] || 'https';
     const host = req.headers['x-forwarded-host'] || req.headers['host'];
     const baseProxy = `${proto}://${host}/api/public/desktop-asset`;
-    const windowsExe = assets.find(a => a.name.endsWith('-setup.exe') && !a.name.endsWith('.sig'));
+    // Match Tauri-style names (-setup.exe, aarch64.dmg, x64.dmg)
+    // AND Electron-builder names (Setup X.X.X.exe, ProductName-X.X.X.dmg)
+    const windowsExe = assets.find(a => a.name.endsWith('-setup.exe') && !a.name.endsWith('.sig'))
+      || assets.find(a => /Setup.*\.exe$/i.test(a.name) && !a.name.endsWith('.blockmap'));
     const windowsMsi = assets.find(a => a.name.endsWith('.msi') && !a.name.endsWith('.sig'));
     const macDmgArm = assets.find(a => a.name.includes('aarch64') && a.name.endsWith('.dmg'));
     const macDmgIntel = assets.find(a => a.name.includes('x64') && a.name.endsWith('.dmg'));
+    // Electron-builder produces a single .dmg (not arch-specific) — use as fallback for dmgArm
+    const macDmgGeneric = !macDmgArm ? assets.find(a => a.name.endsWith('.dmg') && !a.name.includes('aarch64') && !a.name.includes('x64')) : null;
 
     const result = {
       version,
@@ -30509,7 +30514,7 @@ app.get('/api/public/desktop-downloads', async (req, res) => {
         msi: windowsMsi ? { name: windowsMsi.name, size: windowsMsi.size, url: `${baseProxy}/${windowsMsi.id}/${windowsMsi.name}` } : null,
       },
       mac: {
-        dmgArm: macDmgArm ? { name: macDmgArm.name, size: macDmgArm.size, url: `${baseProxy}/${macDmgArm.id}/${macDmgArm.name}` } : null,
+        dmgArm: (macDmgArm || macDmgGeneric) ? { name: (macDmgArm || macDmgGeneric).name, size: (macDmgArm || macDmgGeneric).size, url: `${baseProxy}/${(macDmgArm || macDmgGeneric).id}/${(macDmgArm || macDmgGeneric).name}` } : null,
         dmgIntel: macDmgIntel ? { name: macDmgIntel.name, size: macDmgIntel.size, url: `${baseProxy}/${macDmgIntel.id}/${macDmgIntel.name}` } : null,
       },
     };
