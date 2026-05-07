@@ -17879,12 +17879,19 @@ app.get('/api/token/render/:restaurantId/:orderId', async (req, res) => {
       return {
         tokenLabel,
         categoryName,
-        items: categoryItems.map(i => ({
-          name: i.name || i.itemName || 'Item',
-          quantity: i.quantity || 1,
-          variant: i.selectedVariant?.name || i.variant || null,
-          customizations: i.selectedCustomizations || i.customizations || null
-        })),
+        items: categoryItems.map(i => {
+          const qty = i.quantity || 1;
+          const price = i.price || i.itemPrice || 0;
+          return {
+            name: i.name || i.itemName || 'Item',
+            quantity: qty,
+            price,
+            total: qty * price,
+            variant: i.selectedVariant?.name || i.variant || null,
+            customizations: i.selectedCustomizations || i.customizations || null
+          };
+        }),
+        tokenTotal: categoryItems.reduce((sum, i) => sum + ((i.quantity || 1) * (i.price || i.itemPrice || 0)), 0),
         itemCount: categoryItems.reduce((sum, i) => sum + (i.quantity || 1), 0),
         orderNumber: dailyOrderId,
         time,
