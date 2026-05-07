@@ -8925,6 +8925,10 @@ app.post('/api/orders', async (req, res) => {
       syncSource: syncSource, // 'online' | 'offline' — tracks how order was placed
       ...(idempotencyKey ? { idempotencyKey } : {}),
       walletRedeemAmount: req.body.walletRedeemAmount ? Math.round(Number(req.body.walletRedeemAmount) * 100) / 100 : null,
+      // Coupon fields
+      couponCode: req.body.couponCode || null,
+      couponId: req.body.couponId || null,
+      couponDiscount: req.body.couponDiscount ? Math.round(Number(req.body.couponDiscount) * 100) / 100 : null,
       scheduledFor: req.body.scheduledFor || null,
       isScheduled: req.body.isScheduled || false,
       createdAt: new Date(),
@@ -8946,8 +8950,14 @@ app.post('/api/orders', async (req, res) => {
       orderData.offerDiscount = Math.round(feDiscount * 100) / 100;
       orderData.manualDiscount = Math.round(feManual * 100) / 100;
       orderData.loyaltyDiscount = Math.round(feLoyalty * 100) / 100;
-      orderData.totalDiscountAmount = Math.round(feTotalDisc * 100) / 100;
-      orderData.totalAmount = Math.round(Math.max(0, feSubtotal - feTotalDisc) * 100) / 100;
+      const feCoupon = parseFloat(req.body.couponDiscount) || 0;
+      if (feCoupon > 0) {
+        orderData.couponDiscount = Math.round(feCoupon * 100) / 100;
+        orderData.couponCode = req.body.couponCode || orderData.couponCode;
+        orderData.couponId = req.body.couponId || orderData.couponId;
+      }
+      orderData.totalDiscountAmount = Math.round((feTotalDisc + feCoupon) * 100) / 100;
+      orderData.totalAmount = Math.round(Math.max(0, feSubtotal - orderData.totalDiscountAmount) * 100) / 100;
       orderData.taxBreakdown = req.body.taxBreakdown;
       orderData.taxAmount = Math.round(feTaxAmt * 100) / 100;
       orderData.finalAmount = Math.round(parseFloat(req.body.finalAmount) * 100) / 100;
@@ -26489,7 +26499,10 @@ app.get('/api/public/customer-app-settings/:restaurantId', vercelSecurityMiddlew
         offerSettings: {
           autoApplyBestOffer: customerAppSettings.offerSettings?.autoApplyBestOffer ?? false,
           allowMultipleOffers: customerAppSettings.offerSettings?.allowMultipleOffers ?? false,
-          maxOffersAllowed: customerAppSettings.offerSettings?.maxOffersAllowed ?? 1
+          maxOffersAllowed: customerAppSettings.offerSettings?.maxOffersAllowed ?? 1,
+          couponsEnabled: customerAppSettings.offerSettings?.couponsEnabled ?? false,
+          allowCouponsWithOffers: customerAppSettings.offerSettings?.allowCouponsWithOffers ?? true,
+          maxCouponsPerOrder: customerAppSettings.offerSettings?.maxCouponsPerOrder || 1
         },
         pageSettings: {
           loginMode: customerAppSettings.pageSettings?.loginMode || 'optional',
@@ -27029,7 +27042,10 @@ app.get('/api/restaurants/:restaurantId/customer-app-settings', authenticateToke
       offerSettings: {
         autoApplyBestOffer: existingSettings.offerSettings?.autoApplyBestOffer ?? false,
         allowMultipleOffers: existingSettings.offerSettings?.allowMultipleOffers ?? false,
-        maxOffersAllowed: existingSettings.offerSettings?.maxOffersAllowed || 1
+        maxOffersAllowed: existingSettings.offerSettings?.maxOffersAllowed || 1,
+        couponsEnabled: existingSettings.offerSettings?.couponsEnabled ?? false,
+        allowCouponsWithOffers: existingSettings.offerSettings?.allowCouponsWithOffers ?? true,
+        maxCouponsPerOrder: existingSettings.offerSettings?.maxCouponsPerOrder || 1
       },
       branding: {
         primaryColor: existingSettings.branding?.primaryColor || '#ef4444',
@@ -27152,7 +27168,10 @@ app.put('/api/restaurants/:restaurantId/customer-app-settings', authenticateToke
       offerSettings: {
         autoApplyBestOffer: settings.offerSettings?.autoApplyBestOffer ?? false,
         allowMultipleOffers: settings.offerSettings?.allowMultipleOffers ?? false,
-        maxOffersAllowed: Number(settings.offerSettings?.maxOffersAllowed) || 1
+        maxOffersAllowed: Number(settings.offerSettings?.maxOffersAllowed) || 1,
+        couponsEnabled: settings.offerSettings?.couponsEnabled ?? false,
+        allowCouponsWithOffers: settings.offerSettings?.allowCouponsWithOffers ?? true,
+        maxCouponsPerOrder: Number(settings.offerSettings?.maxCouponsPerOrder) || 1
       },
       branding: {
         primaryColor: settings.branding?.primaryColor || '#ef4444',
@@ -29437,10 +29456,36 @@ app.post('/api/automation/:restaurantId/coupons', authenticateToken, async (req,
       return res.status(403).json({ error: 'Access denied. You do not have permission to manage automation.' });
     }
     const { restaurantId } = req.params;
+    const { code, type, description, discountType, value, minOrderAmount, maxDiscountAmount,
+      maxUses, validFrom, validTo, customerPhone, customerName } = req.body;
+
+    if (!code || !discountType || value == null) {
+      return res.status(400).json({ error: 'Code, discountType, and value are required' });
+    }
+
     const couponData = {
       restaurantId,
-      ...req.body,
+      type: type || 'public',
+      code: code.trim(),
+      codeLower: code.trim().toLowerCase(),
+      description: description || '',
+      discountType, // 'flat' or 'percentage'
+      value: Number(value),
+      minOrderAmount: Number(minOrderAmount) || 0,
+      maxDiscountAmount: discountType === 'percentage' ? (Number(maxDiscountAmount) || 0) : 0,
+      maxUses: type === 'private' ? 1 : (Number(maxUses) || 0), // 0 = unlimited for public
       usedCount: 0,
+      validFrom: validFrom ? new Date(validFrom) : new Date(),
+      validTo: validTo ? new Date(validTo) : null,
+      isActive: true,
+      // Private coupon fields
+      customerPhone: customerPhone || null,
+      customerName: customerName || null,
+      batchId: req.body.batchId || null,
+      denomination: req.body.denomination ? Number(req.body.denomination) : null,
+      redeemedAt: null,
+      redeemedOrderId: null,
+      createdBy: req.user?.userId || req.user?.id || null,
       createdAt: new Date(),
       updatedAt: new Date()
     };
@@ -29460,10 +29505,27 @@ app.patch('/api/automation/:restaurantId/coupons/:couponId', authenticateToken, 
       return res.status(403).json({ error: 'Access denied. You do not have permission to manage automation.' });
     }
     const { couponId } = req.params;
-    const updateData = {
-      ...req.body,
-      updatedAt: new Date()
-    };
+
+    // Don't allow editing redeemed private coupons
+    const couponDoc = await db.collection(collections.coupons).doc(couponId).get();
+    if (!couponDoc.exists) {
+      return res.status(404).json({ error: 'Coupon not found' });
+    }
+    const existing = couponDoc.data();
+    if (existing.type === 'private' && existing.redeemedAt) {
+      return res.status(400).json({ error: 'Cannot edit a redeemed coupon' });
+    }
+
+    const updateData = { ...req.body, updatedAt: new Date() };
+    // Keep codeLower in sync
+    if (updateData.code) {
+      updateData.codeLower = updateData.code.trim().toLowerCase();
+      updateData.code = updateData.code.trim();
+    }
+    if (updateData.value != null) updateData.value = Number(updateData.value);
+    if (updateData.minOrderAmount != null) updateData.minOrderAmount = Number(updateData.minOrderAmount);
+    if (updateData.maxDiscountAmount != null) updateData.maxDiscountAmount = Number(updateData.maxDiscountAmount);
+    if (updateData.maxUses != null) updateData.maxUses = Number(updateData.maxUses);
 
     await db.collection(collections.coupons).doc(couponId).update(updateData);
     res.json({ success: true });
@@ -29485,6 +29547,278 @@ app.delete('/api/automation/:restaurantId/coupons/:couponId', authenticateToken,
   } catch (error) {
     console.error('Delete coupon error:', error);
     res.status(500).json({ error: 'Failed to delete coupon' });
+  }
+});
+
+// Validate coupon code (billing-time check)
+app.post('/api/automation/:restaurantId/coupons/validate', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+    const { code, customerPhone, cartTotal } = req.body;
+
+    if (!code) {
+      return res.status(400).json({ valid: false, reason: 'Coupon code is required' });
+    }
+
+    // Check if coupons are enabled for this restaurant
+    const casDoc = await db.collection(collections.customerAppSettings).where('restaurantId', '==', restaurantId).limit(1).get();
+    if (!casDoc.empty) {
+      const cas = casDoc.docs[0].data();
+      if (!(cas.offerSettings?.couponsEnabled)) {
+        return res.json({ valid: false, reason: 'Coupons are not enabled for this restaurant' });
+      }
+    }
+
+    const codeLower = code.trim().toLowerCase();
+    const snapshot = await db.collection(collections.coupons)
+      .where('restaurantId', '==', restaurantId)
+      .where('codeLower', '==', codeLower)
+      .limit(1)
+      .get();
+
+    if (snapshot.empty) {
+      return res.json({ valid: false, reason: 'Invalid coupon code' });
+    }
+
+    const couponDoc = snapshot.docs[0];
+    const coupon = { id: couponDoc.id, ...couponDoc.data() };
+    const now = new Date();
+
+    // Check active
+    if (!coupon.isActive) {
+      return res.json({ valid: false, reason: 'This coupon is no longer active' });
+    }
+
+    // Check validity dates
+    const validFrom = coupon.validFrom?.toDate ? coupon.validFrom.toDate() : new Date(coupon.validFrom);
+    if (validFrom > now) {
+      return res.json({ valid: false, reason: 'This coupon is not yet valid' });
+    }
+    if (coupon.validTo) {
+      const validTo = coupon.validTo?.toDate ? coupon.validTo.toDate() : new Date(coupon.validTo);
+      // Set to end of day for validTo
+      validTo.setHours(23, 59, 59, 999);
+      if (validTo < now) {
+        return res.json({ valid: false, reason: 'This coupon has expired' });
+      }
+    }
+
+    // Type-specific checks
+    if (coupon.type === 'private') {
+      if (!customerPhone || coupon.customerPhone !== customerPhone) {
+        return res.json({ valid: false, reason: 'This coupon is not assigned to you' });
+      }
+      if (coupon.redeemedAt) {
+        return res.json({ valid: false, reason: 'This coupon has already been redeemed' });
+      }
+    } else {
+      // Public: check usage limit
+      if (coupon.maxUses && coupon.maxUses > 0 && coupon.usedCount >= coupon.maxUses) {
+        return res.json({ valid: false, reason: 'This coupon has reached its usage limit' });
+      }
+    }
+
+    // Check minimum order amount
+    const total = Number(cartTotal) || 0;
+    if (coupon.minOrderAmount && total < coupon.minOrderAmount) {
+      return res.json({ valid: false, reason: `Minimum order amount of ₹${coupon.minOrderAmount} required` });
+    }
+
+    // Calculate discount
+    let discountAmount = 0;
+    if (coupon.discountType === 'percentage') {
+      discountAmount = Math.round((total * coupon.value / 100) * 100) / 100;
+      if (coupon.maxDiscountAmount && coupon.maxDiscountAmount > 0) {
+        discountAmount = Math.min(discountAmount, coupon.maxDiscountAmount);
+      }
+    } else {
+      discountAmount = Math.min(coupon.value, total); // Can't discount more than cart total
+    }
+    discountAmount = Math.round(discountAmount * 100) / 100;
+
+    res.json({
+      valid: true,
+      coupon: {
+        id: coupon.id,
+        code: coupon.code,
+        type: coupon.type,
+        discountType: coupon.discountType,
+        value: coupon.value,
+        description: coupon.description,
+        minOrderAmount: coupon.minOrderAmount,
+        maxDiscountAmount: coupon.maxDiscountAmount,
+      },
+      discountAmount
+    });
+  } catch (error) {
+    console.error('Validate coupon error:', error);
+    res.status(500).json({ valid: false, reason: 'Failed to validate coupon' });
+  }
+});
+
+// Redeem coupon (called after order completion)
+app.post('/api/automation/:restaurantId/coupons/redeem', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+    const { couponId, orderId } = req.body;
+
+    if (!couponId || !orderId) {
+      return res.status(400).json({ error: 'couponId and orderId are required' });
+    }
+
+    const couponRef = db.collection(collections.coupons).doc(couponId);
+    const couponDoc = await couponRef.get();
+
+    if (!couponDoc.exists) {
+      return res.status(404).json({ error: 'Coupon not found' });
+    }
+
+    const coupon = couponDoc.data();
+    if (coupon.restaurantId !== restaurantId) {
+      return res.status(403).json({ error: 'Coupon does not belong to this restaurant' });
+    }
+
+    if (coupon.type === 'private') {
+      if (coupon.redeemedAt) {
+        return res.json({ success: true, alreadyRedeemed: true }); // Idempotent
+      }
+      await couponRef.update({
+        redeemedAt: new Date(),
+        redeemedOrderId: orderId,
+        usedCount: 1,
+        updatedAt: new Date()
+      });
+    } else {
+      // Public coupon — increment usedCount
+      await couponRef.update({
+        usedCount: (coupon.usedCount || 0) + 1,
+        updatedAt: new Date()
+      });
+    }
+
+    res.json({ success: true });
+  } catch (error) {
+    console.error('Redeem coupon error:', error);
+    res.status(500).json({ error: 'Failed to redeem coupon' });
+  }
+});
+
+// Generate private coupons for a customer (advance payment scenario)
+app.post('/api/automation/:restaurantId/coupons/generate-private', authenticateToken, async (req, res) => {
+  try {
+    if (!(await checkFeaturePermission(req, 'admin', 'read'))) {
+      return res.status(403).json({ error: 'Access denied.' });
+    }
+    const { restaurantId } = req.params;
+    const { customerPhone, customerName, totalAmount, denominations, validFrom, validTo } = req.body;
+
+    if (!customerPhone || !denominations || !Array.isArray(denominations) || denominations.length === 0) {
+      return res.status(400).json({ error: 'customerPhone and denominations array are required' });
+    }
+
+    // Validate total matches denominations sum
+    const denomSum = denominations.reduce((s, d) => s + Number(d), 0);
+    if (totalAmount && Math.abs(denomSum - Number(totalAmount)) > 0.01) {
+      return res.status(400).json({ error: `Denominations sum (${denomSum}) does not match total amount (${totalAmount})` });
+    }
+
+    const batchId = `batch_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    const generatedCoupons = [];
+
+    for (const denomination of denominations) {
+      // Generate unique 8-char alphanumeric code
+      const code = `P${Math.random().toString(36).slice(2, 9).toUpperCase()}`;
+
+      const couponData = {
+        restaurantId,
+        type: 'private',
+        code,
+        codeLower: code.toLowerCase(),
+        description: `₹${denomination} coupon for ${customerName || customerPhone}`,
+        discountType: 'flat',
+        value: Number(denomination),
+        denomination: Number(denomination),
+        minOrderAmount: 0,
+        maxDiscountAmount: 0,
+        maxUses: 1,
+        usedCount: 0,
+        validFrom: validFrom ? new Date(validFrom) : new Date(),
+        validTo: validTo ? new Date(validTo) : null,
+        isActive: true,
+        customerPhone,
+        customerName: customerName || null,
+        batchId,
+        redeemedAt: null,
+        redeemedOrderId: null,
+        createdBy: req.user?.userId || req.user?.id || null,
+        createdAt: new Date(),
+        updatedAt: new Date()
+      };
+
+      const docRef = await db.collection(collections.coupons).add(couponData);
+      generatedCoupons.push({ id: docRef.id, ...couponData });
+    }
+
+    res.json({ success: true, batchId, coupons: generatedCoupons });
+  } catch (error) {
+    console.error('Generate private coupons error:', error);
+    res.status(500).json({ error: 'Failed to generate coupons' });
+  }
+});
+
+// Get coupons available for a customer (by phone)
+app.get('/api/automation/:restaurantId/coupons/customer/:phone', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId, phone } = req.params;
+    const now = new Date();
+
+    // Get private coupons for this customer (unredeemed, active)
+    const privateSnapshot = await db.collection(collections.coupons)
+      .where('restaurantId', '==', restaurantId)
+      .where('type', '==', 'private')
+      .where('customerPhone', '==', phone)
+      .where('isActive', '==', true)
+      .get();
+
+    const privateCoupons = privateSnapshot.docs
+      .map(doc => ({ id: doc.id, ...doc.data() }))
+      .filter(c => {
+        if (c.redeemedAt) return false; // Already used
+        if (c.validTo) {
+          const validTo = c.validTo?.toDate ? c.validTo.toDate() : new Date(c.validTo);
+          validTo.setHours(23, 59, 59, 999);
+          if (validTo < now) return false; // Expired
+        }
+        const validFrom = c.validFrom?.toDate ? c.validFrom.toDate() : new Date(c.validFrom);
+        if (validFrom > now) return false; // Not yet valid
+        return true;
+      });
+
+    // Get public coupons that are still usable
+    const publicSnapshot = await db.collection(collections.coupons)
+      .where('restaurantId', '==', restaurantId)
+      .where('type', '==', 'public')
+      .where('isActive', '==', true)
+      .get();
+
+    const publicCoupons = publicSnapshot.docs
+      .map(doc => ({ id: doc.id, ...doc.data() }))
+      .filter(c => {
+        if (c.maxUses && c.maxUses > 0 && c.usedCount >= c.maxUses) return false;
+        if (c.validTo) {
+          const validTo = c.validTo?.toDate ? c.validTo.toDate() : new Date(c.validTo);
+          validTo.setHours(23, 59, 59, 999);
+          if (validTo < now) return false;
+        }
+        const validFrom = c.validFrom?.toDate ? c.validFrom.toDate() : new Date(c.validFrom);
+        if (validFrom > now) return false;
+        return true;
+      });
+
+    res.json({ success: true, coupons: [...privateCoupons, ...publicCoupons] });
+  } catch (error) {
+    console.error('Get customer coupons error:', error);
+    res.status(500).json({ error: 'Failed to get customer coupons' });
   }
 });
 
@@ -30161,6 +30495,98 @@ app.use((req, res) => {
       '/api/automation/*'
     ]
   });
+});
+
+// Desktop app download links: return latest release asset URLs (proxied for private repo)
+let _downloadCache = { data: null, ts: 0 };
+app.get('/api/public/desktop-downloads', async (req, res) => {
+  try {
+    const CACHE_TTL = 10 * 60 * 1000; // 10 minutes
+    if (_downloadCache.data && Date.now() - _downloadCache.ts < CACHE_TTL) {
+      return res.json(_downloadCache.data);
+    }
+
+    const ghToken = process.env.GITHUB_TOKEN;
+    const repo = 'vivek7189/dine-fe2';
+    const headers = { 'Accept': 'application/vnd.github+json', 'User-Agent': 'DineOpen-Backend' };
+    if (ghToken) headers['Authorization'] = `Bearer ${ghToken}`;
+
+    const releaseRes = await fetch(`https://api.github.com/repos/${repo}/releases/latest`, { headers });
+    if (!releaseRes.ok) {
+      return res.status(502).json({ error: 'Failed to fetch release info' });
+    }
+    const release = await releaseRes.json();
+
+    const version = release.tag_name?.replace(/^v/, '') || 'unknown';
+    const assets = release.assets || [];
+
+    // Build download URLs - use backend proxy for private repo
+    const baseProxy = `https://dine-backend-lake.vercel.app/api/public/desktop-asset`;
+    const windowsExe = assets.find(a => a.name.endsWith('-setup.exe') && !a.name.endsWith('.sig'));
+    const windowsMsi = assets.find(a => a.name.endsWith('.msi') && !a.name.endsWith('.sig'));
+    const macDmgArm = assets.find(a => a.name.includes('aarch64') && a.name.endsWith('.dmg'));
+    const macDmgIntel = assets.find(a => a.name.includes('x64') && a.name.endsWith('.dmg'));
+
+    const result = {
+      version,
+      releasedAt: release.published_at,
+      windows: {
+        exe: windowsExe ? { name: windowsExe.name, size: windowsExe.size, url: `${baseProxy}/${windowsExe.id}/${windowsExe.name}` } : null,
+        msi: windowsMsi ? { name: windowsMsi.name, size: windowsMsi.size, url: `${baseProxy}/${windowsMsi.id}/${windowsMsi.name}` } : null,
+      },
+      mac: {
+        dmgArm: macDmgArm ? { name: macDmgArm.name, size: macDmgArm.size, url: `${baseProxy}/${macDmgArm.id}/${macDmgArm.name}` } : null,
+        dmgIntel: macDmgIntel ? { name: macDmgIntel.name, size: macDmgIntel.size, url: `${baseProxy}/${macDmgIntel.id}/${macDmgIntel.name}` } : null,
+      },
+    };
+
+    _downloadCache = { data: result, ts: Date.now() };
+    res.json(result);
+  } catch (err) {
+    console.error('Desktop downloads error:', err.message);
+    res.status(500).json({ error: 'Failed to get download links' });
+  }
+});
+
+// Desktop asset download proxy: stream asset from private GitHub repo
+app.get('/api/public/desktop-asset/:assetId/:filename', async (req, res) => {
+  try {
+    const { assetId, filename } = req.params;
+    const ghToken = process.env.GITHUB_TOKEN;
+    const headers = { 'Accept': 'application/octet-stream', 'User-Agent': 'DineOpen-Backend' };
+    if (ghToken) headers['Authorization'] = `Bearer ${ghToken}`;
+
+    const assetRes = await fetch(`https://api.github.com/repos/vivek7189/dine-fe2/releases/assets/${assetId}`, {
+      headers,
+      redirect: 'follow',
+    });
+
+    if (!assetRes.ok) {
+      return res.status(404).json({ error: 'Asset not found' });
+    }
+
+    res.setHeader('Content-Type', 'application/octet-stream');
+    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+    if (assetRes.headers.get('content-length')) {
+      res.setHeader('Content-Length', assetRes.headers.get('content-length'));
+    }
+
+    // Stream the response
+    const reader = assetRes.body.getReader();
+    const pump = async () => {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) { res.end(); return; }
+        res.write(Buffer.from(value));
+      }
+    };
+    await pump();
+  } catch (err) {
+    console.error('Desktop asset proxy error:', err.message);
+    if (!res.headersSent) {
+      res.status(500).json({ error: 'Download failed' });
+    }
+  }
 });
 
 // Desktop app auto-update: proxy latest.json from GitHub Releases (private repo)
