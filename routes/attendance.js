@@ -82,7 +82,7 @@ function isAdminRole(role) {
 router.post('/:restaurantId/clock-in', async (req, res) => {
   try {
     const { restaurantId } = req.params;
-    const { staffId, staffName, location } = req.body;
+    const { staffId, staffName, role, location } = req.body;
 
     if (!staffId) {
       return res.status(400).json({ error: 'staffId is required' });
@@ -133,6 +133,7 @@ router.post('/:restaurantId/clock-in', async (req, res) => {
     const attendanceData = {
       staffId,
       staffName: staffName || '',
+      role: role || '',
       restaurantId,
       date: todayStr,
       status: 'present',
@@ -362,17 +363,35 @@ router.post('/:restaurantId/manual-entry', async (req, res) => {
       return res.status(403).json({ error: 'Only owner, admin, or manager can create manual entries' });
     }
 
-    const { staffId, staffName, date, status, clockIn, clockOut, notes } = req.body;
+    const { staffId, staffName, role, date, status, clockIn, clockOut, notes } = req.body;
 
     if (!staffId || !date || !status) {
       return res.status(400).json({ error: 'staffId, date, and status are required' });
     }
 
+    // Normalize clock times — if time-only string like "11:34", convert to full ISO using date
+    const normalizeTime = (timeVal) => {
+      if (!timeVal) return null;
+      // Already an ISO string or full datetime
+      if (timeVal.includes('T') || timeVal.length > 10) return timeVal;
+      // Time-only string like "11:34" — combine with date
+      const [h, m] = timeVal.split(':').map(Number);
+      if (isNaN(h) || isNaN(m)) return null;
+      const d = new Date(date + 'T00:00:00');
+      d.setHours(h, m, 0, 0);
+      return d.toISOString();
+    };
+
+    const normalizedClockIn = normalizeTime(clockIn);
+    const normalizedClockOut = normalizeTime(clockOut);
+
     let totalHours = 0;
-    if (clockIn && clockOut) {
-      const inTime = new Date(clockIn);
-      const outTime = new Date(clockOut);
-      totalHours = parseFloat(((outTime - inTime) / (1000 * 60 * 60)).toFixed(2));
+    if (normalizedClockIn && normalizedClockOut) {
+      const inTime = new Date(normalizedClockIn);
+      const outTime = new Date(normalizedClockOut);
+      if (!isNaN(inTime.getTime()) && !isNaN(outTime.getTime())) {
+        totalHours = parseFloat(((outTime - inTime) / (1000 * 60 * 60)).toFixed(2));
+      }
     }
 
     const docId = `${staffId}_${date}`;
@@ -381,11 +400,12 @@ router.post('/:restaurantId/manual-entry', async (req, res) => {
     const attendanceData = {
       staffId,
       staffName: staffName || '',
+      role: role || '',
       restaurantId,
       date,
       status,
-      clockIn: clockIn || null,
-      clockOut: clockOut || null,
+      clockIn: normalizedClockIn,
+      clockOut: normalizedClockOut,
       totalHours,
       notes: notes || '',
       manualEntry: true,
