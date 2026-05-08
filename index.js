@@ -29568,10 +29568,10 @@ app.post('/api/automation/:restaurantId/coupons/validate', authenticateToken, as
     }
 
     // Check if coupons are enabled for this restaurant
-    const casDoc = await db.collection(collections.customerAppSettings).where('restaurantId', '==', restaurantId).limit(1).get();
-    if (!casDoc.empty) {
-      const cas = casDoc.docs[0].data();
-      if (!(cas.offerSettings?.couponsEnabled)) {
+    const restaurantDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
+    if (restaurantDoc.exists) {
+      const customerAppSettings = restaurantDoc.data()?.customerAppSettings || {};
+      if (!(customerAppSettings.offerSettings?.couponsEnabled)) {
         return res.json({ valid: false, reason: 'Coupons are not enabled for this restaurant' });
       }
     }
