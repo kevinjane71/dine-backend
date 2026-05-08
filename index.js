@@ -30474,7 +30474,7 @@ app.get('/api/public/desktop-downloads', async (req, res) => {
     }
 
     const ghToken = process.env.GITHUB_TOKEN;
-    const repo = 'vivek7189/dine-fe2';
+    const repo = 'kevinjane71/dine-frontend';
     const headers = { 'Accept': 'application/vnd.github+json', 'User-Agent': 'DineOpen-Backend' };
     if (ghToken) headers['Authorization'] = `Bearer ${ghToken}`;
 
@@ -30496,7 +30496,7 @@ app.get('/api/public/desktop-downloads', async (req, res) => {
     const windowsExe = assets.find(a => a.name.endsWith('-setup.exe') && !a.name.endsWith('.sig'))
       || assets.find(a => /Setup.*\.exe$/i.test(a.name) && !a.name.endsWith('.blockmap'));
     const windowsMsi = assets.find(a => a.name.endsWith('.msi') && !a.name.endsWith('.sig'));
-    const macDmgArm = assets.find(a => a.name.includes('aarch64') && a.name.endsWith('.dmg'));
+    const macDmgArm = assets.find(a => (a.name.includes('aarch64') || a.name.includes('arm64')) && a.name.endsWith('.dmg'));
     const macDmgIntel = assets.find(a => a.name.includes('x64') && a.name.endsWith('.dmg'));
     // Electron-builder produces a single .dmg (not arch-specific) — use as fallback for dmgArm
     const macDmgGeneric = !macDmgArm ? assets.find(a => a.name.endsWith('.dmg') && !a.name.includes('aarch64') && !a.name.includes('x64')) : null;
@@ -30530,7 +30530,7 @@ app.get('/api/public/desktop-asset/:assetId/:filename', async (req, res) => {
     const headers = { 'Accept': 'application/octet-stream', 'User-Agent': 'DineOpen-Backend' };
     if (ghToken) headers['Authorization'] = `Bearer ${ghToken}`;
 
-    const assetRes = await fetch(`https://api.github.com/repos/vivek7189/dine-fe2/releases/assets/${assetId}`, {
+    const assetRes = await fetch(`https://api.github.com/repos/kevinjane71/dine-frontend/releases/assets/${assetId}`, {
       headers,
       redirect: 'follow',
     });
@@ -30573,7 +30573,7 @@ app.get('/api/public/desktop-update', async (req, res) => {
     }
 
     const ghToken = process.env.GITHUB_TOKEN;
-    const repo = 'vivek7189/dine-fe2';
+    const repo = 'kevinjane71/dine-frontend';
     const headers = { 'Accept': 'application/vnd.github+json', 'User-Agent': 'DineOpen-Backend' };
     if (ghToken) headers['Authorization'] = `Bearer ${ghToken}`;
 
