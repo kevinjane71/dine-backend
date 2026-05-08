@@ -138,12 +138,36 @@ router.put('/admin/currency/:restaurantId', authenticateToken, async (req, res) 
     const oldSettings = restaurant.currencySettings || defaultCurrencySettings;
     const newTaxLabel = currencySettings.taxLabel || 'Tax';
 
-    // Auto-update tax names if country changed and tax label differs
+    // Auto-update tax settings when country/currency changes
     let taxSettingsUpdated = false;
+    const oldCountry = oldSettings.countryCode || 'IN';
+    const newCountry = currencySettings.countryCode;
+    const wasIndia = oldCountry === 'IN';
+    const isIndia = newCountry === 'IN';
+
     if (restaurant.taxSettings && restaurant.taxSettings.taxes && Array.isArray(restaurant.taxSettings.taxes)) {
       const oldTaxLabel = oldSettings.taxLabel || 'GST';
-      if (newTaxLabel !== oldTaxLabel) {
-        // Update tax names that match the old label
+
+      // If switching AWAY from India and tax is the default GST, clear it
+      if (wasIndia && !isIndia) {
+        const isDefaultGST = restaurant.taxSettings.taxes.length === 1 &&
+          restaurant.taxSettings.taxes[0].name === 'GST' &&
+          restaurant.taxSettings.taxes[0].rate === 5;
+        if (isDefaultGST || (!restaurant.taxSettings.taxes.length && restaurant.taxSettings.defaultTaxRate === 5)) {
+          await restaurantRef.update({
+            'taxSettings.enabled': false,
+            'taxSettings.taxes': [],
+            'taxSettings.defaultTaxRate': 0,
+            'taxSettings.updatedAt': new Date(),
+            'taxSettings.updatedBy': userId
+          });
+          taxSettingsUpdated = true;
+          console.log(`📊 Cleared default GST for non-India country: ${newCountry}`);
+        }
+      }
+
+      // Auto-rename tax labels if country changed and tax label differs
+      if (!taxSettingsUpdated && newTaxLabel !== oldTaxLabel) {
         const updatedTaxes = restaurant.taxSettings.taxes.map(tax => {
           if (tax.name === oldTaxLabel || tax.name.toUpperCase() === oldTaxLabel.toUpperCase()) {
             return { ...tax, name: newTaxLabel };
@@ -159,6 +183,20 @@ router.put('/admin/currency/:restaurantId', authenticateToken, async (req, res) 
         taxSettingsUpdated = true;
         console.log(`📊 Auto-updated tax labels from ${oldTaxLabel} to ${newTaxLabel}`);
       }
+    } else if (wasIndia && !isIndia) {
+      // No explicit tax settings stored but switching away from India
+      // Ensure no default GST gets applied by setting empty tax config
+      await restaurantRef.update({
+        taxSettings: {
+          enabled: false,
+          taxes: [],
+          defaultTaxRate: 0,
+          updatedAt: new Date(),
+          updatedBy: userId
+        }
+      });
+      taxSettingsUpdated = true;
+      console.log(`📊 Set empty tax settings for non-India country: ${newCountry}`);
     }
 
     // Update currency settings

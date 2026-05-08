@@ -138,6 +138,36 @@ const notifyBillingPrintRequest = async (restaurantId, orderData) => {
     .catch(err => console.error('FCM Bill notify failed:', err.message));
 };
 
+/**
+ * Trigger when a menu item is created
+ */
+const notifyMenuItemCreated = async (restaurantId, menuItem) => {
+  await triggerOrderEvent(restaurantId, 'menu-item-created', {
+    itemId: menuItem.id,
+    name: menuItem.name,
+    category: menuItem.category,
+  });
+};
+
+/**
+ * Trigger when a menu item is updated (name, price, description, availability, etc.)
+ */
+const notifyMenuUpdated = async (restaurantId, itemId, updatedFields) => {
+  await triggerOrderEvent(restaurantId, 'menu-updated', {
+    itemId,
+    updatedFields,
+  });
+};
+
+/**
+ * Trigger when a menu item is deleted
+ */
+const notifyMenuItemDeleted = async (restaurantId, itemId) => {
+  await triggerOrderEvent(restaurantId, 'menu-item-deleted', {
+    itemId,
+  });
+};
+
 module.exports = {
   pusher,
   triggerOrderEvent,
@@ -146,5 +176,8 @@ module.exports = {
   notifyOrderUpdated,
   notifyOrderDeleted,
   notifyKOTPrintRequest,
-  notifyBillingPrintRequest
+  notifyBillingPrintRequest,
+  notifyMenuItemCreated,
+  notifyMenuUpdated,
+  notifyMenuItemDeleted
 };

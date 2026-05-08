@@ -291,6 +291,21 @@ function findDineInRule(rules) {
 //   Priority 3: restaurant default taxes (taxSettings.taxes)
 //   When a tax group has alsoApplyGlobalTax: true, both group taxes AND global taxes apply.
 //   By default (alsoApplyGlobalTax: false/undefined), group taxes override global taxes.
+// Get default tax settings based on restaurant's country/currency
+// Only India gets default GST 5%; all other countries start with no tax
+function getDefaultTaxSettings(restaurantData) {
+  const currency = restaurantData?.currencySettings;
+  const isIndia = !currency || currency.countryCode === 'IN' || currency.currencyCode === 'INR';
+  if (isIndia) {
+    return {
+      enabled: true,
+      taxes: [{ id: 'gst', name: 'GST', rate: 5, enabled: true, type: 'percentage' }],
+      defaultTaxRate: 5
+    };
+  }
+  return { enabled: false, taxes: [], defaultTaxRate: 0 };
+}
+
 function resolveTaxesForItem(item, taxSettings, categories) {
   if (!taxSettings?.enabled) return [];
   const groups = taxSettings.taxGroups || [];
@@ -7071,6 +7086,10 @@ app.post('/api/menus/:restaurantId', authenticateToken, async (req, res) => {
         .catch(err => console.error('Menu→Inventory link error:', err));
     }
 
+    // Notify all connected clients of menu change
+    pusherService.notifyMenuItemCreated(restaurantId, newMenuItem)
+      .catch(err => console.error('Pusher menu-item-created error:', err));
+
     res.status(201).json({
       message: 'Menu item created successfully',
       menuItem: newMenuItem
@@ -7245,6 +7264,10 @@ app.patch('/api/menus/item/:id', authenticateToken, async (req, res) => {
         })();
       }
     }
+
+    // Notify all connected clients of menu change
+    pusherService.notifyMenuUpdated(foundRestaurant.id, id, Object.keys(updateData).filter(key => key !== 'updatedAt'))
+      .catch(err => console.error('Pusher menu-updated error:', err));
 
     res.json({
       message: 'Menu item updated successfully',
@@ -7487,6 +7510,10 @@ app.delete('/api/menus/item/:id', authenticateToken, async (req, res) => {
         }
       })();
     }
+
+    // Notify all connected clients of menu change
+    pusherService.notifyMenuItemDeleted(foundRestaurant.id, id)
+      .catch(err => console.error('Pusher menu-item-deleted error:', err));
 
     res.json({
       message: 'Menu item deleted successfully',
@@ -8058,11 +8085,7 @@ app.post('/api/public/orders/:restaurantId', vercelSecurityMiddleware.publicAPI,
     const preTaxTotal = Math.max(0, subtotal - discountAmount - loyaltyDiscount);
 
     // Calculate tax using per-item tax resolution (supports tax groups)
-    const taxSettings = restaurantData.taxSettings || {
-      enabled: true,
-      taxes: [{ id: 'gst', name: 'GST', rate: 5, enabled: true, type: 'percentage' }],
-      defaultTaxRate: 5
-    };
+    const taxSettings = restaurantData.taxSettings || getDefaultTaxSettings(restaurantData);
     const categories = restaurantData.categories || [];
     const totalDiscount = discountAmount + loyaltyDiscount;
 
@@ -8817,11 +8840,7 @@ app.post('/api/orders', async (req, res) => {
     console.log(`💰 POS Order pricing: Subtotal ₹${subtotalForDiscount}, Offers -₹${discountAmount}, Manual -₹${manualDiscountAmount}, Loyalty -₹${loyaltyDiscount}, PreTax ₹${preTaxTotal}`);
 
     // Calculate tax using per-item tax resolution (supports tax groups)
-    const taxSettings = restaurantData.taxSettings || {
-      enabled: true,
-      taxes: [{ id: 'gst', name: 'GST', rate: 5, enabled: true, type: 'percentage' }],
-      defaultTaxRate: 5
-    };
+    const taxSettings = restaurantData.taxSettings || getDefaultTaxSettings(restaurantData);
     const posCategories = restaurantData.categories || [];
 
     // Calculate service charge from rate on preTaxTotal (backend-driven)
@@ -11722,11 +11741,7 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
       const taxRestDoc = await db.collection(collections.restaurants).doc(currentOrder.restaurantId).get();
       if (taxRestDoc.exists) {
         const taxRestData = taxRestDoc.data();
-        const taxSettings = taxRestData.taxSettings || {
-          enabled: true,
-          taxes: [{ id: 'gst', name: 'GST', rate: 5, enabled: true, type: 'percentage' }],
-          defaultTaxRate: 5
-        };
+        const taxSettings = taxRestData.taxSettings || getDefaultTaxSettings(taxRestData);
 
         if (taxSettings.enabled && preTaxTotal > 0) {
           // 1. Calculate service charge from rate on preTaxTotal (backend-driven)
@@ -13415,6 +13430,10 @@ app.post('/api/menus/bulk-save/:restaurantId', authenticateToken, async (req, re
       await db.collection(collections.restaurants).doc(restaurantId).update(updateData);
       invalidateRestaurantCache(restaurantId);
       console.log('✅ Bulk save: categories=', existingCategories.length, 'items=', existingItems.length);
+
+      // Notify all connected clients of menu change
+      pusherService.notifyMenuUpdated(restaurantId, null, ['bulk-save'])
+        .catch(err => console.error('Pusher menu-updated (bulk) error:', err));
     }
 
     res.json({
@@ -15743,19 +15762,8 @@ app.get('/api/admin/tax/:restaurantId', authenticateToken, async (req, res) => {
     const restaurant = restaurantDoc.data();
 
     // Get tax settings from restaurant document
-    const taxSettings = restaurant.taxSettings || {
-      enabled: true,
-      taxes: [
-        {
-          id: 'gst',
-          name: 'GST',
-          rate: 5,
-          enabled: true,
-          type: 'percentage'
-        }
-      ],
-      defaultTaxRate: 5
-    };
+    // Default: GST 5% for India, no tax for other countries
+    const taxSettings = restaurant.taxSettings || getDefaultTaxSettings(restaurant);
 
     // Cache for 3 minutes in KV
     kvSet(taxCacheKey, taxSettings, 180).catch(() => {});
@@ -16146,11 +16154,7 @@ app.post('/api/tax/calculate/:restaurantId', authenticateToken, async (req, res)
     }
 
     const restaurant = restaurantDoc.data();
-    const taxSettings = restaurant.taxSettings || {
-      enabled: true,
-      taxes: [{ id: 'gst', name: 'GST', rate: 5, enabled: true, type: 'percentage' }],
-      defaultTaxRate: 5
-    };
+    const taxSettings = restaurant.taxSettings || getDefaultTaxSettings(restaurant);
 
     if (!taxSettings.enabled) {
       return res.json({
@@ -16501,19 +16505,7 @@ app.post('/api/invoice/generate/:orderId', authenticateToken, async (req, res) =
     }
 
     const restaurant = restaurantDoc.data();
-    const taxSettings = restaurant.taxSettings || {
-      enabled: true,
-      taxes: [
-        {
-          id: 'gst',
-          name: 'GST',
-          rate: 5,
-          enabled: true,
-          type: 'percentage'
-        }
-      ],
-      defaultTaxRate: 5
-    };
+    const taxSettings = restaurant.taxSettings || getDefaultTaxSettings(restaurant);
 
     // Use order's stored values if available (backend already calculated with discounts)
     const itemsSubtotal = order.items.reduce((sum, item) => sum + (item.price * item.quantity), 0);
@@ -17546,11 +17538,7 @@ const buildRestaurantBlock = (restaurantId, data) => ({
 // `bill.*`, so existing web code that reads `invoice.restaurantName` etc.
 // continues to work when pointed at this endpoint.
 const assembleBillRenderPayload = (orderId, orderData, restaurantId, restaurantData) => {
-  const taxSettings = restaurantData.taxSettings || {
-    enabled: true,
-    taxes: [{ id: 'gst', name: 'GST', rate: 5, enabled: true, type: 'percentage' }],
-    defaultTaxRate: 5
-  };
+  const taxSettings = restaurantData.taxSettings || getDefaultTaxSettings(restaurantData);
 
   const itemsSubtotal = (orderData.items || [])
     .reduce((sum, it) => sum + ((it.price || 0) * (it.quantity || 1)), 0);
