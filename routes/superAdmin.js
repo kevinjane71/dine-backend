@@ -1660,4 +1660,134 @@ router.post('/reset-mpin', authenticateSuperAdmin, async (req, res) => {
   }
 });
 
+// ─── Admin Tasks (Todo List) ─────────────────────────────────────────
+
+const ADMIN_TASKS_COL = 'adminTasks';
+
+// GET /tasks — list tasks
+router.get('/tasks', authenticateSuperAdmin, async (req, res) => {
+  try {
+    const { status } = req.query;
+    let query = db.collection(ADMIN_TASKS_COL);
+
+    if (status === 'open' || status === 'closed') {
+      query = query.where('status', '==', status);
+    }
+
+    query = query.orderBy('createdAt', 'desc');
+    const snap = await query.get();
+
+    const tasks = snap.docs.map(doc => {
+      const d = doc.data();
+      return {
+        id: doc.id,
+        title: d.title || '',
+        notes: d.notes || '',
+        dueDate: d.dueDate?.toDate ? d.dueDate.toDate().toISOString() : d.dueDate || null,
+        status: d.status || 'open',
+        createdAt: d.createdAt?.toDate ? d.createdAt.toDate().toISOString() : null,
+        updatedAt: d.updatedAt?.toDate ? d.updatedAt.toDate().toISOString() : null,
+      };
+    });
+
+    // Sort: open first (by dueDate asc, nulls last), then closed
+    tasks.sort((a, b) => {
+      if (a.status !== b.status) return a.status === 'open' ? -1 : 1;
+      if (a.status === 'open') {
+        if (a.dueDate && b.dueDate) return new Date(a.dueDate) - new Date(b.dueDate);
+        if (a.dueDate) return -1;
+        if (b.dueDate) return 1;
+      }
+      return 0; // keep createdAt desc from query
+    });
+
+    res.json({ success: true, tasks });
+  } catch (error) {
+    console.error('Admin tasks list error:', error);
+    res.status(500).json({ success: false, error: 'Failed to fetch tasks' });
+  }
+});
+
+// POST /tasks — create task
+router.post('/tasks', authenticateSuperAdmin, async (req, res) => {
+  try {
+    const { title, notes, dueDate } = req.body;
+    if (!title || !title.trim()) {
+      return res.status(400).json({ success: false, error: 'Title is required' });
+    }
+
+    const taskData = {
+      title: title.trim(),
+      notes: (notes || '').trim(),
+      dueDate: dueDate ? new Date(dueDate) : null,
+      status: 'open',
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    };
+
+    const docRef = await db.collection(ADMIN_TASKS_COL).add(taskData);
+    res.status(201).json({
+      success: true,
+      task: {
+        id: docRef.id,
+        ...taskData,
+        dueDate: taskData.dueDate?.toISOString() || null,
+        createdAt: taskData.createdAt.toISOString(),
+        updatedAt: taskData.updatedAt.toISOString(),
+      },
+    });
+  } catch (error) {
+    console.error('Admin task create error:', error);
+    res.status(500).json({ success: false, error: 'Failed to create task' });
+  }
+});
+
+// PATCH /tasks/:taskId — update task
+router.patch('/tasks/:taskId', authenticateSuperAdmin, async (req, res) => {
+  try {
+    const { taskId } = req.params;
+    const docRef = db.collection(ADMIN_TASKS_COL).doc(taskId);
+    const doc = await docRef.get();
+    if (!doc.exists) {
+      return res.status(404).json({ success: false, error: 'Task not found' });
+    }
+
+    const updateData = { updatedAt: new Date() };
+    const allowed = ['title', 'notes', 'dueDate', 'status'];
+    for (const field of allowed) {
+      if (req.body[field] !== undefined) {
+        if (field === 'dueDate') {
+          updateData.dueDate = req.body.dueDate ? new Date(req.body.dueDate) : null;
+        } else {
+          updateData[field] = req.body[field];
+        }
+      }
+    }
+
+    await docRef.update(updateData);
+    res.json({ success: true });
+  } catch (error) {
+    console.error('Admin task update error:', error);
+    res.status(500).json({ success: false, error: 'Failed to update task' });
+  }
+});
+
+// DELETE /tasks/:taskId — delete task
+router.delete('/tasks/:taskId', authenticateSuperAdmin, async (req, res) => {
+  try {
+    const { taskId } = req.params;
+    const docRef = db.collection(ADMIN_TASKS_COL).doc(taskId);
+    const doc = await docRef.get();
+    if (!doc.exists) {
+      return res.status(404).json({ success: false, error: 'Task not found' });
+    }
+
+    await docRef.delete();
+    res.json({ success: true });
+  } catch (error) {
+    console.error('Admin task delete error:', error);
+    res.status(500).json({ success: false, error: 'Failed to delete task' });
+  }
+});
+
 module.exports = router;
