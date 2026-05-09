@@ -24478,7 +24478,7 @@ app.post('/api/books/:restaurantId/expenses', authenticateToken, async (req, res
     }
 
     const { restaurantId } = req.params;
-    const { category, amount, date, description, paymentMethod, receiptUrl, isRecurring, recurringFrequency, vendor } = req.body;
+    const { category, subCategories, amount, date, description, paymentMethod, receiptUrl, isRecurring, recurringFrequency, vendor } = req.body;
 
     if (!category || !amount || !date) {
       return res.status(400).json({ error: 'Category, amount, and date are required' });
@@ -24487,6 +24487,7 @@ app.post('/api/books/:restaurantId/expenses', authenticateToken, async (req, res
     const expenseData = {
       restaurantId,
       category,
+      subCategories: Array.isArray(subCategories) ? subCategories : [],
       amount: parseFloat(amount),
       date: new Date(date),
       description: description || '',
@@ -24526,7 +24527,7 @@ app.patch('/api/books/:restaurantId/expenses/:expenseId', authenticateToken, asy
     }
 
     const updateData = { updatedAt: new Date() };
-    const allowedFields = ['category', 'amount', 'date', 'description', 'paymentMethod', 'receiptUrl', 'isRecurring', 'recurringFrequency', 'vendor'];
+    const allowedFields = ['category', 'subCategories', 'amount', 'date', 'description', 'paymentMethod', 'receiptUrl', 'isRecurring', 'recurringFrequency', 'vendor'];
     allowedFields.forEach(f => {
       if (updates[f] !== undefined) {
         updateData[f] = f === 'amount' ? parseFloat(updates[f]) : f === 'date' ? new Date(updates[f]) : updates[f];
