@@ -8526,7 +8526,9 @@ app.post('/api/orders', async (req, res) => {
         }
         
         // Check table availability - only allow "available" status
-        if (tableStatus !== 'available') {
+        // Skip this check for offline sync requests (they were already placed locally)
+        const isOfflineSync = req.headers['x-sync-source'] === 'offline';
+        if (tableStatus !== 'available' && !isOfflineSync) {
           let statusMessage = '';
           switch (tableStatus) {
             case 'occupied':
@@ -8547,13 +8549,16 @@ app.post('/api/orders', async (req, res) => {
             default:
               statusMessage = `has status "${tableStatus}" and cannot be used`;
           }
-          
+
           console.log('❌ Table not available:', { table: tableNumber, status: tableStatus });
-          return res.status(400).json({ 
-            error: `Table "${tableNumber}" ${statusMessage}. Please choose another table.` 
+          return res.status(400).json({
+            error: `Table "${tableNumber}" ${statusMessage}. Please choose another table.`
           });
         }
-        
+
+        if (isOfflineSync) {
+          console.log('🔄 Offline sync: skipping table availability check for', tableNumber);
+        }
         console.log('✅ Table validation passed:', { tableNumber, status: tableStatus });
       } catch (tableError) {
         console.error('❌ Table validation error:', tableError);
@@ -11417,7 +11422,9 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
         }
         
         // Check table availability - only allow "available" status
-        if (tableStatus !== 'available') {
+        // Skip this check for offline sync requests (they were already placed locally)
+        const isOfflineSync = req.headers['x-sync-source'] === 'offline';
+        if (tableStatus !== 'available' && !isOfflineSync) {
           let statusMessage = '';
           switch (tableStatus) {
             case 'occupied':
@@ -11438,13 +11445,16 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
             default:
               statusMessage = `has status "${tableStatus}" and cannot be used`;
           }
-          
+
           console.log('❌ Table not available for update:', { table: tableNumber, status: tableStatus });
-          return res.status(400).json({ 
-            error: `Table "${tableNumber}" ${statusMessage}. Please choose another table.` 
+          return res.status(400).json({
+            error: `Table "${tableNumber}" ${statusMessage}. Please choose another table.`
           });
         }
-        
+
+        if (isOfflineSync) {
+          console.log('🔄 Offline sync: skipping table availability check for', tableNumber);
+        }
         console.log('✅ New table validation passed:', { tableNumber, status: tableStatus });
       }
     }
@@ -12640,6 +12650,10 @@ app.use('/api', chatbotRoutes);
 app.use('/api', dineaiRoutes);
 app.use('/api', dineaiKnowledgeRoutes);
 app.use('/api', dineaiCheapVoiceRoutes);
+
+// Bolna AI Phone Agent routes
+const bolnaRoutes = require('./routes/bolna');
+app.use('/api', bolnaRoutes);
 
 // Initialize hotel management routes (restaurant-hotel integration)
 // NOTE: hotelManagementRoutes must be registered BEFORE hotelRoutes to handle

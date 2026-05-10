@@ -153,7 +153,10 @@ const collections = {
   orgAuditLog: 'orgAuditLog',
   orgSettings: 'orgSettings',
   // Cash Register / Shift Management
-  cashRegisters: 'cashRegisters'
+  cashRegisters: 'cashRegisters',
+  // Bolna AI Phone Agent
+  bolnaAgents: 'bolnaAgents',
+  phoneCalls: 'phoneCalls'
 };
 
 const admin = null; // We don't need the legacy admin object anymore
