@@ -53,7 +53,8 @@ router.use(authenticateToken);
 // ──────────────────────────────────────────────
 
 // GET /config/:restaurantId — Get parking config
-router.get('/config/:restaurantId', requireParkingEnabled, async (req, res) => {
+// No requireParkingEnabled — config must be accessible for initial setup
+router.get('/config/:restaurantId', async (req, res) => {
   try {
     const { restaurantId } = req.params;
     const doc = await db.collection(collections.parkingConfigs).doc(restaurantId).get();
@@ -74,7 +75,8 @@ router.get('/config/:restaurantId', requireParkingEnabled, async (req, res) => {
 });
 
 // PUT /config/:restaurantId — Create/update parking config
-router.put('/config/:restaurantId', requireParkingEnabled, async (req, res) => {
+// No requireParkingEnabled — config must be saveable during initial setup
+router.put('/config/:restaurantId', async (req, res) => {
   try {
     const { restaurantId } = req.params;
     const ownerId = getOwnerId(req);
