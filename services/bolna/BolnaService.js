@@ -64,6 +64,7 @@ class BolnaService {
     const systemPrompt = this._buildSystemPrompt(restaurantData, menuData);
 
     // Build agent config with webhook tools
+    const apiTools = this._buildApiTools(backendUrl, restaurantId);
     const agentConfig = {
       agent_name: `DineOpen - ${restaurantData.name}`,
       agent_welcome_message: this._buildGreeting(restaurantData),
@@ -74,34 +75,60 @@ class BolnaService {
           task_type: 'conversation',
           tools_config: {
             llm_agent: {
-              provider: 'openai',
-              model: 'gpt-4o-mini',
-              max_tokens: 512,
-              temperature: 0.5
+              agent_type: 'simple_llm_agent',
+              agent_flow_type: 'streaming',
+              llm_config: {
+                provider: 'openai',
+                family: 'openai',
+                model: 'gpt-4o-mini',
+                max_tokens: 512,
+                temperature: 0.5,
+                request_json: false
+              }
             },
             synthesizer: {
               provider: 'elevenlabs',
-              voice: restaurantData.bolnaVoice || 'rachel',
-              language: restaurantData.bolnaLanguage || 'hi'
+              provider_config: {
+                voice: restaurantData.bolnaVoice || 'Nila',
+                voice_id: restaurantData.bolnaVoiceId || 'V9LCAAi4tTlqe9JadbCo',
+                model: 'eleven_turbo_v2_5'
+              },
+              stream: true,
+              buffer_size: 250,
+              audio_format: 'wav'
             },
             transcriber: {
               provider: 'deepgram',
+              model: 'nova-2',
               language: restaurantData.bolnaLanguage || 'hi',
-              model: 'nova-2'
+              stream: true,
+              sampling_rate: 16000,
+              encoding: 'linear16',
+              endpointing: 250
             },
             input: {
               provider: 'default',
-              format: 'pcm'
+              format: 'wav'
             },
             output: {
               provider: 'default',
-              format: 'pcm'
+              format: 'wav'
             },
-            api_tools: this._buildApiTools(backendUrl, restaurantId)
+            api_tools: apiTools
+          },
+          toolchain: {
+            execution: 'sequential',
+            pipelines: [
+              ['transcriber', 'llm', 'synthesizer']
+            ]
           },
           task_config: {
             hangup_after_silence: 15,
-            interruption_threshold: 100
+            incremental_delay: 400,
+            number_of_words_for_interruption: 2,
+            hangup_after_LLMCall: false,
+            backchanneling: false,
+            call_terminate: 120
           }
         }
       ]
@@ -128,7 +155,7 @@ class BolnaService {
       phoneNumber: null, // Will be set after inbound setup
       phoneNumberId: null,
       language: restaurantData.bolnaLanguage || 'hi',
-      voice: restaurantData.bolnaVoice || 'rachel',
+      voice: restaurantData.bolnaVoice || 'Nila',
       greeting: agentConfig.agent_welcome_message,
       capabilities: {
         menuQueries: true,
@@ -563,105 +590,97 @@ ${restaurantData.specialInstructions || ''}`;
    * Build API tools config for Bolna agent (function calling)
    */
   _buildApiTools(backendUrl, restaurantId) {
-    return [
-      {
-        name: 'get_menu',
-        description: 'Get the restaurant menu with items, prices, and categories. Call this when customer asks about menu items, prices, or what food is available.',
-        url: `${backendUrl}/api/bolna/webhook/menu`,
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json'
-        },
-        body: {
-          restaurantId
-        },
-        parameters: {
-          type: 'object',
-          properties: {
-            category: {
-              type: 'string',
-              description: 'Optional: specific category to filter (e.g., starters, mains, drinks)'
+    return {
+      tools: [
+        {
+          name: 'get_menu',
+          description: 'Get the restaurant menu with items, prices, and categories. Call this when customer asks about menu items, prices, or what food is available.',
+          parameters: {
+            type: 'object',
+            properties: {
+              category: {
+                type: 'string',
+                description: 'Optional: specific category to filter (e.g., starters, mains, drinks)'
+              }
             }
           }
-        }
-      },
-      {
-        name: 'get_hours',
-        description: 'Get restaurant operating hours and current open/closed status. Call this when customer asks about timing or if the restaurant is open.',
-        url: `${backendUrl}/api/bolna/webhook/hours`,
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json'
         },
-        body: {
-          restaurantId
+        {
+          name: 'get_hours',
+          description: 'Get restaurant operating hours and current open/closed status. Call this when customer asks about timing or if the restaurant is open.',
+          parameters: {
+            type: 'object',
+            properties: {}
+          }
         },
-        parameters: {
-          type: 'object',
-          properties: {}
-        }
-      },
-      {
-        name: 'make_reservation',
-        description: 'Create a table reservation. Call this after confirming all details with the customer: name, date, time, and party size.',
-        url: `${backendUrl}/api/bolna/webhook/reservation`,
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json'
-        },
-        body: {
-          restaurantId
-        },
-        parameters: {
-          type: 'object',
-          properties: {
-            name: { type: 'string', description: 'Guest name' },
-            phone: { type: 'string', description: 'Guest phone number' },
-            date: { type: 'string', description: 'Reservation date (YYYY-MM-DD)' },
-            time: { type: 'string', description: 'Reservation time (HH:MM)' },
-            party_size: { type: 'integer', description: 'Number of guests' },
-            notes: { type: 'string', description: 'Special requests or notes' }
-          },
-          required: ['name', 'date', 'time', 'party_size']
-        }
-      },
-      {
-        name: 'place_order',
-        description: 'Place a food order for delivery or pickup. Call this after confirming all items and details with the customer.',
-        url: `${backendUrl}/api/bolna/webhook/order`,
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json'
-        },
-        body: {
-          restaurantId
-        },
-        parameters: {
-          type: 'object',
-          properties: {
-            name: { type: 'string', description: 'Customer name' },
-            phone: { type: 'string', description: 'Customer phone number' },
-            order_type: { type: 'string', enum: ['delivery', 'pickup'], description: 'Delivery or pickup' },
-            items: {
-              type: 'array',
-              items: {
-                type: 'object',
-                properties: {
-                  name: { type: 'string' },
-                  quantity: { type: 'integer' },
-                  price: { type: 'number' }
-                }
-              },
-              description: 'List of items to order'
+        {
+          name: 'make_reservation',
+          description: 'Create a table reservation. Call this after confirming all details with the customer: name, date, time, and party size.',
+          parameters: {
+            type: 'object',
+            properties: {
+              name: { type: 'string', description: 'Guest name' },
+              phone: { type: 'string', description: 'Guest phone number' },
+              date: { type: 'string', description: 'Reservation date (YYYY-MM-DD)' },
+              time: { type: 'string', description: 'Reservation time (HH:MM)' },
+              party_size: { type: 'integer', description: 'Number of guests' },
+              notes: { type: 'string', description: 'Special requests or notes' }
             },
-            total: { type: 'number', description: 'Total order amount' },
-            address: { type: 'string', description: 'Delivery address (required for delivery orders)' },
-            notes: { type: 'string', description: 'Special instructions' }
-          },
-          required: ['name', 'items', 'order_type']
+            required: ['name', 'date', 'time', 'party_size']
+          }
+        },
+        {
+          name: 'place_order',
+          description: 'Place a food order for delivery or pickup. Call this after confirming all items and details with the customer.',
+          parameters: {
+            type: 'object',
+            properties: {
+              name: { type: 'string', description: 'Customer name' },
+              phone: { type: 'string', description: 'Customer phone number' },
+              order_type: { type: 'string', enum: ['delivery', 'pickup'], description: 'Delivery or pickup' },
+              items: {
+                type: 'array',
+                items: {
+                  type: 'object',
+                  properties: {
+                    name: { type: 'string' },
+                    quantity: { type: 'integer' },
+                    price: { type: 'number' }
+                  }
+                },
+                description: 'List of items to order'
+              },
+              total: { type: 'number', description: 'Total order amount' },
+              address: { type: 'string', description: 'Delivery address (required for delivery orders)' },
+              notes: { type: 'string', description: 'Special instructions' }
+            },
+            required: ['name', 'items', 'order_type']
+          }
+        }
+      ],
+      tools_params: {
+        get_menu: {
+          method: 'POST',
+          url: `${backendUrl}/api/bolna/webhook/menu`,
+          param: JSON.stringify({ restaurantId, category: '%(category)s' })
+        },
+        get_hours: {
+          method: 'POST',
+          url: `${backendUrl}/api/bolna/webhook/hours`,
+          param: JSON.stringify({ restaurantId })
+        },
+        make_reservation: {
+          method: 'POST',
+          url: `${backendUrl}/api/bolna/webhook/reservation`,
+          param: JSON.stringify({ restaurantId, name: '%(name)s', phone: '%(phone)s', date: '%(date)s', time: '%(time)s', party_size: '%(party_size)s', notes: '%(notes)s' })
+        },
+        place_order: {
+          method: 'POST',
+          url: `${backendUrl}/api/bolna/webhook/order`,
+          param: JSON.stringify({ restaurantId, name: '%(name)s', phone: '%(phone)s', order_type: '%(order_type)s', items: '%(items)s', total: '%(total)s', address: '%(address)s', notes: '%(notes)s' })
         }
       }
-    ];
+    };
   }
 
   // ==================== Sync Menu ====================
