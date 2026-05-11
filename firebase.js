@@ -156,7 +156,13 @@ const collections = {
   cashRegisters: 'cashRegisters',
   // Bolna AI Phone Agent
   bolnaAgents: 'bolnaAgents',
-  phoneCalls: 'phoneCalls'
+  phoneCalls: 'phoneCalls',
+  // Parking Lot Management
+  parkingConfigs: 'parkingConfigs',
+  parkingZones: 'parkingZones',
+  parkingSlots: 'parkingSlots',
+  parkingTickets: 'parkingTickets',
+  parkingRates: 'parkingRates'
 };
 
 const admin = null; // We don't need the legacy admin object anymore

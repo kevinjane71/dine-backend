@@ -950,6 +950,7 @@ const payrollRoutes = require('./routes/payroll');
 const gstRoutes = require('./routes/gstReports');
 const ledgerRoutes = require('./routes/ledger');
 const spaceBookingRoutes = require('./routes/spaceBooking');
+const parkingRoutes = require('./routes/parking');
 const registerRoutes = require('./routes/registerRoutes');
 
 // Chain / Enterprise Module
@@ -12666,6 +12667,9 @@ app.use('/api', roomManagementRoutes);
 
 // Initialize space booking routes
 app.use('/api/space-booking', spaceBookingRoutes);
+
+// Initialize parking management routes
+app.use('/api/parking', parkingRoutes);
 
 // Initialize shift scheduling routes
 app.use('/api/shift-scheduling', shiftSchedulingRoutes);
