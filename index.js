@@ -27651,6 +27651,248 @@ app.post('/api/orders/:orderId/comp-void', authenticateToken, async (req, res) =
   }
 });
 
+// ==========================================
+// Edit Completed Orders
+// ==========================================
+
+// Edit a completed order (metadata only — no items/prices)
+app.patch('/api/orders/:orderId/edit-completed', authenticateToken, async (req, res) => {
+  try {
+    const { orderId } = req.params;
+    const { orderType, paymentMethod, customerInfo, deliveryType, tableNumber, notes } = req.body;
+    const user = req.user;
+
+    // Check if user has allowEditCompletedOrders permission
+    const userDoc = await db.collection(collections.users).doc(user.userId).get();
+    if (!userDoc.exists) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+    const userData = userDoc.data();
+    const isOwnerAdmin = userData.role === 'owner' || userData.role === 'admin';
+    if (!isOwnerAdmin && !userData.allowEditCompletedOrders) {
+      return res.status(403).json({ error: 'You do not have permission to edit completed orders' });
+    }
+
+    // Get current order
+    const orderRef = db.collection(collections.orders).doc(orderId);
+    const orderDoc = await orderRef.get();
+    if (!orderDoc.exists) {
+      return res.status(404).json({ error: 'Order not found' });
+    }
+
+    const currentOrder = orderDoc.data();
+    if (currentOrder.status !== 'completed') {
+      return res.status(400).json({ error: 'This endpoint is only for editing completed orders' });
+    }
+
+    // Build update data and track changes
+    const updateData = { updatedAt: new Date() };
+    const changes = [];
+
+    if (orderType && orderType !== currentOrder.orderType) {
+      changes.push({ field: 'orderType', from: currentOrder.orderType || '', to: orderType });
+      updateData.orderType = orderType;
+    }
+    if (paymentMethod && paymentMethod !== currentOrder.paymentMethod) {
+      changes.push({ field: 'paymentMethod', from: currentOrder.paymentMethod || '', to: paymentMethod });
+      updateData.paymentMethod = paymentMethod;
+    }
+    if (deliveryType !== undefined && deliveryType !== currentOrder.deliveryType) {
+      changes.push({ field: 'deliveryType', from: currentOrder.deliveryType || '', to: deliveryType });
+      updateData.deliveryType = deliveryType;
+    }
+    if (tableNumber !== undefined && tableNumber !== currentOrder.tableNumber) {
+      changes.push({ field: 'tableNumber', from: currentOrder.tableNumber || '', to: tableNumber });
+      updateData.tableNumber = tableNumber;
+    }
+    if (notes !== undefined && notes !== currentOrder.notes) {
+      changes.push({ field: 'notes', from: currentOrder.notes || '', to: notes });
+      updateData.notes = notes;
+    }
+    if (customerInfo) {
+      const currentCI = currentOrder.customerInfo || {};
+      if (customerInfo.name !== undefined && customerInfo.name !== currentCI.name) {
+        changes.push({ field: 'customerInfo.name', from: currentCI.name || '', to: customerInfo.name });
+      }
+      if (customerInfo.phone !== undefined && customerInfo.phone !== currentCI.phone) {
+        changes.push({ field: 'customerInfo.phone', from: currentCI.phone || '', to: customerInfo.phone });
+      }
+      if (changes.some(c => c.field.startsWith('customerInfo'))) {
+        updateData.customerInfo = { ...currentCI, ...customerInfo };
+      }
+    }
+
+    if (changes.length === 0) {
+      return res.status(400).json({ error: 'No changes detected' });
+    }
+
+    // Create edit history entry
+    const editEntry = {
+      editedAt: new Date().toISOString(),
+      editedBy: {
+        id: user.userId,
+        name: userData.name || userData.email || 'Unknown',
+        role: userData.role || 'unknown'
+      },
+      changes
+    };
+
+    // Append to editHistory array
+    const existingHistory = currentOrder.editHistory || [];
+    updateData.editHistory = [...existingHistory, editEntry];
+
+    await orderRef.update(updateData);
+
+    const updatedDoc = await orderRef.get();
+    res.json({
+      success: true,
+      order: { id: orderId, ...updatedDoc.data() },
+      editEntry
+    });
+  } catch (error) {
+    console.error('Error editing completed order:', error);
+    res.status(500).json({ error: 'Failed to edit completed order' });
+  }
+});
+
+// Get edit history for an order
+app.get('/api/orders/:orderId/edit-history', authenticateToken, async (req, res) => {
+  try {
+    const { orderId } = req.params;
+    const orderDoc = await db.collection(collections.orders).doc(orderId).get();
+    if (!orderDoc.exists) {
+      return res.status(404).json({ error: 'Order not found' });
+    }
+    const order = orderDoc.data();
+    res.json({ editHistory: order.editHistory || [] });
+  } catch (error) {
+    console.error('Error fetching edit history:', error);
+    res.status(500).json({ error: 'Failed to fetch edit history' });
+  }
+});
+
+// Search users by phone or email (admin only)
+app.get('/api/admin/users/search', authenticateToken, async (req, res) => {
+  try {
+    const user = req.user;
+    const userDoc = await db.collection(collections.users).doc(user.userId).get();
+    if (!userDoc.exists || !['owner', 'admin'].includes(userDoc.data().role)) {
+      return res.status(403).json({ error: 'Admin access required' });
+    }
+
+    const { q } = req.query;
+    if (!q || q.trim().length < 3) {
+      return res.status(400).json({ error: 'Search query must be at least 3 characters' });
+    }
+
+    const query = q.trim().toLowerCase();
+    let results = [];
+
+    // Search by email
+    const emailSnap = await db.collection(collections.users)
+      .where('email', '==', query)
+      .limit(5)
+      .get();
+    emailSnap.forEach(doc => results.push({ id: doc.id, ...doc.data() }));
+
+    // Search by phone
+    if (results.length === 0) {
+      const phoneSnap = await db.collection(collections.users)
+        .where('phone', '==', query)
+        .limit(5)
+        .get();
+      phoneSnap.forEach(doc => results.push({ id: doc.id, ...doc.data() }));
+    }
+
+    // Also try with +91 prefix for phone
+    if (results.length === 0 && /^\d+$/.test(query)) {
+      const phoneWithPrefix = '+91' + query;
+      const prefixSnap = await db.collection(collections.users)
+        .where('phone', '==', phoneWithPrefix)
+        .limit(5)
+        .get();
+      prefixSnap.forEach(doc => results.push({ id: doc.id, ...doc.data() }));
+    }
+
+    // Return safe fields only
+    const safeResults = results.map(u => ({
+      id: u.id,
+      name: u.name || '',
+      email: u.email || '',
+      phone: u.phone || '',
+      role: u.role || '',
+      allowEditCompletedOrders: u.allowEditCompletedOrders || false
+    }));
+
+    res.json({ users: safeResults });
+  } catch (error) {
+    console.error('Error searching users:', error);
+    res.status(500).json({ error: 'Failed to search users' });
+  }
+});
+
+// Toggle allowEditCompletedOrders permission for a user (admin only)
+app.patch('/api/admin/users/:userId/allow-edit-completed', authenticateToken, async (req, res) => {
+  try {
+    const callerDoc = await db.collection(collections.users).doc(req.user.userId).get();
+    if (!callerDoc.exists || !['owner', 'admin'].includes(callerDoc.data().role)) {
+      return res.status(403).json({ error: 'Admin access required' });
+    }
+
+    const { userId } = req.params;
+    const { allow } = req.body;
+
+    const targetRef = db.collection(collections.users).doc(userId);
+    const targetDoc = await targetRef.get();
+    if (!targetDoc.exists) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    await targetRef.update({ allowEditCompletedOrders: !!allow });
+
+    res.json({
+      success: true,
+      userId,
+      allowEditCompletedOrders: !!allow
+    });
+  } catch (error) {
+    console.error('Error toggling edit permission:', error);
+    res.status(500).json({ error: 'Failed to update permission' });
+  }
+});
+
+// List users who have allowEditCompletedOrders enabled (admin only)
+app.get('/api/admin/users/edit-completed-users', authenticateToken, async (req, res) => {
+  try {
+    const callerDoc = await db.collection(collections.users).doc(req.user.userId).get();
+    if (!callerDoc.exists || !['owner', 'admin'].includes(callerDoc.data().role)) {
+      return res.status(403).json({ error: 'Admin access required' });
+    }
+
+    const snap = await db.collection(collections.users)
+      .where('allowEditCompletedOrders', '==', true)
+      .get();
+
+    const users = [];
+    snap.forEach(doc => {
+      const u = doc.data();
+      users.push({
+        id: doc.id,
+        name: u.name || '',
+        email: u.email || '',
+        phone: u.phone || '',
+        role: u.role || '',
+        allowEditCompletedOrders: true
+      });
+    });
+
+    res.json({ users });
+  } catch (error) {
+    console.error('Error listing edit-completed users:', error);
+    res.status(500).json({ error: 'Failed to list users' });
+  }
+});
+
 // Get customer credit history
 app.get('/api/customers/:customerId/credit-history', authenticateToken, async (req, res) => {
   try {
