@@ -201,33 +201,38 @@ class BolnaService {
       throw new Error(`No phone numbers available for country: ${countryCode}`);
     }
 
-    // Buy the first available number
+    // Buy the first available number — API requires phone_number (E.164) + country
+    const selectedNumber = searchResult[0];
     const buyResult = await this._request('POST', '/phone-numbers/buy', {
-      phone_number_id: searchResult[0].id
+      phone_number: selectedNumber.phone_number,
+      country: countryCode,
+      provider: selectedNumber.provider || undefined
     });
 
     // Set up inbound agent on this number
+    const phoneNumberId = buyResult.id;
     const inboundResult = await this._request('POST', '/inbound/setup', {
       agent_id: agent.bolnaAgentId,
-      phone_number_id: buyResult.id || searchResult[0].id
+      phone_number_id: phoneNumberId
     });
 
     // Update Firestore with phone number
+    const assignedNumber = inboundResult.phone_number || buyResult.phone_number || selectedNumber.phone_number;
     await db.collection('bolnaAgents').doc(restaurantId).update({
-      phoneNumber: inboundResult.phone_number,
-      phoneNumberId: buyResult.id || searchResult[0].id,
+      phoneNumber: assignedNumber,
+      phoneNumberId: phoneNumberId,
       status: 'active',
       updatedAt: FieldValue.serverTimestamp()
     });
 
     return {
       success: true,
-      phoneNumber: inboundResult.phone_number,
+      phoneNumber: assignedNumber,
       callForwardingInstructions: {
-        forwardAll: `**21*${inboundResult.phone_number}#`,
-        forwardIfNoAnswer: `**61*${inboundResult.phone_number}#`,
-        forwardIfBusy: `**67*${inboundResult.phone_number}#`,
-        forwardIfUnreachable: `**62*${inboundResult.phone_number}#`,
+        forwardAll: `**21*${assignedNumber}#`,
+        forwardIfNoAnswer: `**61*${assignedNumber}#`,
+        forwardIfBusy: `**67*${assignedNumber}#`,
+        forwardIfUnreachable: `**62*${assignedNumber}#`,
         cancelForwarding: '##21#'
       }
     };

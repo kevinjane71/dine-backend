@@ -143,7 +143,8 @@ router.put('/config/:restaurantId', async (req, res) => {
 });
 
 // GET /config/:restaurantId/dashboard-stats — Live dashboard summary
-router.get('/config/:restaurantId/dashboard-stats', requireParkingEnabled, async (req, res) => {
+// No requireParkingEnabled — dashboard must load even during initial setup
+router.get('/config/:restaurantId/dashboard-stats', async (req, res) => {
   try {
     const { restaurantId } = req.params;
 
@@ -209,7 +210,8 @@ router.get('/config/:restaurantId/dashboard-stats', requireParkingEnabled, async
 // ──────────────────────────────────────────────
 
 // GET /zones/:restaurantId — List all zones
-router.get('/zones/:restaurantId', requireParkingEnabled, async (req, res) => {
+// No requireParkingEnabled — zones list needed for dashboard to load
+router.get('/zones/:restaurantId', async (req, res) => {
   try {
     const { restaurantId } = req.params;
     const snap = await db.collection(collections.parkingZones)
@@ -442,7 +444,8 @@ router.delete('/slots/:restaurantId/:slotId', requireParkingEnabled, async (req,
 // ──────────────────────────────────────────────
 
 // GET /rates/:restaurantId — List all rates
-router.get('/rates/:restaurantId', requireParkingEnabled, async (req, res) => {
+// No requireParkingEnabled — rates list needed for dashboard to load
+router.get('/rates/:restaurantId', async (req, res) => {
   try {
     const { restaurantId } = req.params;
     const snap = await db.collection(collections.parkingRates)
