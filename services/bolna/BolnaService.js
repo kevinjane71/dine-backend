@@ -184,7 +184,7 @@ class BolnaService {
   /**
    * Buy a phone number and assign it to the agent
    */
-  async setupPhoneNumber(restaurantId, countryCode = 'IN') {
+  async setupPhoneNumber(restaurantId, countryCode = 'IN', provider = null) {
     const db = getDb();
     const agentDoc = await db.collection('bolnaAgents').doc(restaurantId).get();
 
@@ -194,11 +194,13 @@ class BolnaService {
 
     const agent = agentDoc.data();
 
-    // Search for available numbers
-    const searchResult = await this._request('GET', `/phone-numbers/search?country=${countryCode}`);
+    // Search for available numbers (filter by provider if specified)
+    let searchUrl = `/phone-numbers/search?country=${countryCode}`;
+    if (provider) searchUrl += `&provider=${provider}`;
+    const searchResult = await this._request('GET', searchUrl);
 
     if (!searchResult || !searchResult.length) {
-      throw new Error(`No phone numbers available for country: ${countryCode}`);
+      throw new Error(`No phone numbers available for country: ${countryCode}${provider ? ` with provider: ${provider}` : ''}`);
     }
 
     // Buy the first available number — API requires phone_number (E.164) + country
@@ -206,7 +208,7 @@ class BolnaService {
     const buyResult = await this._request('POST', '/phone-numbers/buy', {
       phone_number: selectedNumber.phone_number,
       country: countryCode,
-      provider: selectedNumber.provider || undefined
+      provider: provider || selectedNumber.provider || undefined
     });
 
     // Set up inbound agent on this number
@@ -221,6 +223,7 @@ class BolnaService {
     await db.collection('bolnaAgents').doc(restaurantId).update({
       phoneNumber: assignedNumber,
       phoneNumberId: phoneNumberId,
+      telephonyProvider: provider || selectedNumber.provider || 'bolna',
       status: 'active',
       updatedAt: FieldValue.serverTimestamp()
     });
@@ -751,6 +754,93 @@ ${restaurantData.specialInstructions || ''}`;
    */
   async listPhoneNumbers() {
     return this._request('GET', '/phone-numbers');
+  }
+
+  // ==================== Provider Management ====================
+
+  /**
+   * Provider credential key mapping for Bolna POST /providers
+   */
+  _getProviderKeys(providerName) {
+    const map = {
+      vobiz: [
+        { key: 'VOBIZ_AUTH_ID', field: 'authId' },
+        { key: 'VOBIZ_AUTH_TOKEN', field: 'authToken' }
+      ],
+      plivo: [
+        { key: 'PLIVO_AUTH_ID', field: 'authId' },
+        { key: 'PLIVO_AUTH_TOKEN', field: 'authToken' }
+      ],
+      twilio: [
+        { key: 'TWILIO_ACCOUNT_SID', field: 'authId' },
+        { key: 'TWILIO_AUTH_TOKEN', field: 'authToken' }
+      ]
+    };
+    return map[providerName] || null;
+  }
+
+  /**
+   * Connect a telephony provider to Bolna account
+   * @param {string} providerName - 'vobiz', 'plivo', or 'twilio'
+   * @param {object} credentials - { authId, authToken }
+   */
+  async connectProvider(providerName, credentials) {
+    const keys = this._getProviderKeys(providerName);
+    if (!keys) {
+      throw new Error(`Unsupported provider: ${providerName}`);
+    }
+
+    const results = [];
+    for (const { key, field } of keys) {
+      if (!credentials[field]) {
+        throw new Error(`Missing credential: ${field}`);
+      }
+      const result = await this._request('POST', '/providers', {
+        provider_name: key,
+        provider_value: credentials[field]
+      });
+      results.push({ key, status: result.status || 'added' });
+    }
+
+    return { success: true, provider: providerName, results };
+  }
+
+  /**
+   * List all connected providers on Bolna account
+   */
+  async listProviders() {
+    return this._request('GET', '/providers');
+  }
+
+  /**
+   * Remove a provider from Bolna account
+   * @param {string} providerKeyName - e.g. 'VOBIZ_AUTH_ID'
+   */
+  async removeProvider(providerKeyName) {
+    return this._request('DELETE', `/providers/${providerKeyName}`);
+  }
+
+  /**
+   * Disconnect a telephony provider (removes all its keys)
+   * @param {string} providerName - 'vobiz', 'plivo', or 'twilio'
+   */
+  async disconnectProvider(providerName) {
+    const keys = this._getProviderKeys(providerName);
+    if (!keys) {
+      throw new Error(`Unsupported provider: ${providerName}`);
+    }
+
+    const results = [];
+    for (const { key } of keys) {
+      try {
+        await this.removeProvider(key);
+        results.push({ key, status: 'removed' });
+      } catch (err) {
+        results.push({ key, status: 'error', message: err.message });
+      }
+    }
+
+    return { success: true, provider: providerName, results };
   }
 }
 

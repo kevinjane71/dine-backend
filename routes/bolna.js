@@ -75,7 +75,8 @@ router.post('/bolna/phone-number', authenticateToken, async (req, res) => {
     }
 
     const country = req.body.country || 'IN';
-    const result = await bolnaService.setupPhoneNumber(restaurantId, country);
+    const provider = req.body.provider || null;
+    const result = await bolnaService.setupPhoneNumber(restaurantId, country, provider);
 
     res.json(result);
   } catch (error) {
@@ -186,6 +187,133 @@ router.get('/bolna/phone-numbers/search', authenticateToken, async (req, res) =>
     res.json({ success: true, numbers: result });
   } catch (error) {
     console.error('Error searching phone numbers:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// ==================== Provider Management ====================
+
+/**
+ * Connect a telephony provider (Vobiz, Plivo, Twilio)
+ * POST /api/bolna/connect-provider
+ */
+router.post('/bolna/connect-provider', authenticateToken, async (req, res) => {
+  try {
+    const { provider, credentials } = req.body;
+    if (!provider || !credentials) {
+      return res.status(400).json({ success: false, error: 'provider and credentials required' });
+    }
+
+    const validProviders = ['vobiz', 'plivo', 'twilio'];
+    if (!validProviders.includes(provider)) {
+      return res.status(400).json({ success: false, error: `Invalid provider. Must be one of: ${validProviders.join(', ')}` });
+    }
+
+    if (!credentials.authId || !credentials.authToken) {
+      return res.status(400).json({ success: false, error: 'credentials.authId and credentials.authToken are required' });
+    }
+
+    const result = await bolnaService.connectProvider(provider, credentials);
+
+    // Save provider preference in Firestore (store provider name only, NOT credentials)
+    const restaurantId = req.body.restaurantId || req.user.restaurantId;
+    if (restaurantId) {
+      const db = getDb();
+      const agentRef = db.collection('bolnaAgents').doc(restaurantId);
+      const agentDoc = await agentRef.get();
+      if (agentDoc.exists) {
+        const currentProviders = agentDoc.data().connectedProviders || [];
+        if (!currentProviders.includes(provider)) {
+          currentProviders.push(provider);
+        }
+        await agentRef.update({
+          connectedProviders: currentProviders,
+          preferredProvider: provider,
+          updatedAt: require('firebase-admin/firestore').FieldValue.serverTimestamp()
+        });
+      }
+    }
+
+    res.json(result);
+  } catch (error) {
+    console.error('Error connecting provider:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+/**
+ * List connected telephony providers
+ * GET /api/bolna/providers
+ */
+router.get('/bolna/providers', authenticateToken, async (req, res) => {
+  try {
+    const bolnaProviders = await bolnaService.listProviders();
+
+    // Also get restaurant-level provider info from Firestore
+    const restaurantId = req.query.restaurantId || req.user.restaurantId;
+    let connectedProviders = [];
+    let preferredProvider = null;
+    if (restaurantId) {
+      const db = getDb();
+      const agentDoc = await db.collection('bolnaAgents').doc(restaurantId).get();
+      if (agentDoc.exists) {
+        connectedProviders = agentDoc.data().connectedProviders || [];
+        preferredProvider = agentDoc.data().preferredProvider || null;
+      }
+    }
+
+    // Parse Bolna providers to identify which telephony providers are connected
+    const providerKeys = Array.isArray(bolnaProviders) ? bolnaProviders.map(p => p.provider_name || p.name || '') : [];
+    const detected = {
+      vobiz: providerKeys.some(k => k.toUpperCase().includes('VOBIZ')),
+      plivo: providerKeys.some(k => k.toUpperCase().includes('PLIVO')),
+      twilio: providerKeys.some(k => k.toUpperCase().includes('TWILIO'))
+    };
+
+    res.json({
+      success: true,
+      providers: detected,
+      connectedProviders,
+      preferredProvider,
+      raw: bolnaProviders
+    });
+  } catch (error) {
+    console.error('Error listing providers:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+/**
+ * Disconnect a telephony provider
+ * DELETE /api/bolna/provider/:providerName
+ */
+router.delete('/bolna/provider/:providerName', authenticateToken, async (req, res) => {
+  try {
+    const { providerName } = req.params;
+    const result = await bolnaService.disconnectProvider(providerName);
+
+    // Update Firestore
+    const restaurantId = req.query.restaurantId || req.user.restaurantId;
+    if (restaurantId) {
+      const db = getDb();
+      const agentRef = db.collection('bolnaAgents').doc(restaurantId);
+      const agentDoc = await agentRef.get();
+      if (agentDoc.exists) {
+        const currentProviders = (agentDoc.data().connectedProviders || []).filter(p => p !== providerName);
+        const updates = {
+          connectedProviders: currentProviders,
+          updatedAt: require('firebase-admin/firestore').FieldValue.serverTimestamp()
+        };
+        if (agentDoc.data().preferredProvider === providerName) {
+          updates.preferredProvider = currentProviders[0] || null;
+        }
+        await agentRef.update(updates);
+      }
+    }
+
+    res.json(result);
+  } catch (error) {
+    console.error('Error disconnecting provider:', error);
     res.status(500).json({ success: false, error: error.message });
   }
 });
