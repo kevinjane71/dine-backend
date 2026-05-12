@@ -228,7 +228,8 @@ router.get('/zones/:restaurantId', async (req, res) => {
 });
 
 // POST /zones/:restaurantId — Create zone
-router.post('/zones/:restaurantId', requireParkingEnabled, async (req, res) => {
+// No requireParkingEnabled — zones must be creatable during initial setup
+router.post('/zones/:restaurantId', async (req, res) => {
   try {
     const { restaurantId } = req.params;
     const { zoneName, zoneNameAr, zoneCode, floor, zoneType, totalSlots, sortOrder } = req.body;
@@ -262,7 +263,7 @@ router.post('/zones/:restaurantId', requireParkingEnabled, async (req, res) => {
 });
 
 // PUT /zones/:restaurantId/:zoneId — Update zone
-router.put('/zones/:restaurantId/:zoneId', requireParkingEnabled, async (req, res) => {
+router.put('/zones/:restaurantId/:zoneId', async (req, res) => {
   try {
     const { restaurantId, zoneId } = req.params;
     const updates = req.body;
@@ -282,7 +283,7 @@ router.put('/zones/:restaurantId/:zoneId', requireParkingEnabled, async (req, re
 });
 
 // DELETE /zones/:restaurantId/:zoneId — Soft delete zone
-router.delete('/zones/:restaurantId/:zoneId', requireParkingEnabled, async (req, res) => {
+router.delete('/zones/:restaurantId/:zoneId', async (req, res) => {
   try {
     const { zoneId } = req.params;
     await db.collection(collections.parkingZones).doc(zoneId).update({
@@ -301,7 +302,7 @@ router.delete('/zones/:restaurantId/:zoneId', requireParkingEnabled, async (req,
 // ──────────────────────────────────────────────
 
 // GET /slots/:restaurantId — List slots (filter by zoneId, status)
-router.get('/slots/:restaurantId', requireParkingEnabled, async (req, res) => {
+router.get('/slots/:restaurantId', async (req, res) => {
   try {
     const { restaurantId } = req.params;
     const { zoneId, status } = req.query;
@@ -323,7 +324,7 @@ router.get('/slots/:restaurantId', requireParkingEnabled, async (req, res) => {
 });
 
 // POST /slots/:restaurantId — Create single slot
-router.post('/slots/:restaurantId', requireParkingEnabled, async (req, res) => {
+router.post('/slots/:restaurantId', async (req, res) => {
   try {
     const { restaurantId } = req.params;
     const { zoneId, slotNumber, slotType, vehicleTypeRestriction, sortOrder } = req.body;
@@ -355,7 +356,7 @@ router.post('/slots/:restaurantId', requireParkingEnabled, async (req, res) => {
 });
 
 // POST /slots/:restaurantId/bulk — Bulk create slots for a zone
-router.post('/slots/:restaurantId/bulk', requireParkingEnabled, async (req, res) => {
+router.post('/slots/:restaurantId/bulk', async (req, res) => {
   try {
     const { restaurantId } = req.params;
     const { zoneId, prefix, startNumber, count, slotType, vehicleTypeRestriction } = req.body;
@@ -408,7 +409,7 @@ router.post('/slots/:restaurantId/bulk', requireParkingEnabled, async (req, res)
 });
 
 // PUT /slots/:restaurantId/:slotId — Update slot
-router.put('/slots/:restaurantId/:slotId', requireParkingEnabled, async (req, res) => {
+router.put('/slots/:restaurantId/:slotId', async (req, res) => {
   try {
     const { slotId } = req.params;
     const updates = req.body;
@@ -425,7 +426,7 @@ router.put('/slots/:restaurantId/:slotId', requireParkingEnabled, async (req, re
 });
 
 // DELETE /slots/:restaurantId/:slotId — Soft delete slot
-router.delete('/slots/:restaurantId/:slotId', requireParkingEnabled, async (req, res) => {
+router.delete('/slots/:restaurantId/:slotId', async (req, res) => {
   try {
     const { slotId } = req.params;
     await db.collection(collections.parkingSlots).doc(slotId).update({
@@ -463,7 +464,8 @@ router.get('/rates/:restaurantId', async (req, res) => {
 });
 
 // POST /rates/:restaurantId — Create rate
-router.post('/rates/:restaurantId', requireParkingEnabled, async (req, res) => {
+// No requireParkingEnabled — rates must be creatable during initial setup
+router.post('/rates/:restaurantId', async (req, res) => {
   try {
     const { restaurantId } = req.params;
     const {
@@ -508,7 +510,7 @@ router.post('/rates/:restaurantId', requireParkingEnabled, async (req, res) => {
 });
 
 // PUT /rates/:restaurantId/:rateId — Update rate
-router.put('/rates/:restaurantId/:rateId', requireParkingEnabled, async (req, res) => {
+router.put('/rates/:restaurantId/:rateId', async (req, res) => {
   try {
     const { rateId } = req.params;
     const updates = req.body;
@@ -525,7 +527,7 @@ router.put('/rates/:restaurantId/:rateId', requireParkingEnabled, async (req, re
 });
 
 // DELETE /rates/:restaurantId/:rateId — Soft delete rate
-router.delete('/rates/:restaurantId/:rateId', requireParkingEnabled, async (req, res) => {
+router.delete('/rates/:restaurantId/:rateId', async (req, res) => {
   try {
     const { rateId } = req.params;
     await db.collection(collections.parkingRates).doc(rateId).update({
@@ -651,10 +653,21 @@ router.post('/tickets/:restaurantId/entry', requireParkingEnabled, async (req, r
       ticketSequence: newSequence
     });
 
-    // Get zone info
+    // Get zone info and validate
     const zoneDoc = await db.collection(collections.parkingZones).doc(zoneId).get();
-    const zoneName = zoneDoc.exists ? zoneDoc.data().zoneName : '';
-    const zoneCode = zoneDoc.exists ? zoneDoc.data().zoneCode : '';
+    if (!zoneDoc.exists) {
+      return res.status(400).json({ success: false, error: 'Zone not found' });
+    }
+    const zoneData = zoneDoc.data();
+    if (zoneData.isActive === false) {
+      return res.status(400).json({ success: false, error: 'Zone is inactive' });
+    }
+    // Check zone capacity
+    if (zoneData.totalSlots && (zoneData.occupiedSlots || 0) >= zoneData.totalSlots) {
+      return res.status(400).json({ success: false, error: 'Zone is full — no available slots' });
+    }
+    const zoneName = zoneData.zoneName || '';
+    const zoneCode = zoneData.zoneCode || '';
 
     // Get slot info if individual tracking
     let slotNumber = null;
@@ -671,14 +684,69 @@ router.post('/tickets/:restaurantId/entry', requireParkingEnabled, async (req, r
       }
     }
 
-    // Get rate info
+    // Auto-match rate: find best rate for vehicle type + zone
+    let matchedRateId = rateId || null;
     let rateName = '';
     let rateData = null;
+
     if (rateId) {
+      // Client explicitly provided a rate — use it
       const rateDoc = await db.collection(collections.parkingRates).doc(rateId).get();
       if (rateDoc.exists) {
         rateData = rateDoc.data();
         rateName = rateData.rateName;
+        matchedRateId = rateId;
+      }
+    }
+
+    if (!matchedRateId) {
+      // Auto-match: query all active rates for this restaurant
+      const ratesSnap = await db.collection(collections.parkingRates)
+        .where('restaurantId', '==', restaurantId)
+        .where('isActive', '==', true)
+        .get();
+
+      const allRates = ratesSnap.docs.map(d => ({ id: d.id, ...d.data() }));
+      const vType = vehicleType || 'car';
+
+      // Score each rate: higher = better match
+      let bestRate = null;
+      let bestScore = -1;
+
+      for (const r of allRates) {
+        let score = 0;
+        // Vehicle type match
+        const rVehicle = r.vehicleType || 'all';
+        if (rVehicle === vType) {
+          score += 10; // Exact vehicle type match
+        } else if (rVehicle === 'all') {
+          score += 1; // Generic match
+        } else {
+          continue; // Wrong vehicle type, skip
+        }
+        // Zone match
+        if (r.zoneIds && Array.isArray(r.zoneIds) && r.zoneIds.length > 0) {
+          if (r.zoneIds.includes(zoneId)) {
+            score += 5; // Zone-specific match
+          } else {
+            continue; // Wrong zone, skip
+          }
+        } else {
+          score += 2; // Applies to all zones
+        }
+        // Default rate bonus (fallback)
+        if (r.isDefault) score += 0.5;
+
+        if (score > bestScore) {
+          bestScore = score;
+          bestRate = r;
+        }
+      }
+
+      if (bestRate) {
+        matchedRateId = bestRate.id;
+        rateData = bestRate;
+        rateName = bestRate.rateName;
       }
     }
 
@@ -712,7 +780,7 @@ router.post('/tickets/:restaurantId/entry', requireParkingEnabled, async (req, r
       entryTime: FieldValue.serverTimestamp(),
       exitTime: null,
       duration: null,
-      rateId: rateId || null,
+      rateId: matchedRateId || null,
       rateName,
       calculatedAmount: null,
       discountAmount: 0,
@@ -876,8 +944,16 @@ router.post('/tickets/:restaurantId/exit/confirm', requireParkingEnabled, async 
     }
 
     const ticket = ticketDoc.data();
+    if (ticket.restaurantId !== restaurantId) {
+      return res.status(403).json({ success: false, error: 'Ticket does not belong to this restaurant' });
+    }
     if (ticket.status !== 'active') {
       return res.status(400).json({ success: false, error: 'Ticket is not active' });
+    }
+
+    const validPaymentMethods = ['cash', 'card', 'upi', 'wallet', 'online', 'free'];
+    if (paymentMethod && !validPaymentMethods.includes(paymentMethod)) {
+      return res.status(400).json({ success: false, error: `Invalid payment method. Allowed: ${validPaymentMethods.join(', ')}` });
     }
 
     const now = new Date();
