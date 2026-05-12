@@ -1053,7 +1053,7 @@ const corsOptions = {
   },
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS', 'PATCH'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'Accept', 'Origin'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'Accept', 'Origin', 'X-Sync-Source'],
   optionsSuccessStatus: 200,
   preflightContinue: false
 };
@@ -1122,7 +1122,7 @@ app.use((req, res, next) => {
         res.setHeader('Access-Control-Allow-Origin', origin);
         res.setHeader('Access-Control-Allow-Credentials', 'true');
         res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS, PATCH');
-        res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With, Accept, Origin');
+        res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With, Accept, Origin, X-Sync-Source');
         res.setHeader('Vary', 'Origin');
         res.setHeader('Cache-Control', 'no-store, max-age=0');
         console.log(`✅ CORS preflight allowed for origin: ${origin}`);
@@ -8374,6 +8374,9 @@ app.post('/api/orders', async (req, res) => {
       restaurantId,
       tableNumber,
       roomNumber, // NEW: Support for hotel room orders
+      floorId,    // Floor document ID for multi-floor disambiguation
+      floorName,  // Floor display name
+      tableId,    // Table document ID for direct access
       items,
       customerInfo,
       orderType = 'dine-in',
@@ -8469,6 +8472,11 @@ app.post('/api/orders', async (req, res) => {
     const restaurantData = restaurantDoc.data();
     const menuItems = restaurantData.menu?.items || [];
 
+    // Variables for resolved table identity — declared here so orderData can access them
+    let tableId_resolved = null;
+    let tableFloor = null;
+    let tableFloorId_resolved = null;
+
     // Validate table number if provided
     if (tableNumber && tableNumber.trim()) {
       console.log('🪑 Validating table number:', tableNumber);
@@ -8487,11 +8495,33 @@ app.post('/api/orders', async (req, res) => {
 
         let tableFound = false;
         let tableStatus = null;
-        let tableId = null;
-        let tableFloor = null;
 
-        // Search for the table across all floors
-        for (const floorDoc of floorsSnapshot.docs) {
+        // FAST PATH: If floorId + tableId provided, fetch the exact table directly
+        if (floorId && tableId) {
+          try {
+            const directTableRef = db.collection('restaurants').doc(restaurantId)
+              .collection('floors').doc(floorId).collection('tables').doc(tableId);
+            const directTableDoc = await directTableRef.get();
+            if (directTableDoc.exists) {
+              const td = directTableDoc.data();
+              tableFound = true;
+              tableStatus = td.status;
+              tableId_resolved = directTableDoc.id;
+              tableFloorId_resolved = floorId;
+              const floorDoc = await db.collection('restaurants').doc(restaurantId).collection('floors').doc(floorId).get();
+              const floorData = floorDoc.exists ? floorDoc.data() : {};
+              tableFloor = floorData.name || floorName || null;
+              tableSection = td.section || floorData.section || null;
+              tableFloorData = floorData;
+              console.log('🪑 Direct table lookup:', { id: tableId_resolved, number: tableNumber, status: tableStatus, floor: tableFloor });
+            }
+          } catch (directErr) {
+            console.warn('🪑 Direct table lookup failed, falling back to iteration:', directErr.message);
+          }
+        }
+
+        // FALLBACK: Search for the table across all floors (backwards compat)
+        if (!tableFound) for (const floorDoc of floorsSnapshot.docs) {
           const floorData = floorDoc.data();
 
           const tablesSnapshot = await db.collection('restaurants')
@@ -8507,11 +8537,12 @@ app.post('/api/orders', async (req, res) => {
             if (tableData.name && tableData.name.toString().toLowerCase() === tableNumber.trim().toLowerCase()) {
               tableFound = true;
               tableStatus = tableData.status;
-              tableId = tableDoc.id;
+              tableId_resolved = tableDoc.id;
+              tableFloorId_resolved = floorDoc.id;
               tableFloor = floorData.name;
               tableSection = tableData.section || floorData.section || null;
               tableFloorData = floorData;
-              console.log('🪑 Found table:', { id: tableId, number: tableNumber, status: tableStatus, floor: tableFloor, section: tableSection });
+              console.log('🪑 Found table:', { id: tableId_resolved, number: tableNumber, status: tableStatus, floor: tableFloor, section: tableSection });
               break;
             }
           }
@@ -8889,6 +8920,9 @@ app.post('/api/orders', async (req, res) => {
       dailyOrderId,
       tabNumber,
       tableNumber: tableNumber || seatNumber || null,
+      floorId: tableFloorId_resolved || floorId || null,
+      floorName: tableFloor || floorName || null,
+      tableId: tableId_resolved || tableId || null,
       roomNumber: roomNumber || null, // NEW: Hotel room number
       orderType,
       items: orderItems,
@@ -9383,33 +9417,51 @@ app.post('/api/orders', async (req, res) => {
       try {
         console.log('🔄 Updating table status to occupied:', tableNumber);
 
-        // Find the table in the new restaurant-centric structure
-        const floorsSnapshot = await db.collection('restaurants')
-          .doc(restaurantId)
-          .collection('floors')
-          .get();
-
         let tableUpdated = false;
-        for (const floorDoc of floorsSnapshot.docs) {
-          const tablesSnapshot = await db.collection('restaurants')
+
+        // FAST PATH: Use stored floorId + tableId for direct update
+        if (orderData.floorId && orderData.tableId) {
+          const directRef = db.collection('restaurants').doc(restaurantId)
+            .collection('floors').doc(orderData.floorId)
+            .collection('tables').doc(orderData.tableId);
+          await directRef.update({
+            status: 'occupied',
+            currentOrderId: orderRef.id,
+            lastOrderTime: new Date(),
+            updatedAt: new Date()
+          });
+          console.log('✅ Table status updated (direct path):', tableNumber);
+          tableUpdated = true;
+        }
+
+        // FALLBACK: Find the table by name across all floors
+        if (!tableUpdated) {
+          const floorsSnapshot = await db.collection('restaurants')
             .doc(restaurantId)
             .collection('floors')
-            .doc(floorDoc.id)
-            .collection('tables')
-            .where('name', '==', tableNumber.trim())
             .get();
 
-          if (!tablesSnapshot.empty) {
-            const tableDoc = tablesSnapshot.docs[0];
-            await tableDoc.ref.update({
-              status: 'occupied',
-              currentOrderId: orderRef.id,
-              lastOrderTime: new Date(),
-              updatedAt: new Date()
-            });
-            console.log('✅ Table status updated to occupied:', tableNumber);
-            tableUpdated = true;
-            break;
+          for (const floorDoc of floorsSnapshot.docs) {
+            const tablesSnapshot = await db.collection('restaurants')
+              .doc(restaurantId)
+              .collection('floors')
+              .doc(floorDoc.id)
+              .collection('tables')
+              .where('name', '==', tableNumber.trim())
+              .get();
+
+            if (!tablesSnapshot.empty) {
+              const tableDoc = tablesSnapshot.docs[0];
+              await tableDoc.ref.update({
+                status: 'occupied',
+                currentOrderId: orderRef.id,
+                lastOrderTime: new Date(),
+                updatedAt: new Date()
+              });
+              console.log('✅ Table status updated to occupied:', tableNumber);
+              tableUpdated = true;
+              break;
+            }
           }
         }
 
@@ -9802,7 +9854,10 @@ app.get('/api/orders/single/:orderId', authenticateToken, async (req, res) => {
       customerDisplay: {
         name: orderData.customerInfo?.name || 'Walk-in Customer',
         phone: orderData.customerInfo?.phone || null,
-        tableNumber: orderData.tableNumber || null
+        tableNumber: orderData.tableNumber || null,
+        floorName: orderData.floorName || null,
+        floorId: orderData.floorId || null,
+        tableId: orderData.tableId || null
       },
       staffDisplay: {
         name: orderData.staffInfo?.name || 'Staff',
@@ -9868,7 +9923,10 @@ app.get('/api/orders/:restaurantId', authenticateToken, async (req, res) => {
         customerDisplay: {
           name: orderData.customerInfo?.name || 'Walk-in Customer',
           phone: orderData.customerInfo?.phone || null,
-          tableNumber: orderData.tableNumber || null
+          tableNumber: orderData.tableNumber || null,
+          floorName: orderData.floorName || null,
+          floorId: orderData.floorId || null,
+          tableId: orderData.tableId || null
         },
         staffDisplay: {
           name: orderData.staffInfo?.name || 'Staff',
@@ -11514,6 +11572,9 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
     }
 
     if (tableNumber !== undefined) updateData.tableNumber = tableNumber;
+    if (req.body.floorId !== undefined) updateData.floorId = req.body.floorId;
+    if (req.body.floorName !== undefined) updateData.floorName = req.body.floorName;
+    if (req.body.tableId !== undefined) updateData.tableId = req.body.tableId;
     if (orderType) updateData.orderType = orderType;
     if (paymentMethod) updateData.paymentMethod = paymentMethod;
     if (status) updateData.status = status;
@@ -12039,43 +12100,51 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
     if (status === 'completed' && currentOrder.tableNumber && currentOrder.tableNumber.trim()) {
       try {
         console.log('🔄 Releasing table due to order completion:', currentOrder.tableNumber);
-        
-        // Use the new restaurant-centric structure
-        const floorsSnapshot = await db.collection('restaurants')
-          .doc(currentOrder.restaurantId)
-          .collection('floors')
-          .get();
-        
+
         let tableReleased = false;
-        for (const floorDoc of floorsSnapshot.docs) {
-          const tablesSnapshot = await db.collection('restaurants')
+
+        // FAST PATH: Use stored floorId + tableId from the order
+        if (currentOrder.floorId && currentOrder.tableId) {
+          const directRef = db.collection('restaurants').doc(currentOrder.restaurantId)
+            .collection('floors').doc(currentOrder.floorId)
+            .collection('tables').doc(currentOrder.tableId);
+          await directRef.update({ status: 'available', currentOrderId: null, updatedAt: new Date() });
+          console.log('✅ Table released (direct path):', currentOrder.tableNumber);
+          pusherService.pusher.trigger(`restaurant-${currentOrder.restaurantId}`, 'table-status-updated', {
+            tableId: currentOrder.tableId, status: 'available', orderId: null, tableNumber: currentOrder.tableNumber,
+          }).catch(err => console.error('Pusher table-status-updated error:', err));
+          tableReleased = true;
+        }
+
+        // FALLBACK: Search by table name across all floors
+        if (!tableReleased) {
+          const floorsSnapshot = await db.collection('restaurants')
             .doc(currentOrder.restaurantId)
             .collection('floors')
-            .doc(floorDoc.id)
-            .collection('tables')
-            .where('name', '==', currentOrder.tableNumber.trim())
             .get();
-          
-          if (!tablesSnapshot.empty) {
-            const tableDoc = tablesSnapshot.docs[0];
-            await tableDoc.ref.update({
-              status: 'available',
-              currentOrderId: null,
-              updatedAt: new Date()
-            });
-            console.log('✅ Table released after order completion:', currentOrder.tableNumber);
-            // Send Pusher event for real-time table sync
-            pusherService.pusher.trigger(`restaurant-${currentOrder.restaurantId}`, 'table-status-updated', {
-              tableId: tableDoc.id,
-              status: 'available',
-              orderId: null,
-              tableNumber: currentOrder.tableNumber,
-            }).catch(err => console.error('Pusher table-status-updated error:', err));
-            tableReleased = true;
-            break;
+
+          for (const floorDoc of floorsSnapshot.docs) {
+            const tablesSnapshot = await db.collection('restaurants')
+              .doc(currentOrder.restaurantId)
+              .collection('floors')
+              .doc(floorDoc.id)
+              .collection('tables')
+              .where('name', '==', currentOrder.tableNumber.trim())
+              .get();
+
+            if (!tablesSnapshot.empty) {
+              const tableDoc = tablesSnapshot.docs[0];
+              await tableDoc.ref.update({ status: 'available', currentOrderId: null, updatedAt: new Date() });
+              console.log('✅ Table released after order completion:', currentOrder.tableNumber);
+              pusherService.pusher.trigger(`restaurant-${currentOrder.restaurantId}`, 'table-status-updated', {
+                tableId: tableDoc.id, status: 'available', orderId: null, tableNumber: currentOrder.tableNumber,
+              }).catch(err => console.error('Pusher table-status-updated error:', err));
+              tableReleased = true;
+              break;
+            }
           }
         }
-        
+
         if (!tableReleased) {
           console.log('⚠️ Table not found for release:', currentOrder.tableNumber);
         }
@@ -17075,6 +17144,7 @@ app.get('/api/kot/pending-print/:restaurantId', async (req, res) => {
         dailyOrderId: orderData.dailyOrderId || kotId,
         orderNumber: orderData.orderNumber,
         tableNumber: orderData.tableNumber || '',
+        floorName: orderData.floorName || '',
         roomNumber: orderData.roomNumber || '',
         items,
         notes: orderData.notes || '',
@@ -17242,6 +17312,7 @@ app.get('/api/billing/pending-print/:restaurantId', async (req, res) => {
         dailyOrderId: orderData.dailyOrderId,
         orderNumber: orderData.orderNumber,
         tableNumber: orderData.tableNumber || '',
+        floorName: orderData.floorName || '',
         roomNumber: orderData.roomNumber || '',
         customerName: orderData.customerName || '',
         customerMobile: orderData.customerMobile || '',
@@ -17628,6 +17699,7 @@ const assembleBillRenderPayload = (orderId, orderData, restaurantId, restaurantD
     customerPhone: orderData.customerInfo?.phone || orderData.customerMobile || '',
     customerEmail: orderData.customerInfo?.email || '',
     tableNumber: orderData.tableNumber || '',
+    floorName: orderData.floorName || '',
     roomNumber: orderData.roomNumber || '',
     orderType: orderData.orderType || 'dine-in',
     items: orderData.items || [],
@@ -17784,6 +17856,7 @@ app.get('/api/kot/render/:restaurantId/:orderId', async (req, res) => {
         dailyOrderId: orderData.dailyOrderId || null,
         orderNumber: orderData.orderNumber || null,
         tableNumber: orderData.tableNumber || '',
+        floorName: orderData.floorName || '',
         roomNumber: orderData.roomNumber || '',
         orderType: orderData.orderType || 'dine-in',
         items,
