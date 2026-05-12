@@ -22,29 +22,6 @@ function getActorName(req) {
   return req.user.name || req.user.email || 'Unknown';
 }
 
-// Feature flag middleware
-async function requireParkingEnabled(req, res, next) {
-  try {
-    const restaurantId = req.params.restaurantId || req.query.restaurantId || req.body.restaurantId;
-    if (!restaurantId) {
-      return res.status(400).json({ success: false, error: 'restaurantId required' });
-    }
-    const doc = await db.collection(collections.restaurants).doc(restaurantId).get();
-    if (!doc.exists) {
-      return res.status(404).json({ success: false, error: 'Restaurant not found' });
-    }
-    const data = doc.data();
-    if (!data.parkingEnabled) {
-      return res.status(403).json({ success: false, error: 'Parking feature is not enabled' });
-    }
-    req.restaurant = { id: doc.id, ...data };
-    next();
-  } catch (err) {
-    console.error('Parking feature check error:', err);
-    res.status(500).json({ success: false, error: 'Failed to check parking feature' });
-  }
-}
-
 // All routes require auth
 router.use(authenticateToken);
 
@@ -53,7 +30,6 @@ router.use(authenticateToken);
 // ──────────────────────────────────────────────
 
 // GET /config/:restaurantId — Get parking config
-// No requireParkingEnabled — config must be accessible for initial setup
 router.get('/config/:restaurantId', async (req, res) => {
   try {
     const { restaurantId } = req.params;
@@ -75,7 +51,6 @@ router.get('/config/:restaurantId', async (req, res) => {
 });
 
 // PUT /config/:restaurantId — Create/update parking config
-// No requireParkingEnabled — config must be saveable during initial setup
 router.put('/config/:restaurantId', async (req, res) => {
   try {
     const { restaurantId } = req.params;
@@ -143,7 +118,6 @@ router.put('/config/:restaurantId', async (req, res) => {
 });
 
 // GET /config/:restaurantId/dashboard-stats — Live dashboard summary
-// No requireParkingEnabled — dashboard must load even during initial setup
 router.get('/config/:restaurantId/dashboard-stats', async (req, res) => {
   try {
     const { restaurantId } = req.params;
@@ -210,7 +184,6 @@ router.get('/config/:restaurantId/dashboard-stats', async (req, res) => {
 // ──────────────────────────────────────────────
 
 // GET /zones/:restaurantId — List all zones
-// No requireParkingEnabled — zones list needed for dashboard to load
 router.get('/zones/:restaurantId', async (req, res) => {
   try {
     const { restaurantId } = req.params;
@@ -228,7 +201,6 @@ router.get('/zones/:restaurantId', async (req, res) => {
 });
 
 // POST /zones/:restaurantId — Create zone
-// No requireParkingEnabled — zones must be creatable during initial setup
 router.post('/zones/:restaurantId', async (req, res) => {
   try {
     const { restaurantId } = req.params;
@@ -445,7 +417,6 @@ router.delete('/slots/:restaurantId/:slotId', async (req, res) => {
 // ──────────────────────────────────────────────
 
 // GET /rates/:restaurantId — List all rates
-// No requireParkingEnabled — rates list needed for dashboard to load
 router.get('/rates/:restaurantId', async (req, res) => {
   try {
     const { restaurantId } = req.params;
@@ -464,7 +435,6 @@ router.get('/rates/:restaurantId', async (req, res) => {
 });
 
 // POST /rates/:restaurantId — Create rate
-// No requireParkingEnabled — rates must be creatable during initial setup
 router.post('/rates/:restaurantId', async (req, res) => {
   try {
     const { restaurantId } = req.params;
@@ -624,7 +594,7 @@ function calculateParkingFee(rate, durationMinutes) {
 }
 
 // POST /tickets/:restaurantId/entry — Create parking ticket (vehicle enters)
-router.post('/tickets/:restaurantId/entry', requireParkingEnabled, async (req, res) => {
+router.post('/tickets/:restaurantId/entry', async (req, res) => {
   try {
     const { restaurantId } = req.params;
     const {
@@ -854,7 +824,7 @@ router.post('/tickets/:restaurantId/entry', requireParkingEnabled, async (req, r
 });
 
 // POST /tickets/:restaurantId/exit — Process exit (calculate amount)
-router.post('/tickets/:restaurantId/exit', requireParkingEnabled, async (req, res) => {
+router.post('/tickets/:restaurantId/exit', async (req, res) => {
   try {
     const { restaurantId } = req.params;
     const { ticketId, ticketNumber, qrData } = req.body;
@@ -929,7 +899,7 @@ router.post('/tickets/:restaurantId/exit', requireParkingEnabled, async (req, re
 });
 
 // POST /tickets/:restaurantId/exit/confirm — Confirm exit and payment
-router.post('/tickets/:restaurantId/exit/confirm', requireParkingEnabled, async (req, res) => {
+router.post('/tickets/:restaurantId/exit/confirm', async (req, res) => {
   try {
     const { restaurantId } = req.params;
     const { ticketId, paymentMethod, discountAmount, finalAmount, notes } = req.body;
@@ -1051,7 +1021,7 @@ router.post('/tickets/:restaurantId/exit/confirm', requireParkingEnabled, async 
 });
 
 // GET /tickets/:restaurantId — List tickets with filters
-router.get('/tickets/:restaurantId', requireParkingEnabled, async (req, res) => {
+router.get('/tickets/:restaurantId', async (req, res) => {
   try {
     const { restaurantId } = req.params;
     const { status, date, vehicleNumber, zoneId, limit: queryLimit } = req.query;
@@ -1089,7 +1059,7 @@ router.get('/tickets/:restaurantId', requireParkingEnabled, async (req, res) => 
 });
 
 // GET /tickets/:restaurantId/:ticketId — Get single ticket
-router.get('/tickets/:restaurantId/:ticketId', requireParkingEnabled, async (req, res) => {
+router.get('/tickets/:restaurantId/:ticketId', async (req, res) => {
   try {
     const { ticketId } = req.params;
     const doc = await db.collection(collections.parkingTickets).doc(ticketId).get();
@@ -1104,7 +1074,7 @@ router.get('/tickets/:restaurantId/:ticketId', requireParkingEnabled, async (req
 });
 
 // GET /tickets/:restaurantId/lookup — Lookup by vehicleNumber or ticketNumber
-router.get('/tickets/:restaurantId/lookup', requireParkingEnabled, async (req, res) => {
+router.get('/tickets/:restaurantId/lookup', async (req, res) => {
   try {
     const { restaurantId } = req.params;
     const { vehicleNumber, ticketNumber } = req.query;
@@ -1140,7 +1110,7 @@ router.get('/tickets/:restaurantId/lookup', requireParkingEnabled, async (req, r
 });
 
 // PUT /tickets/:restaurantId/:ticketId — Update ticket
-router.put('/tickets/:restaurantId/:ticketId', requireParkingEnabled, async (req, res) => {
+router.put('/tickets/:restaurantId/:ticketId', async (req, res) => {
   try {
     const { ticketId } = req.params;
     const updates = req.body;
@@ -1158,7 +1128,7 @@ router.put('/tickets/:restaurantId/:ticketId', requireParkingEnabled, async (req
 });
 
 // POST /tickets/:restaurantId/:ticketId/cancel — Cancel ticket
-router.post('/tickets/:restaurantId/:ticketId/cancel', requireParkingEnabled, async (req, res) => {
+router.post('/tickets/:restaurantId/:ticketId/cancel', async (req, res) => {
   try {
     const { ticketId } = req.params;
     const { reason } = req.body;
@@ -1211,7 +1181,7 @@ router.post('/tickets/:restaurantId/:ticketId/cancel', requireParkingEnabled, as
 // ──────────────────────────────────────────────
 
 // POST /ai/recognize-plate/:restaurantId — Upload image, extract plate via OpenAI Vision
-router.post('/ai/recognize-plate/:restaurantId', requireParkingEnabled, async (req, res) => {
+router.post('/ai/recognize-plate/:restaurantId', async (req, res) => {
   try {
     const multer = require('multer');
     const uploadSingle = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } }).single('image');
@@ -1339,7 +1309,7 @@ If you cannot read the plate clearly, set confidence below 0.5 and plateNumber t
 // ──────────────────────────────────────────────
 
 // GET /tickets/:restaurantId/:ticketId/print-data — Structured JSON for slip generation
-router.get('/tickets/:restaurantId/:ticketId/print-data', requireParkingEnabled, async (req, res) => {
+router.get('/tickets/:restaurantId/:ticketId/print-data', async (req, res) => {
   try {
     const { restaurantId, ticketId } = req.params;
 
@@ -1406,7 +1376,7 @@ router.get('/tickets/:restaurantId/:ticketId/print-data', requireParkingEnabled,
 // ──────────────────────────────────────────────
 
 // GET /reports/:restaurantId — Parking analytics
-router.get('/reports/:restaurantId', requireParkingEnabled, async (req, res) => {
+router.get('/reports/:restaurantId', async (req, res) => {
   try {
     const { restaurantId } = req.params;
     const { startDate, endDate } = req.query;
