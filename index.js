@@ -16001,6 +16001,32 @@ app.use('/api/owner', ownerDashboardRoutes);
 app.use('/api/customer-groups', customerGroupsRoutes);
 app.use('/api/orders', moveOrderRoutes);
 
+// ==================== Image Proxy (for PDF export — avoids CORS on GCP Storage) ====================
+app.get('/api/utils/image-to-base64', authenticateToken, async (req, res) => {
+  try {
+    const { url } = req.query;
+    if (!url || typeof url !== 'string') {
+      return res.status(400).json({ error: 'url query parameter is required' });
+    }
+    // Only allow Google Cloud Storage / Firebase Storage URLs
+    const allowed = ['storage.googleapis.com', 'firebasestorage.googleapis.com'];
+    let parsed;
+    try { parsed = new URL(url); } catch { return res.status(400).json({ error: 'Invalid URL' }); }
+    if (!allowed.some(h => parsed.hostname.endsWith(h))) {
+      return res.status(400).json({ error: 'Only Google/Firebase Storage URLs are allowed' });
+    }
+    const response = await fetch(url);
+    if (!response.ok) return res.status(502).json({ error: 'Failed to fetch image' });
+    const contentType = response.headers.get('content-type') || 'image/png';
+    const buffer = Buffer.from(await response.arrayBuffer());
+    const base64 = `data:${contentType};base64,${buffer.toString('base64')}`;
+    res.json({ success: true, base64 });
+  } catch (error) {
+    console.error('Image proxy error:', error);
+    res.status(500).json({ error: 'Failed to convert image' });
+  }
+});
+
 // ==================== AI INSIGHTS & DAILY REPORTS ====================
 // AI-powered analytics and automated email reports
 app.use('/api/ai', aiInsightsRoutes);
