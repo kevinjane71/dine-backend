@@ -8310,6 +8310,8 @@ app.post('/api/public/orders/:restaurantId', vercelSecurityMiddleware.publicAPI,
         status: orderData.status,
         totalAmount: finalTotal,
         tableNumber: tableNum,
+        tableId: tableId_resolved || null,
+        floorId: tableFloorId_resolved || null,
         orderType: orderType,
         orderSource: resolvedOrderSource
       }).catch(err => console.error('Pusher notification error (non-blocking):', err))
@@ -9527,6 +9529,8 @@ app.post('/api/orders', async (req, res) => {
         status: orderData.status,
         totalAmount: totalAmount,
         tableNumber: tableNumber,
+        tableId: orderData.tableId || null,
+        floorId: orderData.floorId || null,
         orderType: orderType
       }).catch(err => console.error('Pusher notification error (non-blocking):', err))
     );
@@ -11047,7 +11051,9 @@ app.patch('/api/orders/:orderId/status', authenticateToken, async (req, res) => 
         orderNumber: orderData.orderNumber,
         dailyOrderId: orderData.dailyOrderId,
         totalAmount: orderData.totalAmount,
-        tableNumber: orderData.tableNumber
+        tableNumber: orderData.tableNumber,
+        tableId: orderData.tableId || null,
+        floorId: orderData.floorId || null,
       }).catch(err => console.error('Pusher notification error (non-blocking):', err))
     );
 
@@ -12252,7 +12258,9 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
         dailyOrderId: currentOrder.dailyOrderId,
         totalAmount: updateData.totalAmount || currentOrder.totalAmount,
         items: updateData.items || currentOrder.items,
-        tableNumber: currentOrder.tableNumber
+        tableNumber: currentOrder.tableNumber,
+        tableId: currentOrder.tableId || null,
+        floorId: currentOrder.floorId || null,
       }).catch(err => console.error('Pusher notification error (non-blocking):', err))
     );
 
@@ -27135,8 +27143,15 @@ app.get('/api/restaurants/:restaurantId/customer-app-settings', authenticateToke
       return res.status(404).json({ error: 'Restaurant not found' });
     }
 
-    if (restaurantData.ownerId !== userId) {
-      return res.status(403).json({ error: 'Access denied' });
+    // Allow owner and staff members of the restaurant to read settings
+    const isOwner = restaurantData.ownerId === userId;
+    if (!isOwner) {
+      // Check if user is staff of this restaurant
+      const userDoc = await db.collection(collections.users).doc(userId).get();
+      const userData = userDoc.exists ? userDoc.data() : null;
+      if (!userData || userData.restaurantId !== restaurantId) {
+        return res.status(403).json({ error: 'Access denied' });
+      }
     }
 
     // Return existing settings or defaults

@@ -40,6 +40,8 @@ const notifyOrderCreated = async (restaurantId, order) => {
     status: order.status,
     totalAmount: order.totalAmount,
     tableNumber: order.tableNumber,
+    tableId: order.tableId || null,
+    floorId: order.floorId || null,
     orderType: order.orderType
   });
 };
@@ -53,7 +55,9 @@ const notifyOrderStatusUpdated = async (restaurantId, orderId, newStatus, orderD
     status: newStatus,
     orderNumber: orderData.orderNumber || orderData.dailyOrderId,
     totalAmount: orderData.totalAmount,
-    tableNumber: orderData.tableNumber
+    tableNumber: orderData.tableNumber,
+    tableId: orderData.tableId || null,
+    floorId: orderData.floorId || null,
   });
 };
 
@@ -67,7 +71,9 @@ const notifyOrderUpdated = async (restaurantId, orderId, orderData) => {
     orderNumber: orderData.orderNumber || orderData.dailyOrderId,
     totalAmount: orderData.totalAmount,
     itemsCount: orderData.items?.length || 0,
-    tableNumber: orderData.tableNumber
+    tableNumber: orderData.tableNumber,
+    tableId: orderData.tableId || null,
+    floorId: orderData.floorId || null,
   });
 };
 
