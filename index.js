@@ -953,6 +953,9 @@ const spaceBookingRoutes = require('./routes/spaceBooking');
 const parkingRoutes = require('./routes/parking');
 const registerRoutes = require('./routes/registerRoutes');
 
+// Move Order
+const moveOrderRoutes = require('./routes/moveOrder');
+
 // Chain / Enterprise Module
 const organizationRoutes = require('./routes/organizationRoutes');
 const centralMenuRoutes = require('./routes/centralMenuRoutes');
@@ -12398,6 +12401,8 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
   }
 });
 
+// Move Order to Another Table — extracted to routes/moveOrder.js
+
 // Manual print request endpoint - triggered from Order History page Print button
 // This sends print request to dine-kot-printer app via Pusher
 app.post('/api/orders/:orderId/manual-print', authenticateToken, async (req, res) => {
@@ -15994,6 +15999,7 @@ app.use('/api', currencyRoutes);
 // Owner dashboard routes for multi-restaurant management
 app.use('/api/owner', ownerDashboardRoutes);
 app.use('/api/customer-groups', customerGroupsRoutes);
+app.use('/api/orders', moveOrderRoutes);
 
 // ==================== AI INSIGHTS & DAILY REPORTS ====================
 // AI-powered analytics and automated email reports
