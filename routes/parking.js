@@ -441,6 +441,7 @@ router.post('/rates/:restaurantId', async (req, res) => {
     const {
       rateName, rateNameAr, vehicleType, rateType,
       hourlyRate, minimumCharge, gracePeriodMinutes, maxDailyRate,
+      firstHourRate, freeEntryMinutes, applyMinInGrace, progressiveSlabs,
       flatRate, tiers, nightSurcharge, weekendSurcharge,
       isDefault, zoneIds, sortOrder
     } = req.body;
@@ -456,9 +457,13 @@ router.post('/rates/:restaurantId', async (req, res) => {
       vehicleType: vehicleType || 'all',
       rateType,
       hourlyRate: hourlyRate || 0,
+      firstHourRate: firstHourRate || 0,
       minimumCharge: minimumCharge || 0,
       gracePeriodMinutes: gracePeriodMinutes ?? 15,
+      freeEntryMinutes: freeEntryMinutes || 0,
+      applyMinInGrace: applyMinInGrace !== false,
       maxDailyRate: maxDailyRate || null,
+      progressiveSlabs: progressiveSlabs || [],
       flatRate: flatRate || 0,
       tiers: tiers || [],
       nightSurcharge: nightSurcharge || { enabled: false, startHour: 22, endHour: 6, multiplier: 1.5 },
@@ -519,16 +524,43 @@ router.delete('/rates/:restaurantId/:rateId', async (req, res) => {
 function calculateParkingFee(rate, durationMinutes) {
   if (!rate || durationMinutes <= 0) return 0;
 
-  // Apply grace period
-  const effectiveMinutes = Math.max(0, durationMinutes - (rate.gracePeriodMinutes || 0));
-  if (effectiveMinutes === 0) return 0;
+  // 1. FREE ENTRY PERIOD — truly free, no charge at all
+  const freeMinutes = rate.freeEntryMinutes || 0;
+  if (freeMinutes > 0 && durationMinutes <= freeMinutes) return 0;
 
+  // 2. GRACE PERIOD — deduct from billable time
+  const graceMins = rate.gracePeriodMinutes || 0;
+  const effectiveMinutes = Math.max(0, durationMinutes - graceMins);
+
+  // 3. If within grace: check if minimumCharge applies
+  if (effectiveMinutes === 0) {
+    if (rate.minimumCharge && rate.applyMinInGrace !== false) {
+      return rate.minimumCharge;
+    }
+    return 0;
+  }
+
+  // 4. CALCULATE based on rate type
   let amount = 0;
 
   switch (rate.rateType) {
     case 'hourly': {
-      const hours = Math.ceil(effectiveMinutes / 60);
-      amount = hours * (rate.hourlyRate || 0);
+      if (rate.progressiveSlabs && rate.progressiveSlabs.length > 0) {
+        // PROGRESSIVE/SLAB: different rate per time block
+        amount = calcProgressiveSlabs(rate.progressiveSlabs, effectiveMinutes);
+      } else if (rate.firstHourRate && effectiveMinutes > 0) {
+        // FIRST HOUR RATE: different rate for first hour, then hourlyRate
+        amount = rate.firstHourRate;
+        const remainingMins = Math.max(0, effectiveMinutes - 60);
+        if (remainingMins > 0) {
+          amount += Math.ceil(remainingMins / 60) * (rate.hourlyRate || 0);
+        }
+      } else {
+        // STANDARD HOURLY
+        const hours = Math.ceil(effectiveMinutes / 60);
+        amount = hours * (rate.hourlyRate || 0);
+      }
+      // Cap at max daily
       if (rate.maxDailyRate && amount > rate.maxDailyRate) {
         amount = rate.maxDailyRate;
       }
@@ -563,12 +595,12 @@ function calculateParkingFee(rate, durationMinutes) {
       amount = 0;
   }
 
-  // Apply minimum charge
-  if (amount > 0 && rate.minimumCharge && amount < rate.minimumCharge) {
+  // 5. APPLY MINIMUM CHARGE
+  if (rate.minimumCharge && amount < rate.minimumCharge) {
     amount = rate.minimumCharge;
   }
 
-  // Apply surcharges
+  // 6. SURCHARGES (night/weekend)
   const now = new Date();
   const hour = now.getHours();
   const day = now.getDay();
@@ -576,7 +608,6 @@ function calculateParkingFee(rate, durationMinutes) {
   if (rate.nightSurcharge?.enabled) {
     const { startHour, endHour, multiplier } = rate.nightSurcharge;
     if (startHour > endHour) {
-      // Overnight (e.g., 22-6)
       if (hour >= startHour || hour < endHour) {
         amount *= (multiplier || 1);
       }
@@ -586,11 +617,30 @@ function calculateParkingFee(rate, durationMinutes) {
   }
 
   if (rate.weekendSurcharge?.enabled && (day === 5 || day === 6)) {
-    // Friday and Saturday for Dubai/Kuwait
     amount *= (rate.weekendSurcharge.multiplier || 1);
   }
 
   return Math.round(amount * 100) / 100;
+}
+
+// Progressive slab calculation: different rate per time block
+function calcProgressiveSlabs(slabs, effectiveMinutes) {
+  const sorted = [...slabs].sort((a, b) => (a.upToHours || Infinity) - (b.upToHours || Infinity));
+  let remaining = effectiveMinutes;
+  let total = 0;
+  let prevBoundaryMins = 0;
+
+  for (const slab of sorted) {
+    if (remaining <= 0) break;
+    const slabEndMins = slab.upToHours ? slab.upToHours * 60 : Infinity;
+    const slabSpan = Math.min(remaining, slabEndMins - prevBoundaryMins);
+    if (slabSpan <= 0) continue;
+    const hours = Math.ceil(slabSpan / 60);
+    total += hours * (slab.ratePerHour || 0);
+    remaining -= slabSpan;
+    prevBoundaryMins = slabEndMins;
+  }
+  return total;
 }
 
 // POST /tickets/:restaurantId/entry — Create parking ticket (vehicle enters)
