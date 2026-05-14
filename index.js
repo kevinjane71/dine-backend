@@ -25696,29 +25696,53 @@ app.get('/api/customers/:restaurantId', authenticateToken, async (req, res) => {
     }
 
     if (search) {
-      // When searching, fetch all and filter in memory (Firestore doesn't support full-text search)
-      const allSnapshot = await db.collection(collections.customers)
-        .where('restaurantId', '==', restaurantId)
-        .orderBy('lastOrderDate', 'desc')
-        .get();
+      const isPhoneSearch = /^\d+$/.test(search);
+      let allCustomers = [];
 
-      const allCustomers = [];
-      allSnapshot.forEach(doc => {
-        const data = doc.data();
-        const nameMatch = data.name && data.name.toLowerCase().includes(search);
-        const phoneMatch = data.phone && data.phone.includes(search);
-        const emailMatch = data.email && data.email.toLowerCase().includes(search);
-        const cityMatch = data.city && data.city.toLowerCase().includes(search);
-        if (nameMatch || phoneMatch || emailMatch || cityMatch) {
+      if (isPhoneSearch) {
+        // Phone prefix search — uses Firestore range query (reads only matching docs)
+        const phoneSnapshot = await db.collection(collections.customers)
+          .where('restaurantId', '==', restaurantId)
+          .where('phone', '>=', search)
+          .where('phone', '<=', search + '\uf8ff')
+          .orderBy('phone')
+          .limit(200)
+          .get();
+        phoneSnapshot.forEach(doc => {
+          const data = doc.data();
           const oh = data.orderHistory || [];
           allCustomers.push({
-            id: doc.id,
-            ...data,
+            id: doc.id, ...data,
             totalOrders: Math.max(data.totalOrders || 0, oh.length),
             totalSpent: Math.max(data.totalSpent || 0, oh.reduce((s, o) => s + (o.finalAmount || o.totalAmount || 0), 0)),
           });
-        }
-      });
+        });
+      } else {
+        // Text search — fetch paginated batch and filter in memory
+        // Use a limited scan to avoid reading entire collection
+        const scanLimit = 2000;
+        const allSnapshot = await db.collection(collections.customers)
+          .where('restaurantId', '==', restaurantId)
+          .orderBy('lastOrderDate', 'desc')
+          .limit(scanLimit)
+          .get();
+
+        allSnapshot.forEach(doc => {
+          const data = doc.data();
+          const nameMatch = data.name && data.name.toLowerCase().includes(search);
+          const phoneMatch = data.phone && data.phone.includes(search);
+          const emailMatch = data.email && data.email.toLowerCase().includes(search);
+          const cityMatch = data.city && data.city.toLowerCase().includes(search);
+          if (nameMatch || phoneMatch || emailMatch || cityMatch) {
+            const oh = data.orderHistory || [];
+            allCustomers.push({
+              id: doc.id, ...data,
+              totalOrders: Math.max(data.totalOrders || 0, oh.length),
+              totalSpent: Math.max(data.totalSpent || 0, oh.reduce((s, o) => s + (o.finalAmount || o.totalAmount || 0), 0)),
+            });
+          }
+        });
+      }
 
       const total = allCustomers.length;
       const skip = (page - 1) * pageSize;
@@ -26336,26 +26360,37 @@ app.post('/api/public/customer/lookup', vercelSecurityMiddleware.publicAPI, asyn
 
     const normalizedPhone = normalizePhone(phone);
 
-    // Try exact match first
-    let customerQuery = await db.collection('customers')
-      .where('restaurantId', '==', restaurantId)
-      .where('phone', '==', phone)
-      .limit(1)
-      .get();
-
+    // Try exact match first, then common variants — avoids fetching entire collection
     let existingCustomer = null;
-    if (!customerQuery.empty) {
-      existingCustomer = customerQuery.docs[0];
-    } else if (normalizedPhone) {
-      // Try normalized phone match
-      const allCustomers = await db.collection('customers')
-        .where('restaurantId', '==', restaurantId)
-        .get();
+    const phonesToTry = [phone];
+    if (normalizedPhone && normalizedPhone !== phone) phonesToTry.push(normalizedPhone);
+    // Also try with country code prefix (e.g., stored as "917042330092")
+    if (normalizedPhone) phonesToTry.push(dialCode + normalizedPhone);
+    // Try with leading 0 (e.g., stored as "07042330092")
+    if (normalizedPhone && !normalizedPhone.startsWith('0')) phonesToTry.push('0' + normalizedPhone);
 
-      existingCustomer = allCustomers.docs.find(doc => {
-        const custPhone = normalizePhone(doc.data().phone);
-        return custPhone === normalizedPhone;
-      });
+    // Deduplicate
+    const uniquePhones = [...new Set(phonesToTry)];
+
+    for (const tryPhone of uniquePhones) {
+      if (existingCustomer) break;
+      const snap = await db.collection('customers')
+        .where('restaurantId', '==', restaurantId)
+        .where('phone', '==', tryPhone)
+        .limit(1)
+        .get();
+      if (!snap.empty) existingCustomer = snap.docs[0];
+    }
+
+    // Last resort: prefix search on normalized phone (handles partial stored formats)
+    if (!existingCustomer && normalizedPhone && normalizedPhone.length >= 10) {
+      const prefixSnap = await db.collection('customers')
+        .where('restaurantId', '==', restaurantId)
+        .where('phone', '>=', normalizedPhone)
+        .where('phone', '<=', normalizedPhone + '\uf8ff')
+        .limit(1)
+        .get();
+      if (!prefixSnap.empty) existingCustomer = prefixSnap.docs[0];
     }
 
     if (existingCustomer) {
