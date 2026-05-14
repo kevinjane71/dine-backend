@@ -25696,53 +25696,32 @@ app.get('/api/customers/:restaurantId', authenticateToken, async (req, res) => {
     }
 
     if (search) {
-      const isPhoneSearch = /^\d+$/.test(search);
-      let allCustomers = [];
+      // Fetch restaurant customers and filter in memory
+      // Firestore doesn't support full-text search; we use a capped scan
+      const scanLimit = 5000;
+      const allSnapshot = await db.collection(collections.customers)
+        .where('restaurantId', '==', restaurantId)
+        .orderBy('lastOrderDate', 'desc')
+        .limit(scanLimit)
+        .get();
 
-      if (isPhoneSearch) {
-        // Phone prefix search — uses Firestore range query (reads only matching docs)
-        const phoneSnapshot = await db.collection(collections.customers)
-          .where('restaurantId', '==', restaurantId)
-          .where('phone', '>=', search)
-          .where('phone', '<=', search + '\uf8ff')
-          .orderBy('phone')
-          .limit(200)
-          .get();
-        phoneSnapshot.forEach(doc => {
-          const data = doc.data();
+      const allCustomers = [];
+      allSnapshot.forEach(doc => {
+        const data = doc.data();
+        const nameMatch = data.name && data.name.toLowerCase().includes(search);
+        const phoneMatch = data.phone && data.phone.includes(search);
+        const emailMatch = data.email && data.email.toLowerCase().includes(search);
+        const cityMatch = data.city && data.city.toLowerCase().includes(search);
+        const addressMatch = data.address && data.address.toLowerCase().includes(search);
+        if (nameMatch || phoneMatch || emailMatch || cityMatch || addressMatch) {
           const oh = data.orderHistory || [];
           allCustomers.push({
             id: doc.id, ...data,
             totalOrders: Math.max(data.totalOrders || 0, oh.length),
             totalSpent: Math.max(data.totalSpent || 0, oh.reduce((s, o) => s + (o.finalAmount || o.totalAmount || 0), 0)),
           });
-        });
-      } else {
-        // Text search — fetch paginated batch and filter in memory
-        // Use a limited scan to avoid reading entire collection
-        const scanLimit = 2000;
-        const allSnapshot = await db.collection(collections.customers)
-          .where('restaurantId', '==', restaurantId)
-          .orderBy('lastOrderDate', 'desc')
-          .limit(scanLimit)
-          .get();
-
-        allSnapshot.forEach(doc => {
-          const data = doc.data();
-          const nameMatch = data.name && data.name.toLowerCase().includes(search);
-          const phoneMatch = data.phone && data.phone.includes(search);
-          const emailMatch = data.email && data.email.toLowerCase().includes(search);
-          const cityMatch = data.city && data.city.toLowerCase().includes(search);
-          if (nameMatch || phoneMatch || emailMatch || cityMatch) {
-            const oh = data.orderHistory || [];
-            allCustomers.push({
-              id: doc.id, ...data,
-              totalOrders: Math.max(data.totalOrders || 0, oh.length),
-              totalSpent: Math.max(data.totalSpent || 0, oh.reduce((s, o) => s + (o.finalAmount || o.totalAmount || 0), 0)),
-            });
-          }
-        });
-      }
+        }
+      });
 
       const total = allCustomers.length;
       const skip = (page - 1) * pageSize;
