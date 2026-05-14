@@ -11543,28 +11543,51 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
       const existingItems = currentOrder.items || [];
       const processedItems = items.map(newItem => {
         const existingItem = existingItems.find(existing => existing.menuItemId === newItem.menuItemId);
-        
+
         // Ensure each item has proper price and total information
+        // Clear any previous KOT diff flags to avoid stale flags from prior updates
+        const { isNew: _isNew, isUpdated: _isUpdated, isRemoved: _isRemoved, addedAt: _addedAt, updatedAt: _updatedAt, removedAt: _removedAt, previousQuantity: _prevQty, quantityDelta: _qtyDelta, ...cleanItem } = newItem;
         const itemWithTotals = {
-          ...newItem,
+          ...cleanItem,
           // Ensure price is available
-          price: newItem.price || existingItem?.price || 0,
+          price: cleanItem.price || existingItem?.price || 0,
           // Calculate total if not provided
-          total: newItem.total || (newItem.price || existingItem?.price || 0) * newItem.quantity
+          total: cleanItem.total || (cleanItem.price || existingItem?.price || 0) * cleanItem.quantity
         };
-        
+
         if (!existingItem) {
           // This is a completely new item
           return { ...itemWithTotals, isNew: true, addedAt: new Date().toISOString() };
         } else if (existingItem.quantity !== newItem.quantity) {
-          // This item's quantity was updated
-          return { ...itemWithTotals, isUpdated: true, updatedAt: new Date().toISOString() };
+          // This item's quantity was updated — store delta info for KOT
+          const previousQuantity = existingItem.quantity;
+          const quantityDelta = newItem.quantity - previousQuantity;
+          return {
+            ...itemWithTotals,
+            isUpdated: true,
+            updatedAt: new Date().toISOString(),
+            previousQuantity,
+            quantityDelta // positive = added more, negative = reduced
+          };
         } else {
-          // This item was not changed
+          // This item was not changed — return clean (no diff flags)
           return { ...itemWithTotals };
         }
       });
-      
+
+      // Detect removed items — items that existed before but are NOT in the new items list
+      const removedItems = existingItems
+        .filter(existing => !items.find(newItem => newItem.menuItemId === existing.menuItemId))
+        .map(removedItem => ({
+          ...removedItem,
+          isRemoved: true,
+          removedAt: new Date().toISOString(),
+          previousQuantity: removedItem.quantity,
+          quantity: 0
+        }));
+
+      // Store removed items separately so they don't affect totals but are available for KOT display
+      updateData.removedItems = removedItems;
       updateData.items = processedItems;
       updateData.itemCount = processedItems.reduce((sum, item) => sum + item.quantity, 0);
       let itemsSubtotal = await calculateOrderTotal(processedItems);
@@ -12292,6 +12315,7 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
                 tableNumber: tableNumber || currentOrder.tableNumber,
                 roomNumber: currentOrder.roomNumber,
                 items: group.items,
+                removedItems: updateData.removedItems || [],
                 notes: currentOrder.notes,
                 specialInstructions: updateData.specialInstructions || currentOrder.specialInstructions,
                 staffInfo: currentOrder.staffInfo,
@@ -16383,7 +16407,9 @@ app.get('/api/admin/print-settings/:restaurantId', authenticateToken, async (req
       tokenBillingEnabled: false,          // Food court: print category-wise token slips after billing
       enableUpdateWithoutKOT: false,       // Show "Update Order" button (save without KOT)
       enableKOTAndPrint: false,            // Show "KOT & Print" combined button
-      enableSaveAndPrint: false            // Show "Bill & Print" combined button
+      enableSaveAndPrint: false,           // Show "Bill & Print" combined button
+      kotTemplate: 'classic',              // KOT print template: classic, compact, bold, grouped, numbered
+      billTemplate: 'classic'              // Bill print template: classic, compact, detailed, elegant, minimal
     };
 
     const printSettings = { ...defaultSettings, ...(restaurantData.printSettings || {}) };
@@ -16440,7 +16466,9 @@ app.put('/api/admin/print-settings/:restaurantId', authenticateToken, async (req
     // String enum fields
     const enumFields = {
       billFontSize: ['small', 'medium', 'large', 'xlarge'],
-      billFontFamily: ['default', 'arial', 'verdana', 'tahoma', 'georgia', 'times']
+      billFontFamily: ['default', 'arial', 'verdana', 'tahoma', 'georgia', 'times'],
+      kotTemplate: ['classic', 'compact', 'bold', 'grouped', 'numbered'],
+      billTemplate: ['classic', 'compact', 'detailed', 'elegant', 'minimal']
     };
 
     const sanitizedSettings = {};
@@ -17187,6 +17215,8 @@ app.get('/api/kot/pending-print/:restaurantId', async (req, res) => {
         floorName: orderData.floorName || '',
         roomNumber: orderData.roomNumber || '',
         items,
+        removedItems: orderData.removedItems || [],
+        updateHistory: orderData.updateHistory || [],
         notes: orderData.notes || '',
         staffInfo: orderData.staffInfo || {},
         orderType: orderData.orderType || 'dine-in',
@@ -17224,7 +17254,10 @@ app.get('/api/kot/pending-print/:restaurantId', async (req, res) => {
         printKOTCopy,                  // Number of KOT copies
         printBillCopy,                 // Number of bill copies
         billFontScale: printSettings.billFontScale || 100,      // Font scale 50-150
-        billFontFamily: printSettings.billFontFamily || 'default' // Font family id
+        billFontFamily: printSettings.billFontFamily || 'default', // Font family id
+        kotUpdatePrintMode: printSettings.kotUpdatePrintMode || 'delta', // 'delta' = only new/changed items, 'detailed' = full KOT with markings
+        kotTemplate: printSettings.kotTemplate || 'classic',    // KOT print template
+        billTemplate: printSettings.billTemplate || 'classic'   // Bill print template
       },
       // Print stations for KOT printer station selector dropdown
       printStations: printStations.filter(s => s.enabled).map(s => ({
@@ -17401,7 +17434,9 @@ app.get('/api/billing/pending-print/:restaurantId', async (req, res) => {
         autoPrintOnBilling,
         printBillCopy,
         billFontScale: printSettings.billFontScale || 100,
-        billFontFamily: printSettings.billFontFamily || 'default'
+        billFontFamily: printSettings.billFontFamily || 'default',
+        kotTemplate: printSettings.kotTemplate || 'classic',
+        billTemplate: printSettings.billTemplate || 'classic'
       }
     });
 
@@ -25448,7 +25483,7 @@ app.post('/api/customers', authenticateToken, async (req, res) => {
       return res.status(403).json({ error: 'Access denied. Customers add permission required.' });
     }
     const { userId } = req.user;
-    const { name, phone, email, city, dob, restaurantId, orderHistory = [] } = req.body;
+    const { name, phone, email, city, dob, restaurantId, orderHistory = [], address, locality, anniversary, gstNumber, source, doNotContact } = req.body;
 
     console.log(`📞 Customer API called with:`, {
       name, phone, email, restaurantId, orderHistoryLength: orderHistory.length
@@ -25566,6 +25601,12 @@ app.post('/api/customers', authenticateToken, async (req, res) => {
         email: email || customerData.email,
         city: city || customerData.city,
         dob: dob || customerData.dob,
+        address: address || customerData.address || null,
+        locality: locality || customerData.locality || null,
+        anniversary: anniversary || customerData.anniversary || null,
+        gstNumber: gstNumber || customerData.gstNumber || null,
+        source: source || customerData.source || null,
+        doNotContact: doNotContact !== undefined ? doNotContact : (customerData.doNotContact || false),
         orderHistory: [...(customerData.orderHistory || []), ...orderHistory.map(order => ({
           ...order,
           invoiceId: order.invoiceId || null,
@@ -25598,6 +25639,12 @@ app.post('/api/customers', authenticateToken, async (req, res) => {
         email: email || null,
         city: city || null,
         dob: dob || null,
+        address: address || null,
+        locality: locality || null,
+        anniversary: anniversary || null,
+        gstNumber: gstNumber || null,
+        source: source || null,
+        doNotContact: doNotContact || false,
         restaurantId,
         orderHistory: (orderHistory || []).map(order => ({
           ...order,
@@ -25837,6 +25884,162 @@ app.delete('/api/customers/:customerId', authenticateToken, async (req, res) => 
   } catch (error) {
     console.error('Delete customer error:', error);
     res.status(500).json({ error: 'Failed to delete customer' });
+  }
+});
+
+// Bulk import customers from XLS/CSV
+app.post('/api/customers/bulk-import', authenticateToken, async (req, res) => {
+  try {
+    if (!(await checkFeaturePermission(req, 'customers', 'add'))) {
+      return res.status(403).json({ error: 'Access denied. Customers add permission required.' });
+    }
+    const { userId } = req.user;
+    const { restaurantId, customers } = req.body;
+
+    if (!restaurantId) {
+      return res.status(400).json({ error: 'Restaurant ID is required' });
+    }
+    if (!Array.isArray(customers) || customers.length === 0) {
+      return res.status(400).json({ error: 'customers array is required' });
+    }
+    if (customers.length > 200) {
+      return res.status(400).json({ error: 'Maximum 200 customers per batch' });
+    }
+
+    // Verify user has access to this restaurant
+    const userDoc = await db.collection(collections.users).doc(userId).get();
+    const userData = userDoc.data();
+    if (!['owner', 'admin'].includes(userData.role)) {
+      return res.status(403).json({ error: 'Only admin or owner can bulk import customers.' });
+    }
+    let hasAccess = userData.restaurantId === restaurantId;
+    if (!hasAccess) {
+      const restDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
+      if (restDoc.exists && restDoc.data().ownerId === userId) hasAccess = true;
+    }
+    if (!hasAccess) {
+      return res.status(403).json({ error: 'Access denied to this restaurant' });
+    }
+
+    // Normalize phone helper
+    const normalizePhone = (phone) => {
+      if (phone === null || phone === undefined || phone === '') return null;
+      const digits = String(phone).replace(/\D/g, '');
+      if (digits.length === 12 && digits.startsWith('91')) return digits.substring(2);
+      if (digits.length === 10) return digits;
+      if (digits.length === 11 && digits.startsWith('0')) return digits.substring(1);
+      return digits;
+    };
+
+    // Collect all phones from the batch and normalize
+    const batchPhones = customers
+      .map(c => normalizePhone(c.phone))
+      .filter(p => p && p.length >= 10);
+
+    // Query existing customers by phone (Firestore where-in limit is 30)
+    const existingMap = new Map(); // normalizedPhone -> docRef + data
+    for (let i = 0; i < batchPhones.length; i += 30) {
+      const chunk = batchPhones.slice(i, i + 30);
+      if (chunk.length === 0) continue;
+      // Query by exact phone
+      const snap = await db.collection(collections.customers)
+        .where('restaurantId', '==', restaurantId)
+        .where('phone', 'in', chunk)
+        .get();
+      snap.docs.forEach(doc => {
+        const np = normalizePhone(doc.data().phone);
+        if (np) existingMap.set(np, { ref: doc.ref, data: doc.data() });
+      });
+    }
+
+    // Also check with +91 prefix variants if not found
+    const missingPhones = batchPhones.filter(p => !existingMap.has(p));
+    if (missingPhones.length > 0) {
+      const prefixedPhones = missingPhones.map(p => '91' + p);
+      for (let i = 0; i < prefixedPhones.length; i += 30) {
+        const chunk = prefixedPhones.slice(i, i + 30);
+        if (chunk.length === 0) continue;
+        const snap = await db.collection(collections.customers)
+          .where('restaurantId', '==', restaurantId)
+          .where('phone', 'in', chunk)
+          .get();
+        snap.docs.forEach(doc => {
+          const np = normalizePhone(doc.data().phone);
+          if (np) existingMap.set(np, { ref: doc.ref, data: doc.data() });
+        });
+      }
+    }
+
+    let created = 0, updated = 0, skipped = 0;
+    const errors = [];
+    const batch = db.batch();
+
+    for (let idx = 0; idx < customers.length; idx++) {
+      const c = customers[idx];
+      const np = normalizePhone(c.phone);
+      if (!np || np.length < 10) {
+        skipped++;
+        errors.push({ row: idx, phone: c.phone || '', error: 'Invalid or missing phone number' });
+        continue;
+      }
+
+      const existing = existingMap.get(np);
+      if (existing) {
+        // Update — merge new fields, don't overwrite existing non-null fields
+        const updates = { updatedAt: new Date() };
+        if (c.name && !existing.data.name) updates.name = c.name;
+        if (c.email && !existing.data.email) updates.email = c.email;
+        if (c.city && !existing.data.city) updates.city = c.city;
+        if (c.dob && !existing.data.dob) updates.dob = c.dob;
+        if (c.address && !existing.data.address) updates.address = c.address;
+        if (c.locality && !existing.data.locality) updates.locality = c.locality;
+        if (c.anniversary && !existing.data.anniversary) updates.anniversary = c.anniversary;
+        if (c.gstNumber && !existing.data.gstNumber) updates.gstNumber = c.gstNumber;
+        if (c.source && !existing.data.source) updates.source = c.source;
+        if (c.doNotContact !== undefined && c.doNotContact !== null) updates.doNotContact = c.doNotContact;
+        batch.update(existing.ref, updates);
+        updated++;
+      } else {
+        // Create new customer
+        const newRef = db.collection(collections.customers).doc();
+        batch.set(newRef, {
+          name: c.name || null,
+          phone: np,
+          email: c.email || null,
+          city: c.city || null,
+          dob: c.dob || null,
+          address: c.address || null,
+          locality: c.locality || null,
+          anniversary: c.anniversary || null,
+          gstNumber: c.gstNumber || null,
+          source: c.source || 'Import',
+          doNotContact: c.doNotContact || false,
+          restaurantId,
+          orderHistory: [],
+          totalOrders: 0,
+          totalSpent: 0,
+          lastOrderDate: null,
+          createdAt: c.createdAt ? new Date(c.createdAt) : new Date(),
+          updatedAt: new Date(),
+        });
+        // Mark this phone as now existing to handle duplicates within same batch
+        existingMap.set(np, { ref: newRef, data: { phone: np } });
+        created++;
+      }
+    }
+
+    await batch.commit();
+
+    res.json({
+      created,
+      updated,
+      skipped,
+      errors,
+      total: customers.length,
+    });
+  } catch (error) {
+    console.error('Bulk import customers error:', error);
+    res.status(500).json({ error: 'Failed to bulk import customers' });
   }
 });
 
