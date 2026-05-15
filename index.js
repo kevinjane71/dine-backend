@@ -21142,7 +21142,7 @@ app.post('/api/inventory/:restaurantId/confirm-leftover-waste', authenticateToke
 // ══════════════════════════════════════════════════════════════
 // SMART IMPORT — Parse text/image → create inventory + menu + recipes
 // ══════════════════════════════════════════════════════════════
-app.post('/api/inventory/:restaurantId/smart-import/parse', authenticateToken, aiUsageLimiter.middleware(), upload.fields([{ name: 'image', maxCount: 3 }, { name: 'file', maxCount: 1 }]), async (req, res) => {
+app.post('/api/inventory/:restaurantId/smart-import/parse', authenticateToken, aiUsageLimiter.middleware(), upload.fields([{ name: 'image', maxCount: 4 }, { name: 'file', maxCount: 1 }]), async (req, res) => {
   try {
     const { restaurantId } = req.params;
     const { text, mode } = req.body;
@@ -21150,6 +21150,15 @@ app.post('/api/inventory/:restaurantId/smart-import/parse', authenticateToken, a
     const imageFiles = fileFields.image || [];
     const spreadsheetFile = (fileFields.file || [])[0] || null;
     const imageFile = imageFiles.length > 0 ? imageFiles[0] : null;
+
+    // Enforce max 20MB per image
+    const MAX_IMAGE_SIZE = 20 * 1024 * 1024;
+    for (const img of imageFiles) {
+      if (img.size > MAX_IMAGE_SIZE) {
+        return res.status(400).json({ error: `Image "${img.originalname}" exceeds 20MB limit (${(img.size / 1024 / 1024).toFixed(1)}MB)` });
+      }
+    }
+
     const isFileMode = mode === 'file' && spreadsheetFile;
     const isInvoiceMode = !isFileMode && (mode === 'invoice' || (imageFile && !text));
 
