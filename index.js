@@ -21142,16 +21142,164 @@ app.post('/api/inventory/:restaurantId/confirm-leftover-waste', authenticateToke
 // ══════════════════════════════════════════════════════════════
 // SMART IMPORT — Parse text/image → create inventory + menu + recipes
 // ══════════════════════════════════════════════════════════════
-app.post('/api/inventory/:restaurantId/smart-import/parse', authenticateToken, aiUsageLimiter.middleware(), upload.array('image', 2), async (req, res) => {
+app.post('/api/inventory/:restaurantId/smart-import/parse', authenticateToken, aiUsageLimiter.middleware(), upload.any(), async (req, res) => {
   try {
     const { restaurantId } = req.params;
     const { text, mode } = req.body;
-    const imageFiles = req.files || [];
+    const allFiles = req.files || [];
+    const imageFiles = allFiles.filter(f => f.fieldname === 'image');
+    const spreadsheetFile = allFiles.find(f => f.fieldname === 'file');
     const imageFile = imageFiles.length > 0 ? imageFiles[0] : null;
-    const isInvoiceMode = mode === 'invoice' || (imageFile && !text);
+    const isFileMode = mode === 'file' && spreadsheetFile;
+    const isInvoiceMode = !isFileMode && (mode === 'invoice' || (imageFile && !text));
+
+    // ── FILE MODE: parse spreadsheet (CSV/XLS/XLSX) directly without AI ──
+    if (isFileMode) {
+      const XLSX = require('xlsx');
+      const workbook = XLSX.read(spreadsheetFile.buffer, { type: 'buffer' });
+      const sheet = workbook.Sheets[workbook.SheetNames[0]];
+      const raw = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: '' });
+
+      // Load existing inventory for duplicate detection
+      const existingInvSnap = await db.collection(collections.inventory)
+        .where('restaurantId', '==', restaurantId).get();
+      const existingInventory = [];
+      existingInvSnap.forEach(doc => existingInventory.push({ id: doc.id, ...doc.data() }));
+
+      // Auto-detect format: recipe layout vs flat inventory table
+      const flatStr = JSON.stringify(raw.slice(0, 3)).toLowerCase();
+      const hasRecipeMarker = raw.some(row => row.some(cell => /^recipe\s*name$/i.test(String(cell || '').trim())));
+      const hasFlatHeaders = /\b(name|item.?name)\b/.test(flatStr) && (/\bunit\b/.test(flatStr) || /\bcategory\b/.test(flatStr) || /\bstock\b/.test(flatStr) || /\bcost\b/.test(flatStr));
+
+      let inventoryItems = [];
+      let recipes = [];
+
+      if (hasRecipeMarker && !hasFlatHeaders) {
+        // ── RECIPE LAYOUT: multi-column side-by-side recipes ──
+        // Scan for all "Recipe Name" cells to detect recipe block positions
+        const recipeBlocks = [];
+        for (let r = 0; r < raw.length; r++) {
+          for (let c = 0; c < (raw[r] || []).length; c++) {
+            if (/^recipe\s*name$/i.test(String(raw[r][c] || '').trim())) {
+              recipeBlocks.push({ row: r, col: c });
+            }
+          }
+        }
+
+        const ingredientMap = {}; // track unique ingredients
+
+        for (const block of recipeBlocks) {
+          const { row: startRow, col } = block;
+          const recipeName = String(raw[startRow]?.[col + 1] || '').trim();
+          if (!recipeName) continue;
+
+          // Row after Recipe Name should be Serving Size
+          let servingSize = 1;
+          const row1Label = String(raw[startRow + 1]?.[col] || '').trim().toLowerCase();
+          if (/serving/i.test(row1Label)) {
+            servingSize = parseFloat(raw[startRow + 1]?.[col + 1]) || 1;
+          }
+
+          // Find ingredient start (row with "Ingredients" / "Ingidients" header)
+          let ingStartRow = startRow + 2;
+          const row2Label = String(raw[startRow + 2]?.[col] || '').trim().toLowerCase();
+          if (/ingr[ei]dient|qty/i.test(row2Label)) {
+            ingStartRow = startRow + 3; // skip header row
+          }
+
+          // Extract unit from header if present (e.g., "Qty used (g)")
+          const qtyHeader = String(raw[startRow + 2]?.[col + 1] || '').trim();
+          const unitMatch = qtyHeader.match(/\((\w+)\)/);
+          const defaultUnit = unitMatch ? unitMatch[1] : 'g';
+
+          // Read ingredient rows until we hit an empty name or another "Recipe Name"
+          const ingredients = [];
+          for (let r = ingStartRow; r < raw.length; r++) {
+            const ingName = String(raw[r]?.[col] || '').trim();
+            if (!ingName) break;
+            if (/^recipe\s*name$/i.test(ingName)) break;
+
+            const qty = parseFloat(raw[r]?.[col + 1]) || 0;
+            if (qty <= 0) continue;
+
+            ingredients.push({ itemName: ingName, qty, unit: defaultUnit });
+            ingredientMap[ingName.toLowerCase()] = { name: ingName, unit: defaultUnit };
+          }
+
+          if (ingredients.length > 0) {
+            recipes.push({
+              menuItemName: recipeName,
+              servings: servingSize,
+              category: 'General',
+              ingredients,
+              instructions: '',
+            });
+          }
+        }
+
+        // Build inventory items from unique ingredients
+        inventoryItems = Object.values(ingredientMap).map(ing => ({
+          name: ing.name,
+          unit: ing.unit,
+          category: 'General',
+          costPerUnit: 0,
+          quantity: 0,
+          totalCost: 0,
+          isNew: true,
+          isDuplicate: existingInventory.some(e => e.name.toLowerCase() === ing.name.toLowerCase()),
+          existingId: existingInventory.find(e => e.name.toLowerCase() === ing.name.toLowerCase())?.id || null,
+        }));
+        // Mark duplicates as not new
+        inventoryItems.forEach(item => { if (item.isDuplicate) item.isNew = false; });
+
+      } else {
+        // ── FLAT INVENTORY TABLE: columns like Name, Unit, Category, Stock, Cost ──
+        const headers = (raw[0] || []).map(h => String(h || '').trim().toLowerCase());
+        const findCol = (...patterns) => headers.findIndex(h => patterns.some(p => p.test(h)));
+
+        const nameIdx = findCol(/^(name|item.?name|ingredient|product)$/i);
+        const unitIdx = findCol(/^unit$/i);
+        const catIdx = findCol(/^(category|cat|type|group)$/i);
+        const stockIdx = findCol(/^(stock|current.?stock|qty|quantity|opening.?stock)$/i);
+        const costIdx = findCol(/^(cost|cost.?per.?unit|price|rate|unit.?price|unit.?cost)$/i);
+        const minIdx = findCol(/^(min.?stock|minimum|reorder)$/i);
+        const maxIdx = findCol(/^(max.?stock|maximum)$/i);
+
+        if (nameIdx === -1) {
+          return res.status(400).json({ error: 'Could not detect a "Name" column in the spreadsheet. Please ensure the first row has column headers.' });
+        }
+
+        for (let r = 1; r < raw.length; r++) {
+          const row = raw[r] || [];
+          const name = String(row[nameIdx] || '').trim();
+          if (!name) continue;
+
+          inventoryItems.push({
+            name,
+            unit: unitIdx >= 0 ? String(row[unitIdx] || 'pcs').trim() : 'pcs',
+            category: catIdx >= 0 ? String(row[catIdx] || 'General').trim() : 'General',
+            costPerUnit: costIdx >= 0 ? (parseFloat(row[costIdx]) || 0) : 0,
+            quantity: stockIdx >= 0 ? (parseFloat(row[stockIdx]) || 0) : 0,
+            totalCost: 0,
+            minStock: minIdx >= 0 ? (parseFloat(row[minIdx]) || 0) : 0,
+            maxStock: maxIdx >= 0 ? (parseFloat(row[maxIdx]) || 0) : 0,
+            isNew: true,
+            isDuplicate: existingInventory.some(e => e.name.toLowerCase() === name.toLowerCase()),
+            existingId: existingInventory.find(e => e.name.toLowerCase() === name.toLowerCase())?.id || null,
+          });
+        }
+        inventoryItems.forEach(item => { if (item.isDuplicate) item.isNew = false; });
+      }
+
+      console.log(`📁 File import parsed: ${inventoryItems.length} inventory items, ${recipes.length} recipes`);
+      return res.json({
+        success: true,
+        data: { inventoryItems, recipes, menuCategories: [], menuItems: [] }
+      });
+    }
 
     if (!text && !imageFile) {
-      return res.status(400).json({ error: 'Either text or image is required' });
+      return res.status(400).json({ error: 'Either text, image, or file is required' });
     }
 
     // Load existing inventory items and menu for duplicate detection
