@@ -21142,13 +21142,13 @@ app.post('/api/inventory/:restaurantId/confirm-leftover-waste', authenticateToke
 // ══════════════════════════════════════════════════════════════
 // SMART IMPORT — Parse text/image → create inventory + menu + recipes
 // ══════════════════════════════════════════════════════════════
-app.post('/api/inventory/:restaurantId/smart-import/parse', authenticateToken, aiUsageLimiter.middleware(), upload.any(), async (req, res) => {
+app.post('/api/inventory/:restaurantId/smart-import/parse', authenticateToken, aiUsageLimiter.middleware(), upload.fields([{ name: 'image', maxCount: 3 }, { name: 'file', maxCount: 1 }]), async (req, res) => {
   try {
     const { restaurantId } = req.params;
     const { text, mode } = req.body;
-    const allFiles = req.files || [];
-    const imageFiles = allFiles.filter(f => f.fieldname === 'image');
-    const spreadsheetFile = allFiles.find(f => f.fieldname === 'file');
+    const fileFields = req.files || {};
+    const imageFiles = fileFields.image || [];
+    const spreadsheetFile = (fileFields.file || [])[0] || null;
     const imageFile = imageFiles.length > 0 ? imageFiles[0] : null;
     const isFileMode = mode === 'file' && spreadsheetFile;
     const isInvoiceMode = !isFileMode && (mode === 'invoice' || (imageFile && !text));
