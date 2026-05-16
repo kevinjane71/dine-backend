@@ -9321,8 +9321,10 @@ app.post('/api/orders', async (req, res) => {
     }
 
     // Track partial payment in customer credit
+    // Use orderData.finalAmount (may have been overridden by POS billing values) instead of local finalAmount
     if (req.body.partialPayAmount && customerId) {
-      const outstanding = Math.round((finalAmount - Number(req.body.partialPayAmount)) * 100) / 100;
+      const creditFinalAmount = orderData.finalAmount || finalAmount;
+      const outstanding = Math.round((creditFinalAmount - Number(req.body.partialPayAmount)) * 100) / 100;
       if (outstanding > 0) {
         db.collection('customers').doc(customerId).update({
           outstandingBalance: FieldValue.increment(outstanding),
@@ -9330,7 +9332,7 @@ app.post('/api/orders', async (req, res) => {
             orderId: orderRef.id,
             orderNumber: orderNumber,
             date: new Date().toISOString(),
-            totalAmount: Math.round(finalAmount * 100) / 100,
+            totalAmount: Math.round(creditFinalAmount * 100) / 100,
             paidAmount: Math.round(Number(req.body.partialPayAmount) * 100) / 100,
             outstandingAmount: outstanding
           })
@@ -25944,6 +25946,147 @@ app.get('/api/customers/:restaurantId', authenticateToken, async (req, res) => {
   } catch (error) {
     console.error('Get customers error:', error);
     res.status(500).json({ error: 'Failed to fetch customers' });
+  }
+});
+
+// Customer Reports - aggregated stats with cross-restaurant support
+app.get('/api/customers/reports', authenticateToken, async (req, res) => {
+  try {
+    const { userId } = req.user;
+    const restaurantIds = (req.query.restaurantIds || '').split(',').filter(Boolean);
+    const period = req.query.period || 'all';
+    const topLimit = Math.min(50, parseInt(req.query.limit) || 20);
+
+    if (!restaurantIds.length) {
+      return res.status(400).json({ error: 'restaurantIds query parameter is required' });
+    }
+
+    // Verify ownership for all requested restaurants
+    const restaurantDocs = await Promise.all(
+      restaurantIds.map(id => db.collection(collections.restaurants).doc(id).get())
+    );
+    const restaurantNames = {};
+    for (const doc of restaurantDocs) {
+      if (!doc.exists || doc.data().ownerId !== userId) {
+        return res.status(403).json({ error: 'Access denied to one or more restaurants' });
+      }
+      restaurantNames[doc.id] = doc.data().name || 'Unknown';
+    }
+
+    // Build date filter
+    const now = new Date();
+    let dateFilter = null;
+    switch (period) {
+      case 'this_week': {
+        const start = new Date(now);
+        const day = start.getDay();
+        start.setDate(start.getDate() - (day === 0 ? 6 : day - 1)); // Monday
+        start.setHours(0, 0, 0, 0);
+        dateFilter = { start, end: now };
+        break;
+      }
+      case 'this_month': {
+        dateFilter = { start: new Date(now.getFullYear(), now.getMonth(), 1), end: now };
+        break;
+      }
+      case 'last_month': {
+        const start = new Date(now.getFullYear(), now.getMonth() - 1, 1);
+        const end = new Date(now.getFullYear(), now.getMonth(), 0, 23, 59, 59, 999);
+        dateFilter = { start, end };
+        break;
+      }
+      default: break; // 'all' - no filter
+    }
+
+    // Fetch customers for all restaurants in parallel (cap 5000 per restaurant)
+    const allCustomers = [];
+    await Promise.all(restaurantIds.map(async (rid) => {
+      const snap = await db.collection(collections.customers)
+        .where('restaurantId', '==', rid)
+        .limit(5000)
+        .get();
+      snap.forEach(doc => {
+        allCustomers.push({ id: doc.id, ...doc.data() });
+      });
+    }));
+
+    // Compute per-customer stats from orderHistory
+    const customerStats = allCustomers.map(c => {
+      const orders = (c.orderHistory || []).filter(o => {
+        if (!dateFilter) return true;
+        const d = o.orderDate && o.orderDate.toDate ? o.orderDate.toDate() : new Date(o.orderDate);
+        return d >= dateFilter.start && d <= dateFilter.end;
+      });
+
+      const totalDiscount = orders.reduce((sum, o) => {
+        const disc = o.totalDiscountAmount || ((o.discountAmount || 0) + (o.manualDiscount || 0) + (o.loyaltyDiscount || 0) + (o.couponDiscount || 0));
+        return sum + disc;
+      }, 0);
+      const totalSpent = orders.reduce((sum, o) => sum + (o.finalAmount || o.totalAmount || 0), 0);
+
+      return {
+        id: c.id,
+        name: c.name || '',
+        phone: c.phone || '',
+        email: c.email || '',
+        restaurantId: c.restaurantId,
+        restaurantName: restaurantNames[c.restaurantId] || '',
+        totalDiscount: Math.round(totalDiscount * 100) / 100,
+        totalSpent: Math.round(totalSpent * 100) / 100,
+        orderCount: orders.length,
+        loyaltyPoints: c.loyaltyPoints || 0,
+      };
+    });
+
+    // Summary
+    const summary = {
+      totalCustomers: customerStats.length,
+      totalRevenue: Math.round(customerStats.reduce((s, c) => s + c.totalSpent, 0) * 100) / 100,
+      totalDiscounts: Math.round(customerStats.reduce((s, c) => s + c.totalDiscount, 0) * 100) / 100,
+      totalOrders: customerStats.reduce((s, c) => s + c.orderCount, 0),
+      avgOrderValue: 0,
+    };
+    const totalOrd = summary.totalOrders;
+    summary.avgOrderValue = totalOrd > 0 ? Math.round((summary.totalRevenue / totalOrd) * 100) / 100 : 0;
+
+    // Top lists
+    const topByDiscount = [...customerStats].filter(c => c.totalDiscount > 0).sort((a, b) => b.totalDiscount - a.totalDiscount).slice(0, topLimit);
+    const topBySpending = [...customerStats].filter(c => c.totalSpent > 0).sort((a, b) => b.totalSpent - a.totalSpent).slice(0, topLimit);
+    const topByOrders = [...customerStats].filter(c => c.orderCount > 0).sort((a, b) => b.orderCount - a.orderCount).slice(0, topLimit);
+
+    // Group stats
+    const groupStats = [];
+    await Promise.all(restaurantIds.map(async (rid) => {
+      const snap = await db.collection('customerGroups')
+        .where('restaurantId', '==', rid)
+        .get();
+      snap.forEach(doc => {
+        const g = doc.data();
+        const memberIds = g.customerIds || [];
+        const memberPhones = g.customerPhones || [];
+        const members = customerStats.filter(c =>
+          c.restaurantId === rid && (memberIds.includes(c.id) || memberPhones.includes(c.phone))
+        );
+        groupStats.push({
+          groupId: doc.id,
+          groupName: g.name || '',
+          color: g.color || '#6b7280',
+          restaurantId: rid,
+          restaurantName: restaurantNames[rid] || '',
+          memberCount: members.length,
+          totalRevenue: Math.round(members.reduce((s, m) => s + m.totalSpent, 0) * 100) / 100,
+          totalDiscount: Math.round(members.reduce((s, m) => s + m.totalDiscount, 0) * 100) / 100,
+          avgSpending: members.length > 0
+            ? Math.round((members.reduce((s, m) => s + m.totalSpent, 0) / members.length) * 100) / 100 : 0,
+          totalOrders: members.reduce((s, m) => s + m.orderCount, 0),
+        });
+      });
+    }));
+
+    res.json({ summary, topByDiscount, topBySpending, topByOrders, groupStats, period });
+  } catch (error) {
+    console.error('Customer reports error:', error);
+    res.status(500).json({ error: 'Failed to generate customer reports' });
   }
 });
 
