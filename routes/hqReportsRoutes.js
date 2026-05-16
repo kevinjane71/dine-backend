@@ -86,6 +86,114 @@ function getOrderRevenue(order) {
   return Number(order.totalAmount) || Number(order.total) || 0;
 }
 
+// ─── Helper: Parse restaurantIds filter from query params ────────────────────
+function parseRestaurantIds(req) {
+  const ids = req.query.restaurantIds || req.query['restaurantIds[]'];
+  if (!ids) return [];
+  return Array.isArray(ids) ? ids : [ids];
+}
+
+// ─── Helper: Filter outlets by restaurantIds (empty = no filter) ─────────────
+function filterOutlets(outlets, restaurantIds) {
+  if (!restaurantIds || restaurantIds.length === 0) return outlets;
+  const idSet = new Set(restaurantIds);
+  return outlets.filter(o => idSet.has(o.id));
+}
+
+// ═══════════════════════════════════════════════
+//  0. GET /:orgId/summaries
+//     Lightweight preview data for all report cards
+// ═══════════════════════════════════════════════
+router.get('/:orgId/summaries', ...reportMiddleware, async (req, res) => {
+  try {
+    const { orgId } = req.params;
+    const { startDate, endDate } = parseDateRange(req.query);
+    const outlets = filterOutlets(await getOrgOutlets(orgId), parseRestaurantIds(req));
+    const round = v => Math.round(v * 100) / 100;
+
+    let totalRevenue = 0, totalOrders = 0, totalExpenses = 0;
+    let totalDiscount = 0, totalTax = 0;
+    const paymentMethods = {};
+    const categories = {};
+
+    // Single pass: fetch all outlet orders + expenses in parallel
+    const results = await Promise.all(outlets.map(async (outlet) => {
+      const [orders, expenses] = await Promise.all([
+        getOutletOrders(outlet.id, startDate, endDate),
+        getOutletExpenses(outlet.id, startDate, endDate)
+      ]);
+      return { outlet, orders, expenses };
+    }));
+
+    results.forEach(({ orders, expenses }) => {
+      totalRevenue += orders.reduce((s, o) => s + getOrderRevenue(o), 0);
+      totalOrders += orders.length;
+      totalExpenses += expenses.reduce((s, e) => s + (Number(e.amount) || 0), 0);
+
+      orders.forEach(order => {
+        totalDiscount += (Number(order.discountAmount) || 0) + (Number(order.manualDiscount) || 0) + (Number(order.loyaltyDiscount) || 0);
+        totalTax += (Number(order.taxAmount) || 0);
+
+        // Payment method tracking
+        const pm = (order.paymentMethod || 'cash').toLowerCase();
+        const bucket = ['upi', 'razorpay', 'phonepe', 'gpay', 'paytm'].includes(pm) ? 'UPI'
+          : ['card', 'credit_card', 'debit_card'].includes(pm) ? 'Card'
+          : pm === 'cash' ? 'Cash' : 'Other';
+        paymentMethods[bucket] = (paymentMethods[bucket] || 0) + 1;
+
+        // Category tracking
+        (order.items || order.cartItems || []).forEach(item => {
+          const cat = item.category || item.menuCategory || 'Uncategorized';
+          const qty = Number(item.quantity) || Number(item.qty) || 1;
+          const rev = qty * (Number(item.price) || Number(item.itemPrice) || 0);
+          if (!categories[cat]) categories[cat] = { revenue: 0, count: 0 };
+          categories[cat].revenue += rev;
+          categories[cat].count += qty;
+        });
+      });
+    });
+
+    // Low stock count across all outlets
+    let lowStockCount = 0;
+    const inventoryPromises = outlets.map(outlet =>
+      db.collection(collections.inventory || 'inventory')
+        .where('restaurantId', '==', outlet.id)
+        .get()
+    );
+    const inventoryResults = await Promise.all(inventoryPromises);
+    inventoryResults.forEach(snap => {
+      snap.forEach(doc => {
+        const d = doc.data();
+        const current = Number(d.currentStock) || Number(d.quantity) || 0;
+        const min = Number(d.minStock) || Number(d.reorderLevel) || Number(d.reorderPoint) || 0;
+        if (current <= 0 || (min > 0 && current <= min)) lowStockCount++;
+      });
+    });
+
+    const grossProfit = totalRevenue - totalExpenses;
+    const topPayment = Object.entries(paymentMethods).sort((a, b) => b[1] - a[1])[0];
+    const topCategory = Object.entries(categories).sort((a, b) => b[1].revenue - a[1].revenue)[0];
+
+    res.json({
+      success: true,
+      summaries: {
+        sales: { revenue: round(totalRevenue), orders: totalOrders },
+        pl: { profit: round(grossProfit), margin: totalRevenue > 0 ? round((grossProfit / totalRevenue) * 100) : 0 },
+        inventory: { lowStock: lowStockCount },
+        category: { topCategory: topCategory ? topCategory[0] : null, topCategoryRevenue: topCategory ? round(topCategory[1].revenue) : 0 },
+        discount: { totalDiscount: round(totalDiscount) },
+        tax: { totalTax: round(totalTax) },
+        payment: { topMethod: topPayment ? topPayment[0] : null, topMethodCount: topPayment ? topPayment[1] : 0 },
+        'order-analytics': { orders: totalOrders, avgValue: totalOrders > 0 ? round(totalRevenue / totalOrders) : 0 },
+        'revenue-trends': { revenue: round(totalRevenue), orders: totalOrders },
+      }
+    });
+  } catch (error) {
+    console.error('Report summaries error:', error);
+    res.status(500).json({ success: false, error: 'Failed to fetch report summaries' });
+  }
+});
+
 // ═══════════════════════════════════════════════
 //  1. GET /:orgId/inventory-comparison
 //     Cross-outlet inventory comparison matrix
@@ -93,7 +201,7 @@ function getOrderRevenue(order) {
 router.get('/:orgId/inventory-comparison', ...reportMiddleware, async (req, res) => {
   try {
     const { orgId } = req.params;
-    const outlets = await getOrgOutlets(orgId);
+    const outlets = filterOutlets(await getOrgOutlets(orgId), parseRestaurantIds(req));
 
     if (outlets.length === 0) {
       return res.json({ success: true, outlets: [], items: [], matrix: [] });
@@ -191,7 +299,7 @@ router.get('/:orgId/consolidated-pl', ...reportMiddleware, async (req, res) => {
   try {
     const { orgId } = req.params;
     const { startDate, endDate } = parseDateRange(req.query);
-    const outlets = await getOrgOutlets(orgId);
+    const outlets = filterOutlets(await getOrgOutlets(orgId), parseRestaurantIds(req));
 
     if (outlets.length === 0) {
       return res.json({
@@ -316,7 +424,7 @@ router.get('/:orgId/kitchen-reports', ...reportMiddleware, async (req, res) => {
     const recipeBreakdown = Object.values(recipeMap).sort((a, b) => b.totalProducedQty - a.totalProducedQty);
 
     // Query waste entries for this org in date range
-    const outlets = await getOrgOutlets(orgId);
+    const outlets = filterOutlets(await getOrgOutlets(orgId), parseRestaurantIds(req));
     let totalWasteEntries = 0;
     let totalWasteQty = 0;
     let totalWasteCost = 0;
@@ -497,7 +605,7 @@ router.get('/:orgId/warehouse-metrics', ...reportMiddleware, async (req, res) =>
 router.get('/:orgId/indent-tracking', ...reportMiddleware, async (req, res) => {
   try {
     const { orgId } = req.params;
-    const outlets = await getOrgOutlets(orgId);
+    const outlets = filterOutlets(await getOrgOutlets(orgId), parseRestaurantIds(req));
     const outletMap = {};
     outlets.forEach(o => { outletMap[o.id] = o.name; });
 
@@ -569,7 +677,7 @@ router.get('/:orgId/menu-performance', ...reportMiddleware, async (req, res) => 
   try {
     const { orgId } = req.params;
     const { startDate, endDate } = parseDateRange(req.query);
-    const outlets = await getOrgOutlets(orgId);
+    const outlets = filterOutlets(await getOrgOutlets(orgId), parseRestaurantIds(req));
 
     if (outlets.length === 0) {
       return res.json({ success: true, items: [], outlets: [] });
@@ -653,7 +761,7 @@ router.get('/:orgId/outlet-ranking', ...reportMiddleware, async (req, res) => {
   try {
     const { orgId } = req.params;
     const { startDate, endDate } = parseDateRange(req.query);
-    const outlets = await getOrgOutlets(orgId);
+    const outlets = filterOutlets(await getOrgOutlets(orgId), parseRestaurantIds(req));
 
     if (outlets.length === 0) {
       return res.json({
@@ -731,7 +839,7 @@ router.get('/:orgId/sales-summary', ...reportMiddleware, async (req, res) => {
   try {
     const { orgId } = req.params;
     const { startDate, endDate } = parseDateRange(req.query);
-    const outlets = await getOrgOutlets(orgId);
+    const outlets = filterOutlets(await getOrgOutlets(orgId), parseRestaurantIds(req));
 
     const paymentBuckets = { cash: { count: 0, amount: 0 }, card: { count: 0, amount: 0 }, upi: { count: 0, amount: 0 }, aggregator: { count: 0, amount: 0 }, other: { count: 0, amount: 0 } };
     const serviceBuckets = { dine_in: { count: 0, amount: 0 }, takeaway: { count: 0, amount: 0 }, delivery: { count: 0, amount: 0 }, aggregator: { count: 0, amount: 0 } };
@@ -836,7 +944,7 @@ router.get('/:orgId/staff-performance', ...reportMiddleware, async (req, res) =>
   try {
     const { orgId } = req.params;
     const { startDate, endDate } = parseDateRange(req.query);
-    const outlets = await getOrgOutlets(orgId);
+    const outlets = filterOutlets(await getOrgOutlets(orgId), parseRestaurantIds(req));
 
     const staffMap = {};
     const outletStaffMap = {};
@@ -870,12 +978,42 @@ router.get('/:orgId/staff-performance', ...reportMiddleware, async (req, res) =>
 
     await Promise.all(outletPromises);
 
+    // Enrich staff with role/designation from staffUsers collection
+    try {
+      const staffEnrichPromises = outlets.map(async (outlet) => {
+        const staffSnap = await db.collection(collections.staffUsers || 'staffUsers')
+          .where('restaurantId', '==', outlet.id)
+          .get();
+        staffSnap.forEach(doc => {
+          const data = doc.data();
+          const sid = doc.id;
+          if (staffMap[sid]) {
+            staffMap[sid].role = data.role || data.designation || data.position || '';
+          }
+          // Also try matching by name for staff who used different auth
+          const name = data.name || data.displayName || '';
+          if (name) {
+            Object.values(staffMap).forEach(s => {
+              if (!s.role && s.staffName && s.staffName.toLowerCase() === name.toLowerCase()) {
+                s.role = data.role || data.designation || data.position || '';
+              }
+            });
+          }
+        });
+      });
+      await Promise.all(staffEnrichPromises);
+    } catch (enrichErr) {
+      // Non-critical — continue without role data
+      console.warn('Staff role enrichment failed:', enrichErr.message);
+    }
+
     const round = v => Math.round(v * 100) / 100;
     const staffRankings = Object.values(staffMap)
       .filter(s => s.staffId !== 'unknown')
       .map(s => ({
         staffId: s.staffId,
         staffName: s.staffName,
+        role: s.role || '',
         ordersHandled: s.ordersHandled,
         totalSales: round(s.totalSales),
         avgTicketSize: s.ordersHandled > 0 ? round(s.totalSales / s.ordersHandled) : 0,
@@ -884,6 +1022,17 @@ router.get('/:orgId/staff-performance', ...reportMiddleware, async (req, res) =>
       }))
       .sort((a, b) => b.totalSales - a.totalSales)
       .map((s, idx) => ({ rank: idx + 1, ...s }));
+
+    // Build role breakdown summary
+    const roleMap = {};
+    staffRankings.forEach(s => {
+      const role = s.role || 'Other';
+      if (!roleMap[role]) roleMap[role] = { role, staffCount: 0, totalOrders: 0, totalSales: 0 };
+      roleMap[role].staffCount++;
+      roleMap[role].totalOrders += s.ordersHandled;
+      roleMap[role].totalSales += round(s.totalSales);
+    });
+    const roleBreakdown = Object.values(roleMap).sort((a, b) => b.totalSales - a.totalSales);
 
     const outletBreakdown = Object.values(outletStaffMap).map(o => ({
       outletId: o.outletId,
@@ -899,6 +1048,7 @@ router.get('/:orgId/staff-performance', ...reportMiddleware, async (req, res) =>
       endDate: endDate.toISOString(),
       totalStaff: staffRankings.length,
       staffRankings,
+      roleBreakdown,
       outletBreakdown,
     });
   } catch (error) {
@@ -915,7 +1065,7 @@ router.get('/:orgId/category-sales', ...reportMiddleware, async (req, res) => {
   try {
     const { orgId } = req.params;
     const { startDate, endDate } = parseDateRange(req.query);
-    const outlets = await getOrgOutlets(orgId);
+    const outlets = filterOutlets(await getOrgOutlets(orgId), parseRestaurantIds(req));
 
     const categoryMap = {};
 
@@ -984,7 +1134,7 @@ router.get('/:orgId/discount-report', ...reportMiddleware, async (req, res) => {
   try {
     const { orgId } = req.params;
     const { startDate, endDate } = parseDateRange(req.query);
-    const outlets = await getOrgOutlets(orgId);
+    const outlets = filterOutlets(await getOrgOutlets(orgId), parseRestaurantIds(req));
 
     let totalDiscountGiven = 0, discountedOrderCount = 0, nonDiscountedOrderCount = 0;
     let discountedRevenue = 0, nonDiscountedRevenue = 0;
@@ -1075,7 +1225,7 @@ router.get('/:orgId/tax-summary', ...reportMiddleware, async (req, res) => {
   try {
     const { orgId } = req.params;
     const { startDate, endDate } = parseDateRange(req.query);
-    const outlets = await getOrgOutlets(orgId);
+    const outlets = filterOutlets(await getOrgOutlets(orgId), parseRestaurantIds(req));
 
     let totalTaxCollected = 0, totalTaxableAmount = 0, totalNonTaxableOrders = 0, totalOrdersWithTax = 0;
     const taxTypeMap = {};
@@ -1176,7 +1326,7 @@ router.get('/:orgId/customer-insights', ...reportMiddleware, async (req, res) =>
   try {
     const { orgId } = req.params;
     const { startDate, endDate } = parseDateRange(req.query);
-    const outlets = await getOrgOutlets(orgId);
+    const outlets = filterOutlets(await getOrgOutlets(orgId), parseRestaurantIds(req));
 
     const customerMap = {};
     let anonymousOrders = 0;
@@ -1296,7 +1446,7 @@ router.get('/:orgId/export/:reportType', ...reportMiddleware, async (req, res) =
   try {
     const { orgId, reportType } = req.params;
     const { startDate, endDate } = parseDateRange(req.query);
-    const outlets = await getOrgOutlets(orgId);
+    const outlets = filterOutlets(await getOrgOutlets(orgId), parseRestaurantIds(req));
 
     let csvContent = '';
     let filename = '';
@@ -1734,7 +1884,7 @@ router.get('/:orgId/payment-analytics', ...reportMiddleware, async (req, res) =>
   try {
     const { orgId } = req.params;
     const { startDate, endDate } = parseDateRange(req.query);
-    const outlets = await getOrgOutlets(orgId);
+    const outlets = filterOutlets(await getOrgOutlets(orgId), parseRestaurantIds(req));
     const round = v => Math.round(v * 100) / 100;
 
     const methodMap = {};
@@ -1840,7 +1990,7 @@ router.get('/:orgId/order-analytics', ...reportMiddleware, async (req, res) => {
   try {
     const { orgId } = req.params;
     const { startDate, endDate } = parseDateRange(req.query);
-    const outlets = await getOrgOutlets(orgId);
+    const outlets = filterOutlets(await getOrgOutlets(orgId), parseRestaurantIds(req));
     const round = v => Math.round(v * 100) / 100;
 
     const typeMap = {};
@@ -1952,7 +2102,7 @@ router.get('/:orgId/revenue-trends', ...reportMiddleware, async (req, res) => {
   try {
     const { orgId } = req.params;
     const { startDate, endDate } = parseDateRange(req.query);
-    const outlets = await getOrgOutlets(orgId);
+    const outlets = filterOutlets(await getOrgOutlets(orgId), parseRestaurantIds(req));
     const round = v => Math.round(v * 100) / 100;
 
     // Calculate previous period (same duration before startDate)
@@ -2070,7 +2220,7 @@ router.get('/:orgId/wallet-loyalty', ...reportMiddleware, async (req, res) => {
   try {
     const { orgId } = req.params;
     const { startDate, endDate } = parseDateRange(req.query);
-    const outlets = await getOrgOutlets(orgId);
+    const outlets = filterOutlets(await getOrgOutlets(orgId), parseRestaurantIds(req));
     const round = v => Math.round(v * 100) / 100;
 
     let totalWalletRedeemed = 0;

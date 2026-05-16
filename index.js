@@ -3781,10 +3781,12 @@ app.post('/api/auth/email/login', async (req, res) => {
     }
 
     // Update last login
-    await userDoc.ref.update({
+    const emailLoginUpdate = {
       lastLogin: new Date(),
       updatedAt: new Date()
-    });
+    };
+    if (req.body.platform) emailLoginUpdate.lastLoginPlatform = req.body.platform;
+    await userDoc.ref.update(emailLoginUpdate);
 
     // Generate JWT token
     const token = jwt.sign(
@@ -4372,10 +4374,12 @@ app.post('/api/auth/google', async (req, res) => {
       
       // Update user with Google info - smart linking
       const updateData = {
+        lastLogin: new Date(),
         updatedAt: new Date(),
         picture: picture || userData.picture,
         googleUid: uid // Store Google UID for future reference
       };
+      if (req.body.platform) updateData.lastLoginPlatform = req.body.platform;
 
       // Ensure email is set (should already be set, but just in case)
       if (!userData.email) {
@@ -4944,10 +4948,13 @@ app.post('/api/auth/phone/verify-otp', async (req, res) => {
       const userData = userDoc.docs[0].data();
       userId = userDoc.docs[0].id;
       
-      await userDoc.docs[0].ref.update({
+      const otpUpdateData = {
         phoneVerified: true,
+        lastLogin: new Date(),
         updatedAt: new Date()
-      });
+      };
+      if (req.body.platform) otpUpdateData.lastLoginPlatform = req.body.platform;
+      await userDoc.docs[0].ref.update(otpUpdateData);
 
       // Check if owner has restaurants
       const restaurantsQuery = await db.collection(collections.restaurants)
@@ -5235,12 +5242,14 @@ app.post('/api/auth/pin/login', async (req, res) => {
     }
 
     // PIN verified - reset attempts, update lastLogin
-    await userDoc.ref.update({
+    const pinLoginUpdate = {
       pinAttempts: 0,
       pinLockedUntil: null,
       lastLogin: new Date(),
       updatedAt: new Date()
-    });
+    };
+    if (req.body.platform) pinLoginUpdate.lastLoginPlatform = req.body.platform;
+    await userDoc.ref.update(pinLoginUpdate);
 
     // Generate JWT token (same as phone verify-otp)
     const token = jwt.sign(
@@ -5607,11 +5616,13 @@ app.post('/api/auth/local-login', async (req, res) => {
       // Existing user login (same as OTP flow)
       const userData = userDoc.data();
       userId = userDoc.id;
-      
+
       // Update user with provided phone/email if not already set
       const updateData = {
+        lastLogin: new Date(),
         updatedAt: new Date()
       };
+      if (req.body.platform) updateData.lastLoginPlatform = req.body.platform;
       
       if (normalizedPhone && !userData.phone) {
         updateData.phone = normalizedPhone;
@@ -15707,10 +15718,12 @@ app.post('/api/auth/staff/login', async (req, res) => {
     }
 
     // Update last login
-    await staffDoc.ref.update({
+    const staffLoginUpdate = {
       lastLogin: new Date(),
       updatedAt: new Date()
-    });
+    };
+    if (req.body.platform) staffLoginUpdate.lastLoginPlatform = req.body.platform;
+    await staffDoc.ref.update(staffLoginUpdate);
 
     const token = jwt.sign(
       {

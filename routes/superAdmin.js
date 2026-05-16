@@ -1129,15 +1129,56 @@ router.get('/restaurants', authenticateSuperAdmin, async (req, res) => {
 });
 
 // ─── Orders Summary (paginated per-restaurant list) ──────────────────
+// Helper: get date strings for a period
+function getDateStringsForPeriod(period) {
+  const now = new Date();
+  const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+
+  if (period === 'yesterday') {
+    const y = new Date(today);
+    y.setDate(y.getDate() - 1);
+    return [formatDateStr(y)];
+  }
+  if (period === '7days') {
+    const dates = [];
+    for (let i = 0; i < 7; i++) {
+      const d = new Date(today);
+      d.setDate(d.getDate() - i);
+      dates.push(formatDateStr(d));
+    }
+    return dates;
+  }
+  // default: today
+  return [getTodayString()];
+}
+
+function formatDateStr(d) {
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, '0');
+  const day = String(d.getDate()).padStart(2, '0');
+  return `${y}-${m}-${day}`;
+}
+
 router.get('/orders/summary', authenticateSuperAdmin, async (req, res) => {
   try {
-    const todayStr = getTodayString();
+    const period = req.query.period || 'today'; // 'today' | 'yesterday' | '7days'
+    const dateStrings = getDateStringsForPeriod(period);
     const perRestLimit = parseLimit(req.query.limit);
 
     // dailyStats: one doc per restaurant per day — lightweight
-    const dailyStatsSnap = await db.collection('dailyStats')
-      .where('date', '==', todayStr)
-      .get();
+    // Firestore 'in' queries support up to 30 values, 7days = 7 values
+    let dailyStatsDocs = [];
+    if (dateStrings.length === 1) {
+      const snap = await db.collection('dailyStats')
+        .where('date', '==', dateStrings[0])
+        .get();
+      dailyStatsDocs = snap.docs;
+    } else {
+      const snap = await db.collection('dailyStats')
+        .where('date', 'in', dateStrings)
+        .get();
+      dailyStatsDocs = snap.docs;
+    }
 
     let totalOrders = 0;
     let totalRevenue = 0;
@@ -1145,7 +1186,7 @@ router.get('/orders/summary', authenticateSuperAdmin, async (req, res) => {
     const statsMap = {};
     const restaurantIds = new Set();
 
-    dailyStatsSnap.docs.forEach(doc => {
+    dailyStatsDocs.forEach(doc => {
       const data = doc.data();
       const orders = data.totalOrders || 0;
       const revenue = data.totalRevenue || 0;
@@ -1157,7 +1198,12 @@ router.get('/orders/summary', authenticateSuperAdmin, async (req, res) => {
 
       if (data.restaurantId) {
         restaurantIds.add(data.restaurantId);
-        statsMap[data.restaurantId] = { orders, revenue, revenueWithTax };
+        if (!statsMap[data.restaurantId]) {
+          statsMap[data.restaurantId] = { orders: 0, revenue: 0, revenueWithTax: 0 };
+        }
+        statsMap[data.restaurantId].orders += orders;
+        statsMap[data.restaurantId].revenue += revenue;
+        statsMap[data.restaurantId].revenueWithTax += revenueWithTax;
       }
     });
 
@@ -1181,6 +1227,8 @@ router.get('/orders/summary', authenticateSuperAdmin, async (req, res) => {
 
     res.json({
       success: true,
+      period,
+      dateRange: dateStrings.length === 1 ? dateStrings[0] : `${dateStrings[dateStrings.length - 1]} to ${dateStrings[0]}`,
       today: {
         totalOrders,
         totalRevenue: Math.round(totalRevenue * 100) / 100,
@@ -1194,6 +1242,94 @@ router.get('/orders/summary', authenticateSuperAdmin, async (req, res) => {
   } catch (error) {
     console.error('Super admin orders summary error:', error);
     res.status(500).json({ success: false, error: 'Failed to fetch orders summary' });
+  }
+});
+
+// ─── Activity: Logins ────────────────────────────────────────────────
+// GET /api/super-admin/activity/logins?period=today|yesterday|7days
+// Returns users (owners) who logged in during the period, with their restaurants
+router.get('/activity/logins', authenticateSuperAdmin, async (req, res) => {
+  try {
+    const period = req.query.period || 'today';
+    const now = new Date();
+    const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+
+    let startDate, endDate;
+    if (period === 'yesterday') {
+      startDate = new Date(today);
+      startDate.setDate(startDate.getDate() - 1);
+      endDate = new Date(today);
+    } else if (period === '7days') {
+      startDate = new Date(today);
+      startDate.setDate(startDate.getDate() - 7);
+      endDate = new Date(today);
+      endDate.setDate(endDate.getDate() + 1);
+    } else {
+      // today
+      startDate = new Date(today);
+      endDate = new Date(today);
+      endDate.setDate(endDate.getDate() + 1);
+    }
+
+    // Fetch users who logged in during the period
+    const usersSnap = await db.collection(collections.users)
+      .where('lastLogin', '>=', startDate)
+      .where('lastLogin', '<', endDate)
+      .orderBy('lastLogin', 'desc')
+      .limit(200)
+      .get();
+
+    // Collect owner IDs and fetch their restaurants
+    const ownerIds = [];
+    const usersData = [];
+    usersSnap.docs.forEach(doc => {
+      const data = doc.data();
+      usersData.push({ id: doc.id, ...data });
+      if (data.role === 'owner') ownerIds.push(doc.id);
+    });
+
+    // Fetch restaurants owned by these users
+    let restaurantMap = {};
+    if (ownerIds.length > 0) {
+      // Firestore 'in' supports up to 30 values; batch if needed
+      const batches = [];
+      for (let i = 0; i < ownerIds.length; i += 30) {
+        batches.push(ownerIds.slice(i, i + 30));
+      }
+      for (const batch of batches) {
+        const restSnap = await db.collection(collections.restaurants)
+          .where('ownerId', 'in', batch)
+          .get();
+        restSnap.docs.forEach(doc => {
+          const data = doc.data();
+          const ownerId = data.ownerId;
+          if (!restaurantMap[ownerId]) restaurantMap[ownerId] = [];
+          restaurantMap[ownerId].push({ id: doc.id, name: data.name || 'Unnamed' });
+        });
+      }
+    }
+
+    const logins = usersData.map(u => ({
+      userId: u.id,
+      name: u.name || '',
+      email: u.email || '',
+      phone: u.phone || '',
+      role: u.role || '',
+      provider: u.provider || '',
+      lastLogin: toISO(u.lastLogin),
+      lastLoginPlatform: u.lastLoginPlatform || null,
+      restaurants: restaurantMap[u.id] || [],
+    }));
+
+    res.json({
+      success: true,
+      period,
+      totalLogins: logins.length,
+      logins,
+    });
+  } catch (error) {
+    console.error('Super admin activity logins error:', error);
+    res.status(500).json({ success: false, error: 'Failed to fetch login activity' });
   }
 });
 

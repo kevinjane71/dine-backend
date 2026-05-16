@@ -312,6 +312,12 @@ router.get('/analytics', authenticateToken, requireOwnerRole, async (req, res) =
       }
     }
 
+    // Calculate previous period for comparison (same duration before current period)
+    const periodMs = dateEnd.getTime() - dateStart.getTime();
+    const prevDateStart = new Date(dateStart.getTime() - periodMs);
+    const prevDateEnd = new Date(dateStart.getTime() - 1);
+    prevDateEnd.setHours(23, 59, 59, 999);
+
     // Get restaurant details for names
     const restaurantDetailsPromises = restaurantIds.map(id =>
       db.collection(collections.restaurants).doc(id).get()
@@ -324,16 +330,23 @@ router.get('/analytics', authenticateToken, requireOwnerRole, async (req, res) =
       }
     });
 
-    // Fetch orders for all selected restaurants
-    const ordersPromises = restaurantIds.map(restaurantId =>
-      db.collection(collections.orders)
-        .where('restaurantId', '==', restaurantId)
-        .where('createdAt', '>=', dateStart)
-        .where('createdAt', '<=', dateEnd)
-        .get()
-    );
-
-    const ordersResults = await Promise.all(ordersPromises);
+    // Fetch current + previous period orders in parallel
+    const [ordersResults, prevOrdersResults] = await Promise.all([
+      Promise.all(restaurantIds.map(restaurantId =>
+        db.collection(collections.orders)
+          .where('restaurantId', '==', restaurantId)
+          .where('createdAt', '>=', dateStart)
+          .where('createdAt', '<=', dateEnd)
+          .get()
+      )),
+      Promise.all(restaurantIds.map(restaurantId =>
+        db.collection(collections.orders)
+          .where('restaurantId', '==', restaurantId)
+          .where('createdAt', '>=', prevDateStart)
+          .where('createdAt', '<=', prevDateEnd)
+          .get()
+      ))
+    ]);
 
     // Aggregate analytics
     let totalRevenue = 0;
@@ -376,6 +389,26 @@ router.get('/analytics', authenticateToken, requireOwnerRole, async (req, res) =
         });
       });
     });
+
+    // Aggregate previous period totals for comparison
+    let previousTotalRevenue = 0;
+    let previousTotalOrders = 0;
+    const prevAllOrders = [];
+
+    restaurantIds.forEach((restaurantId, index) => {
+      const prevOrders = prevOrdersResults[index].docs.filter(doc => !nonCountedStatuses.includes(doc.data().status));
+      previousTotalRevenue += prevOrders.reduce((sum, doc) => sum + (doc.data().totalAmount || 0), 0);
+      previousTotalOrders += prevOrders.length;
+      prevOrders.forEach(doc => {
+        prevAllOrders.push({ ...doc.data(), restaurantId });
+      });
+    });
+
+    const previousAvgOrderValue = previousTotalOrders > 0
+      ? Math.round((previousTotalRevenue / previousTotalOrders) * 100) / 100 : 0;
+
+    const calcChange = (current, previous) =>
+      previous > 0 ? Math.round(((current - previous) / previous) * 1000) / 10 : (current > 0 ? 100 : 0);
 
     // Calculate revenue by day (or by hour for "today")
     const isToday = period === 'today';
@@ -449,18 +482,43 @@ router.get('/analytics', authenticateToken, requireOwnerRole, async (req, res) =
       percentage: totalOrders > 0 ? Math.round((ordersByType[type] / totalOrders) * 100) : 0
     }));
 
+    // Build previous day hourly data for "today" chart overlay
+    let previousDayRevenueByHour = undefined;
+    if (isToday && prevAllOrders.length > 0) {
+      const prevHourly = {};
+      prevAllOrders.forEach(order => {
+        const orderDate = order.createdAt?.toDate ? order.createdAt.toDate() : new Date(order.createdAt);
+        const hour = String(orderDate.getHours()).padStart(2, '0');
+        if (!prevHourly[hour]) prevHourly[hour] = { hour, revenue: 0, orders: 0 };
+        prevHourly[hour].revenue += (order.totalAmount || order.finalAmount || 0);
+        prevHourly[hour].orders += 1;
+      });
+      previousDayRevenueByHour = Object.values(prevHourly).sort((a, b) => a.hour.localeCompare(b.hour));
+    }
+
+    const currentAvgOrderValue = totalOrders > 0 ? Math.round((totalRevenue / totalOrders) * 100) / 100 : 0;
+
     res.json({
       success: true,
       analytics: {
         totalRevenue: Math.round(totalRevenue * 100) / 100,
         totalRevenueWithTax: Math.round(totalRevenueWithTax * 100) / 100,
         totalOrders,
-        avgOrderValue: totalOrders > 0 ? Math.round((totalRevenue / totalOrders) * 100) / 100 : 0,
+        avgOrderValue: currentAvgOrderValue,
         revenueByRestaurant: revenueByRestaurant.sort((a, b) => b.revenue - a.revenue),
         revenueByDay: Object.values(revenueByDay).sort((a, b) => a.date.localeCompare(b.date)),
         popularItems,
         busyHours,
-        ordersByType: ordersByTypeArray
+        ordersByType: ordersByTypeArray,
+        // Period comparison deltas
+        previousTotalRevenue: Math.round(previousTotalRevenue * 100) / 100,
+        previousTotalOrders,
+        previousAvgOrderValue,
+        revenueChange: calcChange(totalRevenue, previousTotalRevenue),
+        ordersChange: calcChange(totalOrders, previousTotalOrders),
+        avgOrderValueChange: calcChange(currentAvgOrderValue, previousAvgOrderValue),
+        // Hourly comparison for "today" overlay
+        ...(previousDayRevenueByHour ? { previousDayRevenueByHour } : {})
       },
       meta: {
         restaurantsIncluded: restaurantIds.length,
