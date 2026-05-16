@@ -162,7 +162,10 @@ const collections = {
   parkingZones: 'parkingZones',
   parkingSlots: 'parkingSlots',
   parkingTickets: 'parkingTickets',
-  parkingRates: 'parkingRates'
+  parkingRates: 'parkingRates',
+  // Bookings & Catering
+  bookings: 'bookings',
+  bookingVenues: 'bookingVenues'
 };
 
 const admin = null; // We don't need the legacy admin object anymore

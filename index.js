@@ -952,6 +952,7 @@ const ledgerRoutes = require('./routes/ledger');
 const spaceBookingRoutes = require('./routes/spaceBooking');
 const parkingRoutes = require('./routes/parking');
 const registerRoutes = require('./routes/registerRoutes');
+const bookingRoutes = require('./routes/bookings');
 
 // Move Order
 const moveOrderRoutes = require('./routes/moveOrder');
@@ -9216,15 +9217,16 @@ app.post('/api/orders', async (req, res) => {
                 }
               }
 
-              // Step 3: Full scan only if both exact match and cache miss
+              // Step 3: Full scan only if both exact match and cache miss (select only phone to reduce transfer)
               if (!existingCustomer) {
                 const allCusts = await db.collection(collections.customers)
                   .where('restaurantId', '==', restaurantId)
+                  .select('phone')
                   .get();
-                existingCustomer = allCusts.docs.find(doc => normalizePhone(doc.data().phone) === normalizedPhone) || null;
-
-                // Cache the result for future lookups
-                if (existingCustomer) {
+                const matched = allCusts.docs.find(doc => normalizePhone(doc.data().phone) === normalizedPhone) || null;
+                // Re-fetch full doc since select('phone') doesn't include orderHistory etc.
+                if (matched) {
+                  existingCustomer = await matched.ref.get();
                   cacheCustomerByPhone(restaurantId, normalizedPhone, {
                     id: existingCustomer.id, phone: existingCustomer.data().phone
                   }).catch(() => {});
@@ -10917,8 +10919,10 @@ app.patch('/api/orders/:orderId/status', authenticateToken, async (req, res) => 
           } else {
             const np = normPhone(customerPhone);
             if (np) {
-              const all = await db.collection(collections.customers).where('restaurantId', '==', orderData.restaurantId).get();
-              custDoc = all.docs.find(d => normPhone(d.data().phone) === np) || null;
+              const all = await db.collection(collections.customers).where('restaurantId', '==', orderData.restaurantId).select('phone').get();
+              const matched = all.docs.find(d => normPhone(d.data().phone) === np) || null;
+              // Re-fetch full doc since select('phone') doesn't include orderHistory
+              if (matched) custDoc = await matched.ref.get();
             }
           }
           if (custDoc) {
@@ -12786,6 +12790,9 @@ app.use('/api', roomManagementRoutes);
 
 // Initialize space booking routes
 app.use('/api/space-booking', spaceBookingRoutes);
+
+// Initialize bookings & catering routes
+app.use('/api/bookings', bookingRoutes(db, collections, authenticateToken, checkFeaturePermission));
 
 // Initialize parking management routes
 app.use('/api/parking', parkingRoutes);
@@ -19034,6 +19041,7 @@ const FEATURE_OPS = {
   tables: ['read', 'add', 'update', 'delete', 'reset'],
   customers: ['read', 'add', 'update', 'delete'],
   offers: ['read', 'add', 'update', 'delete'],
+  bookings: ['read', 'add', 'update', 'delete', 'complete'],
   admin: ADMIN_TAB_OPS
 };
 
@@ -25705,19 +25713,22 @@ app.post('/api/customers', authenticateToken, async (req, res) => {
           .where('phone', '==', phone)
           .limit(1)
           .get();
-        
-        // If exact match not found, try normalized phone
+
+        // If exact match not found, try normalized phone (select only phone to reduce data transfer)
         if (customerQuery.empty && normalizedPhone) {
           const allCustomers = await db.collection(collections.customers)
             .where('restaurantId', '==', restaurantId)
+            .select('phone')
             .get();
-          
-          existingCustomer = allCustomers.docs.find(doc => {
+
+          const matched = allCustomers.docs.find(doc => {
             const customerPhone = normalizePhone(doc.data().phone);
             return customerPhone === normalizedPhone;
           });
+          // Re-fetch full doc since select('phone') doesn't include all fields
+          if (matched) existingCustomer = await matched.ref.get();
         }
-        
+
         if (!existingCustomer && customerQuery.empty) {
           customerQuery = await db.collection(collections.customers)
             .where('restaurantId', '==', restaurantId)
@@ -25732,17 +25743,20 @@ app.post('/api/customers', authenticateToken, async (req, res) => {
           .where('phone', '==', phone)
           .limit(1)
           .get();
-        
-        // If exact match not found, try normalized phone
+
+        // If exact match not found, try normalized phone (select only phone to reduce data transfer)
         if (customerQuery.empty && normalizedPhone) {
           const allCustomers = await db.collection(collections.customers)
             .where('restaurantId', '==', restaurantId)
+            .select('phone')
             .get();
-          
-          existingCustomer = allCustomers.docs.find(doc => {
+
+          const matched = allCustomers.docs.find(doc => {
             const customerPhone = normalizePhone(doc.data().phone);
             return customerPhone === normalizedPhone;
           });
+          // Re-fetch full doc since select('phone') doesn't include all fields
+          if (matched) existingCustomer = await matched.ref.get();
         }
       } else if (email) {
         customerQuery = await db.collection(collections.customers)
@@ -25870,10 +25884,12 @@ app.get('/api/customers/:restaurantId', authenticateToken, async (req, res) => {
     if (search) {
       // Fetch restaurant customers and filter in memory
       // Firestore doesn't support full-text search; we use a capped scan
+      // select() only fields needed for search matching + display (skip orderHistory to reduce data transfer)
       const scanLimit = 5000;
       const allSnapshot = await db.collection(collections.customers)
         .where('restaurantId', '==', restaurantId)
         .orderBy('lastOrderDate', 'desc')
+        .select('name', 'phone', 'email', 'city', 'address', 'totalOrders', 'totalSpent', 'loyaltyPoints', 'lastOrderDate', 'source', 'createdAt', 'dob', 'outstandingBalance', 'restaurantId')
         .limit(scanLimit)
         .get();
 
@@ -25886,11 +25902,10 @@ app.get('/api/customers/:restaurantId', authenticateToken, async (req, res) => {
         const cityMatch = data.city && data.city.toLowerCase().includes(search);
         const addressMatch = data.address && data.address.toLowerCase().includes(search);
         if (nameMatch || phoneMatch || emailMatch || cityMatch || addressMatch) {
-          const oh = data.orderHistory || [];
           allCustomers.push({
             id: doc.id, ...data,
-            totalOrders: Math.max(data.totalOrders || 0, oh.length),
-            totalSpent: Math.max(data.totalSpent || 0, oh.reduce((s, o) => s + (o.finalAmount || o.totalAmount || 0), 0)),
+            totalOrders: data.totalOrders || 0,
+            totalSpent: data.totalSpent || 0,
           });
         }
       });
@@ -25915,33 +25930,51 @@ app.get('/api/customers/:restaurantId', authenticateToken, async (req, res) => {
       .get();
     const total = countSnapshot.data().count;
 
-    // Fetch paginated customers
-    const skip = (page - 1) * pageSize;
-    const customersSnapshot = await db.collection(collections.customers)
+    // Fetch paginated customers (select only fields needed for list view, skip orderHistory to reduce transfer)
+    // Supports cursor-based pagination (preferred, avoids reading skipped docs) and offset fallback
+    const cursor = req.query.cursor; // last document ID from previous page
+    const listFields = ['name', 'phone', 'email', 'city', 'totalOrders', 'totalSpent', 'loyaltyPoints', 'lastOrderDate', 'source', 'createdAt', 'dob', 'outstandingBalance', 'restaurantId'];
+
+    let query = db.collection(collections.customers)
       .where('restaurantId', '==', restaurantId)
       .orderBy('lastOrderDate', 'desc')
-      .offset(skip)
-      .limit(pageSize)
-      .get();
+      .select(...listFields);
+
+    if (cursor) {
+      // Cursor-based: start after the last doc from previous page (no wasted reads)
+      const cursorDoc = await db.collection(collections.customers).doc(cursor).get();
+      if (cursorDoc.exists) {
+        query = query.startAfter(cursorDoc);
+      }
+    } else if (page > 1) {
+      // Fallback: offset-based for backward compatibility
+      const skip = (page - 1) * pageSize;
+      query = query.offset(skip);
+    }
+
+    const customersSnapshot = await query.limit(pageSize).get();
 
     const customers = [];
     customersSnapshot.forEach(doc => {
       const data = doc.data();
-      const oh = data.orderHistory || [];
       customers.push({
         id: doc.id,
         ...data,
-        totalOrders: Math.max(data.totalOrders || 0, oh.length),
-        totalSpent: Math.max(data.totalSpent || 0, oh.reduce((s, o) => s + (o.finalAmount || o.totalAmount || 0), 0)),
+        totalOrders: data.totalOrders || 0,
+        totalSpent: data.totalSpent || 0,
       });
     });
+
+    // Include nextCursor for efficient next-page fetching
+    const nextCursor = customers.length === pageSize ? customers[customers.length - 1].id : null;
 
     res.json({
       customers,
       total,
       page,
       pageSize,
-      totalPages: Math.ceil(total / pageSize)
+      totalPages: Math.ceil(total / pageSize),
+      nextCursor,
     });
   } catch (error) {
     console.error('Get customers error:', error);
@@ -25999,10 +26032,12 @@ app.get('/api/customers/reports', authenticateToken, async (req, res) => {
     }
 
     // Fetch customers for all restaurants in parallel (cap 5000 per restaurant)
+    // select() only fields needed for report calculations (skip address, city, dob, gstNumber etc. to reduce transfer)
     const allCustomers = [];
     await Promise.all(restaurantIds.map(async (rid) => {
       const snap = await db.collection(collections.customers)
         .where('restaurantId', '==', rid)
+        .select('name', 'phone', 'email', 'restaurantId', 'loyaltyPoints', 'orderHistory', 'totalOrders', 'totalSpent')
         .limit(5000)
         .get();
       snap.forEach(doc => {
@@ -26252,39 +26287,22 @@ app.post('/api/customers/bulk-import', authenticateToken, async (req, res) => {
       .map(c => normalizePhone(c.phone))
       .filter(p => p && p.length >= 10);
 
-    // Query existing customers by phone (Firestore where-in limit is 30)
+    // Fetch ALL existing customers for this restaurant in a SINGLE query (only phone field)
+    // This replaces 400+ chunked where-in queries with 1 lightweight query
     const existingMap = new Map(); // normalizedPhone -> docRef + data
-    for (let i = 0; i < batchPhones.length; i += 30) {
-      const chunk = batchPhones.slice(i, i + 30);
-      if (chunk.length === 0) continue;
-      // Query by exact phone
-      const snap = await db.collection(collections.customers)
-        .where('restaurantId', '==', restaurantId)
-        .where('phone', 'in', chunk)
-        .get();
-      snap.docs.forEach(doc => {
-        const np = normalizePhone(doc.data().phone);
-        if (np) existingMap.set(np, { ref: doc.ref, data: doc.data() });
-      });
-    }
-
-    // Also check with +91 prefix variants if not found
-    const missingPhones = batchPhones.filter(p => !existingMap.has(p));
-    if (missingPhones.length > 0) {
-      const prefixedPhones = missingPhones.map(p => '91' + p);
-      for (let i = 0; i < prefixedPhones.length; i += 30) {
-        const chunk = prefixedPhones.slice(i, i + 30);
-        if (chunk.length === 0) continue;
-        const snap = await db.collection(collections.customers)
-          .where('restaurantId', '==', restaurantId)
-          .where('phone', 'in', chunk)
-          .get();
-        snap.docs.forEach(doc => {
-          const np = normalizePhone(doc.data().phone);
-          if (np) existingMap.set(np, { ref: doc.ref, data: doc.data() });
-        });
+    const allExistingSnap = await db.collection(collections.customers)
+      .where('restaurantId', '==', restaurantId)
+      .select('phone', 'name', 'email', 'city', 'dob', 'address', 'locality', 'anniversary', 'gstNumber', 'source', 'doNotContact')
+      .get();
+    allExistingSnap.docs.forEach(doc => {
+      const rawPhone = doc.data().phone;
+      const np = normalizePhone(rawPhone);
+      if (np) existingMap.set(np, { ref: doc.ref, data: doc.data() });
+      // Also map the raw phone with +91 prefix normalization
+      if (rawPhone && String(rawPhone).startsWith('91') && np) {
+        existingMap.set(np, { ref: doc.ref, data: doc.data() });
       }
-    }
+    });
 
     let created = 0, updated = 0, skipped = 0;
     const errors = [];
