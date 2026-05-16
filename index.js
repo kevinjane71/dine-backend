@@ -14506,8 +14506,307 @@ app.delete('/api/floors/:floorId', authenticateToken, async (req, res) => {
   }
 });
 
-// Booking Management APIs
+// ==================== NEW BOOKING SYSTEM (Catering, Advance Order, Venue) ====================
+
+// IMPORTANT: Static sub-routes must come BEFORE /:bookingId to avoid param capture
+
+// --- Venues CRUD ---
+app.get('/api/bookings/:restaurantId/venues', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+    const snapshot = await db.collection('booking_venues').where('restaurantId', '==', restaurantId).get();
+    const venues = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+    res.json({ success: true, venues });
+  } catch (err) {
+    console.error('Get venues error:', err.message);
+    res.status(500).json({ error: 'Failed to fetch venues' });
+  }
+});
+
+app.post('/api/bookings/:restaurantId/venues', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+    const { name, capacity, description, sections, amenities } = req.body;
+    if (!name) return res.status(400).json({ error: 'Venue name is required' });
+    const venueData = {
+      restaurantId, name, capacity: Number(capacity) || 0,
+      description: description || '', sections: sections || [],
+      amenities: amenities || [], status: 'active',
+      createdAt: new Date(), updatedAt: new Date()
+    };
+    const ref = await db.collection('booking_venues').add(venueData);
+    res.json({ success: true, venue: { id: ref.id, ...venueData } });
+  } catch (err) {
+    console.error('Create venue error:', err.message);
+    res.status(500).json({ error: 'Failed to create venue' });
+  }
+});
+
+app.patch('/api/bookings/:restaurantId/venues/:venueId', authenticateToken, async (req, res) => {
+  try {
+    const { venueId } = req.params;
+    const { name, capacity, description, sections, amenities, status } = req.body;
+    const update = { updatedAt: new Date() };
+    if (name !== undefined) update.name = name;
+    if (capacity !== undefined) update.capacity = Number(capacity) || 0;
+    if (description !== undefined) update.description = description;
+    if (sections !== undefined) update.sections = sections;
+    if (amenities !== undefined) update.amenities = amenities;
+    if (status !== undefined) update.status = status;
+    await db.collection('booking_venues').doc(venueId).update(update);
+    res.json({ success: true, message: 'Venue updated' });
+  } catch (err) {
+    console.error('Update venue error:', err.message);
+    res.status(500).json({ error: 'Failed to update venue' });
+  }
+});
+
+app.delete('/api/bookings/:restaurantId/venues/:venueId', authenticateToken, async (req, res) => {
+  try {
+    const { venueId } = req.params;
+    await db.collection('booking_venues').doc(venueId).delete();
+    res.json({ success: true, message: 'Venue deleted' });
+  } catch (err) {
+    console.error('Delete venue error:', err.message);
+    res.status(500).json({ error: 'Failed to delete venue' });
+  }
+});
+
+app.get('/api/bookings/:restaurantId/venues/:venueId/availability', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId, venueId } = req.params;
+    const { date, startTime, endTime, endDate } = req.query;
+    if (!date) return res.status(400).json({ error: 'Date is required' });
+    // Check for bookings on this venue for the given date range
+    let query = db.collection('bookings_v2')
+      .where('restaurantId', '==', restaurantId)
+      .where('venue.venueId', '==', venueId)
+      .where('status', 'in', ['confirmed', 'in_progress']);
+    const snapshot = await query.get();
+    const conflicts = [];
+    snapshot.docs.forEach(doc => {
+      const b = doc.data();
+      const bStart = b.eventDate;
+      const bEnd = b.eventEndDate || b.eventDate;
+      const checkEnd = endDate || date;
+      // Simple date overlap check
+      if (bStart <= checkEnd && bEnd >= date) {
+        conflicts.push({ id: doc.id, eventName: b.eventName, eventDate: b.eventDate, eventEndDate: b.eventEndDate });
+      }
+    });
+    res.json({ success: true, available: conflicts.length === 0, conflicts });
+  } catch (err) {
+    console.error('Venue availability error:', err.message);
+    res.status(500).json({ error: 'Failed to check availability' });
+  }
+});
+
+// --- Calendar ---
+app.get('/api/bookings/:restaurantId/calendar', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+    const { startDate, endDate } = req.query;
+    if (!startDate || !endDate) return res.status(400).json({ error: 'startDate and endDate required' });
+    const snapshot = await db.collection('bookings_v2')
+      .where('restaurantId', '==', restaurantId)
+      .get();
+    const bookings = [];
+    snapshot.docs.forEach(doc => {
+      const d = doc.data();
+      // Filter by date range
+      if (d.eventDate && d.eventDate >= startDate && d.eventDate <= endDate) {
+        bookings.push({ id: doc.id, ...d });
+      }
+    });
+    res.json({ success: true, bookings });
+  } catch (err) {
+    console.error('Calendar error:', err.message);
+    res.status(500).json({ error: 'Failed to fetch calendar data' });
+  }
+});
+
+// --- Single booking actions (must come after /venues and /calendar) ---
+app.get('/api/bookings/:restaurantId/:bookingId', authenticateToken, async (req, res) => {
+  try {
+    const { bookingId } = req.params;
+    const doc = await db.collection('bookings_v2').doc(bookingId).get();
+    if (!doc.exists) return res.status(404).json({ error: 'Booking not found' });
+    res.json({ success: true, booking: { id: doc.id, ...doc.data() } });
+  } catch (err) {
+    console.error('Get booking error:', err.message);
+    res.status(500).json({ error: 'Failed to fetch booking' });
+  }
+});
+
+app.patch('/api/bookings/:restaurantId/:bookingId', authenticateToken, async (req, res) => {
+  try {
+    const { bookingId } = req.params;
+    const body = req.body;
+    const update = { updatedAt: new Date() };
+    // Allow updating any booking fields
+    const allowedFields = ['type', 'customer', 'eventName', 'eventDate', 'eventEndDate', 'eventTime', 'eventEndTime',
+      'guestCount', 'specialInstructions', 'venue', 'items', 'subtotal', 'discount', 'taxAmount',
+      'serviceCharge', 'totalAmount', 'status', 'trackExpense'];
+    allowedFields.forEach(f => { if (body[f] !== undefined) update[f] = body[f]; });
+    // Recalculate balance if totalAmount or payments changed
+    if (body.totalAmount !== undefined || body.payments !== undefined) {
+      const doc = await db.collection('bookings_v2').doc(bookingId).get();
+      if (doc.exists) {
+        const existing = doc.data();
+        const total = body.totalAmount !== undefined ? body.totalAmount : existing.totalAmount || 0;
+        const payments = body.payments !== undefined ? body.payments : existing.payments || [];
+        const paid = payments.reduce((s, p) => s + (Number(p.amount) || 0), 0);
+        update.paidAmount = paid;
+        update.balanceAmount = total - paid;
+      }
+    }
+    await db.collection('bookings_v2').doc(bookingId).update(update);
+    res.json({ success: true, message: 'Booking updated' });
+  } catch (err) {
+    console.error('Update booking error:', err.message);
+    res.status(500).json({ error: 'Failed to update booking' });
+  }
+});
+
+app.delete('/api/bookings/:restaurantId/:bookingId', authenticateToken, async (req, res) => {
+  try {
+    const { bookingId } = req.params;
+    const { reason } = req.body || {};
+    // Instead of deleting, mark as cancelled
+    await db.collection('bookings_v2').doc(bookingId).update({
+      status: 'cancelled',
+      cancelReason: reason || null,
+      cancelledAt: new Date(),
+      updatedAt: new Date()
+    });
+    res.json({ success: true, message: 'Booking cancelled' });
+  } catch (err) {
+    console.error('Cancel booking error:', err.message);
+    res.status(500).json({ error: 'Failed to cancel booking' });
+  }
+});
+
+app.post('/api/bookings/:restaurantId/:bookingId/complete', authenticateToken, async (req, res) => {
+  try {
+    const { bookingId } = req.params;
+    await db.collection('bookings_v2').doc(bookingId).update({
+      status: 'completed',
+      completedAt: new Date(),
+      updatedAt: new Date()
+    });
+    res.json({ success: true, message: 'Booking completed' });
+  } catch (err) {
+    console.error('Complete booking error:', err.message);
+    res.status(500).json({ error: 'Failed to complete booking' });
+  }
+});
+
+app.post('/api/bookings/:restaurantId/:bookingId/payment', authenticateToken, async (req, res) => {
+  try {
+    const { bookingId } = req.params;
+    const { amount, method, note } = req.body;
+    if (!amount) return res.status(400).json({ error: 'Payment amount is required' });
+    const payment = {
+      amount: Number(amount),
+      method: method || 'cash',
+      note: note || null,
+      date: new Date().toISOString(),
+      type: 'payment'
+    };
+    const doc = await db.collection('bookings_v2').doc(bookingId).get();
+    if (!doc.exists) return res.status(404).json({ error: 'Booking not found' });
+    const data = doc.data();
+    const payments = data.payments || [];
+    payments.push(payment);
+    const paidAmount = payments.reduce((s, p) => s + (Number(p.amount) || 0), 0);
+    const balanceAmount = (data.totalAmount || 0) - paidAmount;
+    await db.collection('bookings_v2').doc(bookingId).update({
+      payments, paidAmount, balanceAmount, updatedAt: new Date()
+    });
+    res.json({ success: true, payment, paidAmount, balanceAmount });
+  } catch (err) {
+    console.error('Add payment error:', err.message);
+    res.status(500).json({ error: 'Failed to add payment' });
+  }
+});
+
+app.post('/api/bookings/:restaurantId/:bookingId/invoice', authenticateToken, async (req, res) => {
+  try {
+    const { bookingId } = req.params;
+    const doc = await db.collection('bookings_v2').doc(bookingId).get();
+    if (!doc.exists) return res.status(404).json({ error: 'Booking not found' });
+    const booking = { id: doc.id, ...doc.data() };
+    // Return booking data as invoice
+    res.json({ success: true, invoice: booking });
+  } catch (err) {
+    console.error('Invoice error:', err.message);
+    res.status(500).json({ error: 'Failed to generate invoice' });
+  }
+});
+
+// ==================== LEGACY Booking Management APIs (Table Reservations) ====================
 app.get('/api/bookings/:restaurantId', authenticateToken, async (req, res) => {
+  const { restaurantId } = req.params;
+  const { date, status, type, startDate, endDate, search } = req.query;
+
+  try {
+    // Fetch new-style bookings (catering, advance_order, venue) from bookings_v2
+    const v2Snapshot = await db.collection('bookings_v2')
+      .where('restaurantId', '==', restaurantId)
+      .get();
+
+    let bookings = [];
+    v2Snapshot.docs.forEach(doc => {
+      const d = doc.data();
+      const b = {
+        id: doc.id,
+        ...d,
+        // Generate bookingNumber if not present
+        bookingNumber: d.bookingNumber || ('BK-' + doc.id.slice(-6).toUpperCase()),
+      };
+      bookings.push(b);
+    });
+
+    // Apply filters
+    if (type) {
+      bookings = bookings.filter(b => b.type === type);
+    }
+    if (status) {
+      bookings = bookings.filter(b => b.status === status);
+    }
+    if (startDate) {
+      bookings = bookings.filter(b => b.eventDate && b.eventDate >= startDate);
+    }
+    if (endDate) {
+      bookings = bookings.filter(b => b.eventDate && b.eventDate <= endDate);
+    }
+    if (search) {
+      const s = search.toLowerCase();
+      bookings = bookings.filter(b =>
+        (b.customer?.name || '').toLowerCase().includes(s) ||
+        (b.customer?.phone || '').includes(s) ||
+        (b.eventName || '').toLowerCase().includes(s) ||
+        (b.bookingNumber || '').toLowerCase().includes(s)
+      );
+    }
+
+    // Sort by creation date desc
+    bookings.sort((a, b) => {
+      const aDate = a.createdAt?.toDate ? a.createdAt.toDate() : (a.createdAt ? new Date(a.createdAt) : new Date(0));
+      const bDate = b.createdAt?.toDate ? b.createdAt.toDate() : (b.createdAt ? new Date(b.createdAt) : new Date(0));
+      return bDate - aDate;
+    });
+
+    return res.json({ success: true, bookings, _total: bookings.length });
+
+  } catch (error) {
+    console.error('Get bookings error:', error.message);
+    return res.status(500).json({ error: 'Failed to fetch bookings', message: error.message });
+  }
+});
+
+// Legacy table reservations endpoint
+app.get('/api/bookings/legacy/:restaurantId', authenticateToken, async (req, res) => {
   const { restaurantId } = req.params;
   const { date, status } = req.query;
 
@@ -14700,15 +14999,59 @@ app.get('/api/bookings/availability/:restaurantId', async (req, res) => {
 });
 
 // Create new booking
-app.post('/api/bookings/:restaurantId', async (req, res) => {
+app.post('/api/bookings/:restaurantId', authenticateToken, async (req, res) => {
   try {
     const { restaurantId } = req.params;
-    const { 
+    const body = req.body;
+
+    // New-style booking (catering, advance_order, venue) — detected by presence of 'type' field
+    if (body.type && ['catering', 'advance_order', 'venue'].includes(body.type)) {
+      const payments = body.payments || [];
+      const totalAmount = Number(body.totalAmount) || 0;
+      const paidAmount = payments.reduce((s, p) => s + (Number(p.amount) || 0), 0);
+      const balanceAmount = totalAmount - paidAmount;
+
+      const bookingNumber = 'BK-' + Date.now().toString(36).toUpperCase() + Math.random().toString(36).slice(2, 5).toUpperCase();
+
+      const bookingData = {
+        restaurantId,
+        bookingNumber,
+        type: body.type,
+        customer: body.customer || { name: '', phone: '', email: '' },
+        eventName: body.eventName || '',
+        eventDate: body.eventDate || null,
+        eventEndDate: body.eventEndDate || null,
+        eventTime: body.eventTime || null,
+        eventEndTime: body.eventEndTime || null,
+        guestCount: Number(body.guestCount) || 0,
+        specialInstructions: body.specialInstructions || '',
+        venue: body.venue || null,
+        items: body.items || [],
+        subtotal: Number(body.subtotal) || 0,
+        discount: body.discount || null,
+        taxAmount: Number(body.taxAmount) || 0,
+        serviceCharge: Number(body.serviceCharge) || 0,
+        totalAmount,
+        payments,
+        paidAmount,
+        balanceAmount,
+        status: 'confirmed',
+        trackExpense: body.trackExpense || false,
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      };
+
+      const ref = await db.collection('bookings_v2').add(bookingData);
+      return res.json({ success: true, booking: { id: ref.id, ...bookingData } });
+    }
+
+    // Legacy table reservation — fall through to old logic
+    const {
       tableId,
-      customerName, 
-      customerPhone, 
+      customerName,
+      customerPhone,
       customerEmail,
-      partySize, 
+      partySize,
       bookingDate, 
       bookingTime,
       duration = 120, // default 2 hours
