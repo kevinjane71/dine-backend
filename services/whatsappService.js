@@ -214,12 +214,57 @@ class WhatsAppService {
   }
 
   /**
+   * Send interactive list message (for menus with many items)
+   */
+  async sendListMessage(to, { headerText, bodyText, footerText, buttonText, sections }) {
+    try {
+      const formattedPhone = to.replace(/[\s\+\-\(\)]/g, '');
+
+      const response = await axios.post(
+        `${this.baseURL}/${this.phoneNumberId}/messages`,
+        {
+          messaging_product: 'whatsapp',
+          recipient_type: 'individual',
+          to: formattedPhone,
+          type: 'interactive',
+          interactive: {
+            type: 'list',
+            header: headerText ? { type: 'text', text: headerText } : undefined,
+            body: { text: bodyText },
+            footer: footerText ? { text: footerText } : undefined,
+            action: {
+              button: buttonText || 'View Menu',
+              sections: sections
+            }
+          }
+        },
+        {
+          headers: {
+            'Authorization': `Bearer ${this.accessToken}`,
+            'Content-Type': 'application/json'
+          }
+        }
+      );
+
+      return {
+        success: true,
+        messageId: response.data.messages[0].id,
+        data: response.data
+      };
+    } catch (error) {
+      console.error('WhatsApp list message error:', error.response?.data || error.message);
+      return {
+        success: false,
+        error: error.response?.data || error.message
+      };
+    }
+  }
+
+  /**
    * Get message status
    */
   async getMessageStatus(messageId) {
     try {
-      // This would typically be handled via webhooks
-      // For now, return a placeholder
       return {
         success: true,
         status: 'sent',

@@ -1112,6 +1112,8 @@ router.get('/restaurants', authenticateSuperAdmin, async (req, res) => {
         orders24h: stats.orders24h || 0,
         lastOrderDate: stats.lastOrderDate || null,
         adminNote: d.adminNote || '',
+        allowOrderDelete: d.orderSettings?.allowOrderDelete || false,
+        notificationOrderTypes: d.orderSettings?.notificationOrderTypes || ['online'],
       };
     });
 
@@ -1660,6 +1662,41 @@ router.post('/reset-restaurant-data', authenticateSuperAdmin, async (req, res) =
   } catch (error) {
     console.error('Super admin reset restaurant data error:', error);
     res.status(500).json({ success: false, error: error.message || 'Failed to reset restaurant data' });
+  }
+});
+
+// ─── Update Restaurant Settings (super-admin) ────────────────────────
+// PATCH /api/super-admin/restaurants/:restaurantId/settings
+// Body: { orderSettings: { allowOrderDelete: true/false, ... } }
+// Merges into existing orderSettings on the restaurant document.
+router.patch('/restaurants/:restaurantId/settings', authenticateSuperAdmin, async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+    const { orderSettings } = req.body || {};
+
+    if (!restaurantId) {
+      return res.status(400).json({ success: false, error: 'restaurantId is required' });
+    }
+
+    const restaurantRef = db.collection(collections.restaurants).doc(restaurantId);
+    const restaurant = await restaurantRef.get();
+    if (!restaurant.exists) {
+      return res.status(404).json({ success: false, error: 'Restaurant not found' });
+    }
+
+    const updateData = { updatedAt: new Date() };
+
+    if (orderSettings && typeof orderSettings === 'object') {
+      const existing = restaurant.data().orderSettings || {};
+      updateData.orderSettings = { ...existing, ...orderSettings };
+    }
+
+    await restaurantRef.update(updateData);
+
+    res.json({ success: true, orderSettings: updateData.orderSettings || restaurant.data().orderSettings || {} });
+  } catch (error) {
+    console.error('Super admin update restaurant settings error:', error);
+    res.status(500).json({ success: false, error: 'Failed to update restaurant settings' });
   }
 });
 

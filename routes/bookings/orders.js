@@ -158,10 +158,14 @@ module.exports = function(db, collections, authenticateToken, checkFeaturePermis
       // Generate booking number
       const bookingNumber = await generateBookingNumber(db, collections, restaurantId);
 
-      // Sync customer to customers collection
+      // Sync customer to customers collection (non-blocking — booking saves even if sync fails)
       let customerId = customer.id || null;
       if (customer.phone) {
-        customerId = await syncCustomerData(db, collections, restaurantId, customer);
+        try {
+          customerId = await syncCustomerData(db, collections, restaurantId, customer);
+        } catch (syncErr) {
+          console.warn('Customer sync failed (non-fatal):', syncErr.message);
+        }
       }
 
       // Calculate payment totals
@@ -225,8 +229,8 @@ module.exports = function(db, collections, authenticateToken, checkFeaturePermis
         booking: { id: ref.id, ...bookingData, bookingNumber },
       });
     } catch (error) {
-      console.error('Create booking error:', error);
-      res.status(500).json({ error: 'Failed to create booking' });
+      console.error('Create booking error:', error.message, error.stack);
+      res.status(500).json({ error: 'Failed to create booking', details: error.message });
     }
   });
 

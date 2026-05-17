@@ -293,6 +293,38 @@ class InventoryService {
         }
 
         if (!recipeDoc) {
+            // Direct deduction: if item is stock-managed, deduct 1:1 from linked inventory item
+            if (item.isStockManaged || item.trackInventory) {
+              const directInvItem = inventoryItems.find(i =>
+                (item.inventoryItemId && i.id === item.inventoryItemId) ||
+                (i.linkedMenuItemId === item.menuItemId) ||
+                (i.linkedMenuItemId === item.id) ||
+                (item.name && i.name && i.name.toLowerCase() === item.name.toLowerCase())
+              );
+              if (directInvItem) {
+                const deductQty = (item.deductionQuantity || 1) * qtySold;
+                const newStock = Math.max(0, (directInvItem.currentStock || 0) - deductQty);
+                batch.update(directInvItem.ref, { currentStock: newStock, updatedAt: new Date() });
+                const unitCost = directInvItem.costPerUnit || 0;
+                const transactionRef = db.collection('inventoryTransactions').doc();
+                batch.set(transactionRef, {
+                  restaurantId, inventoryItemId: directInvItem.id, inventoryItemName: directInvItem.name,
+                  type: 'DEDUCTION', source: 'ORDER', referenceId: orderId,
+                  quantityChange: -deductQty, unit: directInvItem.unit || 'pcs',
+                  costPerUnit: unitCost, totalCost: deductQty * unitCost,
+                  date: new Date(), notes: `Direct deduction: ${qtySold}x ${item.name}`
+                });
+                hasUpdates = true;
+                deductions.push({
+                  inventoryItemId: directInvItem.id, inventoryItemName: directInvItem.name,
+                  unit: directInvItem.unit, quantityDeducted: deductQty, newStock,
+                  menuItemName: item.name, method: 'direct'
+                });
+                directInvItem.currentStock = newStock;
+                console.log(`📦 Direct deduction: ${deductQty} ${directInvItem.unit || 'pcs'} of ${directInvItem.name} for ${item.name}`);
+                continue;
+              }
+            }
             console.log(`⚠️ No recipe found for item: ${item.name} (${item.menuItemId}). Skipping deduction.`);
             continue;
         }

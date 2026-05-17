@@ -44,6 +44,18 @@ const notifyOrderCreated = async (restaurantId, order) => {
     floorId: order.floorId || null,
     orderType: order.orderType
   });
+
+  // Also send FCM push notification for web browsers (background tab / closed)
+  fcmService.sendToRestaurant(restaurantId, {
+    type: 'new-order',
+    title: `New ${order.orderType || 'Online'} Order #${order.orderNumber || order.dailyOrderId || ''}`,
+    body: `${order.tableNumber ? 'Table ' + order.tableNumber + ' • ' : ''}${order.itemsCount || ''} items${order.totalAmount ? ' • ₹' + order.totalAmount : ''}`,
+    orderId: order.id,
+    dailyOrderId: order.dailyOrderId || order.orderNumber || '',
+    orderType: order.orderType || 'online',
+    tableNumber: order.tableNumber || '',
+    totalAmount: order.totalAmount || 0,
+  }).catch(err => console.warn('FCM web push error (non-blocking):', err.message));
 };
 
 /**

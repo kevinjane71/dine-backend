@@ -236,6 +236,7 @@ module.exports = {
   registerToken,
   unregisterToken,
   getTokensForRestaurant,
+  sendToRestaurant,
   sendKOTPrintNotification,
   sendBillingPrintNotification,
 };

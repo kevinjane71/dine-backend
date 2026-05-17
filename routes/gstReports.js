@@ -70,6 +70,7 @@ router.get('/:restaurantId/gstr1', async (req, res) => {
         igst: Math.round(gst.igst * 100) / 100,
         totalValue: Math.round((order.finalAmount || order.totalAmount || 0) * 100) / 100,
         paymentMethod: order.paymentMethod || 'cash',
+        taxInclusiveMode: order.taxInclusiveMode || 'exclusive',
       });
     });
 

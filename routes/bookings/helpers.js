@@ -8,16 +8,22 @@ async function generateBookingNumber(db, collections, restaurantId) {
   const dateStr = today.toISOString().split('T')[0].replace(/-/g, '');
   const prefix = `BK-${dateStr}`;
 
-  // Count today's bookings to get next sequence
-  const startOfDay = new Date(today.getFullYear(), today.getMonth(), today.getDate());
-  const snap = await db.collection(collections.bookings)
-    .where('restaurantId', '==', restaurantId)
-    .where('createdAt', '>=', startOfDay)
-    .count()
-    .get();
+  try {
+    // Count today's bookings by bookingNumber prefix (single-field range, no composite index needed)
+    const snap = await db.collection(collections.bookings)
+      .where('bookingNumber', '>=', prefix)
+      .where('bookingNumber', '<=', prefix + '\uf8ff')
+      .count()
+      .get();
 
-  const seq = (snap.data().count || 0) + 1;
-  return `${prefix}-${String(seq).padStart(3, '0')}`;
+    const seq = (snap.data().count || 0) + 1;
+    return `${prefix}-${String(seq).padStart(3, '0')}`;
+  } catch (err) {
+    // Fallback: use timestamp-based sequence
+    console.warn('generateBookingNumber query failed, using fallback:', err.message);
+    const seq = (Date.now() % 900) + 100;
+    return `${prefix}-${String(seq)}`;
+  }
 }
 
 /**
