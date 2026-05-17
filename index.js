@@ -9249,8 +9249,9 @@ app.post('/api/orders', async (req, res) => {
         selectedOfferName: appliedOffers.length > 0 ? appliedOffers.map(ao => ao.name).join(', ') : (req.body.selectedOfferName || (appliedOffer ? appliedOffer.name : null)),
         loyaltyPointsEarned: loyaltyPointsEarned,
         loyaltyPointsRedeemed: loyaltyPointsRedeemed,
-        outstandingAmount: req.body.partialPayAmount ? Math.round((finalAmount - Number(req.body.partialPayAmount)) * 100) / 100 : 0,
-        paidAmount: req.body.partialPayAmount ? Math.round(Number(req.body.partialPayAmount) * 100) / 100 : 0,
+        outstandingAmount: req.body.partialPayAmount != null ? Math.round((finalAmount - Number(req.body.partialPayAmount)) * 100) / 100 : 0,
+        paidAmount: req.body.partialPayAmount != null ? Math.round(Number(req.body.partialPayAmount) * 100) / 100 : 0,
+        paymentStatus: req.body.partialPayAmount != null ? (Number(req.body.partialPayAmount) === 0 ? 'due' : 'partial') : 'paid',
         orderDate: new Date(),
         tableNumber: tableNumber || seatNumber || null,
         orderType: orderType,
@@ -12122,6 +12123,9 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
                 orderType: currentOrder.orderType,
                 loyaltyPointsEarned: pointsEarned,
                 loyaltyPointsRedeemed: pointsRedeemed,
+                paymentStatus: updateData.paymentStatus || 'paid',
+                paidAmount: updateData.paidAmount || null,
+                outstandingAmount: updateData.outstandingAmount || 0,
               };
               const newHistory = [...existingHistory, histEntry];
               await db.collection('customers').doc(custId).update({
@@ -12135,6 +12139,31 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
           }
         } catch (custErr) {
           console.error('Error updating customer history on PATCH completion:', custErr);
+        }
+      }
+
+      // Track partial/due payment in customer credit (same logic as POST handler)
+      if (req.body.partialPayAmount != null && custId) {
+        const creditFinalAmount = updateData.finalAmount || currentOrder.finalAmount || 0;
+        const creditPaid = Number(req.body.partialPayAmount);
+        const creditOutstanding = Math.round((creditFinalAmount - creditPaid) * 100) / 100;
+        if (creditOutstanding > 0) {
+          try {
+            await db.collection('customers').doc(custId).update({
+              outstandingBalance: FieldValue.increment(creditOutstanding),
+              creditHistory: FieldValue.arrayUnion({
+                orderId: orderId,
+                orderNumber: currentOrder.orderNumber,
+                date: new Date().toISOString(),
+                totalAmount: Math.round(creditFinalAmount * 100) / 100,
+                paidAmount: Math.round(creditPaid * 100) / 100,
+                outstandingAmount: creditOutstanding
+              })
+            });
+            console.log(`💳 PATCH: Customer ${custId} credit updated: +₹${creditOutstanding} outstanding`);
+          } catch (creditErr) {
+            console.error('Error updating customer credit on PATCH:', creditErr);
+          }
         }
       }
 
@@ -26532,11 +26561,11 @@ app.get('/api/customers/:restaurantId', authenticateToken, async (req, res) => {
       const allCustomers = [];
       allSnapshot.forEach(doc => {
         const data = doc.data();
-        const nameMatch = data.name && data.name.toLowerCase().includes(search);
-        const phoneMatch = data.phone && data.phone.includes(search);
-        const emailMatch = data.email && data.email.toLowerCase().includes(search);
-        const cityMatch = data.city && data.city.toLowerCase().includes(search);
-        const addressMatch = data.address && data.address.toLowerCase().includes(search);
+        const nameMatch = data.name && String(data.name).toLowerCase().includes(search);
+        const phoneMatch = data.phone && String(data.phone).includes(search);
+        const emailMatch = data.email && String(data.email).toLowerCase().includes(search);
+        const cityMatch = data.city && String(data.city).toLowerCase().includes(search);
+        const addressMatch = data.address && String(data.address).toLowerCase().includes(search);
         if (nameMatch || phoneMatch || emailMatch || cityMatch || addressMatch) {
           allCustomers.push({
             id: doc.id, ...data,
@@ -27187,13 +27216,18 @@ app.post('/api/public/customer/lookup', vercelSecurityMiddleware.publicAPI, asyn
 
     // Last resort: prefix search on normalized phone (handles partial stored formats)
     if (!existingCustomer && normalizedPhone && normalizedPhone.length >= 10) {
-      const prefixSnap = await db.collection('customers')
-        .where('restaurantId', '==', restaurantId)
-        .where('phone', '>=', normalizedPhone)
-        .where('phone', '<=', normalizedPhone + '\uf8ff')
-        .limit(1)
-        .get();
-      if (!prefixSnap.empty) existingCustomer = prefixSnap.docs[0];
+      try {
+        const prefixSnap = await db.collection('customers')
+          .where('restaurantId', '==', restaurantId)
+          .where('phone', '>=', normalizedPhone)
+          .where('phone', '<=', normalizedPhone + '\uf8ff')
+          .limit(1)
+          .get();
+        if (!prefixSnap.empty) existingCustomer = prefixSnap.docs[0];
+      } catch (prefixErr) {
+        // Index may not exist — skip prefix search silently
+        console.warn('Customer prefix search skipped (index missing):', prefixErr.message);
+      }
     }
 
     if (existingCustomer) {
@@ -29125,19 +29159,32 @@ app.post('/api/customers/:customerId/settle-credit', authenticateToken, async (r
 
     await customerRef.update(updateData);
 
-    // Also update the order if orderId provided
+    // Also update the order document if orderId provided
     if (orderId) {
       const orderRef = db.collection(collections.orders).doc(orderId);
       const orderDoc = await orderRef.get();
       if (orderDoc.exists) {
         const orderData = orderDoc.data();
-        const newPaid = (orderData.paidAmount || 0) + settleAmount;
-        const newOutstanding = Math.max(0, (orderData.outstandingAmount || 0) - settleAmount);
+        const newPaid = Math.round(((orderData.paidAmount || 0) + settleAmount) * 100) / 100;
+        const newOutstanding = Math.max(0, Math.round(((orderData.outstandingAmount || 0) - settleAmount) * 100) / 100);
+        const newPaymentStatus = newOutstanding <= 0 ? 'paid' : 'partial';
         await orderRef.update({
           paidAmount: newPaid,
           outstandingAmount: newOutstanding,
-          paymentStatus: newOutstanding <= 0 ? 'paid' : 'partial'
+          paymentStatus: newPaymentStatus
         });
+
+        // Also update the embedded orderHistory entry on the customer doc
+        const orderHistory = customerData.orderHistory || [];
+        const updatedOrderHistory = orderHistory.map(entry => {
+          if (entry.orderId === orderId) {
+            return { ...entry, paidAmount: newPaid, outstandingAmount: newOutstanding, paymentStatus: newPaymentStatus };
+          }
+          return entry;
+        });
+        if (JSON.stringify(updatedOrderHistory) !== JSON.stringify(orderHistory)) {
+          await customerRef.update({ orderHistory: updatedOrderHistory });
+        }
       }
     }
 
@@ -29222,10 +29269,21 @@ app.post('/api/customers/:customerId/bulk-settle-credit', authenticateToken, asy
       updatedOrderStatus: updateOrderStatus || false,
     });
 
+    // Also update embedded orderHistory entries on customer doc
+    const orderHistory = customerData.orderHistory || [];
+    const updatedOrderHistory = orderHistory.map(entry => {
+      if (orderIds.includes(entry.orderId)) {
+        const finalAmt = entry.finalAmount || entry.totalAmount || 0;
+        return { ...entry, paidAmount: Math.round(finalAmt * 100) / 100, outstandingAmount: 0, paymentStatus: 'paid' };
+      }
+      return entry;
+    });
+
     await customerRef.update({
       outstandingBalance: newBalance,
       creditHistory: updatedHistory,
       settlementHistory,
+      orderHistory: updatedOrderHistory,
     });
 
     res.json({ success: true, newBalance, settledTotal: Math.round(settledTotal * 100) / 100, settledOrders: settledOrderNumbers });

@@ -305,10 +305,12 @@ const initializePaymentRoutes = (db, razorpay) => {
         await paymentRef.set(offlinePaymentDoc);
 
         // Update order status to completed
+        // Preserve partial/due payment status if the order was billed with credit
         console.log('[PAYMENT] Updating order status to completed:', orderId);
+        const preserveCredit = orderData.paymentStatus === 'due' || orderData.paymentStatus === 'partial';
         await db.collection('orders').doc(orderId).update({
           status: 'completed',
-          paymentStatus: 'paid',
+          paymentStatus: preserveCredit ? orderData.paymentStatus : 'paid',
           paymentMethod: offlineMethod,
           paymentId: paymentId,
           completedAt: new Date(),

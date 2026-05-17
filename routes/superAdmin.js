@@ -1667,6 +1667,22 @@ router.post('/reset-restaurant-data', authenticateSuperAdmin, async (req, res) =
 
 // ─── Update Restaurant Settings (super-admin) ────────────────────────
 // PATCH /api/super-admin/restaurants/:restaurantId/settings
+// GET /restaurants/:restaurantId/settings — fetch restaurant name + orderSettings
+router.get('/restaurants/:restaurantId/settings', authenticateSuperAdmin, async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+    const restaurant = await db.collection(collections.restaurants).doc(restaurantId).get();
+    if (!restaurant.exists) {
+      return res.status(404).json({ success: false, error: 'Restaurant not found' });
+    }
+    const data = restaurant.data();
+    res.json({ success: true, name: data.name || '', orderSettings: data.orderSettings || {} });
+  } catch (err) {
+    console.error('Error fetching restaurant settings:', err);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
 // Body: { orderSettings: { allowOrderDelete: true/false, ... } }
 // Merges into existing orderSettings on the restaurant document.
 router.patch('/restaurants/:restaurantId/settings', authenticateSuperAdmin, async (req, res) => {
