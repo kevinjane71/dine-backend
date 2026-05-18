@@ -5,9 +5,29 @@ const { authenticateToken, requireOwnerRole } = require('../middleware/auth');
 const emailService = require('../emailService');
 
 // ============================================
-// AI INSIGHTS & DAILY REPORTS fds
-// Provides AI-powered analytics and automated emailssgd
+// AI INSIGHTS & DAILY REPORTS
+// Provides AI-powered analytics and automated emails
 // ============================================
+
+/**
+ * Convert a local time + timezone to UTC hour for cron matching.
+ * E.g. "08:00" in "Asia/Kolkata" → 2 (08:00 IST = 02:30 UTC → hour 2)
+ */
+function convertToUTCHour(timeStr, tz) {
+  try {
+    const [hours] = timeStr.split(':').map(Number);
+    // Create a reference date and format it in both timezones to find offset
+    const ref = new Date('2024-06-15T12:00:00Z'); // Use a fixed date to avoid DST issues
+    const localStr = ref.toLocaleString('en-US', { timeZone: tz, hour: 'numeric', hour12: false, minute: 'numeric' });
+    const utcStr = ref.toLocaleString('en-US', { timeZone: 'UTC', hour: 'numeric', hour12: false, minute: 'numeric' });
+    const localHour = parseInt(localStr.split(':')[0]);
+    const utcHour = parseInt(utcStr.split(':')[0]);
+    const offsetHours = localHour - utcHour;
+    return ((hours - offsetHours) % 24 + 24) % 24;
+  } catch {
+    return 2; // Default: 08:00 IST = 02:30 UTC → hour 2
+  }
+}
 
 /**
  * Generate AI insights based on restaurant data
@@ -591,14 +611,23 @@ router.get('/usage', authenticateToken, requireOwnerRole, async (req, res) => {
 router.post('/email-preferences', authenticateToken, requireOwnerRole, async (req, res) => {
   try {
     const userId = req.user.userId || req.user.id;
-    const { emailEnabled, email, timezone = 'Asia/Kolkata', reportTime = '08:00' } = req.body;
+    const { emailEnabled, email, reportEmails, timezone = 'Asia/Kolkata', reportTime = '08:00' } = req.body;
 
-    // Store preferences in user document or a separate collection
+    // Normalize: support both old single email and new array (max 5)
+    const emails = (reportEmails && reportEmails.length > 0)
+      ? reportEmails.slice(0, 5)
+      : (email ? [email] : []);
+
+    // Pre-compute UTC hour for cron job matching
+    const reportTimeUTC = convertToUTCHour(reportTime, timezone);
+
     await db.collection('ownerPreferences').doc(userId).set({
       emailEnabled: !!emailEnabled,
-      reportEmail: email || req.user.email,
+      reportEmails: emails,
+      reportEmail: emails[0] || req.user.email || '', // Legacy compat
       timezone,
       reportTime,
+      reportTimeUTC,
       updatedAt: new Date()
     }, { merge: true });
 
@@ -632,6 +661,7 @@ router.get('/email-preferences', authenticateToken, requireOwnerRole, async (req
         success: true,
         preferences: {
           emailEnabled: false,
+          reportEmails: req.user.email ? [req.user.email] : [],
           reportEmail: req.user.email || '',
           timezone: 'Asia/Kolkata',
           reportTime: '08:00'
@@ -655,198 +685,197 @@ router.get('/email-preferences', authenticateToken, requireOwnerRole, async (req
 });
 
 /**
+ * Generate a full AI insights report for an owner (reusable by test + cron)
+ * Returns { insights, analytics, restaurantCount } or null if no restaurants
+ */
+async function generateReportForOwner(userId) {
+  const restaurantsSnap = await db.collection(collections.restaurants)
+    .where('ownerId', '==', userId)
+    .get();
+
+  if (restaurantsSnap.empty) return null;
+
+  const restaurants = [];
+  const restaurantIds = [];
+  restaurantsSnap.docs.forEach(doc => {
+    restaurantIds.push(doc.id);
+    restaurants.push({ id: doc.id, ...doc.data() });
+  });
+
+  const sevenDaysAgo = new Date();
+  sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 7);
+
+  let totalRevenue = 0;
+  let totalOrders = 0;
+  let staffCount = 0;
+  let lowStockCount = 0;
+  let outOfStockCount = 0;
+  const allOrders = [];
+  const revenueByDay = {};
+  const itemCounts = {};
+  const itemRevenue = {};
+  const ordersByType = {};
+  const hourCounts = {};
+
+  for (const restaurantId of restaurantIds) {
+    const ordersSnap = await db.collection(collections.orders)
+      .where('restaurantId', '==', restaurantId)
+      .where('createdAt', '>=', sevenDaysAgo)
+      .get();
+
+    const restaurant = restaurants.find(r => r.id === restaurantId);
+    let restaurantRevenue = 0;
+    let restaurantOrders = 0;
+
+    ordersSnap.docs.forEach(doc => {
+      const order = doc.data();
+      const amount = order.totalAmount || order.finalAmount || 0;
+      totalRevenue += amount;
+      totalOrders++;
+      restaurantRevenue += amount;
+      restaurantOrders++;
+      allOrders.push(order);
+
+      const orderDate = order.createdAt?.toDate ? order.createdAt.toDate() : new Date(order.createdAt);
+      const dateKey = orderDate.toISOString().split('T')[0];
+      if (!revenueByDay[dateKey]) revenueByDay[dateKey] = { date: dateKey, revenue: 0, orders: 0 };
+      revenueByDay[dateKey].revenue += amount;
+      revenueByDay[dateKey].orders++;
+
+      if (order.items) {
+        order.items.forEach(item => {
+          const name = item.name || item.itemName;
+          if (name) {
+            itemCounts[name] = (itemCounts[name] || 0) + (item.quantity || 1);
+            itemRevenue[name] = (itemRevenue[name] || 0) + (item.price || 0) * (item.quantity || 1);
+          }
+        });
+      }
+
+      const type = order.orderType || 'dine_in';
+      ordersByType[type] = (ordersByType[type] || 0) + 1;
+
+      const hour = orderDate.getHours();
+      const hourStr = `${hour.toString().padStart(2, '0')}:00`;
+      hourCounts[hourStr] = (hourCounts[hourStr] || 0) + 1;
+    });
+
+    if (restaurant) {
+      restaurant.revenue = restaurantRevenue;
+      restaurant.orders = restaurantOrders;
+    }
+  }
+
+  for (const restaurantId of restaurantIds) {
+    const [staffNewSnap, staffLegacySnap] = await Promise.all([
+      db.collection(collections.staffUsers)
+        .where('restaurantId', '==', restaurantId)
+        .where('status', '==', 'active')
+        .get(),
+      db.collection(collections.users)
+        .where('restaurantId', '==', restaurantId)
+        .where('status', '==', 'active')
+        .get()
+    ]);
+    staffNewSnap.docs.forEach(() => staffCount++);
+    staffLegacySnap.docs.forEach(doc => {
+      const role = (doc.data().role || '').toLowerCase();
+      if (role !== 'owner' && role !== 'customer') staffCount++;
+    });
+  }
+
+  for (const restaurantId of restaurantIds) {
+    const invSnap = await db.collection(collections.inventory)
+      .where('restaurantId', '==', restaurantId)
+      .get();
+    invSnap.docs.forEach(doc => {
+      const data = doc.data();
+      const currentStock = data.currentStock || 0;
+      const minStock = data.minStock || data.reorderLevel || 0;
+      if (currentStock <= 0) outOfStockCount++;
+      else if (currentStock <= minStock) lowStockCount++;
+    });
+  }
+
+  const popularItems = Object.keys(itemCounts)
+    .map(name => ({ name, orders: itemCounts[name], revenue: itemRevenue[name] }))
+    .sort((a, b) => b.orders - a.orders)
+    .slice(0, 10);
+
+  const busyHours = Object.keys(hourCounts)
+    .map(hour => ({ hour, orders: hourCounts[hour] }))
+    .sort((a, b) => b.orders - a.orders)
+    .slice(0, 5);
+
+  const ordersByTypeArray = Object.keys(ordersByType).map(type => ({
+    type,
+    count: ordersByType[type],
+    percentage: totalOrders > 0 ? Math.round((ordersByType[type] / totalOrders) * 100) : 0
+  }));
+
+  const analytics = {
+    totalRevenue: Math.round(totalRevenue * 100) / 100,
+    totalOrders,
+    avgOrderValue: totalOrders > 0 ? Math.round((totalRevenue / totalOrders) * 100) / 100 : 0,
+    revenueByDay: Object.values(revenueByDay).sort((a, b) => a.date.localeCompare(b.date)),
+    popularItems,
+    busyHours,
+    ordersByType: ordersByTypeArray
+  };
+
+  const insights = generateAIInsights({
+    restaurants,
+    orders: allOrders,
+    analytics,
+    period: '7d',
+    staffCount,
+    lowStockCount,
+    outOfStockCount
+  });
+
+  return { insights, analytics, restaurantCount: restaurants.length };
+}
+
+/**
  * POST /api/ai/send-test-report
- * Send a test daily report email with AI insights
+ * Send a test daily report email with AI insights (supports multiple emails)
  */
 router.post('/send-test-report', authenticateToken, requireOwnerRole, async (req, res) => {
   try {
     const userId = req.user.userId || req.user.id;
-    const { email } = req.body;
+    const { email, emails } = req.body;
 
-    if (!email) {
+    // Support both single email (legacy) and array
+    const recipients = (emails && emails.length > 0) ? emails : (email ? [email] : []);
+    if (recipients.length === 0) {
       return res.status(400).json({ success: false, error: 'Email address required' });
     }
 
-    console.log(`🤖 Generating AI insights report for ${email}...`);
+    console.log(`🤖 Generating AI insights report for ${recipients.join(', ')}...`);
 
-    // Get owner's restaurants
-    const restaurantsSnap = await db.collection(collections.restaurants)
-      .where('ownerId', '==', userId)
-      .get();
-
-    if (restaurantsSnap.empty) {
-      return res.status(400).json({
-        success: false,
-        error: 'No restaurants found for this owner'
-      });
+    const reportData = await generateReportForOwner(userId);
+    if (!reportData) {
+      return res.status(400).json({ success: false, error: 'No restaurants found for this owner' });
     }
 
-    const restaurants = [];
-    const restaurantIds = [];
-    restaurantsSnap.docs.forEach(doc => {
-      restaurantIds.push(doc.id);
-      restaurants.push({ id: doc.id, ...doc.data() });
-    });
-
-    // Get orders for last 7 days
-    const sevenDaysAgo = new Date();
-    sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 7);
-
-    let totalRevenue = 0;
-    let totalOrders = 0;
-    let staffCount = 0;
-    let lowStockCount = 0;
-    let outOfStockCount = 0;
-    const allOrders = [];
-    const revenueByDay = {};
-    const itemCounts = {};
-    const itemRevenue = {};
-    const ordersByType = {};
-    const hourCounts = {};
-
-    // Fetch orders
-    for (const restaurantId of restaurantIds) {
-      const ordersSnap = await db.collection(collections.orders)
-        .where('restaurantId', '==', restaurantId)
-        .where('createdAt', '>=', sevenDaysAgo)
-        .get();
-
-      const restaurant = restaurants.find(r => r.id === restaurantId);
-      let restaurantRevenue = 0;
-      let restaurantOrders = 0;
-
-      ordersSnap.docs.forEach(doc => {
-        const order = doc.data();
-        const amount = order.totalAmount || order.finalAmount || 0;
-        totalRevenue += amount;
-        totalOrders++;
-        restaurantRevenue += amount;
-        restaurantOrders++;
-        allOrders.push(order);
-
-        // Revenue by day
-        const orderDate = order.createdAt?.toDate ? order.createdAt.toDate() : new Date(order.createdAt);
-        const dateKey = orderDate.toISOString().split('T')[0];
-        if (!revenueByDay[dateKey]) revenueByDay[dateKey] = { date: dateKey, revenue: 0, orders: 0 };
-        revenueByDay[dateKey].revenue += amount;
-        revenueByDay[dateKey].orders++;
-
-        // Items
-        if (order.items) {
-          order.items.forEach(item => {
-            const name = item.name || item.itemName;
-            if (name) {
-              itemCounts[name] = (itemCounts[name] || 0) + (item.quantity || 1);
-              itemRevenue[name] = (itemRevenue[name] || 0) + (item.price || 0) * (item.quantity || 1);
-            }
-          });
-        }
-
-        // Order type
-        const type = order.orderType || 'dine_in';
-        ordersByType[type] = (ordersByType[type] || 0) + 1;
-
-        // Busy hours
-        const hour = orderDate.getHours();
-        const hourStr = `${hour.toString().padStart(2, '0')}:00`;
-        hourCounts[hourStr] = (hourCounts[hourStr] || 0) + 1;
-      });
-
-      if (restaurant) {
-        restaurant.revenue = restaurantRevenue;
-        restaurant.orders = restaurantOrders;
-      }
-    }
-
-    // Get staff count from both staffUsers and users collections
-    for (const restaurantId of restaurantIds) {
-      const [staffNewSnap, staffLegacySnap] = await Promise.all([
-        db.collection(collections.staffUsers)
-          .where('restaurantId', '==', restaurantId)
-          .where('status', '==', 'active')
-          .get(),
-        db.collection(collections.users)
-          .where('restaurantId', '==', restaurantId)
-          .where('status', '==', 'active')
-          .get()
-      ]);
-      staffNewSnap.docs.forEach(() => staffCount++);
-      staffLegacySnap.docs.forEach(doc => {
-        const role = (doc.data().role || '').toLowerCase();
-        if (role !== 'owner' && role !== 'customer') staffCount++;
-      });
-    }
-
-    // Get inventory alerts
-    for (const restaurantId of restaurantIds) {
-      const invSnap = await db.collection(collections.inventory)
-        .where('restaurantId', '==', restaurantId)
-        .get();
-      invSnap.docs.forEach(doc => {
-        const data = doc.data();
-        const currentStock = data.currentStock || 0;
-        const minStock = data.minStock || data.reorderLevel || 0;
-        if (currentStock <= 0) outOfStockCount++;
-        else if (currentStock <= minStock) lowStockCount++;
-      });
-    }
-
-    // Build analytics
-    const popularItems = Object.keys(itemCounts)
-      .map(name => ({ name, orders: itemCounts[name], revenue: itemRevenue[name] }))
-      .sort((a, b) => b.orders - a.orders)
-      .slice(0, 10);
-
-    const busyHours = Object.keys(hourCounts)
-      .map(hour => ({ hour, orders: hourCounts[hour] }))
-      .sort((a, b) => b.orders - a.orders)
-      .slice(0, 5);
-
-    const ordersByTypeArray = Object.keys(ordersByType).map(type => ({
-      type,
-      count: ordersByType[type],
-      percentage: totalOrders > 0 ? Math.round((ordersByType[type] / totalOrders) * 100) : 0
-    }));
-
-    const analytics = {
-      totalRevenue: Math.round(totalRevenue * 100) / 100,
-      totalOrders,
-      avgOrderValue: totalOrders > 0 ? Math.round((totalRevenue / totalOrders) * 100) / 100 : 0,
-      revenueByDay: Object.values(revenueByDay).sort((a, b) => a.date.localeCompare(b.date)),
-      popularItems,
-      busyHours,
-      ordersByType: ordersByTypeArray
-    };
-
-    // Generate AI insights
-    const insights = generateAIInsights({
-      restaurants,
-      orders: allOrders,
-      analytics,
-      period: '7d',
-      staffCount,
-      lowStockCount,
-      outOfStockCount
-    });
-
-    // Get owner name from user data
     const ownerName = req.user.name || req.user.displayName || 'Restaurant Owner';
 
-    // Send email using emailService
-    const emailResult = await emailService.sendAIInsightsReport({
-      ownerEmail: email,
-      ownerName: ownerName,
-      insights: insights,
-      analytics: analytics,
-      restaurantCount: restaurants.length
-    });
+    // Send to all recipients
+    for (const recipientEmail of recipients) {
+      await emailService.sendAIInsightsReport({
+        ownerEmail: recipientEmail,
+        ownerName,
+        insights: reportData.insights,
+        analytics: reportData.analytics,
+        restaurantCount: reportData.restaurantCount
+      });
+    }
 
-    console.log(`✅ AI Insights report sent to: ${email}`);
+    console.log(`✅ AI Insights report sent to: ${recipients.join(', ')}`);
 
     res.json({
       success: true,
-      message: `AI Insights report sent successfully to ${email}`,
-      emailId: emailResult.messageId
+      message: `AI Insights report sent successfully to ${recipients.join(', ')}`
     });
 
   } catch (error) {
@@ -911,4 +940,6 @@ async function generateDailyReport(userId, period = 'today') {
   };
 }
 
+// Export router as default, plus helper for cron job
 module.exports = router;
+module.exports.generateReportForOwner = generateReportForOwner;

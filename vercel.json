@@ -1,6 +1,12 @@
 {
   "version": 2,
   "regions": ["bom1"],
+  "crons": [
+    {
+      "path": "/api/cron/send-daily-reports",
+      "schedule": "0 * * * *"
+    }
+  ],
   "builds": [
     {
       "src": "index.js",

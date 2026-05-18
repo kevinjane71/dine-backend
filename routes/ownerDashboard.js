@@ -57,6 +57,9 @@ router.get('/dashboard', authenticateToken, requireOwnerRole, async (req, res) =
     // Get date range based on period parameter
     const { period = 'today', startDate, endDate } = req.query;
     const now = new Date();
+    // IST timezone helpers (UTC+5:30)
+    const IST_OFFSET = 5.5 * 60 * 60 * 1000;
+    const toIST = (date) => new Date(date.getTime() + IST_OFFSET);
     let dateStart, dateEnd;
 
     if (startDate && endDate) {
@@ -71,10 +74,12 @@ router.get('/dashboard', authenticateToken, requireOwnerRole, async (req, res) =
       dateEnd.setHours(23, 59, 59, 999);
 
       switch (period) {
-        case 'today':
-          dateStart = new Date(now);
-          dateStart.setHours(0, 0, 0, 0);
+        case 'today': {
+          // Midnight IST (UTC+5:30)
+          const istNow = toIST(now);
+          dateStart = new Date(Date.UTC(istNow.getUTCFullYear(), istNow.getUTCMonth(), istNow.getUTCDate()) - IST_OFFSET);
           break;
+        }
         case '7d':
           dateStart = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
           dateStart.setHours(0, 0, 0, 0);
@@ -236,6 +241,10 @@ router.get('/dashboard', authenticateToken, requireOwnerRole, async (req, res) =
  */
 router.get('/analytics', authenticateToken, requireOwnerRole, async (req, res) => {
   try {
+    // IST timezone helpers (UTC+5:30)
+    const IST_OFFSET = 5.5 * 60 * 60 * 1000;
+    const toIST = (date) => new Date(date.getTime() + IST_OFFSET);
+
     const userId = getOwnerId(req);
     const { period = '7d', startDate, endDate } = req.query;
     let restaurantIds = req.query.restaurantIds || req.query['restaurantIds[]'];
@@ -294,10 +303,12 @@ router.get('/analytics', authenticateToken, requireOwnerRole, async (req, res) =
       dateEnd = new Date(endDate);
     } else {
       switch (period) {
-        case 'today':
-          dateStart = new Date(now);
-          dateStart.setHours(0, 0, 0, 0);
+        case 'today': {
+          // Midnight IST (UTC+5:30)
+          const istNow = toIST(now);
+          dateStart = new Date(Date.UTC(istNow.getUTCFullYear(), istNow.getUTCMonth(), istNow.getUTCDate()) - IST_OFFSET);
           break;
+        }
         case '7d':
           dateStart = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
           break;
@@ -417,9 +428,10 @@ router.get('/analytics', authenticateToken, requireOwnerRole, async (req, res) =
       const orderDate = order.createdAt?.toDate ? order.createdAt.toDate() : new Date(order.createdAt);
       let dateKey;
       if (isToday) {
-        // Group by hour — use ISO string with hour to keep sortable
-        const hour = orderDate.getHours();
-        const dayStr = orderDate.toISOString().split('T')[0];
+        // Group by hour in IST — use ISO string with hour to keep sortable
+        const istDate = toIST(orderDate);
+        const hour = istDate.getUTCHours();
+        const dayStr = istDate.toISOString().split('T')[0];
         dateKey = `${dayStr}T${String(hour).padStart(2, '0')}:00:00`;
       } else {
         dateKey = orderDate.toISOString().split('T')[0];
@@ -455,11 +467,12 @@ router.get('/analytics', authenticateToken, requireOwnerRole, async (req, res) =
       .sort((a, b) => b.orders - a.orders)
       .slice(0, 10);
 
-    // Calculate busy hours
+    // Calculate busy hours (in IST)
     const hourCounts = {};
     allOrders.forEach(order => {
       const orderDate = order.createdAt?.toDate ? order.createdAt.toDate() : new Date(order.createdAt);
-      const hour = orderDate.getHours();
+      const istDate = toIST(orderDate);
+      const hour = istDate.getUTCHours();
       const hourStr = `${hour.toString().padStart(2, '0')}:00`;
       hourCounts[hourStr] = (hourCounts[hourStr] || 0) + 1;
     });
@@ -488,7 +501,8 @@ router.get('/analytics', authenticateToken, requireOwnerRole, async (req, res) =
       const prevHourly = {};
       prevAllOrders.forEach(order => {
         const orderDate = order.createdAt?.toDate ? order.createdAt.toDate() : new Date(order.createdAt);
-        const hour = String(orderDate.getHours()).padStart(2, '0');
+        const istDate = toIST(orderDate);
+        const hour = String(istDate.getUTCHours()).padStart(2, '0');
         if (!prevHourly[hour]) prevHourly[hour] = { hour, revenue: 0, orders: 0 };
         prevHourly[hour].revenue += (order.totalAmount || order.finalAmount || 0);
         prevHourly[hour].orders += 1;

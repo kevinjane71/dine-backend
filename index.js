@@ -8473,6 +8473,7 @@ app.post('/api/orders', async (req, res) => {
       manualDiscount,
       redeemLoyaltyPoints,
       pricingRuleId,
+      assignedStaff,
     } = req.body;
 
     // Billing feature fields
@@ -9066,6 +9067,7 @@ app.post('/api/orders', async (req, res) => {
         waiterName: 'Customer Self-Order',
         kitchenNotes: 'Direct customer order'
       } : (staffInfo || null),
+      assignedStaff: assignedStaff || null,
       notes: notes || (orderType === 'customer_self_order' ? `Customer self-order from seat ${seatNumber || 'Walk-in'}` : ''),
       specialInstructions: specialInstructions || null, // Kitchen special instructions
       status: req.body.status || 'confirmed',
@@ -9086,6 +9088,26 @@ app.post('/api/orders', async (req, res) => {
       createdAt: new Date(),
       updatedAt: new Date()
     };
+
+    // Auto-create staff member if assignedStaff has a name but no id
+    if (assignedStaff?.name && !assignedStaff?.id) {
+      try {
+        const existingStaff = await db.collection('staffUsers')
+          .where('restaurantId', '==', restaurantId)
+          .where('name', '==', assignedStaff.name)
+          .limit(1).get();
+        if (existingStaff.empty) {
+          const staffRef = db.collection('staffUsers').doc();
+          await staffRef.set({
+            name: assignedStaff.name, restaurantId, role: 'waiter',
+            status: 'active', createdAt: new Date().toISOString(),
+          });
+          orderData.assignedStaff = { name: assignedStaff.name, id: staffRef.id };
+        } else {
+          orderData.assignedStaff = { name: assignedStaff.name, id: existingStaff.docs[0].id };
+        }
+      } catch (e) { console.error('Auto-create staff failed:', e); }
+    }
 
     // Dashboard-originated orders send pre-calculated billing values that the
     // frontend has already shown to the user. When these are present, override
@@ -11503,7 +11525,8 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
       specialInstructions,
       updatedAt,
       lastUpdatedBy,
-      skipKOT
+      skipKOT,
+      assignedStaff
     } = req.body;
 
     // Granular permission check: determine operation type
@@ -11710,6 +11733,7 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
     if (customerInfo) updateData.customerInfo = customerInfo;
     if (specialInstructions !== undefined) updateData.specialInstructions = specialInstructions;
     if (lastUpdatedBy) updateData.lastUpdatedBy = lastUpdatedBy;
+    if (assignedStaff !== undefined) updateData.assignedStaff = assignedStaff;
 
     // Billing feature fields
     if (req.body.serviceChargeRate !== undefined) updateData.serviceChargeRate = req.body.serviceChargeRate;
@@ -16566,6 +16590,74 @@ app.get('/api/utils/image-to-base64', authenticateToken, async (req, res) => {
 // ==================== AI INSIGHTS & DAILY REPORTS ====================
 // AI-powered analytics and automated email reports
 app.use('/api/ai', aiInsightsRoutes);
+
+// ==================== CRON JOBS ====================
+// Vercel Cron — runs hourly, sends daily reports to owners at their preferred time
+app.get('/api/cron/send-daily-reports', async (req, res) => {
+  try {
+    // Verify Vercel cron secret
+    const authHeader = req.headers.authorization;
+    if (authHeader !== `Bearer ${process.env.CRON_SECRET}`) {
+      return res.status(401).json({ error: 'Unauthorized' });
+    }
+
+    const currentUTCHour = new Date().getUTCHours();
+    console.log(`⏰ Cron: checking daily reports for UTC hour ${currentUTCHour}`);
+
+    // Query all owners who want reports at this UTC hour
+    const prefsSnap = await db.collection('ownerPreferences')
+      .where('emailEnabled', '==', true)
+      .where('reportTimeUTC', '==', currentUTCHour)
+      .get();
+
+    if (prefsSnap.empty) {
+      return res.json({ success: true, message: 'No reports to send this hour', sent: 0 });
+    }
+
+    let sent = 0;
+    let errors = 0;
+
+    for (const prefDoc of prefsSnap.docs) {
+      try {
+        const prefs = prefDoc.data();
+        const userId = prefDoc.id;
+        const recipients = prefs.reportEmails || (prefs.reportEmail ? [prefs.reportEmail] : []);
+        if (recipients.length === 0) continue;
+
+        // Get owner's name
+        const userDoc = await db.collection('users').doc(userId).get();
+        const ownerName = userDoc.exists ? (userDoc.data().name || userDoc.data().displayName || 'Restaurant Owner') : 'Restaurant Owner';
+
+        // Generate report using the exported function
+        const reportData = await aiInsightsRoutes.generateReportForOwner(userId);
+        if (!reportData) continue;
+
+        // Send to all recipient emails
+        for (const email of recipients) {
+          await emailService.sendAIInsightsReport({
+            ownerEmail: email,
+            ownerName,
+            insights: reportData.insights,
+            analytics: reportData.analytics,
+            restaurantCount: reportData.restaurantCount
+          });
+        }
+
+        console.log(`✅ Cron: sent daily report to ${recipients.join(', ')} for user ${userId}`);
+        sent++;
+      } catch (err) {
+        console.error(`❌ Cron email error for user ${prefDoc.id}:`, err.message);
+        errors++;
+      }
+    }
+
+    console.log(`⏰ Cron complete: sent=${sent}, errors=${errors}, checked=${prefsSnap.size}`);
+    res.json({ success: true, sent, errors, checked: prefsSnap.size });
+  } catch (error) {
+    console.error('Cron send-daily-reports error:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
 
 // ==================== SUPER ADMIN (internal dashboard) ====================
 app.use('/api/super-admin', superAdminRoutes);
