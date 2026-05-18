@@ -27,7 +27,117 @@ function notifyPaymentStatus(data) {
 
 // Initialize routes using shared database instance
 const initializePaymentRoutes = (db, razorpay) => {
-  // 1. Create Order API
+  // Razorpay plan ID mapping from environment variables
+  const RAZORPAY_PLANS = {
+    'starter-monthly': process.env.RAZORPAY_PLAN_STARTER_MONTHLY,
+    'starter-yearly': process.env.RAZORPAY_PLAN_STARTER_ANNUAL,
+    'growth-monthly': process.env.RAZORPAY_PLAN_GROWTH_MONTHLY,
+    'growth-yearly': process.env.RAZORPAY_PLAN_GROWTH_ANNUAL,
+    'pro-monthly': process.env.RAZORPAY_PLAN_PRO_MONTHLY,
+    'pro-yearly': process.env.RAZORPAY_PLAN_PRO_ANNUAL,
+  };
+
+  // 1. Create Subscription API (replaces create-order for recurring plans)
+  router.post('/create-subscription', async (req, res) => {
+    try {
+      if (!razorpay) {
+        return res.status(503).json({
+          success: false,
+          error: 'Payment service unavailable - Razorpay not configured'
+        });
+      }
+
+      const { planId, email, userId, phone, shopId } = req.body;
+
+      // Validate required fields
+      if (!planId || !email || !userId) {
+        return res.status(400).json({
+          success: false,
+          error: 'Missing required fields: planId, email, and userId are required'
+        });
+      }
+
+      const razorpayPlanId = RAZORPAY_PLANS[planId];
+      if (!razorpayPlanId) {
+        return res.status(400).json({
+          success: false,
+          error: `Invalid plan ID: ${planId}. Available plans: ${Object.keys(RAZORPAY_PLANS).join(', ')}`
+        });
+      }
+
+      console.log('[PAYMENT] Creating subscription:', { planId, razorpayPlanId, email, userId });
+
+      // Cancel any existing active Razorpay subscription for this user
+      try {
+        const userDoc = await db.collection('dine_user_data').doc(userId).get();
+        if (userDoc.exists) {
+          const existingSub = userDoc.data()?.subscription;
+          if (existingSub?.razorpaySubscriptionId && existingSub?.status === 'active' && existingSub?.autoRenew) {
+            console.log('[PAYMENT] Cancelling existing subscription:', existingSub.razorpaySubscriptionId);
+            try {
+              await razorpay.subscriptions.cancel(existingSub.razorpaySubscriptionId, { cancel_at_cycle_end: false });
+            } catch (cancelErr) {
+              console.warn('[PAYMENT] Could not cancel old subscription:', cancelErr.message);
+            }
+          }
+        }
+      } catch (e) {
+        console.warn('[PAYMENT] Error checking existing subscription:', e.message);
+      }
+
+      // Create Razorpay subscription
+      const subscription = await razorpay.subscriptions.create({
+        plan_id: razorpayPlanId,
+        total_count: planId.includes('yearly') ? 10 : 120, // max billing cycles
+        quantity: 1,
+        customer_notify: 1,
+        notes: {
+          planId,
+          email,
+          userId,
+          phone: phone || '',
+          shopId: shopId || '',
+          app: 'Dine'
+        }
+      });
+
+      // Store subscription record in database
+      const subData = {
+        subscriptionId: subscription.id,
+        razorpayPlanId,
+        planId,
+        email,
+        userId,
+        app: 'Dine',
+        status: 'created',
+        createdAt: new Date()
+      };
+      if (phone) subData.phone = phone;
+      if (shopId) subData.shopId = shopId;
+
+      await db.collection('dine_subscriptions').doc(subscription.id).set(subData);
+
+      res.json({
+        success: true,
+        subscription: {
+          id: subscription.id,
+          plan_id: subscription.plan_id,
+          status: subscription.status,
+          short_url: subscription.short_url
+        }
+      });
+
+    } catch (error) {
+      console.error('[PAYMENT] Subscription creation error:', error);
+      res.status(500).json({
+        success: false,
+        error: 'Failed to create subscription',
+        details: error.message
+      });
+    }
+  });
+
+  // 1b. Legacy Create Order API (kept for backward compatibility)
   router.post('/create-order', async (req, res) => {
     try {
       if (!razorpay) {
@@ -36,9 +146,9 @@ const initializePaymentRoutes = (db, razorpay) => {
           error: 'Payment service unavailable - Razorpay not configured'
         });
       }
-      
+
       const { amount, currency = 'INR', planId, email, userId, phone, shopId } = req.body;
-      
+
       // Validate required fields
       if (!amount || !planId || !email || !userId) {
         return res.status(400).json({
@@ -46,7 +156,7 @@ const initializePaymentRoutes = (db, razorpay) => {
           error: 'Missing required fields: amount, planId, email, and userId are required'
         });
       }
-      
+
       const amountInPaise = Math.round(Number(amount) * 100);
 
       console.log('[PAYMENT] Creating order with amount:', {
@@ -86,15 +196,15 @@ const initializePaymentRoutes = (db, razorpay) => {
         status: 'created',
         createdAt: new Date()
       };
-      
+
       // Only add optional fields if they have values
       if (phone) orderData.phone = phone;
       if (shopId) orderData.shopId = shopId;
-      
+
       await db.collection('dine_orders').doc(order.id).set(orderData);
 
-      res.json({ 
-        success: true, 
+      res.json({
+        success: true,
         order: {
           id: order.id,
           amount: order.amount,
@@ -104,15 +214,15 @@ const initializePaymentRoutes = (db, razorpay) => {
 
     } catch (error) {
       console.error('[PAYMENT] Order creation error:', error);
-      res.status(500).json({ 
-        success: false, 
+      res.status(500).json({
+        success: false,
         error: 'Failed to create order',
         details: error.message
       });
     }
   });
 
-  // 2. Verify Payment API - Updated for Offline/Manual Payments
+  // 2. Verify Payment API - Updated for Subscriptions + Offline/Manual Payments
   router.post('/verify', async (req, res) => {
     try {
       const {
@@ -122,7 +232,9 @@ const initializePaymentRoutes = (db, razorpay) => {
         userId,
         restaurantId,
         planId,
-        // Razorpay fields
+        // Razorpay subscription fields
+        razorpay_subscription_id,
+        // Razorpay order fields (legacy)
         razorpay_order_id,
         razorpay_payment_id,
         razorpay_signature
@@ -135,10 +247,117 @@ const initializePaymentRoutes = (db, razorpay) => {
         userId,
         restaurantId,
         planId,
+        hasSubscriptionData: !!(razorpay_subscription_id && razorpay_payment_id && razorpay_signature),
         hasRazorpayData: !!(razorpay_order_id && razorpay_payment_id && razorpay_signature)
       });
 
-      // Handle Razorpay subscription payments FIRST (check for razorpay fields)
+      // Handle Razorpay SUBSCRIPTION payments
+      if (razorpay_subscription_id && razorpay_payment_id && razorpay_signature) {
+        // Verify subscription signature: HMAC-SHA256(payment_id + "|" + subscription_id, key_secret)
+        const shasum = crypto.createHmac('sha256', process.env.RAZORPAY_KEY_SECRET);
+        shasum.update(`${razorpay_payment_id}|${razorpay_subscription_id}`);
+        const digest = shasum.digest('hex');
+
+        if (digest !== razorpay_signature) {
+          console.error('[PAYMENT] Subscription signature mismatch:', { razorpay_subscription_id, razorpay_payment_id });
+
+          notifyPaymentStatus({
+            status: 'failed',
+            planId: planId || 'unknown',
+            amount: 0,
+            currency: 'INR',
+            userId: userId || 'unknown',
+            email: '',
+            gateway: 'Razorpay',
+            paymentId: razorpay_payment_id,
+            orderId: razorpay_subscription_id,
+            reason: 'Subscription signature mismatch — possible tampering'
+          });
+
+          return res.status(400).json({
+            success: false,
+            error: 'Invalid payment signature'
+          });
+        }
+
+        // Get subscription details from database
+        const subDoc = await db.collection('dine_subscriptions').doc(razorpay_subscription_id).get();
+        let subData = {};
+        if (subDoc.exists) {
+          subData = subDoc.data();
+        } else {
+          console.warn('[PAYMENT] Subscription not found in dine_subscriptions, using request data');
+          subData = { planId, userId, email: '', app: 'Dine' };
+        }
+
+        const subUserId = subData.userId || userId;
+        const subPlanId = subData.planId || planId;
+        const subEmail = subData.email || '';
+
+        // Create payment record
+        const paymentRef = db.collection('dine_payments').doc(razorpay_payment_id);
+        const paymentDoc = {
+          subscriptionId: razorpay_subscription_id,
+          paymentId: razorpay_payment_id,
+          signature: razorpay_signature,
+          planId: subPlanId,
+          email: subEmail,
+          userId: subUserId,
+          amount: subData.amount || getPlanPricing(subPlanId).amount * 100,
+          currency: 'INR',
+          app: 'Dine',
+          status: 'verified',
+          type: 'subscription',
+          verifiedAt: new Date()
+        };
+        if (subData.phone) paymentDoc.phone = subData.phone;
+        await paymentRef.set(paymentDoc);
+
+        // Update subscription record
+        await db.collection('dine_subscriptions').doc(razorpay_subscription_id).update({
+          status: 'active',
+          paymentId: razorpay_payment_id,
+          activatedAt: new Date(),
+          updatedAt: new Date()
+        });
+
+        // Activate the user's subscription
+        if (subUserId && subPlanId) {
+          try {
+            await updateUserSubscription(db, subUserId, subEmail, subPlanId, { razorpaySubscriptionId: razorpay_subscription_id });
+            console.log('[PAYMENT] Subscription activated via verify:', { userId: subUserId, planId: subPlanId, subscriptionId: razorpay_subscription_id });
+          } catch (subError) {
+            console.error('[PAYMENT] Failed to activate subscription (will retry via webhook):', subError);
+          }
+        }
+
+        notifyPaymentStatus({
+          status: 'success',
+          planId: subPlanId,
+          amount: getPlanPricing(subPlanId).amount,
+          currency: 'INR',
+          userId: subUserId,
+          email: subEmail,
+          gateway: 'Razorpay (Subscription)',
+          paymentId: razorpay_payment_id,
+          orderId: razorpay_subscription_id
+        });
+
+        return res.json({
+          success: true,
+          message: 'Subscription payment verified successfully',
+          data: {
+            planId: subPlanId,
+            paymentId: razorpay_payment_id,
+            subscriptionId: razorpay_subscription_id,
+            email: subEmail,
+            userId: subUserId,
+            app: 'Dine'
+          }
+        });
+      }
+
+      // Handle Razorpay ONE-TIME order payments (legacy)
       if (razorpay_order_id && razorpay_payment_id && razorpay_signature) {
         // Verify signature
         const shasum = crypto.createHmac('sha256', process.env.RAZORPAY_KEY_SECRET);
@@ -148,7 +367,6 @@ const initializePaymentRoutes = (db, razorpay) => {
         if (digest !== razorpay_signature) {
           console.error('[PAYMENT] Razorpay signature mismatch:', { razorpay_order_id, razorpay_payment_id });
 
-          // Send failure email (non-blocking, never breaks flow)
           notifyPaymentStatus({
             status: 'failed',
             planId: planId || 'unknown',
@@ -356,9 +574,9 @@ const initializePaymentRoutes = (db, razorpay) => {
     }
   });
 
-  // 3. Webhook Handler for automated payment notifications
-  router.post('/webhook', 
-    express.raw({ type: 'application/json' }), 
+  // 3. Webhook Handler for automated payment & subscription notifications
+  router.post('/webhook',
+    express.raw({ type: 'application/json' }),
     async (req, res) => {
       try {
         // Verify webhook signature
@@ -372,57 +590,213 @@ const initializePaymentRoutes = (db, razorpay) => {
         }
 
         const event = req.body.event;
-        const payment = req.body.payload.payment?.entity;
-        
-        if (!payment) {
-          return res.status(400).json({ error: 'Invalid payment data in webhook' });
+        console.log(`[PAYMENT] Webhook received: ${event}`);
+
+        // Store all webhook events
+        const webhookDoc = {
+          fullPayload: req.body,
+          webhookReceivedAt: new Date(),
+          event,
+          app: 'Dine'
+        };
+        await db.collection('dine_webhook_events').add(webhookDoc);
+
+        // ── Handle SUBSCRIPTION events ──
+        if (event.startsWith('subscription.')) {
+          const subscription = req.body.payload.subscription?.entity;
+          if (!subscription) {
+            return res.status(200).json({ status: 'ok', message: 'No subscription entity' });
+          }
+
+          const subNotes = subscription.notes || {};
+          if (subNotes.app !== 'Dine') {
+            console.log(`[PAYMENT] Ignoring subscription webhook for app: ${subNotes.app}`);
+            return res.json({ status: 'ok', message: 'Not for Dine' });
+          }
+
+          const subId = subscription.id;
+          const subUserId = subNotes.userId;
+          const subPlanId = subNotes.planId;
+          const subEmail = subNotes.email || '';
+
+          console.log(`[PAYMENT] Subscription webhook: ${event}`, { subId, subUserId, subPlanId });
+
+          switch (event) {
+            case 'subscription.activated': {
+              // First payment successful — activate subscription
+              if (subUserId && subPlanId) {
+                await updateUserSubscription(db, subUserId, subEmail, subPlanId, { razorpaySubscriptionId: subId });
+              }
+              await db.collection('dine_subscriptions').doc(subId).set({
+                status: 'active', activatedAt: new Date(), updatedAt: new Date()
+              }, { merge: true });
+              console.log(`[PAYMENT] Subscription activated: ${subId} for user ${subUserId}`);
+              break;
+            }
+
+            case 'subscription.charged': {
+              // Recurring payment successful — extend subscription
+              const payment = req.body.payload.payment?.entity;
+              if (subUserId && subPlanId) {
+                await updateUserSubscription(db, subUserId, subEmail, subPlanId, { razorpaySubscriptionId: subId });
+                console.log(`[PAYMENT] Subscription renewed: ${subId} for user ${subUserId}`);
+              }
+              // Record payment
+              if (payment) {
+                await db.collection('dine_payments').doc(payment.id).set({
+                  subscriptionId: subId,
+                  paymentId: payment.id,
+                  planId: subPlanId,
+                  email: subEmail,
+                  userId: subUserId,
+                  amount: payment.amount,
+                  currency: payment.currency || 'INR',
+                  status: 'captured',
+                  type: 'subscription_renewal',
+                  app: 'Dine',
+                  webhookAt: new Date()
+                });
+              }
+              await db.collection('dine_subscriptions').doc(subId).set({
+                status: 'active', lastChargedAt: new Date(), updatedAt: new Date()
+              }, { merge: true });
+              break;
+            }
+
+            case 'subscription.pending': {
+              // Payment attempt pending
+              console.log(`[PAYMENT] Subscription payment pending: ${subId}`);
+              await db.collection('dine_subscriptions').doc(subId).set({
+                status: 'pending', updatedAt: new Date()
+              }, { merge: true });
+              break;
+            }
+
+            case 'subscription.halted': {
+              // Payment failed after all retries — downgrade user
+              console.error(`[PAYMENT] Subscription halted (payment failed): ${subId} for user ${subUserId}`);
+              if (subUserId) {
+                await db.collection('dine_user_data').doc(subUserId).update({
+                  'subscription.status': 'halted',
+                  'subscription.autoRenew': false,
+                  'subscription.lastUpdated': new Date().toISOString()
+                });
+              }
+              await db.collection('dine_subscriptions').doc(subId).set({
+                status: 'halted', updatedAt: new Date()
+              }, { merge: true });
+
+              notifyPaymentStatus({
+                status: 'failed',
+                planId: subPlanId,
+                amount: 0,
+                currency: 'INR',
+                userId: subUserId,
+                email: subEmail,
+                gateway: 'Razorpay (Subscription)',
+                paymentId: '',
+                orderId: subId,
+                reason: 'Subscription halted — payment failed after retries'
+              });
+              break;
+            }
+
+            case 'subscription.cancelled': {
+              console.log(`[PAYMENT] Subscription cancelled: ${subId} for user ${subUserId}`);
+              if (subUserId) {
+                await db.collection('dine_user_data').doc(subUserId).update({
+                  'subscription.status': 'cancelled',
+                  'subscription.autoRenew': false,
+                  'subscription.cancelledAt': new Date().toISOString(),
+                  'subscription.lastUpdated': new Date().toISOString()
+                });
+              }
+              await db.collection('dine_subscriptions').doc(subId).set({
+                status: 'cancelled', cancelledAt: new Date(), updatedAt: new Date()
+              }, { merge: true });
+              break;
+            }
+
+            case 'subscription.completed': {
+              // All billing cycles done
+              console.log(`[PAYMENT] Subscription completed: ${subId} for user ${subUserId}`);
+              if (subUserId) {
+                await db.collection('dine_user_data').doc(subUserId).update({
+                  'subscription.status': 'expired',
+                  'subscription.autoRenew': false,
+                  'subscription.lastUpdated': new Date().toISOString()
+                });
+              }
+              await db.collection('dine_subscriptions').doc(subId).set({
+                status: 'completed', completedAt: new Date(), updatedAt: new Date()
+              }, { merge: true });
+              break;
+            }
+
+            case 'subscription.paused': {
+              console.log(`[PAYMENT] Subscription paused: ${subId}`);
+              if (subUserId) {
+                await db.collection('dine_user_data').doc(subUserId).update({
+                  'subscription.status': 'paused',
+                  'subscription.lastUpdated': new Date().toISOString()
+                });
+              }
+              break;
+            }
+
+            case 'subscription.resumed': {
+              console.log(`[PAYMENT] Subscription resumed: ${subId}`);
+              if (subUserId) {
+                await db.collection('dine_user_data').doc(subUserId).update({
+                  'subscription.status': 'active',
+                  'subscription.lastUpdated': new Date().toISOString()
+                });
+              }
+              break;
+            }
+
+            default:
+              console.log(`[PAYMENT] Unhandled subscription event: ${event}`);
+          }
+
+          return res.json({ status: 'ok', message: `Subscription webhook ${event} processed` });
         }
 
-        // FIRST check if this webhook is for Dine by examining the order notes
+        // ── Handle PAYMENT events (legacy one-time orders) ──
+        const payment = req.body.payload.payment?.entity;
+
+        if (!payment) {
+          return res.status(200).json({ status: 'ok', message: 'No payment entity in webhook' });
+        }
+
         try {
           const orderInfo = await razorpay.orders.fetch(payment.order_id);
           const appName = orderInfo.notes?.app || 'Unknown';
-          
+
           // If this webhook is not for Dine, acknowledge it and return immediately
           if (appName !== 'Dine') {
             console.log(`[PAYMENT] Ignoring webhook for app: ${appName}, not for Dine`);
-            return res.json({ 
-              status: 'ok', 
+            return res.json({
+              status: 'ok',
               message: 'Webhook acknowledged but ignored - not for Dine'
             });
           }
-          
+
           console.log(`[PAYMENT] Processing webhook for Dine:`, {
             paymentId: payment.id,
             orderId: payment.order_id,
             status: payment.status,
             event: event
           });
-          
-          // Create webhook record
-          const webhookDoc = {
-            fullPayload: req.body,
-            webhookReceivedAt: new Date(),
-            event,
-            orderId: payment.order_id,
-            paymentId: payment.id,
-            status: payment.status || null,
-            amount: payment.amount,
-            currency: payment.currency,
-            app: 'Dine'
-          };
-
-          // Store in dine_webhook_events collection
-          await db.collection('dine_webhook_events').add(webhookDoc);
 
           // Handle specific events for Dine app
           if (event === 'payment.captured' || event === 'payment.authorized') {
             // Get order details
             const orderDoc = await db.collection('dine_orders').doc(payment.order_id).get();
-            
+
             if (orderDoc.exists) {
               const orderData = orderDoc.data();
-              
+
               // Update order status if it's not already paid
               if (orderData.status !== 'paid') {
                 await db.collection('dine_orders').doc(payment.order_id).update({
@@ -434,9 +808,9 @@ const initializePaymentRoutes = (db, razorpay) => {
 
               // Create or update payment record
               const paymentRef = db.collection('dine_payments').doc(payment.id);
-              const paymentDoc = await paymentRef.get();
-              
-              if (!paymentDoc.exists) {
+              const paymentDocCheck = await paymentRef.get();
+
+              if (!paymentDocCheck.exists) {
                 const webhookPaymentDoc = {
                   orderId: payment.order_id,
                   paymentId: payment.id,
@@ -449,11 +823,10 @@ const initializePaymentRoutes = (db, razorpay) => {
                   app: 'Dine',
                   webhookAt: new Date()
                 };
-                
-                // Only add optional fields if they have values
+
                 if (orderData.phone) webhookPaymentDoc.phone = orderData.phone;
                 if (orderData.shopId) webhookPaymentDoc.shopId = orderData.shopId;
-                
+
                 await paymentRef.set(webhookPaymentDoc);
               }
 
@@ -464,13 +837,12 @@ const initializePaymentRoutes = (db, razorpay) => {
               console.log(`[PAYMENT] Order ${payment.order_id} not found for webhook ${event}`);
             }
           }
-          
+
           // Send success response
           return res.json({ status: 'ok', message: 'Webhook processed successfully for Dine' });
-          
+
         } catch (orderError) {
           console.error('[PAYMENT] Failed to fetch order details:', orderError);
-          // Always return 200 to prevent infinite retries
           return res.status(200).json({
             status: 'ok',
             error: 'Error determining app ownership - logged'
@@ -1047,21 +1419,90 @@ const initializePaymentRoutes = (db, razorpay) => {
     }
   });
 
+  // 12. Cancel Razorpay Subscription
+  router.post('/cancel-subscription', async (req, res) => {
+    try {
+      const { userId } = req.body;
+
+      if (!userId) {
+        return res.status(400).json({ success: false, error: 'User ID is required' });
+      }
+
+      // Get user's subscription data
+      const userDoc = await db.collection('dine_user_data').doc(userId).get();
+      if (!userDoc.exists) {
+        return res.status(404).json({ success: false, error: 'User not found' });
+      }
+
+      const subscription = userDoc.data()?.subscription;
+      if (!subscription?.razorpaySubscriptionId) {
+        // No Razorpay subscription ID — just downgrade to free-trial
+        await db.collection('dine_user_data').doc(userId).update({
+          'subscription.status': 'cancelled',
+          'subscription.autoRenew': false,
+          'subscription.cancelledAt': new Date().toISOString(),
+          'subscription.lastUpdated': new Date().toISOString()
+        });
+        return res.json({ success: true, message: 'Subscription cancelled (no active Razorpay subscription)' });
+      }
+
+      // Cancel on Razorpay — let user keep access until current cycle ends
+      try {
+        await razorpay.subscriptions.cancel(subscription.razorpaySubscriptionId, { cancel_at_cycle_end: true });
+        console.log(`[PAYMENT] Razorpay subscription cancelled: ${subscription.razorpaySubscriptionId}`);
+      } catch (rzpError) {
+        console.error('[PAYMENT] Razorpay cancel error:', rzpError.message);
+        // If subscription is already cancelled/completed on Razorpay, just update locally
+        if (!rzpError.message?.includes('already cancelled') && !rzpError.message?.includes('already completed')) {
+          return res.status(500).json({ success: false, error: 'Failed to cancel on Razorpay: ' + rzpError.message });
+        }
+      }
+
+      // Update local subscription
+      await db.collection('dine_user_data').doc(userId).update({
+        'subscription.status': 'cancelled',
+        'subscription.autoRenew': false,
+        'subscription.cancelledAt': new Date().toISOString(),
+        'subscription.lastUpdated': new Date().toISOString()
+      });
+
+      // Update subscription record
+      try {
+        await db.collection('dine_subscriptions').doc(subscription.razorpaySubscriptionId).update({
+          status: 'cancelled',
+          cancelledAt: new Date(),
+          updatedAt: new Date()
+        });
+      } catch (e) {
+        // Subscription record might not exist
+      }
+
+      res.json({
+        success: true,
+        message: `Subscription cancelled. You'll keep access until ${subscription.endDate ? new Date(subscription.endDate).toLocaleDateString() : 'current period ends'}.`
+      });
+
+    } catch (error) {
+      console.error('[PAYMENT] Cancel subscription error:', error);
+      res.status(500).json({ success: false, error: 'Failed to cancel subscription' });
+    }
+  });
+
   return router;
 };
 
 // Helper function to update user subscription
-async function updateUserSubscription(db, userId, email, planId) {
+async function updateUserSubscription(db, userId, email, planId, extraData = {}) {
   try {
     console.log(`[PAYMENT] Updating subscription for user: ${userId}, plan: ${planId}`);
-    
+
     if (!userId) {
       throw new Error('User ID is required for subscription update');
     }
-    
+
     const userRef = db.collection('dine_user_data').doc(userId);
     const userDoc = await userRef.get();
-    
+
     if (!userDoc.exists) {
       // Try to find by email as fallback
       if (email) {
@@ -1069,13 +1510,13 @@ async function updateUserSubscription(db, userId, email, planId) {
           .where('email', '==', email)
           .limit(1)
           .get();
-        
+
         if (!userByEmailSnapshot.empty) {
           const userFoundByEmail = userByEmailSnapshot.docs[0];
-          return updateUserSubscriptionDoc(userFoundByEmail.ref, planId);
+          return updateUserSubscriptionDoc(userFoundByEmail.ref, planId, extraData);
         }
       }
-      
+
       // User doesn't exist, create a new user document
       console.log(`[PAYMENT] User not found, creating new user document for: ${userId}`);
       const currentDate = new Date();
@@ -1086,16 +1527,16 @@ async function updateUserSubscription(db, userId, email, planId) {
         lastUpdated: currentDate.toISOString(),
         app: 'Dine'
       };
-      
+
       // Create the user document
       await userRef.set(newUserData);
       console.log(`[PAYMENT] Created new user document for: ${userId}`);
-      
+
       // Now update with subscription
-      return updateUserSubscriptionDoc(userRef, planId);
+      return updateUserSubscriptionDoc(userRef, planId, extraData);
     }
-    
-    return updateUserSubscriptionDoc(userRef, planId);
+
+    return updateUserSubscriptionDoc(userRef, planId, extraData);
   } catch (error) {
     console.error('[PAYMENT] Update subscription error:', error);
     throw error;
@@ -1103,7 +1544,7 @@ async function updateUserSubscription(db, userId, email, planId) {
 }
 
 // Helper function to update the user document with subscription data
-async function updateUserSubscriptionDoc(userRef, planId) {
+async function updateUserSubscriptionDoc(userRef, planId, extraData = {}) {
   const currentDate = new Date();
   let endDate = null;
   const isTrial = planId === 'free-trial' || planId === 'starter';
@@ -1111,18 +1552,13 @@ async function updateUserSubscriptionDoc(userRef, planId) {
   // Set end date based on plan
   if (!isTrial) {
     endDate = new Date(currentDate);
-    switch (planId) {
-      case 'yearly':
-      case 'spark-yearly':
-        endDate.setFullYear(endDate.getFullYear() + 1);
-        break;
-      case 'quarterly':
-        endDate.setMonth(endDate.getMonth() + 3);
-        break;
-      case 'monthly':
-      case 'spark-monthly':
-      default:
-        endDate.setMonth(endDate.getMonth() + 1); // Monthly plan
+    const isYearly = planId.includes('yearly') || planId === 'yearly';
+    if (isYearly) {
+      endDate.setFullYear(endDate.getFullYear() + 1);
+    } else if (planId === 'quarterly') {
+      endDate.setMonth(endDate.getMonth() + 3);
+    } else {
+      endDate.setMonth(endDate.getMonth() + 1); // Monthly plan
     }
   }
 
@@ -1141,15 +1577,22 @@ async function updateUserSubscriptionDoc(userRef, planId) {
     currency: planPricing.currency,
     features: planDetails.features,
     paymentGateway: 'razorpay',
+    autoRenew: !isTrial,
     lastUpdated: currentDate.toISOString(),
     app: 'Dine'
   };
+
+  // Store Razorpay subscription ID if provided
+  if (extraData.razorpaySubscriptionId) {
+    subscriptionData.razorpaySubscriptionId = extraData.razorpaySubscriptionId;
+  }
 
   // Preserve trial dates for trial plans, clear them for paid plans
   if (isTrial) {
     subscriptionData.trialStartDate = currentDate.toISOString();
     subscriptionData.trialEndDate = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString();
     subscriptionData.trialDays = 30;
+    subscriptionData.autoRenew = false;
   }
 
   await userRef.update({
@@ -1166,6 +1609,13 @@ function getPlanPricing(planId) {
     'free-trial': { amount: 0, currency: 'INR' },
     'starter': { amount: 0, currency: 'INR' },
     'free': { amount: 0, currency: 'INR' },
+    'starter-monthly': { amount: 299, currency: 'INR' },
+    'starter-yearly': { amount: 3000, currency: 'INR' },
+    'growth-monthly': { amount: 899, currency: 'INR' },
+    'growth-yearly': { amount: 8988, currency: 'INR' },
+    'pro-monthly': { amount: 1799, currency: 'INR' },
+    'pro-yearly': { amount: 17988, currency: 'INR' },
+    // Legacy plan IDs
     'spark-monthly': { amount: 300, currency: 'INR' },
     'spark-yearly': { amount: 2500, currency: 'INR' },
     'basic': { amount: 99, currency: 'INR' },
@@ -1182,6 +1632,30 @@ function getPlanPricing(planId) {
 // Helper function to get plan details
 function getPlanDetails(planId) {
   const plans = {
+    'starter-monthly': {
+      name: 'Starter',
+      features: getFeaturesByPlan('starter-monthly')
+    },
+    'starter-yearly': {
+      name: 'Starter Annual',
+      features: getFeaturesByPlan('starter-monthly')
+    },
+    'growth-monthly': {
+      name: 'Growth',
+      features: getFeaturesByPlan('growth-monthly')
+    },
+    'growth-yearly': {
+      name: 'Growth Annual',
+      features: getFeaturesByPlan('growth-monthly')
+    },
+    'pro-monthly': {
+      name: 'Pro',
+      features: getFeaturesByPlan('pro-monthly')
+    },
+    'pro-yearly': {
+      name: 'Pro Annual',
+      features: getFeaturesByPlan('pro-monthly')
+    },
     'starter': {
       name: 'Starter',
       features: getFeaturesByPlan('starter')
@@ -1238,6 +1712,50 @@ function getPlanDetails(planId) {
 // Helper function to get features by plan
 function getFeaturesByPlan(planId) {
   switch (planId) {
+    case 'pro-monthly':
+    case 'pro-yearly':
+      return {
+        maxProducts: 'unlimited',
+        maxLocations: 'unlimited',
+        maxTransactions: 'unlimited',
+        inventoryTracking: true,
+        multiStore: true,
+        advancedReports: true,
+        prioritySupport: true,
+        backupEnabled: true,
+        staffAccounts: 'unlimited',
+        apiAccess: true,
+        customIntegrations: true,
+        aiAgent: true
+      };
+    case 'growth-monthly':
+    case 'growth-yearly':
+      return {
+        maxProducts: 'unlimited',
+        maxLocations: 5,
+        maxTransactions: 'unlimited',
+        inventoryTracking: true,
+        multiStore: true,
+        advancedReports: true,
+        prioritySupport: true,
+        backupEnabled: true,
+        staffAccounts: 10,
+        aiAgent: true
+      };
+    case 'starter-monthly':
+    case 'starter-yearly':
+      return {
+        maxProducts: 'unlimited',
+        maxLocations: 1,
+        maxTransactions: 'unlimited',
+        inventoryTracking: true,
+        multiStore: false,
+        advancedReports: false,
+        prioritySupport: false,
+        backupEnabled: true,
+        staffAccounts: 3,
+        aiAgent: true
+      };
     case 'enterprise':
       return {
         maxProducts: 'unlimited',
@@ -1267,7 +1785,7 @@ function getFeaturesByPlan(planId) {
       };
     case 'free-trial':
       return {
-        maxProducts: 200,
+        maxProducts: 'unlimited',
         maxLocations: 1,
         maxTransactions: 'unlimited',
         inventoryTracking: true,
@@ -1276,7 +1794,7 @@ function getFeaturesByPlan(planId) {
         prioritySupport: false,
         backupEnabled: false,
         staffAccounts: 1,
-        tableManagement: 100
+        aiAgent: true
       };
     case 'starter':
       return {
