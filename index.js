@@ -189,6 +189,18 @@ function updateDailyStats(restaurantId, order, operation) {
 
     statsRef.set(update, { merge: true })
       .catch(err => console.error('dailyStats update error (non-blocking):', err));
+
+    // Also update sub-restaurant-specific dailyStats if applicable
+    if (order.subRestaurantId) {
+      const subDocId = `${restaurantId}_sub_${order.subRestaurantId}_${dateStr}`;
+      const subStatsRef = db.collection('dailyStats').doc(subDocId);
+      subStatsRef.set({
+        ...update,
+        subRestaurantId: order.subRestaurantId,
+        subRestaurantName: order.subRestaurantName || null,
+      }, { merge: true })
+        .catch(err => console.error('sub-restaurant dailyStats error (non-blocking):', err));
+    }
   } catch (err) {
     console.error('dailyStats helper error (non-blocking):', err);
   }
@@ -218,6 +230,18 @@ function updateDailyStatsRevenueDiff(restaurantId, order, oldAmount, newAmount, 
 
     statsRef.set(update, { merge: true })
       .catch(err => console.error('dailyStats revenue diff error (non-blocking):', err));
+
+    // Also update sub-restaurant-specific dailyStats if applicable
+    if (order.subRestaurantId) {
+      const subDocId = `${restaurantId}_sub_${order.subRestaurantId}_${dateStr}`;
+      const subStatsRef = db.collection('dailyStats').doc(subDocId);
+      subStatsRef.set({
+        ...update,
+        subRestaurantId: order.subRestaurantId,
+        subRestaurantName: order.subRestaurantName || null,
+      }, { merge: true })
+        .catch(err => console.error('sub-restaurant dailyStats revenueDiff error (non-blocking):', err));
+    }
   } catch (err) {
     console.error('dailyStats revenueDiff helper error (non-blocking):', err);
   }
@@ -962,6 +986,7 @@ const customerGroupsRoutes = require('./routes/customerGroups');
 const aiInsightsRoutes = require('./routes/aiInsights');
 const superAdminRoutes = require('./routes/superAdmin');
 const publicToolsRoutes = require('./routes/publicTools');
+const feedbackRoutes = require('./routes/feedback');
 
 // Invoice Module
 const initializeInvoiceRoutes = require('./invoice');
@@ -1406,26 +1431,39 @@ async function findStaffByLogin(identifier) {
 
 // Get all staff for a restaurant from both collections
 async function getStaffForRestaurant(restaurantId) {
-  const staffRoles = ['waiter', 'manager', 'employee', 'cashier', 'sales'];
-  const results = [];
+  const staffRoles = ['waiter', 'manager', 'employee', 'cashier', 'sales', 'admin'];
+  const resultMap = new Map(); // deduplicate by ID
 
-  // From staffUsers (new)
+  // From staffUsers (new) — primary restaurantId
   const newStaff = await db.collection(collections.staffUsers)
     .where('restaurantId', '==', restaurantId).get();
-  newStaff.forEach(doc => results.push({ id: doc.id, ...doc.data(), _collection: 'staffUsers' }));
+  newStaff.forEach(doc => resultMap.set(doc.id, { id: doc.id, ...doc.data(), _collection: 'staffUsers' }));
 
-  // From users (legacy)
+  // From users (legacy) — primary restaurantId
   const oldStaff = await db.collection(collections.users)
     .where('restaurantId', '==', restaurantId).get();
   oldStaff.forEach(doc => {
     const d = doc.data();
     const role = (d.role || '').toLowerCase();
-    if (staffRoles.includes(role)) {
-      results.push({ id: doc.id, ...d, _collection: 'users' });
+    if (staffRoles.includes(role) && !resultMap.has(doc.id)) {
+      resultMap.set(doc.id, { id: doc.id, ...d, _collection: 'users' });
     }
   });
 
-  return results;
+  // From userRestaurants junction table — staff assigned to this restaurant but primary is elsewhere
+  const junctionDocs = await db.collection(collections.userRestaurants)
+    .where('restaurantId', '==', restaurantId).get();
+  for (const jDoc of junctionDocs.docs) {
+    const userId = jDoc.data().userId;
+    if (resultMap.has(userId)) continue; // already found via primary
+    let staffDoc = await db.collection(collections.staffUsers).doc(userId).get();
+    if (!staffDoc.exists) staffDoc = await db.collection(collections.users).doc(userId).get();
+    if (staffDoc.exists) {
+      resultMap.set(userId, { id: userId, ...staffDoc.data(), _collection: staffDoc.ref.parent.id });
+    }
+  }
+
+  return Array.from(resultMap.values());
 }
 
 // --- End staff dual-collection helpers ---
@@ -6226,6 +6264,162 @@ app.delete('/api/restaurants/:restaurantId', authenticateToken, async (req, res)
   }
 });
 
+// ==================== SUB-RESTAURANTS ====================
+
+// List sub-restaurants for a restaurant
+app.get('/api/restaurants/:restaurantId/sub-restaurants', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+    const hasAccess = await validateRestaurantAccess(req.user.userId, restaurantId);
+    if (!hasAccess) return res.status(403).json({ error: 'Access denied' });
+
+    const snapshot = await db.collection(collections.restaurants).doc(restaurantId)
+      .collection('subRestaurants')
+      .where('status', 'in', ['active', 'inactive'])
+      .orderBy('sortOrder', 'asc')
+      .get();
+
+    const subRestaurants = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+    res.json({ success: true, subRestaurants });
+  } catch (error) {
+    console.error('List sub-restaurants error:', error);
+    res.status(500).json({ error: 'Failed to list sub-restaurants' });
+  }
+});
+
+// Create a sub-restaurant
+app.post('/api/restaurants/:restaurantId/sub-restaurants', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+    const { name, description, menuMode, tableMode, assignedSections, assignedFloorIds, menu } = req.body;
+
+    if (!name || !name.trim()) return res.status(400).json({ error: 'Name is required' });
+    if (!['shared', 'own'].includes(menuMode)) return res.status(400).json({ error: 'menuMode must be shared or own' });
+    if (!['shared', 'own'].includes(tableMode)) return res.status(400).json({ error: 'tableMode must be shared or own' });
+
+    // Verify restaurant ownership
+    const restaurantDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
+    if (!restaurantDoc.exists) return res.status(404).json({ error: 'Restaurant not found' });
+
+    const callerRole = req.user.role;
+    const restaurantData = restaurantDoc.data();
+    if (callerRole === 'owner' && restaurantData.ownerId !== req.user.userId) {
+      return res.status(403).json({ error: 'Access denied' });
+    }
+    if (callerRole === 'admin') {
+      const hasAccess = await validateRestaurantAccess(req.user.userId, restaurantId);
+      if (!hasAccess) return res.status(403).json({ error: 'Access denied' });
+    }
+    if (callerRole !== 'owner' && callerRole !== 'admin') {
+      return res.status(403).json({ error: 'Owner or admin role required' });
+    }
+
+    // Get current count for sortOrder
+    const existing = await db.collection(collections.restaurants).doc(restaurantId)
+      .collection('subRestaurants').where('status', '!=', 'deleted').get();
+
+    const subData = {
+      name: name.trim(),
+      description: (description || '').trim(),
+      menuMode,
+      menu: menuMode === 'own' ? (menu || { items: [] }) : { items: [] },
+      tableMode,
+      assignedSections: tableMode === 'shared' ? (assignedSections || []) : [],
+      assignedFloorIds: tableMode === 'shared' ? (assignedFloorIds || []) : [],
+      status: 'active',
+      sortOrder: existing.size,
+      createdAt: new Date(),
+      updatedAt: new Date()
+    };
+
+    const docRef = await db.collection(collections.restaurants).doc(restaurantId)
+      .collection('subRestaurants').add(subData);
+
+    res.status(201).json({ success: true, subRestaurant: { id: docRef.id, ...subData } });
+  } catch (error) {
+    console.error('Create sub-restaurant error:', error);
+    res.status(500).json({ error: 'Failed to create sub-restaurant' });
+  }
+});
+
+// Update a sub-restaurant
+app.patch('/api/restaurants/:restaurantId/sub-restaurants/:subId', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId, subId } = req.params;
+    const { name, description, menuMode, tableMode, assignedSections, assignedFloorIds, menu, status, sortOrder } = req.body;
+
+    // Verify access
+    const restaurantDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
+    if (!restaurantDoc.exists) return res.status(404).json({ error: 'Restaurant not found' });
+    const callerRole = req.user.role;
+    if (callerRole !== 'owner' && callerRole !== 'admin') {
+      return res.status(403).json({ error: 'Owner or admin role required' });
+    }
+    if (callerRole === 'owner' && restaurantDoc.data().ownerId !== req.user.userId) {
+      return res.status(403).json({ error: 'Access denied' });
+    }
+    if (callerRole === 'admin') {
+      const hasAccess = await validateRestaurantAccess(req.user.userId, restaurantId);
+      if (!hasAccess) return res.status(403).json({ error: 'Access denied' });
+    }
+
+    const subRef = db.collection(collections.restaurants).doc(restaurantId)
+      .collection('subRestaurants').doc(subId);
+    const subDoc = await subRef.get();
+    if (!subDoc.exists) return res.status(404).json({ error: 'Sub-restaurant not found' });
+
+    const update = { updatedAt: new Date() };
+    if (name !== undefined) update.name = name.trim();
+    if (description !== undefined) update.description = (description || '').trim();
+    if (menuMode !== undefined && ['shared', 'own'].includes(menuMode)) update.menuMode = menuMode;
+    if (tableMode !== undefined && ['shared', 'own'].includes(tableMode)) update.tableMode = tableMode;
+    if (assignedSections !== undefined) update.assignedSections = assignedSections;
+    if (assignedFloorIds !== undefined) update.assignedFloorIds = assignedFloorIds;
+    if (menu !== undefined) update.menu = menu;
+    if (status !== undefined && ['active', 'inactive'].includes(status)) update.status = status;
+    if (sortOrder !== undefined) update.sortOrder = sortOrder;
+
+    await subRef.update(update);
+    const updated = (await subRef.get()).data();
+    res.json({ success: true, subRestaurant: { id: subId, ...updated } });
+  } catch (error) {
+    console.error('Update sub-restaurant error:', error);
+    res.status(500).json({ error: 'Failed to update sub-restaurant' });
+  }
+});
+
+// Delete (soft) a sub-restaurant
+app.delete('/api/restaurants/:restaurantId/sub-restaurants/:subId', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId, subId } = req.params;
+
+    const restaurantDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
+    if (!restaurantDoc.exists) return res.status(404).json({ error: 'Restaurant not found' });
+    const callerRole = req.user.role;
+    if (callerRole !== 'owner' && callerRole !== 'admin') {
+      return res.status(403).json({ error: 'Owner or admin role required' });
+    }
+    if (callerRole === 'owner' && restaurantDoc.data().ownerId !== req.user.userId) {
+      return res.status(403).json({ error: 'Access denied' });
+    }
+    if (callerRole === 'admin') {
+      const hasAccess = await validateRestaurantAccess(req.user.userId, restaurantId);
+      if (!hasAccess) return res.status(403).json({ error: 'Access denied' });
+    }
+
+    const subRef = db.collection(collections.restaurants).doc(restaurantId)
+      .collection('subRestaurants').doc(subId);
+    const subDoc = await subRef.get();
+    if (!subDoc.exists) return res.status(404).json({ error: 'Sub-restaurant not found' });
+
+    await subRef.update({ status: 'deleted', updatedAt: new Date() });
+    res.json({ success: true, message: 'Sub-restaurant deleted' });
+  } catch (error) {
+    console.error('Delete sub-restaurant error:', error);
+    res.status(500).json({ error: 'Failed to delete sub-restaurant' });
+  }
+});
+
 // Seed default menu & tables for first-time users
 app.post('/api/restaurants/:restaurantId/seed-default', authenticateToken, async (req, res) => {
   try {
@@ -8299,6 +8493,9 @@ app.post('/api/public/orders/:restaurantId', vercelSecurityMiddleware.publicAPI,
       paymentStatus: paymentMethod === 'razorpay' ? 'paid' : 'pending',
       otpVerified: true,
       verificationId: verificationId,
+      // Sub-restaurant fields
+      subRestaurantId: req.body.subRestaurantId || null,
+      subRestaurantName: req.body.subRestaurantName || null,
       createdAt: new Date(),
       updatedAt: new Date()
     };
@@ -9085,6 +9282,9 @@ app.post('/api/orders', async (req, res) => {
       // Delivery fields
       deliveryInfo: req.body.deliveryInfo || null,
       deliveryAddress: req.body.deliveryAddress || null,
+      // Sub-restaurant fields
+      subRestaurantId: req.body.subRestaurantId || null,
+      subRestaurantName: req.body.subRestaurantName || null,
       createdAt: new Date(),
       updatedAt: new Date()
     };
@@ -9785,6 +9985,25 @@ app.post('/api/orders', async (req, res) => {
             timestamp: new Date()
           });
           console.log(`📱 WhatsApp bill sent for direct billing order ${orderRef.id}`);
+
+          // Send feedback form link if enabled
+          try {
+            const fbSettings = restaurantData.feedbackSettings;
+            if (fbSettings?.whatsappAutoSend && fbSettings?.defaultFormId) {
+              const fbFormDoc = await db.collection(collections.feedbackForms).doc(fbSettings.defaultFormId).get();
+              if (fbFormDoc.exists && fbFormDoc.data().status === 'active') {
+                const shortCode = fbFormDoc.data().distribution?.shortCode;
+                const feedbackUrl = shortCode
+                  ? `${process.env.FRONTEND_URL || 'https://www.dineopen.com'}/f/${shortCode}?src=wa`
+                  : `${process.env.FRONTEND_URL || 'https://www.dineopen.com'}/feedback/${fbSettings.defaultFormId}?src=wa`;
+                const fbMsg = `Hi ${customerName}! 😊\n\nWe hope you enjoyed your experience at ${restaurantData.name || 'our restaurant'}.\n\nWe'd love to hear your feedback:\n${feedbackUrl}\n\nThank you! 🙏`;
+                await whatsappSvc.sendTextMessage(formatted, fbMsg);
+                console.log('📱 Feedback form link sent via WhatsApp');
+              }
+            }
+          } catch (fbErr) {
+            console.error('📱 Feedback WhatsApp error (non-blocking):', fbErr.message);
+          }
         } catch (err) {
           console.error('📱 WhatsApp bill error (direct billing, non-blocking):', err.message);
         }
@@ -10592,8 +10811,8 @@ function aggregateDailyStats(dailyDocs, dateStrings) {
 
 // Helper function to calculate analytics from raw orders (used for today/24h)
 function calculateAnalytics(orders, period) {
-  // Exclude cancelled/deleted/saved orders from analytics — only count valid orders
-  orders = orders.filter(o => !['cancelled', 'deleted', 'saved'].includes(o.status));
+  // Exclude cancelled/deleted/saved/refunded orders from analytics — only count valid orders
+  orders = orders.filter(o => !['cancelled', 'deleted', 'saved', 'refunded'].includes(o.status));
 
   if (orders.length === 0) {
     return {
@@ -10602,8 +10821,15 @@ function calculateAnalytics(orders, period) {
     };
   }
 
-  const totalRevenue = orders.reduce((sum, order) => sum + (order.totalAmount || 0), 0);
-  const totalRevenueWithTax = orders.reduce((sum, order) => sum + (order.finalAmount || order.totalAmount || 0), 0);
+  // Subtract partial refund amounts from revenue (full refunds are already excluded by status filter)
+  const totalRevenue = orders.reduce((sum, order) => {
+    const refundAdj = order.refundAmount || 0;
+    return sum + (order.totalAmount || 0) - refundAdj;
+  }, 0);
+  const totalRevenueWithTax = orders.reduce((sum, order) => {
+    const refundAdj = order.refundAmount || 0;
+    return sum + (order.finalAmount || order.totalAmount || 0) - refundAdj;
+  }, 0);
   const totalOrders = orders.length;
   const avgOrderValue = totalOrders > 0 ? Math.round(totalRevenue / totalOrders) : 0;
 
@@ -10671,9 +10897,10 @@ function calculateAnalytics(orders, period) {
   const paymentBreakdown = {};
   orders.forEach(order => {
     const method = (order.paymentMethod || 'cash').toLowerCase();
+    const refundAdj = order.refundAmount || 0;
     if (!paymentBreakdown[method]) paymentBreakdown[method] = { count: 0, total: 0 };
     paymentBreakdown[method].count += 1;
-    paymentBreakdown[method].total += (order.finalAmount || order.totalAmount || 0);
+    paymentBreakdown[method].total += (order.finalAmount || order.totalAmount || 0) - refundAdj;
   });
   // Round totals
   Object.keys(paymentBreakdown).forEach(method => {
@@ -10693,7 +10920,7 @@ app.get('/api/analytics/:restaurantId/daily-summary', authenticateToken, async (
       return res.status(403).json({ error: 'Access denied. You do not have permission to view analytics.' });
     }
     const { restaurantId } = req.params;
-    const { date, period, startDate, endDate } = req.query;
+    const { date, period, startDate, endDate, subRestaurantId } = req.query;
 
     // Determine date range
     const today = new Date().toISOString().split('T')[0];
@@ -10742,7 +10969,12 @@ app.get('/api/analytics/:restaurantId/daily-summary', authenticateToken, async (
 
     if (!isTodayOnly) {
       // Batch-read dailyStats docs for historical dates
-      const docRefs = dates.map(d => db.collection('dailyStats').doc(`${restaurantId}_${d}`));
+      const docRefs = dates.map(d => {
+        const docId = subRestaurantId
+          ? `${restaurantId}_sub_${subRestaurantId}_${d}`
+          : `${restaurantId}_${d}`;
+        return db.collection('dailyStats').doc(docId);
+      });
       const docs = docRefs.length > 0 ? await db.getAll(...docRefs) : [];
 
       console.log(`📊 daily-summary: found ${docs.filter(d => d.exists).length}/${docs.length} dailyStats docs`);
@@ -10796,14 +11028,17 @@ app.get('/api/analytics/:restaurantId/daily-summary', authenticateToken, async (
       const [ey, em, ed] = dates[dates.length - 1].split('-').map(Number);
       const rangeStart = new Date(sy, sm - 1, sd, 0, 0, 0, 0);
       const rangeEnd = new Date(ey, em - 1, ed, 23, 59, 59, 999);
-      const catPaySnap = await db.collection(collections.orders)
+      let catPayQuery = db.collection(collections.orders)
         .where('restaurantId', '==', restaurantId)
         .where('createdAt', '>=', rangeStart)
-        .where('createdAt', '<=', rangeEnd)
-        .get();
+        .where('createdAt', '<=', rangeEnd);
+      if (subRestaurantId) catPayQuery = catPayQuery.where('subRestaurantId', '==', subRestaurantId);
+      const catPaySnap = await catPayQuery.get();
       catPaySnap.docs.forEach(doc => {
         const order = doc.data();
-        if (['cancelled', 'deleted', 'saved'].includes(order.status)) return;
+        if (['cancelled', 'deleted', 'saved', 'refunded'].includes(order.status)) return;
+        // Subtract any partial refund from revenue
+        const refundAdj = (order.refundAmount && order.status !== 'refunded') ? order.refundAmount : 0;
         if (order.items && Array.isArray(order.items)) {
           order.items.forEach(item => {
             const cat = item.category || 'Uncategorized';
@@ -10815,7 +11050,7 @@ app.get('/api/analytics/:restaurantId/daily-summary', authenticateToken, async (
         const pm = (order.paymentMethod || 'cash').toLowerCase();
         if (!paymentMap[pm]) paymentMap[pm] = { transactions: 0, amount: 0 };
         paymentMap[pm].transactions++;
-        paymentMap[pm].amount += (order.finalAmount || order.totalAmount || 0);
+        paymentMap[pm].amount += (order.finalAmount || order.totalAmount || 0) - refundAdj;
       });
     }
 
@@ -10840,21 +11075,24 @@ app.get('/api/analytics/:restaurantId/daily-summary', authenticateToken, async (
       const rangeStart = new Date(sy, sm - 1, sd, 0, 0, 0, 0);
       const rangeEnd = new Date(ey, em - 1, ed, 23, 59, 59, 999);
       console.log(`📊 daily-summary ${isTodayOnly ? '(today live)' : '(fallback)'}: querying raw orders from ${rangeStart.toISOString()} to ${rangeEnd.toISOString()}`);
-      const ordersSnap = await db.collection(collections.orders)
+      let rawQuery = db.collection(collections.orders)
         .where('restaurantId', '==', restaurantId)
         .where('createdAt', '>=', rangeStart)
-        .where('createdAt', '<=', rangeEnd)
-        .get();
+        .where('createdAt', '<=', rangeEnd);
+      if (subRestaurantId) rawQuery = rawQuery.where('subRestaurantId', '==', subRestaurantId);
+      const ordersSnap = await rawQuery.get();
 
       console.log(`📊 daily-summary fallback: found ${ordersSnap.size} raw orders`);
       totalOrders = 0; totalRevenue = 0; totalRevenueWithTax = 0;
 
       ordersSnap.docs.forEach(doc => {
         const order = doc.data();
-        if (['cancelled', 'deleted', 'saved'].includes(order.status)) return;
+        if (['cancelled', 'deleted', 'saved', 'refunded'].includes(order.status)) return;
         totalOrders++;
-        totalRevenue += (order.totalAmount || 0);
-        totalRevenueWithTax += (order.finalAmount || order.totalAmount || 0);
+        // Subtract any partial refund amount from revenue
+        const refundAdj = (order.refundAmount && order.status !== 'refunded') ? order.refundAmount : 0;
+        totalRevenue += (order.totalAmount || 0) - refundAdj;
+        totalRevenueWithTax += (order.finalAmount || order.totalAmount || 0) - refundAdj;
 
         const type = (order.orderType || 'dine_in').toLowerCase().replace(/[\s-]+/g, '_');
         ordersByType[type] = (ordersByType[type] || 0) + 1;
@@ -10888,7 +11126,7 @@ app.get('/api/analytics/:restaurantId/daily-summary', authenticateToken, async (
         const pm = (order.paymentMethod || 'cash').toLowerCase();
         if (!paymentMap[pm]) paymentMap[pm] = { transactions: 0, amount: 0 };
         paymentMap[pm].transactions++;
-        paymentMap[pm].amount += (order.finalAmount || order.totalAmount || 0);
+        paymentMap[pm].amount += (order.finalAmount || order.totalAmount || 0) - refundAdj;
       });
 
       items = [];
@@ -10900,6 +11138,38 @@ app.get('/api/analytics/:restaurantId/daily-summary', authenticateToken, async (
     }
 
     items.sort((a, b) => b.quantity - a.quantity);
+
+    // Build sub-restaurant breakdown if no filter applied
+    let subRestaurantBreakdown = [];
+    if (!subRestaurantId) {
+      try {
+        const subBreakdownMap = {};
+        const subSnap = await db.collection('dailyStats')
+          .where('restaurantId', '==', restaurantId)
+          .where('subRestaurantId', '!=', null)
+          .get();
+        subSnap.docs.forEach(doc => {
+          const d = doc.data();
+          if (!dates.includes(d.date)) return;
+          const sid = d.subRestaurantId;
+          if (!subBreakdownMap[sid]) {
+            subBreakdownMap[sid] = {
+              subRestaurantId: sid,
+              subRestaurantName: d.subRestaurantName || 'Unknown',
+              totalOrders: 0,
+              totalRevenue: 0
+            };
+          }
+          subBreakdownMap[sid].totalOrders += (d.totalOrders || 0);
+          subBreakdownMap[sid].totalRevenue += (d.totalRevenueWithTax || d.totalRevenue || 0);
+        });
+        subRestaurantBreakdown = Object.values(subBreakdownMap)
+          .map(s => ({ ...s, totalRevenue: Math.round(s.totalRevenue * 100) / 100 }))
+          .sort((a, b) => b.totalRevenue - a.totalRevenue);
+      } catch (subErr) {
+        console.error('Sub-restaurant breakdown error:', subErr);
+      }
+    }
 
     res.json({
       success: true,
@@ -10925,7 +11195,8 @@ app.get('/api/analytics/:restaurantId/daily-summary', authenticateToken, async (
           transactions: d.transactions,
           amount: Math.round(d.amount * 100) / 100,
           percentage: totalRevenueWithTax > 0 ? Math.round((d.amount / totalRevenueWithTax) * 10000) / 100 : 0
-        })).sort((a, b) => b.amount - a.amount)
+        })).sort((a, b) => b.amount - a.amount),
+        subRestaurantBreakdown: subRestaurantBreakdown.length > 0 ? subRestaurantBreakdown : undefined
       }
     });
   } catch (error) {
@@ -12806,7 +13077,10 @@ app.delete('/api/orders/:orderId', authenticateToken, async (req, res) => {
     if (order.status === 'deleted') {
       return res.json({ message: 'Order already deleted' });
     }
-    
+
+    // Determine if this was a completed/billed order (needs refund)
+    const wasCompleted = order.status === 'completed' || order.paymentStatus === 'completed';
+
     // Soft delete: set status to 'deleted' and preserve the state it was in (lastStatus) so we can show "Deleted (was: Completed)" etc.
     const lastStatus = order.status || 'pending';
     const updateData = {
@@ -12819,18 +13093,53 @@ app.delete('/api/orders/:orderId', authenticateToken, async (req, res) => {
     if (reason && reason.trim()) {
       updateData.deleteReason = reason.trim();
     }
+
+    // If order was completed/billed, auto-create refund record
+    if (wasCompleted) {
+      const refundAmount = order.finalAmount || order.totalAmount || 0;
+      updateData.refundAmount = refundAmount;
+      updateData.refundType = 'full';
+      updateData.refundedAt = new Date().toISOString();
+      updateData.refundedBy = userId;
+      updateData.refundReason = reason?.trim() || 'Order deleted after billing';
+    }
+
     await orderRef.update(updateData);
+
+    // Reverse all side effects (inventory, customer, loyalty, offers)
+    reverseOrderSideEffects(orderId, order)
+      .catch(err => console.error('Side effect reversal error (non-blocking):', err));
 
     // Update daily analytics stats — only if order was counted (not saved/cancelled)
     if (!['saved', 'cancelled', 'deleted'].includes(order.status)) {
       updateDailyStats(order.restaurantId, order, 'delete');
     }
 
+    // Release table if assigned
+    if (order.tableNumber) {
+      try {
+        const tablesSnapshot = await db.collection(collections.tables)
+          .where('restaurantId', '==', order.restaurantId)
+          .where('number', '==', order.tableNumber)
+          .limit(1)
+          .get();
+        if (!tablesSnapshot.empty) {
+          await db.collection(collections.tables).doc(tablesSnapshot.docs[0].id).update({
+            status: 'available',
+            currentOrderId: null,
+            updatedAt: new Date()
+          });
+        }
+      } catch (tableErr) {
+        console.error('Error releasing table after delete:', tableErr);
+      }
+    }
+
     // Trigger Pusher notification for real-time updates
     pusherService.notifyOrderDeleted(order.restaurantId, orderId)
       .catch(err => console.error('Pusher notification error (non-blocking):', err));
 
-    res.json({ message: 'Order deleted successfully' });
+    res.json({ message: 'Order deleted successfully', wasCompleted });
   } catch (error) {
     console.error('Delete order error:', error);
     res.status(500).json({ error: 'Failed to delete order' });
@@ -12966,6 +13275,9 @@ app.use('/api/print-installer', printInstallerRoutes);
 
 // Public AI tools (no auth, IP rate-limited)
 app.use('/api/public/tools', vercelSecurityMiddleware.publicAPI, publicToolsRoutes);
+
+// Feedback forms module
+app.use('/api/feedback', feedbackRoutes);
 
 // Generic image upload API
 app.post('/api/upload/image', authenticateToken, upload.single('image'), async (req, res) => {
@@ -15558,6 +15870,20 @@ app.get('/api/staff/:restaurantId', authenticateToken, requireOwnerRole, async (
       });
     }
 
+    // Batch-fetch restaurant counts from userRestaurants junction table
+    const staffIds = staff.map(s => s.id);
+    const restaurantCounts = {};
+    for (let i = 0; i < staffIds.length; i += 30) {
+      const chunk = staffIds.slice(i, i + 30);
+      const snap = await db.collection(collections.userRestaurants)
+        .where('userId', 'in', chunk).get();
+      snap.forEach(doc => {
+        const uid = doc.data().userId;
+        restaurantCounts[uid] = (restaurantCounts[uid] || 0) + 1;
+      });
+    }
+    staff.forEach(s => { s.restaurantCount = restaurantCounts[s.id] || 1; });
+
     res.json({ staff });
 
   } catch (error) {
@@ -15874,11 +16200,22 @@ app.post('/api/staff/:staffId/restaurants', authenticateToken, requireOwnerRole,
     const { restaurantId } = req.body;
     if (!restaurantId) return res.status(400).json({ error: 'restaurantId is required' });
 
-    // Verify staff exists and is admin
+    // Verify staff exists
     const staffDoc = await db.collection(collections.staffUsers).doc(staffId).get();
     if (!staffDoc.exists) return res.status(404).json({ error: 'Staff member not found' });
-    if (staffDoc.data().role !== 'admin') {
-      return res.status(400).json({ error: 'Multi-restaurant assignment is only available for admin staff.' });
+    const staffRole = staffDoc.data().role;
+
+    // Admin callers cannot manage owner or other admin access
+    if (req.user.role === 'admin' && (staffRole === 'owner' || staffRole === 'admin')) {
+      return res.status(403).json({ error: 'Admins cannot manage restaurant access for owners or other admins.' });
+    }
+    // Admin callers can only assign restaurants they themselves have access to
+    if (req.user.role === 'admin') {
+      const callerAccess = await db.collection(collections.userRestaurants)
+        .where('userId', '==', req.user.userId).where('restaurantId', '==', restaurantId).get();
+      if (callerAccess.empty) {
+        return res.status(403).json({ error: 'You do not have access to this restaurant.' });
+      }
     }
 
     // Verify restaurant belongs to this owner (admin uses ownerId from JWT)
@@ -15897,36 +16234,47 @@ app.post('/api/staff/:staffId/restaurants', authenticateToken, requireOwnerRole,
     await db.collection(collections.userRestaurants).add({
       userId: staffId,
       restaurantId,
-      role: 'admin',
-      pageAccess: staffDoc.data().pageAccess || ROLE_DEFAULT_PAGE_ACCESS.admin,
+      role: staffRole,
+      pageAccess: staffDoc.data().pageAccess || ROLE_DEFAULT_PAGE_ACCESS[staffRole] || {},
       createdAt: new Date(),
       updatedAt: new Date()
     });
 
-    res.json({ success: true, message: 'Restaurant assigned to admin staff.' });
+    res.json({ success: true, message: 'Restaurant assigned to staff.' });
   } catch (error) {
     console.error('Assign staff restaurant error:', error);
     res.status(500).json({ error: 'Failed to assign restaurant' });
   }
 });
 
-// Remove admin staff from a restaurant
+// Remove staff from a restaurant
 app.delete('/api/staff/:staffId/restaurants/:restaurantId', authenticateToken, requireOwnerRole, async (req, res) => {
   try {
     const { staffId, restaurantId } = req.params;
 
-    // Verify staff exists and is admin
+    // Verify staff exists
     const staffDoc = await db.collection(collections.staffUsers).doc(staffId).get();
     if (!staffDoc.exists) return res.status(404).json({ error: 'Staff member not found' });
-    if (staffDoc.data().role !== 'admin') {
-      return res.status(400).json({ error: 'Multi-restaurant management is only for admin staff.' });
+    const staffRole = staffDoc.data().role;
+
+    // Admin callers cannot manage owner or other admin access
+    if (req.user.role === 'admin' && (staffRole === 'owner' || staffRole === 'admin')) {
+      return res.status(403).json({ error: 'Admins cannot manage restaurant access for owners or other admins.' });
+    }
+    // Admin callers can only remove restaurants they themselves have access to
+    if (req.user.role === 'admin') {
+      const callerAccess = await db.collection(collections.userRestaurants)
+        .where('userId', '==', req.user.userId).where('restaurantId', '==', restaurantId).get();
+      if (callerAccess.empty) {
+        return res.status(403).json({ error: 'You do not have access to this restaurant.' });
+      }
     }
 
     // Check how many restaurants are assigned
     const allAssignments = await db.collection(collections.userRestaurants)
       .where('userId', '==', staffId).get();
     if (allAssignments.size <= 1) {
-      return res.status(400).json({ error: 'Admin must have at least one restaurant assigned.' });
+      return res.status(400).json({ error: 'Staff must have at least one restaurant assigned.' });
     }
 
     // Find and delete the assignment
@@ -15949,7 +16297,7 @@ app.delete('/api/staff/:staffId/restaurants/:restaurantId', authenticateToken, r
       }
     }
 
-    res.json({ success: true, message: 'Restaurant removed from admin staff.' });
+    res.json({ success: true, message: 'Restaurant removed from staff.' });
   } catch (error) {
     console.error('Remove staff restaurant error:', error);
     res.status(500).json({ error: 'Failed to remove restaurant' });
@@ -16224,6 +16572,38 @@ app.post('/api/auth/staff/login', async (req, res) => {
       ownerData = ownerDoc.exists ? ownerDoc.data() : null;
     }
 
+    // Check for multi-restaurant access via userRestaurants junction table
+    let multiRestaurant = false;
+    let staffRestaurants = [];
+    try {
+      const urSnapshot = await db.collection(collections.userRestaurants)
+        .where('userId', '==', staffDoc.id)
+        .get();
+
+      const restaurantIds = new Set();
+      urSnapshot.docs.forEach(d => restaurantIds.add(d.data().restaurantId));
+      // Always include primary restaurantId
+      if (staffData.restaurantId) restaurantIds.add(staffData.restaurantId);
+
+      if (restaurantIds.size > 1) {
+        multiRestaurant = true;
+        // Fetch restaurant details for each
+        const restDocs = await Promise.all(
+          [...restaurantIds].map(rid => db.collection(collections.restaurants).doc(rid).get())
+        );
+        staffRestaurants = restDocs
+          .filter(d => d.exists)
+          .map(d => ({
+            id: d.id,
+            name: d.data().name,
+            address: d.data().address || '',
+            phone: d.data().phone || ''
+          }));
+      }
+    } catch (urErr) {
+      console.error('Error checking multi-restaurant access:', urErr);
+    }
+
     // Update last login
     const staffLoginUpdate = {
       lastLogin: new Date(),
@@ -16248,6 +16628,8 @@ app.post('/api/auth/staff/login', async (req, res) => {
     res.json({
       message: 'Staff login successful',
       token,
+      multiRestaurant,
+      restaurants: multiRestaurant ? staffRestaurants : [],
       user: {
         id: staffDoc.id,
         email: staffData.email,
@@ -16283,6 +16665,104 @@ app.post('/api/auth/staff/login', async (req, res) => {
   } catch (error) {
     console.error('Staff login error:', error);
     res.status(500).json({ error: 'Staff login failed' });
+  }
+});
+
+// Switch restaurant for staff with multi-restaurant access
+app.post('/api/auth/staff/switch-restaurant', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId } = req.body;
+    if (!restaurantId) {
+      return res.status(400).json({ error: 'restaurantId is required' });
+    }
+
+    const userId = req.user.userId;
+
+    // Check if staff has access to this restaurant
+    // 1. Primary restaurantId matches
+    let hasAccess = false;
+
+    // Check staffUsers/users doc for primary restaurantId
+    const collName = req.user.source === 'staffUsers' ? collections.staffUsers : collections.users;
+    const staffDoc = await db.collection(collName).doc(userId).get();
+    if (!staffDoc.exists) {
+      return res.status(404).json({ error: 'Staff member not found' });
+    }
+    const staffData = staffDoc.data();
+
+    if (staffData.restaurantId === restaurantId) {
+      hasAccess = true;
+    }
+
+    // 2. Check userRestaurants junction table
+    if (!hasAccess) {
+      const urSnapshot = await db.collection(collections.userRestaurants)
+        .where('userId', '==', userId)
+        .where('restaurantId', '==', restaurantId)
+        .get();
+      if (!urSnapshot.empty) {
+        hasAccess = true;
+      }
+    }
+
+    if (!hasAccess) {
+      return res.status(403).json({ error: 'You do not have access to this restaurant' });
+    }
+
+    // Fetch the target restaurant
+    const restaurantDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
+    if (!restaurantDoc.exists) {
+      return res.status(404).json({ error: 'Restaurant not found' });
+    }
+    const restaurantData = restaurantDoc.data();
+
+    // Get owner details
+    let ownerData = null;
+    if (restaurantData.ownerId) {
+      const ownerDoc = await db.collection(collections.users).doc(restaurantData.ownerId).get();
+      ownerData = ownerDoc.exists ? ownerDoc.data() : null;
+    }
+
+    // Issue new JWT with the switched restaurantId
+    const newToken = jwt.sign(
+      {
+        userId: userId,
+        email: req.user.email,
+        role: req.user.role,
+        restaurantId: restaurantId,
+        ownerId: restaurantData.ownerId,
+        source: req.user.source
+      },
+      process.env.JWT_SECRET,
+      { expiresIn: '30d' }
+    );
+
+    res.json({
+      success: true,
+      token: newToken,
+      restaurant: {
+        id: restaurantId,
+        name: restaurantData.name,
+        address: restaurantData.address || '',
+        phone: restaurantData.phone || '',
+        email: restaurantData.email || '',
+        cuisine: restaurantData.cuisine || '',
+        description: restaurantData.description || '',
+        ownerId: restaurantData.ownerId,
+        legalBusinessName: restaurantData.legalBusinessName || '',
+        gstin: restaurantData.gstin || '',
+        showGstOnInvoice: restaurantData.showGstOnInvoice === true,
+      },
+      owner: ownerData ? {
+        id: restaurantData.ownerId,
+        name: ownerData.name,
+        email: ownerData.email,
+        phone: ownerData.phone
+      } : null
+    });
+  } catch (error) {
+    console.error('Switch restaurant error:', error);
+    res.status(500).json({ error: 'Failed to switch restaurant' });
   }
 });
 
@@ -18661,6 +19141,106 @@ app.get('/api/token/render/:restaurantId/:orderId', async (req, res) => {
   }
 });
 
+// ========================================
+// Order Reversal Helper — reverses all side effects when order is cancelled/deleted
+// ========================================
+async function reverseOrderSideEffects(orderId, orderData) {
+  const restaurantId = orderData.restaurantId;
+  const results = { inventory: false, customer: false, loyalty: false, offers: false, credit: false };
+
+  console.log(`🔄 Reversing side effects for Order ${orderId} (was: ${orderData.status})`);
+
+  // 1. Reverse inventory deductions
+  try {
+    const restorations = await inventoryService.restoreInventoryForOrder(restaurantId, orderId);
+    if (restorations.length > 0) {
+      results.inventory = true;
+      console.log(`📦 Inventory restored: ${restorations.length} items for Order ${orderId}`);
+    }
+  } catch (err) {
+    console.error(`⚠️ Inventory restore failed for Order ${orderId}:`, err.message);
+  }
+
+  // 2. Reverse customer stats + loyalty points
+  const customerId = orderData.customerId;
+  if (customerId) {
+    try {
+      const custRef = db.collection(collections.customers).doc(customerId);
+      const custDoc = await custRef.get();
+      if (custDoc.exists) {
+        const custData = custDoc.data();
+        const orderHistory = custData.orderHistory || [];
+
+        // Remove this order from orderHistory
+        const updatedHistory = orderHistory.filter(h => h.orderId !== orderId);
+        const newTotalOrders = updatedHistory.length;
+        const newTotalSpent = updatedHistory.reduce((sum, o) => sum + (o.finalAmount || o.totalAmount || 0), 0);
+
+        const custUpdate = {
+          orderHistory: updatedHistory,
+          totalOrders: newTotalOrders,
+          totalSpent: Math.round(newTotalSpent * 100) / 100,
+          updatedAt: new Date()
+        };
+
+        // Reverse loyalty points: undo earned, restore redeemed
+        const pointsEarned = orderData.loyaltyPointsEarned || 0;
+        const pointsRedeemed = orderData.loyaltyPointsRedeemed || 0;
+        const netReverse = -pointsEarned + pointsRedeemed; // subtract earned, add back redeemed
+        if (netReverse !== 0) {
+          custUpdate.loyaltyPoints = FieldValue.increment(netReverse);
+          results.loyalty = true;
+          console.log(`🎯 Loyalty reversed for Customer ${customerId}: ${netReverse > 0 ? '+' : ''}${netReverse} points`);
+        }
+
+        // Reverse outstanding balance if this order had partial payment with credit
+        if (orderData.outstandingAmount && orderData.outstandingAmount > 0) {
+          const creditHistory = custData.creditHistory || [];
+          const updatedCredit = creditHistory.filter(c => c.orderId !== orderId);
+          const removedEntry = creditHistory.find(c => c.orderId === orderId);
+          custUpdate.creditHistory = updatedCredit;
+          if (removedEntry) {
+            custUpdate.outstandingBalance = FieldValue.increment(-(removedEntry.outstandingAmount || 0));
+            results.credit = true;
+          }
+        }
+
+        await custRef.update(custUpdate);
+        results.customer = true;
+        console.log(`👤 Customer ${customerId} stats reversed: orders ${custData.totalOrders} → ${newTotalOrders}, spent ₹${custData.totalSpent} → ₹${Math.round(newTotalSpent * 100) / 100}`);
+      }
+    } catch (err) {
+      console.error(`⚠️ Customer stats reversal failed for Order ${orderId}:`, err.message);
+    }
+  }
+
+  // 3. Reverse offer/promo usage
+  const appliedOffers = orderData.appliedOffers && orderData.appliedOffers.length > 0
+    ? orderData.appliedOffers
+    : (orderData.appliedOffer && orderData.appliedOffer.id ? [orderData.appliedOffer] : []);
+
+  if (appliedOffers.length > 0) {
+    try {
+      // Build the customer key for per-customer usage tracking
+      const customerPhone = orderData.customerPhone || orderData.customer?.phone || '';
+      const offerCustomerKey = offerEngine.buildCustomerKey(customerId, customerPhone);
+
+      for (const offer of appliedOffers) {
+        if (offer && offer.id) {
+          await offerEngine.decrementUsage(db, offer.id, offerCustomerKey);
+          console.log(`🎁 Offer usage decremented for ${offer.id} (${offer.name || 'unnamed'})`);
+        }
+      }
+      results.offers = true;
+    } catch (err) {
+      console.error(`⚠️ Offer usage reversal failed for Order ${orderId}:`, err.message);
+    }
+  }
+
+  console.log(`✅ Side effect reversal complete for Order ${orderId}:`, results);
+  return results;
+}
+
 // Cancel Order API
 app.patch('/api/orders/:orderId/cancel', authenticateToken, async (req, res) => {
   try {
@@ -18681,23 +19261,24 @@ app.patch('/api/orders/:orderId/cancel', authenticateToken, async (req, res) => 
 
     const orderData = orderDoc.data();
 
-    // Check if order can be cancelled (not completed billing)
+    // Block cancellation for completed/billed orders — use Refund endpoint instead
     if (orderData.status === 'completed' || orderData.paymentStatus === 'completed') {
-      return res.status(400).json({ 
-        error: 'Cannot cancel order that has been completed or billed' 
+      return res.status(400).json({
+        error: 'Cannot cancel a completed/billed order. Use the Refund option instead.'
       });
     }
 
     // Check if order is already cancelled
     if (orderData.status === 'cancelled') {
-      return res.status(400).json({ 
-        error: 'Order is already cancelled' 
+      return res.status(400).json({
+        error: 'Order is already cancelled'
       });
     }
 
     // Update order status to cancelled
     const updateData = {
       status: 'cancelled',
+      lastStatus: orderData.status,
       cancelledAt: new Date(),
       cancelledBy: req.user.userId,
       cancellationReason: reason || 'No reason provided',
@@ -18705,6 +19286,9 @@ app.patch('/api/orders/:orderId/cancel', authenticateToken, async (req, res) => 
     };
 
     await db.collection(collections.orders).doc(orderId).update(updateData);
+
+    // Reverse all side effects (inventory, customer, loyalty, offers)
+    const reversal = await reverseOrderSideEffects(orderId, orderData);
 
     // Update daily analytics stats — only if order was counted (not saved)
     if (!['saved', 'cancelled', 'deleted'].includes(orderData.status)) {
@@ -18756,7 +19340,8 @@ app.patch('/api/orders/:orderId/cancel', authenticateToken, async (req, res) => 
       success: true,
       message: 'Order cancelled successfully',
       orderId: orderId,
-      cancelledAt: updateData.cancelledAt
+      cancelledAt: updateData.cancelledAt,
+      reversals: reversal
     });
 
   } catch (error) {
@@ -25242,22 +25827,26 @@ app.get('/api/books/:restaurantId/revenue', authenticateToken, async (req, res) 
       return res.status(403).json({ error: 'Access denied. You do not have permission to view books.' });
     }
     const { restaurantId } = req.params;
-    const { period = 'this_month', startDate, endDate } = req.query;
+    const { period = 'this_month', startDate, endDate, subRestaurantId } = req.query;
     const { start, end } = getDateRange(period, startDate, endDate);
     const prev = getPreviousRange(start, end);
 
     const ordersRef = db.collection(collections.orders);
-    const [currentSnap, prevSnap] = await Promise.all([
-      ordersRef.where('restaurantId', '==', restaurantId)
-        .where('createdAt', '>=', start).where('createdAt', '<=', end).get(),
-      ordersRef.where('restaurantId', '==', restaurantId)
-        .where('createdAt', '>=', prev.start).where('createdAt', '<=', prev.end).get()
-    ]);
+    let curQuery = ordersRef.where('restaurantId', '==', restaurantId)
+      .where('createdAt', '>=', start).where('createdAt', '<=', end);
+    let prevQuery = ordersRef.where('restaurantId', '==', restaurantId)
+      .where('createdAt', '>=', prev.start).where('createdAt', '<=', prev.end);
+    if (subRestaurantId) {
+      curQuery = curQuery.where('subRestaurantId', '==', subRestaurantId);
+      prevQuery = prevQuery.where('subRestaurantId', '==', subRestaurantId);
+    }
+    const [currentSnap, prevSnap] = await Promise.all([curQuery.get(), prevQuery.get()]);
 
     let totalRevenue = 0, totalTax = 0, totalDiscounts = 0, refunds = 0, orderCount = 0;
     const byPaymentMethod = {};
     const byOrderType = {};
     const dailyMap = {};
+    const bySubRestaurant = {};
 
     currentSnap.forEach(doc => {
       const o = doc.data();
@@ -25280,6 +25869,15 @@ app.get('/api/books/:restaurantId/revenue', authenticateToken, async (req, res) 
       dailyMap[dateKey].revenue += amount;
       dailyMap[dateKey].orders++;
       dailyMap[dateKey].tax += o.taxAmount || 0;
+
+      // Sub-restaurant breakdown (when no filter applied)
+      if (!subRestaurantId && o.subRestaurantId) {
+        if (!bySubRestaurant[o.subRestaurantId]) {
+          bySubRestaurant[o.subRestaurantId] = { name: o.subRestaurantName || 'Unknown', revenue: 0, orders: 0 };
+        }
+        bySubRestaurant[o.subRestaurantId].revenue += amount;
+        bySubRestaurant[o.subRestaurantId].orders++;
+      }
     });
 
     let prevRevenue = 0;
@@ -25291,15 +25889,17 @@ app.get('/api/books/:restaurantId/revenue', authenticateToken, async (req, res) 
     const dailyBreakdown = Object.values(dailyMap).sort((a, b) => a.date.localeCompare(b.date));
     const changePercent = prevRevenue > 0 ? ((totalRevenue - prevRevenue) / prevRevenue * 100) : 0;
 
-    res.json({
-      success: true,
-      data: {
-        totalRevenue, totalTax, totalDiscounts, refunds, orderCount,
-        avgOrderValue: orderCount > 0 ? totalRevenue / orderCount : 0,
-        byPaymentMethod, byOrderType, dailyBreakdown,
-        previousRevenue: prevRevenue, changePercent: Math.round(changePercent * 10) / 10
-      }
-    });
+    const responseData = {
+      totalRevenue, totalTax, totalDiscounts, refunds, orderCount,
+      avgOrderValue: orderCount > 0 ? totalRevenue / orderCount : 0,
+      byPaymentMethod, byOrderType, dailyBreakdown,
+      previousRevenue: prevRevenue, changePercent: Math.round(changePercent * 10) / 10
+    };
+    if (!subRestaurantId && Object.keys(bySubRestaurant).length > 0) {
+      responseData.bySubRestaurant = bySubRestaurant;
+    }
+
+    res.json({ success: true, data: responseData });
   } catch (error) {
     console.error('Books revenue error:', error);
     res.status(500).json({ error: 'Failed to fetch revenue data' });
@@ -28831,16 +29431,62 @@ app.post('/api/orders/:orderId/refund', authenticateToken, async (req, res) => {
       return res.status(400).json({ error: 'Refund amount cannot exceed order total' });
     }
 
-    await orderRef.update({
+    const isFullRefund = refundAmount >= finalAmount;
+    const updateFields = {
       refundAmount: Number(refundAmount),
       refundReason: refundReason || null,
-      refundType: refundType || (refundAmount >= finalAmount ? 'full' : 'partial'),
+      refundType: refundType || (isFullRefund ? 'full' : 'partial'),
       refundedAt: new Date().toISOString(),
       refundedBy: userId,
-      status: refundAmount >= finalAmount ? 'refunded' : orderData.status
-    });
+      status: isFullRefund ? 'refunded' : orderData.status,
+      updatedAt: new Date()
+    };
+    await orderRef.update(updateFields);
 
-    res.json({ success: true, message: 'Refund processed successfully' });
+    // On full refund, reverse all side effects (inventory, customer stats, loyalty, offers)
+    let reversals = null;
+    if (isFullRefund) {
+      try {
+        reversals = await reverseOrderSideEffects(orderId, orderData);
+        console.log(`🔄 Full refund reversals applied for Order ${orderId}`);
+      } catch (revErr) {
+        console.error('Side effect reversal error on refund (non-blocking):', revErr);
+      }
+
+      // Update daily stats — full refund effectively removes from revenue
+      if (!['saved', 'cancelled', 'deleted'].includes(orderData.status)) {
+        updateDailyStats(orderData.restaurantId, orderData, 'cancel');
+      }
+    } else {
+      // Partial refund — subtract refund amount from daily stats revenue (order still counts)
+      if (!['saved', 'cancelled', 'deleted'].includes(orderData.status)) {
+        const oldFinal = orderData.finalAmount || orderData.totalAmount || 0;
+        const oldBase = orderData.totalAmount || 0;
+        updateDailyStatsRevenueDiff(orderData.restaurantId, orderData, oldBase, oldBase - refundAmount, oldFinal, oldFinal - refundAmount);
+      }
+    }
+
+    // Notify via Pusher
+    try {
+      await pusherService.triggerOrderEvent(orderData.restaurantId, 'order-refunded', {
+        orderId,
+        dailyOrderId: orderData.dailyOrderId || null,
+        orderNumber: orderData.orderNumber || null,
+        refundAmount: Number(refundAmount),
+        refundType: isFullRefund ? 'full' : 'partial',
+        totalAmount: finalAmount
+      });
+    } catch (pusherErr) {
+      console.error('Pusher refund notification error (non-blocking):', pusherErr);
+    }
+
+    res.json({
+      success: true,
+      message: isFullRefund ? 'Full refund processed — all calculations reversed' : 'Partial refund recorded',
+      refundAmount: Number(refundAmount),
+      refundType: isFullRefund ? 'full' : 'partial',
+      reversals
+    });
   } catch (error) {
     console.error('Error processing refund:', error);
     res.status(500).json({ error: 'Failed to process refund' });

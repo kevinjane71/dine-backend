@@ -517,6 +517,107 @@ class InventoryService {
   }
 
   /**
+   * Restores inventory that was deducted for an order (used on cancel/delete).
+   *
+   * Instead of re-computing from recipes, this queries the actual inventoryTransactions
+   * created during deduction and reverses them exactly. This is more reliable because
+   * recipes or menu items may have changed since the order was placed.
+   */
+  async restoreInventoryForOrder(restaurantId, orderId) {
+    console.log(`📈 Restoring inventory for cancelled/deleted Order ${orderId}`);
+
+    try {
+      // Find all deduction transactions for this order
+      const txSnapshot = await db.collection('inventoryTransactions')
+        .where('referenceId', '==', orderId)
+        .where('type', '==', 'DEDUCTION')
+        .where('source', '==', 'ORDER')
+        .get();
+
+      if (txSnapshot.empty) {
+        console.log(`ℹ️ No inventory deductions found for Order ${orderId} — nothing to restore`);
+        return [];
+      }
+
+      const batch = db.batch();
+      const restorations = [];
+
+      for (const txDoc of txSnapshot.docs) {
+        const tx = txDoc.data();
+        const restoreQty = Math.abs(tx.quantityChange || 0);
+        if (restoreQty <= 0) continue;
+
+        // Restore inventory item stock
+        const invRef = db.collection('inventory').doc(tx.inventoryItemId);
+        const invDoc = await invRef.get();
+        if (invDoc.exists) {
+          const currentStock = invDoc.data().currentStock || 0;
+          batch.update(invRef, {
+            currentStock: currentStock + restoreQty,
+            updatedAt: new Date()
+          });
+        }
+
+        // Restore batch quantities if FIFO batches were used
+        if (tx.batchIds && tx.batchIds.length > 0) {
+          for (const batchId of tx.batchIds) {
+            try {
+              const batchRef = db.collection(collections.stockBatches).doc(batchId);
+              const batchDoc = await batchRef.get();
+              if (batchDoc.exists) {
+                const batchData = batchDoc.data();
+                batch.update(batchRef, {
+                  remainingQty: (batchData.remainingQty || 0) + restoreQty / tx.batchIds.length,
+                  status: 'active',
+                  updatedAt: new Date()
+                });
+              }
+            } catch (batchErr) {
+              console.warn(`⚠️ Could not restore batch ${batchId}:`, batchErr.message);
+            }
+          }
+        }
+
+        // Create reversal transaction record
+        const reversalRef = db.collection('inventoryTransactions').doc();
+        batch.set(reversalRef, {
+          restaurantId,
+          inventoryItemId: tx.inventoryItemId,
+          inventoryItemName: tx.inventoryItemName || '',
+          type: 'ADDITION',
+          source: 'ORDER_CANCELLED',
+          referenceId: orderId,
+          quantityChange: restoreQty,
+          unit: tx.unit || '',
+          costPerUnit: tx.costPerUnit || 0,
+          totalCost: restoreQty * (tx.costPerUnit || 0),
+          date: new Date(),
+          notes: `Inventory restored — order ${orderId} cancelled/deleted`,
+          originalTransactionId: txDoc.id
+        });
+
+        restorations.push({
+          inventoryItemId: tx.inventoryItemId,
+          inventoryItemName: tx.inventoryItemName,
+          quantityRestored: restoreQty,
+          unit: tx.unit
+        });
+      }
+
+      if (restorations.length > 0) {
+        await batch.commit();
+        console.log(`✅ Inventory restored for Order ${orderId}: ${restorations.length} items`);
+      }
+
+      return restorations;
+
+    } catch (error) {
+      console.error(`❌ Error restoring inventory for Order ${orderId}:`, error);
+      return [];
+    }
+  }
+
+  /**
    * Handles "Bulk Production" (e.g., Making 10kg Gravy).
    * Deducts raw ingredients, Adds to "Prepped" inventory.
    */

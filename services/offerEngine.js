@@ -384,6 +384,39 @@ const incrementUsage = async (db, offerId, customerKey) => {
   }
 };
 
+const decrementUsage = async (db, offerId, customerKey) => {
+  if (!db || !offerId) return;
+  try {
+    // Decrement global offer usage count (min 0)
+    const offerRef = db.collection('offers').doc(offerId);
+    const offerSnap = await offerRef.get();
+    if (offerSnap.exists) {
+      const current = offerSnap.data().usageCount || 0;
+      if (current > 0) {
+        await offerRef.update({
+          usageCount: current - 1,
+          updatedAt: new Date(),
+        });
+      }
+    }
+
+    // Decrement per-customer usage (if customerKey provided)
+    if (customerKey) {
+      const ref = db.collection('offers').doc(offerId).collection('customerOfferUsage').doc(customerKey);
+      await db.runTransaction(async (tx) => {
+        const snap = await tx.get(ref);
+        if (snap.exists) {
+          const data = snap.data();
+          const newCount = Math.max(0, (data.usageCount || 0) - 1);
+          tx.update(ref, { usageCount: newCount });
+        }
+      });
+    }
+  } catch (err) {
+    console.error('[offerEngine] decrementUsage error:', err);
+  }
+};
+
 module.exports = {
   normalizePhone,
   isScheduleValid,
@@ -395,4 +428,5 @@ module.exports = {
   buildCustomerKey,
   getCustomerUsageMap,
   incrementUsage,
+  decrementUsage,
 };

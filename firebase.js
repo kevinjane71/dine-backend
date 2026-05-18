@@ -82,6 +82,8 @@ const collections = {
   purchaseOrders: 'purchaseOrders',
   analytics: 'analytics',
   feedback: 'feedback',
+  feedbackForms: 'feedbackForms',
+  feedbackResponses: 'feedbackResponses',
   loyalty: 'loyalty',
   tables: 'tables',
   floors: 'floors',
