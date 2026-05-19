@@ -1425,11 +1425,38 @@ router.get('/tickets/:restaurantId/:ticketId/print-data', async (req, res) => {
 // REPORTS
 // ──────────────────────────────────────────────
 
+// Helper: group payment methods into cash/card/digital
+function groupPaymentMethods(paymentMethodData) {
+  const group = (methods) => {
+    let count = 0, revenue = 0;
+    methods.forEach(m => {
+      if (paymentMethodData[m]) { count += paymentMethodData[m].count; revenue += paymentMethodData[m].revenue; }
+    });
+    return { count, revenue: Math.round(revenue * 100) / 100 };
+  };
+  const cashData = group(['cash']);
+  const cardData = group(['card']);
+  const digitalData = group(['digital', 'upi', 'wallet', 'online', 'apple_pay', 'samsung_pay']);
+  const freeData = group(['free']);
+  return {
+    cash: cashData.count, card: cardData.count, digital: digitalData.count, free: freeData.count,
+    cashRevenue: cashData.revenue, cardRevenue: cardData.revenue, digitalRevenue: digitalData.revenue,
+  };
+}
+
+// Helper: safely extract string from potential {en,ar} object
+function safeConfigStr(val, fallback = '') {
+  if (!val) return fallback;
+  if (typeof val === 'string') return val || fallback;
+  if (typeof val === 'object') return val.en || val.ar || val.url || fallback;
+  return String(val);
+}
+
 // GET /reports/:restaurantId — Parking analytics
 router.get('/reports/:restaurantId', async (req, res) => {
   try {
     const { restaurantId } = req.params;
-    const { startDate, endDate } = req.query;
+    const { startDate, endDate, staffId } = req.query;
 
     const start = startDate ? new Date(startDate) : (() => { const d = new Date(); d.setDate(d.getDate() - 30); return d; })();
     const end = endDate ? new Date(endDate) : new Date();
@@ -1454,13 +1481,16 @@ router.get('/reports/:restaurantId', async (req, res) => {
     const zoneData = {};
     const dailyRevenueMap = {};
     const hourlyDistributionMap = {};
-    // Track both counts AND revenue per payment method
     const paymentMethodData = {};
+    const operatorMap = {};
 
     snap.forEach(doc => {
       const t = doc.data();
-      totalVehicles++;
 
+      // Staff filter: skip tickets not belonging to this staff
+      if (staffId && t.entryOperatorId !== staffId && t.exitOperatorId !== staffId) return;
+
+      totalVehicles++;
       const amount = t.finalAmount || 0;
       if (amount) totalRevenue += amount;
       if (t.duration) { totalDuration += t.duration; completedVehicles++; }
@@ -1471,17 +1501,17 @@ router.get('/reports/:restaurantId', async (req, res) => {
       vehicleTypeCounts[vType].count++;
       vehicleTypeCounts[vType].revenue += amount;
 
-      // Zone breakdown (count + revenue)
+      // Zone breakdown
       const zName = t.zoneName || 'Unknown';
       const zId = t.zoneId || zName;
       if (!zoneData[zId]) zoneData[zId] = { zoneName: zName, zoneId: zId, totalVehicles: 0, revenue: 0 };
       zoneData[zId].totalVehicles++;
       zoneData[zId].revenue += amount;
 
-      // Daily revenue
+      // Daily revenue with payment breakdown
       const entryDate = t.entryTime?.toDate ? t.entryTime.toDate() : new Date(t.entryTime);
       const dateKey = entryDate.toISOString().split('T')[0];
-      if (!dailyRevenueMap[dateKey]) dailyRevenueMap[dateKey] = { revenue: 0, vehicleCount: 0 };
+      if (!dailyRevenueMap[dateKey]) dailyRevenueMap[dateKey] = { revenue: 0, vehicleCount: 0, cashRevenue: 0, cardRevenue: 0, digitalRevenue: 0 };
       dailyRevenueMap[dateKey].revenue += amount;
       dailyRevenueMap[dateKey].vehicleCount++;
 
@@ -1489,77 +1519,76 @@ router.get('/reports/:restaurantId', async (req, res) => {
       const hour = entryDate.getHours();
       hourlyDistributionMap[hour] = (hourlyDistributionMap[hour] || 0) + 1;
 
-      // Payment methods: track count AND revenue
-      if (t.paymentMethod && t.status === 'completed') {
-        const pm = t.paymentMethod;
+      // Payment methods
+      const pm = t.paymentMethod || '';
+      if (pm && t.status === 'completed') {
         if (!paymentMethodData[pm]) paymentMethodData[pm] = { count: 0, revenue: 0 };
         paymentMethodData[pm].count++;
         paymentMethodData[pm].revenue += amount;
+
+        // Daily payment breakdown
+        const pmGroup = ['digital', 'upi', 'wallet', 'online', 'apple_pay', 'samsung_pay'].includes(pm) ? 'digital' : pm;
+        if (pmGroup === 'cash') dailyRevenueMap[dateKey].cashRevenue += amount;
+        else if (pmGroup === 'card') dailyRevenueMap[dateKey].cardRevenue += amount;
+        else dailyRevenueMap[dateKey].digitalRevenue += amount;
+      }
+
+      // Operator tracking
+      const opId = t.entryOperatorId || 'unknown';
+      const opName = t.entryOperatorName || 'Unknown';
+      if (!operatorMap[opId]) {
+        operatorMap[opId] = { id: opId, name: opName, vehicles: 0, revenue: 0, entries: 0, exits: 0, duration: 0, completedCount: 0, cashRevenue: 0, cardRevenue: 0, digitalRevenue: 0, cashCount: 0, cardCount: 0, digitalCount: 0 };
+      }
+      operatorMap[opId].vehicles++;
+      operatorMap[opId].entries++;
+      operatorMap[opId].revenue += amount;
+      if (t.duration) { operatorMap[opId].duration += t.duration; operatorMap[opId].completedCount++; }
+      if (pm && t.status === 'completed') {
+        const pmGroup = ['digital', 'upi', 'wallet', 'online', 'apple_pay', 'samsung_pay'].includes(pm) ? 'digital' : pm;
+        if (pmGroup === 'cash') { operatorMap[opId].cashRevenue += amount; operatorMap[opId].cashCount++; }
+        else if (pmGroup === 'card') { operatorMap[opId].cardRevenue += amount; operatorMap[opId].cardCount++; }
+        else { operatorMap[opId].digitalRevenue += amount; operatorMap[opId].digitalCount++; }
+      }
+      // Track exits by exit operator
+      if (t.exitOperatorId && t.status === 'completed') {
+        const exitOpId = t.exitOperatorId;
+        if (!operatorMap[exitOpId]) {
+          operatorMap[exitOpId] = { id: exitOpId, name: t.exitOperatorName || 'Unknown', vehicles: 0, revenue: 0, entries: 0, exits: 0, duration: 0, completedCount: 0, cashRevenue: 0, cardRevenue: 0, digitalRevenue: 0, cashCount: 0, cardCount: 0, digitalCount: 0 };
+        }
+        if (exitOpId !== opId) operatorMap[exitOpId].exits++;
+        else operatorMap[opId].exits++;
       }
     });
 
-    // Convert vehicle types to array format (frontend expects array)
     const vehicleTypes = Object.entries(vehicleTypeCounts)
-      .map(([type, data]) => ({
-        type,
-        count: data.count,
-        revenue: Math.round(data.revenue * 100) / 100,
-        percentage: totalVehicles > 0 ? Math.round((data.count / totalVehicles) * 100) : 0,
-      }))
+      .map(([type, data]) => ({ type, count: data.count, revenue: Math.round(data.revenue * 100) / 100, percentage: totalVehicles > 0 ? Math.round((data.count / totalVehicles) * 100) : 0 }))
       .sort((a, b) => b.count - a.count);
 
-    // Convert zones to array format
     const zones = Object.values(zoneData)
       .map(z => ({ ...z, revenue: Math.round(z.revenue * 100) / 100 }))
       .sort((a, b) => b.totalVehicles - a.totalVehicles);
 
-    // Convert daily revenue to sorted array
     const dailyRevenue = Object.entries(dailyRevenueMap)
-      .map(([date, data]) => ({ date, revenue: Math.round(data.revenue * 100) / 100, vehicleCount: data.vehicleCount }))
+      .map(([date, d]) => ({ date, revenue: Math.round(d.revenue * 100) / 100, vehicleCount: d.vehicleCount, cashRevenue: Math.round(d.cashRevenue * 100) / 100, cardRevenue: Math.round(d.cardRevenue * 100) / 100, digitalRevenue: Math.round(d.digitalRevenue * 100) / 100 }))
       .sort((a, b) => a.date.localeCompare(b.date));
 
-    // Convert hourly distribution to full 24-hour array
-    const hourlyDistribution = Array.from({ length: 24 }, (_, i) => ({
-      hour: i,
-      count: hourlyDistributionMap[i] || 0,
-    }));
+    const hourlyDistribution = Array.from({ length: 24 }, (_, i) => ({ hour: i, count: hourlyDistributionMap[i] || 0 }));
 
-    // Payment methods as object with both counts and revenue (cash/card/digital grouping)
-    const groupPayment = (methods) => {
-      let count = 0, revenue = 0;
-      methods.forEach(m => {
-        if (paymentMethodData[m]) {
-          count += paymentMethodData[m].count;
-          revenue += paymentMethodData[m].revenue;
-        }
-      });
-      return { count, revenue: Math.round(revenue * 100) / 100 };
-    };
-    const cashData = groupPayment(['cash']);
-    const cardData = groupPayment(['card']);
-    const digitalData = groupPayment(['digital', 'upi', 'wallet', 'online', 'apple_pay', 'samsung_pay']);
-    const freeData = groupPayment(['free']);
+    const paymentMethods = groupPaymentMethods(paymentMethodData);
 
-    const paymentMethods = {
-      cash: cashData.count,
-      card: cardData.count,
-      digital: digitalData.count,
-      free: freeData.count,
-      // Revenue breakdown by payment type
-      cashRevenue: cashData.revenue,
-      cardRevenue: cardData.revenue,
-      digitalRevenue: digitalData.revenue,
-    };
+    const operators = Object.values(operatorMap)
+      .map(op => ({ ...op, revenue: Math.round(op.revenue * 100) / 100, cashRevenue: Math.round(op.cashRevenue * 100) / 100, cardRevenue: Math.round(op.cardRevenue * 100) / 100, digitalRevenue: Math.round(op.digitalRevenue * 100) / 100, avgDuration: op.completedCount > 0 ? Math.round(op.duration / op.completedCount) : 0 }))
+      .sort((a, b) => b.revenue - a.revenue);
 
     res.json({
       success: true,
       reports: {
         period: { start: start.toISOString(), end: end.toISOString() },
         config: {
-          lotName: typeof config.lotName === 'string' ? config.lotName : (config.lotName?.en || config.lotName?.ar || ''),
-          logo: typeof config.logo === 'string' ? config.logo : (config.logo?.url || ''),
+          lotName: safeConfigStr(config.lotName),
+          logo: safeConfigStr(config.logo),
           currency,
-          address: typeof config.address === 'string' ? config.address : (config.address?.en || config.address?.ar || ''),
+          address: safeConfigStr(config.address),
         },
         summary: {
           totalRevenue: Math.round(totalRevenue * 100) / 100,
@@ -1573,11 +1602,208 @@ router.get('/reports/:restaurantId', async (req, res) => {
         dailyRevenue,
         hourlyDistribution,
         paymentMethods,
+        operators,
       }
     });
   } catch (error) {
     console.error('Error generating reports:', error);
     res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// ──────────────────────────────────────────────
+// REPORT DOWNLOAD (Excel / CSV)
+// ──────────────────────────────────────────────
+
+router.get('/reports/:restaurantId/download', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+    const { startDate, endDate, staffId, format = 'xlsx' } = req.query;
+    const role = req.user.role || '';
+    const userId = req.user.userId || req.user.id;
+
+    // Permission: staff can only download their own
+    if (!staffId && role !== 'owner' && role !== 'admin') {
+      return res.status(403).json({ error: 'Only owner/admin can download all-staff reports' });
+    }
+    if (staffId && staffId !== userId && role !== 'owner' && role !== 'admin') {
+      return res.status(403).json({ error: 'You can only download your own report' });
+    }
+
+    const start = startDate ? new Date(startDate) : (() => { const d = new Date(); d.setDate(d.getDate() - 30); return d; })();
+    const end = endDate ? new Date(endDate) : new Date();
+    end.setHours(23, 59, 59, 999);
+
+    const configDoc = await db.collection(collections.parkingConfigs).doc(restaurantId).get();
+    const config = configDoc.exists ? configDoc.data() : {};
+    const currency = config.currency || 'AED';
+    const lotName = safeConfigStr(config.lotName, 'Parking');
+
+    const snap = await db.collection(collections.parkingTickets)
+      .where('restaurantId', '==', restaurantId)
+      .where('entryTime', '>=', start)
+      .where('entryTime', '<=', end)
+      .get();
+
+    // Collect all ticket data
+    const tickets = [];
+    const operatorMap = {};
+    const dailyMap = {};
+    const paymentData = {};
+    let totalRevenue = 0, totalVehicles = 0;
+
+    snap.forEach(doc => {
+      const t = doc.data();
+      if (staffId && t.entryOperatorId !== staffId && t.exitOperatorId !== staffId) return;
+
+      const amount = t.finalAmount || 0;
+      totalRevenue += amount;
+      totalVehicles++;
+
+      const entryDate = t.entryTime?.toDate ? t.entryTime.toDate() : new Date(t.entryTime);
+      const exitDate = t.exitTime ? (t.exitTime?.toDate ? t.exitTime.toDate() : new Date(t.exitTime)) : null;
+      const dateKey = entryDate.toISOString().split('T')[0];
+      const pm = t.paymentMethod || '';
+      const pmGroup = ['digital', 'upi', 'wallet', 'online', 'apple_pay', 'samsung_pay'].includes(pm) ? 'digital' : (pm || 'unpaid');
+
+      tickets.push({
+        date: dateKey,
+        ticketNumber: t.ticketNumber || '',
+        vehicleNumber: t.vehicleNumber || '',
+        vehicleType: t.vehicleType || '',
+        zoneName: t.zoneName || '',
+        entryTime: entryDate.toLocaleString('en-GB', { day: '2-digit', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit', hour12: true }),
+        exitTime: exitDate ? exitDate.toLocaleString('en-GB', { day: '2-digit', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit', hour12: true }) : '-',
+        duration: t.duration ? `${Math.floor(t.duration / 60)}h ${t.duration % 60}m` : '-',
+        durationMin: t.duration || 0,
+        amount,
+        paymentMethod: pm || (t.status === 'completed' ? 'unpaid' : '-'),
+        entryOperator: t.entryOperatorName || '-',
+        exitOperator: t.exitOperatorName || '-',
+        status: t.status || '',
+      });
+
+      // Operator aggregation
+      const opId = t.entryOperatorId || 'unknown';
+      const opName = t.entryOperatorName || 'Unknown';
+      if (!operatorMap[opId]) operatorMap[opId] = { name: opName, vehicles: 0, revenue: 0, cashRevenue: 0, cardRevenue: 0, digitalRevenue: 0, cashCount: 0, cardCount: 0, digitalCount: 0, totalDuration: 0, completedCount: 0, entries: 0, exits: 0 };
+      operatorMap[opId].vehicles++;
+      operatorMap[opId].entries++;
+      operatorMap[opId].revenue += amount;
+      if (t.duration) { operatorMap[opId].totalDuration += t.duration; operatorMap[opId].completedCount++; }
+      if (pm && t.status === 'completed') {
+        if (pmGroup === 'cash') { operatorMap[opId].cashRevenue += amount; operatorMap[opId].cashCount++; }
+        else if (pmGroup === 'card') { operatorMap[opId].cardRevenue += amount; operatorMap[opId].cardCount++; }
+        else if (pmGroup === 'digital') { operatorMap[opId].digitalRevenue += amount; operatorMap[opId].digitalCount++; }
+      }
+      if (t.exitOperatorId && t.status === 'completed') {
+        if (t.exitOperatorId === opId) operatorMap[opId].exits++;
+      }
+
+      // Daily aggregation
+      if (!dailyMap[dateKey]) dailyMap[dateKey] = { revenue: 0, vehicleCount: 0, cashRevenue: 0, cardRevenue: 0, digitalRevenue: 0 };
+      dailyMap[dateKey].revenue += amount;
+      dailyMap[dateKey].vehicleCount++;
+      if (pm && t.status === 'completed') {
+        if (pmGroup === 'cash') dailyMap[dateKey].cashRevenue += amount;
+        else if (pmGroup === 'card') dailyMap[dateKey].cardRevenue += amount;
+        else if (pmGroup === 'digital') dailyMap[dateKey].digitalRevenue += amount;
+      }
+
+      // Payment method aggregation
+      if (pm && t.status === 'completed') {
+        if (!paymentData[pmGroup]) paymentData[pmGroup] = { count: 0, revenue: 0 };
+        paymentData[pmGroup].count++;
+        paymentData[pmGroup].revenue += amount;
+      }
+    });
+
+    const operators = Object.values(operatorMap).map(op => ({
+      ...op, revenue: Math.round(op.revenue * 100) / 100, cashRevenue: Math.round(op.cashRevenue * 100) / 100, cardRevenue: Math.round(op.cardRevenue * 100) / 100, digitalRevenue: Math.round(op.digitalRevenue * 100) / 100,
+      avgDuration: op.completedCount > 0 ? `${Math.floor(op.totalDuration / op.completedCount / 60)}h ${Math.round(op.totalDuration / op.completedCount % 60)}m` : '-',
+    })).sort((a, b) => b.revenue - a.revenue);
+
+    const dailyRows = Object.entries(dailyMap)
+      .map(([date, d]) => ({ date, revenue: Math.round(d.revenue * 100) / 100, vehicleCount: d.vehicleCount, cashRevenue: Math.round(d.cashRevenue * 100) / 100, cardRevenue: Math.round(d.cardRevenue * 100) / 100, digitalRevenue: Math.round(d.digitalRevenue * 100) / 100 }))
+      .sort((a, b) => a.date.localeCompare(b.date));
+
+    const totalCompletedRevenue = Object.values(paymentData).reduce((s, p) => s + p.revenue, 0);
+    const paymentRows = Object.entries(paymentData)
+      .map(([method, d]) => ({ method: method.charAt(0).toUpperCase() + method.slice(1), count: d.count, revenue: Math.round(d.revenue * 100) / 100, percentage: totalCompletedRevenue > 0 ? Math.round(d.revenue / totalCompletedRevenue * 100) : 0 }))
+      .sort((a, b) => b.revenue - a.revenue);
+
+    const periodStr = `${start.toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' })} – ${end.toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' })}`;
+    const reportType = staffId ? `Staff: ${operators[0]?.name || 'Unknown'}` : 'All Staff';
+    const baseFilename = `parking-report-${startDate || 'all'}-to-${endDate || 'now'}`;
+
+    // ── EXCEL ─────────────────────────────────────
+    if (format === 'xlsx') {
+      const XLSX = require('xlsx');
+      const wb = XLSX.utils.book_new();
+
+      // Sheet 1: Staff Summary
+      const staffHeaders = ['Staff Name', 'Total Vehicles', `Total Revenue (${currency})`, `Cash Revenue (${currency})`, `Card Revenue (${currency})`, `Digital Revenue (${currency})`, 'Cash Txns', 'Card Txns', 'Digital Txns', 'Avg Duration', 'Entries', 'Exits'];
+      const staffRows = operators.map(op => [op.name, op.vehicles, op.revenue, op.cashRevenue, op.cardRevenue, op.digitalRevenue, op.cashCount, op.cardCount, op.digitalCount, op.avgDuration, op.entries, op.exits]);
+      const staffTotalRow = ['TOTAL', totalVehicles, Math.round(totalRevenue * 100) / 100, operators.reduce((s, o) => s + o.cashRevenue, 0), operators.reduce((s, o) => s + o.cardRevenue, 0), operators.reduce((s, o) => s + o.digitalRevenue, 0), operators.reduce((s, o) => s + o.cashCount, 0), operators.reduce((s, o) => s + o.cardCount, 0), operators.reduce((s, o) => s + o.digitalCount, 0), '', operators.reduce((s, o) => s + o.entries, 0), operators.reduce((s, o) => s + o.exits, 0)];
+      const staffSheet = XLSX.utils.aoa_to_sheet([[`${lotName} — Parking Report`], [periodStr], [`Report Type: ${reportType}`], [], staffHeaders, ...staffRows, staffTotalRow]);
+      staffSheet['!cols'] = [{ wch: 20 }, { wch: 14 }, { wch: 18 }, { wch: 18 }, { wch: 18 }, { wch: 18 }, { wch: 10 }, { wch: 10 }, { wch: 12 }, { wch: 14 }, { wch: 8 }, { wch: 8 }];
+      XLSX.utils.book_append_sheet(wb, staffSheet, 'Staff Summary');
+
+      // Sheet 2: Payment Breakdown
+      const payHeaders = ['Payment Method', 'Transaction Count', `Revenue (${currency})`, '% of Total'];
+      const payRows = paymentRows.map(p => [p.method, p.count, p.revenue, `${p.percentage}%`]);
+      payRows.push(['TOTAL', paymentRows.reduce((s, p) => s + p.count, 0), Math.round(totalCompletedRevenue * 100) / 100, '100%']);
+      const paySheet = XLSX.utils.aoa_to_sheet([[`Payment Breakdown — ${periodStr}`], [], payHeaders, ...payRows]);
+      paySheet['!cols'] = [{ wch: 18 }, { wch: 18 }, { wch: 18 }, { wch: 12 }];
+      XLSX.utils.book_append_sheet(wb, paySheet, 'Payment Breakdown');
+
+      // Sheet 3: Daily Revenue by Payment
+      const dailyHeaders = ['Date', `Total Revenue (${currency})`, `Cash (${currency})`, `Card (${currency})`, `Digital (${currency})`, 'Vehicles'];
+      const dailyDataRows = dailyRows.map(d => [d.date, d.revenue, d.cashRevenue, d.cardRevenue, d.digitalRevenue, d.vehicleCount]);
+      dailyDataRows.push(['TOTAL', dailyRows.reduce((s, d) => s + d.revenue, 0), dailyRows.reduce((s, d) => s + d.cashRevenue, 0), dailyRows.reduce((s, d) => s + d.cardRevenue, 0), dailyRows.reduce((s, d) => s + d.digitalRevenue, 0), dailyRows.reduce((s, d) => s + d.vehicleCount, 0)]);
+      const dailySheet = XLSX.utils.aoa_to_sheet([[`Daily Revenue — ${periodStr}`], [], dailyHeaders, ...dailyDataRows]);
+      dailySheet['!cols'] = [{ wch: 14 }, { wch: 18 }, { wch: 14 }, { wch: 14 }, { wch: 14 }, { wch: 10 }];
+      XLSX.utils.book_append_sheet(wb, dailySheet, 'Daily Revenue');
+
+      // Sheet 4: Transaction Details
+      const txHeaders = ['Date', 'Ticket #', 'Vehicle', 'Type', 'Zone', 'Entry Time', 'Exit Time', 'Duration', `Amount (${currency})`, 'Payment', 'Entry Operator', 'Exit Operator', 'Status'];
+      const txRows = tickets.map(t => [t.date, t.ticketNumber, t.vehicleNumber, t.vehicleType, t.zoneName, t.entryTime, t.exitTime, t.duration, t.amount, t.paymentMethod, t.entryOperator, t.exitOperator, t.status]);
+      const txSheet = XLSX.utils.aoa_to_sheet([[`Transaction Details — ${periodStr}`], [], txHeaders, ...txRows]);
+      txSheet['!cols'] = [{ wch: 12 }, { wch: 14 }, { wch: 14 }, { wch: 8 }, { wch: 14 }, { wch: 22 }, { wch: 22 }, { wch: 10 }, { wch: 12 }, { wch: 10 }, { wch: 16 }, { wch: 16 }, { wch: 10 }];
+      XLSX.utils.book_append_sheet(wb, txSheet, 'Transactions');
+
+      const buf = XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' });
+      res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+      res.setHeader('Content-Disposition', `attachment; filename="${baseFilename}.xlsx"`);
+      return res.send(Buffer.from(buf));
+    }
+
+    // ── CSV ───────────────────────────────────────
+    const escCsv = (v) => { const s = String(v ?? ''); return s.includes(',') || s.includes('"') || s.includes('\n') ? `"${s.replace(/"/g, '""')}"` : s; };
+    let csv = '';
+    csv += `${lotName} — Parking Report\n${periodStr}\nReport Type: ${reportType}\nGenerated: ${new Date().toLocaleString('en-GB')}\n\n`;
+
+    csv += `═══ STAFF SUMMARY ═══\nStaff Name,Total Vehicles,Total Revenue (${currency}),Cash Revenue,Card Revenue,Digital Revenue,Cash Txns,Card Txns,Digital Txns,Avg Duration,Entries,Exits\n`;
+    operators.forEach(op => { csv += `${escCsv(op.name)},${op.vehicles},${op.revenue},${op.cashRevenue},${op.cardRevenue},${op.digitalRevenue},${op.cashCount},${op.cardCount},${op.digitalCount},${escCsv(op.avgDuration)},${op.entries},${op.exits}\n`; });
+    csv += `TOTAL,${totalVehicles},${Math.round(totalRevenue * 100) / 100},${operators.reduce((s, o) => s + o.cashRevenue, 0)},${operators.reduce((s, o) => s + o.cardRevenue, 0)},${operators.reduce((s, o) => s + o.digitalRevenue, 0)},${operators.reduce((s, o) => s + o.cashCount, 0)},${operators.reduce((s, o) => s + o.cardCount, 0)},${operators.reduce((s, o) => s + o.digitalCount, 0)},,${operators.reduce((s, o) => s + o.entries, 0)},${operators.reduce((s, o) => s + o.exits, 0)}\n\n`;
+
+    csv += `═══ PAYMENT BREAKDOWN ═══\nPayment Method,Transaction Count,Revenue (${currency}),% of Total\n`;
+    paymentRows.forEach(p => { csv += `${escCsv(p.method)},${p.count},${p.revenue},${p.percentage}%\n`; });
+    csv += `TOTAL,${paymentRows.reduce((s, p) => s + p.count, 0)},${Math.round(totalCompletedRevenue * 100) / 100},100%\n\n`;
+
+    csv += `═══ DAILY REVENUE ═══\nDate,Total Revenue (${currency}),Cash,Card,Digital,Vehicles\n`;
+    dailyRows.forEach(d => { csv += `${d.date},${d.revenue},${d.cashRevenue},${d.cardRevenue},${d.digitalRevenue},${d.vehicleCount}\n`; });
+    csv += '\n';
+
+    csv += `═══ TRANSACTION DETAILS ═══\nDate,Ticket #,Vehicle,Type,Zone,Entry Time,Exit Time,Duration,Amount (${currency}),Payment,Entry Operator,Exit Operator,Status\n`;
+    tickets.forEach(t => { csv += `${t.date},${escCsv(t.ticketNumber)},${escCsv(t.vehicleNumber)},${escCsv(t.vehicleType)},${escCsv(t.zoneName)},${escCsv(t.entryTime)},${escCsv(t.exitTime)},${escCsv(t.duration)},${t.amount},${escCsv(t.paymentMethod)},${escCsv(t.entryOperator)},${escCsv(t.exitOperator)},${escCsv(t.status)}\n`; });
+
+    res.setHeader('Content-Type', 'text/csv');
+    res.setHeader('Content-Disposition', `attachment; filename="${baseFilename}.csv"`);
+    return res.send(csv);
+  } catch (error) {
+    console.error('Error generating parking report download:', error);
+    res.status(500).json({ error: 'Failed to generate report' });
   }
 });
 
