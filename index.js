@@ -15135,8 +15135,13 @@ app.patch('/api/bookings/:restaurantId/:bookingId', authenticateToken, async (re
 app.delete('/api/bookings/:restaurantId/:bookingId', authenticateToken, async (req, res) => {
   try {
     const { bookingId } = req.params;
-    const { reason } = req.body || {};
-    // Instead of deleting, mark as cancelled
+    const { reason, permanent } = req.body || {};
+    if (permanent) {
+      // Hard-delete the booking document entirely
+      await db.collection('bookings_v2').doc(bookingId).delete();
+      return res.json({ success: true, message: 'Booking deleted' });
+    }
+    // Soft-cancel: mark as cancelled but keep the record
     await db.collection('bookings_v2').doc(bookingId).update({
       status: 'cancelled',
       cancelReason: reason || null,
