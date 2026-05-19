@@ -1381,17 +1381,17 @@ router.get('/tickets/:restaurantId/:ticketId/print-data', async (req, res) => {
     res.json({
       success: true,
       printData: {
-        // Config
-        lotName: config.lotName || '',
-        lotNameAr: config.lotNameAr || '',
-        address: config.address || '',
-        addressAr: config.addressAr || '',
-        logo: config.logo || '',
-        receiptHeader: config.receiptHeader || '',
-        receiptHeaderAr: config.receiptHeaderAr || '',
-        receiptFooter: config.receiptFooter || '',
-        receiptFooterAr: config.receiptFooterAr || '',
-        printLanguage: config.printLanguage || 'dual',
+        // Config — safely handle values that may be stored as objects
+        lotName: typeof config.lotName === 'string' ? (config.lotName || '') : (config.lotName?.en || ''),
+        lotNameAr: typeof config.lotNameAr === 'string' ? (config.lotNameAr || '') : (config.lotNameAr?.ar || ''),
+        address: typeof config.address === 'string' ? (config.address || '') : (config.address?.en || ''),
+        addressAr: typeof config.addressAr === 'string' ? (config.addressAr || '') : (config.addressAr?.ar || ''),
+        logo: typeof config.logo === 'string' ? (config.logo || '') : (config.logo?.url || ''),
+        receiptHeader: typeof config.receiptHeader === 'string' ? (config.receiptHeader || '') : (config.receiptHeader?.en || ''),
+        receiptHeaderAr: typeof config.receiptHeaderAr === 'string' ? (config.receiptHeaderAr || '') : (config.receiptHeaderAr?.ar || ''),
+        receiptFooter: typeof config.receiptFooter === 'string' ? (config.receiptFooter || '') : (config.receiptFooter?.en || ''),
+        receiptFooterAr: typeof config.receiptFooterAr === 'string' ? (config.receiptFooterAr || '') : (config.receiptFooterAr?.ar || ''),
+        printLanguage: typeof config.printLanguage === 'string' ? (config.printLanguage || 'dual') : 'dual',
         currency: config.currency || 'AED',
         // Ticket
         ticketNumber: ticket.ticketNumber,
@@ -1556,10 +1556,10 @@ router.get('/reports/:restaurantId', async (req, res) => {
       reports: {
         period: { start: start.toISOString(), end: end.toISOString() },
         config: {
-          lotName: config.lotName || '',
-          logo: config.logo || '',
+          lotName: typeof config.lotName === 'string' ? config.lotName : (config.lotName?.en || config.lotName?.ar || ''),
+          logo: typeof config.logo === 'string' ? config.logo : (config.logo?.url || ''),
           currency,
-          address: config.address || '',
+          address: typeof config.address === 'string' ? config.address : (config.address?.en || config.address?.ar || ''),
         },
         summary: {
           totalRevenue: Math.round(totalRevenue * 100) / 100,
