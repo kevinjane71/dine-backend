@@ -1435,6 +1435,11 @@ router.get('/reports/:restaurantId', async (req, res) => {
     const end = endDate ? new Date(endDate) : new Date();
     end.setHours(23, 59, 59, 999);
 
+    // Fetch parking config for currency, logo, name
+    const configDoc = await db.collection(collections.parkingConfigs).doc(restaurantId).get();
+    const config = configDoc.exists ? configDoc.data() : {};
+    const currency = config.currency || 'AED';
+
     const snap = await db.collection(collections.parkingTickets)
       .where('restaurantId', '==', restaurantId)
       .where('entryTime', '>=', start)
@@ -1444,59 +1449,130 @@ router.get('/reports/:restaurantId', async (req, res) => {
     let totalRevenue = 0;
     let totalVehicles = 0;
     let totalDuration = 0;
+    let completedVehicles = 0;
     const vehicleTypeCounts = {};
-    const zoneCounts = {};
-    const dailyRevenue = {};
-    const hourlyDistribution = {};
-    const paymentMethodCounts = {};
+    const zoneData = {};
+    const dailyRevenueMap = {};
+    const hourlyDistributionMap = {};
+    // Track both counts AND revenue per payment method
+    const paymentMethodData = {};
 
     snap.forEach(doc => {
       const t = doc.data();
       totalVehicles++;
 
-      if (t.finalAmount) totalRevenue += t.finalAmount;
-      if (t.duration) totalDuration += t.duration;
+      const amount = t.finalAmount || 0;
+      if (amount) totalRevenue += amount;
+      if (t.duration) { totalDuration += t.duration; completedVehicles++; }
 
       // Vehicle type breakdown
       const vType = t.vehicleType || 'unknown';
-      vehicleTypeCounts[vType] = (vehicleTypeCounts[vType] || 0) + 1;
+      if (!vehicleTypeCounts[vType]) vehicleTypeCounts[vType] = { count: 0, revenue: 0 };
+      vehicleTypeCounts[vType].count++;
+      vehicleTypeCounts[vType].revenue += amount;
 
-      // Zone breakdown
+      // Zone breakdown (count + revenue)
       const zName = t.zoneName || 'Unknown';
-      zoneCounts[zName] = (zoneCounts[zName] || 0) + 1;
+      const zId = t.zoneId || zName;
+      if (!zoneData[zId]) zoneData[zId] = { zoneName: zName, zoneId: zId, totalVehicles: 0, revenue: 0 };
+      zoneData[zId].totalVehicles++;
+      zoneData[zId].revenue += amount;
 
       // Daily revenue
       const entryDate = t.entryTime?.toDate ? t.entryTime.toDate() : new Date(t.entryTime);
       const dateKey = entryDate.toISOString().split('T')[0];
-      if (!dailyRevenue[dateKey]) dailyRevenue[dateKey] = { revenue: 0, vehicles: 0 };
-      dailyRevenue[dateKey].revenue += t.finalAmount || 0;
-      dailyRevenue[dateKey].vehicles++;
+      if (!dailyRevenueMap[dateKey]) dailyRevenueMap[dateKey] = { revenue: 0, vehicleCount: 0 };
+      dailyRevenueMap[dateKey].revenue += amount;
+      dailyRevenueMap[dateKey].vehicleCount++;
 
       // Hourly distribution
       const hour = entryDate.getHours();
-      hourlyDistribution[hour] = (hourlyDistribution[hour] || 0) + 1;
+      hourlyDistributionMap[hour] = (hourlyDistributionMap[hour] || 0) + 1;
 
-      // Payment methods
-      if (t.paymentMethod) {
-        paymentMethodCounts[t.paymentMethod] = (paymentMethodCounts[t.paymentMethod] || 0) + 1;
+      // Payment methods: track count AND revenue
+      if (t.paymentMethod && t.status === 'completed') {
+        const pm = t.paymentMethod;
+        if (!paymentMethodData[pm]) paymentMethodData[pm] = { count: 0, revenue: 0 };
+        paymentMethodData[pm].count++;
+        paymentMethodData[pm].revenue += amount;
       }
     });
+
+    // Convert vehicle types to array format (frontend expects array)
+    const vehicleTypes = Object.entries(vehicleTypeCounts)
+      .map(([type, data]) => ({
+        type,
+        count: data.count,
+        revenue: Math.round(data.revenue * 100) / 100,
+        percentage: totalVehicles > 0 ? Math.round((data.count / totalVehicles) * 100) : 0,
+      }))
+      .sort((a, b) => b.count - a.count);
+
+    // Convert zones to array format
+    const zones = Object.values(zoneData)
+      .map(z => ({ ...z, revenue: Math.round(z.revenue * 100) / 100 }))
+      .sort((a, b) => b.totalVehicles - a.totalVehicles);
+
+    // Convert daily revenue to sorted array
+    const dailyRevenue = Object.entries(dailyRevenueMap)
+      .map(([date, data]) => ({ date, revenue: Math.round(data.revenue * 100) / 100, vehicleCount: data.vehicleCount }))
+      .sort((a, b) => a.date.localeCompare(b.date));
+
+    // Convert hourly distribution to full 24-hour array
+    const hourlyDistribution = Array.from({ length: 24 }, (_, i) => ({
+      hour: i,
+      count: hourlyDistributionMap[i] || 0,
+    }));
+
+    // Payment methods as object with both counts and revenue (cash/card/digital grouping)
+    const groupPayment = (methods) => {
+      let count = 0, revenue = 0;
+      methods.forEach(m => {
+        if (paymentMethodData[m]) {
+          count += paymentMethodData[m].count;
+          revenue += paymentMethodData[m].revenue;
+        }
+      });
+      return { count, revenue: Math.round(revenue * 100) / 100 };
+    };
+    const cashData = groupPayment(['cash']);
+    const cardData = groupPayment(['card']);
+    const digitalData = groupPayment(['digital', 'upi', 'wallet', 'online', 'apple_pay', 'samsung_pay']);
+    const freeData = groupPayment(['free']);
+
+    const paymentMethods = {
+      cash: cashData.count,
+      card: cardData.count,
+      digital: digitalData.count,
+      free: freeData.count,
+      // Revenue breakdown by payment type
+      cashRevenue: cashData.revenue,
+      cardRevenue: cardData.revenue,
+      digitalRevenue: digitalData.revenue,
+    };
 
     res.json({
       success: true,
       reports: {
         period: { start: start.toISOString(), end: end.toISOString() },
+        config: {
+          lotName: config.lotName || '',
+          logo: config.logo || '',
+          currency,
+          address: config.address || '',
+        },
         summary: {
           totalRevenue: Math.round(totalRevenue * 100) / 100,
           totalVehicles,
-          averageDuration: totalVehicles > 0 ? Math.round(totalDuration / totalVehicles) : 0,
-          averageRevenue: totalVehicles > 0 ? Math.round((totalRevenue / totalVehicles) * 100) / 100 : 0
+          averageDuration: completedVehicles > 0 ? Math.round(totalDuration / completedVehicles) : 0,
+          averageRevenuePerVehicle: totalVehicles > 0 ? Math.round((totalRevenue / totalVehicles) * 100) / 100 : 0,
+          currency,
         },
-        vehicleTypes: vehicleTypeCounts,
-        zones: zoneCounts,
+        vehicleTypes,
+        zones,
         dailyRevenue,
         hourlyDistribution,
-        paymentMethods: paymentMethodCounts
+        paymentMethods,
       }
     });
   } catch (error) {
