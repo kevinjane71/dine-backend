@@ -9343,6 +9343,49 @@ app.post('/api/orders', async (req, res) => {
       console.log(`📊 POS override: Using frontend billing values (Subtotal: ₹${orderData.subtotal}, Disc: ₹${orderData.totalDiscountAmount}, Tax: ₹${orderData.taxAmount}, Final: ₹${orderData.finalAmount})`);
     }
 
+    // Billing audit: compare FE-sent values vs BE-resolved values
+    if (orderItems.length > 0) {
+      const beResolvedSubtotal = orderItems.reduce((s, i) => s + ((i.price || 0) * (i.quantity || 1)), 0);
+      const feSubtotal = parseFloat(req.body.totalAmount) || beResolvedSubtotal;
+      const itemPriceDiscrepancies = [];
+      const reqItems = req.body.items || [];
+      orderItems.forEach((item, idx) => {
+        const sentPrice = parseFloat(reqItems[idx]?.price) || 0;
+        const resolvedPrice = item.price || 0;
+        if (sentPrice > 0 && Math.abs(sentPrice - resolvedPrice) > 0.01) {
+          itemPriceDiscrepancies.push({
+            menuItemId: item.menuItemId,
+            name: item.name,
+            sentPrice,
+            resolvedPrice,
+            difference: Math.round((resolvedPrice - sentPrice) * 100) / 100,
+          });
+        }
+      });
+      const hasDiscrepancy = Math.abs(feSubtotal - beResolvedSubtotal) > 0.01 || itemPriceDiscrepancies.length > 0;
+      if (hasDiscrepancy) {
+        orderData.billingAudit = {
+          timestamp: new Date().toISOString(),
+          frontend: {
+            subtotal: feSubtotal,
+            finalAmount: parseFloat(req.body.finalAmount) || null,
+            totalAmount: parseFloat(req.body.totalAmount) || null,
+            serviceChargeAmount: parseFloat(req.body.serviceChargeAmount) || 0,
+            taxAmount: parseFloat(req.body.taxAmount) || 0,
+            manualDiscount: parseFloat(req.body.manualDiscount) || 0,
+          },
+          backend: {
+            subtotal: beResolvedSubtotal,
+            finalAmount: orderData.finalAmount || null,
+            serviceChargeAmount: orderData.serviceChargeAmount || 0,
+            taxAmount: orderData.taxAmount || 0,
+          },
+          itemPriceDiscrepancies,
+        };
+        console.warn('⚠️ POST billing discrepancy detected:', JSON.stringify(orderData.billingAudit));
+      }
+    }
+
     console.log('🛒 Backend Order Creation - Status from frontend:', req.body.status);
     console.log('🛒 Backend Order Creation - Final status:', orderData.status);
     console.log('🛒 Backend Order Creation - StaffInfo received:', req.body.staffInfo);
@@ -11928,20 +11971,70 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
     };
 
     if (items) {
+      // Fetch restaurant menu data for server-side price resolution
+      const restaurantDoc = await db.collection(collections.restaurants).doc(currentOrder.restaurantId).get();
+      const restaurantData = restaurantDoc.exists ? restaurantDoc.data() : {};
+      const menuItems = restaurantData?.menu?.items || [];
+      const multiPricing = restaurantData?.pricingSettings?.multiPricing;
+
+      // Resolve active pricing rule (same logic as POST handler)
+      let activePricingRuleId = null;
+      if (multiPricing?.enabled) {
+        if (req.body.pricingRuleId) {
+          const manualRule = (multiPricing.rules || []).find(r => r.id === req.body.pricingRuleId && r.isActive);
+          if (manualRule) activePricingRuleId = manualRule.id;
+        }
+        if (!activePricingRuleId && orderType) {
+          const autoRule = (multiPricing.rules || []).find(r => r.isActive && r.orderType === orderType);
+          if (autoRule) activePricingRuleId = autoRule.id;
+        }
+      }
+
       // Compare with existing items to mark new/updated items
       const existingItems = currentOrder.items || [];
       const processedItems = items.map(newItem => {
         const existingItem = existingItems.find(existing => existing.menuItemId === newItem.menuItemId);
 
-        // Ensure each item has proper price and total information
         // Clear any previous KOT diff flags to avoid stale flags from prior updates
         const { isNew: _isNew, isUpdated: _isUpdated, isRemoved: _isRemoved, addedAt: _addedAt, updatedAt: _updatedAt, removedAt: _removedAt, previousQuantity: _prevQty, quantityDelta: _qtyDelta, ...cleanItem } = newItem;
+
+        // Server-side price resolution (mirrors POST handler logic)
+        const menuItem = menuItems.find(m => m.id === cleanItem.menuItemId);
+        const selectedVariant = cleanItem.selectedVariant || null;
+        const customizations = Array.isArray(cleanItem.selectedCustomizations) ? cleanItem.selectedCustomizations : [];
+
+        let resolvedBasePrice;
+        if (menuItem) {
+          resolvedBasePrice = typeof selectedVariant?.price === 'number'
+            ? selectedVariant.price
+            : (typeof cleanItem.basePrice === 'number' ? cleanItem.basePrice
+              : (typeof cleanItem.price === 'number' ? cleanItem.price : menuItem.price));
+
+          // Multi-tier pricing: override base price for non-variant items
+          if (multiPricing?.enabled && activePricingRuleId && !selectedVariant) {
+            const rulePrice = resolveItemPriceForRule(menuItem, activePricingRuleId, multiPricing.rules);
+            if (rulePrice !== null) resolvedBasePrice = rulePrice;
+          }
+        } else {
+          // Menu item not found — use FE-sent price as fallback
+          resolvedBasePrice = cleanItem.price || existingItem?.price || 0;
+        }
+
+        const customizationPrice = customizations.reduce((sum, c) => sum + (typeof c.price === 'number' ? c.price : 0), 0);
+        const resolvedUnitPrice = (resolvedBasePrice || 0) + (customizationPrice || 0);
+
+        // Log if FE-sent price differs from BE-resolved price
+        if (cleanItem.price && Math.abs(cleanItem.price - resolvedUnitPrice) > 0.01) {
+          console.warn(`⚠️ PATCH price mismatch for "${cleanItem.name}": FE sent ${cleanItem.price}, BE resolved ${resolvedUnitPrice}`);
+        }
+
+        const itemQuantity = Math.max(1, parseInt(cleanItem.quantity, 10) || 1);
         const itemWithTotals = {
           ...cleanItem,
-          // Ensure price is available
-          price: cleanItem.price || existingItem?.price || 0,
-          // Calculate total if not provided
-          total: cleanItem.total || (cleanItem.price || existingItem?.price || 0) * cleanItem.quantity
+          price: resolvedUnitPrice,
+          total: resolvedUnitPrice * itemQuantity,
+          selectedVariant: selectedVariant ? { name: selectedVariant.name, price: selectedVariant.price || 0 } : null,
+          selectedCustomizations: customizations.map(c => ({ id: c.id || null, name: c.name || c, price: typeof c.price === 'number' ? c.price : 0 })),
         };
 
         if (!existingItem) {
@@ -12356,6 +12449,49 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
         updateData.outstandingAmount = Math.round((updateData.finalAmount - Number(req.body.partialPayAmount)) * 100) / 100;
       }
       console.log(`📊 PATCH POS override: Using frontend billing values (Subtotal: ₹${updateData.subtotal}, Disc: ₹${updateData.totalDiscountAmount}, Tax: ₹${updateData.taxAmount}, Final: ₹${updateData.finalAmount})`);
+    }
+
+    // Billing audit: compare FE-sent values vs BE-resolved values
+    if (items && updateData.items) {
+      const beResolvedSubtotal = updateData.items.reduce((s, i) => s + ((i.price || 0) * (i.quantity || 1)), 0);
+      const feSubtotal = parseFloat(req.body.subtotal || req.body.totalAmount) || beResolvedSubtotal;
+      const itemPriceDiscrepancies = [];
+      const reqItems = req.body.items || [];
+      updateData.items.forEach((item, idx) => {
+        const sentPrice = parseFloat(reqItems[idx]?.price) || 0;
+        const resolvedPrice = item.price || 0;
+        if (sentPrice > 0 && Math.abs(sentPrice - resolvedPrice) > 0.01) {
+          itemPriceDiscrepancies.push({
+            menuItemId: item.menuItemId,
+            name: item.name,
+            sentPrice,
+            resolvedPrice,
+            difference: Math.round((resolvedPrice - sentPrice) * 100) / 100,
+          });
+        }
+      });
+      const hasDiscrepancy = Math.abs(feSubtotal - beResolvedSubtotal) > 0.01 || itemPriceDiscrepancies.length > 0;
+      if (hasDiscrepancy) {
+        updateData.billingAudit = {
+          timestamp: new Date().toISOString(),
+          frontend: {
+            subtotal: feSubtotal,
+            finalAmount: parseFloat(req.body.finalAmount) || null,
+            totalAmount: parseFloat(req.body.totalAmount) || null,
+            serviceChargeAmount: parseFloat(req.body.serviceChargeAmount) || 0,
+            taxAmount: parseFloat(req.body.taxAmount) || 0,
+            manualDiscount: parseFloat(req.body.manualDiscount) || 0,
+          },
+          backend: {
+            subtotal: beResolvedSubtotal,
+            finalAmount: updateData.finalAmount || null,
+            serviceChargeAmount: updateData.serviceChargeAmount || 0,
+            taxAmount: updateData.taxAmount || 0,
+          },
+          itemPriceDiscrepancies,
+        };
+        console.warn('⚠️ PATCH billing discrepancy detected:', JSON.stringify(updateData.billingAudit));
+      }
     }
 
     // Add update history
@@ -17573,6 +17709,11 @@ app.put('/api/admin/print-settings/:restaurantId', authenticateToken, async (req
     if (printSettings.billFontScale !== undefined) {
       const val = parseInt(printSettings.billFontScale);
       sanitizedSettings.billFontScale = isNaN(val) ? 100 : Math.max(50, Math.min(val, 150));
+    }
+    // printerWidth: thermal paper width in mm (58 or 80, default 80)
+    if (printSettings.printerWidth !== undefined) {
+      const val = parseInt(printSettings.printerWidth);
+      sanitizedSettings.printerWidth = [58, 80].includes(val) ? val : 80;
     }
     // receiptLogo: object with url, position, size, nameAlignment, enabled
     if (printSettings.receiptLogo !== undefined) {
