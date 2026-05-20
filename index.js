@@ -406,8 +406,11 @@ function calculatePerItemTax(orderItems, taxSettings, categories, totalDiscount,
       ? (itemTotal / discountableSubtotal) * totalDiscount
       : 0;
     const itemTaxable = Math.max(0, itemTotal - itemDiscShare);
-    // Service charge distributed across ALL items (applies universally)
-    const itemSCShare = subtotal > 0 ? (itemTotal / subtotal) * (serviceChargeAmount || 0) : 0;
+    // Service charge distributed across items proportional to their post-discount taxable amount
+    const postDiscountSubtotal = Math.max(0, subtotal - totalDiscount);
+    const itemSCShare = postDiscountSubtotal > 0
+      ? (itemTaxable / postDiscountSubtotal) * (serviceChargeAmount || 0)
+      : (subtotal > 0 ? (itemTotal / subtotal) * (serviceChargeAmount || 0) : 0);
     const itemTaxableWithSC = itemTaxable + itemSCShare;
 
     const itemTaxes = resolveTaxesForItem(item, taxSettings, categories);
@@ -418,9 +421,10 @@ function calculatePerItemTax(orderItems, taxSettings, categories, totalDiscount,
     for (const tax of itemTaxes) {
       // Inclusive: tax = amount * rate / (100 + totalRate)  (back-calculate from inclusive price)
       // Exclusive: tax = amount * rate / 100  (add on top)
+      // Accumulate raw (unrounded) values to minimize per-item rounding errors
       const amt = isInclusive
-        ? Math.round((itemTaxableWithSC * (tax.rate || 0) / (100 + totalRate)) * 100) / 100
-        : Math.round((itemTaxableWithSC * (tax.rate || 0) / 100) * 100) / 100;
+        ? (itemTaxableWithSC * (tax.rate || 0) / (100 + totalRate))
+        : (itemTaxableWithSC * (tax.rate || 0) / 100);
       const key = `${tax.name || 'Tax'}|${tax.rate || 0}|${isInclusive}`;
       if (!taxTotals[key]) taxTotals[key] = { name: tax.name || 'Tax', rate: tax.rate || 0, amount: 0, inclusive: isInclusive };
       taxTotals[key].amount += amt;
@@ -430,7 +434,7 @@ function calculatePerItemTax(orderItems, taxSettings, categories, totalDiscount,
       else exclusiveTaxAmount += amt;
     }
 
-    // Store per-item tax amount and inclusive flag for audit trail
+    // Store per-item tax amount and inclusive flag for audit trail (round only the per-item total)
     item.itemTaxAmount = Math.round(itemTaxAmount * 100) / 100;
     item.taxInclusive = isInclusive;
     item.taxGroupId = item.taxGroupId || null;
@@ -672,10 +676,91 @@ async function syncInventoryStockToMenuItems(restaurantId) {
         'menu.lastUpdated': new Date()
       });
       invalidateRestaurantCache(restaurantId);
+      // Notify frontend to refresh menu so stock badges update in real-time
+      pusherService.notifyMenuUpdated(restaurantId, null, ['stockQuantity'])
+        .catch(err => console.error('Pusher inventory-sync notification error:', err));
       console.log(`🔄 Bulk inventory→menu sync for ${restaurantId}`);
     }
   } catch (err) {
     console.error('syncInventoryStockToMenuItems error:', err);
+  }
+}
+
+// Decrement stockQuantity directly on menu items that are stock-managed
+// but NOT linked to the inventory system. Inventory-linked items are handled
+// by syncInventoryStockToMenuItems. Uses a transaction for concurrency safety.
+// mode: 'decrement' (order placed) or 'restore' (items removed during edit)
+async function adjustDirectMenuItemStock(restaurantId, orderItems, mode = 'decrement') {
+  try {
+    if (!orderItems || orderItems.length === 0) return;
+
+    // Find inventory-linked menu item IDs (these are synced separately)
+    const invSnap = await db.collection(collections.inventory)
+      .where('restaurantId', '==', restaurantId)
+      .where('linkedMenuItemId', '!=', null)
+      .get();
+
+    const inventoryLinkedIds = new Set();
+    invSnap.docs.forEach(doc => {
+      const d = doc.data();
+      if (d.linkedMenuItemId) inventoryLinkedIds.add(d.linkedMenuItemId);
+    });
+
+    // Build quantity map: menuItemId -> total quantity
+    const qtyMap = {};
+    for (const item of orderItems) {
+      const id = item.menuItemId || item.id;
+      if (!id) continue;
+      qtyMap[id] = (qtyMap[id] || 0) + (item.quantity || 1);
+    }
+
+    // Skip if all ordered items are inventory-linked
+    const hasDirectItems = Object.keys(qtyMap).some(id => !inventoryLinkedIds.has(id));
+    if (!hasDirectItems) return;
+
+    const restaurantRef = db.collection(collections.restaurants).doc(restaurantId);
+
+    await db.runTransaction(async (transaction) => {
+      const doc = await transaction.get(restaurantRef);
+      if (!doc.exists) return;
+
+      const menuItems = doc.data()?.menu?.items || [];
+      let changed = false;
+
+      const updatedItems = menuItems.map(mi => {
+        if (!mi.isStockManaged || typeof mi.stockQuantity !== 'number') return mi;
+        if (inventoryLinkedIds.has(mi.id)) return mi; // handled by inventory sync
+
+        const qty = qtyMap[mi.id];
+        if (!qty) return mi;
+
+        let newQty;
+        if (mode === 'restore') {
+          newQty = mi.stockQuantity + qty;
+        } else {
+          newQty = Math.max(0, mi.stockQuantity - qty);
+        }
+        const newAvail = newQty > 0;
+        if (mi.stockQuantity === newQty && mi.isAvailable === newAvail) return mi;
+        changed = true;
+        return { ...mi, stockQuantity: newQty, isAvailable: newAvail, updatedAt: new Date() };
+      });
+
+      if (changed) {
+        transaction.update(restaurantRef, {
+          'menu.items': updatedItems,
+          'menu.lastUpdated': new Date()
+        });
+      }
+    });
+
+    invalidateRestaurantCache(restaurantId);
+    // Notify frontend to refresh menu so stock badges update in real-time
+    pusherService.notifyMenuUpdated(restaurantId, null, ['stockQuantity'])
+      .catch(err => console.error('Pusher stock-update notification error:', err));
+    console.log(`📦 Direct menu stock ${mode === 'restore' ? 'restored' : 'decremented'} for ${restaurantId}`);
+  } catch (err) {
+    console.error(`adjustDirectMenuItemStock (${mode}) error:`, err);
   }
 }
 
@@ -8336,7 +8421,7 @@ app.post('/api/public/orders/:restaurantId', vercelSecurityMiddleware.publicAPI,
 
       if (pointsToRedeem > 0) {
         // Dynamic: points / redemptionRate = discount (1=1pt:₹1, 10=10pts:₹1, 100=100pts:₹1)
-        const redemptionRate = loyaltySettings.redemptionRate || 1;
+        const redemptionRate = Math.max(1, Number(loyaltySettings.redemptionRate) || 1);
         loyaltyDiscount = pointsToRedeem / redemptionRate;
 
         // Cap at max redemption percent of subtotal
@@ -8565,10 +8650,16 @@ app.post('/api/public/orders/:restaurantId', vercelSecurityMiddleware.publicAPI,
     console.log(`🏷️ Order Type: ${orderType}`);
     console.log(`💰 Total: ₹${finalTotal} (Subtotal: ₹${subtotal}, Discount: ₹${discountAmount}, Loyalty: ₹${loyaltyDiscount})`);
 
-    // SMART INVENTORY: Deduct stock asynchronously
-    inventoryService.deductInventoryForOrder(restaurantId, orderRef.id, orderItems)
-        .then(() => syncInventoryStockToMenuItems(restaurantId))
-        .catch(err => console.error('Inventory Deduction Error:', err));
+    // SMART INVENTORY: Deduct stock (awaited, but non-blocking on failure)
+    try {
+      await inventoryService.deductInventoryForOrder(restaurantId, orderRef.id, orderItems);
+      await syncInventoryStockToMenuItems(restaurantId);
+      await adjustDirectMenuItemStock(restaurantId, orderItems, 'decrement');
+    } catch (invErr) {
+      console.error('⚠️ Inventory Deduction Error (order still created):', invErr);
+      // Record failure in order for later reconciliation
+      orderRef.update({ inventoryDeductionFailed: true, inventoryError: invErr.message }).catch(() => {});
+    }
 
     // Update daily analytics stats (fire-and-forget)
     updateDailyStats(restaurantId, orderData, 'add');
@@ -8687,37 +8778,76 @@ app.post('/api/orders', async (req, res) => {
     const idempotencyKey = req.body.idempotencyKey || null;
     const syncSource = req.body.syncSource || 'online';
 
-    // Idempotency check: if key provided, check if order already exists
-    // Uses deterministic doc ID for new keys, falls back to query for old keys
+    // Idempotency check: if key provided, atomically reserve or return existing order
     if (idempotencyKey && restaurantId) {
       try {
-        let existingData = null;
+        const idempDocRef = db.collection('idempotency_keys').doc(`${restaurantId}_${idempotencyKey}`);
+        const idempDoc = await idempDocRef.get();
 
-        // 1. Check new format (deterministic doc ID — fast O(1) lookup)
-        const idempDoc = await db.collection('idempotency_keys').doc(`${restaurantId}_${idempotencyKey}`).get();
         if (idempDoc.exists) {
-          existingData = idempDoc.data();
+          const existingData = idempDoc.data();
+          if (existingData.orderId) {
+            const existingOrderDoc = await db.collection(collections.orders).doc(existingData.orderId).get();
+            if (existingOrderDoc.exists) {
+              console.log(`🔑 Idempotency key hit: ${idempotencyKey} -> order ${existingData.orderId}`);
+              return res.status(200).json({
+                message: 'Order already created (idempotency)',
+                order: { id: existingData.orderId, ...existingOrderDoc.data() },
+                idempotent: true
+              });
+            }
+          }
+          // Key exists but order doesn't — possibly failed creation, allow retry
         } else {
-          // 2. Fallback: check old format (query-based — for keys created before this update)
+          // Atomically reserve the key using create() (fails if another request creates it first)
+          try {
+            await idempDocRef.create({
+              key: idempotencyKey,
+              restaurantId,
+              createdAt: new Date(),
+              orderId: null // Will be updated after order creation
+            });
+          } catch (createErr) {
+            // create() failed = another request already reserved this key
+            if (createErr.code === 6) { // ALREADY_EXISTS
+              // Re-read and return existing order
+              const retryDoc = await idempDocRef.get();
+              if (retryDoc.exists && retryDoc.data().orderId) {
+                const existingOrderDoc = await db.collection(collections.orders).doc(retryDoc.data().orderId).get();
+                if (existingOrderDoc.exists) {
+                  console.log(`🔑 Idempotency key race resolved: ${idempotencyKey} -> order ${retryDoc.data().orderId}`);
+                  return res.status(200).json({
+                    message: 'Order already created (idempotency)',
+                    order: { id: retryDoc.data().orderId, ...existingOrderDoc.data() },
+                    idempotent: true
+                  });
+                }
+              }
+            }
+            // Other errors — continue with normal creation
+          }
+        }
+
+        // Fallback: check old format keys (query-based — for keys created before deterministic IDs)
+        if (!idempDoc.exists) {
           const oldSnapshot = await db.collection('idempotency_keys')
             .where('key', '==', idempotencyKey)
             .where('restaurantId', '==', restaurantId)
             .limit(1)
             .get();
           if (!oldSnapshot.empty) {
-            existingData = oldSnapshot.docs[0].data();
-          }
-        }
-
-        if (existingData && existingData.orderId) {
-          const existingOrderDoc = await db.collection(collections.orders).doc(existingData.orderId).get();
-          if (existingOrderDoc.exists) {
-            console.log(`🔑 Idempotency key hit: ${idempotencyKey} -> order ${existingData.orderId}`);
-            return res.status(200).json({
-              message: 'Order already created (idempotency)',
-              order: { id: existingData.orderId, ...existingOrderDoc.data() },
-              idempotent: true
-            });
+            const existingData = oldSnapshot.docs[0].data();
+            if (existingData.orderId) {
+              const existingOrderDoc = await db.collection(collections.orders).doc(existingData.orderId).get();
+              if (existingOrderDoc.exists) {
+                console.log(`🔑 Idempotency key hit (old format): ${idempotencyKey} -> order ${existingData.orderId}`);
+                return res.status(200).json({
+                  message: 'Order already created (idempotency)',
+                  order: { id: existingData.orderId, ...existingOrderDoc.data() },
+                  idempotent: true
+                });
+              }
+            }
           }
         }
       } catch (idempErr) {
@@ -8840,7 +8970,42 @@ app.post('/api/orders', async (req, res) => {
         // Check table availability - only allow "available" status
         // Skip this check for offline sync requests (they were already placed locally)
         const isOfflineSync = req.headers['x-sync-source'] === 'offline';
-        if (tableStatus !== 'available' && !isOfflineSync) {
+
+        // Use Firestore transaction to atomically check + claim the table (prevents race conditions)
+        if (tableId_resolved && tableFloorId_resolved && !isOfflineSync) {
+          const tableRef = db.collection('restaurants').doc(restaurantId)
+            .collection('floors').doc(tableFloorId_resolved)
+            .collection('tables').doc(tableId_resolved);
+          try {
+            await db.runTransaction(async (transaction) => {
+              const tableSnap = await transaction.get(tableRef);
+              const currentStatus = tableSnap.exists ? tableSnap.data().status : 'available';
+              if (currentStatus !== 'available') {
+                const statusMessages = {
+                  'occupied': 'is currently occupied by another customer',
+                  'serving': 'is currently being served',
+                  'out-of-service': 'is out of service and cannot be used',
+                  'reserved': 'is reserved for another customer',
+                  'maintenance': 'is under maintenance',
+                };
+                throw new Error(`TABLE_UNAVAILABLE:Table "${tableNumber}" ${statusMessages[currentStatus] || `has status "${currentStatus}" and cannot be used`}. Please choose another table.`);
+              }
+              // Atomically claim the table by setting a pending status
+              transaction.update(tableRef, {
+                status: 'occupied',
+                lastOrderTime: new Date(),
+                updatedAt: new Date()
+              });
+            });
+            console.log('✅ Table atomically claimed:', { tableNumber, status: 'occupied' });
+          } catch (txError) {
+            if (txError.message && txError.message.startsWith('TABLE_UNAVAILABLE:')) {
+              console.log('❌ Table not available (atomic check):', { table: tableNumber });
+              return res.status(400).json({ error: txError.message.replace('TABLE_UNAVAILABLE:', '') });
+            }
+            throw txError;
+          }
+        } else if (!isOfflineSync && tableStatus !== 'available') {
           let statusMessage = '';
           switch (tableStatus) {
             case 'occupied':
@@ -8878,6 +9043,10 @@ app.post('/api/orders', async (req, res) => {
       }
     }
 
+    // Check if price edit is enabled in POS settings
+    const allowPriceEdit = restaurantData.posSettings?.allowPriceEdit === true;
+    const priceDiscrepancies = []; // Track FE vs BE price mismatches
+
     // Multi-tier pricing: resolve which pricing rule applies to this order
     const multiPricing = restaurantData.pricingSettings?.multiPricing;
     let activePricingRuleId = null;
@@ -8897,6 +9066,42 @@ app.post('/api/orders', async (req, res) => {
     }
 
     for (const item of items) {
+      // Check if this is a custom item (added via "Add Custom Item" when price edit is enabled)
+      const isCustomItem = allowPriceEdit && typeof item.menuItemId === 'string' && item.menuItemId.startsWith('custom-');
+
+      if (isCustomItem) {
+        // Custom item — no menu lookup needed, use FE-provided name/price directly
+        const fePrice = typeof item.price === 'number' ? item.price : (typeof item.basePrice === 'number' ? item.basePrice : 0);
+        if (fePrice < 0) {
+          return res.status(400).json({ error: `Invalid price for custom item "${item.name}": price cannot be negative (₹${fePrice})` });
+        }
+        const parsedQty = parseInt(item.quantity, 10);
+        if (parsedQty != null && parsedQty <= 0) {
+          return res.status(400).json({ error: `Invalid quantity for custom item "${item.name}": quantity must be positive` });
+        }
+        const itemQuantity = Math.max(1, parsedQty || 1);
+        const itemTotal = fePrice * itemQuantity;
+        totalAmount += itemTotal;
+
+        orderItems.push({
+          menuItemId: item.menuItemId,
+          name: typeof item.name === 'string' ? item.name.substring(0, 200) : 'Custom Item',
+          price: fePrice,
+          quantity: itemQuantity,
+          total: itemTotal,
+          category: item.category || 'custom',
+          shortCode: null,
+          notes: typeof item.notes === 'string' ? item.notes.substring(0, 500) : '',
+          selectedVariant: null,
+          selectedCustomizations: [],
+          isCustomItem: true,
+          menuPrice: null,
+          priceEdited: false,
+        });
+        console.log(`🛒 Custom item added: "${item.name}" ₹${fePrice} x${itemQuantity}`);
+        continue;
+      }
+
       // Find menu item in the embedded menu structure
       const menuItem = menuItems.find(menuItem => menuItem.id === item.menuItemId);
 
@@ -8915,22 +9120,79 @@ app.post('/api/orders', async (req, res) => {
         ? item.selectedCustomizations
         : (Array.isArray(item.customizations) ? item.customizations : []);
 
-      let basePrice = typeof selectedVariant?.price === 'number'
-        ? selectedVariant.price
-        : (typeof item.basePrice === 'number' ? item.basePrice : (typeof item.price === 'number' ? item.price : menuItem.price));
+      // Resolve base price — always prefer the authoritative menu price from the DB
+      // unless price edit is explicitly enabled (POS setting) and FE sent a different price
+      const fePrice = typeof item.basePrice === 'number' ? item.basePrice
+        : (typeof item.price === 'number' ? item.price : null);
+      let basePrice;
+
+      // expectedMenuPrice = the price this item SHOULD be (variant price or base menu price)
+      // Used to detect genuine manual price edits vs legitimate variant price differences
+      let expectedMenuPrice = menuItem.price;
+
+      if (selectedVariant && typeof selectedVariant.price === 'number') {
+        // Variant selected — validate variant exists in menu item
+        const matchedVariant = (menuItem.variants || []).find(v =>
+          v.name === selectedVariant.name || v.price === selectedVariant.price
+        );
+        basePrice = matchedVariant ? matchedVariant.price : selectedVariant.price;
+        expectedMenuPrice = basePrice; // variant price is the expected price
+      } else if (allowPriceEdit && fePrice !== null) {
+        // Price edit enabled — trust the frontend price (staff manually adjusted)
+        basePrice = fePrice;
+        // Still log if it differs from menu for audit trail
+        if (fePrice !== menuItem.price) {
+          const disc = {
+            menuItemId: item.menuItemId,
+            itemName: menuItem.name,
+            menuPrice: menuItem.price,
+            chargedPrice: fePrice,
+            reason: 'price_edit_enabled',
+          };
+          priceDiscrepancies.push(disc);
+          console.log(`💰 Price edit: "${menuItem.name}" menu=₹${menuItem.price} → charged=₹${fePrice} (price edit enabled)`);
+        }
+      } else {
+        // Price edit NOT enabled — always use the menu price from DB
+        basePrice = menuItem.price;
+        // Log discrepancy if FE sent a different price (stale cart, caching, etc.)
+        if (fePrice !== null && fePrice !== menuItem.price) {
+          const disc = {
+            menuItemId: item.menuItemId,
+            itemName: menuItem.name,
+            menuPrice: menuItem.price,
+            frontendPrice: fePrice,
+            reason: 'stale_price_corrected',
+          };
+          priceDiscrepancies.push(disc);
+          console.warn(`⚠️ Price mismatch CORRECTED: "${menuItem.name}" FE sent ₹${fePrice} but menu price is ₹${menuItem.price} — using menu price`);
+        }
+      }
 
       // Multi-tier pricing: override base price for non-variant items
       if (multiPricing?.enabled && activePricingRuleId && !selectedVariant) {
         const rulePrice = resolveItemPriceForRule(menuItem, activePricingRuleId, multiPricing.rules);
         if (rulePrice !== null) {
           basePrice = rulePrice;
+          expectedMenuPrice = rulePrice; // pricing rule price is the expected price
         }
       }
 
       const customizationPrice = customizations.reduce((sum, c) => sum + (typeof c.price === 'number' ? c.price : 0), 0);
       const unitPrice = (basePrice || 0) + (customizationPrice || 0);
+      // Expected unit price = expected base + customizations (for price edit comparison)
+      const expectedUnitPrice = (expectedMenuPrice || 0) + (customizationPrice || 0);
 
-      const itemQuantity = Math.max(1, parseInt(item.quantity, 10) || 1);
+      // Validate price is non-negative
+      if (unitPrice < 0) {
+        return res.status(400).json({ error: `Invalid price for item "${menuItem.name}": price cannot be negative (₹${unitPrice})` });
+      }
+
+      const parsedQty = parseInt(item.quantity, 10);
+      if (parsedQty != null && parsedQty <= 0) {
+        return res.status(400).json({ error: `Invalid quantity for item "${menuItem.name}": quantity must be positive` });
+      }
+      const itemQuantity = Math.max(1, parsedQty || 1);
       const itemTotal = unitPrice * itemQuantity;
       totalAmount += itemTotal;
 
@@ -8942,7 +9204,7 @@ app.post('/api/orders', async (req, res) => {
         total: itemTotal,
         category: menuItem.category || '',
         shortCode: menuItem.shortCode || null,
-        notes: item.notes || '',
+        notes: typeof item.notes === 'string' ? item.notes.substring(0, 500) : '',
         // Persist kitchen-facing details
         selectedVariant: selectedVariant ? { name: selectedVariant.name, price: selectedVariant.price || 0 } : null,
         selectedCustomizations: customizations.map(c => ({ id: c.id || null, name: c.name || c, price: typeof c.price === 'number' ? c.price : 0 })),
@@ -8963,6 +9225,10 @@ app.post('/api/orders', async (req, res) => {
         trackInventory: menuItem.trackInventory || menuItem.isStockManaged || false,
         inventoryItemId: menuItem.inventoryItemId || null,
         deductionQuantity: menuItem.deductionQuantity || 1,
+        // Per-item price edit tracking — only flag when price genuinely differs from expected
+        // (variant price or base menu price), NOT when variant selection changes the price
+        menuPrice: allowPriceEdit && unitPrice !== expectedUnitPrice ? expectedMenuPrice : null,
+        priceEdited: allowPriceEdit && unitPrice !== expectedUnitPrice,
       });
     }
 
@@ -9121,11 +9387,14 @@ app.post('/api/orders', async (req, res) => {
 
           if (pointsToRedeem > 0) {
             // Dynamic: points / redemptionRate = discount
-            const redemptionRate = posLoyaltySettings.redemptionRate || 1;
+            const redemptionRate = Math.max(1, Number(posLoyaltySettings.redemptionRate) || 1);
             loyaltyDiscount = pointsToRedeem / redemptionRate;
 
             const maxRedemptionPercent = posLoyaltySettings.maxRedemptionPercent || 20;
-            const maxLoyaltyDiscount = (subtotalForDiscount * maxRedemptionPercent) / 100;
+            // Cap loyalty against remaining amount after prior discounts (offer + manual)
+            const remainingAfterDiscounts = Math.max(0, subtotalForDiscount - discountAmount - manualDiscountAmount);
+            const maxLoyaltyByPercent = (remainingAfterDiscounts * maxRedemptionPercent) / 100;
+            const maxLoyaltyDiscount = Math.min(maxLoyaltyByPercent, remainingAfterDiscounts);
 
             if (loyaltyDiscount > maxLoyaltyDiscount) {
               loyaltyDiscount = maxLoyaltyDiscount;
@@ -9133,6 +9402,8 @@ app.post('/api/orders', async (req, res) => {
             } else {
               loyaltyPointsRedeemed = pointsToRedeem;
             }
+            // Final safety: ensure total discounts never exceed subtotal
+            loyaltyDiscount = Math.min(loyaltyDiscount, Math.max(0, subtotalForDiscount - discountAmount - manualDiscountAmount));
             console.log(`💎 POS Loyalty redeemed: ${loyaltyPointsRedeemed} points = ₹${loyaltyDiscount}`);
           }
         }
@@ -9141,8 +9412,12 @@ app.post('/api/orders', async (req, res) => {
       }
     }
 
-    // Calculate pre-tax total after all discounts
-    const totalDiscountAmount = discountAmount + manualDiscountAmount + loyaltyDiscount;
+    // Calculate pre-tax total after all discounts (including coupon)
+    let couponDiscountAmount = req.body.couponDiscount ? Math.round(Number(req.body.couponDiscount) * 100) / 100 : 0;
+    // Cap coupon discount so total discounts never exceed subtotal
+    const priorDiscounts = discountAmount + manualDiscountAmount + loyaltyDiscount;
+    couponDiscountAmount = Math.min(couponDiscountAmount, Math.max(0, subtotalForDiscount - priorDiscounts));
+    const totalDiscountAmount = priorDiscounts + couponDiscountAmount;
     const preTaxTotal = Math.max(0, totalAmount - totalDiscountAmount);
 
     // Calculate loyalty points earned (stored in order, awarded on completion)
@@ -9152,9 +9427,11 @@ app.post('/api/orders', async (req, res) => {
 
       if (loyaltyPointsRedeemed > 0 && !posLoyaltySettings.earnPointsOnRedemption) {
         loyaltyPointsEarned = 0;
-      } else if (loyaltyPointsRedeemed > 0 && posLoyaltySettings.earnOnFullAmount) {
-        loyaltyPointsEarned = Math.floor((totalAmount - discountAmount - manualDiscountAmount) / earnPerAmount) * pointsEarnedRate;
+      } else if (posLoyaltySettings.earnOnFullAmount) {
+        // earnOnFullAmount: earn on subtotal minus all discounts (consistent with preTaxTotal)
+        loyaltyPointsEarned = Math.floor((totalAmount - discountAmount - manualDiscountAmount - loyaltyDiscount) / earnPerAmount) * pointsEarnedRate;
       } else {
+        // Default: earn on preTaxTotal (after all discounts including coupon)
         loyaltyPointsEarned = Math.floor(preTaxTotal / earnPerAmount) * pointsEarnedRate;
       }
     }
@@ -9172,6 +9449,11 @@ app.post('/api/orders', async (req, res) => {
     // Enrich orderItems with taxGroupId and discountApplicable from menu items
     const menuItemsForTax = restaurantData.menu?.items || [];
     for (const oi of orderItems) {
+      if (oi.isCustomItem) {
+        // Custom items: apply default tax, discount applicable
+        oi.discountApplicable = true;
+        continue;
+      }
       const mi = menuItemsForTax.find(m => m.id === oi.menuItemId);
       if (mi?.taxGroupId) oi.taxGroupId = mi.taxGroupId;
       oi.discountApplicable = mi?.discountApplicable !== false;
@@ -9187,9 +9469,12 @@ app.post('/api/orders', async (req, res) => {
     let finalAmount = preTaxTotal + exclusiveTaxAmount;
 
     // Add billing components to finalAmount
-    const tipAmt = tipAmount ? Number(tipAmount) : 0;
+    let tipAmt = tipAmount ? Number(tipAmount) : 0;
+    // Validate tip: must be non-negative and capped at 100% of order subtotal
+    if (tipAmt < 0) tipAmt = 0;
+    if (tipAmt > subtotalForDiscount) tipAmt = subtotalForDiscount;
     const roAmt = roundOffAmount ? Number(roundOffAmount) : 0;
-    finalAmount = finalAmount + scAmt + tipAmt + roAmt;
+    finalAmount = Math.max(0, finalAmount + scAmt + tipAmt + roAmt);
 
     // Generate order number and daily/sequential order ID (based on restaurant orderSettings.sequentialOrderIdEnabled)
     const orderNumber = `ORD-${Date.now()}-${Math.random().toString(36).substr(2, 4).toUpperCase()}`;
@@ -9199,6 +9484,42 @@ app.post('/api/orders', async (req, res) => {
     let tabNumber = null;
     if (isSavedOrder) {
       tabNumber = await getNextTabNumber(restaurantId);
+    }
+
+    // Validate split payments
+    if (splitPayments && Array.isArray(splitPayments)) {
+      for (const sp of splitPayments) {
+        if (typeof sp.amount !== 'number' || sp.amount < 0) {
+          return res.status(400).json({ error: 'Invalid split payment: amounts must be non-negative numbers' });
+        }
+      }
+      const splitTotal = splitPayments.reduce((sum, sp) => sum + (sp.amount || 0), 0);
+      const tolerance = 0.02; // allow 2 paise rounding tolerance
+      if (Math.abs(splitTotal - finalAmount) > tolerance) {
+        console.warn(`⚠️ Split payment sum (₹${splitTotal}) differs from finalAmount (₹${finalAmount}) by ₹${Math.abs(splitTotal - finalAmount)}`);
+      }
+    }
+
+    // Validate cash/change consistency
+    if (cashReceived != null && cashReceived < 0) {
+      return res.status(400).json({ error: 'Cash received cannot be negative' });
+    }
+    if (changeReturned != null && changeReturned < 0) {
+      return res.status(400).json({ error: 'Change returned cannot be negative' });
+    }
+    if (cashReceived != null && changeReturned != null && changeReturned > cashReceived) {
+      return res.status(400).json({ error: 'Change returned cannot exceed cash received' });
+    }
+
+    // Validate partial payment
+    if (req.body.partialPayAmount != null) {
+      const partialPay = Number(req.body.partialPayAmount);
+      if (partialPay < 0) {
+        return res.status(400).json({ error: 'Partial payment amount cannot be negative' });
+      }
+      if (partialPay > finalAmount + 0.02) {
+        return res.status(400).json({ error: `Partial payment (₹${partialPay}) exceeds order total (₹${finalAmount})` });
+      }
     }
 
     const orderData = {
@@ -9218,6 +9539,8 @@ app.post('/api/orders', async (req, res) => {
       discountAmount: Math.round(discountAmount * 100) / 100,
       offerDiscount: Math.round(discountAmount * 100) / 100,
       manualDiscount: Math.round(manualDiscountAmount * 100) / 100,
+      manualDiscountType: req.body.manualDiscountType || null,
+      manualDiscountValue: req.body.manualDiscountValue != null ? parseFloat(req.body.manualDiscountValue) : null,
       loyaltyDiscount: Math.round(loyaltyDiscount * 100) / 100,
       totalDiscountAmount: Math.round(totalDiscountAmount * 100) / 100,
       selectedOfferName: req.body.selectedOfferName || (appliedOffer ? appliedOffer.name : null),
@@ -9249,6 +9572,7 @@ app.post('/api/orders', async (req, res) => {
       // Billing feature fields
       serviceChargeRate: serviceChargeRate,
       serviceChargeAmount: scAmt > 0 ? Math.round(scAmt * 100) / 100 : null,
+      serviceChargeEnabled: req.body.serviceChargeEnabled != null ? Boolean(req.body.serviceChargeEnabled) : null,
       tipAmount: tipAmount ? Math.round(tipAmount * 100) / 100 : null,
       tipPercentage: tipPercentage,
       cashReceived: cashReceived ? Math.round(cashReceived * 100) / 100 : null,
@@ -9256,7 +9580,8 @@ app.post('/api/orders', async (req, res) => {
       splitPayments: splitPayments,
       roundOffAmount: roundOffAmount ? Math.round(roundOffAmount * 100) / 100 : null,
       paidAmount: (req.body.partialPayAmount != null) ? Math.round(Number(req.body.partialPayAmount) * 100) / 100 : null,
-      outstandingAmount: (req.body.partialPayAmount != null) ? Math.round((finalAmount - Number(req.body.partialPayAmount)) * 100) / 100 : null,
+      // Derive outstanding from rounded paidAmount to ensure paidAmount + outstandingAmount = finalAmount
+      outstandingAmount: (req.body.partialPayAmount != null) ? Math.max(0, Math.round((finalAmount - Math.round(Number(req.body.partialPayAmount) * 100) / 100) * 100) / 100) : null,
       compItems: req.body.compItems || null,
       voidItems: req.body.voidItems || null,
       staffInfo: orderType === 'customer_self_order' ? {
@@ -9285,9 +9610,18 @@ app.post('/api/orders', async (req, res) => {
       // Sub-restaurant fields
       subRestaurantId: req.body.subRestaurantId || null,
       subRestaurantName: req.body.subRestaurantName || null,
+      // Price discrepancy audit trail — logged when FE price differs from menu price
+      ...(priceDiscrepancies.length > 0 ? { priceDiscrepancies } : {}),
       createdAt: new Date(),
       updatedAt: new Date()
     };
+
+    // Log summary of price corrections for this order
+    if (priceDiscrepancies.length > 0) {
+      console.warn(`⚠️ Order ${orderNumber}: ${priceDiscrepancies.length} price discrepanc${priceDiscrepancies.length === 1 ? 'y' : 'ies'} detected:`,
+        priceDiscrepancies.map(d => `"${d.itemName}" FE=₹${d.frontendPrice || d.chargedPrice} vs Menu=₹${d.menuPrice} [${d.reason}]`).join(', ')
+      );
+    }
 
     // Auto-create staff member if assignedStaff has a name but no id
     if (assignedStaff?.name && !assignedStaff?.id) {
@@ -9338,8 +9672,9 @@ app.post('/api/orders', async (req, res) => {
       if (req.body.taxInclusiveMode) orderData.taxInclusiveMode = req.body.taxInclusiveMode;
       // Recalculate outstanding if partial/due
       if (req.body.partialPayAmount != null) {
-        orderData.outstandingAmount = Math.round((orderData.finalAmount - Number(req.body.partialPayAmount)) * 100) / 100;
+        orderData.outstandingAmount = Math.max(0, Math.round((orderData.finalAmount - Number(req.body.partialPayAmount)) * 100) / 100);
       }
+      orderData.finalAmount = Math.max(0, orderData.finalAmount);
       console.log(`📊 POS override: Using frontend billing values (Subtotal: ₹${orderData.subtotal}, Disc: ₹${orderData.totalDiscountAmount}, Tax: ₹${orderData.taxAmount}, Final: ₹${orderData.finalAmount})`);
     }
 
@@ -9396,13 +9731,14 @@ app.post('/api/orders', async (req, res) => {
     console.log('🛒 Backend Order Creation - Order saved to DB with ID:', orderRef.id);
 
     // Store idempotency key for deduplication (use key as doc ID for atomic uniqueness)
+    // Update idempotency key with the actual orderId (key was reserved atomically before creation)
     if (idempotencyKey) {
       db.collection('idempotency_keys').doc(`${restaurantId}_${idempotencyKey}`).set({
         key: idempotencyKey,
         orderId: orderRef.id,
         restaurantId,
         createdAt: new Date()
-      }).catch(err => console.error('Idempotency key store error (non-blocking):', err));
+      }, { merge: true }).catch(err => console.error('Idempotency key update error (non-blocking):', err));
     }
     console.log('🛒 Backend Order Creation - Order data saved:', orderData);
     
@@ -9439,7 +9775,10 @@ app.post('/api/orders', async (req, res) => {
             console.log(`⚠️ Order ${orderRef.id} is already linked to check-in ${checkInId} - skipping duplicate`);
           } else {
             // Use finalAmount (with tax) instead of totalAmount for hotel billing
-            const orderFinalAmount = orderData.finalAmount || (orderData.totalAmount + (orderData.taxAmount || 0));
+            const orderFinalAmount = orderData.finalAmount || (
+              (orderData.totalAmount || 0) + (orderData.taxAmount || 0) +
+              (orderData.serviceChargeAmount || 0) + (orderData.tipAmount || 0) + (orderData.roundOffAmount || 0)
+            );
             foodOrders.push({
               orderId: orderRef.id,
               amount: Math.round(orderFinalAmount * 100) / 100, // Use final amount with tax
@@ -9693,10 +10032,16 @@ app.post('/api/orders', async (req, res) => {
       console.log(`👤 Customer ID: ${customerId}`);
     }
 
-    // SMART INVENTORY: Deduct stock asynchronously
-    inventoryService.deductInventoryForOrder(restaurantId, orderRef.id, orderItems)
-        .then(() => syncInventoryStockToMenuItems(restaurantId))
-        .catch(err => console.error('Inventory Deduction Error:', err));
+    // SMART INVENTORY: Deduct stock (awaited, but non-blocking on failure)
+    try {
+      await inventoryService.deductInventoryForOrder(restaurantId, orderRef.id, orderItems);
+      await syncInventoryStockToMenuItems(restaurantId);
+      await adjustDirectMenuItemStock(restaurantId, orderItems, 'decrement');
+    } catch (invErr) {
+      console.error('⚠️ Inventory Deduction Error (order still created):', invErr);
+      // Record failure in order for later reconciliation
+      orderRef.update({ inventoryDeductionFailed: true, inventoryError: invErr.message }).catch(() => {});
+    }
 
     // NEW: Link order to hotel check-in if room number is provided
     if (roomNumber && roomNumber.trim()) {
@@ -9776,6 +10121,7 @@ app.post('/api/orders', async (req, res) => {
     }
 
     // Update table status to "occupied" if table number is provided
+    // If table was already atomically claimed above, just set the currentOrderId
     if (tableNumber && tableNumber.trim()) {
       try {
         console.log('🔄 Updating table status to occupied:', tableNumber);
@@ -10956,6 +11302,131 @@ function calculateAnalytics(orders, period) {
   };
 }
 
+// Cancelled/Deleted Orders Report — date-filtered with aggregation
+app.get('/api/analytics/:restaurantId/cancelled-orders', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+    const { period, startDate, endDate, type } = req.query;
+
+    // Resolve date range
+    let rangeStart, rangeEnd;
+    const now = new Date();
+    if (startDate && endDate) {
+      rangeStart = new Date(startDate);
+      rangeStart.setHours(0, 0, 0, 0);
+      rangeEnd = new Date(endDate);
+      rangeEnd.setHours(23, 59, 59, 999);
+    } else {
+      const daysMap = { today: 0, yesterday: 1, '7d': 7, '30d': 30 };
+      const days = daysMap[period] ?? 0;
+      if (period === 'yesterday') {
+        rangeStart = new Date(now); rangeStart.setDate(now.getDate() - 1); rangeStart.setHours(0, 0, 0, 0);
+        rangeEnd = new Date(now); rangeEnd.setDate(now.getDate() - 1); rangeEnd.setHours(23, 59, 59, 999);
+      } else {
+        rangeStart = new Date(now); rangeStart.setDate(now.getDate() - days); rangeStart.setHours(0, 0, 0, 0);
+        rangeEnd = new Date(now); rangeEnd.setHours(23, 59, 59, 999);
+      }
+    }
+
+    // Query cancelled orders
+    const statusFilter = type === 'cancelled' ? ['cancelled'] : type === 'deleted' ? ['deleted'] : ['cancelled', 'deleted'];
+    let allOrders = [];
+
+    for (const status of statusFilter) {
+      const dateField = status === 'cancelled' ? 'cancelledAt' : 'deletedAt';
+      const snap = await db.collection(collections.orders)
+        .where('restaurantId', '==', restaurantId)
+        .where('status', '==', status)
+        .where(dateField, '>=', rangeStart)
+        .where(dateField, '<=', rangeEnd)
+        .orderBy(dateField, 'desc')
+        .get();
+      snap.forEach(doc => allOrders.push({ id: doc.id, ...doc.data() }));
+    }
+
+    // Sort combined results by most recent first
+    allOrders.sort((a, b) => {
+      const dateA = a.cancelledAt || a.deletedAt;
+      const dateB = b.cancelledAt || b.deletedAt;
+      const tA = dateA?.toDate ? dateA.toDate().getTime() : new Date(dateA).getTime();
+      const tB = dateB?.toDate ? dateB.toDate().getTime() : new Date(dateB).getTime();
+      return tB - tA;
+    });
+
+    // Aggregate summary
+    let totalCancelled = 0, totalDeleted = 0, totalValueLost = 0;
+    const staffMap = {};
+    const reasonMap = {};
+    const dailyMap = {};
+
+    for (const order of allOrders) {
+      const amount = order.finalAmount || order.totalAmount || 0;
+      totalValueLost += amount;
+      if (order.status === 'cancelled') totalCancelled++;
+      else totalDeleted++;
+
+      // Staff breakdown
+      const staffId = order.cancelledBy || order.deletedBy || 'unknown';
+      const staffName = order.staffInfo?.name || order.cancelledByName || staffId;
+      if (!staffMap[staffId]) staffMap[staffId] = { name: staffName, count: 0, value: 0 };
+      staffMap[staffId].count++;
+      staffMap[staffId].value += amount;
+
+      // Reason breakdown
+      const reason = order.cancellationReason || order.deleteReason || 'No reason provided';
+      if (!reasonMap[reason]) reasonMap[reason] = { reason, count: 0 };
+      reasonMap[reason].count++;
+
+      // Daily breakdown
+      const ts = order.cancelledAt || order.deletedAt;
+      const dateStr = ts?.toDate ? ts.toDate().toISOString().split('T')[0]
+        : (ts ? new Date(ts).toISOString().split('T')[0] : 'unknown');
+      if (!dailyMap[dateStr]) dailyMap[dateStr] = { date: dateStr, cancelled: 0, deleted: 0, value: 0 };
+      if (order.status === 'cancelled') dailyMap[dateStr].cancelled++;
+      else dailyMap[dateStr].deleted++;
+      dailyMap[dateStr].value += amount;
+    }
+
+    // Build response — slim down order objects for transfer
+    const orders = allOrders.map(o => ({
+      id: o.id,
+      orderNumber: o.orderNumber || o.dailyOrderId || null,
+      status: o.status,
+      lastStatus: o.lastStatus || null,
+      totalAmount: o.finalAmount || o.totalAmount || 0,
+      itemCount: (o.items || []).length,
+      itemsSummary: (o.items || []).slice(0, 3).map(i => i.name).join(', ') + ((o.items || []).length > 3 ? '...' : ''),
+      tableNumber: o.tableNumber || null,
+      orderType: o.orderType || null,
+      cancelledBy: o.cancelledBy || o.deletedBy || null,
+      cancelledByName: o.staffInfo?.name || o.cancelledByName || null,
+      reason: o.cancellationReason || o.deleteReason || null,
+      cancelledAt: o.cancelledAt || null,
+      deletedAt: o.deletedAt || null,
+      createdAt: o.createdAt || null,
+      customerInfo: o.customerInfo || null,
+      paymentMethod: o.paymentMethod || null,
+    }));
+
+    res.json({
+      success: true,
+      summary: {
+        totalCancelled,
+        totalDeleted,
+        totalCount: totalCancelled + totalDeleted,
+        totalValueLost: Math.round(totalValueLost * 100) / 100,
+        byStaff: Object.values(staffMap).sort((a, b) => b.count - a.count),
+        byReason: Object.values(reasonMap).sort((a, b) => b.count - a.count),
+        dailyBreakdown: Object.values(dailyMap).sort((a, b) => b.date.localeCompare(a.date)),
+      },
+      orders,
+    });
+  } catch (error) {
+    console.error('Error fetching cancelled orders report:', error);
+    res.status(500).json({ success: false, error: 'Failed to fetch cancelled orders report' });
+  }
+});
+
 // Sales Summary — supports single date, period presets, and custom date ranges
 app.get('/api/analytics/:restaurantId/daily-summary', authenticateToken, async (req, res) => {
   try {
@@ -11992,28 +12463,59 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
 
       // Compare with existing items to mark new/updated items
       const existingItems = currentOrder.items || [];
+      const allowPriceEditPatch = restaurantData?.posSettings?.allowPriceEdit === true;
       const processedItems = items.map(newItem => {
         const existingItem = existingItems.find(existing => existing.menuItemId === newItem.menuItemId);
 
         // Clear any previous KOT diff flags to avoid stale flags from prior updates
         const { isNew: _isNew, isUpdated: _isUpdated, isRemoved: _isRemoved, addedAt: _addedAt, updatedAt: _updatedAt, removedAt: _removedAt, previousQuantity: _prevQty, quantityDelta: _qtyDelta, ...cleanItem } = newItem;
 
+        // Check if this is a custom item (added via "Add Custom Item" when price edit is enabled)
+        const isCustomItemPatch = allowPriceEditPatch && typeof cleanItem.menuItemId === 'string' && cleanItem.menuItemId.startsWith('custom-');
+
         // Server-side price resolution (mirrors POST handler logic)
-        const menuItem = menuItems.find(m => m.id === cleanItem.menuItemId);
+        const menuItem = isCustomItemPatch ? null : menuItems.find(m => m.id === cleanItem.menuItemId);
+
+        // Check availability for NEW items being added to the order
+        const isNewItem = !existingItem;
+        if (isNewItem && menuItem && menuItem.isAvailable === false) {
+          throw new Error(`Item "${menuItem.name}" is currently unavailable and cannot be added to the order`);
+        }
+
         const selectedVariant = cleanItem.selectedVariant || null;
         const customizations = Array.isArray(cleanItem.selectedCustomizations) ? cleanItem.selectedCustomizations : [];
 
         let resolvedBasePrice;
+        let expectedMenuPricePatch = menuItem ? menuItem.price : 0;
         if (menuItem) {
-          resolvedBasePrice = typeof selectedVariant?.price === 'number'
-            ? selectedVariant.price
-            : (typeof cleanItem.basePrice === 'number' ? cleanItem.basePrice
-              : (typeof cleanItem.price === 'number' ? cleanItem.price : menuItem.price));
+          const fePricePatch = typeof cleanItem.basePrice === 'number' ? cleanItem.basePrice
+            : (typeof cleanItem.price === 'number' ? cleanItem.price : null);
+
+          if (selectedVariant && typeof selectedVariant.price === 'number') {
+            // Variant selected — validate against menu
+            const matchedVariant = (menuItem.variants || []).find(v =>
+              v.name === selectedVariant.name || v.price === selectedVariant.price
+            );
+            resolvedBasePrice = matchedVariant ? matchedVariant.price : selectedVariant.price;
+            expectedMenuPricePatch = resolvedBasePrice; // variant price is the expected price
+          } else if (allowPriceEditPatch && fePricePatch !== null) {
+            // Price edit enabled — trust FE price
+            resolvedBasePrice = fePricePatch;
+          } else {
+            // Price edit disabled — always use menu price from DB
+            resolvedBasePrice = menuItem.price;
+            if (fePricePatch !== null && fePricePatch !== menuItem.price) {
+              console.warn(`⚠️ PATCH price corrected: "${menuItem.name}" FE=₹${fePricePatch} → Menu=₹${menuItem.price}`);
+            }
+          }
 
           // Multi-tier pricing: override base price for non-variant items
           if (multiPricing?.enabled && activePricingRuleId && !selectedVariant) {
             const rulePrice = resolveItemPriceForRule(menuItem, activePricingRuleId, multiPricing.rules);
-            if (rulePrice !== null) resolvedBasePrice = rulePrice;
+            if (rulePrice !== null) {
+              resolvedBasePrice = rulePrice;
+              expectedMenuPricePatch = rulePrice;
+            }
           }
         } else {
           // Menu item not found — use FE-sent price as fallback
@@ -12022,19 +12524,33 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
 
         const customizationPrice = customizations.reduce((sum, c) => sum + (typeof c.price === 'number' ? c.price : 0), 0);
         const resolvedUnitPrice = (resolvedBasePrice || 0) + (customizationPrice || 0);
+        const expectedUnitPricePatch = (expectedMenuPricePatch || 0) + (customizationPrice || 0);
+
+        // Validate price is non-negative
+        if (resolvedUnitPrice < 0) {
+          throw new Error(`Invalid price for item "${cleanItem.name || menuItem?.name}": price cannot be negative (₹${resolvedUnitPrice})`);
+        }
 
         // Log if FE-sent price differs from BE-resolved price
         if (cleanItem.price && Math.abs(cleanItem.price - resolvedUnitPrice) > 0.01) {
           console.warn(`⚠️ PATCH price mismatch for "${cleanItem.name}": FE sent ${cleanItem.price}, BE resolved ${resolvedUnitPrice}`);
         }
 
-        const itemQuantity = Math.max(1, parseInt(cleanItem.quantity, 10) || 1);
+        const parsedQtyPatch = parseInt(cleanItem.quantity, 10);
+        if (parsedQtyPatch != null && parsedQtyPatch <= 0) {
+          throw new Error(`Invalid quantity for item "${cleanItem.name || menuItem?.name}": quantity must be positive`);
+        }
+        const itemQuantity = Math.max(1, parsedQtyPatch || 1);
         const itemWithTotals = {
           ...cleanItem,
           price: resolvedUnitPrice,
           total: resolvedUnitPrice * itemQuantity,
           selectedVariant: selectedVariant ? { name: selectedVariant.name, price: selectedVariant.price || 0 } : null,
           selectedCustomizations: customizations.map(c => ({ id: c.id || null, name: c.name || c, price: typeof c.price === 'number' ? c.price : 0 })),
+          // Per-item price edit tracking — only flag genuine manual edits, not variant/rule price differences
+          menuPrice: menuItem && allowPriceEditPatch && resolvedUnitPrice !== expectedUnitPricePatch ? expectedMenuPricePatch : null,
+          priceEdited: !!(menuItem && allowPriceEditPatch && resolvedUnitPrice !== expectedUnitPricePatch),
+          ...(isCustomItemPatch ? { isCustomItem: true } : {}),
         };
 
         if (!existingItem) {
@@ -12098,30 +12614,68 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
     if (specialInstructions !== undefined) updateData.specialInstructions = specialInstructions;
     if (lastUpdatedBy) updateData.lastUpdatedBy = lastUpdatedBy;
     if (assignedStaff !== undefined) updateData.assignedStaff = assignedStaff;
+    if (req.body.customerId !== undefined) updateData.customerId = req.body.customerId;
+
+    // Delivery fields
+    if (req.body.deliveryInfo !== undefined) updateData.deliveryInfo = req.body.deliveryInfo || null;
+    if (req.body.deliveryAddress !== undefined) updateData.deliveryAddress = req.body.deliveryAddress || null;
 
     // Billing feature fields
     if (req.body.serviceChargeRate !== undefined) updateData.serviceChargeRate = req.body.serviceChargeRate;
     if (req.body.serviceChargeAmount !== undefined) updateData.serviceChargeAmount = req.body.serviceChargeAmount;
+    if (req.body.serviceChargeEnabled !== undefined) updateData.serviceChargeEnabled = req.body.serviceChargeEnabled;
     if (req.body.tipAmount !== undefined) updateData.tipAmount = req.body.tipAmount;
     if (req.body.tipPercentage !== undefined) updateData.tipPercentage = req.body.tipPercentage;
     if (req.body.cashReceived !== undefined) updateData.cashReceived = req.body.cashReceived;
     if (req.body.changeReturned !== undefined) updateData.changeReturned = req.body.changeReturned;
-    if (req.body.splitPayments !== undefined) updateData.splitPayments = req.body.splitPayments;
+    if (req.body.splitPayments !== undefined) {
+      // Validate split payments in PATCH
+      if (Array.isArray(req.body.splitPayments)) {
+        for (const sp of req.body.splitPayments) {
+          if (typeof sp.amount !== 'number' || sp.amount < 0) {
+            return res.status(400).json({ error: 'Invalid split payment: amounts must be non-negative numbers' });
+          }
+        }
+      }
+      updateData.splitPayments = req.body.splitPayments;
+    }
     if (req.body.roundOffAmount !== undefined) updateData.roundOffAmount = req.body.roundOffAmount;
     if (req.body.paidAmount !== undefined) updateData.paidAmount = req.body.paidAmount;
     if (req.body.outstandingAmount !== undefined) updateData.outstandingAmount = req.body.outstandingAmount;
     if (req.body.paymentStatus !== undefined) updateData.paymentStatus = req.body.paymentStatus;
+    // Validate cash/change in PATCH
+    if (req.body.cashReceived !== undefined && req.body.cashReceived != null && req.body.cashReceived < 0) {
+      return res.status(400).json({ error: 'Cash received cannot be negative' });
+    }
+    if (req.body.changeReturned !== undefined && req.body.changeReturned != null && req.body.changeReturned < 0) {
+      return res.status(400).json({ error: 'Change returned cannot be negative' });
+    }
 
     // Handle partialPayAmount - compute paidAmount and outstandingAmount (supports 0 for full due)
     if (req.body.partialPayAmount != null && !req.body.paidAmount) {
       const partialPay = Number(req.body.partialPayAmount);
+      if (partialPay < 0) {
+        return res.status(400).json({ error: 'Partial payment amount cannot be negative' });
+      }
       const orderFinal = updateData.finalAmount || currentOrder.finalAmount || (updateData.totalAmount || currentOrder.totalAmount || 0);
+      if (partialPay > orderFinal + 0.02) {
+        return res.status(400).json({ error: `Partial payment (₹${partialPay}) exceeds order total (₹${orderFinal})` });
+      }
       updateData.paidAmount = Math.round(partialPay * 100) / 100;
-      updateData.outstandingAmount = Math.round((orderFinal - partialPay) * 100) / 100;
-      updateData.paymentStatus = partialPay === 0 ? 'due' : 'partial';
+      updateData.outstandingAmount = Math.max(0, Math.round((orderFinal - partialPay) * 100) / 100);
+      updateData.paymentStatus = partialPay === 0 ? 'due' : (partialPay >= orderFinal ? 'paid' : 'partial');
     }
     if (req.body.compItems !== undefined) updateData.compItems = req.body.compItems;
     if (req.body.voidItems !== undefined) updateData.voidItems = req.body.voidItems;
+    // Coupon fields
+    if (req.body.couponDiscount !== undefined) updateData.couponDiscount = req.body.couponDiscount ? Math.round(Number(req.body.couponDiscount) * 100) / 100 : null;
+    if (req.body.couponCode !== undefined) updateData.couponCode = req.body.couponCode || null;
+    if (req.body.couponId !== undefined) updateData.couponId = req.body.couponId || null;
+    // Wallet fields
+    if (req.body.walletCustomerId !== undefined) updateData.walletCustomerId = req.body.walletCustomerId || null;
+    // Manager pin & tax mode
+    if (req.body.managerPin !== undefined) updateData.managerPin = req.body.managerPin || null;
+    if (req.body.taxInclusiveMode !== undefined) updateData.taxInclusiveMode = req.body.taxInclusiveMode;
     // Override payment method if split
     if (req.body.splitPayments && req.body.splitPayments.length > 1) {
       updateData.paymentMethod = 'split';
@@ -12132,7 +12686,11 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
     const redeemLoyaltyPointsVal = parseInt(req.body.redeemLoyaltyPoints) || 0;
     const orderSubtotal = updateData.subtotal || currentOrder.subtotal || updateData.totalAmount || currentOrder.totalAmount || 0;
 
-    if (req.body.manualDiscount !== undefined) updateData.manualDiscount = manualDiscountVal;
+    // Cap manual discount against remaining amount after offer discount
+    const priorOfferDiscount = updateData.discountAmount || currentOrder.discountAmount || 0;
+    if (req.body.manualDiscount !== undefined) updateData.manualDiscount = Math.min(manualDiscountVal, Math.max(0, orderSubtotal - priorOfferDiscount));
+    if (req.body.manualDiscountType !== undefined) updateData.manualDiscountType = req.body.manualDiscountType;
+    if (req.body.manualDiscountValue !== undefined) updateData.manualDiscountValue = req.body.manualDiscountValue != null ? parseFloat(req.body.manualDiscountValue) : null;
     if (req.body.selectedOfferName !== undefined) updateData.selectedOfferName = req.body.selectedOfferName;
     if (req.body.appliedOffer !== undefined) updateData.appliedOffer = req.body.appliedOffer;
     if (req.body.appliedOffers !== undefined) updateData.appliedOffers = req.body.appliedOffers;
@@ -12159,7 +12717,7 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
         }
       } catch (e) {}
 
-      const maxOffers = offerSettingsData.allowMultipleOffers ? (offerSettingsData.maxOffersAllowed || 3) : 1;
+      const maxOffers = offerSettingsData.allowMultipleOffers ? (offerSettingsData.maxOffersAllowed || 1) : 1;
       const idsToProcess = offerIds.slice(0, maxOffers);
 
       for (const oid of idsToProcess) {
@@ -12246,7 +12804,7 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
           }
 
           const pointsToRedeem = Math.min(redeemLoyaltyPointsVal, custPoints);
-          const redemptionRate = loyaltySettings.redemptionRate || 1;
+          const redemptionRate = Math.max(1, Number(loyaltySettings.redemptionRate) || 1);
           let loyaltyDiscount = pointsToRedeem / redemptionRate;
           const maxPct = loyaltySettings.maxRedemptionPercent || 20;
           const discAmount = updateData.discountAmount || 0;
@@ -12258,6 +12816,9 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
             loyaltyDiscount = maxLoyaltyDiscount;
             loyaltyPointsRedeemed = Math.floor(loyaltyDiscount * redemptionRate);
           }
+          // Final safety: ensure total discounts never exceed subtotal
+          const remainingForLoyalty = Math.max(0, orderSubtotal - discAmount - manualDisc);
+          loyaltyDiscount = Math.min(loyaltyDiscount, remainingForLoyalty);
 
           loyaltyDiscount = Math.round(loyaltyDiscount * 100) / 100;
           updateData.loyaltyDiscount = loyaltyDiscount;
@@ -12313,8 +12874,8 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
       if (req.body.redeemLoyaltyPoints !== undefined) updateData.redeemLoyaltyPoints = req.body.redeemLoyaltyPoints;
     }
 
-    // Compute totalDiscountAmount
-    updateData.totalDiscountAmount = Math.round(((updateData.discountAmount || 0) + (updateData.manualDiscount || 0) + (updateData.loyaltyDiscount || 0)) * 100) / 100;
+    // Compute totalDiscountAmount (including coupon)
+    updateData.totalDiscountAmount = Math.round(((updateData.discountAmount || 0) + (updateData.manualDiscount || 0) + (updateData.loyaltyDiscount || 0) + (updateData.couponDiscount || 0)) * 100) / 100;
 
     // --- FIX: Calculate tax and finalAmount AFTER discounts (matching POST endpoint) ---
     // Previously, tax was computed on raw subtotal before discounts were applied.
@@ -12381,7 +12942,7 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
           // 3. Calculate final amount (only add exclusive tax; inclusive is already in preTaxTotal)
           const tipAmt = parseFloat(req.body.tipAmount || currentOrder.tipAmount || 0);
           const roAmt = parseFloat(req.body.roundOffAmount || currentOrder.roundOffAmount || 0);
-          updateData.finalAmount = Math.round((preTaxTotal + patchExclusiveTax + scAmt + tipAmt + roAmt) * 100) / 100;
+          updateData.finalAmount = Math.max(0, Math.round((preTaxTotal + patchExclusiveTax + scAmt + tipAmt + roAmt) * 100) / 100);
         } else {
           // Tax disabled
           updateData.taxAmount = 0;
@@ -12391,7 +12952,7 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
           updateData.serviceChargeAmount = scAmt;
           const tipAmt = parseFloat(req.body.tipAmount || currentOrder.tipAmount || 0);
           const roAmt = parseFloat(req.body.roundOffAmount || currentOrder.roundOffAmount || 0);
-          updateData.finalAmount = Math.round((preTaxTotal + scAmt + tipAmt + roAmt) * 100) / 100;
+          updateData.finalAmount = Math.max(0, Math.round((preTaxTotal + scAmt + tipAmt + roAmt) * 100) / 100);
         }
       } else {
         // Restaurant doc doesn't exist - preserve existing values
@@ -12446,8 +13007,9 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
       if (req.body.taxInclusiveMode) updateData.taxInclusiveMode = req.body.taxInclusiveMode;
       // Recalculate outstanding if partial/due
       if (req.body.partialPayAmount != null) {
-        updateData.outstandingAmount = Math.round((updateData.finalAmount - Number(req.body.partialPayAmount)) * 100) / 100;
+        updateData.outstandingAmount = Math.max(0, Math.round((updateData.finalAmount - Number(req.body.partialPayAmount)) * 100) / 100);
       }
+      updateData.finalAmount = Math.max(0, updateData.finalAmount);
       console.log(`📊 PATCH POS override: Using frontend billing values (Subtotal: ₹${updateData.subtotal}, Disc: ₹${updateData.totalDiscountAmount}, Tax: ₹${updateData.taxAmount}, Final: ₹${updateData.finalAmount})`);
     }
 
@@ -12514,6 +13076,77 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
     console.log('🔄 Backend - Updating order:', orderId, 'with data:', updateData);
     await db.collection(collections.orders).doc(orderId).update(updateData);
 
+    // Inventory adjustment: if items changed, compute delta and adjust stock
+    if (items && updateData.items && currentOrder.items) {
+      try {
+        const oldItems = currentOrder.items || [];
+        const newItems = updateData.items || [];
+
+        // Build maps: menuItemId → total quantity
+        const oldQtyMap = {};
+        oldItems.forEach(i => {
+          const key = i.menuItemId || i.id;
+          oldQtyMap[key] = (oldQtyMap[key] || 0) + (i.quantity || 1);
+        });
+        const newQtyMap = {};
+        newItems.forEach(i => {
+          const key = i.menuItemId || i.id;
+          newQtyMap[key] = (newQtyMap[key] || 0) + (i.quantity || 1);
+        });
+
+        // Compute deltas: positive = need more deduction, negative = need restoration
+        const allKeys = new Set([...Object.keys(oldQtyMap), ...Object.keys(newQtyMap)]);
+        const addedItems = []; // Items that need additional deduction
+        const removedItems = []; // Items that need inventory restoration
+
+        for (const key of allKeys) {
+          const oldQty = oldQtyMap[key] || 0;
+          const newQty = newQtyMap[key] || 0;
+          const delta = newQty - oldQty;
+
+          if (delta > 0) {
+            // More of this item — need to deduct additional inventory
+            const itemData = newItems.find(i => (i.menuItemId || i.id) === key);
+            if (itemData) {
+              addedItems.push({ ...itemData, quantity: delta });
+            }
+          } else if (delta < 0) {
+            // Less of this item — need to restore inventory
+            const itemData = oldItems.find(i => (i.menuItemId || i.id) === key);
+            if (itemData) {
+              removedItems.push({ ...itemData, quantity: Math.abs(delta) });
+            }
+          }
+        }
+
+        // Deduct inventory for added items (awaited, but non-blocking on failure)
+        if (addedItems.length > 0) {
+          try {
+            await inventoryService.deductInventoryForOrder(currentOrder.restaurantId, `${orderId}_edit_${Date.now()}`, addedItems);
+            await syncInventoryStockToMenuItems(currentOrder.restaurantId);
+            await adjustDirectMenuItemStock(currentOrder.restaurantId, addedItems, 'decrement');
+          } catch (err) {
+            console.error('📦 Inventory adjustment (add) error:', err);
+          }
+          console.log(`📦 PATCH: Deducting inventory for ${addedItems.length} added/increased items`);
+        }
+
+        // Restore inventory for removed items (using direct increment)
+        if (removedItems.length > 0) {
+          try {
+            await inventoryService.restoreInventoryForEditedOrder(currentOrder.restaurantId, orderId, removedItems);
+            await syncInventoryStockToMenuItems(currentOrder.restaurantId);
+            await adjustDirectMenuItemStock(currentOrder.restaurantId, removedItems, 'restore');
+          } catch (err) {
+            console.error('📦 Inventory adjustment (remove) error:', err);
+          }
+          console.log(`📦 PATCH: Restoring inventory for ${removedItems.length} removed/decreased items`);
+        }
+      } catch (invEditErr) {
+        console.error('📦 Error computing inventory deltas on PATCH:', invEditErr);
+      }
+    }
+
     // Award loyalty points on completion (dashboard billing flow)
     if (status === 'completed' && currentOrder.status !== 'completed') {
       const custId = req.body.customerId || currentOrder.customerId;
@@ -12523,7 +13156,7 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
 
       if (custId && netPointsChange !== 0) {
         try {
-          await db.collection('customers').doc(custId).update({
+          await db.collection(collections.customers).doc(custId).update({
             loyaltyPoints: FieldValue.increment(netPointsChange)
           });
           console.log(`💎 PATCH: Customer ${custId} loyalty updated: ${netPointsChange > 0 ? '+' : ''}${netPointsChange} points`);
@@ -12536,7 +13169,7 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
       if (custId) {
         try {
           const orderFinalAmount = updateData.finalAmount || currentOrder.finalAmount || 0;
-          const custDoc = await db.collection('customers').doc(custId).get();
+          const custDoc = await db.collection(collections.customers).doc(custId).get();
           if (custDoc.exists) {
             const custData = custDoc.data();
             const existingHistory = custData.orderHistory || [];
@@ -12559,7 +13192,7 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
                 outstandingAmount: updateData.outstandingAmount || 0,
               };
               const newHistory = [...existingHistory, histEntry];
-              await db.collection('customers').doc(custId).update({
+              await db.collection(collections.customers).doc(custId).update({
                 orderHistory: newHistory,
                 totalOrders: newHistory.length,
                 totalSpent: newHistory.reduce((s, o) => s + (o.finalAmount || o.totalAmount || 0), 0),
@@ -12574,28 +13207,60 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
       }
 
       // Track partial/due payment in customer credit (same logic as POST handler)
-      if (req.body.partialPayAmount != null && custId) {
+      let creditUpdated = false;
+      const creditPartialPay = req.body.partialPayAmount;
+      console.log(`💳 PATCH credit check: partialPayAmount=${creditPartialPay}, custId=${custId}, paymentStatus=${updateData.paymentStatus}`);
+
+      if (creditPartialPay != null && custId) {
         const creditFinalAmount = updateData.finalAmount || currentOrder.finalAmount || 0;
-        const creditPaid = Number(req.body.partialPayAmount);
+        const creditPaid = Number(creditPartialPay);
         const creditOutstanding = Math.round((creditFinalAmount - creditPaid) * 100) / 100;
+        console.log(`💳 PATCH credit calc: finalAmount=${creditFinalAmount}, paid=${creditPaid}, outstanding=${creditOutstanding}`);
         if (creditOutstanding > 0) {
           try {
-            await db.collection('customers').doc(custId).update({
+            await db.collection(collections.customers).doc(custId).update({
               outstandingBalance: FieldValue.increment(creditOutstanding),
               creditHistory: FieldValue.arrayUnion({
                 orderId: orderId,
-                orderNumber: currentOrder.orderNumber,
+                orderNumber: currentOrder.orderNumber || updateData.orderNumber,
                 date: new Date().toISOString(),
                 totalAmount: Math.round(creditFinalAmount * 100) / 100,
                 paidAmount: Math.round(creditPaid * 100) / 100,
                 outstandingAmount: creditOutstanding
               })
             });
+            creditUpdated = true;
             console.log(`💳 PATCH: Customer ${custId} credit updated: +₹${creditOutstanding} outstanding`);
           } catch (creditErr) {
-            console.error('Error updating customer credit on PATCH:', creditErr);
+            console.error('💳 Error updating customer credit on PATCH:', creditErr);
           }
+        } else {
+          console.log(`💳 PATCH: Skipping credit — calculated outstanding is ${creditOutstanding} (not > 0)`);
         }
+      }
+
+      // Fallback: if main path didn't update credit but paymentStatus is due/partial, still update
+      if (!creditUpdated && (updateData.paymentStatus === 'due' || updateData.paymentStatus === 'partial') && custId && updateData.outstandingAmount > 0) {
+        console.log(`💳 PATCH fallback: paymentStatus=${updateData.paymentStatus}, outstanding=${updateData.outstandingAmount}`);
+        try {
+          await db.collection(collections.customers).doc(custId).update({
+            outstandingBalance: FieldValue.increment(updateData.outstandingAmount),
+            creditHistory: FieldValue.arrayUnion({
+              orderId: orderId,
+              orderNumber: currentOrder.orderNumber || updateData.orderNumber,
+              date: new Date().toISOString(),
+              totalAmount: Math.round((updateData.finalAmount || currentOrder.finalAmount || 0) * 100) / 100,
+              paidAmount: Math.round((updateData.paidAmount || 0) * 100) / 100,
+              outstandingAmount: updateData.outstandingAmount
+            })
+          });
+          creditUpdated = true;
+          console.log(`💳 PATCH fallback: Customer ${custId} credit updated: +₹${updateData.outstandingAmount} outstanding`);
+        } catch (creditErr) {
+          console.error('💳 Error in fallback credit update on PATCH:', creditErr);
+        }
+      } else if (!creditUpdated) {
+        console.log(`💳 PATCH: No credit update needed — partialPayAmount=${creditPartialPay}, custId=${custId}, paymentStatus=${updateData.paymentStatus}`);
       }
 
       // Increment offer usage for applied offers
@@ -13274,6 +13939,54 @@ app.delete('/api/orders/:orderId', authenticateToken, async (req, res) => {
     // Trigger Pusher notification for real-time updates
     pusherService.notifyOrderDeleted(order.restaurantId, orderId)
       .catch(err => console.error('Pusher notification error (non-blocking):', err));
+
+    // Non-blocking WhatsApp notification to owner on delete (if enabled)
+    (async () => {
+      try {
+        if (!restaurantData?.orderSettings?.notifyOwnerOnCancelWhatsApp) return;
+
+        const waSnap = await db.collection(collections.automationSettings)
+          .where('restaurantId', '==', order.restaurantId)
+          .where('type', '==', 'whatsapp')
+          .where('connected', '==', true)
+          .limit(1).get();
+        if (waSnap.empty) return;
+
+        const ownerPhone = restaurantData.phone || restaurantData.ownerPhone;
+        if (!ownerPhone) return;
+
+        const waSettings = waSnap.docs[0].data();
+        const credentials = waSettings.mode === 'dineopen' ? {
+          accessToken: process.env.DINEOPEN_WHATSAPP_ACCESS_TOKEN,
+          phoneNumberId: waSettings.phoneNumberId || process.env.DINEOPEN_WHATSAPP_PHONE_NUMBER_ID,
+          businessAccountId: process.env.DINEOPEN_WHATSAPP_BUSINESS_ACCOUNT_ID
+        } : {
+          accessToken: waSettings.accessToken,
+          phoneNumberId: waSettings.phoneNumberId || process.env.DINEOPEN_WHATSAPP_PHONE_NUMBER_ID,
+          businessAccountId: waSettings.businessAccountId
+        };
+
+        const whatsappSvc = require('./services/whatsappService');
+        await whatsappSvc.initialize(order.restaurantId, credentials);
+        const formatted = ownerPhone.replace(/[\s\-\(\)\+]/g, '');
+        const currencySymbol = restaurantData.currencySymbol || '₹';
+        const amount = Number(order.finalAmount || order.totalAmount || 0).toFixed(2);
+        const orderNum = order.orderNumber || order.dailyOrderId || orderId.slice(-6);
+        const staffName = req.user?.name || req.user?.email || 'Staff';
+        const message = `🗑️ *Order #${orderNum} DELETED*\n\nBy: ${staffName}\nReason: ${reason || 'No reason provided'}\nAmount: ${currencySymbol}${amount}\nItems: ${(order.items || []).length} items\nWas: ${lastStatus}\nTime: ${new Date().toLocaleString('en-IN')}\n\n— ${restaurantData.name || 'DineOpen'}`;
+
+        const result = await whatsappSvc.sendTextMessage(formatted, message);
+        await db.collection(collections.automationLogs).add({
+          restaurantId: order.restaurantId, type: 'whatsapp_delete_alert',
+          phone: formatted, message: `Delete alert: Order #${orderNum}`,
+          messageId: result?.messageId || null, orderId,
+          direction: 'outgoing', status: result?.success ? 'sent' : 'failed',
+          timestamp: new Date()
+        });
+      } catch (waErr) {
+        console.error('WhatsApp delete notification error (non-blocking):', waErr.message);
+      }
+    })();
 
     res.json({ message: 'Order deleted successfully', wasCompleted });
   } catch (error) {
@@ -19481,6 +20194,57 @@ app.patch('/api/orders/:orderId/cancel', authenticateToken, async (req, res) => 
     } catch (pusherErr) {
       console.error('Failed to send void notification:', pusherErr);
     }
+
+    // Non-blocking WhatsApp notification to owner on cancel (if enabled)
+    (async () => {
+      try {
+        const restDoc = await db.collection(collections.restaurants).doc(orderData.restaurantId).get();
+        if (!restDoc.exists) return;
+        const restData = restDoc.data();
+        if (!restData.orderSettings?.notifyOwnerOnCancelWhatsApp) return;
+
+        const waSnap = await db.collection(collections.automationSettings)
+          .where('restaurantId', '==', orderData.restaurantId)
+          .where('type', '==', 'whatsapp')
+          .where('connected', '==', true)
+          .limit(1).get();
+        if (waSnap.empty) return;
+
+        const ownerPhone = restData.phone || restData.ownerPhone;
+        if (!ownerPhone) return;
+
+        const waSettings = waSnap.docs[0].data();
+        const credentials = waSettings.mode === 'dineopen' ? {
+          accessToken: process.env.DINEOPEN_WHATSAPP_ACCESS_TOKEN,
+          phoneNumberId: waSettings.phoneNumberId || process.env.DINEOPEN_WHATSAPP_PHONE_NUMBER_ID,
+          businessAccountId: process.env.DINEOPEN_WHATSAPP_BUSINESS_ACCOUNT_ID
+        } : {
+          accessToken: waSettings.accessToken,
+          phoneNumberId: waSettings.phoneNumberId || process.env.DINEOPEN_WHATSAPP_PHONE_NUMBER_ID,
+          businessAccountId: waSettings.businessAccountId
+        };
+
+        const whatsappSvc = require('./services/whatsappService');
+        await whatsappSvc.initialize(orderData.restaurantId, credentials);
+        const formatted = ownerPhone.replace(/[\s\-\(\)\+]/g, '');
+        const currencySymbol = restData.currencySymbol || '₹';
+        const amount = Number(orderData.finalAmount || orderData.totalAmount || 0).toFixed(2);
+        const orderNum = orderData.orderNumber || orderData.dailyOrderId || orderId.slice(-6);
+        const staffName = req.user?.name || req.user?.email || 'Staff';
+        const message = `🚫 *Order #${orderNum} CANCELLED*\n\nBy: ${staffName}\nReason: ${reason || 'No reason provided'}\nAmount: ${currencySymbol}${amount}\nItems: ${(orderData.items || []).length} items\nTime: ${new Date().toLocaleString('en-IN')}\n\n— ${restData.name || 'DineOpen'}`;
+
+        const result = await whatsappSvc.sendTextMessage(formatted, message);
+        await db.collection(collections.automationLogs).add({
+          restaurantId: orderData.restaurantId, type: 'whatsapp_cancel_alert',
+          phone: formatted, message: `Cancel alert: Order #${orderNum}`,
+          messageId: result?.messageId || null, orderId,
+          direction: 'outgoing', status: result?.success ? 'sent' : 'failed',
+          timestamp: new Date()
+        });
+      } catch (waErr) {
+        console.error('WhatsApp cancel notification error (non-blocking):', waErr.message);
+      }
+    })();
 
     res.json({
       success: true,

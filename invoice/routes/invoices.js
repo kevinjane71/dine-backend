@@ -182,16 +182,26 @@ module.exports = (db, collections) => {
       // Auto-generate invoice number
       const invoiceNumber = await getNextNumber(db, collections, orgId, 'invoice');
 
-      // Process line items with amounts
-      const processedItems = items.map(item => ({
-        itemId: item.itemId || '',
-        name: item.name || '',
-        description: item.description || '',
-        quantity: parseFloat(item.quantity) || 1,
-        rate: parseFloat(item.rate) || 0,
-        taxRate: parseFloat(item.taxRate) || 0,
-        amount: (parseFloat(item.quantity) || 1) * (parseFloat(item.rate) || 0)
-      }));
+      // Process and validate line items
+      const processedItems = items.map(item => {
+        const qty = parseFloat(item.quantity);
+        const rate = parseFloat(item.rate);
+        if (isNaN(qty) || qty <= 0) {
+          throw new Error(`Invalid quantity for item "${item.name || 'Unknown'}": must be a positive number`);
+        }
+        if (isNaN(rate) || rate < 0) {
+          throw new Error(`Invalid rate for item "${item.name || 'Unknown'}": must be a non-negative number`);
+        }
+        return {
+          itemId: item.itemId || '',
+          name: item.name || '',
+          description: item.description || '',
+          quantity: qty,
+          rate: rate,
+          taxRate: parseFloat(item.taxRate) || 0,
+          amount: Math.round(qty * rate * 100) / 100
+        };
+      });
 
       // Calculate totals
       const totals = calculateInvoiceTotals(processedItems, discountType, discountValue, adjustments);
@@ -236,7 +246,8 @@ module.exports = (db, collections) => {
       });
     } catch (error) {
       console.error('Error creating invoice:', error);
-      return res.status(500).json({ success: false, error: 'Failed to create invoice' });
+      const statusCode = error.message?.includes('Invalid') ? 400 : 500;
+      return res.status(statusCode).json({ success: false, error: error.message || 'Failed to create invoice' });
     }
   });
 

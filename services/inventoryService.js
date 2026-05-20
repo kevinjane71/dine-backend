@@ -1,4 +1,5 @@
 const { db, collections } = require('../firebase');
+const { FieldValue } = require('firebase-admin/firestore');
 const aiRecipeService = require('./aiRecipeService');
 
 // Comprehensive unit conversion map — all conversions to a "base" unit per dimension
@@ -243,6 +244,19 @@ class InventoryService {
     try {
       if (!orderItems || orderItems.length === 0) return [];
 
+      // Idempotency: check if this order already has deduction transactions
+      const existingTxSnap = await db.collection('inventoryTransactions')
+        .where('referenceId', '==', orderId)
+        .where('type', '==', 'DEDUCTION')
+        .where('source', '==', 'ORDER')
+        .limit(1)
+        .get();
+
+      if (!existingTxSnap.empty) {
+        console.log(`⚠️ Inventory already deducted for Order ${orderId} — skipping (idempotent)`);
+        return [];
+      }
+
       // Create batch using the db instance
       const batch = db.batch();
       let hasUpdates = false;
@@ -303,8 +317,11 @@ class InventoryService {
               );
               if (directInvItem) {
                 const deductQty = (item.deductionQuantity || 1) * qtySold;
-                const newStock = Math.max(0, (directInvItem.currentStock || 0) - deductQty);
-                batch.update(directInvItem.ref, { currentStock: newStock, updatedAt: new Date() });
+                // Use atomic increment to prevent race conditions on concurrent orders
+                batch.update(directInvItem.ref, {
+                  currentStock: FieldValue.increment(-deductQty),
+                  updatedAt: new Date()
+                });
                 const unitCost = directInvItem.costPerUnit || 0;
                 const transactionRef = db.collection('inventoryTransactions').doc();
                 batch.set(transactionRef, {
@@ -315,12 +332,17 @@ class InventoryService {
                   date: new Date(), notes: `Direct deduction: ${qtySold}x ${item.name}`
                 });
                 hasUpdates = true;
+                const estimatedStock = Math.max(0, (directInvItem.currentStock || 0) - deductQty);
                 deductions.push({
                   inventoryItemId: directInvItem.id, inventoryItemName: directInvItem.name,
-                  unit: directInvItem.unit, quantityDeducted: deductQty, newStock,
+                  unit: directInvItem.unit, quantityDeducted: deductQty, newStock: estimatedStock,
                   menuItemName: item.name, method: 'direct'
                 });
-                directInvItem.currentStock = newStock;
+                directInvItem.currentStock = estimatedStock;
+                // Warn if stock likely insufficient
+                if (estimatedStock <= 0) {
+                  console.warn(`⚠️ Low/zero stock after deduction: ${directInvItem.name} (estimated: ${estimatedStock})`);
+                }
                 console.log(`📦 Direct deduction: ${deductQty} ${directInvItem.unit || 'pcs'} of ${directInvItem.name} for ${item.name}`);
                 continue;
               }
@@ -460,9 +482,9 @@ class InventoryService {
                   newStock = Math.max(0, (inventoryItem.currentStock || 0) - deductionAmount);
                 }
 
-                // Update Inventory
+                // Update Inventory (atomic increment for concurrent safety)
                 batch.update(inventoryItem.ref, {
-                    currentStock: newStock,
+                    currentStock: FieldValue.increment(-deductionAmount),
                     updatedAt: new Date()
                 });
 
@@ -487,16 +509,20 @@ class InventoryService {
                 batch.set(transactionRef, txData);
 
                 hasUpdates = true;
+                const estimatedNewStock = Math.max(0, (inventoryItem.currentStock || 0) - deductionAmount);
                 deductions.push({
                   inventoryItemId: inventoryItem.id,
                   inventoryItemName: inventoryItem.name,
                   unit: inventoryItem.unit,
                   quantityDeducted: deductionAmount,
-                  newStock,
+                  newStock: estimatedNewStock,
                   menuItemName: item.name,
                   ...(batchIds.length > 0 && { batchIds }),
                 });
-                inventoryItem.currentStock = newStock;
+                if (estimatedNewStock <= 0) {
+                  console.warn(`⚠️ Low/zero stock after deduction: ${inventoryItem.name} (estimated: ${estimatedNewStock})`);
+                }
+                inventoryItem.currentStock = estimatedNewStock;
             } else {
                 console.log(`⚠️ Could not find inventory item for ingredient: ${ingredient.inventoryItemName}`);
             }
@@ -506,6 +532,22 @@ class InventoryService {
       if (hasUpdates) {
         await batch.commit();
         console.log(`✅ Inventory updated for Order ${orderId}`);
+
+        // Post-commit: floor negative stock values to 0 (can happen with concurrent FieldValue.increment)
+        for (const d of deductions) {
+          if (d.newStock <= 0) {
+            try {
+              const invRef = db.collection('inventory').doc(d.inventoryItemId);
+              const invDoc = await invRef.get();
+              if (invDoc.exists && (invDoc.data().currentStock || 0) < 0) {
+                await invRef.update({ currentStock: 0 });
+                console.log(`📦 Floored negative stock to 0 for ${d.inventoryItemName}`);
+              }
+            } catch (floorErr) {
+              // Non-critical — stock sync will fix later
+            }
+          }
+        }
       }
 
       return deductions;
@@ -613,6 +655,136 @@ class InventoryService {
 
     } catch (error) {
       console.error(`❌ Error restoring inventory for Order ${orderId}:`, error);
+      return [];
+    }
+  }
+
+  /**
+   * Restores inventory for items removed during an order edit.
+   * Unlike restoreInventoryForOrder (cancel), this uses item data directly
+   * since we know exactly which items and quantities were reduced.
+   */
+  async restoreInventoryForEditedOrder(restaurantId, orderId, removedItems) {
+    console.log(`📈 Restoring inventory for edited Order ${orderId}: ${removedItems.length} items`);
+
+    try {
+      if (!removedItems || removedItems.length === 0) return [];
+
+      const batch = db.batch();
+      const restorations = [];
+
+      // Load inventory items and recipes for matching
+      const inventorySnapshot = await db.collection('inventory')
+        .where('restaurantId', '==', restaurantId)
+        .get();
+      const inventoryItems = [];
+      inventorySnapshot.forEach(doc => {
+        inventoryItems.push({ id: doc.id, ...doc.data(), ref: doc.ref });
+      });
+
+      const allRecipesSnap = await db.collection('recipes')
+        .where('restaurantId', '==', restaurantId)
+        .get();
+      const recipesList = [];
+      allRecipesSnap.forEach(doc => {
+        recipesList.push({ id: doc.id, ...doc.data(), ref: doc.ref });
+      });
+
+      for (const item of removedItems) {
+        const qtySold = item.quantity;
+
+        // Find recipe
+        let recipeDoc = recipesList.find(r => r.menuItemId === item.menuItemId);
+        if (!recipeDoc && item.name) {
+          const itemNameLower = item.name.toLowerCase().replace(/\s*\(.*?\)\s*/g, '').trim();
+          recipeDoc = recipesList.find(r => {
+            const rName = (r.name || '').toLowerCase().trim();
+            return rName === itemNameLower || itemNameLower.includes(rName) || rName.includes(itemNameLower);
+          });
+        }
+
+        if (!recipeDoc) {
+          // Direct restoration for stock-managed items
+          if (item.isStockManaged || item.trackInventory) {
+            const directInvItem = inventoryItems.find(i =>
+              (item.inventoryItemId && i.id === item.inventoryItemId) ||
+              (i.linkedMenuItemId === item.menuItemId) ||
+              (item.name && i.name && i.name.toLowerCase() === item.name.toLowerCase())
+            );
+            if (directInvItem) {
+              const restoreQty = (item.deductionQuantity || 1) * qtySold;
+              batch.update(directInvItem.ref, {
+                currentStock: FieldValue.increment(restoreQty),
+                updatedAt: new Date()
+              });
+              const unitCost = directInvItem.costPerUnit || 0;
+              const txRef = db.collection('inventoryTransactions').doc();
+              batch.set(txRef, {
+                restaurantId, inventoryItemId: directInvItem.id, inventoryItemName: directInvItem.name,
+                type: 'ADDITION', source: 'ORDER_EDITED', referenceId: orderId,
+                quantityChange: restoreQty, unit: directInvItem.unit || 'pcs',
+                costPerUnit: unitCost, totalCost: restoreQty * unitCost,
+                date: new Date(), notes: `Edit restore: ${qtySold}x ${item.name} removed`
+              });
+              restorations.push({
+                inventoryItemId: directInvItem.id, inventoryItemName: directInvItem.name,
+                quantityRestored: restoreQty, unit: directInvItem.unit
+              });
+            }
+          }
+          continue;
+        }
+
+        // Recipe-based restoration
+        const recipeMap = {};
+        allRecipesSnap.forEach(doc => { recipeMap[doc.id] = doc.data(); });
+        const flatIngredients = this.flattenIngredients(recipeMap, recipeDoc.ingredients || []);
+
+        for (const ingredient of flatIngredients) {
+          const qtyToRestore = ingredient.quantity * qtySold;
+          let inventoryItem = null;
+          if (ingredient.inventoryItemId) {
+            inventoryItem = inventoryItems.find(i => i.id === ingredient.inventoryItemId);
+          }
+          if (!inventoryItem) {
+            const targetName = (ingredient.inventoryItemName || '').toLowerCase();
+            inventoryItem = inventoryItems.find(i =>
+              i.name.toLowerCase() === targetName ||
+              i.name.toLowerCase().includes(targetName) ||
+              targetName.includes(i.name.toLowerCase())
+            );
+          }
+          if (inventoryItem) {
+            const restoreAmount = convertUnits(qtyToRestore, ingredient.unit, inventoryItem.unit);
+            batch.update(inventoryItem.ref, {
+              currentStock: FieldValue.increment(restoreAmount),
+              updatedAt: new Date()
+            });
+            const unitCost = inventoryItem.costPerUnit || 0;
+            const txRef = db.collection('inventoryTransactions').doc();
+            batch.set(txRef, {
+              restaurantId, inventoryItemId: inventoryItem.id, inventoryItemName: inventoryItem.name,
+              type: 'ADDITION', source: 'ORDER_EDITED', referenceId: orderId,
+              quantityChange: restoreAmount, unit: inventoryItem.unit,
+              costPerUnit: unitCost, totalCost: restoreAmount * unitCost,
+              date: new Date(), notes: `Edit restore: ${qtySold}x ${item.name} removed`
+            });
+            restorations.push({
+              inventoryItemId: inventoryItem.id, inventoryItemName: inventoryItem.name,
+              quantityRestored: restoreAmount, unit: inventoryItem.unit
+            });
+          }
+        }
+      }
+
+      if (restorations.length > 0) {
+        await batch.commit();
+        console.log(`✅ Inventory restored for edited Order ${orderId}: ${restorations.length} items`);
+      }
+
+      return restorations;
+    } catch (error) {
+      console.error(`❌ Error restoring inventory for edited Order ${orderId}:`, error);
       return [];
     }
   }

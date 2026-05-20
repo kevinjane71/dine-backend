@@ -48,14 +48,14 @@ function calculateInvoiceTotals(items = [], discountType = 'fixed', discountValu
     const slab = taxMap[key];
     // Proportionally reduce taxable amount by discount ratio
     const proportion = subtotal > 0 ? slab.taxableAmount / subtotal : 0;
-    const adjustedTaxable = round2(taxableAfterDiscount * proportion);
-    const slabTax = round2((adjustedTaxable * slab.rate) / 100);
+    const adjustedTaxable = taxableAfterDiscount * proportion; // Keep raw for precision
+    const slabTax = (adjustedTaxable * slab.rate) / 100; // Keep raw for precision
 
     taxAmount += slabTax;
     taxBreakdown.push({
       rate: slab.rate,
-      taxableAmount: adjustedTaxable,
-      taxAmount: slabTax
+      taxableAmount: round2(adjustedTaxable), // Round only for display
+      taxAmount: round2(slabTax) // Round only for display
     });
   }
 
