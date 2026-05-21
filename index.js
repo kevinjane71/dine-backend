@@ -9170,7 +9170,9 @@ app.post('/api/orders', async (req, res) => {
       }
 
       // Multi-tier pricing: override base price for non-variant items
-      if (multiPricing?.enabled && activePricingRuleId && !selectedVariant) {
+      // Skip if staff explicitly edited the price (priceEdited flag or fePrice differs from menu)
+      const wasManuallyEdited = item.priceEdited === true || (allowPriceEdit && fePrice !== null && fePrice !== menuItem.price);
+      if (multiPricing?.enabled && activePricingRuleId && !selectedVariant && !wasManuallyEdited) {
         const rulePrice = resolveItemPriceForRule(menuItem, activePricingRuleId, multiPricing.rules);
         if (rulePrice !== null) {
           basePrice = rulePrice;
@@ -12455,8 +12457,27 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
           const manualRule = (multiPricing.rules || []).find(r => r.id === req.body.pricingRuleId && r.isActive);
           if (manualRule) activePricingRuleId = manualRule.id;
         }
+        // Fallback: use existing order's pricing rule if still active
+        if (!activePricingRuleId && currentOrder.pricingRuleId) {
+          const existingRule = (multiPricing.rules || []).find(r => r.id === currentOrder.pricingRuleId && r.isActive);
+          if (existingRule) activePricingRuleId = existingRule.id;
+        }
         if (!activePricingRuleId && orderType) {
-          const autoRule = (multiPricing.rules || []).find(r => r.isActive && r.orderType === orderType);
+          // Auto-resolve pricing rule by order type name (mirrors frontend logic)
+          const ot = orderType.toLowerCase().trim();
+          let autoRule;
+          if (['takeaway', 'take away', 'take-away'].includes(ot)) {
+            autoRule = (multiPricing.rules || []).find(r => r.isActive && ['takeaway', 'take away', 'take-away'].includes((r.name || '').toLowerCase().trim()));
+          } else if (ot === 'delivery') {
+            autoRule = (multiPricing.rules || []).find(r => r.isActive && (r.name || '').toLowerCase().trim() === 'delivery');
+          } else if (ot === 'dine-in' || ot === 'dinein' || ot === 'dine in') {
+            // For dine-in, try to resolve from table floor mapping first
+            const tableData = currentOrder.tableId ? await db.collection('tables').doc(currentOrder.tableId).get() : null;
+            const floorName = tableData?.exists ? tableData.data()?.floor : null;
+            if (floorName) {
+              autoRule = (multiPricing.rules || []).find(r => r.isActive && (r.tableMappings || []).some(m => floorName.toLowerCase().trim() === m.toLowerCase().trim()));
+            }
+          }
           if (autoRule) activePricingRuleId = autoRule.id;
         }
       }
@@ -12510,7 +12531,9 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
           }
 
           // Multi-tier pricing: override base price for non-variant items
-          if (multiPricing?.enabled && activePricingRuleId && !selectedVariant) {
+          // Skip if staff explicitly edited the price
+          const wasManuallyEditedPatch = cleanItem.priceEdited === true || (allowPriceEditPatch && fePricePatch !== null && fePricePatch !== menuItem.price);
+          if (multiPricing?.enabled && activePricingRuleId && !selectedVariant && !wasManuallyEditedPatch) {
             const rulePrice = resolveItemPriceForRule(menuItem, activePricingRuleId, multiPricing.rules);
             if (rulePrice !== null) {
               resolvedBasePrice = rulePrice;
