@@ -1029,6 +1029,7 @@ const emailService = require('./emailService');
 
 // Chatbot RAG routes
 const chatbotRoutes = require('./routes/chatbot');
+const websiteChatRoutes = require('./routes/websiteChat');
 
 // DineAI Voice Assistant routes
 const dineaiRoutes = require('./routes/dineai');
@@ -14100,6 +14101,9 @@ app.use('/api/public/razorpay', vercelSecurityMiddleware.publicAPI, razorpayPubl
 
 // Initialize chatbot RAG routes
 app.use('/api', chatbotRoutes);
+
+// Public website chatbot (no auth, rate-limited)
+app.use('/api', websiteChatRoutes);
 
 // DineAI Voice Assistant routes
 app.use('/api', dineaiRoutes);

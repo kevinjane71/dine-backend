@@ -172,8 +172,9 @@ router.post('/chatbot/intelligent-query', authenticateToken, aiUsageLimiter.midd
       // Continue without history
     }
 
-    // Process query with function calling agent
-    const result = await functionCallingAgent.processQuery(query, restaurantId, userId, conversationHistory);
+    // Process query with function calling agent (pass user role for access control)
+    const userRole = req.user.role || null;
+    const result = await functionCallingAgent.processQuery(query, restaurantId, userId, conversationHistory, userRole);
 
     if (!result.success) {
       return res.status(400).json({

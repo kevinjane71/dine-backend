@@ -710,6 +710,37 @@ class FunctionCallingAgent {
   }
 
   /**
+   * Read-only functions allowed for non-owner/admin roles (waiter, employee, manager, staff)
+   */
+  static READ_ONLY_FUNCTIONS = new Set([
+    'get_orders',
+    'get_order_by_id',
+    'get_tables',
+    'get_menu',
+    'get_sales_summary',
+    'search_menu_items',
+    'get_customers',
+    'get_customer_by_id',
+    'get_customer_history',
+    'get_google_review_settings',
+    'get_review_link',
+  ]);
+
+  /**
+   * Get functions filtered by user role.
+   * Owner/admin: all functions. Other roles: read-only functions only.
+   */
+  getFunctionsForRole(userRole) {
+    if (!userRole || ['owner', 'admin'].includes(userRole)) {
+      return this.functions; // Full access
+    }
+    // Filter to read-only functions for staff roles
+    return this.functions.filter(f =>
+      FunctionCallingAgent.READ_ONLY_FUNCTIONS.has(f.function.name)
+    );
+  }
+
+  /**
    * Verify user has access to restaurant (Security check)
    */
   async verifyRestaurantAccess(restaurantId, userId) {
@@ -2688,7 +2719,7 @@ Generate a review that feels authentic and would be helpful to other customers. 
   /**
    * Process user query using OpenAI function calling
    */
-  async processQuery(query, restaurantId, userId, conversationHistory = []) {
+  async processQuery(query, restaurantId, userId, conversationHistory = [], userRole = null) {
     try {
       // Fetch context (minimal for cost efficiency)
       const sessionSummary = await this.getSessionSummary(userId, restaurantId);
@@ -2701,6 +2732,8 @@ Generate a review that feels authentic and would be helpful to other customers. 
           role: 'system',
           content: `You are "DineAgent", an intelligent restaurant operations assistant connected to the restaurant's backend APIs and Firestore database.
 
+**User role:** ${userRole || 'owner'}
+${userRole && !['owner', 'admin'].includes(userRole) ? `\n**IMPORTANT: This user is a "${userRole}" (staff member). They only have READ-ONLY access. They can view orders, tables, menu, customers, and sales data. They CANNOT place orders, update tables, modify menu items, add/update/delete customers, or cancel orders. If they ask to perform a write action, politely explain that this requires owner or admin access.\n` : ''}
 Your goals:
 1. Answer questions and take actions related to restaurant operations — orders, tables, reservations, customers, billing, and menu.
 2. Use facts provided under "Relevant facts" for static info (menu, FAQs, policies).
@@ -2743,11 +2776,14 @@ For follow-up queries like "check again", "what about X", always call the releva
         }
       ];
 
+      // Get role-filtered functions (staff only gets read-only functions)
+      const availableTools = this.getFunctionsForRole(userRole);
+
       // Call OpenAI with function calling
       const response = await this.openai.chat.completions.create({
         model: 'gpt-4o-mini', // Use mini for cost efficiency
         messages,
-        tools: this.functions,
+        tools: availableTools,
         tool_choice: 'auto', // Let model decide when to use functions
         temperature: 0.7,
         max_tokens: 500 // Limit response length
