@@ -128,7 +128,8 @@ const firestoreOptimizer = require('./utils/firestoreOptimizer');
 const { kvGet, kvSet, kvDel, getCachedRestaurant, invalidateRestaurantCache, invalidateUserCache } = require('./utils/kvCache');
 const inventoryService = require('./services/inventoryService');
 const offerEngine = require('./services/offerEngine');
-const pusherService = require('./services/pusherService');
+// const pusherService = require('./services/pusherService'); // COMMENTED OUT — replaced by Firebase RTDB
+const pusherService = require('./services/firebaseRealtimeService');
 
 // Pre-compute daily analytics stats on every order write (fire-and-forget)
 // Doc ID: {restaurantId}_{YYYY-MM-DD} in 'dailyStats' collection
@@ -13398,9 +13399,9 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
             .collection('tables').doc(currentOrder.tableId);
           await directRef.update({ status: 'available', currentOrderId: null, updatedAt: new Date() });
           console.log('✅ Table released (direct path):', currentOrder.tableNumber);
-          pusherService.pusher.trigger(`restaurant-${currentOrder.restaurantId}`, 'table-status-updated', {
+          pusherService.triggerTableStatusUpdated(currentOrder.restaurantId, {
             tableId: currentOrder.tableId, status: 'available', orderId: null, tableNumber: currentOrder.tableNumber,
-          }).catch(err => console.error('Pusher table-status-updated error:', err));
+          }).catch(err => console.error('RTDB table-status-updated error:', err));
           tableReleased = true;
         }
 
@@ -13424,9 +13425,9 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
               const tableDoc = tablesSnapshot.docs[0];
               await tableDoc.ref.update({ status: 'available', currentOrderId: null, updatedAt: new Date() });
               console.log('✅ Table released after order completion:', currentOrder.tableNumber);
-              pusherService.pusher.trigger(`restaurant-${currentOrder.restaurantId}`, 'table-status-updated', {
+              pusherService.triggerTableStatusUpdated(currentOrder.restaurantId, {
                 tableId: tableDoc.id, status: 'available', orderId: null, tableNumber: currentOrder.tableNumber,
-              }).catch(err => console.error('Pusher table-status-updated error:', err));
+              }).catch(err => console.error('RTDB table-status-updated error:', err));
               tableReleased = true;
               break;
             }
@@ -15306,12 +15307,12 @@ app.patch('/api/tables/:tableId/status', authenticateToken, async (req, res) => 
       return res.status(404).json({ error: 'Table not found' });
     }
 
-    // Send Pusher event for real-time table sync
-    pusherService.pusher.trigger(`restaurant-${restaurantId}`, 'table-status-updated', {
+    // Send real-time event for table sync (Firebase RTDB)
+    pusherService.triggerTableStatusUpdated(restaurantId, {
       tableId,
       status,
       orderId: status === 'occupied' ? orderId : null,
-    }).catch(err => console.error('Pusher table-status-updated error:', err));
+    }).catch(err => console.error('RTDB table-status-updated error:', err));
 
     res.json({ message: 'Table status updated successfully' });
 
@@ -15360,10 +15361,10 @@ app.post('/api/tables/:restaurantId/reset-all', authenticateToken, async (req, r
     if (resetCount > 0) {
       await batch.commit();
 
-      // Send Pusher event for real-time sync
-      pusherService.pusher.trigger(`restaurant-${restaurantId}`, 'tables-reset', {
+      // Send real-time event for table sync (Firebase RTDB)
+      pusherService.pushEvent(restaurantId, 'tables', 'tables-reset', {
         resetCount,
-      }).catch(err => console.error('Pusher tables-reset error:', err));
+      }).catch(err => console.error('RTDB tables-reset error:', err));
     }
 
     res.json({ message: `${resetCount} table(s) reset to available`, resetCount });
@@ -20205,9 +20206,9 @@ app.patch('/api/orders/:orderId/cancel', authenticateToken, async (req, res) => 
 
     console.log(`✅ Order ${orderId} cancelled successfully`);
 
-    // Send real-time void notification to owner/admin via Pusher
+    // Send real-time void notification to owner/admin (Firebase RTDB)
     try {
-      await pusherService.triggerOrderEvent(orderData.restaurantId, 'order-voided', {
+      await pusherService.pushEvent(orderData.restaurantId, 'orders', 'order-voided', {
         orderId,
         dailyOrderId: orderData.dailyOrderId || null,
         orderNumber: orderData.orderNumber || null,
@@ -20218,8 +20219,8 @@ app.patch('/api/orders/:orderId/cancel', authenticateToken, async (req, res) => 
         reason: reason || 'No reason provided',
         itemCount: (orderData.items || []).length
       });
-    } catch (pusherErr) {
-      console.error('Failed to send void notification:', pusherErr);
+    } catch (rtdbErr) {
+      console.error('Failed to send void notification:', rtdbErr);
     }
 
     // Non-blocking WhatsApp notification to owner on cancel (if enabled)
@@ -29707,7 +29708,7 @@ app.post('/api/offers/:restaurantId', authenticateToken, async (req, res) => {
     kvDel(`offers:${restaurantId}`).catch(() => {});
 
     // Notify all connected clients (POS, dashboard) about offer change
-    pusherService.triggerOrderEvent(restaurantId, 'offer-updated', { offerId: offerRef.id, action: 'created' });
+    pusherService.pushEvent(restaurantId, 'menu', 'offer-updated', { offerId: offerRef.id, action: 'created' });
 
     res.status(201).json({
       message: 'Offer created successfully',
@@ -29779,7 +29780,7 @@ app.put('/api/offers/:restaurantId/:offerId', authenticateToken, async (req, res
     kvDel(`offers:${restaurantId}`).catch(() => {});
 
     // Notify all connected clients (POS, dashboard) about offer change
-    pusherService.triggerOrderEvent(restaurantId, 'offer-updated', { offerId, action: 'updated' });
+    pusherService.pushEvent(restaurantId, 'menu', 'offer-updated', { offerId, action: 'updated' });
 
     res.json({
       message: 'Offer updated successfully',
@@ -29827,7 +29828,7 @@ app.delete('/api/offers/:restaurantId/:offerId', authenticateToken, async (req, 
     kvDel(`offers:${restaurantId}`).catch(() => {});
 
     // Notify all connected clients (POS, dashboard) about offer change
-    pusherService.triggerOrderEvent(restaurantId, 'offer-updated', { offerId, action: 'deleted' });
+    pusherService.pushEvent(restaurantId, 'menu', 'offer-updated', { offerId, action: 'deleted' });
 
     res.json({
       message: 'Offer deleted successfully'
@@ -30059,7 +30060,7 @@ app.put('/api/restaurants/:restaurantId/customer-app-settings', authenticateToke
     invalidateRestaurantCache(restaurantId);
 
     // Notify all connected clients about offer settings change
-    pusherService.triggerOrderEvent(restaurantId, 'offer-updated', { action: 'settings-updated' });
+    pusherService.pushEvent(restaurantId, 'menu', 'offer-updated', { action: 'settings-updated' });
 
     res.json({
       message: 'Customer app settings updated successfully',
@@ -30403,9 +30404,9 @@ app.post('/api/orders/:orderId/refund', authenticateToken, async (req, res) => {
       }
     }
 
-    // Notify via Pusher
+    // Notify via Firebase RTDB
     try {
-      await pusherService.triggerOrderEvent(orderData.restaurantId, 'order-refunded', {
+      await pusherService.pushEvent(orderData.restaurantId, 'orders', 'order-refunded', {
         orderId,
         dailyOrderId: orderData.dailyOrderId || null,
         orderNumber: orderData.orderNumber || null,
@@ -30413,8 +30414,8 @@ app.post('/api/orders/:orderId/refund', authenticateToken, async (req, res) => {
         refundType: isFullRefund ? 'full' : 'partial',
         totalAmount: finalAmount
       });
-    } catch (pusherErr) {
-      console.error('Pusher refund notification error (non-blocking):', pusherErr);
+    } catch (rtdbErr) {
+      console.error('RTDB refund notification error (non-blocking):', rtdbErr);
     }
 
     res.json({

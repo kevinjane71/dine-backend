@@ -15,11 +15,12 @@ const { db, collections } = require('../firebase');
 const { authenticateToken } = require('../middleware/auth');
 const talabatService = require('../services/talabatService');
 
-// Lazy-load pusherService to avoid circular dependency issues
+// Lazy-load realtime service to avoid circular dependency issues
+// const pusherService = require('../services/pusherService'); // COMMENTED OUT — replaced by Firebase RTDB
 let pusherService;
 function getPusherService() {
   if (!pusherService) {
-    pusherService = require('../services/pusherService');
+    pusherService = require('../services/firebaseRealtimeService');
   }
   return pusherService;
 }

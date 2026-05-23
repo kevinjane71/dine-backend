@@ -1,5 +1,6 @@
 const { initializeApp, cert } = require('firebase-admin/app');
 const { getFirestore, connectFirestoreEmulator } = require('firebase-admin/firestore');
+const { getDatabase } = require('firebase-admin/database');
 require('dotenv').config();
 
 let db;
@@ -32,7 +33,8 @@ function initializeFirebase() {
       projectId: process.env.FIREBASE_PROJECT_ID,
       privateKey: process.env.FIREBASE_PRIVATE_KEY?.replace(/\\n/g, '\n'),
       clientEmail: process.env.FIREBASE_CLIENT_EMAIL
-    })
+    }),
+    databaseURL: process.env.FIREBASE_DATABASE_URL
   });
   
   console.log('✅ Firebase Admin initialized successfully');
@@ -180,11 +182,22 @@ function getDb() {
   return db;
 }
 
+// Realtime Database getter (lazy init)
+let rtdb;
+function getRealtimeDb() {
+  if (!rtdb) {
+    if (!isInitialized) initializeFirebase();
+    rtdb = getDatabase();
+  }
+  return rtdb;
+}
+
 module.exports = {
   admin,
   get db() {
     return getDb();
   },
   getDb, // Export getter for lazy initialization
+  getRealtimeDb,
   collections
 };

@@ -2,7 +2,8 @@ const express = require('express');
 const router = express.Router();
 const { db } = require('../firebase');
 const { authenticateToken } = require('../middleware/auth');
-const pusherService = require('../services/pusherService');
+// const pusherService = require('../services/pusherService'); // COMMENTED OUT — replaced by Firebase RTDB
+const pusherService = require('../services/firebaseRealtimeService');
 
 router.use(authenticateToken);
 
@@ -881,12 +882,12 @@ router.post('/:restaurantId/location-ping', async (req, res) => {
       updatedAt: now.toISOString(),
     });
 
-    // Push real-time update via Pusher
+    // Push real-time update via Firebase RTDB
     try {
-      await pusherService.triggerOrderEvent(restaurantId, 'staff-location-updated', {
+      await pusherService.pushEvent(restaurantId, 'orders', 'staff-location-updated', {
         staffId, staffName: staffName || '', lat, lng, speed, heading,
       });
-    } catch (e) { /* Pusher failure shouldn't block response */ }
+    } catch (e) { /* RTDB failure shouldn't block response */ }
 
     res.json({ ok: true });
   } catch (err) {

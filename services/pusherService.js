@@ -1,7 +1,14 @@
+/**
+ * COMMENTED OUT — Replaced by firebaseRealtimeService.js (Firebase Realtime Database)
+ * Kept for reference during migration. Safe to delete after verifying Firebase RTDB works.
+ *
+ * Original: Pusher-based real-time notification service
+ */
+
+/*
 const Pusher = require('pusher');
 const fcmService = require('./fcmService');
 
-// Initialize Pusher with environment variables
 const pusher = new Pusher({
   appId: process.env.PUSHER_APP_ID || '2108100',
   key: process.env.PUSHER_KEY || '4e1f74ae05c66bbc4eec',
@@ -10,12 +17,6 @@ const pusher = new Pusher({
   useTLS: true
 });
 
-/**
- * Trigger an event on a restaurant-specific channel
- * @param {string} restaurantId - The restaurant ID
- * @param {string} eventName - The event name (e.g., 'order-created', 'order-updated')
- * @param {object} data - The data to send with the event
- */
 const triggerOrderEvent = async (restaurantId, eventName, data) => {
   try {
     const channelName = `restaurant-${restaurantId}`;
@@ -23,16 +24,11 @@ const triggerOrderEvent = async (restaurantId, eventName, data) => {
       ...data,
       timestamp: new Date().toISOString()
     });
-    console.log(`📡 Pusher: Event '${eventName}' triggered on channel '${channelName}'`);
   } catch (error) {
-    console.error('📡 Pusher Error:', error.message);
-    // Don't throw - Pusher failures shouldn't break the main flow
+    console.error('Pusher Error:', error.message);
   }
 };
 
-/**
- * Trigger when a new order is created
- */
 const notifyOrderCreated = async (restaurantId, order) => {
   await triggerOrderEvent(restaurantId, 'order-created', {
     orderId: order.id,
@@ -44,158 +40,25 @@ const notifyOrderCreated = async (restaurantId, order) => {
     floorId: order.floorId || null,
     orderType: order.orderType
   });
-
-  // Also send FCM push notification for web browsers (background tab / closed)
-  fcmService.sendToRestaurant(restaurantId, {
-    type: 'new-order',
-    title: `New ${order.orderType || 'Online'} Order #${order.orderNumber || order.dailyOrderId || ''}`,
-    body: `${order.tableNumber ? 'Table ' + order.tableNumber + ' • ' : ''}${order.itemsCount || ''} items${order.totalAmount ? ' • ₹' + order.totalAmount : ''}`,
-    orderId: order.id,
-    dailyOrderId: order.dailyOrderId || order.orderNumber || '',
-    orderType: order.orderType || 'online',
-    tableNumber: order.tableNumber || '',
-    totalAmount: order.totalAmount || 0,
-  }).catch(err => console.warn('FCM web push error (non-blocking):', err.message));
+  fcmService.sendToRestaurant(restaurantId, { ... }).catch(() => {});
 };
 
-/**
- * Trigger when order status is updated
- */
-const notifyOrderStatusUpdated = async (restaurantId, orderId, newStatus, orderData = {}) => {
-  await triggerOrderEvent(restaurantId, 'order-status-updated', {
-    orderId,
-    status: newStatus,
-    orderNumber: orderData.orderNumber || orderData.dailyOrderId,
-    totalAmount: orderData.totalAmount,
-    tableNumber: orderData.tableNumber,
-    tableId: orderData.tableId || null,
-    floorId: orderData.floorId || null,
-  });
-};
-
-/**
- * Trigger when order is updated (items, amount, etc.)
- */
-const notifyOrderUpdated = async (restaurantId, orderId, orderData) => {
-  await triggerOrderEvent(restaurantId, 'order-updated', {
-    orderId,
-    status: orderData.status,
-    orderNumber: orderData.orderNumber || orderData.dailyOrderId,
-    totalAmount: orderData.totalAmount,
-    itemsCount: orderData.items?.length || 0,
-    tableNumber: orderData.tableNumber,
-    tableId: orderData.tableId || null,
-    floorId: orderData.floorId || null,
-  });
-};
-
-/**
- * Trigger when order is deleted/cancelled
- */
-const notifyOrderDeleted = async (restaurantId, orderId) => {
-  await triggerOrderEvent(restaurantId, 'order-deleted', {
-    orderId
-  });
-};
-
-/**
- * Trigger KOT print request for dine-kot-printer app
- * Used when an order is confirmed/sent to kitchen
- */
-const notifyKOTPrintRequest = async (restaurantId, orderData) => {
-  // Lightweight notification only — printer app must fetch full order via
-  // GET /api/kot/:restaurantId/:orderId to stay under Pusher's 10KB limit.
-  await triggerOrderEvent(restaurantId, 'kot-print-request', {
-    id: orderData.id,
-    orderId: orderData.id,
-    kotId: `KOT-${orderData.id.slice(-6).toUpperCase()}`,
-    dailyOrderId: orderData.dailyOrderId,
-    orderNumber: orderData.orderNumber,
-    tableNumber: orderData.tableNumber || '',
-    roomNumber: orderData.roomNumber || '',
-    orderType: orderData.orderType || 'dine-in',
-    itemsCount: orderData.items?.length || 0,
-    createdAt: orderData.createdAt || new Date().toISOString(),
-    // Pass through reprint/force flags so printer app knows to skip dedup cache
-    isReprint: orderData.isReprint || false,
-    forcePrint: orderData.forcePrint || false,
-    // Print station routing
-    printStationId: orderData.printStationId || null,
-    printStationName: orderData.printStationName || null
-  });
-  // Fire-and-forget FCM fan-out. Never blocks or throws — failures are
-  // logged inside fcmService. Printer clients in 'fcm' mode receive this.
-  fcmService.sendKOTPrintNotification(restaurantId, orderData)
-    .catch(err => console.error('FCM KOT notify failed:', err.message));
-};
-
-/**
- * Trigger Billing/Invoice print request for dine-kot-printer app
- * Used when billing is completed for an order
- */
-const notifyBillingPrintRequest = async (restaurantId, orderData) => {
-  // Lightweight notification only — printer app must fetch full order via
-  // GET /api/kot/:restaurantId/:orderId to stay under Pusher's 10KB limit.
-  const completedAt = orderData.completedAt || new Date();
-  await triggerOrderEvent(restaurantId, 'billing-print-request', {
-    id: orderData.id,
-    orderId: orderData.id,
-    dailyOrderId: orderData.dailyOrderId,
-    orderNumber: orderData.orderNumber,
-    tableNumber: orderData.tableNumber || '',
-    roomNumber: orderData.roomNumber || '',
-    orderType: orderData.orderType || 'dine-in',
-    itemsCount: orderData.items?.length || 0,
-    totalAmount: orderData.finalAmount || orderData.totalAmount || 0,
-    paymentMethod: orderData.paymentMethod || 'cash',
-    createdAt: orderData.createdAt || new Date().toISOString(),
-    completedAt: completedAt instanceof Date ? completedAt.toISOString() : completedAt
-  });
-  // Fire-and-forget FCM fan-out for billing print.
-  fcmService.sendBillingPrintNotification(restaurantId, orderData)
-    .catch(err => console.error('FCM Bill notify failed:', err.message));
-};
-
-/**
- * Trigger when a menu item is created
- */
-const notifyMenuItemCreated = async (restaurantId, menuItem) => {
-  await triggerOrderEvent(restaurantId, 'menu-item-created', {
-    itemId: menuItem.id,
-    name: menuItem.name,
-    category: menuItem.category,
-  });
-};
-
-/**
- * Trigger when a menu item is updated (name, price, description, availability, etc.)
- */
-const notifyMenuUpdated = async (restaurantId, itemId, updatedFields) => {
-  await triggerOrderEvent(restaurantId, 'menu-updated', {
-    itemId,
-    updatedFields,
-  });
-};
-
-/**
- * Trigger when a menu item is deleted
- */
-const notifyMenuItemDeleted = async (restaurantId, itemId) => {
-  await triggerOrderEvent(restaurantId, 'menu-item-deleted', {
-    itemId,
-  });
-};
+const notifyOrderStatusUpdated = async (restaurantId, orderId, newStatus, orderData = {}) => { ... };
+const notifyOrderUpdated = async (restaurantId, orderId, orderData) => { ... };
+const notifyOrderDeleted = async (restaurantId, orderId) => { ... };
+const notifyKOTPrintRequest = async (restaurantId, orderData) => { ... };
+const notifyBillingPrintRequest = async (restaurantId, orderData) => { ... };
+const notifyMenuItemCreated = async (restaurantId, menuItem) => { ... };
+const notifyMenuUpdated = async (restaurantId, itemId, updatedFields) => { ... };
+const notifyMenuItemDeleted = async (restaurantId, itemId) => { ... };
 
 module.exports = {
-  pusher,
-  triggerOrderEvent,
-  notifyOrderCreated,
-  notifyOrderStatusUpdated,
-  notifyOrderUpdated,
-  notifyOrderDeleted,
-  notifyKOTPrintRequest,
-  notifyBillingPrintRequest,
-  notifyMenuItemCreated,
-  notifyMenuUpdated,
-  notifyMenuItemDeleted
+  pusher, triggerOrderEvent,
+  notifyOrderCreated, notifyOrderStatusUpdated, notifyOrderUpdated, notifyOrderDeleted,
+  notifyKOTPrintRequest, notifyBillingPrintRequest,
+  notifyMenuItemCreated, notifyMenuUpdated, notifyMenuItemDeleted
 };
+*/
+
+// This file is no longer active. See firebaseRealtimeService.js
+module.exports = {};

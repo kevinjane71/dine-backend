@@ -5,7 +5,8 @@ const router = express.Router();
 const { db, collections } = require('../firebase');
 const { authenticateToken } = require('../middleware/auth');
 const admin = require('firebase-admin');
-const pusherService = require('../services/pusherService');
+// const pusherService = require('../services/pusherService'); // COMMENTED OUT — replaced by Firebase RTDB
+const pusherService = require('../services/firebaseRealtimeService');
 
 const COLLECTION = 'customerGroups';
 const FieldValue = admin.firestore.FieldValue;
@@ -130,7 +131,7 @@ router.post('/:restaurantId', authenticateToken, async (req, res) => {
       createdBy: req.user.userId || req.user.id || null,
     };
     await docRef.set(data);
-    pusherService.triggerOrderEvent(restaurantId, 'offer-updated', { action: 'group-created', groupId: docRef.id });
+    pusherService.pushEvent(restaurantId, 'menu', 'offer-updated', { action: 'group-created', groupId: docRef.id });
     res.json({ success: true, group: { id: docRef.id, ...data } });
   } catch (err) {
     console.error('[customerGroups] create error', err);
@@ -152,7 +153,7 @@ router.patch('/:restaurantId/:groupId', authenticateToken, async (req, res) => {
     const input = sanitizeGroupInput({ ...snap.data(), ...req.body });
     const update = { ...input, updatedAt: nowISO() };
     await ref.update(update);
-    pusherService.triggerOrderEvent(restaurantId, 'offer-updated', { action: 'group-updated', groupId });
+    pusherService.pushEvent(restaurantId, 'menu', 'offer-updated', { action: 'group-updated', groupId });
     const fresh = await ref.get();
     res.json({ success: true, group: { id: groupId, ...fresh.data() } });
   } catch (err) {
@@ -172,7 +173,7 @@ router.delete('/:restaurantId/:groupId', authenticateToken, async (req, res) => 
       return res.status(403).json({ success: false, error: 'Restaurant mismatch' });
     }
     await ref.delete();
-    pusherService.triggerOrderEvent(restaurantId, 'offer-updated', { action: 'group-deleted', groupId });
+    pusherService.pushEvent(restaurantId, 'menu', 'offer-updated', { action: 'group-deleted', groupId });
     res.json({ success: true });
   } catch (err) {
     console.error('[customerGroups] delete error', err);
@@ -212,7 +213,7 @@ router.post('/:restaurantId/:groupId/members', authenticateToken, async (req, re
       await ref.update({ customerCount: newCount });
       data.customerCount = newCount;
     }
-    pusherService.triggerOrderEvent(restaurantId, 'offer-updated', { action: 'group-members-added', groupId });
+    pusherService.pushEvent(restaurantId, 'menu', 'offer-updated', { action: 'group-members-added', groupId });
     res.json({ success: true, group: { id: groupId, ...data } });
   } catch (err) {
     console.error('[customerGroups] add members error', err);
@@ -246,7 +247,7 @@ router.delete('/:restaurantId/:groupId/members', authenticateToken, async (req, 
     const newCount = (data.customerIds?.length || 0) + (data.customerPhones?.length || 0);
     await ref.update({ customerCount: newCount });
     data.customerCount = newCount;
-    pusherService.triggerOrderEvent(restaurantId, 'offer-updated', { action: 'group-members-removed', groupId });
+    pusherService.pushEvent(restaurantId, 'menu', 'offer-updated', { action: 'group-members-removed', groupId });
     res.json({ success: true, group: { id: groupId, ...data } });
   } catch (err) {
     console.error('[customerGroups] remove members error', err);

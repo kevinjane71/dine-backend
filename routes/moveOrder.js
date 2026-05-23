@@ -2,7 +2,8 @@ const express = require('express');
 const router = express.Router();
 const { db, collections } = require('../firebase');
 const { authenticateToken } = require('../middleware/auth');
-const pusherService = require('../services/pusherService');
+// const pusherService = require('../services/pusherService'); // COMMENTED OUT — replaced by Firebase RTDB
+const pusherService = require('../services/firebaseRealtimeService');
 
 // ==========================================
 // Move Order to Another Table
@@ -141,15 +142,15 @@ router.post('/:orderId/move-table', authenticateToken, async (req, res) => {
       updatedAt: new Date(),
     });
 
-    // 6. Pusher events for real-time sync
+    // 6. Real-time events for table sync (Firebase RTDB)
     if (oldTableId) {
-      pusherService.pusher.trigger(`restaurant-${rid}`, 'table-status-updated', {
+      pusherService.triggerTableStatusUpdated(rid, {
         tableId: oldTableId, status: 'available', orderId: null, tableNumber: oldTableNumber,
-      }).catch(err => console.error('Pusher error (old table):', err));
+      }).catch(err => console.error('RTDB error (old table):', err));
     }
-    pusherService.pusher.trigger(`restaurant-${rid}`, 'table-status-updated', {
+    pusherService.triggerTableStatusUpdated(rid, {
       tableId: targetTableId, status: 'occupied', orderId, tableNumber: targetTableName,
-    }).catch(err => console.error('Pusher error (new table):', err));
+    }).catch(err => console.error('RTDB error (new table):', err));
 
     // Notify order update
     pusherService.notifyOrderUpdated(rid, orderId, {

@@ -837,10 +837,10 @@ router.post('/tickets/:restaurantId/entry', async (req, res) => {
       updatedAt: FieldValue.serverTimestamp()
     });
 
-    // Pusher real-time notification (fire-and-forget)
+    // Real-time notification (fire-and-forget) — Firebase RTDB
     try {
-      const pusherService = require('../services/pusherService');
-      pusherService.triggerOrderEvent(restaurantId, 'parking-entry', {
+      const realtimeService = require('../services/firebaseRealtimeService');
+      realtimeService.pushEvent(restaurantId, 'orders', 'parking-entry', {
         ticketId: ref.id,
         ticketNumber,
         vehicleNumber: ticketData.vehicleNumber,
@@ -1030,10 +1030,10 @@ router.post('/tickets/:restaurantId/exit/confirm', async (req, res) => {
       });
     }
 
-    // Pusher real-time notification (fire-and-forget)
+    // Real-time notification (fire-and-forget) — Firebase RTDB
     try {
-      const pusherService = require('../services/pusherService');
-      pusherService.triggerOrderEvent(restaurantId, 'parking-exit', {
+      const realtimeService = require('../services/firebaseRealtimeService');
+      realtimeService.pushEvent(restaurantId, 'orders', 'parking-exit', {
         ticketId,
         ticketNumber: ticket.ticketNumber,
         vehicleNumber: ticket.vehicleNumber,

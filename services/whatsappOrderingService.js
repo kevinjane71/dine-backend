@@ -547,10 +547,10 @@ async function createWhatsAppOrder(restaurantId, phoneNumber, session, config) {
 
     const orderRef = await db.collection(collections.orders).add(orderData);
 
-    // Trigger real-time notification
+    // Trigger real-time notification (Firebase RTDB)
     try {
-      const pusherService = require('./pusherService');
-      await pusherService.notifyOrderCreated(restaurantId, {
+      const realtimeService = require('./firebaseRealtimeService');
+      await realtimeService.notifyOrderCreated(restaurantId, {
         id: orderRef.id,
         orderNumber,
         status: 'pending',
@@ -559,7 +559,7 @@ async function createWhatsAppOrder(restaurantId, phoneNumber, session, config) {
         orderType: 'whatsapp'
       });
     } catch (e) {
-      console.error('Pusher notification error (non-blocking):', e.message);
+      console.error('RTDB notification error (non-blocking):', e.message);
     }
 
     // Log the WhatsApp order
