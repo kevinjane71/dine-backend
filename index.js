@@ -6305,6 +6305,12 @@ app.patch('/api/restaurants/:restaurantId', authenticateToken, async (req, res) 
       updateData.posSettings = { ...existing, ...req.body.posSettings };
     }
 
+    // ECR terminal settings (NAPS Qatar payment terminal integration)
+    if (req.body.ecrSettings !== undefined) {
+      const existing = restaurant.data().ecrSettings || {};
+      updateData.ecrSettings = { ...existing, ...req.body.ecrSettings };
+    }
+
     // Booking settings (enable/disable Catering, Advance Order, Venue Booking)
     if (req.body.bookingSettings !== undefined) {
       const existing = restaurant.data().bookingSettings || {};
@@ -14146,6 +14152,10 @@ app.use('/api/google-reviews', googleReviewsRoutes);
 // Initialize Custom URL (slug) routes
 app.use('/api', customUrlRoutes);
 
+// ECR Payment Terminal proxy (NAPS Qatar)
+const ecrProxyRoutes = require('./routes/ecrProxy')(db, collections, authenticateToken);
+app.use('/api/ecr', ecrProxyRoutes);
+
 // Print installer (KOT Printer exe/dmg) – use same bucket as image/menu uploads
 app.set('printInstallerBucket', bucket);
 app.use('/api/print-installer', printInstallerRoutes);
@@ -19779,7 +19789,9 @@ const assembleBillRenderPayload = (orderId, orderData, restaurantId, restaurantD
     invoiceDate: completedAtIso || createdAtIso,
     generatedAt: new Date().toISOString(),
     formattedDate,
-    formattedTime
+    formattedTime,
+    // ECR card terminal response (NAPS Qatar)
+    ecrResponse: orderData.ecrResponse || null
   };
 
   return {

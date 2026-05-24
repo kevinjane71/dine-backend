@@ -109,7 +109,7 @@ router.post('/login', async (req, res) => {
 
 // ─── Platform Stats ──────────────────────────────────────────────────
 // Uses count() aggregation queries to avoid fetching full documents
-router.get('/stats', authenticateSuperAdmin, async (req, res) => {
+router.get('/stats', authenticateSuperAdmin, requireSuperAdmin, async (req, res) => {
   try {
     const { start: todayStart } = getTodayBounds();
     const sevenDaysAgo = new Date(todayStart);
@@ -160,7 +160,7 @@ router.get('/stats', authenticateSuperAdmin, async (req, res) => {
 });
 
 // ─── Demo Requests (paginated, 50 default) ──────────────────────────
-router.get('/demo-requests', authenticateSuperAdmin, async (req, res) => {
+router.get('/demo-requests', authenticateSuperAdmin, requireSuperAdmin, async (req, res) => {
   try {
     const limit = parseLimit(req.query.limit);
     let query = db.collection('demoRequests').orderBy('createdAt', 'desc');
@@ -197,7 +197,7 @@ router.get('/demo-requests', authenticateSuperAdmin, async (req, res) => {
 });
 
 // ─── Users List (paginated, 50 default) ─────────────────────────────
-router.get('/users', authenticateSuperAdmin, async (req, res) => {
+router.get('/users', authenticateSuperAdmin, requireSuperAdmin, async (req, res) => {
   try {
     const { filter = 'all', search } = req.query;
     const limit = parseLimit(req.query.limit);
@@ -276,7 +276,7 @@ router.get('/users', authenticateSuperAdmin, async (req, res) => {
 
 // ─── Lookup user by email or phone ──────────────────────────────────
 // Must be BEFORE /users/:userId so Express doesn't match "lookup" as a userId
-router.get('/users/lookup', authenticateSuperAdmin, async (req, res) => {
+router.get('/users/lookup', authenticateSuperAdmin, requireSuperAdmin, async (req, res) => {
   try {
     const { email, phone } = req.query;
     if (!email && !phone) {
@@ -784,7 +784,7 @@ router.post('/menus/csv-import/:restaurantId', authenticateSuperAdmin, requireSu
 
 // ─── User Detail ─────────────────────────────────────────────────────
 // Paginated orders with limit+cursor
-router.get('/users/:userId', authenticateSuperAdmin, async (req, res) => {
+router.get('/users/:userId', authenticateSuperAdmin, requireSuperAdmin, async (req, res) => {
   try {
     const { userId } = req.params;
     const ordersLimit = parseLimit(req.query.ordersLimit || '50');
@@ -876,7 +876,7 @@ router.get('/users/:userId', authenticateSuperAdmin, async (req, res) => {
 // ─── Delete User + Associated Restaurants ────────────────────────────
 // Step 1: Preview — GET /users/:userId/delete-preview
 // Returns the user and all owned restaurants so admin can confirm
-router.get('/users/:userId/delete-preview', authenticateSuperAdmin, async (req, res) => {
+router.get('/users/:userId/delete-preview', authenticateSuperAdmin, requireSuperAdmin, async (req, res) => {
   try {
     const { userId } = req.params;
 
@@ -1026,7 +1026,7 @@ router.delete('/users/:userId', authenticateSuperAdmin, requireSuperAdmin, async
 
 // ─── Restaurants List (paginated, 50 default) ────────────────────────
 // Uses count() for 24h orders and parallel batched lookups
-router.get('/restaurants', authenticateSuperAdmin, async (req, res) => {
+router.get('/restaurants', authenticateSuperAdmin, requireSuperAdmin, async (req, res) => {
   try {
     const limit = parseLimit(req.query.limit);
 
@@ -1164,7 +1164,7 @@ function formatDateStr(d) {
   return `${y}-${m}-${day}`;
 }
 
-router.get('/orders/summary', authenticateSuperAdmin, async (req, res) => {
+router.get('/orders/summary', authenticateSuperAdmin, requireSuperAdmin, async (req, res) => {
   try {
     const period = req.query.period || 'today'; // 'today' | 'yesterday' | '7days'
     const dateStrings = getDateStringsForPeriod(period);
@@ -1253,7 +1253,7 @@ router.get('/orders/summary', authenticateSuperAdmin, async (req, res) => {
 // ─── Activity: Logins ────────────────────────────────────────────────
 // GET /api/super-admin/activity/logins?period=today|yesterday|7days
 // Returns users (owners) who logged in during the period, with their restaurants
-router.get('/activity/logins', authenticateSuperAdmin, async (req, res) => {
+router.get('/activity/logins', authenticateSuperAdmin, requireSuperAdmin, async (req, res) => {
   try {
     const period = req.query.period || 'today';
     const now = new Date();
@@ -1671,7 +1671,7 @@ router.post('/reset-restaurant-data', authenticateSuperAdmin, requireSuperAdmin,
 // ─── Update Restaurant Settings (super-admin) ────────────────────────
 // PATCH /api/super-admin/restaurants/:restaurantId/settings
 // GET /restaurants/:restaurantId/settings — fetch restaurant name + orderSettings
-router.get('/restaurants/:restaurantId/settings', authenticateSuperAdmin, async (req, res) => {
+router.get('/restaurants/:restaurantId/settings', authenticateSuperAdmin, requireSuperAdmin, async (req, res) => {
   try {
     const { restaurantId } = req.params;
     const restaurant = await db.collection(collections.restaurants).doc(restaurantId).get();
@@ -1688,7 +1688,7 @@ router.get('/restaurants/:restaurantId/settings', authenticateSuperAdmin, async 
 
 // Body: { orderSettings: { allowOrderDelete: true/false, ... } }
 // Merges into existing orderSettings on the restaurant document.
-router.patch('/restaurants/:restaurantId/settings', authenticateSuperAdmin, async (req, res) => {
+router.patch('/restaurants/:restaurantId/settings', authenticateSuperAdmin, requireSuperAdmin, async (req, res) => {
   try {
     const { restaurantId } = req.params;
     const { orderSettings } = req.body || {};
@@ -1724,7 +1724,7 @@ router.patch('/restaurants/:restaurantId/settings', authenticateSuperAdmin, asyn
 // PATCH /api/super-admin/notes/:collection/:docId
 // Body: { note: string }
 // Stores adminNote + adminNoteUpdatedAt on the Firestore document.
-router.patch('/notes/:collection/:docId', authenticateSuperAdmin, async (req, res) => {
+router.patch('/notes/:collection/:docId', authenticateSuperAdmin, requireSuperAdmin, async (req, res) => {
   try {
     const { collection, docId } = req.params;
     const { note } = req.body || {};
@@ -1857,7 +1857,7 @@ router.post('/reset-mpin', authenticateSuperAdmin, checkPermission('dine:reset-m
 const ADMIN_TASKS_COL = 'adminTasks';
 
 // GET /tasks — list tasks
-router.get('/tasks', authenticateSuperAdmin, async (req, res) => {
+router.get('/tasks', authenticateSuperAdmin, requireSuperAdmin, async (req, res) => {
   try {
     const { status } = req.query;
     let query = db.collection(ADMIN_TASKS_COL);
@@ -1901,7 +1901,7 @@ router.get('/tasks', authenticateSuperAdmin, async (req, res) => {
 });
 
 // POST /tasks — create task
-router.post('/tasks', authenticateSuperAdmin, async (req, res) => {
+router.post('/tasks', authenticateSuperAdmin, requireSuperAdmin, async (req, res) => {
   try {
     const { title, notes, dueDate } = req.body;
     if (!title || !title.trim()) {
@@ -1935,7 +1935,7 @@ router.post('/tasks', authenticateSuperAdmin, async (req, res) => {
 });
 
 // PATCH /tasks/:taskId — update task
-router.patch('/tasks/:taskId', authenticateSuperAdmin, async (req, res) => {
+router.patch('/tasks/:taskId', authenticateSuperAdmin, requireSuperAdmin, async (req, res) => {
   try {
     const { taskId } = req.params;
     const docRef = db.collection(ADMIN_TASKS_COL).doc(taskId);
@@ -1965,7 +1965,7 @@ router.patch('/tasks/:taskId', authenticateSuperAdmin, async (req, res) => {
 });
 
 // DELETE /tasks/:taskId — delete task
-router.delete('/tasks/:taskId', authenticateSuperAdmin, async (req, res) => {
+router.delete('/tasks/:taskId', authenticateSuperAdmin, requireSuperAdmin, async (req, res) => {
   try {
     const { taskId } = req.params;
     const docRef = db.collection(ADMIN_TASKS_COL).doc(taskId);
@@ -1996,19 +1996,53 @@ router.get('/my-users', authenticateSuperAdmin, async (req, res) => {
       .limit(100)
       .get();
 
-    const users = snap.docs.map(doc => {
+    // Fetch restaurant info for each user in parallel
+    const users = await Promise.all(snap.docs.map(async (doc) => {
       const data = doc.data();
+      const userId = doc.id;
+
+      // Get restaurants owned by this user
+      let restaurants = [];
+      try {
+        const restSnap = await db.collection(collections.restaurants)
+          .where('ownerId', '==', userId)
+          .limit(5)
+          .get();
+        restaurants = restSnap.docs.map(r => {
+          const rd = r.data();
+          return { id: r.id, name: rd.name || '', subdomain: rd.subdomain || '' };
+        });
+      } catch {}
+
+      // Get subscription info
+      let subscription = null;
+      try {
+        const subDoc = await db.collection('dine_user_data').doc(userId).get();
+        if (subDoc.exists) {
+          const sd = subDoc.data();
+          subscription = {
+            planId: sd.subscription?.planId || 'none',
+            planName: sd.subscription?.planName || '',
+            status: sd.subscription?.status || '',
+          };
+        }
+      } catch {}
+
       return {
-        id: doc.id,
+        id: userId,
         name: data.name || '',
         email: data.email || '',
         phone: data.phone || '',
         role: data.role || '',
         setupComplete: data.setupComplete || false,
+        lastLogin: data.lastLogin?.toDate ? data.lastLogin.toDate().toISOString() : data.lastLogin || null,
         createdAt: data.createdAt?.toDate ? data.createdAt.toDate().toISOString() : data.createdAt || null,
+        temporaryPassword: data.temporaryPassword || false,
+        restaurants,
+        subscription,
         platform: 'dine',
       };
-    });
+    }));
 
     res.json({ success: true, users });
   } catch (error) {
