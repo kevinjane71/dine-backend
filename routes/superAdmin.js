@@ -3,7 +3,9 @@ const router = express.Router();
 const jwt = require('jsonwebtoken');
 const bcrypt = require('bcryptjs');
 const { db, collections } = require('../firebase');
-const { authenticateSuperAdmin } = require('../middleware/superAdminAuth');
+const { authenticateSuperAdmin, requireSuperAdmin } = require('../middleware/superAdminAuth');
+const { checkPermission } = require('../middleware/checkPermission');
+const subAdminRoutes = require('./subAdmin');
 
 // ─── Constants ───────────────────────────────────────────────────────
 const DEFAULT_PAGE_SIZE = 50;
@@ -338,7 +340,7 @@ router.get('/users/lookup', authenticateSuperAdmin, async (req, res) => {
 
 // ─── Merge / Link two user accounts ─────────────────────────────────
 // Moves restaurants + userRestaurants from secondary → primary, copies missing fields, deletes secondary
-router.post('/users/merge', authenticateSuperAdmin, async (req, res) => {
+router.post('/users/merge', authenticateSuperAdmin, requireSuperAdmin, async (req, res) => {
   try {
     const { primaryUserId, secondaryUserId } = req.body;
 
@@ -435,7 +437,7 @@ router.post('/users/merge', authenticateSuperAdmin, async (req, res) => {
 });
 
 // ─── Create Owner Account (or set temp password for existing) ────────
-router.post('/users/create-owner', authenticateSuperAdmin, async (req, res) => {
+router.post('/users/create-owner', authenticateSuperAdmin, checkPermission('dine:create-user'), async (req, res) => {
   try {
     const { email } = req.body;
 
@@ -506,7 +508,8 @@ router.post('/users/create-owner', authenticateSuperAdmin, async (req, res) => {
       setupComplete: false,
       createdAt: new Date(),
       updatedAt: new Date(),
-      createdBy: 'admin',
+      createdBy: req.admin.role === 'sub_admin' ? req.admin.subAdminId : 'admin',
+      createdByRole: req.admin.role,
     });
 
     const userId = userDoc.id;
@@ -561,7 +564,7 @@ router.post('/users/create-owner', authenticateSuperAdmin, async (req, res) => {
 });
 
 // ─── CSV Menu Import ─────────────────────────────────────────────────
-router.post('/menus/csv-import/:restaurantId', authenticateSuperAdmin, async (req, res) => {
+router.post('/menus/csv-import/:restaurantId', authenticateSuperAdmin, requireSuperAdmin, async (req, res) => {
   try {
     const { restaurantId } = req.params;
     const { menuItems, categories: inputCategories = [], taxConfig = [] } = req.body;
@@ -916,7 +919,7 @@ router.get('/users/:userId/delete-preview', authenticateSuperAdmin, async (req, 
 
 // Step 2: Execute delete — DELETE /users/:userId
 // Hard-deletes the user and all associated data (restaurants, orders, staff, menus, etc.)
-router.delete('/users/:userId', authenticateSuperAdmin, async (req, res) => {
+router.delete('/users/:userId', authenticateSuperAdmin, requireSuperAdmin, async (req, res) => {
   try {
     const { userId } = req.params;
 
@@ -1341,7 +1344,7 @@ router.get('/activity/logins', authenticateSuperAdmin, async (req, res) => {
 //   OR: { restaurantId: string, startDate: 'YYYY-MM-DD', endDate: 'YYYY-MM-DD' }
 // Soft-deletes (status='deleted') all orders for that restaurant in the date range (server local time).
 // Idempotent: orders already marked deleted are skipped.
-router.post('/orders/soft-delete', authenticateSuperAdmin, async (req, res) => {
+router.post('/orders/soft-delete', authenticateSuperAdmin, requireSuperAdmin, async (req, res) => {
   try {
     const { restaurantId, date, startDate, endDate } = req.body || {};
     if (!restaurantId || typeof restaurantId !== 'string') {
@@ -1471,7 +1474,7 @@ router.post('/orders/soft-delete', authenticateSuperAdmin, async (req, res) => {
 // POST /api/super-admin/orders/soft-delete-by-id
 // Body: { restaurantId: string, orderId: string }
 // Soft-deletes a single order. Verifies it belongs to the given restaurant.
-router.post('/orders/soft-delete-by-id', authenticateSuperAdmin, async (req, res) => {
+router.post('/orders/soft-delete-by-id', authenticateSuperAdmin, requireSuperAdmin, async (req, res) => {
   try {
     const { restaurantId, orderId } = req.body || {};
     if (!restaurantId || typeof restaurantId !== 'string') {
@@ -1524,7 +1527,7 @@ router.post('/orders/soft-delete-by-id', authenticateSuperAdmin, async (req, res
 // Body: { restaurantId: string, collections: string[] }
 // Hard-deletes documents from selected collections for a restaurant.
 // Used to wipe test data before a restaurant goes live.
-router.post('/reset-restaurant-data', authenticateSuperAdmin, async (req, res) => {
+router.post('/reset-restaurant-data', authenticateSuperAdmin, requireSuperAdmin, async (req, res) => {
   try {
     const { restaurantId, collections: collectionsToReset } = req.body || {};
     if (!restaurantId || typeof restaurantId !== 'string') {
@@ -1761,7 +1764,7 @@ router.patch('/notes/:collection/:docId', authenticateSuperAdmin, async (req, re
 });
 
 // ─── Reset User MPIN ────────────────────────────────────────────
-router.post('/reset-mpin', authenticateSuperAdmin, async (req, res) => {
+router.post('/reset-mpin', authenticateSuperAdmin, checkPermission('dine:reset-mpin'), async (req, res) => {
   try {
     const { phone } = req.body;
     if (!phone || !phone.trim()) {
@@ -1978,5 +1981,43 @@ router.delete('/tasks/:taskId', authenticateSuperAdmin, async (req, res) => {
     res.status(500).json({ success: false, error: 'Failed to delete task' });
   }
 });
+
+// ─── My Onboarded Users (sub-admin scoped) ──────────────────────────
+router.get('/my-users', authenticateSuperAdmin, async (req, res) => {
+  try {
+    if (req.admin.role !== 'sub_admin') {
+      return res.status(400).json({ success: false, error: 'This endpoint is for sub-admins only' });
+    }
+
+    const subAdminId = req.admin.subAdminId;
+    const snap = await db.collection(collections.users)
+      .where('createdBy', '==', subAdminId)
+      .orderBy('createdAt', 'desc')
+      .limit(100)
+      .get();
+
+    const users = snap.docs.map(doc => {
+      const data = doc.data();
+      return {
+        id: doc.id,
+        name: data.name || '',
+        email: data.email || '',
+        phone: data.phone || '',
+        role: data.role || '',
+        setupComplete: data.setupComplete || false,
+        createdAt: data.createdAt?.toDate ? data.createdAt.toDate().toISOString() : data.createdAt || null,
+        platform: 'dine',
+      };
+    });
+
+    res.json({ success: true, users });
+  } catch (error) {
+    console.error('My users error:', error);
+    res.status(500).json({ success: false, error: 'Failed to fetch users' });
+  }
+});
+
+// ─── Mount sub-admin routes ─────────────────────────────────────────
+router.use('/sub-admins', subAdminRoutes);
 
 module.exports = router;
