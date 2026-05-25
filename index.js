@@ -12551,6 +12551,9 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
         } else {
           // Menu item not found — use FE-sent price as fallback
           resolvedBasePrice = cleanItem.price || existingItem?.price || 0;
+          console.warn(`⚠️ PATCH: Menu item not found for "${cleanItem.name || cleanItem.menuItemId}". ` +
+            `Using fallback price ₹${resolvedBasePrice} (FE: ${cleanItem.price}, existing: ${existingItem?.price}). ` +
+            `Order: ${req.params.orderId}`);
         }
 
         const customizationPrice = customizations.reduce((sum, c) => sum + (typeof c.price === 'number' ? c.price : 0), 0);
@@ -30381,6 +30384,14 @@ app.post('/api/orders/:orderId/refund', authenticateToken, async (req, res) => {
       return res.status(400).json({ error: 'Refund amount cannot exceed order total' });
     }
 
+    // Validate refund doesn't exceed what was actually paid
+    const paidAmount = typeof orderData.paidAmount === 'number' ? orderData.paidAmount : finalAmount;
+    const alreadyRefunded = typeof orderData.refundAmount === 'number' ? orderData.refundAmount : 0;
+    const refundableAmount = paidAmount - alreadyRefunded;
+    if (refundAmount > refundableAmount + 0.01) {
+      return res.status(400).json({ error: `Refund amount (₹${refundAmount}) exceeds refundable amount (₹${Math.round(refundableAmount * 100) / 100}). Only ₹${Math.round(refundableAmount * 100) / 100} has been paid.` });
+    }
+
     const isFullRefund = refundAmount >= finalAmount;
     const updateFields = {
       refundAmount: Number(refundAmount),
@@ -30524,6 +30535,7 @@ app.post('/api/orders/:orderId/comp-void', authenticateToken, async (req, res) =
       return res.status(404).json({ error: 'Order not found' });
     }
 
+    const orderData = orderDoc.data();
     const fieldName = type === 'comp' ? 'compItems' : 'voidItems';
     const newItems = items.map(item => ({
       ...item,
@@ -30532,11 +30544,40 @@ app.post('/api/orders/:orderId/comp-void', authenticateToken, async (req, res) =
       authorizedAt: new Date().toISOString()
     }));
 
+    // Calculate the total amount being comped/voided
+    const adjustmentAmount = newItems.reduce((sum, item) => {
+      const amount = typeof item.amount === 'number' ? item.amount
+        : (typeof item.price === 'number' && typeof item.quantity === 'number')
+          ? item.price * item.quantity : 0;
+      return sum + amount;
+    }, 0);
+
+    // Recalculate order totals after comp/void adjustment
+    const existingCompAmount = (orderData.compAmount || 0);
+    const existingVoidAmount = (orderData.voidAmount || 0);
+    const newCompAmount = type === 'comp' ? existingCompAmount + adjustmentAmount : existingCompAmount;
+    const newVoidAmount = type === 'void' ? existingVoidAmount + adjustmentAmount : existingVoidAmount;
+    const totalAdjustment = newCompAmount + newVoidAmount;
+
+    const originalFinal = orderData.finalAmount || orderData.totalAmount || 0;
+    // adjustedFinalAmount reflects the effective amount after comps/voids
+    const adjustedFinalAmount = Math.max(0, Math.round((originalFinal - totalAdjustment) * 100) / 100);
+
     await orderRef.update({
-      [fieldName]: FieldValue.arrayUnion(...newItems)
+      [fieldName]: FieldValue.arrayUnion(...newItems),
+      compAmount: Math.round(newCompAmount * 100) / 100,
+      voidAmount: Math.round(newVoidAmount * 100) / 100,
+      adjustedFinalAmount,
+      updatedAt: new Date(),
     });
 
-    res.json({ success: true, message: `Items ${type === 'comp' ? 'comped' : 'voided'} successfully` });
+    res.json({
+      success: true,
+      message: `Items ${type === 'comp' ? 'comped' : 'voided'} successfully`,
+      adjustedFinalAmount,
+      compAmount: Math.round(newCompAmount * 100) / 100,
+      voidAmount: Math.round(newVoidAmount * 100) / 100,
+    });
   } catch (error) {
     console.error('Error processing comp/void:', error);
     res.status(500).json({ error: 'Failed to process comp/void' });
