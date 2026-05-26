@@ -14262,6 +14262,10 @@ app.use('/api', customUrlRoutes);
 const ecrProxyRoutes = require('./routes/ecrProxy')(db, collections, authenticateToken);
 app.use('/api/ecr', ecrProxyRoutes);
 
+// Sadad Cloud Payment (WiseCashier cloud-mode ECR)
+const sadadRoutes = require('./routes/sadadRoutes')(db, collections, authenticateToken);
+app.use('/api/sadad', sadadRoutes);
+
 // Print installer (KOT Printer exe/dmg) – use same bucket as image/menu uploads
 app.set('printInstallerBucket', bucket);
 app.use('/api/print-installer', printInstallerRoutes);
@@ -18564,6 +18568,18 @@ app.put('/api/admin/print-settings/:restaurantId', authenticateToken, async (req
       if (printSettings[field] !== undefined) {
         sanitizedSettings[field] = allowed.includes(printSettings[field]) ? printSettings[field] : allowed[1]; // default to 2nd value (medium)
       }
+    }
+    // printContentWidth: numeric content width override in mm
+    if (printSettings.printContentWidth !== undefined) {
+      const val = parseInt(printSettings.printContentWidth);
+      if (!isNaN(val) && val >= 30 && val <= 80) {
+        sanitizedSettings.printContentWidth = val;
+      }
+    }
+    // printLeftMargin: numeric left margin in mm (0-10, default 2)
+    if (printSettings.printLeftMargin !== undefined) {
+      const val = parseInt(printSettings.printLeftMargin);
+      sanitizedSettings.printLeftMargin = isNaN(val) ? 2 : Math.max(0, Math.min(val, 10));
     }
     // billFontScale: numeric 50-150 (default 100)
     if (printSettings.billFontScale !== undefined) {
