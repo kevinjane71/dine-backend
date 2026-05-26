@@ -3,6 +3,7 @@ const router = express.Router();
 const { db, collections } = require('../firebase');
 const { authenticateToken, requireOwnerRole } = require('../middleware/auth');
 const emailService = require('../emailService');
+const { parseTZ, todayInTZ, dateStrInTZ, dateBoundsInTZ } = require('../utils/timezone');
 
 // ============================================
 // AI INSIGHTS & DAILY REPORTS
@@ -374,13 +375,13 @@ router.get('/insights', authenticateToken, requireOwnerRole, async (req, res) =>
       restaurantIds = ownedIds;
     }
 
-    // Calculate date range
+    // Calculate date range (timezone-aware)
     const now = new Date();
+    const tzOffset = parseTZ(req);
     let dateStart;
     switch (period) {
       case 'today':
-        dateStart = new Date(now);
-        dateStart.setHours(0, 0, 0, 0);
+        dateStart = tzOffset !== undefined ? todayInTZ(tzOffset).start : (() => { const d = new Date(now); d.setHours(0, 0, 0, 0); return d; })();
         break;
       case '7d':
         dateStart = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
@@ -907,11 +908,12 @@ async function generateDailyReport(userId, period = 'today') {
     restaurants.push({ id: doc.id, ...doc.data() });
   });
 
-  // Get today's data
-  const today = new Date();
-  today.setHours(0, 0, 0, 0);
-  const tomorrow = new Date(today);
-  tomorrow.setDate(tomorrow.getDate() + 1);
+  // Get today's data — use IST (UTC+5:30) as default for automated reports
+  // TODO: Should use store-specific timezone from restaurant settings
+  const IST_OFFSET = -330; // IST getTimezoneOffset() value
+  const todayBounds = todayInTZ(IST_OFFSET);
+  const today = todayBounds.start;
+  const tomorrow = new Date(todayBounds.end.getTime() + 1);
 
   let totalRevenue = 0;
   let totalOrders = 0;

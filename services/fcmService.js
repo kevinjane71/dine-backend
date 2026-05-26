@@ -232,11 +232,76 @@ async function sendBillingPrintNotification(restaurantId, orderData) {
   });
 }
 
+/**
+ * Send a data-only message to a specific staff member's device.
+ * Uses the staffFcmTokens subcollection (separate from printer device tokens).
+ */
+async function sendToStaff(restaurantId, staffId, data) {
+  const messaging = getMessagingClient();
+  if (!messaging) return { success: false, reason: 'fcm-not-initialized' };
+
+  try {
+    const db = getDb();
+    const tokenDoc = await db
+      .collection(collections.restaurants)
+      .doc(restaurantId)
+      .collection('staffFcmTokens')
+      .doc(staffId)
+      .get();
+
+    if (!tokenDoc.exists || !tokenDoc.data()?.token) {
+      return { success: false, reason: 'no-token-for-staff' };
+    }
+
+    const token = tokenDoc.data().token;
+
+    // Coerce all values to strings (FCM data requirement)
+    const stringData = {};
+    for (const [k, v] of Object.entries(data || {})) {
+      if (v === null || v === undefined) continue;
+      stringData[k] = typeof v === 'string' ? v : JSON.stringify(v);
+    }
+
+    await messaging.send({
+      token,
+      data: stringData,
+      android: { priority: 'high', ttl: 300 * 1000 }, // 5 min TTL for delivery assignments
+      apns: {
+        headers: { 'apns-priority': '10' },
+        payload: { aps: { contentAvailable: true, alert: { title: data.title || '', body: data.body || '' } } },
+      },
+    });
+
+    console.log(`📬 FCM sent to staff ${staffId} at ${restaurantId}`);
+    return { success: true };
+  } catch (err) {
+    const code = err.code || '';
+    if (
+      code === 'messaging/registration-token-not-registered' ||
+      code === 'messaging/invalid-registration-token'
+    ) {
+      // Clean up stale token
+      try {
+        const db = getDb();
+        await db
+          .collection(collections.restaurants)
+          .doc(restaurantId)
+          .collection('staffFcmTokens')
+          .doc(staffId)
+          .delete();
+      } catch (_) {}
+    }
+    console.error(`FCM send to staff ${staffId} failed:`, err.message);
+    return { success: false, error: err.message };
+  }
+}
+
 module.exports = {
   registerToken,
   unregisterToken,
   getTokensForRestaurant,
   sendToRestaurant,
+  sendToStaff,
   sendKOTPrintNotification,
   sendBillingPrintNotification,
 };

@@ -5,6 +5,7 @@ const bcrypt = require('bcryptjs');
 const { db, collections } = require('../firebase');
 const { authenticateSuperAdmin, requireSuperAdmin } = require('../middleware/superAdminAuth');
 const { checkPermission } = require('../middleware/checkPermission');
+const { parseTZ, todayInTZ, dateStrInTZ, dateBoundsInTZ } = require('../utils/timezone');
 const subAdminRoutes = require('./subAdmin');
 
 // ─── Constants ───────────────────────────────────────────────────────
@@ -24,12 +25,8 @@ function getTodayBounds() {
   return { start, end };
 }
 
-function getTodayString() {
-  const now = new Date();
-  const y = now.getFullYear();
-  const m = String(now.getMonth() + 1).padStart(2, '0');
-  const d = String(now.getDate()).padStart(2, '0');
-  return `${y}-${m}-${d}`;
+function getTodayString(tzOffset) {
+  return dateStrInTZ(new Date(), tzOffset);
 }
 
 function toDate(val) {
@@ -129,7 +126,7 @@ router.get('/stats', authenticateSuperAdmin, requireSuperAdmin, async (req, res)
       db.collection(collections.users).where('lastLogin', '>=', todayStart).count().get(),
       db.collection(collections.users).where('createdAt', '>=', sevenDaysAgo).count().get(),
       // dailyStats is small (one doc per restaurant per day), safe to fetch
-      db.collection('dailyStats').where('date', '==', getTodayString()).get(),
+      db.collection('dailyStats').where('date', '==', getTodayString(parseTZ(req))).get(),
       db.collection('demoRequests').count().get(),
     ]);
 
@@ -1135,26 +1132,24 @@ router.get('/restaurants', authenticateSuperAdmin, requireSuperAdmin, async (req
 
 // ─── Orders Summary (paginated per-restaurant list) ──────────────────
 // Helper: get date strings for a period
-function getDateStringsForPeriod(period) {
-  const now = new Date();
-  const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+function getDateStringsForPeriod(period, tzOffset) {
+  const todayStr = getTodayString(tzOffset);
+  const todayNoon = new Date(todayStr + 'T12:00:00Z');
 
   if (period === 'yesterday') {
-    const y = new Date(today);
-    y.setDate(y.getDate() - 1);
-    return [formatDateStr(y)];
+    const y = new Date(todayNoon); y.setUTCDate(y.getUTCDate() - 1);
+    return [`${y.getUTCFullYear()}-${String(y.getUTCMonth() + 1).padStart(2, '0')}-${String(y.getUTCDate()).padStart(2, '0')}`];
   }
   if (period === '7days') {
     const dates = [];
     for (let i = 0; i < 7; i++) {
-      const d = new Date(today);
-      d.setDate(d.getDate() - i);
-      dates.push(formatDateStr(d));
+      const d = new Date(todayNoon); d.setUTCDate(d.getUTCDate() - i);
+      dates.push(`${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}-${String(d.getUTCDate()).padStart(2, '0')}`);
     }
     return dates;
   }
   // default: today
-  return [getTodayString()];
+  return [todayStr];
 }
 
 function formatDateStr(d) {
@@ -1167,7 +1162,7 @@ function formatDateStr(d) {
 router.get('/orders/summary', authenticateSuperAdmin, requireSuperAdmin, async (req, res) => {
   try {
     const period = req.query.period || 'today'; // 'today' | 'yesterday' | '7days'
-    const dateStrings = getDateStringsForPeriod(period);
+    const dateStrings = getDateStringsForPeriod(period, parseTZ(req));
     const perRestLimit = parseLimit(req.query.limit);
 
     // dailyStats: one doc per restaurant per day — lightweight
@@ -1256,30 +1251,43 @@ router.get('/orders/summary', authenticateSuperAdmin, requireSuperAdmin, async (
 router.get('/activity/logins', authenticateSuperAdmin, requireSuperAdmin, async (req, res) => {
   try {
     const period = req.query.period || 'today';
-    const now = new Date();
-    const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+    const _tz = parseTZ(req);
+    const todayStr = getTodayString(_tz);
+    const todayNoon = new Date(todayStr + 'T12:00:00Z');
 
     let startDate, endDate;
     if (period === 'yesterday') {
-      startDate = new Date(today);
-      startDate.setDate(startDate.getDate() - 1);
-      endDate = new Date(today);
+      const yNoon = new Date(todayNoon); yNoon.setUTCDate(yNoon.getUTCDate() - 1);
+      const yStr = `${yNoon.getUTCFullYear()}-${String(yNoon.getUTCMonth() + 1).padStart(2, '0')}-${String(yNoon.getUTCDate()).padStart(2, '0')}`;
+      if (_tz !== undefined) {
+        const b = dateBoundsInTZ(yStr, _tz);
+        startDate = b.start; endDate = b.end;
+      } else {
+        const now = new Date();
+        startDate = new Date(now.getFullYear(), now.getMonth(), now.getDate() - 1);
+        endDate = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+      }
     } else if (period === '7days') {
-      startDate = new Date(today);
-      startDate.setDate(startDate.getDate() - 7);
-      endDate = new Date(today);
-      endDate.setDate(endDate.getDate() + 1);
+      const wNoon = new Date(todayNoon); wNoon.setUTCDate(wNoon.getUTCDate() - 7);
+      const wStr = `${wNoon.getUTCFullYear()}-${String(wNoon.getUTCMonth() + 1).padStart(2, '0')}-${String(wNoon.getUTCDate()).padStart(2, '0')}`;
+      startDate = _tz !== undefined ? dateBoundsInTZ(wStr, _tz).start : new Date(new Date().getFullYear(), new Date().getMonth(), new Date().getDate() - 7);
+      endDate = _tz !== undefined ? dateBoundsInTZ(todayStr, _tz).end : new Date(new Date().getFullYear(), new Date().getMonth(), new Date().getDate() + 1);
     } else {
       // today
-      startDate = new Date(today);
-      endDate = new Date(today);
-      endDate.setDate(endDate.getDate() + 1);
+      if (_tz !== undefined) {
+        const b = dateBoundsInTZ(todayStr, _tz);
+        startDate = b.start; endDate = b.end;
+      } else {
+        const now = new Date();
+        startDate = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+        endDate = new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1);
+      }
     }
 
     // Fetch users who logged in during the period
     const usersSnap = await db.collection(collections.users)
       .where('lastLogin', '>=', startDate)
-      .where('lastLogin', '<', endDate)
+      .where('lastLogin', '<=', endDate)
       .orderBy('lastLogin', 'desc')
       .limit(200)
       .get();

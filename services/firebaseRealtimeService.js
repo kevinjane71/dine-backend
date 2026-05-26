@@ -202,6 +202,25 @@ const cleanupOldEvents = async () => {
   }
 };
 
+// ─── Delivery Events ────────────────────────────────────────────────────────
+
+const notifyDeliveryAssigned = async (restaurantId, { orderId, staffId, staffName, orderNumber }) => {
+  await pushEvent(restaurantId, 'delivery', 'delivery-assigned', {
+    orderId,
+    staffId,
+    staffName,
+    orderNumber,
+  });
+};
+
+const notifyDeliveryStatusUpdated = async (restaurantId, { orderId, status, staffName }) => {
+  await pushEvent(restaurantId, 'delivery', 'delivery-status-updated', {
+    orderId,
+    status,
+    staffName,
+  });
+};
+
 module.exports = {
   pushEvent,
   triggerTableStatusUpdated,
@@ -214,5 +233,7 @@ module.exports = {
   notifyMenuItemCreated,
   notifyMenuUpdated,
   notifyMenuItemDeleted,
+  notifyDeliveryAssigned,
+  notifyDeliveryStatusUpdated,
   cleanupOldEvents
 };

@@ -3,6 +3,7 @@ const router = express.Router();
 const { db, collections } = require('../firebase');
 const { authenticateToken, requireOwnerRole } = require('../middleware/auth');
 const { requireOrgAccess, getOwnerId, getOrgOutlets } = require('../middleware/orgAccess');
+const { parseTZ, dateBoundsInTZ, dateStrInTZ } = require('../utils/timezone');
 
 // ============================================
 // HQ-LEVEL CROSS-OUTLET REPORTS
@@ -12,31 +13,45 @@ const { requireOrgAccess, getOwnerId, getOrgOutlets } = require('../middleware/o
 
 const reportMiddleware = [authenticateToken, requireOwnerRole, requireOrgAccess];
 
-// ─── Helper: Parse date range from query params ──────────────────────────────
+// ─── Helper: Parse date range from query params (timezone-aware) ──────────────
 function parseDateRange(query) {
   const now = new Date();
+  const tzOffset = query.tz !== undefined && query.tz !== '' ? Number(query.tz) : undefined;
+  const isValidTZ = tzOffset !== undefined && !isNaN(tzOffset);
   let startDate, endDate;
 
   if (query.startDate) {
-    startDate = new Date(query.startDate);
-    if (isNaN(startDate.getTime())) {
-      startDate = new Date(now.getFullYear(), now.getMonth(), 1);
+    if (isValidTZ) {
+      startDate = dateBoundsInTZ(query.startDate, tzOffset).start;
+    } else {
+      startDate = new Date(query.startDate);
+      if (isNaN(startDate.getTime())) {
+        startDate = new Date(now.getFullYear(), now.getMonth(), 1);
+      }
     }
   } else {
-    startDate = new Date(now.getFullYear(), now.getMonth(), 1);
+    if (isValidTZ) {
+      const todayStr = dateStrInTZ(now, tzOffset);
+      startDate = dateBoundsInTZ(todayStr.slice(0, 8) + '01', tzOffset).start;
+    } else {
+      startDate = new Date(now.getFullYear(), now.getMonth(), 1);
+    }
   }
 
   if (query.endDate) {
-    endDate = new Date(query.endDate);
-    if (isNaN(endDate.getTime())) {
-      endDate = now;
+    if (isValidTZ) {
+      endDate = dateBoundsInTZ(query.endDate, tzOffset).end;
+    } else {
+      endDate = new Date(query.endDate);
+      if (isNaN(endDate.getTime())) {
+        endDate = now;
+      } else {
+        endDate.setHours(23, 59, 59, 999);
+      }
     }
   } else {
     endDate = now;
   }
-
-  // Ensure endDate covers the full day
-  endDate.setHours(23, 59, 59, 999);
 
   return { startDate, endDate };
 }

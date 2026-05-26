@@ -2,6 +2,7 @@ const express = require('express');
 const router = express.Router();
 const { db, collections } = require('../firebase');
 const { authenticateToken, requireOwnerRole } = require('../middleware/auth');
+const { parseTZ, buildDateRange, dateStrInTZ, dateBoundsInTZ } = require('../utils/timezone');
 
 // ============================================
 // OWNER CHAIN DASHBOARD APIs
@@ -54,49 +55,10 @@ router.get('/dashboard', authenticateToken, requireOwnerRole, async (req, res) =
       });
     });
 
-    // Get date range based on period parameter
+    // Get date range based on period parameter (timezone-aware via client tz offset)
     const { period = 'today', startDate, endDate } = req.query;
-    const now = new Date();
-    // IST timezone helpers (UTC+5:30)
-    const IST_OFFSET = 5.5 * 60 * 60 * 1000;
-    const toIST = (date) => new Date(date.getTime() + IST_OFFSET);
-    let dateStart, dateEnd;
-
-    if (startDate && endDate) {
-      // Custom date range
-      dateStart = new Date(startDate);
-      dateStart.setHours(0, 0, 0, 0);
-      dateEnd = new Date(endDate);
-      dateEnd.setHours(23, 59, 59, 999);
-    } else {
-      // Preset periods
-      dateEnd = new Date(now);
-      dateEnd.setHours(23, 59, 59, 999);
-
-      switch (period) {
-        case 'today': {
-          // Midnight IST (UTC+5:30)
-          const istNow = toIST(now);
-          dateStart = new Date(Date.UTC(istNow.getUTCFullYear(), istNow.getUTCMonth(), istNow.getUTCDate()) - IST_OFFSET);
-          break;
-        }
-        case '7d':
-          dateStart = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
-          dateStart.setHours(0, 0, 0, 0);
-          break;
-        case '30d':
-          dateStart = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000);
-          dateStart.setHours(0, 0, 0, 0);
-          break;
-        case '90d':
-          dateStart = new Date(now.getTime() - 90 * 24 * 60 * 60 * 1000);
-          dateStart.setHours(0, 0, 0, 0);
-          break;
-        default:
-          dateStart = new Date(now);
-          dateStart.setHours(0, 0, 0, 0);
-      }
-    }
+    const tzOffset = parseTZ(req);
+    const { start: dateStart, end: dateEnd } = buildDateRange(period, startDate, endDate, tzOffset);
 
     console.log(`📊 Dashboard date range: ${dateStart.toISOString()} to ${dateEnd.toISOString()}`);
 
@@ -241,9 +203,7 @@ router.get('/dashboard', authenticateToken, requireOwnerRole, async (req, res) =
  */
 router.get('/analytics', authenticateToken, requireOwnerRole, async (req, res) => {
   try {
-    // IST timezone helpers (UTC+5:30)
-    const IST_OFFSET = 5.5 * 60 * 60 * 1000;
-    const toIST = (date) => new Date(date.getTime() + IST_OFFSET);
+    const tzOffset = parseTZ(req);
 
     const userId = getOwnerId(req);
     const { period = '7d', startDate, endDate } = req.query;
@@ -293,35 +253,8 @@ router.get('/analytics', authenticateToken, requireOwnerRole, async (req, res) =
       });
     }
 
-    // Calculate date range
-    const now = new Date();
-    let dateStart;
-    let dateEnd = now;
-
-    if (startDate && endDate) {
-      dateStart = new Date(startDate);
-      dateEnd = new Date(endDate);
-    } else {
-      switch (period) {
-        case 'today': {
-          // Midnight IST (UTC+5:30)
-          const istNow = toIST(now);
-          dateStart = new Date(Date.UTC(istNow.getUTCFullYear(), istNow.getUTCMonth(), istNow.getUTCDate()) - IST_OFFSET);
-          break;
-        }
-        case '7d':
-          dateStart = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
-          break;
-        case '30d':
-          dateStart = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000);
-          break;
-        case '90d':
-          dateStart = new Date(now.getTime() - 90 * 24 * 60 * 60 * 1000);
-          break;
-        default:
-          dateStart = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
-      }
-    }
+    // Calculate date range (timezone-aware)
+    const { start: dateStart, end: dateEnd } = buildDateRange(period, startDate, endDate, tzOffset);
 
     // Calculate previous period for comparison (same duration before current period)
     const periodMs = dateEnd.getTime() - dateStart.getTime();
@@ -422,19 +355,21 @@ router.get('/analytics', authenticateToken, requireOwnerRole, async (req, res) =
       previous > 0 ? Math.round(((current - previous) / previous) * 1000) / 10 : (current > 0 ? 100 : 0);
 
     // Calculate revenue by day (or by hour for "today")
+    // Helper: shift date to client timezone for hour/date grouping
+    const _shiftToTZ = (d) => tzOffset !== undefined ? new Date(d.getTime() - tzOffset * 60000) : d;
     const isToday = period === 'today';
     const revenueByDay = {};
     allOrders.forEach(order => {
       const orderDate = order.createdAt?.toDate ? order.createdAt.toDate() : new Date(order.createdAt);
       let dateKey;
       if (isToday) {
-        // Group by hour in IST — use ISO string with hour to keep sortable
-        const istDate = toIST(orderDate);
-        const hour = istDate.getUTCHours();
-        const dayStr = istDate.toISOString().split('T')[0];
+        // Group by hour in client timezone
+        const shifted = _shiftToTZ(orderDate);
+        const hour = shifted.getUTCHours();
+        const dayStr = dateStrInTZ(orderDate, tzOffset);
         dateKey = `${dayStr}T${String(hour).padStart(2, '0')}:00:00`;
       } else {
-        dateKey = orderDate.toISOString().split('T')[0];
+        dateKey = dateStrInTZ(orderDate, tzOffset);
       }
       if (!revenueByDay[dateKey]) {
         revenueByDay[dateKey] = { date: dateKey, revenue: 0, orders: 0 };
@@ -467,12 +402,12 @@ router.get('/analytics', authenticateToken, requireOwnerRole, async (req, res) =
       .sort((a, b) => b.orders - a.orders)
       .slice(0, 10);
 
-    // Calculate busy hours (in IST)
+    // Calculate busy hours (timezone-aware)
     const hourCounts = {};
     allOrders.forEach(order => {
       const orderDate = order.createdAt?.toDate ? order.createdAt.toDate() : new Date(order.createdAt);
-      const istDate = toIST(orderDate);
-      const hour = istDate.getUTCHours();
+      const shifted = _shiftToTZ(orderDate);
+      const hour = shifted.getUTCHours();
       const hourStr = `${hour.toString().padStart(2, '0')}:00`;
       hourCounts[hourStr] = (hourCounts[hourStr] || 0) + 1;
     });
@@ -501,8 +436,8 @@ router.get('/analytics', authenticateToken, requireOwnerRole, async (req, res) =
       const prevHourly = {};
       prevAllOrders.forEach(order => {
         const orderDate = order.createdAt?.toDate ? order.createdAt.toDate() : new Date(order.createdAt);
-        const istDate = toIST(orderDate);
-        const hour = String(istDate.getUTCHours()).padStart(2, '0');
+        const shifted = _shiftToTZ(orderDate);
+        const hour = String(shifted.getUTCHours()).padStart(2, '0');
         if (!prevHourly[hour]) prevHourly[hour] = { hour, revenue: 0, orders: 0 };
         prevHourly[hour].revenue += (order.totalAmount || order.finalAmount || 0);
         prevHourly[hour].orders += 1;

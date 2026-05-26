@@ -131,13 +131,52 @@ const offerEngine = require('./services/offerEngine');
 // const pusherService = require('./services/pusherService'); // COMMENTED OUT — replaced by Firebase RTDB
 const pusherService = require('./services/firebaseRealtimeService');
 
+// ── Timezone-aware date helpers ──
+// tzOffset = value of browser's getTimezoneOffset() (minutes from UTC, negative for east)
+// e.g. Qatar UTC+3 → tzOffset = -180, IST UTC+5:30 → tzOffset = -330
+
+// Get YYYY-MM-DD for a given Date in the client's timezone
+function dateStrInTZ(d, tzOffset) {
+  if (tzOffset === undefined || tzOffset === null) return d.toISOString().split('T')[0];
+  const ms = d.getTime() - tzOffset * 60000;
+  const shifted = new Date(ms);
+  return `${shifted.getUTCFullYear()}-${String(shifted.getUTCMonth() + 1).padStart(2, '0')}-${String(shifted.getUTCDate()).padStart(2, '0')}`;
+}
+
+// Get start-of-day and end-of-day as UTC Date objects for a date string in client TZ
+function dateBoundsInTZ(dateStr, tzOffset) {
+  const [y, m, d] = dateStr.split('-').map(Number);
+  const midnightUTC = Date.UTC(y, m - 1, d, 0, 0, 0, 0);
+  const startMs = midnightUTC + tzOffset * 60000;
+  return {
+    start: new Date(startMs),
+    end: new Date(startMs + 24 * 60 * 60 * 1000 - 1)
+  };
+}
+
+// Get "today" date string and boundaries in client timezone
+function todayInTZ(tzOffset) {
+  const now = new Date();
+  const todayStr = dateStrInTZ(now, tzOffset);
+  const bounds = dateBoundsInTZ(todayStr, tzOffset);
+  return { dateStr: todayStr, ...bounds };
+}
+
+// Parse tz query param (returns number or undefined)
+function parseTZ(req) {
+  const tz = req.query?.tz;
+  if (tz === undefined || tz === null || tz === '') return undefined;
+  const n = Number(tz);
+  return isNaN(n) ? undefined : n;
+}
+
 // Pre-compute daily analytics stats on every order write (fire-and-forget)
 // Doc ID: {restaurantId}_{YYYY-MM-DD} in 'dailyStats' collection
-function updateDailyStats(restaurantId, order, operation) {
+function updateDailyStats(restaurantId, order, operation, tzOffset) {
   try {
     const orderDate = order.createdAt?.toDate ? order.createdAt.toDate()
       : (order.createdAt instanceof Date ? order.createdAt : new Date(order.createdAt || Date.now()));
-    const dateStr = orderDate.toISOString().split('T')[0];
+    const dateStr = dateStrInTZ(orderDate, tzOffset);
     const docId = `${restaurantId}_${dateStr}`;
     const statsRef = db.collection('dailyStats').doc(docId);
 
@@ -159,8 +198,14 @@ function updateDailyStats(restaurantId, order, operation) {
     const orderType = (order.orderType || 'dine_in').toLowerCase().replace(/[\s-]+/g, '_');
     update[`ordersByType_${orderType}`] = FieldValue.increment(sign);
 
-    // Busy hour bucket
-    const hour = orderDate.getHours();
+    // Busy hour bucket (timezone-aware)
+    let hour;
+    if (tzOffset !== undefined && tzOffset !== null) {
+      const ms = orderDate.getTime() - tzOffset * 60000;
+      hour = new Date(ms).getUTCHours();
+    } else {
+      hour = orderDate.getHours();
+    }
     update[`hour_${hour.toString().padStart(2, '0')}`] = FieldValue.increment(sign);
 
     // Customer tracking (only add, never remove from array)
@@ -208,11 +253,11 @@ function updateDailyStats(restaurantId, order, operation) {
 }
 
 // Update dailyStats when order amount changes (PATCH with items update)
-function updateDailyStatsRevenueDiff(restaurantId, order, oldAmount, newAmount, oldFinalAmount, newFinalAmount) {
+function updateDailyStatsRevenueDiff(restaurantId, order, oldAmount, newAmount, oldFinalAmount, newFinalAmount, tzOffset) {
   try {
     const orderDate = order.createdAt?.toDate ? order.createdAt.toDate()
       : (order.createdAt instanceof Date ? order.createdAt : new Date(order.createdAt || Date.now()));
-    const dateStr = orderDate.toISOString().split('T')[0];
+    const dateStr = dateStrInTZ(orderDate, tzOffset);
     const docId = `${restaurantId}_${dateStr}`;
     const statsRef = db.collection('dailyStats').doc(docId);
 
@@ -1081,6 +1126,9 @@ const invoiceRoutes = initializeInvoiceRoutes(db, collections);
 
 // Attendance Module
 const attendanceRoutes = require('./routes/attendance');
+
+// Delivery Management Module
+const deliveryRoutes = require('./routes/delivery');
 
 // Books Module (separate route files)
 const payrollRoutes = require('./routes/payroll');
@@ -8670,7 +8718,7 @@ app.post('/api/public/orders/:restaurantId', vercelSecurityMiddleware.publicAPI,
     }
 
     // Update daily analytics stats (fire-and-forget)
-    updateDailyStats(restaurantId, orderData, 'add');
+    updateDailyStats(restaurantId, orderData, 'add', parseTZ(req));
 
     // Run all Pusher notifications in parallel (saves 1-3s vs sequential awaits).
     // Still awaited before res.json() to prevent Vercel runtime from aborting them.
@@ -10229,7 +10277,7 @@ app.post('/api/orders', async (req, res) => {
 
     // Update daily analytics stats (fire-and-forget) — skip 'saved' orders (counted when placed)
     if (orderData.status !== 'saved') {
-      updateDailyStats(restaurantId, orderData, 'add');
+      updateDailyStats(restaurantId, orderData, 'add', parseTZ(req));
     }
 
     // Run all Pusher notifications in parallel (saves 1-3s vs sequential awaits).
@@ -10702,10 +10750,10 @@ app.get('/api/orders/:restaurantId', authenticateToken, async (req, res) => {
           .orderBy('createdAt', 'desc')
           .limit(10);
 
-        // If todayOnly, narrow down to today
+        // If todayOnly, narrow down to today (timezone-aware)
         if (todayOnly === 'true') {
-          const todayStart = new Date();
-          todayStart.setHours(0, 0, 0, 0);
+          const _tz = parseTZ(req);
+          const todayStart = _tz !== undefined ? todayInTZ(_tz).start : (() => { const d = new Date(); d.setHours(0, 0, 0, 0); return d; })();
           numQuery = db.collection(collections.orders)
             .where('restaurantId', '==', restaurantId)
             .where('dailyOrderId', '==', numericSearch)
@@ -10763,20 +10811,32 @@ app.get('/api/orders/:restaurantId', authenticateToken, async (req, res) => {
       }
 
       if (todayOnly === 'true') {
-        const todayStart = new Date();
-        todayStart.setHours(0, 0, 0, 0);
-        const todayEnd = new Date();
-        todayEnd.setHours(23, 59, 59, 999);
+        const _tz = parseTZ(req);
+        let todayStart, todayEnd;
+        if (_tz !== undefined) {
+          const t = todayInTZ(_tz);
+          todayStart = t.start; todayEnd = t.end;
+        } else {
+          todayStart = new Date(); todayStart.setHours(0, 0, 0, 0);
+          todayEnd = new Date(); todayEnd.setHours(23, 59, 59, 999);
+        }
         fastQuery = fastQuery.where('createdAt', '>=', todayStart)
                              .where('createdAt', '<=', todayEnd);
       }
 
       if (date && todayOnly !== 'true') {
-        const sDate = new Date(date);
-        const eDate = new Date(date);
-        eDate.setDate(eDate.getDate() + 1);
+        const _tz = parseTZ(req);
+        let sDate, eDate;
+        if (_tz !== undefined) {
+          const b = dateBoundsInTZ(date, _tz);
+          sDate = b.start; eDate = b.end;
+        } else {
+          sDate = new Date(date);
+          eDate = new Date(date);
+          eDate.setDate(eDate.getDate() + 1);
+        }
         fastQuery = fastQuery.where('createdAt', '>=', sDate)
-                             .where('createdAt', '<', eDate);
+                             .where('createdAt', '<=', eDate);
       } else if (startDate && endDate && todayOnly !== 'true' && !date) {
         const rangeStart = new Date(startDate);
         const rangeEnd = new Date(endDate);
@@ -10834,20 +10894,31 @@ app.get('/api/orders/:restaurantId', authenticateToken, async (req, res) => {
       searchQuery = searchQuery.where('isScheduled', '==', true);
     }
 
-    // Apply date filters
+    // Apply date filters (timezone-aware)
+    const _tz2 = parseTZ(req);
     if (todayOnly === 'true') {
-      const todayStart = new Date();
-      todayStart.setHours(0, 0, 0, 0);
-      const todayEnd = new Date();
-      todayEnd.setHours(23, 59, 59, 999);
+      let todayStart, todayEnd;
+      if (_tz2 !== undefined) {
+        const t = todayInTZ(_tz2);
+        todayStart = t.start; todayEnd = t.end;
+      } else {
+        todayStart = new Date(); todayStart.setHours(0, 0, 0, 0);
+        todayEnd = new Date(); todayEnd.setHours(23, 59, 59, 999);
+      }
       searchQuery = searchQuery.where('createdAt', '>=', todayStart)
                                .where('createdAt', '<=', todayEnd);
     } else if (date) {
-      const sDate = new Date(date);
-      const eDate = new Date(date);
-      eDate.setDate(eDate.getDate() + 1);
+      let sDate, eDate;
+      if (_tz2 !== undefined) {
+        const b = dateBoundsInTZ(date, _tz2);
+        sDate = b.start; eDate = b.end;
+      } else {
+        sDate = new Date(date);
+        eDate = new Date(date);
+        eDate.setDate(eDate.getDate() + 1);
+      }
       searchQuery = searchQuery.where('createdAt', '>=', sDate)
-                               .where('createdAt', '<', eDate);
+                               .where('createdAt', '<=', eDate);
     } else if (startDate && endDate) {
       const rangeStart = new Date(startDate);
       const rangeEnd = new Date(endDate);
@@ -11009,15 +11080,20 @@ app.get('/api/analytics/:restaurantId', authenticateToken, async (req, res) => {
     }
     const { restaurantId } = req.params;
     const { period = '7d', startDate, endDate } = req.query;
+    const tzOffset = parseTZ(req);
 
-    console.log(`📊 Fetching analytics for restaurant ${restaurantId}, period: ${period}, startDate: ${startDate || 'none'}, endDate: ${endDate || 'none'}`);
+    console.log(`📊 Fetching analytics for restaurant ${restaurantId}, period: ${period}, startDate: ${startDate || 'none'}, endDate: ${endDate || 'none'}, tz: ${tzOffset}`);
 
     // Custom date range: read raw orders for the specified range
     if (startDate && endDate) {
-      const rangeStart = new Date(startDate);
-      rangeStart.setHours(0, 0, 0, 0);
-      const rangeEnd = new Date(endDate);
-      rangeEnd.setHours(23, 59, 59, 999);
+      let rangeStart, rangeEnd;
+      if (tzOffset !== undefined) {
+        rangeStart = dateBoundsInTZ(startDate, tzOffset).start;
+        rangeEnd = dateBoundsInTZ(endDate, tzOffset).end;
+      } else {
+        rangeStart = new Date(startDate); rangeStart.setHours(0, 0, 0, 0);
+        rangeEnd = new Date(endDate); rangeEnd.setHours(23, 59, 59, 999);
+      }
 
       const ordersQuery = await db.collection(collections.orders)
         .where('restaurantId', '==', restaurantId)
@@ -11037,17 +11113,20 @@ app.get('/api/analytics/:restaurantId', authenticateToken, async (req, res) => {
     if (useRawOrders) {
       // For today/24h: read raw orders for real-time accuracy (small dataset)
       const now = new Date();
-      let startDate;
+      let qStart;
       if (period === 'today') {
-        startDate = new Date(now);
-        startDate.setHours(0, 0, 0, 0);
+        if (tzOffset !== undefined) {
+          qStart = todayInTZ(tzOffset).start;
+        } else {
+          qStart = new Date(now); qStart.setHours(0, 0, 0, 0);
+        }
       } else {
-        startDate = new Date(now.getTime() - 24 * 60 * 60 * 1000);
+        qStart = new Date(now.getTime() - 24 * 60 * 60 * 1000);
       }
 
       const ordersQuery = await db.collection(collections.orders)
         .where('restaurantId', '==', restaurantId)
-        .where('createdAt', '>=', startDate)
+        .where('createdAt', '>=', qStart)
         .where('createdAt', '<=', now)
         .limit(2000)
         .get();
@@ -11070,11 +11149,13 @@ app.get('/api/analytics/:restaurantId', authenticateToken, async (req, res) => {
       default: daysBack = 7;
     }
 
-    // Build list of date strings to query
+    // Build list of date strings to query (timezone-aware)
+    const todayStr = tzOffset !== undefined ? dateStrInTZ(now, tzOffset) : now.toISOString().split('T')[0];
     const dateStrings = [];
     for (let i = 0; i < daysBack; i++) {
-      const d = new Date(now.getTime() - i * 24 * 60 * 60 * 1000);
-      dateStrings.push(d.toISOString().split('T')[0]);
+      const d = new Date(todayStr + 'T12:00:00Z');
+      d.setUTCDate(d.getUTCDate() - i);
+      dateStrings.push(`${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}-${String(d.getUTCDate()).padStart(2, '0')}`);
     }
 
     // Fetch dailyStats docs (Firestore getAll for batch read)
@@ -11317,24 +11398,38 @@ app.get('/api/analytics/:restaurantId/cancelled-orders', authenticateToken, asyn
   try {
     const { restaurantId } = req.params;
     const { period, startDate, endDate, type } = req.query;
+    const tzOffset = parseTZ(req);
 
-    // Resolve date range
+    // Resolve date range (timezone-aware)
     let rangeStart, rangeEnd;
     const now = new Date();
+    const todayStr = tzOffset !== undefined ? dateStrInTZ(now, tzOffset) : now.toISOString().split('T')[0];
     if (startDate && endDate) {
-      rangeStart = new Date(startDate);
-      rangeStart.setHours(0, 0, 0, 0);
-      rangeEnd = new Date(endDate);
-      rangeEnd.setHours(23, 59, 59, 999);
+      if (tzOffset !== undefined) {
+        rangeStart = dateBoundsInTZ(startDate, tzOffset).start;
+        rangeEnd = dateBoundsInTZ(endDate, tzOffset).end;
+      } else {
+        rangeStart = new Date(startDate); rangeStart.setHours(0, 0, 0, 0);
+        rangeEnd = new Date(endDate); rangeEnd.setHours(23, 59, 59, 999);
+      }
     } else {
       const daysMap = { today: 0, yesterday: 1, '7d': 7, '30d': 30 };
       const days = daysMap[period] ?? 0;
       if (period === 'yesterday') {
-        rangeStart = new Date(now); rangeStart.setDate(now.getDate() - 1); rangeStart.setHours(0, 0, 0, 0);
-        rangeEnd = new Date(now); rangeEnd.setDate(now.getDate() - 1); rangeEnd.setHours(23, 59, 59, 999);
+        const yStr = new Date(todayStr + 'T12:00:00Z'); yStr.setUTCDate(yStr.getUTCDate() - 1);
+        const yDate = `${yStr.getUTCFullYear()}-${String(yStr.getUTCMonth() + 1).padStart(2, '0')}-${String(yStr.getUTCDate()).padStart(2, '0')}`;
+        if (tzOffset !== undefined) {
+          rangeStart = dateBoundsInTZ(yDate, tzOffset).start;
+          rangeEnd = dateBoundsInTZ(yDate, tzOffset).end;
+        } else {
+          rangeStart = new Date(now); rangeStart.setDate(now.getDate() - 1); rangeStart.setHours(0, 0, 0, 0);
+          rangeEnd = new Date(now); rangeEnd.setDate(now.getDate() - 1); rangeEnd.setHours(23, 59, 59, 999);
+        }
       } else {
-        rangeStart = new Date(now); rangeStart.setDate(now.getDate() - days); rangeStart.setHours(0, 0, 0, 0);
-        rangeEnd = new Date(now); rangeEnd.setHours(23, 59, 59, 999);
+        const dStr = new Date(todayStr + 'T12:00:00Z'); dStr.setUTCDate(dStr.getUTCDate() - days);
+        const dDate = `${dStr.getUTCFullYear()}-${String(dStr.getUTCMonth() + 1).padStart(2, '0')}-${String(dStr.getUTCDate()).padStart(2, '0')}`;
+        rangeStart = tzOffset !== undefined ? dateBoundsInTZ(dDate, tzOffset).start : (() => { const d = new Date(now); d.setDate(now.getDate() - days); d.setHours(0, 0, 0, 0); return d; })();
+        rangeEnd = tzOffset !== undefined ? dateBoundsInTZ(todayStr, tzOffset).end : (() => { const d = new Date(now); d.setHours(23, 59, 59, 999); return d; })();
       }
     }
 
@@ -11445,38 +11540,41 @@ app.get('/api/analytics/:restaurantId/daily-summary', authenticateToken, async (
     }
     const { restaurantId } = req.params;
     const { date, period, startDate, endDate, subRestaurantId } = req.query;
+    const tzOffset = parseTZ(req);
 
-    // Determine date range
-    const today = new Date().toISOString().split('T')[0];
+    // Determine date range (timezone-aware)
+    const today = tzOffset !== undefined ? dateStrInTZ(new Date(), tzOffset) : new Date().toISOString().split('T')[0];
     let dates = []; // array of YYYY-MM-DD strings to aggregate
 
     if (startDate && endDate) {
-      // Custom range
-      const start = new Date(startDate);
-      const end = new Date(endDate);
+      // Custom range — parse as UTC noon to avoid date-shift during iteration
+      const start = new Date(startDate + 'T12:00:00Z');
+      const end = new Date(endDate + 'T12:00:00Z');
       for (let d = new Date(start); d <= end; d.setDate(d.getDate() + 1)) {
-        dates.push(d.toISOString().split('T')[0]);
+        dates.push(`${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}-${String(d.getUTCDate()).padStart(2, '0')}`);
       }
     } else if (period) {
       const daysMap = { today: 0, yesterday: 1, '2d': 2, '7d': 7, '30d': 30 };
       const daysBack = daysMap[period] ?? 0;
       if (period === 'yesterday') {
-        const d = new Date(); d.setDate(d.getDate() - 1);
-        dates = [d.toISOString().split('T')[0]];
+        const d = new Date(today + 'T12:00:00Z');
+        d.setUTCDate(d.getUTCDate() - 1);
+        dates = [`${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}-${String(d.getUTCDate()).padStart(2, '0')}`];
       } else {
         for (let i = daysBack; i >= 0; i--) {
-          const d = new Date(); d.setDate(d.getDate() - i);
-          dates.push(d.toISOString().split('T')[0]);
+          const d = new Date(today + 'T12:00:00Z');
+          d.setUTCDate(d.getUTCDate() - i);
+          dates.push(`${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}-${String(d.getUTCDate()).padStart(2, '0')}`);
         }
       }
     } else {
       dates = [date || today];
     }
 
-    console.log(`📊 daily-summary: restaurantId=${restaurantId}, dates=${JSON.stringify(dates)}, period=${period}`);
+    console.log(`📊 daily-summary: restaurantId=${restaurantId}, dates=${JSON.stringify(dates)}, period=${period}, tz=${tzOffset}`);
 
     // For today, always use raw orders for real-time accuracy (dailyStats may be stale)
-    const todayStr = new Date().toISOString().split('T')[0];
+    const todayStr = today;
     const isTodayOnly = dates.length === 1 && dates[0] === todayStr;
 
     // Aggregate across all dates
@@ -11593,11 +11691,16 @@ app.get('/api/analytics/:restaurantId/daily-summary', authenticateToken, async (
 
     // For today or when dailyStats had no data, aggregate from raw orders for accuracy
     if (isTodayOnly || items.length === 0) {
-      // Use local timezone (matching how orders are created with new Date())
-      const [sy, sm, sd] = dates[0].split('-').map(Number);
-      const [ey, em, ed] = dates[dates.length - 1].split('-').map(Number);
-      const rangeStart = new Date(sy, sm - 1, sd, 0, 0, 0, 0);
-      const rangeEnd = new Date(ey, em - 1, ed, 23, 59, 59, 999);
+      let rangeStart, rangeEnd;
+      if (tzOffset !== undefined) {
+        rangeStart = dateBoundsInTZ(dates[0], tzOffset).start;
+        rangeEnd = dateBoundsInTZ(dates[dates.length - 1], tzOffset).end;
+      } else {
+        const [sy, sm, sd] = dates[0].split('-').map(Number);
+        const [ey, em, ed] = dates[dates.length - 1].split('-').map(Number);
+        rangeStart = new Date(sy, sm - 1, sd, 0, 0, 0, 0);
+        rangeEnd = new Date(ey, em - 1, ed, 23, 59, 59, 999);
+      }
       console.log(`📊 daily-summary ${isTodayOnly ? '(today live)' : '(fallback)'}: querying raw orders from ${rangeStart.toISOString()} to ${rangeEnd.toISOString()}`);
       let rawQuery = db.collection(collections.orders)
         .where('restaurantId', '==', restaurantId)
@@ -11949,10 +12052,10 @@ app.patch('/api/orders/:orderId/status', authenticateToken, async (req, res) => 
     const _nowCounted = !_nonCounted.includes(status);
     if (_prevCounted && !_nowCounted) {
       // active → cancelled/deleted
-      updateDailyStats(orderData.restaurantId, orderData, 'cancel');
+      updateDailyStats(orderData.restaurantId, orderData, 'cancel', parseTZ(req));
     } else if (!_prevCounted && _nowCounted) {
       // saved/cancelled → active (e.g., saved order placed)
-      updateDailyStats(orderData.restaurantId, orderData, 'add');
+      updateDailyStats(orderData.restaurantId, orderData, 'add', parseTZ(req));
     }
 
     // Run all Pusher notifications in parallel (saves 1-3s vs sequential awaits).
@@ -13329,15 +13432,15 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
       // Status transition: order entered or left the "counted" set
       if (nowCounted && !prevCounted) {
         // saved → placed, or cancelled/deleted → re-activated (edge case)
-        updateDailyStats(currentOrder.restaurantId, { ...currentOrder, ...updateData }, 'add');
+        updateDailyStats(currentOrder.restaurantId, { ...currentOrder, ...updateData }, 'add', parseTZ(req));
       } else if (!nowCounted && prevCounted) {
         // active → cancelled/deleted via PATCH
-        updateDailyStats(currentOrder.restaurantId, currentOrder, 'cancel');
+        updateDailyStats(currentOrder.restaurantId, currentOrder, 'cancel', parseTZ(req));
       }
     } else if (prevCounted && nowCounted) {
       // Order stayed counted — check if amount changed
       if (updateData.totalAmount !== undefined && updateData.totalAmount !== currentOrder.totalAmount) {
-        updateDailyStatsRevenueDiff(currentOrder.restaurantId, currentOrder, currentOrder.totalAmount, updateData.totalAmount, currentOrder.finalAmount, updateData.finalAmount);
+        updateDailyStatsRevenueDiff(currentOrder.restaurantId, currentOrder, currentOrder.totalAmount, updateData.totalAmount, currentOrder.finalAmount, updateData.finalAmount, parseTZ(req));
       }
     }
 
@@ -13947,7 +14050,7 @@ app.delete('/api/orders/:orderId', authenticateToken, async (req, res) => {
 
     // Update daily analytics stats — only if order was counted (not saved/cancelled)
     if (!['saved', 'cancelled', 'deleted'].includes(order.status)) {
-      updateDailyStats(order.restaurantId, order, 'delete');
+      updateDailyStats(order.restaurantId, order, 'delete', parseTZ(req));
     }
 
     // Release table if assigned
@@ -14049,7 +14152,7 @@ app.post('/api/public/delete-order', async (req, res) => {
     // Update daily analytics stats before hard delete (fire-and-forget) — only if order was counted
     const _nonCountedStatuses = ['saved', 'cancelled', 'deleted'];
     if (!_nonCountedStatuses.includes(order.status)) {
-      updateDailyStats(order.restaurantId, order, 'delete');
+      updateDailyStats(order.restaurantId, order, 'delete', parseTZ(req));
     }
     await orderRef.delete();
     pusherService.notifyOrderDeleted(order.restaurantId, id).catch(err => console.error('Pusher delete-order (non-blocking):', err));
@@ -18043,6 +18146,9 @@ app.use('/api/invoice', invoiceRoutes);
 // ==================== ATTENDANCE MODULE ====================
 app.use('/api/attendance', attendanceRoutes);
 
+// ==================== DELIVERY MANAGEMENT MODULE ====================
+app.use('/api/delivery', deliveryRoutes);
+
 // ==================== BOOKS MODULE (Payroll, GST, Ledger) ====================
 app.use('/api/payroll', payrollRoutes);
 app.use('/api/gst', gstRoutes);
@@ -18897,9 +19003,16 @@ app.get('/api/kot/:restaurantId', async (req, res) => {
     console.log(`🔍 KOT API - Getting orders for restaurant: ${restaurantId}, status filter: ${status || 'all'}`);
 
     // Get orders from yesterday onwards to avoid loading too much historical data
-    const yesterdayStart = new Date();
-    yesterdayStart.setDate(yesterdayStart.getDate() - 1);
-    yesterdayStart.setHours(0, 0, 0, 0);
+    const _tz = parseTZ(req);
+    let yesterdayStart;
+    if (_tz !== undefined) {
+      const t = todayInTZ(_tz);
+      yesterdayStart = new Date(t.start.getTime() - 24 * 60 * 60 * 1000);
+    } else {
+      yesterdayStart = new Date();
+      yesterdayStart.setDate(yesterdayStart.getDate() - 1);
+      yesterdayStart.setHours(0, 0, 0, 0);
+    }
 
     console.log(`📅 Filtering orders from: ${yesterdayStart.toISOString()}`);
 
@@ -20194,7 +20307,7 @@ app.patch('/api/orders/:orderId/cancel', authenticateToken, async (req, res) => 
 
     // Update daily analytics stats — only if order was counted (not saved)
     if (!['saved', 'cancelled', 'deleted'].includes(orderData.status)) {
-      updateDailyStats(orderData.restaurantId, orderData, 'cancel');
+      updateDailyStats(orderData.restaurantId, orderData, 'cancel', parseTZ(req));
     }
 
     // If order has a table, update table status
@@ -21530,25 +21643,33 @@ app.get('/api/inventory/:restaurantId/usage-summary', authenticateToken, async (
   try {
     const { restaurantId } = req.params;
     const { period = 'today', startDate, endDate } = req.query;
+    const _tz = parseTZ(req);
 
     let start, end;
     const now = new Date();
+    const todayStr = _tz !== undefined ? dateStrInTZ(now, _tz) : now.toISOString().split('T')[0];
+
+    function _daysAgo(n) {
+      const d = new Date(todayStr + 'T12:00:00Z');
+      d.setUTCDate(d.getUTCDate() - n);
+      return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}-${String(d.getUTCDate()).padStart(2, '0')}`;
+    }
 
     if (period === 'today') {
-      start = new Date(now); start.setHours(0, 0, 0, 0);
-      end = new Date(now); end.setHours(23, 59, 59, 999);
+      if (_tz !== undefined) { const b = dateBoundsInTZ(todayStr, _tz); start = b.start; end = b.end; }
+      else { start = new Date(now); start.setHours(0, 0, 0, 0); end = new Date(now); end.setHours(23, 59, 59, 999); }
     } else if (period === 'week' || period === '7days') {
-      start = new Date(now); start.setDate(now.getDate() - 6); start.setHours(0, 0, 0, 0);
-      end = new Date(now); end.setHours(23, 59, 59, 999);
+      if (_tz !== undefined) { start = dateBoundsInTZ(_daysAgo(6), _tz).start; end = dateBoundsInTZ(todayStr, _tz).end; }
+      else { start = new Date(now); start.setDate(now.getDate() - 6); start.setHours(0, 0, 0, 0); end = new Date(now); end.setHours(23, 59, 59, 999); }
     } else if (period === 'month' || period === '30days') {
-      start = new Date(now); start.setDate(now.getDate() - 29); start.setHours(0, 0, 0, 0);
-      end = new Date(now); end.setHours(23, 59, 59, 999);
+      if (_tz !== undefined) { start = dateBoundsInTZ(_daysAgo(29), _tz).start; end = dateBoundsInTZ(todayStr, _tz).end; }
+      else { start = new Date(now); start.setDate(now.getDate() - 29); start.setHours(0, 0, 0, 0); end = new Date(now); end.setHours(23, 59, 59, 999); }
     } else if (period === 'custom' && startDate && endDate) {
-      start = new Date(startDate); start.setHours(0, 0, 0, 0);
-      end = new Date(endDate); end.setHours(23, 59, 59, 999);
+      if (_tz !== undefined) { start = dateBoundsInTZ(startDate, _tz).start; end = dateBoundsInTZ(endDate, _tz).end; }
+      else { start = new Date(startDate); start.setHours(0, 0, 0, 0); end = new Date(endDate); end.setHours(23, 59, 59, 999); }
     } else {
-      start = new Date(now); start.setHours(0, 0, 0, 0);
-      end = new Date(now); end.setHours(23, 59, 59, 999);
+      if (_tz !== undefined) { const b = dateBoundsInTZ(todayStr, _tz); start = b.start; end = b.end; }
+      else { start = new Date(now); start.setHours(0, 0, 0, 0); end = new Date(now); end.setHours(23, 59, 59, 999); }
     }
 
     const snapshot = await db.collection(collections.inventoryTransactions)
@@ -30416,14 +30537,14 @@ app.post('/api/orders/:orderId/refund', authenticateToken, async (req, res) => {
 
       // Update daily stats — full refund effectively removes from revenue
       if (!['saved', 'cancelled', 'deleted'].includes(orderData.status)) {
-        updateDailyStats(orderData.restaurantId, orderData, 'cancel');
+        updateDailyStats(orderData.restaurantId, orderData, 'cancel', parseTZ(req));
       }
     } else {
       // Partial refund — subtract refund amount from daily stats revenue (order still counts)
       if (!['saved', 'cancelled', 'deleted'].includes(orderData.status)) {
         const oldFinal = orderData.finalAmount || orderData.totalAmount || 0;
         const oldBase = orderData.totalAmount || 0;
-        updateDailyStatsRevenueDiff(orderData.restaurantId, orderData, oldBase, oldBase - refundAmount, oldFinal, oldFinal - refundAmount);
+        updateDailyStatsRevenueDiff(orderData.restaurantId, orderData, oldBase, oldBase - refundAmount, oldFinal, oldFinal - refundAmount, parseTZ(req));
       }
     }
 
