@@ -589,16 +589,12 @@ class InventoryService {
         const restoreQty = Math.abs(tx.quantityChange || 0);
         if (restoreQty <= 0) continue;
 
-        // Restore inventory item stock
+        // Restore inventory item stock (atomic increment for concurrent safety)
         const invRef = db.collection('inventory').doc(tx.inventoryItemId);
-        const invDoc = await invRef.get();
-        if (invDoc.exists) {
-          const currentStock = invDoc.data().currentStock || 0;
-          batch.update(invRef, {
-            currentStock: currentStock + restoreQty,
-            updatedAt: new Date()
-          });
-        }
+        batch.update(invRef, {
+          currentStock: FieldValue.increment(restoreQty),
+          updatedAt: new Date()
+        });
 
         // Restore batch quantities if FIFO batches were used
         if (tx.batchIds && tx.batchIds.length > 0) {

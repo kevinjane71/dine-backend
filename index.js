@@ -684,85 +684,45 @@ async function syncInventoryToMenuItem(restaurantId, inventoryItemId) {
 }
 
 async function syncInventoryStockToMenuItems(restaurantId) {
-  try {
-    const invSnap = await db.collection(collections.inventory)
-      .where('restaurantId', '==', restaurantId)
-      .where('linkedMenuItemId', '!=', null)
-      .get();
-
-    if (invSnap.empty) return;
-
-    const restaurantRef = db.collection(collections.restaurants).doc(restaurantId);
-    const restaurantDoc = await restaurantRef.get();
-    if (!restaurantDoc.exists) return;
-
-    const restaurantData = restaurantDoc.data();
-    const menuItems = restaurantData.menu?.items || [];
-    let changed = false;
-
-    const invMap = {};
-    invSnap.docs.forEach(doc => {
-      const d = doc.data();
-      if (d.linkedMenuItemId) invMap[d.linkedMenuItemId] = d;
-    });
-
-    const updatedItems = menuItems.map(mi => {
-      const inv = invMap[mi.id];
-      if (!inv) return mi;
-      const newQty = Math.max(0, Math.round(inv.currentStock));
-      const newAvail = newQty > 0;
-      if (mi.stockQuantity === newQty && mi.isAvailable === newAvail) return mi;
-      changed = true;
-      return { ...mi, stockQuantity: newQty, isAvailable: newAvail, updatedAt: new Date() };
-    });
-
-    if (changed) {
-      await restaurantRef.update({
-        'menu.items': updatedItems,
-        'menu.lastUpdated': new Date()
-      });
-      invalidateRestaurantCache(restaurantId);
-      // Notify frontend to refresh menu so stock badges update in real-time
-      pusherService.notifyMenuUpdated(restaurantId, null, ['stockQuantity'])
-        .catch(err => console.error('Pusher inventory-sync notification error:', err));
-      console.log(`🔄 Bulk inventory→menu sync for ${restaurantId}`);
-    }
-  } catch (err) {
-    console.error('syncInventoryStockToMenuItems error:', err);
-  }
+  // Delegates to adjustDirectMenuItemStock which handles inventory sync
+  // inside a transaction to prevent race conditions.
+  await adjustDirectMenuItemStock(restaurantId, [], 'decrement');
 }
 
-// Decrement stockQuantity directly on menu items that are stock-managed
-// but NOT linked to the inventory system. Inventory-linked items are handled
-// by syncInventoryStockToMenuItems. Uses a transaction for concurrency safety.
+// Syncs inventory-linked items AND decrements direct stock-managed items
+// in a SINGLE Firestore transaction. This prevents race conditions where
+// a non-transactional sync overwrites concurrent stock changes.
 // mode: 'decrement' (order placed) or 'restore' (items removed during edit)
 async function adjustDirectMenuItemStock(restaurantId, orderItems, mode = 'decrement') {
   try {
-    if (!orderItems || orderItems.length === 0) return;
-
-    // Find inventory-linked menu item IDs (these are synced separately)
+    // Read inventory items with linkedMenuItemId (for inventory sync)
     const invSnap = await db.collection(collections.inventory)
       .where('restaurantId', '==', restaurantId)
       .where('linkedMenuItemId', '!=', null)
       .get();
 
     const inventoryLinkedIds = new Set();
+    const invMap = {};
     invSnap.docs.forEach(doc => {
       const d = doc.data();
-      if (d.linkedMenuItemId) inventoryLinkedIds.add(d.linkedMenuItemId);
+      if (d.linkedMenuItemId) {
+        inventoryLinkedIds.add(d.linkedMenuItemId);
+        invMap[d.linkedMenuItemId] = d;
+      }
     });
 
-    // Build quantity map: menuItemId -> total quantity
+    // Build quantity map from order items: menuItemId -> { totalQty, deductionQuantity }
     const qtyMap = {};
-    for (const item of orderItems) {
-      const id = item.menuItemId || item.id;
-      if (!id) continue;
-      qtyMap[id] = (qtyMap[id] || 0) + (item.quantity || 1);
+    if (orderItems && orderItems.length > 0) {
+      for (const item of orderItems) {
+        const id = item.menuItemId || item.id;
+        if (!id) continue;
+        if (!qtyMap[id]) {
+          qtyMap[id] = { totalQty: 0, deductionQuantity: item.deductionQuantity || 1 };
+        }
+        qtyMap[id].totalQty += (item.quantity || 1);
+      }
     }
-
-    // Skip if all ordered items are inventory-linked
-    const hasDirectItems = Object.keys(qtyMap).some(id => !inventoryLinkedIds.has(id));
-    if (!hasDirectItems) return;
 
     const restaurantRef = db.collection(collections.restaurants).doc(restaurantId);
 
@@ -774,17 +734,32 @@ async function adjustDirectMenuItemStock(restaurantId, orderItems, mode = 'decre
       let changed = false;
 
       const updatedItems = menuItems.map(mi => {
-        if (!mi.isStockManaged || typeof mi.stockQuantity !== 'number') return mi;
-        if (inventoryLinkedIds.has(mi.id)) return mi; // handled by inventory sync
+        // 1. Inventory-linked items: sync stockQuantity from inventory currentStock
+        if (inventoryLinkedIds.has(mi.id)) {
+          const inv = invMap[mi.id];
+          if (!inv) return mi;
+          const newQty = Math.max(0, Math.round(inv.currentStock));
+          const newAvail = newQty > 0;
+          if (mi.stockQuantity === newQty && mi.isAvailable === newAvail) return mi;
+          changed = true;
+          return { ...mi, stockQuantity: newQty, isAvailable: newAvail, updatedAt: new Date() };
+        }
 
-        const qty = qtyMap[mi.id];
-        if (!qty) return mi;
+        // 2. Direct stock-managed items: decrement/restore stockQuantity
+        if (!mi.isStockManaged || typeof mi.stockQuantity !== 'number') return mi;
+
+        const entry = qtyMap[mi.id];
+        if (!entry) return mi;
+
+        // Use deductionQuantity from the menu item (how much stock to deduct per sale)
+        const perUnitDeduction = mi.deductionQuantity || entry.deductionQuantity || 1;
+        const totalDeduction = perUnitDeduction * entry.totalQty;
 
         let newQty;
         if (mode === 'restore') {
-          newQty = mi.stockQuantity + qty;
+          newQty = mi.stockQuantity + totalDeduction;
         } else {
-          newQty = Math.max(0, mi.stockQuantity - qty);
+          newQty = Math.max(0, mi.stockQuantity - totalDeduction);
         }
         const newAvail = newQty > 0;
         if (mi.stockQuantity === newQty && mi.isAvailable === newAvail) return mi;
@@ -804,7 +779,7 @@ async function adjustDirectMenuItemStock(restaurantId, orderItems, mode = 'decre
     // Notify frontend to refresh menu so stock badges update in real-time
     pusherService.notifyMenuUpdated(restaurantId, null, ['stockQuantity'])
       .catch(err => console.error('Pusher stock-update notification error:', err));
-    console.log(`📦 Direct menu stock ${mode === 'restore' ? 'restored' : 'decremented'} for ${restaurantId}`);
+    console.log(`📦 Menu stock ${mode === 'restore' ? 'restored' : 'updated'} for ${restaurantId}`);
   } catch (err) {
     console.error(`adjustDirectMenuItemStock (${mode}) error:`, err);
   }
@@ -12688,6 +12663,11 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
           menuPrice: menuItem && allowPriceEditPatch && resolvedUnitPrice !== expectedUnitPricePatch ? expectedMenuPricePatch : null,
           priceEdited: !!(menuItem && allowPriceEditPatch && resolvedUnitPrice !== expectedUnitPricePatch),
           ...(isCustomItemPatch ? { isCustomItem: true } : {}),
+          // Inventory direct-tracking fields (must be present for stock deduction on edit)
+          isStockManaged: menuItem?.isStockManaged || cleanItem.isStockManaged || false,
+          trackInventory: menuItem?.trackInventory || menuItem?.isStockManaged || cleanItem.trackInventory || false,
+          inventoryItemId: menuItem?.inventoryItemId || cleanItem.inventoryItemId || null,
+          deductionQuantity: menuItem?.deductionQuantity || cleanItem.deductionQuantity || 1,
         };
 
         if (!existingItem) {
@@ -20181,12 +20161,18 @@ async function reverseOrderSideEffects(orderId, orderData) {
 
   console.log(`🔄 Reversing side effects for Order ${orderId} (was: ${orderData.status})`);
 
-  // 1. Reverse inventory deductions
+  // 1. Reverse inventory deductions + sync menu stock
   try {
     const restorations = await inventoryService.restoreInventoryForOrder(restaurantId, orderId);
     if (restorations.length > 0) {
       results.inventory = true;
       console.log(`📦 Inventory restored: ${restorations.length} items for Order ${orderId}`);
+    }
+    // Sync restored inventory stock back to menu items + restore direct stock
+    await syncInventoryStockToMenuItems(restaurantId);
+    const orderItems = orderData.items || [];
+    if (orderItems.length > 0) {
+      await adjustDirectMenuItemStock(restaurantId, orderItems, 'restore');
     }
   } catch (err) {
     console.error(`⚠️ Inventory restore failed for Order ${orderId}:`, err.message);
@@ -21997,12 +21983,24 @@ Return [] if no items could be identified.`
 
       // Deduct inventory via recipes (synchronous for user feedback)
       let deductions = [];
+      const enrichedItems = validItems.map(i => {
+        const mi = menuItems.find(m => m.id === i.menuItemId);
+        return {
+          menuItemId: i.menuItemId, name: i.name, quantity: i.quantity || 1,
+          isStockManaged: mi?.isStockManaged || false,
+          trackInventory: mi?.trackInventory || mi?.isStockManaged || false,
+          inventoryItemId: mi?.inventoryItemId || null,
+          deductionQuantity: mi?.deductionQuantity || 1,
+        };
+      });
       try {
         deductions = await inventoryService.deductInventoryForOrder(
           restaurantId,
           orderRef.id,
-          validItems.map(i => ({ menuItemId: i.menuItemId, name: i.name, quantity: i.quantity || 1 }))
+          enrichedItems
         ) || [];
+        await syncInventoryStockToMenuItems(restaurantId);
+        await adjustDirectMenuItemStock(restaurantId, enrichedItems, 'decrement');
         console.log('✅ Inventory deducted for quick order:', orderRef.id);
       } catch (deductError) {
         console.error('⚠️ Inventory deduction failed (order still created):', deductError.message);
