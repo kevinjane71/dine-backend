@@ -550,6 +550,24 @@ class InventoryService {
         }
       }
 
+      // Bar bottle tracking: if enabled, record pours against open bottles
+      try {
+        const restDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
+        const restData = restDoc.exists ? restDoc.data() : {};
+        const barSettings = restData.barInventorySettings;
+        if (barSettings?.enabled && barSettings.trackedCategoryIds?.length > 0) {
+          const barInventoryService = require('./barInventoryService');
+          const barDeductions = await barInventoryService.deductBarInventoryForOrder(
+            restaurantId, orderId, orderItems, barSettings.trackedCategoryIds
+          );
+          if (barDeductions.length > 0) {
+            console.log(`🍷 Bar bottle pours recorded for Order ${orderId}: ${barDeductions.length} items`);
+          }
+        }
+      } catch (barErr) {
+        console.warn('Bar inventory deduction failed (non-blocking):', barErr.message);
+      }
+
       return deductions;
 
     } catch (error) {

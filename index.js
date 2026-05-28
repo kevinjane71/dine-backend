@@ -18632,7 +18632,8 @@ app.get('/api/admin/print-stations/:restaurantId', authenticateToken, async (req
     res.json({
       success: true,
       printStations: data.printStations || [],
-      categories: data.categories || []
+      categories: data.categories || [],
+      kotPrintingMode: data.kotPrintingMode || 'single'
     });
   } catch (error) {
     console.error('Get print stations error:', error);
@@ -18647,13 +18648,14 @@ app.put('/api/admin/print-stations/:restaurantId', authenticateToken, async (req
       return res.status(403).json({ error: 'Access denied. Print settings permission required.' });
     }
     const { restaurantId } = req.params;
-    const { printStations } = req.body;
+    const { printStations, kotPrintingMode } = req.body;
 
     if (!Array.isArray(printStations)) {
       return res.status(400).json({ error: 'printStations must be an array' });
     }
 
     const validTypes = ['kitchen', 'bar', 'expo', 'pastry', 'other'];
+    const validPrinterTypes = ['bluetooth', 'network', 'usb', 'airprint'];
     const now = new Date();
 
     // Sanitize and validate each station
@@ -18668,6 +18670,19 @@ app.put('/api/admin/print-stations/:restaurantId', authenticateToken, async (req
         createdAt: station.createdAt || now.toISOString(),
         updatedAt: now.toISOString()
       };
+      // Preserve printer config for multi-printer mode
+      if (station.printerConfig && typeof station.printerConfig === 'object') {
+        s.printerConfig = {
+          type: validPrinterTypes.includes(station.printerConfig.type) ? station.printerConfig.type : null,
+          name: typeof station.printerConfig.name === 'string' ? station.printerConfig.name.slice(0, 100) : null,
+          macAddress: typeof station.printerConfig.macAddress === 'string' ? station.printerConfig.macAddress : null,
+          host: typeof station.printerConfig.host === 'string' ? station.printerConfig.host : null,
+          port: typeof station.printerConfig.port === 'number' ? station.printerConfig.port : null,
+          vendorId: station.printerConfig.vendorId ?? null,
+          productId: station.printerConfig.productId ?? null,
+          url: typeof station.printerConfig.url === 'string' ? station.printerConfig.url : null
+        };
+      }
       return s;
     });
 
@@ -18683,26 +18698,243 @@ app.put('/api/admin/print-stations/:restaurantId', authenticateToken, async (req
       }
     }
 
-    await db.collection(collections.restaurants).doc(restaurantId).update({
+    const updateData = {
       printStations: sanitized,
       updatedAt: now
-    });
+    };
+
+    // Save KOT printing mode if provided
+    if (kotPrintingMode === 'single' || kotPrintingMode === 'multi') {
+      updateData.kotPrintingMode = kotPrintingMode;
+    }
+
+    await db.collection(collections.restaurants).doc(restaurantId).update(updateData);
 
     // Invalidate cache if function exists
     if (typeof invalidateRestaurantCache === 'function') {
       invalidateRestaurantCache(restaurantId);
     }
 
-    console.log(`🖨️ Print stations updated for restaurant ${restaurantId}: ${sanitized.length} stations`);
+    console.log(`🖨️ Print stations updated for restaurant ${restaurantId}: ${sanitized.length} stations, mode: ${kotPrintingMode || 'unchanged'}`);
 
     res.json({
       success: true,
       message: 'Print stations updated successfully',
-      printStations: sanitized
+      printStations: sanitized,
+      kotPrintingMode: updateData.kotPrintingMode
     });
   } catch (error) {
     console.error('Update print stations error:', error);
     res.status(500).json({ error: 'Failed to update print stations' });
+  }
+});
+
+// ===== BAR INVENTORY APIs =====
+const barInventoryService = require('./services/barInventoryService');
+
+// Register a new bottle
+app.post('/api/bar/bottles/:restaurantId', authenticateToken, async (req, res) => {
+  try {
+    if (!(await checkFeaturePermission(req, 'inventory', 'add'))) {
+      return res.status(403).json({ error: 'Access denied.' });
+    }
+    const bottle = await barInventoryService.registerBottle(req.params.restaurantId, req.body, req.user.userId);
+    res.json({ success: true, bottle });
+  } catch (error) {
+    console.error('Register bottle error:', error);
+    res.status(500).json({ error: error.message || 'Failed to register bottle' });
+  }
+});
+
+// List bottles
+app.get('/api/bar/bottles/:restaurantId', authenticateToken, async (req, res) => {
+  try {
+    if (!(await checkFeaturePermission(req, 'inventory', 'read'))) {
+      return res.status(403).json({ error: 'Access denied.' });
+    }
+    const { status, categoryId, limit } = req.query;
+    const bottles = await barInventoryService.getBottles(req.params.restaurantId, {
+      status: status || undefined,
+      categoryId: categoryId || undefined,
+      limit: limit ? parseInt(limit) : 100
+    });
+    res.json({ success: true, bottles });
+  } catch (error) {
+    console.error('Get bottles error:', error);
+    res.status(500).json({ error: 'Failed to get bottles' });
+  }
+});
+
+// Update bottle (open, weigh, close)
+app.put('/api/bar/bottles/:restaurantId/:bottleId', authenticateToken, async (req, res) => {
+  try {
+    if (!(await checkFeaturePermission(req, 'inventory', 'update'))) {
+      return res.status(403).json({ error: 'Access denied.' });
+    }
+    const { bottleId } = req.params;
+    const { action, weight } = req.body;
+
+    let result;
+    switch (action) {
+      case 'open':
+        result = await barInventoryService.openBottle(bottleId, weight, req.user.userId);
+        break;
+      case 'weigh':
+        result = await barInventoryService.updateWeight(bottleId, weight, req.user.userId);
+        break;
+      case 'close':
+        result = await barInventoryService.closeBottle(bottleId, weight, req.user.userId);
+        break;
+      default:
+        return res.status(400).json({ error: 'Invalid action. Use: open, weigh, or close' });
+    }
+    res.json({ success: true, result });
+  } catch (error) {
+    console.error('Update bottle error:', error);
+    res.status(400).json({ error: error.message || 'Failed to update bottle' });
+  }
+});
+
+// Record wastage
+app.post('/api/bar/bottles/:restaurantId/:bottleId/wastage', authenticateToken, async (req, res) => {
+  try {
+    if (!(await checkFeaturePermission(req, 'inventory', 'update'))) {
+      return res.status(403).json({ error: 'Access denied.' });
+    }
+    const entry = await barInventoryService.recordWastage(req.params.bottleId, req.body, req.user.userId);
+    res.json({ success: true, entry });
+  } catch (error) {
+    console.error('Record wastage error:', error);
+    res.status(400).json({ error: error.message || 'Failed to record wastage' });
+  }
+});
+
+// Delete bottle
+app.delete('/api/bar/bottles/:restaurantId/:bottleId', authenticateToken, async (req, res) => {
+  try {
+    if (!(await checkFeaturePermission(req, 'inventory', 'delete'))) {
+      return res.status(403).json({ error: 'Access denied.' });
+    }
+    await barInventoryService.deleteBottle(req.params.bottleId);
+    res.json({ success: true, message: 'Bottle deleted' });
+  } catch (error) {
+    console.error('Delete bottle error:', error);
+    res.status(500).json({ error: 'Failed to delete bottle' });
+  }
+});
+
+// Get pour accuracy for a bottle
+app.get('/api/bar/bottles/:restaurantId/:bottleId/accuracy', authenticateToken, async (req, res) => {
+  try {
+    const accuracy = await barInventoryService.getPourAccuracy(req.params.bottleId);
+    res.json({ success: true, accuracy });
+  } catch (error) {
+    console.error('Get accuracy error:', error);
+    res.status(400).json({ error: error.message });
+  }
+});
+
+// Open daily reconciliation
+app.post('/api/bar/reconciliation/:restaurantId', authenticateToken, async (req, res) => {
+  try {
+    if (!(await checkFeaturePermission(req, 'inventory', 'update'))) {
+      return res.status(403).json({ error: 'Access denied.' });
+    }
+    const recon = await barInventoryService.openReconciliation(req.params.restaurantId, req.body, req.user.userId);
+    res.json({ success: true, reconciliation: recon });
+  } catch (error) {
+    console.error('Open reconciliation error:', error);
+    res.status(500).json({ error: error.message || 'Failed to open reconciliation' });
+  }
+});
+
+// List reconciliations
+app.get('/api/bar/reconciliation/:restaurantId', authenticateToken, async (req, res) => {
+  try {
+    const { limit } = req.query;
+    const reconciliations = await barInventoryService.getReconciliations(req.params.restaurantId, {
+      limit: limit ? parseInt(limit) : 30
+    });
+    res.json({ success: true, reconciliations });
+  } catch (error) {
+    console.error('Get reconciliations error:', error);
+    res.status(500).json({ error: 'Failed to get reconciliations' });
+  }
+});
+
+// Get single reconciliation
+app.get('/api/bar/reconciliation/:restaurantId/:id', authenticateToken, async (req, res) => {
+  try {
+    const recon = await barInventoryService.getReconciliation(req.params.id);
+    if (!recon) return res.status(404).json({ error: 'Reconciliation not found' });
+    res.json({ success: true, reconciliation: recon });
+  } catch (error) {
+    console.error('Get reconciliation error:', error);
+    res.status(500).json({ error: 'Failed to get reconciliation' });
+  }
+});
+
+// Close reconciliation with closing weights
+app.put('/api/bar/reconciliation/:restaurantId/:id', authenticateToken, async (req, res) => {
+  try {
+    if (!(await checkFeaturePermission(req, 'inventory', 'update'))) {
+      return res.status(403).json({ error: 'Access denied.' });
+    }
+    const result = await barInventoryService.closeReconciliation(req.params.id, req.body, req.user.userId);
+    res.json({ success: true, reconciliation: result });
+  } catch (error) {
+    console.error('Close reconciliation error:', error);
+    res.status(400).json({ error: error.message || 'Failed to close reconciliation' });
+  }
+});
+
+// ===== DISCOUNT APPROVAL APIs =====
+const discountApprovalService = require('./services/discountApprovalService');
+
+// Request discount approval
+app.post('/api/discount-approval/:restaurantId/request', authenticateToken, async (req, res) => {
+  try {
+    const result = await discountApprovalService.requestApproval(req.params.restaurantId, {
+      ...req.body,
+      requestedBy: req.user.userId,
+      requestedByRole: req.user.role || req.body.requestedByRole
+    });
+    res.json({ success: true, ...result });
+  } catch (error) {
+    console.error('Request approval error:', error);
+    res.status(400).json({ error: error.message || 'Failed to request approval' });
+  }
+});
+
+// Verify discount approval (PIN or OTP)
+app.post('/api/discount-approval/:restaurantId/verify', authenticateToken, async (req, res) => {
+  try {
+    const { approvalId, pin, otp } = req.body;
+    if (!approvalId) {
+      return res.status(400).json({ error: 'approvalId is required' });
+    }
+    const result = await discountApprovalService.verifyApproval(approvalId, { pin, otp });
+    res.json({ success: true, ...result });
+  } catch (error) {
+    console.error('Verify approval error:', error);
+    res.status(400).json({ error: error.message || 'Verification failed' });
+  }
+});
+
+// Get approval history
+app.get('/api/discount-approval/:restaurantId/history', authenticateToken, async (req, res) => {
+  try {
+    if (!(await checkFeaturePermission(req, 'admin', 'settings'))) {
+      return res.status(403).json({ error: 'Access denied.' });
+    }
+    const { limit } = req.query;
+    const history = await discountApprovalService.getApprovalHistory(req.params.restaurantId, {
+      limit: limit ? parseInt(limit) : 50
+    });
+    res.json({ success: true, history });
+  } catch (error) {
+    console.error('Get approval history error:', error);
+    res.status(500).json({ error: 'Failed to get approval history' });
   }
 });
 
@@ -27611,7 +27843,49 @@ app.get('/api/admin/settings/:restaurantId', authenticateToken, async (req, res)
           allowOrderModifications: true,
           maxModificationTime: 5 // minutes
         },
-        
+
+        // KOT Printing Mode: 'single' = split KOTs per station on same printer, 'multi' = per-station printers
+        kotPrintingMode: 'single',
+
+        // Bar Inventory Tracking
+        barInventorySettings: {
+          enabled: false,
+          trackedCategoryIds: [],       // which menu categories to track (empty = none)
+          defaultPegSize: 60,           // default pour size in ml
+          pourTolerancePercent: 10,     // acceptable variance %
+          requireDailyReconciliation: false,
+          weightUnit: 'g',
+          mlPerGram: 1.0               // density factor for spirits (~0.94 for ethanol, ~1.0 approx)
+        },
+
+        // Discount Approval Settings
+        discountApprovalSettings: {
+          enabled: false,
+          roleConfig: {
+            waiter: {
+              requireApproval: false,
+              approvalMethod: 'pin',          // 'pin' or 'otp'
+              otpChannel: 'whatsapp',          // 'whatsapp', 'email', or 'both'
+              approverRole: 'manager',         // whose PIN/OTP is needed
+              maxDiscountWithoutApproval: 0    // 0 = always require approval when enabled
+            },
+            cashier: {
+              requireApproval: false,
+              approvalMethod: 'pin',
+              otpChannel: 'whatsapp',
+              approverRole: 'manager',
+              maxDiscountWithoutApproval: 0
+            },
+            staff: {
+              requireApproval: false,
+              approvalMethod: 'pin',
+              otpChannel: 'whatsapp',
+              approverRole: 'manager',
+              maxDiscountWithoutApproval: 0
+            }
+          }
+        },
+
         createdAt: new Date(),
         updatedAt: new Date()
       };

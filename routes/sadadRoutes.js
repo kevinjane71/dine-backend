@@ -54,9 +54,8 @@ module.exports = (db, collections, authenticateToken) => {
       const config = await loadSadadConfig(restaurantId);
 
       // Build notify URL for webhook
-      const backendUrl = process.env.BACKEND_URL || process.env.VERCEL_URL
-        ? `https://${process.env.VERCEL_URL}`
-        : 'https://dine-be2-phi.vercel.app';
+      const backendUrl = process.env.BACKEND_URL
+        || (process.env.VERCEL_URL ? `https://${process.env.VERCEL_URL}` : 'https://dine-be2-phi.vercel.app');
       const notifyUrl = `${backendUrl}/api/sadad/webhook`;
 
       const result = await sadadService.createOrder(config, {
