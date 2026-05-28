@@ -8714,7 +8714,7 @@ app.post('/api/public/orders/:restaurantId', vercelSecurityMiddleware.publicAPI,
     );
     const printSettings = restaurantData.printSettings || {};
     if (printSettings.kotPrinterEnabled !== false && printSettings.usePusherForKOT === true) {
-      const stationGroups = splitOrderByPrintStation(orderItems, restaurantData.printStations, restaurantData.categories);
+      const stationGroups = splitOrderByPrintStation(orderItems, restaurantData.printStations, restaurantData.categories, { ...DEFAULT_PRINT_SETTINGS, ...printSettings });
       for (const group of stationGroups) {
         pusherPromises.push(
           pusherService.notifyKOTPrintRequest(restaurantId, {
@@ -10273,7 +10273,7 @@ app.post('/api/orders', async (req, res) => {
     );
     const printSettings = restaurantData.printSettings || {};
     if (orderData.status === 'confirmed' && printSettings.kotPrinterEnabled !== false && printSettings.usePusherForKOT === true) {
-      const stationGroups = splitOrderByPrintStation(orderItems, restaurantData.printStations, restaurantData.categories);
+      const stationGroups = splitOrderByPrintStation(orderItems, restaurantData.printStations, restaurantData.categories, { ...DEFAULT_PRINT_SETTINGS, ...printSettings });
       for (const group of stationGroups) {
         pusherPromises.push(
           pusherService.notifyKOTPrintRequest(restaurantId, {
@@ -10592,6 +10592,11 @@ app.delete('/api/saved-carts/:id', authenticateToken, async (req, res) => {
 // Get a single order by ID — direct document fetch (1 read instead of a query)
 app.get('/api/orders/single/:orderId', authenticateToken, async (req, res) => {
   try {
+    // Permission check: staff must have history/orders read access
+    if (!(await checkFeaturePermission(req, 'orders', 'read'))) {
+      return res.status(403).json({ error: 'Access denied: insufficient permissions' });
+    }
+
     const { orderId } = req.params;
 
     const orderRef = db.collection(collections.orders).doc(orderId);
@@ -10643,6 +10648,11 @@ app.get('/api/orders/single/:orderId', authenticateToken, async (req, res) => {
 
 app.get('/api/orders/:restaurantId', authenticateToken, async (req, res) => {
   try {
+    // Permission check: staff must have history/orders read access
+    if (!(await checkFeaturePermission(req, 'orders', 'read'))) {
+      return res.status(403).json({ error: 'Access denied: insufficient permissions' });
+    }
+
     const { restaurantId } = req.params;
     const {
       page = 1,
@@ -11371,6 +11381,11 @@ function calculateAnalytics(orders, period) {
 // Cancelled/Deleted Orders Report — date-filtered with aggregation
 app.get('/api/analytics/:restaurantId/cancelled-orders', authenticateToken, async (req, res) => {
   try {
+    // Permission check: staff must have analytics read access
+    if (!(await checkFeaturePermission(req, 'analytics', 'read'))) {
+      return res.status(403).json({ error: 'Access denied: insufficient permissions' });
+    }
+
     const { restaurantId } = req.params;
     const { period, startDate, endDate, type } = req.query;
     const tzOffset = parseTZ(req);
@@ -12053,7 +12068,7 @@ app.patch('/api/orders/:orderId/status', authenticateToken, async (req, res) => 
 
       if (status === 'confirmed' && printSettings.kotPrinterEnabled !== false && printSettings.usePusherForKOT === true) {
         const restaurantFullData = restaurantDoc.data();
-        const stationGroups = splitOrderByPrintStation(orderData.items, restaurantFullData.printStations, restaurantFullData.categories);
+        const stationGroups = splitOrderByPrintStation(orderData.items, restaurantFullData.printStations, restaurantFullData.categories, { ...DEFAULT_PRINT_SETTINGS, ...(restaurantFullData.printSettings || {}) });
         for (const group of stationGroups) {
           pusherPromises.push(
             pusherService.notifyKOTPrintRequest(orderData.restaurantId, {
@@ -13654,7 +13669,7 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
           const restaurantFullData = restaurantDoc.data();
           const reprintItems = updateData.items || items;
           const hasNewItems = reprintItems.some(i => i.isNew || i.isUpdated);
-          const stationGroups = splitOrderByPrintStation(reprintItems, restaurantFullData.printStations, restaurantFullData.categories);
+          const stationGroups = splitOrderByPrintStation(reprintItems, restaurantFullData.printStations, restaurantFullData.categories, { ...DEFAULT_PRINT_SETTINGS, ...(restaurantFullData.printSettings || {}) });
           for (const group of stationGroups) {
             pusherPromises.push(
               pusherService.notifyKOTPrintRequest(currentOrder.restaurantId, {
@@ -13889,7 +13904,7 @@ app.post('/api/orders/:orderId/manual-print', authenticateToken, async (req, res
       // Print KOT
       console.log('🖨️ Manual KOT print request for order:', orderId);
 
-      const stationGroups = splitOrderByPrintStation(order.items || [], restaurantData.printStations, restaurantData.categories);
+      const stationGroups = splitOrderByPrintStation(order.items || [], restaurantData.printStations, restaurantData.categories, { ...DEFAULT_PRINT_SETTINGS, ...(restaurantData.printSettings || {}) });
       const kotPromises = stationGroups.map(group =>
         pusherService.notifyKOTPrintRequest(order.restaurantId, {
           id: orderId,
@@ -17155,7 +17170,7 @@ app.patch('/api/staff/:staffId', authenticateToken, requireOwnerRole, async (req
     if (email !== undefined) updateData.email = email;
     if (role) updateData.role = role;
     if (status) updateData.status = status;
-    if (pageAccess) updateData.pageAccess = pageAccess;
+    if (pageAccess !== undefined) updateData.pageAccess = pageAccess;
 
     const collName = staffColl === 'staffUsers' ? collections.staffUsers : collections.users;
     await db.collection(collName).doc(staffId).update(updateData);
@@ -17344,6 +17359,77 @@ app.get('/api/user/page-access', authenticateToken, async (req, res) => {
   }
 });
 
+// Server-side route access check — frontend calls this on navigation for live verification
+const BACKEND_ROUTE_ACCESS_MAP = {
+  'dashboard': 'dashboard',
+  'orders': 'history',
+  'orderhistory': 'history',
+  'tables': 'tables',
+  'customers': 'customers',
+  'menu': 'menu',
+  'inventory': 'inventory',
+  'kot': 'kot',
+  'admin': 'admin',
+  'hotel': 'hotel',
+  'invoice': 'invoice',
+  'billing': 'completeBill',
+  'register': 'completeBill',
+  'books': 'admin',
+  'dineai': 'analytics',
+  'analytics': 'analytics',
+  'shifts': 'admin',
+  'attendance': 'admin',
+  'offers': 'offers',
+  'automation': 'admin',
+  'spaces': 'admin',
+  'parking': 'parking',
+  'whatsapp-ordering': 'analytics',
+  'social-media': 'analytics',
+  'feedback': 'admin',
+  'bookings': 'bookings',
+  'phone-agent': 'analytics',
+  'google-reviews': 'admin',
+};
+
+app.get('/api/user/check-access/:route', authenticateToken, async (req, res) => {
+  try {
+    const { role } = req.user;
+    const route = req.params.route;
+
+    // Owner, admin, waiter bypass all access checks
+    if (['owner', 'admin', 'waiter'].includes(role)) {
+      return res.json({ allowed: true });
+    }
+
+    const accessKey = BACKEND_ROUTE_ACCESS_MAP[route];
+    if (!accessKey) {
+      return res.json({ allowed: true }); // Unknown route = accessible
+    }
+
+    const userId = req.user.userId || req.user.id;
+    const collName = req.user.source === 'staffUsers' ? collections.staffUsers : collections.users;
+    const userDoc = await db.collection(collName).doc(userId).get();
+
+    if (!userDoc.exists) {
+      return res.json({ allowed: false });
+    }
+
+    const pageAccess = userDoc.data()?.pageAccess;
+    if (!pageAccess) {
+      return res.json({ allowed: false });
+    }
+
+    const accessValue = pageAccess[accessKey];
+    if (typeof accessValue === 'object' && accessValue !== null) {
+      return res.json({ allowed: Object.values(accessValue).some(Boolean) });
+    }
+    return res.json({ allowed: !!accessValue });
+  } catch (error) {
+    console.error('Check access error:', error);
+    return res.json({ allowed: false });
+  }
+});
+
 // Update feature toggles (notAllowedPages) for owner
 app.patch('/api/user/features', authenticateToken, async (req, res) => {
   try {
@@ -17372,6 +17458,21 @@ app.patch('/api/user/features', authenticateToken, async (req, res) => {
   } catch (error) {
     console.error('Update features error:', error);
     res.status(500).json({ error: 'Failed to update features' });
+  }
+});
+
+// Get a Firebase custom token for the authenticated user (for RTDB access)
+app.get('/api/auth/firebase-token', authenticateToken, async (req, res) => {
+  try {
+    const fbAdmin = require('firebase-admin');
+    const token = await fbAdmin.auth().createCustomToken(req.user.userId, {
+      role: req.user.role,
+      restaurantId: req.user.restaurantId
+    });
+    res.json({ success: true, firebaseCustomToken: token });
+  } catch (error) {
+    console.error('Failed to create Firebase custom token:', error.message);
+    res.status(500).json({ success: false, error: 'Failed to generate token' });
   }
 });
 
@@ -17607,9 +17708,23 @@ app.post('/api/auth/staff/login', async (req, res) => {
       { expiresIn: '30d' }
     );
 
+    // Generate Firebase custom token so the frontend can sign into Firebase Auth
+    // (needed for Firebase RTDB security rules that require auth)
+    let firebaseCustomToken = null;
+    try {
+      const fbAdmin = require('firebase-admin');
+      firebaseCustomToken = await fbAdmin.auth().createCustomToken(staffDoc.id, {
+        role: staffData.role,
+        restaurantId: staffData.restaurantId
+      });
+    } catch (fbErr) {
+      console.warn('Failed to create Firebase custom token for staff:', fbErr.message);
+    }
+
     res.json({
       message: 'Staff login successful',
       token,
+      firebaseCustomToken,
       multiRestaurant,
       restaurants: multiRestaurant ? staffRestaurants : [],
       user: {
@@ -19115,6 +19230,11 @@ app.get('/api/invoice/:invoiceId', authenticateToken, async (req, res) => {
 // Get invoices for a restaurant
 app.get('/api/invoices/:restaurantId', authenticateToken, async (req, res) => {
   try {
+    // Permission check: staff must have invoice read access (owner/admin bypass via checkFeaturePermission)
+    if (!(await checkFeaturePermission(req, 'invoice', 'read'))) {
+      return res.status(403).json({ error: 'Access denied: insufficient permissions' });
+    }
+
     const { restaurantId } = req.params;
     const userId = req.user.userId;
     const { limit = 50, offset = 0, startDate, endDate } = req.query;
@@ -19175,13 +19295,34 @@ app.get('/api/invoices/:restaurantId', authenticateToken, async (req, res) => {
 // ============================================================================
 
 /**
+ * Filter out items excluded from KOT printing by category or item ID.
+ * Returns items unchanged when the feature is disabled.
+ */
+function filterKotExcludedItems(items, printSettings) {
+  if (!printSettings?.kotExclusionEnabled) return items;
+  const excludedCats = new Set(printSettings.kotExcludedCategories || []);
+  const excludedIds = new Set(printSettings.kotExcludedItemIds || []);
+  if (excludedCats.size === 0 && excludedIds.size === 0) return items;
+  return items.filter(item => {
+    if (excludedIds.has(item.id || item.menuItemId)) return false;
+    if (excludedCats.has(item.categoryId)) return false;
+    return true;
+  });
+}
+
+/**
  * Given order items and print stations, returns an array of
  * { stationId, stationName, items } groups.
  * If no print stations configured, returns single group with all items.
  */
-function splitOrderByPrintStation(orderItems, printStations, restaurantCategories) {
+function splitOrderByPrintStation(orderItems, printStations, restaurantCategories, printSettings) {
+  // KOT Exclusion: remove excluded items before station routing
+  orderItems = filterKotExcludedItems(orderItems || [], printSettings);
+
   if (!printStations || printStations.length === 0 || !orderItems || orderItems.length === 0) {
-    return [{ stationId: null, stationName: null, items: orderItems || [] }];
+    return orderItems && orderItems.length > 0
+      ? [{ stationId: null, stationName: null, items: orderItems }]
+      : [];
   }
 
   const enabledStations = printStations.filter(s => s.enabled);
@@ -19942,7 +20083,32 @@ const DEFAULT_PRINT_SETTINGS = {
   printBillCopy: 1,
   billFontSize: 'medium',
   billFontScale: 100,
-  billFontFamily: 'default'
+  billFontFamily: 'default',
+  // KOT Exclusion: skip certain categories/items from KOT printing
+  kotExclusionEnabled: false,
+  kotExcludedCategories: [],
+  kotExcludedItemIds: [],
+  // Bill & KOT section visibility (all default true = current behavior)
+  billLayout: {
+    showAddress: true,
+    showPhone: true,
+    showTable: true,
+    showWaiter: true,
+    showCustomer: true,
+    showPayment: true,
+    showOrderType: true,
+    showSubtotal: true,
+    showTaxBreakdown: true,
+    showFooter: true,
+    showPoweredBy: true,
+  },
+  kotLayout: {
+    showRestaurantName: true,
+    showCustomer: true,
+    showWaiter: true,
+    showDate: true,
+    showOrderType: true,
+  },
 };
 
 // Business-type aware labels — mirrors the web InvoiceModal map so server can
@@ -20213,6 +20379,12 @@ app.get('/api/kot/render/:restaurantId/:orderId', async (req, res) => {
     // Incremental KOT: only return new/updated items
     if (newOnly === 'true') {
       items = items.filter(item => item.isNew === true || item.isUpdated === true);
+    }
+
+    // KOT Exclusion: filter out excluded items
+    items = filterKotExcludedItems(items, printSettings);
+    if (items.length === 0) {
+      return res.json({ success: true, empty: true, reason: 'all_items_excluded' });
     }
     let printStationName = null;
     if (stationId && restaurantData.printStations && restaurantData.printStations.length > 0) {
