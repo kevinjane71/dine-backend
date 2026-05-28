@@ -236,8 +236,8 @@ const ensureRtdbRules = async () => {
       rules: {
         events: {
           $restaurantId: {
-            '.read': 'auth != null',
-            '.write': false  // Only server (Admin SDK) writes
+            '.read': true,    // Events are ephemeral, non-sensitive (order IDs + status only)
+            '.write': false   // Only server (Admin SDK) writes
           }
         },
         '.read': false,
@@ -246,7 +246,7 @@ const ensureRtdbRules = async () => {
     };
 
     await adminDb.setRules(rules);
-    console.log('✅ RTDB: Security rules set (auth required for reads, server-only writes)');
+    console.log('✅ RTDB: Security rules set (public reads on events, server-only writes)');
   } catch (error) {
     // Non-fatal: rules might already be set, or we might not have permission
     console.warn('⚠️ RTDB: Could not set security rules:', error.message);

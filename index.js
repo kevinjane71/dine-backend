@@ -18701,6 +18701,36 @@ app.put('/api/admin/print-settings/:restaurantId', authenticateToken, async (req
         sanitizedSettings.receiptLogo = null;
       }
     }
+    // billLayout: object with boolean flags for bill section visibility
+    if (printSettings.billLayout !== undefined && typeof printSettings.billLayout === 'object') {
+      const validBillKeys = ['showAddress','showPhone','showTable','showWaiter','showCustomer','showPayment','showOrderType','showSubtotal','showTaxBreakdown','showFooter','showPoweredBy'];
+      const bl = {};
+      for (const k of validBillKeys) {
+        if (printSettings.billLayout[k] !== undefined) bl[k] = Boolean(printSettings.billLayout[k]);
+      }
+      if (Object.keys(bl).length > 0) sanitizedSettings.billLayout = bl;
+    }
+    // kotLayout: object with boolean flags for KOT section visibility
+    if (printSettings.kotLayout !== undefined && typeof printSettings.kotLayout === 'object') {
+      const validKotKeys = ['showKotTitle','showRestaurantName','showOrderNumber','showTable','showCustomer','showWaiter','showDate','showOrderType'];
+      const kl = {};
+      for (const k of validKotKeys) {
+        if (printSettings.kotLayout[k] !== undefined) kl[k] = Boolean(printSettings.kotLayout[k]);
+      }
+      if (Object.keys(kl).length > 0) sanitizedSettings.kotLayout = kl;
+    }
+    // kotExclusionEnabled: boolean
+    if (printSettings.kotExclusionEnabled !== undefined) {
+      sanitizedSettings.kotExclusionEnabled = Boolean(printSettings.kotExclusionEnabled);
+    }
+    // kotExcludedItemIds: array of item IDs to exclude from KOTs
+    if (printSettings.kotExcludedItemIds !== undefined && Array.isArray(printSettings.kotExcludedItemIds)) {
+      sanitizedSettings.kotExcludedItemIds = printSettings.kotExcludedItemIds.filter(id => typeof id === 'string');
+    }
+    // kotExcludedCategories: array of category IDs to exclude from KOTs
+    if (printSettings.kotExcludedCategories !== undefined && Array.isArray(printSettings.kotExcludedCategories)) {
+      sanitizedSettings.kotExcludedCategories = printSettings.kotExcludedCategories.filter(id => typeof id === 'string');
+    }
 
     const restaurantDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
     if (!restaurantDoc.exists) {
