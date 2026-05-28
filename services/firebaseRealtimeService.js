@@ -221,8 +221,41 @@ const notifyDeliveryStatusUpdated = async (restaurantId, { orderId, status, staf
   });
 };
 
+// ─── RTDB Security Rules Setup ───────────────────────────────────────────────
+
+/**
+ * Ensure RTDB security rules allow authenticated users to read events.
+ * Call once on server startup. Safe to call multiple times.
+ */
+const ensureRtdbRules = async () => {
+  try {
+    const fbAdmin = require('firebase-admin');
+    const adminDb = fbAdmin.database();
+
+    const rules = {
+      rules: {
+        events: {
+          $restaurantId: {
+            '.read': 'auth != null',
+            '.write': false  // Only server (Admin SDK) writes
+          }
+        },
+        '.read': false,
+        '.write': false
+      }
+    };
+
+    await adminDb.setRules(rules);
+    console.log('✅ RTDB: Security rules set (auth required for reads, server-only writes)');
+  } catch (error) {
+    // Non-fatal: rules might already be set, or we might not have permission
+    console.warn('⚠️ RTDB: Could not set security rules:', error.message);
+  }
+};
+
 module.exports = {
   pushEvent,
+  ensureRtdbRules,
   triggerTableStatusUpdated,
   notifyOrderCreated,
   notifyOrderStatusUpdated,

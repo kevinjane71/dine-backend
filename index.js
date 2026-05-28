@@ -21734,6 +21734,15 @@ async function checkFeaturePermission(req, feature, operation) {
     const perms = resolveFeaturePerms(pageAccess, feature);
     if (perms[operation]) return true;
 
+    // Fallback: frontend maps /orderhistory to pageAccess.history,
+    // so grant orders.read when history access is enabled
+    if (feature === 'orders' && operation === 'read') {
+      const historyPerms = resolveFeaturePerms(pageAccess, 'history');
+      if (historyPerms.read) return true;
+      // Also accept legacy boolean: pageAccess.history === true
+      if (pageAccess?.history === true) return true;
+    }
+
     return false;
   } catch (err) {
     console.error(`Permission check error for ${feature}.${operation}:`, err.message);
@@ -34533,6 +34542,13 @@ const server = app.listen(PORT, '0.0.0.0', async () => {
       console.log(`🔓 Cleared localhost blocks for development`);
     } catch (error) {
       console.error('Error clearing localhost blocks:', error);
+    }
+
+    // Ensure Firebase RTDB security rules allow authenticated reads
+    try {
+      await pusherService.ensureRtdbRules();
+    } catch (error) {
+      console.warn('RTDB rules setup skipped:', error.message);
     }
   });
 
