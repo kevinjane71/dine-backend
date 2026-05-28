@@ -1835,6 +1835,39 @@ router.get('/:orgId/export/:reportType', ...reportMiddleware, async (req, res) =
         break;
       }
 
+      case 'menu-performance':
+      case 'item-sales': {
+        filename = `item-wise-sales-${orgId}.csv`;
+        csvContent += '#,Item,Qty Sold,Revenue,% of Total\n';
+
+        const mpItemMap = {};
+        const mpPromises = outlets.map(async (outlet) => {
+          const orders = await getOutletOrders(outlet.id, startDate, endDate);
+          orders.forEach(order => {
+            const items = order.items || order.orderItems || [];
+            items.forEach(item => {
+              const name = item.name || item.itemName || 'Unknown';
+              if (!mpItemMap[name]) mpItemMap[name] = { name, quantity: 0, revenue: 0 };
+              const qty = Number(item.quantity) || 1;
+              const price = Number(item.price) || Number(item.itemPrice) || 0;
+              mpItemMap[name].quantity += qty;
+              mpItemMap[name].revenue += qty * price;
+            });
+          });
+        });
+        await Promise.all(mpPromises);
+
+        const mpItems = Object.values(mpItemMap).sort((a, b) => b.quantity - a.quantity);
+        const mpTotalRev = mpItems.reduce((s, i) => s + i.revenue, 0);
+        mpItems.forEach((item, idx) => {
+          const pct = mpTotalRev > 0 ? ((item.revenue / mpTotalRev) * 100).toFixed(1) : '0.0';
+          csvContent += `${idx + 1},${escapeCsvField(item.name)},${item.quantity},${Math.round(item.revenue * 100) / 100},${pct}%\n`;
+        });
+        const mpTotalQty = mpItems.reduce((s, i) => s + i.quantity, 0);
+        csvContent += `,Total,${mpTotalQty},${Math.round(mpTotalRev * 100) / 100},100%\n`;
+        break;
+      }
+
       case 'wallet-loyalty': {
         filename = `wallet-loyalty-${orgId}.csv`;
         csvContent += 'Metric,Value\n';
@@ -1868,7 +1901,7 @@ router.get('/:orgId/export/:reportType', ...reportMiddleware, async (req, res) =
       default:
         return res.status(400).json({
           success: false,
-          error: `Invalid report type: '${reportType}'. Valid types: inventory, pl, indents, outlet-ranking, sales-summary, staff-performance, category-sales, discount-report, tax-summary, customer-insights, payment-analytics, order-analytics, revenue-trends, wallet-loyalty`
+          error: `Invalid report type: '${reportType}'. Valid types: inventory, pl, indents, outlet-ranking, sales-summary, staff-performance, category-sales, discount-report, tax-summary, customer-insights, payment-analytics, order-analytics, revenue-trends, wallet-loyalty, menu-performance, item-sales`
         });
     }
 

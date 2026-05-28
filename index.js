@@ -20103,7 +20103,10 @@ const DEFAULT_PRINT_SETTINGS = {
     showPoweredBy: true,
   },
   kotLayout: {
+    showKotTitle: true,
     showRestaurantName: true,
+    showOrderNumber: true,
+    showTable: true,
     showCustomer: true,
     showWaiter: true,
     showDate: true,
