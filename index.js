@@ -30862,6 +30862,15 @@ app.get('/api/restaurants/:restaurantId/billing-settings', authenticateToken, as
       refundsRequireApproval: existing.refundsRequireApproval ?? true,
       emailInvoiceEnabled: existing.emailInvoiceEnabled ?? false,
       whatsappBillingEnabled: existing.whatsappBillingEnabled ?? false,
+      // Role-based feature access (empty array = all roles allowed)
+      serviceChargeRoles: Array.isArray(existing.serviceChargeRoles) ? existing.serviceChargeRoles : [],
+      roundOffRoles: Array.isArray(existing.roundOffRoles) ? existing.roundOffRoles : [],
+      cashTenderingRoles: Array.isArray(existing.cashTenderingRoles) ? existing.cashTenderingRoles : [],
+      tipsRoles: Array.isArray(existing.tipsRoles) ? existing.tipsRoles : [],
+      splitPaymentRoles: Array.isArray(existing.splitPaymentRoles) ? existing.splitPaymentRoles : [],
+      partialPaymentRoles: Array.isArray(existing.partialPaymentRoles) ? existing.partialPaymentRoles : [],
+      compVoidRoles: Array.isArray(existing.compVoidRoles) ? existing.compVoidRoles : [],
+      refundsRoles: Array.isArray(existing.refundsRoles) ? existing.refundsRoles : [],
     };
 
 
@@ -30914,6 +30923,31 @@ app.put('/api/restaurants/:restaurantId/billing-settings', authenticateToken, as
       refundsRequireApproval: settings.refundsRequireApproval ?? true,
       emailInvoiceEnabled: settings.emailInvoiceEnabled ?? false,
       whatsappBillingEnabled: settings.whatsappBillingEnabled ?? false,
+      // Role-based feature access (empty array = all roles allowed, accepts dynamic roles)
+      serviceChargeRoles: Array.isArray(settings.serviceChargeRoles)
+        ? settings.serviceChargeRoles.filter(r => typeof r === 'string' && r.length > 0 && r.length <= 50)
+        : [],
+      roundOffRoles: Array.isArray(settings.roundOffRoles)
+        ? settings.roundOffRoles.filter(r => typeof r === 'string' && r.length > 0 && r.length <= 50)
+        : [],
+      cashTenderingRoles: Array.isArray(settings.cashTenderingRoles)
+        ? settings.cashTenderingRoles.filter(r => typeof r === 'string' && r.length > 0 && r.length <= 50)
+        : [],
+      tipsRoles: Array.isArray(settings.tipsRoles)
+        ? settings.tipsRoles.filter(r => typeof r === 'string' && r.length > 0 && r.length <= 50)
+        : [],
+      splitPaymentRoles: Array.isArray(settings.splitPaymentRoles)
+        ? settings.splitPaymentRoles.filter(r => typeof r === 'string' && r.length > 0 && r.length <= 50)
+        : [],
+      partialPaymentRoles: Array.isArray(settings.partialPaymentRoles)
+        ? settings.partialPaymentRoles.filter(r => typeof r === 'string' && r.length > 0 && r.length <= 50)
+        : [],
+      compVoidRoles: Array.isArray(settings.compVoidRoles)
+        ? settings.compVoidRoles.filter(r => typeof r === 'string' && r.length > 0 && r.length <= 50)
+        : [],
+      refundsRoles: Array.isArray(settings.refundsRoles)
+        ? settings.refundsRoles.filter(r => typeof r === 'string' && r.length > 0 && r.length <= 50)
+        : [],
       updatedAt: new Date(),
     };
 
