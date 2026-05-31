@@ -436,13 +436,18 @@ router.post('/users/merge', authenticateSuperAdmin, requireSuperAdmin, async (re
 // ─── Create Owner Account (or set temp password for existing) ────────
 router.post('/users/create-owner', authenticateSuperAdmin, checkPermission('dine:create-user'), async (req, res) => {
   try {
-    const { email } = req.body;
+    const { email, phone } = req.body;
 
-    if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
-      return res.status(400).json({ success: false, error: 'A valid email is required' });
+    const hasEmail = email && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
+    const hasPhone = phone && phone.trim().length >= 5;
+
+    if (!hasEmail && !hasPhone) {
+      return res.status(400).json({ success: false, error: 'A valid email or phone number is required' });
     }
 
-    const normalizedEmail = email.toLowerCase().trim();
+    const normalizedEmail = hasEmail ? email.toLowerCase().trim() : '';
+    const normalizedPhone = hasPhone ? phone.trim() : '';
+    const createdBy = req.admin.role === 'sub_admin' ? req.admin.subAdminId : 'admin';
 
     // Generate 8-char alphanumeric temp password (excludes ambiguous chars)
     const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789';
@@ -452,11 +457,27 @@ router.post('/users/create-owner', authenticateSuperAdmin, checkPermission('dine
     }
     const hashedPassword = await bcrypt.hash(tempPassword, 10);
 
-    // Check if user already exists
-    const existingSnap = await db.collection(collections.users)
-      .where('email', '==', normalizedEmail)
-      .limit(1)
-      .get();
+    // Check if user already exists (by email first, then phone)
+    let existingSnap = { empty: true, docs: [] };
+    if (normalizedEmail) {
+      existingSnap = await db.collection(collections.users)
+        .where('email', '==', normalizedEmail)
+        .limit(1)
+        .get();
+    }
+    if (existingSnap.empty && normalizedPhone) {
+      existingSnap = await db.collection(collections.users)
+        .where('phone', '==', normalizedPhone)
+        .limit(1)
+        .get();
+      // Try with +91 prefix if not found
+      if (existingSnap.empty && !normalizedPhone.startsWith('+')) {
+        existingSnap = await db.collection(collections.users)
+          .where('phone', '==', '+91' + normalizedPhone)
+          .limit(1)
+          .get();
+      }
+    }
 
     if (!existingSnap.empty) {
       // ── Existing user: set temp password so they can login with email ──
@@ -464,12 +485,16 @@ router.post('/users/create-owner', authenticateSuperAdmin, checkPermission('dine
       const existingData = existingDoc.data();
       const userId = existingDoc.id;
 
-      await existingDoc.ref.update({
+      const updateFields = {
         password: hashedPassword,
-        emailVerified: true,
         temporaryPassword: true,
         updatedAt: new Date(),
-      });
+        createdBy: createdBy,
+        createdByRole: req.admin.role,
+      };
+      if (normalizedEmail) updateFields.emailVerified = true;
+
+      await existingDoc.ref.update(updateFields);
 
       // Check restaurants
       const restSnap = await db.collection(collections.restaurants)
@@ -477,15 +502,15 @@ router.post('/users/create-owner', authenticateSuperAdmin, checkPermission('dine
         .limit(1)
         .get();
 
-      console.log(`[super-admin] Set temp password for existing user ${userId} (${normalizedEmail})`);
+      console.log(`[super-admin] Set temp password for existing user ${userId} (${normalizedEmail || normalizedPhone})`);
 
       return res.json({
         success: true,
         isExisting: true,
         userId,
-        email: normalizedEmail,
+        email: existingData.email || normalizedEmail,
         name: existingData.name || '',
-        phone: existingData.phone || '',
+        phone: existingData.phone || normalizedPhone,
         provider: existingData.provider || 'unknown',
         hasRestaurants: !restSnap.empty,
         temporaryPassword: tempPassword,
@@ -493,21 +518,23 @@ router.post('/users/create-owner', authenticateSuperAdmin, checkPermission('dine
     }
 
     // ── New user: create account with same fields as normal registration ──
-    const userDoc = await db.collection(collections.users).add({
+    const newUserFields = {
       email: normalizedEmail,
+      phone: normalizedPhone,
       password: hashedPassword,
       name: '',
       role: 'owner',
-      emailVerified: true,
-      phoneVerified: false,
-      provider: 'email',
+      emailVerified: !!normalizedEmail,
+      phoneVerified: !!normalizedPhone,
+      provider: normalizedEmail ? 'email' : 'phone',
       temporaryPassword: true,
       setupComplete: false,
       createdAt: new Date(),
       updatedAt: new Date(),
-      createdBy: req.admin.role === 'sub_admin' ? req.admin.subAdminId : 'admin',
+      createdBy,
       createdByRole: req.admin.role,
-    });
+    };
+    const userDoc = await db.collection(collections.users).add(newUserFields);
 
     const userId = userDoc.id;
 
@@ -1987,6 +2014,133 @@ router.delete('/tasks/:taskId', authenticateSuperAdmin, requireSuperAdmin, async
   } catch (error) {
     console.error('Admin task delete error:', error);
     res.status(500).json({ success: false, error: 'Failed to delete task' });
+  }
+});
+
+// ─── Agent User Lookup (sub-admin accessible) ──────────────────────
+// Search for existing users by email or phone so sub-admins can link them
+router.get('/users/agent-lookup', authenticateSuperAdmin, async (req, res) => {
+  try {
+    const { email, phone } = req.query;
+    if (!email && !phone) {
+      return res.status(400).json({ success: false, error: 'Provide email or phone to search' });
+    }
+
+    let userDoc = null;
+
+    if (email) {
+      const snap = await db.collection(collections.users)
+        .where('email', '==', email.trim().toLowerCase())
+        .limit(1)
+        .get();
+      if (!snap.empty) userDoc = snap.docs[0];
+    }
+
+    if (!userDoc && phone) {
+      const phoneTrimmed = phone.trim();
+      let snap = await db.collection(collections.users)
+        .where('phone', '==', phoneTrimmed)
+        .limit(1)
+        .get();
+      if (snap.empty && !phoneTrimmed.startsWith('+')) {
+        snap = await db.collection(collections.users)
+          .where('phone', '==', '+91' + phoneTrimmed)
+          .limit(1)
+          .get();
+      }
+      if (!snap.empty) userDoc = snap.docs[0];
+    }
+
+    if (!userDoc) {
+      return res.status(404).json({ success: false, error: 'User not found' });
+    }
+
+    const userData = userDoc.data();
+    const userId = userDoc.id;
+    const user = {
+      id: userId,
+      name: userData.name || '',
+      email: userData.email || '',
+      phone: userData.phone || '',
+      role: userData.role || '',
+      createdBy: userData.createdBy || null,
+      createdAt: userData.createdAt?.toDate ? userData.createdAt.toDate().toISOString() : userData.createdAt || null,
+      setupComplete: userData.setupComplete || false,
+    };
+
+    // Fetch restaurants
+    const restaurantsSnap = await db.collection(collections.restaurants)
+      .where('ownerId', '==', userId)
+      .limit(10)
+      .get();
+
+    const restaurants = restaurantsSnap.docs.map(doc => {
+      const d = doc.data();
+      return { id: doc.id, name: d.name || '', subdomain: d.subdomain || '' };
+    });
+
+    res.json({ success: true, user, restaurants });
+  } catch (error) {
+    console.error('Agent user lookup error:', error);
+    res.status(500).json({ success: false, error: 'Failed to lookup user' });
+  }
+});
+
+// ─── Link Existing User to Agent ────────────────────────────────────
+// Sub-admin claims an existing user so they appear in My Users
+router.post('/users/link-to-agent', authenticateSuperAdmin, async (req, res) => {
+  try {
+    if (req.admin.role !== 'sub_admin') {
+      return res.status(400).json({ success: false, error: 'This endpoint is for sub-admins only' });
+    }
+
+    const { userId } = req.body;
+    if (!userId) {
+      return res.status(400).json({ success: false, error: 'userId is required' });
+    }
+
+    const subAdminId = req.admin.subAdminId;
+
+    const userRef = db.collection(collections.users).doc(userId);
+    const userDoc = await userRef.get();
+    if (!userDoc.exists) {
+      return res.status(404).json({ success: false, error: 'User not found' });
+    }
+
+    const userData = userDoc.data();
+
+    // Check if already linked to another sub-admin
+    if (userData.createdBy && userData.createdBy !== 'admin' && userData.createdBy !== subAdminId) {
+      return res.status(409).json({ success: false, error: 'User is already linked to another agent' });
+    }
+
+    // Already linked to this agent
+    if (userData.createdBy === subAdminId) {
+      return res.json({ success: true, message: 'User is already in your list', alreadyLinked: true });
+    }
+
+    // Link the user
+    await userRef.update({
+      createdBy: subAdminId,
+      createdByRole: 'sub_admin',
+      updatedAt: new Date(),
+    });
+
+    console.log(`[sub-admin] Agent ${subAdminId} linked user ${userId}`);
+
+    res.json({
+      success: true,
+      message: 'User linked successfully',
+      user: {
+        id: userId,
+        name: userData.name || '',
+        email: userData.email || '',
+        phone: userData.phone || '',
+      },
+    });
+  } catch (error) {
+    console.error('Link user to agent error:', error);
+    res.status(500).json({ success: false, error: 'Failed to link user' });
   }
 });
 
