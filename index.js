@@ -18731,6 +18731,16 @@ app.put('/api/admin/print-settings/:restaurantId', authenticateToken, async (req
     if (printSettings.kotExcludedCategories !== undefined && Array.isArray(printSettings.kotExcludedCategories)) {
       sanitizedSettings.kotExcludedCategories = printSettings.kotExcludedCategories.filter(id => typeof id === 'string');
     }
+    // receiptAddress: optional override for address printed on receipts
+    if (printSettings.receiptAddress !== undefined) {
+      sanitizedSettings.receiptAddress = typeof printSettings.receiptAddress === 'string'
+        ? printSettings.receiptAddress.trim().slice(0, 500) : '';
+    }
+    // receiptPhone: optional override for phone printed on receipts
+    if (printSettings.receiptPhone !== undefined) {
+      sanitizedSettings.receiptPhone = typeof printSettings.receiptPhone === 'string'
+        ? printSettings.receiptPhone.trim().slice(0, 20) : '';
+    }
 
     const restaurantDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
     if (!restaurantDoc.exists) {
@@ -20132,6 +20142,9 @@ const DEFAULT_PRINT_SETTINGS = {
     showFooter: true,
     showPoweredBy: true,
   },
+  // Receipt identity overrides (empty = use restaurant's actual values)
+  receiptAddress: '',
+  receiptPhone: '',
   kotLayout: {
     showKotTitle: true,
     showRestaurantName: true,
@@ -20274,8 +20287,8 @@ const assembleBillRenderPayload = (orderId, orderData, restaurantId, restaurantD
     restaurantId,
     restaurantName: restaurant.name,
     restaurantLegalName: restaurant.legalBusinessName || '',
-    restaurantAddress: restaurant.address,
-    restaurantPhone: restaurant.phone,
+    restaurantAddress: printSettings.receiptAddress || restaurant.address,
+    restaurantPhone: printSettings.receiptPhone || restaurant.phone,
     restaurantEmail: restaurant.email,
     gstin: restaurant.gstin || '',
     fssai: restaurant.fssai || '',
