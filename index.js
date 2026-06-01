@@ -30885,6 +30885,8 @@ app.get('/api/restaurants/:restaurantId/billing-settings', authenticateToken, as
       partialPaymentRoles: Array.isArray(existing.partialPaymentRoles) ? existing.partialPaymentRoles : [],
       compVoidRoles: Array.isArray(existing.compVoidRoles) ? existing.compVoidRoles : [],
       refundsRoles: Array.isArray(existing.refundsRoles) ? existing.refundsRoles : [],
+      settlementMethods: Array.isArray(existing.settlementMethods) ? existing.settlementMethods
+        : [{ id: 'cash', label: 'Cash', enabled: true }, { id: 'card', label: 'Card', enabled: true }, { id: 'upi', label: 'UPI', enabled: true }],
     };
 
 
@@ -30962,6 +30964,12 @@ app.put('/api/restaurants/:restaurantId/billing-settings', authenticateToken, as
       refundsRoles: Array.isArray(settings.refundsRoles)
         ? settings.refundsRoles.filter(r => typeof r === 'string' && r.length > 0 && r.length <= 50)
         : [],
+      settlementMethods: Array.isArray(settings.settlementMethods)
+        ? settings.settlementMethods
+            .filter(m => m && typeof m.id === 'string' && typeof m.label === 'string')
+            .map(m => ({ id: m.id.toLowerCase().replace(/\s+/g, '_').substring(0, 30), label: m.label.trim().substring(0, 30), enabled: m.enabled !== false }))
+            .slice(0, 20)
+        : [{ id: 'cash', label: 'Cash', enabled: true }, { id: 'card', label: 'Card', enabled: true }, { id: 'upi', label: 'UPI', enabled: true }],
       updatedAt: new Date(),
     };
 
@@ -31372,6 +31380,311 @@ app.get('/api/orders/:orderId/edit-history', authenticateToken, async (req, res)
   } catch (error) {
     console.error('Error fetching edit history:', error);
     res.status(500).json({ error: 'Failed to fetch edit history' });
+  }
+});
+
+// Edit completed order items (full item editing — add/remove/change quantities)
+app.patch('/api/orders/:orderId/edit-completed-items', authenticateToken, async (req, res) => {
+  try {
+    const { orderId } = req.params;
+    const { items, editReason, pinCode } = req.body;
+    const user = req.user;
+
+    if (!items || !Array.isArray(items) || items.length === 0) {
+      return res.status(400).json({ error: 'Items array is required' });
+    }
+    if (!editReason || typeof editReason !== 'string' || editReason.trim().length < 3) {
+      return res.status(400).json({ error: 'Edit reason is required (minimum 3 characters)' });
+    }
+
+    // Auth check: owner/admin always allowed; others need allowEditCompletedOrders
+    const userDoc = await db.collection(collections.users).doc(user.userId).get();
+    if (!userDoc.exists) return res.status(404).json({ error: 'User not found' });
+    const userData = userDoc.data();
+    const isOwnerAdmin = userData.role === 'owner' || userData.role === 'admin';
+    if (!isOwnerAdmin && !userData.allowEditCompletedOrders) {
+      return res.status(403).json({ error: 'You do not have permission to edit completed orders' });
+    }
+
+    // Get current order
+    const orderRef = db.collection(collections.orders).doc(orderId);
+    const orderDoc = await orderRef.get();
+    if (!orderDoc.exists) return res.status(404).json({ error: 'Order not found' });
+    const currentOrder = orderDoc.data();
+    if (currentOrder.status !== 'completed') {
+      return res.status(400).json({ error: 'This endpoint is only for editing completed orders' });
+    }
+
+    // PIN check
+    const restaurantDoc = await db.collection(collections.restaurants).doc(currentOrder.restaurantId).get();
+    const restaurantData = restaurantDoc.exists ? restaurantDoc.data() : {};
+    const posSettings = restaurantData.posSettings || {};
+    if (posSettings.requirePinForCompletedOrderEdit) {
+      if (!pinCode) {
+        return res.status(403).json({ error: 'PIN is required to edit completed orders', requirePin: true });
+      }
+      if (String(pinCode) !== String(posSettings.completedOrderEditPin || '')) {
+        return res.status(403).json({ error: 'Invalid PIN', requirePin: true });
+      }
+    }
+
+    // Store pre-edit snapshot (only on first edit)
+    const updateData = { updatedAt: new Date() };
+    if (!currentOrder.preEditSnapshot) {
+      updateData.preEditSnapshot = {
+        items: currentOrder.items || [],
+        finalAmount: currentOrder.finalAmount || 0,
+        totalAmount: currentOrder.totalAmount || 0,
+        taxAmount: currentOrder.taxAmount || 0,
+        subtotalAmount: currentOrder.subtotal || currentOrder.subtotalAmount || 0,
+        snapshotAt: new Date().toISOString(),
+      };
+    }
+
+    // --- Server-side pricing ---
+    const menuItems = restaurantData?.menu?.items || [];
+    const multiPricing = restaurantData?.pricingSettings?.multiPricing;
+    let activePricingRuleId = null;
+    if (multiPricing?.enabled && currentOrder.pricingRuleId) {
+      const existingRule = (multiPricing.rules || []).find(r => r.id === currentOrder.pricingRuleId && r.isActive);
+      if (existingRule) activePricingRuleId = existingRule.id;
+    }
+
+    const allowPriceEdit = restaurantData?.posSettings?.allowPriceEdit === true;
+    const existingItems = currentOrder.items || [];
+
+    const processedItems = items.map(newItem => {
+      const { isNew: _n, isUpdated: _u, isRemoved: _r, addedAt: _a, updatedAt: _ut, removedAt: _rt, previousQuantity: _pq, quantityDelta: _qd, ...cleanItem } = newItem;
+      const isCustomItem = allowPriceEdit && typeof cleanItem.menuItemId === 'string' && cleanItem.menuItemId.startsWith('custom-');
+      const menuItem = isCustomItem ? null : menuItems.find(m => m.id === cleanItem.menuItemId);
+      const selectedVariant = cleanItem.selectedVariant || null;
+      const customizations = Array.isArray(cleanItem.selectedCustomizations) ? cleanItem.selectedCustomizations : [];
+
+      let resolvedBasePrice;
+      if (menuItem) {
+        if (selectedVariant && typeof selectedVariant.price === 'number') {
+          const matchedVariant = (menuItem.variants || []).find(v => v.name === selectedVariant.name || v.price === selectedVariant.price);
+          resolvedBasePrice = matchedVariant ? matchedVariant.price : selectedVariant.price;
+        } else if (allowPriceEdit && cleanItem.price != null) {
+          resolvedBasePrice = cleanItem.price;
+        } else {
+          resolvedBasePrice = menuItem.price;
+        }
+        if (multiPricing?.enabled && activePricingRuleId && !selectedVariant) {
+          const rulePrice = resolveItemPriceForRule(menuItem, activePricingRuleId, multiPricing.rules);
+          if (rulePrice !== null) resolvedBasePrice = rulePrice;
+        }
+      } else {
+        resolvedBasePrice = cleanItem.price || 0;
+      }
+
+      const customizationPrice = customizations.reduce((sum, c) => sum + (typeof c.price === 'number' ? c.price : 0), 0);
+      const resolvedUnitPrice = (resolvedBasePrice || 0) + customizationPrice;
+      const itemQuantity = Math.max(1, parseInt(cleanItem.quantity, 10) || 1);
+
+      return {
+        ...cleanItem,
+        name: cleanItem.name || menuItem?.name || 'Unknown Item',
+        price: resolvedUnitPrice,
+        total: resolvedUnitPrice * itemQuantity,
+        quantity: itemQuantity,
+        selectedVariant: selectedVariant ? { name: selectedVariant.name, price: selectedVariant.price || 0 } : null,
+        selectedCustomizations: customizations.map(c => ({ id: c.id || null, name: c.name || c, price: typeof c.price === 'number' ? c.price : 0 })),
+        isStockManaged: menuItem?.isStockManaged || cleanItem.isStockManaged || false,
+        trackInventory: menuItem?.trackInventory || menuItem?.isStockManaged || cleanItem.trackInventory || false,
+        inventoryItemId: menuItem?.inventoryItemId || cleanItem.inventoryItemId || null,
+        deductionQuantity: menuItem?.deductionQuantity || cleanItem.deductionQuantity || 1,
+      };
+    });
+
+    updateData.items = processedItems;
+    updateData.itemCount = processedItems.reduce((sum, item) => sum + item.quantity, 0);
+    const itemsSubtotal = processedItems.reduce((sum, item) => sum + (item.total || 0), 0);
+    updateData.subtotal = itemsSubtotal;
+
+    // Preserve existing discounts (recalculate percentage-based manual discount)
+    let manualDiscount = currentOrder.manualDiscount || 0;
+    if (currentOrder.manualDiscountType === 'percentage' && currentOrder.manualDiscountValue) {
+      manualDiscount = Math.round((itemsSubtotal * currentOrder.manualDiscountValue / 100) * 100) / 100;
+    }
+    updateData.manualDiscount = manualDiscount;
+    updateData.manualDiscountType = currentOrder.manualDiscountType || null;
+    updateData.manualDiscountValue = currentOrder.manualDiscountValue || null;
+
+    const offerDiscount = currentOrder.discountAmount || currentOrder.offerDiscount || 0;
+    updateData.discountAmount = offerDiscount;
+    updateData.offerDiscount = offerDiscount;
+    const loyaltyDiscount = currentOrder.loyaltyDiscount || 0;
+    updateData.loyaltyDiscount = loyaltyDiscount;
+    const couponDiscount = currentOrder.couponDiscount || 0;
+    updateData.couponDiscount = couponDiscount;
+    updateData.totalDiscountAmount = Math.round((offerDiscount + manualDiscount + loyaltyDiscount + couponDiscount) * 100) / 100;
+
+    // Tax calculation
+    const preTaxTotal = Math.max(0, itemsSubtotal - updateData.totalDiscountAmount);
+    updateData.totalAmount = preTaxTotal;
+
+    const taxSettings = restaurantData.taxSettings || {};
+    const scRate = parseFloat(currentOrder.serviceChargeRate || 0);
+    const scAmt = scRate > 0 ? Math.round((preTaxTotal * scRate / 100) * 100) / 100 : (currentOrder.serviceChargeAmount || 0);
+    updateData.serviceChargeAmount = scAmt;
+    updateData.serviceChargeRate = scRate;
+
+    const taxableAmount = preTaxTotal + scAmt;
+    let taxAmount = 0;
+    let exclusiveTax = 0;
+    const taxBreakdown = [];
+    const isGlobalInclusive = taxSettings.taxInclusivePricing === true;
+
+    if (taxSettings.enabled && taxableAmount > 0) {
+      if (taxSettings.taxes && Array.isArray(taxSettings.taxes) && taxSettings.taxes.length > 0) {
+        const enabledTaxes = taxSettings.taxes.filter(t => t.enabled);
+        const totalRate = enabledTaxes.reduce((sum, t) => sum + (t.rate || 0), 0);
+        enabledTaxes.forEach(tax => {
+          const amt = isGlobalInclusive
+            ? Math.round((taxableAmount * (tax.rate || 0) / (100 + totalRate)) * 100) / 100
+            : Math.round((taxableAmount * (tax.rate || 0) / 100) * 100) / 100;
+          taxAmount += amt;
+          if (!isGlobalInclusive) exclusiveTax += amt;
+          taxBreakdown.push({ name: tax.name || 'Tax', rate: tax.rate || 0, amount: amt, inclusive: isGlobalInclusive });
+        });
+      } else if (taxSettings.defaultTaxRate) {
+        const amt = isGlobalInclusive
+          ? Math.round((taxableAmount * taxSettings.defaultTaxRate / (100 + taxSettings.defaultTaxRate)) * 100) / 100
+          : Math.round((taxableAmount * (taxSettings.defaultTaxRate / 100)) * 100) / 100;
+        taxAmount = amt;
+        if (!isGlobalInclusive) exclusiveTax = amt;
+        taxBreakdown.push({ name: 'Tax', rate: taxSettings.defaultTaxRate, amount: amt, inclusive: isGlobalInclusive });
+      }
+    } else {
+      // Fallback: use order's existing tax rate
+      const existingTaxRate = (currentOrder.taxBreakdown || []).reduce((sum, t) => sum + (t.rate || 0), 0);
+      if (existingTaxRate > 0 && taxableAmount > 0) {
+        const wasInclusive = currentOrder.taxInclusiveMode === 'inclusive';
+        const amt = wasInclusive
+          ? Math.round((taxableAmount * existingTaxRate / (100 + existingTaxRate)) * 100) / 100
+          : Math.round((taxableAmount * existingTaxRate / 100) * 100) / 100;
+        taxAmount = amt;
+        if (!wasInclusive) exclusiveTax = amt;
+        (currentOrder.taxBreakdown || []).forEach(t => {
+          const tAmt = wasInclusive
+            ? Math.round((taxableAmount * (t.rate || 0) / (100 + existingTaxRate)) * 100) / 100
+            : Math.round((taxableAmount * (t.rate || 0) / 100) * 100) / 100;
+          taxBreakdown.push({ name: t.name || 'Tax', rate: t.rate || 0, amount: tAmt, inclusive: wasInclusive });
+        });
+      }
+    }
+
+    updateData.taxAmount = Math.round(taxAmount * 100) / 100;
+    updateData.taxBreakdown = taxBreakdown.length > 0 ? taxBreakdown : (currentOrder.taxBreakdown || []);
+    updateData.taxInclusiveMode = currentOrder.taxInclusiveMode || (isGlobalInclusive ? 'inclusive' : 'exclusive');
+
+    const tipAmt = currentOrder.tipAmount || 0;
+    const roundOff = currentOrder.roundOffAmount || currentOrder.roundOff || 0;
+    updateData.finalAmount = Math.max(0, Math.round((preTaxTotal + exclusiveTax + scAmt + tipAmt + roundOff) * 100) / 100);
+
+    // --- Edit count and history ---
+    updateData.editCount = (currentOrder.editCount || 0) + 1;
+
+    const oldItemMap = {};
+    existingItems.forEach(i => { oldItemMap[i.menuItemId] = i; });
+    const newItemMap = {};
+    processedItems.forEach(i => { newItemMap[i.menuItemId] = i; });
+    const itemsAdded = processedItems.filter(i => !oldItemMap[i.menuItemId]).map(i => ({ name: i.name, quantity: i.quantity }));
+    const itemsRemoved = existingItems.filter(i => !newItemMap[i.menuItemId]).map(i => ({ name: i.name, quantity: i.quantity }));
+    const itemsModified = processedItems.filter(i => oldItemMap[i.menuItemId] && oldItemMap[i.menuItemId].quantity !== i.quantity)
+      .map(i => ({ name: i.name, from: oldItemMap[i.menuItemId].quantity, to: i.quantity }));
+
+    const editEntry = {
+      editedAt: new Date().toISOString(),
+      editedBy: { id: user.userId, name: userData.name || userData.email || 'Unknown', role: userData.role || 'unknown' },
+      type: 'items',
+      editReason: editReason.trim(),
+      changes: { itemsAdded, itemsRemoved, itemsModified, oldTotal: currentOrder.finalAmount || 0, newTotal: updateData.finalAmount }
+    };
+    updateData.editHistory = [...(currentOrder.editHistory || []), editEntry];
+
+    // --- Auto-refund if new total < old total ---
+    const oldFinalAmount = currentOrder.finalAmount || currentOrder.totalAmount || 0;
+    const amountDiff = Math.round((updateData.finalAmount - oldFinalAmount) * 100) / 100;
+    let autoRefundCreated = false;
+    if (amountDiff < 0) {
+      updateData.autoRefundAmount = Math.abs(amountDiff);
+      updateData.autoRefundReason = `Order edited after completion: ${editReason.trim()}`;
+      updateData.autoRefundAt = new Date().toISOString();
+      updateData.autoRefundBy = user.userId;
+      autoRefundCreated = true;
+    }
+
+    // Save updated order
+    await orderRef.update(updateData);
+
+    // --- Inventory adjustment ---
+    try {
+      const oldQtyMap = {};
+      existingItems.forEach(i => { const key = i.menuItemId || i.id; oldQtyMap[key] = (oldQtyMap[key] || 0) + (i.quantity || 1); });
+      const newQtyMap = {};
+      processedItems.forEach(i => { const key = i.menuItemId || i.id; newQtyMap[key] = (newQtyMap[key] || 0) + (i.quantity || 1); });
+      const allKeys = new Set([...Object.keys(oldQtyMap), ...Object.keys(newQtyMap)]);
+      const addedInvItems = [];
+      const removedInvItems = [];
+      for (const key of allKeys) {
+        const oldQty = oldQtyMap[key] || 0;
+        const newQty = newQtyMap[key] || 0;
+        const delta = newQty - oldQty;
+        if (delta > 0) {
+          const itemData = processedItems.find(i => (i.menuItemId || i.id) === key);
+          if (itemData) addedInvItems.push({ ...itemData, quantity: delta });
+        } else if (delta < 0) {
+          const itemData = existingItems.find(i => (i.menuItemId || i.id) === key);
+          if (itemData) removedInvItems.push({ ...itemData, quantity: Math.abs(delta) });
+        }
+      }
+      if (addedInvItems.length > 0) {
+        try {
+          await inventoryService.deductInventoryForOrder(currentOrder.restaurantId, `${orderId}_editcomplete_${Date.now()}`, addedInvItems);
+          await syncInventoryStockToMenuItems(currentOrder.restaurantId);
+          await adjustDirectMenuItemStock(currentOrder.restaurantId, addedInvItems, 'decrement');
+        } catch (err) { console.error('Edit completed - inventory add error:', err); }
+      }
+      if (removedInvItems.length > 0) {
+        try {
+          await inventoryService.restoreInventoryForEditedOrder(currentOrder.restaurantId, orderId, removedInvItems);
+          await syncInventoryStockToMenuItems(currentOrder.restaurantId);
+          await adjustDirectMenuItemStock(currentOrder.restaurantId, removedInvItems, 'restore');
+        } catch (err) { console.error('Edit completed - inventory remove error:', err); }
+      }
+    } catch (invErr) {
+      console.error('Error adjusting inventory for completed order edit:', invErr);
+    }
+
+    // --- Revenue adjustment ---
+    if (amountDiff !== 0) {
+      try {
+        updateDailyStatsRevenueDiff(
+          currentOrder.restaurantId, currentOrder,
+          currentOrder.totalAmount || 0, updateData.totalAmount,
+          oldFinalAmount, updateData.finalAmount,
+          parseTZ(req)
+        );
+      } catch (statErr) {
+        console.error('Revenue stats adjustment error (non-blocking):', statErr);
+      }
+    }
+
+    const updatedDoc = await orderRef.get();
+    res.json({
+      success: true,
+      order: { id: orderId, ...updatedDoc.data() },
+      amountDiff,
+      autoRefundCreated,
+      editEntry,
+    });
+
+    console.log(`Completed order ${orderId} items edited by ${userData.name || user.userId}. Amount diff: ${amountDiff}, Edit #${updateData.editCount}`);
+  } catch (error) {
+    console.error('Error editing completed order items:', error);
+    res.status(500).json({ error: error.message || 'Failed to edit completed order items' });
   }
 });
 

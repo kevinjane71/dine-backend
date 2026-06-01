@@ -833,7 +833,7 @@ function normalizePaymentMethod(method, order) {
   if (m === 'cash') return 'cash';
   if (['card', 'credit_card', 'debit_card'].includes(m)) return 'card';
   if (['upi', 'razorpay', 'phonepe', 'gpay', 'paytm'].includes(m)) return 'upi';
-  return 'other';
+  return m || 'other'; // Preserve custom method names (e.g. 'check', 'bank_transfer')
 }
 
 // ─── Helper: Normalize order/service type ────────────────────────────────────
@@ -1964,12 +1964,12 @@ router.get('/:orgId/payment-analytics', ...reportMiddleware, async (req, res) =>
             methodMap[method].amount += amount;
 
             if (hourKey) {
-              if (!hourlyMap[hourKey]) hourlyMap[hourKey] = { cash: 0, card: 0, upi: 0, other: 0, total: 0 };
+              if (!hourlyMap[hourKey]) hourlyMap[hourKey] = { total: 0 };
               hourlyMap[hourKey][method] = (hourlyMap[hourKey][method] || 0) + amount;
               hourlyMap[hourKey].total += amount;
             }
             if (dayKey) {
-              if (!dailyMap[dayKey]) dailyMap[dayKey] = { cash: 0, card: 0, upi: 0, total: 0 };
+              if (!dailyMap[dayKey]) dailyMap[dayKey] = { total: 0 };
               dailyMap[dayKey][method] = (dailyMap[dayKey][method] || 0) + amount;
               dailyMap[dayKey].total += amount;
             }
@@ -1981,12 +1981,12 @@ router.get('/:orgId/payment-analytics', ...reportMiddleware, async (req, res) =>
           methodMap[method].amount += revenue;
 
           if (hourKey) {
-            if (!hourlyMap[hourKey]) hourlyMap[hourKey] = { cash: 0, card: 0, upi: 0, other: 0, total: 0 };
+            if (!hourlyMap[hourKey]) hourlyMap[hourKey] = { total: 0 };
             hourlyMap[hourKey][method] = (hourlyMap[hourKey][method] || 0) + revenue;
             hourlyMap[hourKey].total += revenue;
           }
           if (dayKey) {
-            if (!dailyMap[dayKey]) dailyMap[dayKey] = { cash: 0, card: 0, upi: 0, total: 0 };
+            if (!dailyMap[dayKey]) dailyMap[dayKey] = { total: 0 };
             dailyMap[dayKey][method] = (dailyMap[dayKey][method] || 0) + revenue;
             dailyMap[dayKey].total += revenue;
           }
@@ -2004,13 +2004,28 @@ router.get('/:orgId/payment-analytics', ...reportMiddleware, async (req, res) =>
       avgValue: d.count > 0 ? round(d.amount / d.count) : 0,
     })).sort((a, b) => b.amount - a.amount);
 
+    // Collect all method keys seen across trends
+    const allMethods = new Set();
+    Object.values(hourlyMap).forEach(d => Object.keys(d).forEach(k => k !== 'total' && allMethods.add(k)));
+    Object.values(dailyMap).forEach(d => Object.keys(d).forEach(k => k !== 'total' && allMethods.add(k)));
+
     const hourlyTrend = Object.entries(hourlyMap)
       .sort(([a], [b]) => a.localeCompare(b))
-      .map(([hour, d]) => ({ hour, cash: round(d.cash || 0), card: round(d.card || 0), upi: round(d.upi || 0), other: round(d.other || 0), total: round(d.total) }));
+      .map(([hour, d]) => {
+        const entry = { hour };
+        allMethods.forEach(m => { entry[m] = round(d[m] || 0); });
+        entry.total = round(d.total);
+        return entry;
+      });
 
     const dailyTrend = Object.entries(dailyMap)
       .sort(([a], [b]) => a.localeCompare(b))
-      .map(([date, d]) => ({ date, cash: round(d.cash || 0), card: round(d.card || 0), upi: round(d.upi || 0), total: round(d.total) }));
+      .map(([date, d]) => {
+        const entry = { date };
+        allMethods.forEach(m => { entry[m] = round(d[m] || 0); });
+        entry.total = round(d.total);
+        return entry;
+      });
 
     return res.json({
       success: true,
