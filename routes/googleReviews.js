@@ -5,6 +5,7 @@ const { authenticateToken, requireOwnerRole } = require('../middleware/auth');
 const QRCode = require('qrcode');
 const OpenAI = require('openai');
 const { OAuth2Client } = require('google-auth-library');
+const { getCachedRestDoc } = require('../utils/kvCache');
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
@@ -85,7 +86,7 @@ async function getGbpAccountAndLocation(restaurantId, accessToken) {
     // Try to load restaurant data for matching
     let restaurantData = null;
     try {
-      const restaurantDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
+      const restaurantDoc = await getCachedRestDoc(db, collections.restaurants, restaurantId);
       if (restaurantDoc.exists) restaurantData = restaurantDoc.data();
     } catch (_) { /* ignore */ }
 
@@ -320,7 +321,7 @@ router.post('/generate-content/:restaurantId', authenticateToken, requireOwnerRo
     const { customerName, rating } = req.body;
 
     // Fetch restaurant details
-    const restaurantDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
+    const restaurantDoc = await getCachedRestDoc(db, collections.restaurants, restaurantId);
     if (!restaurantDoc.exists) {
       return res.status(404).json({ success: false, error: 'Restaurant not found' });
     }
@@ -924,7 +925,7 @@ router.post('/reviews/:restaurantId/generate-reply', authenticateToken, requireO
     // Fetch restaurant name
     let restaurantName = 'our restaurant';
     try {
-      const restaurantDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
+      const restaurantDoc = await getCachedRestDoc(db, collections.restaurants, restaurantId);
       if (restaurantDoc.exists) {
         restaurantName = restaurantDoc.data().name || restaurantName;
       }

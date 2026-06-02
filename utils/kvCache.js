@@ -116,6 +116,19 @@ function invalidateRestaurantCache(restaurantId) {
   kvDel(`restaurant:${restaurantId}`).catch(() => {});
 }
 
+/**
+ * Drop-in replacement for db.collection('restaurants').doc(id).get()
+ * Returns a Firestore-doc-like object: { exists, data(), id }
+ * Safe for READ-ONLY use. Do NOT use when you need .ref for writes.
+ */
+async function getCachedRestDoc(db, collection, restaurantId) {
+  const result = await getCachedRestaurant(db, collection, restaurantId);
+  if (result.fromCache) {
+    return { exists: !!result.data, data: () => result.data, id: restaurantId };
+  }
+  return result.doc;
+}
+
 function invalidateUserCache(userId) {
   kvDel(`user:${userId}`).catch(() => {});
 }
@@ -165,6 +178,7 @@ module.exports = {
   kvSet,
   kvDel,
   getCachedRestaurant,
+  getCachedRestDoc,
   invalidateRestaurantCache,
   invalidateUserCache,
   cacheCustomerByPhone,

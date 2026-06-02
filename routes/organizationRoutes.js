@@ -4,6 +4,7 @@ const { db, collections } = require('../firebase');
 const { authenticateToken, requireOwnerRole } = require('../middleware/auth');
 const { requireOrgAccess, getOwnerId, getOrgOutlets, requireOrgMember } = require('../middleware/orgAccess');
 const { pushTemplateToOutlets } = require('./centralMenuRoutes');
+const { getCachedRestDoc } = require('../utils/kvCache');
 
 // ============================================
 // ORGANIZATION / CHAIN MANAGEMENT APIs
@@ -29,7 +30,7 @@ router.post('/', authenticateToken, requireOwnerRole, async (req, res) => {
     // Verify all provided restaurants belong to this owner
     if (restaurantIds && restaurantIds.length > 0) {
       for (const rid of restaurantIds) {
-        const rDoc = await db.collection(collections.restaurants).doc(rid).get();
+        const rDoc = await getCachedRestDoc(db, collections.restaurants, rid);
         if (!rDoc.exists) {
           return res.status(400).json({ error: `Restaurant ${rid} not found` });
         }

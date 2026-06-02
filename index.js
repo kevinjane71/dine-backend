@@ -126,6 +126,22 @@ const { FieldValue } = require('firebase-admin/firestore');
 const performanceOptimizer = require('./middleware/performanceOptimizer');
 const firestoreOptimizer = require('./utils/firestoreOptimizer');
 const { kvGet, kvSet, kvDel, getCachedRestaurant, invalidateRestaurantCache, invalidateUserCache } = require('./utils/kvCache');
+
+/**
+ * Cached restaurant doc read — returns a Firestore-doc-like object.
+ * Uses Redis cache (3 min TTL) + automatic invalidation on writes.
+ * DO NOT use this when you need .ref for writes — use direct Firestore read instead.
+ */
+async function getCachedRestDoc(restaurantId) {
+  const result = await getCachedRestaurant(db, collections.restaurants, restaurantId);
+  if (result.fromCache) {
+    // Return a doc-like object with .exists, .data(), .id for cached data
+    return { exists: !!result.data, data: () => result.data, id: restaurantId };
+  }
+  // Return the real Firestore doc when cache missed (has .ref, .exists, .data(), etc.)
+  return result.doc;
+}
+
 const inventoryService = require('./services/inventoryService');
 const offerEngine = require('./services/offerEngine');
 // const pusherService = require('./services/pusherService'); // COMMENTED OUT — replaced by Firebase RTDB
@@ -890,7 +906,7 @@ async function generateSequentialOrderId(restaurantId) {
 async function getNextOrderId(restaurantId, restaurantDataOrNull) {
   let restaurantData = restaurantDataOrNull;
   if (!restaurantData) {
-    const restaurantDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
+    const restaurantDoc = await getCachedRestDoc(restaurantId);
     restaurantData = restaurantDoc.exists ? restaurantDoc.data() : {};
   }
   const useSequential = !!(restaurantData.orderSettings && restaurantData.orderSettings.sequentialOrderIdEnabled);
@@ -1455,7 +1471,7 @@ async function validateRestaurantAccess(userId, restaurantId) {
     }
 
     // Check 2: Owner in restaurants collection
-    const restaurantDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
+    const restaurantDoc = await getCachedRestDoc(restaurantId);
     if (restaurantDoc.exists) {
       const restaurant = restaurantDoc.data();
       if (restaurant.ownerId === userId) {
@@ -2053,7 +2069,7 @@ async function executeDeleteOperation(operation, restaurantId, userId) {
 // Get restaurant static data and FAQ
 async function getRestaurantStaticData(restaurantId) {
   try {
-    const restaurantDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
+    const restaurantDoc = await getCachedRestDoc(restaurantId);
     if (!restaurantDoc.exists) {
       return null;
     }
@@ -6006,7 +6022,7 @@ app.get('/api/restaurants', authenticateToken, async (req, res) => {
 
       // Fetch all restaurants in parallel and verify they belong to the same owner
       const rDocs = await Promise.all(
-        assignedRestaurantIds.map(rid => db.collection(collections.restaurants).doc(rid).get())
+        assignedRestaurantIds.map(rid => getCachedRestDoc(rid))
       );
       for (const rDoc of rDocs) {
         if (rDoc.exists) {
@@ -6020,7 +6036,7 @@ app.get('/api/restaurants', authenticateToken, async (req, res) => {
 
       // If no restaurants found via userRestaurants, fall back to primary restaurantId
       if (restaurants.length === 0 && restaurantId) {
-        const rDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
+        const rDoc = await getCachedRestDoc(restaurantId);
         if (rDoc.exists) {
           const rData = rDoc.data();
           // Safety: only add if restaurant belongs to same owner
@@ -6048,7 +6064,7 @@ app.get('/api/restaurants', authenticateToken, async (req, res) => {
       return res.json({ restaurants, defaultRestaurantId });
     } else if (isStaffUser && restaurantId) {
       // Non-admin staff see only their single assigned restaurant
-      const restaurantDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
+      const restaurantDoc = await getCachedRestDoc(restaurantId);
       if (restaurantDoc.exists) {
         const restaurantData = restaurantDoc.data();
         const { qrCode, menu, ...restaurantWithoutLargeData } = restaurantData;
@@ -6063,7 +6079,7 @@ app.get('/api/restaurants', authenticateToken, async (req, res) => {
       query = query.where('ownerId', '==', userId);
     } else if (restaurantId) {
       // Non-staff users with a restaurantId see only that restaurant
-      const restaurantDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
+      const restaurantDoc = await getCachedRestDoc(restaurantId);
       if (restaurantDoc.exists) {
         const restaurantData = restaurantDoc.data();
         const { qrCode, menu, ...restaurantWithoutLargeData } = restaurantData;
@@ -6256,7 +6272,7 @@ app.patch('/api/restaurants/:restaurantId', authenticateToken, async (req, res) 
     const updateData = {};
 
     // Only allow owner to update their own restaurants
-    const restaurant = await db.collection(collections.restaurants).doc(restaurantId).get();
+    const restaurant = await getCachedRestDoc(restaurantId);
     if (!restaurant.exists || restaurant.data().ownerId !== userId) {
       return res.status(403).json({ error: 'Access denied' });
     }
@@ -6417,7 +6433,7 @@ app.post('/api/restaurants/:restaurantId/sub-restaurants', authenticateToken, as
     if (!['shared', 'own'].includes(tableMode)) return res.status(400).json({ error: 'tableMode must be shared or own' });
 
     // Verify restaurant ownership
-    const restaurantDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
+    const restaurantDoc = await getCachedRestDoc(restaurantId);
     if (!restaurantDoc.exists) return res.status(404).json({ error: 'Restaurant not found' });
 
     const callerRole = req.user.role;
@@ -6468,7 +6484,7 @@ app.patch('/api/restaurants/:restaurantId/sub-restaurants/:subId', authenticateT
     const { name, description, menuMode, tableMode, assignedSections, assignedFloorIds, menu, status, sortOrder } = req.body;
 
     // Verify access
-    const restaurantDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
+    const restaurantDoc = await getCachedRestDoc(restaurantId);
     if (!restaurantDoc.exists) return res.status(404).json({ error: 'Restaurant not found' });
     const callerRole = req.user.role;
     if (callerRole !== 'owner' && callerRole !== 'admin') {
@@ -6512,7 +6528,7 @@ app.delete('/api/restaurants/:restaurantId/sub-restaurants/:subId', authenticate
   try {
     const { restaurantId, subId } = req.params;
 
-    const restaurantDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
+    const restaurantDoc = await getCachedRestDoc(restaurantId);
     if (!restaurantDoc.exists) return res.status(404).json({ error: 'Restaurant not found' });
     const callerRole = req.user.role;
     if (callerRole !== 'owner' && callerRole !== 'admin') {
@@ -6551,7 +6567,7 @@ app.post('/api/restaurants/:restaurantId/seed-default', authenticateToken, async
       return res.status(403).json({ error: 'Access denied' });
     }
 
-    const restaurantDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
+    const restaurantDoc = await getCachedRestDoc(restaurantId);
     if (!restaurantDoc.exists) {
       return res.status(404).json({ error: 'Restaurant not found' });
     }
@@ -7042,7 +7058,7 @@ app.get('/api/public/menu/:restaurantId', vercelSecurityMiddleware.publicAPI, as
 app.get('/api/menu-theme/:restaurantId', authenticateToken, async (req, res) => {
   try {
     const { restaurantId } = req.params;
-    const restaurantDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
+    const restaurantDoc = await getCachedRestDoc(restaurantId);
     
     if (!restaurantDoc.exists) {
       return res.status(404).json({ success: false, error: 'Restaurant not found' });
@@ -7082,7 +7098,7 @@ app.post('/api/menu-theme/:restaurantId', authenticateToken, async (req, res) =>
     const { restaurantId } = req.params;
     const { themeId, layoutId, headerImage } = req.body || {};
     
-    const restaurantDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
+    const restaurantDoc = await getCachedRestDoc(restaurantId);
     
     if (!restaurantDoc.exists) {
       return res.status(404).json({ success: false, error: 'Restaurant not found' });
@@ -7141,7 +7157,7 @@ app.get('/public/placeorder', vercelSecurityMiddleware.publicAPI, async (req, re
     // Sanitize seat to alnum/underscore/hyphen/space and truncate
     const seat = seatRaw ? seatRaw.replace(/[^\w\- ]/g, '').slice(0, 50) : '';
 
-    const restaurantDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
+    const restaurantDoc = await getCachedRestDoc(restaurantId);
     if (!restaurantDoc.exists) {
       return res.status(404).json({ success: false, error: 'Restaurant not found' });
     }
@@ -7299,7 +7315,7 @@ app.post('/api/menus/:restaurantId', authenticateToken, async (req, res) => {
     }
 
     // Get current restaurant data
-    const restaurantDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
+    const restaurantDoc = await getCachedRestDoc(restaurantId);
 
     if (!restaurantDoc.exists) {
       return res.status(404).json({ error: 'Restaurant not found' });
@@ -7480,7 +7496,7 @@ app.patch('/api/menus/item/:id', authenticateToken, async (req, res) => {
 
     // Fast path: single doc lookup when restaurantId provided
     if (hintRestaurantId) {
-      const rDoc = await db.collection(collections.restaurants).doc(hintRestaurantId).get();
+      const rDoc = await getCachedRestDoc(hintRestaurantId);
       if (rDoc.exists) {
         const item = (rDoc.data().menu?.items || []).find(item => item.id === id);
         if (item) { foundRestaurant = rDoc; foundItem = item; }
@@ -7680,7 +7696,7 @@ app.post('/api/menus/:restaurantId/item/:itemId/favorite', authenticateToken, as
     }
 
     // Get restaurant document
-    const restaurantDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
+    const restaurantDoc = await getCachedRestDoc(restaurantId);
     if (!restaurantDoc.exists) {
       return res.status(404).json({ error: 'Restaurant not found' });
     }
@@ -7742,7 +7758,7 @@ app.delete('/api/menus/:restaurantId/item/:itemId/favorite', authenticateToken, 
     }
 
     // Get restaurant document
-    const restaurantDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
+    const restaurantDoc = await getCachedRestDoc(restaurantId);
     if (!restaurantDoc.exists) {
       return res.status(404).json({ error: 'Restaurant not found' });
     }
@@ -7808,7 +7824,7 @@ app.delete('/api/menus/item/:id', authenticateToken, async (req, res) => {
 
     // Fast path: single doc lookup when restaurantId provided
     if (hintRestaurantId) {
-      const rDoc = await db.collection(collections.restaurants).doc(hintRestaurantId).get();
+      const rDoc = await getCachedRestDoc(hintRestaurantId);
       if (rDoc.exists) {
         const item = (rDoc.data().menu?.items || []).find(item => item.id === id);
         if (item) { foundRestaurant = rDoc; foundItem = item; }
@@ -7924,7 +7940,7 @@ app.delete('/api/menus/:restaurantId/bulk-delete', authenticateToken, async (req
     const { userId } = req.user;
 
     // Get the restaurant
-    const restaurantDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
+    const restaurantDoc = await getCachedRestDoc(restaurantId);
 
     if (!restaurantDoc.exists) {
       return res.status(404).json({ error: 'Restaurant not found' });
@@ -8018,7 +8034,7 @@ app.get('/api/public/bill/:token', vercelSecurityMiddleware.publicAPI, async (re
     const order = orderDoc.data();
 
     // Get restaurant info
-    const restDoc = await db.collection(collections.restaurants).doc(order.restaurantId).get();
+    const restDoc = await getCachedRestDoc(order.restaurantId);
     const restaurant = restDoc.exists ? restDoc.data() : {};
 
     // Return only safe public fields (no internal IDs, no customer email, etc.)
@@ -8109,7 +8125,7 @@ app.post('/api/public/orders/:restaurantId', vercelSecurityMiddleware.publicAPI,
     }
 
     // Check if restaurant exists (need this early for loginMode check)
-    const restaurantDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
+    const restaurantDoc = await getCachedRestDoc(restaurantId);
     if (!restaurantDoc.exists) {
       return res.status(404).json({ error: 'Restaurant not found' });
     }
@@ -8912,7 +8928,7 @@ app.post('/api/orders', async (req, res) => {
     let tableFloorData = null;
 
     // Get restaurant document to access embedded menu items
-    const restaurantDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
+    const restaurantDoc = await getCachedRestDoc(restaurantId);
     if (!restaurantDoc.exists) {
       return res.status(404).json({ error: 'Restaurant not found' });
     }
@@ -12070,7 +12086,7 @@ app.patch('/api/orders/:orderId/status', authenticateToken, async (req, res) => 
     );
 
     if (status === 'confirmed' || status === 'completed') {
-      const restaurantDoc = await db.collection(collections.restaurants).doc(orderData.restaurantId).get();
+      const restaurantDoc = await getCachedRestDoc(orderData.restaurantId);
       const printSettings = restaurantDoc.exists ? (restaurantDoc.data().printSettings || {}) : {};
 
       if (status === 'confirmed' && printSettings.kotPrinterEnabled !== false && printSettings.usePusherForKOT === true) {
@@ -12152,7 +12168,7 @@ app.patch('/api/orders/:orderId/status', authenticateToken, async (req, res) => 
     if (status === 'completed') {
       (async () => {
         try {
-          const restDoc = await db.collection(collections.restaurants).doc(orderData.restaurantId).get();
+          const restDoc = await getCachedRestDoc(orderData.restaurantId);
           const bSettings = restDoc.exists ? (restDoc.data().billingSettings || {}) : {};
           if (!bSettings.whatsappBillingEnabled) return;
 
@@ -12248,7 +12264,7 @@ app.patch('/api/orders/:orderId/status', authenticateToken, async (req, res) => 
     if (status === 'completed') {
       (async () => {
         try {
-          const restDoc2 = await db.collection(collections.restaurants).doc(orderData.restaurantId).get();
+          const restDoc2 = await getCachedRestDoc(orderData.restaurantId);
           if (!restDoc2.exists) return;
           const ownerId = restDoc2.data().ownerId;
           if (!ownerId) return;
@@ -12553,7 +12569,7 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
 
     if (items) {
       // Fetch restaurant menu data for server-side price resolution
-      const restaurantDoc = await db.collection(collections.restaurants).doc(currentOrder.restaurantId).get();
+      const restaurantDoc = await getCachedRestDoc(currentOrder.restaurantId);
       const restaurantData = restaurantDoc.exists ? restaurantDoc.data() : {};
       const menuItems = restaurantData?.menu?.items || [];
       const multiPricing = restaurantData?.pricingSettings?.multiPricing;
@@ -12849,7 +12865,7 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
       // Load offer settings
       let offerSettingsData = { allowMultipleOffers: false, maxOffersAllowed: 1 };
       try {
-        const restDoc = await db.collection(collections.restaurants).doc(currentOrder.restaurantId).get();
+        const restDoc = await getCachedRestDoc(currentOrder.restaurantId);
         if (restDoc.exists) {
           const cas = restDoc.data().customerAppSettings || {};
           offerSettingsData = cas.offerSettings || offerSettingsData;
@@ -12929,7 +12945,7 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
     // Loyalty points — server-side calculation when completing order
     if (redeemLoyaltyPointsVal > 0 && status === 'completed') {
       try {
-        const restDoc = await db.collection(collections.restaurants).doc(currentOrder.restaurantId).get();
+        const restDoc = await getCachedRestDoc(currentOrder.restaurantId);
         const cas = restDoc.exists ? (restDoc.data().customerAppSettings || {}) : {};
         const loyaltySettings = cas.loyaltySettings || {};
 
@@ -12987,7 +13003,7 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
     } else if (status === 'completed') {
       // No redemption but still calculate earnings
       try {
-        const restDoc = await db.collection(collections.restaurants).doc(currentOrder.restaurantId).get();
+        const restDoc = await getCachedRestDoc(currentOrder.restaurantId);
         const cas = restDoc.exists ? (restDoc.data().customerAppSettings || {}) : {};
         const loyaltySettings = cas.loyaltySettings || {};
         const custId = req.body.customerId || currentOrder.customerId;
@@ -13025,7 +13041,7 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
 
     // Calculate tax on discounted amount
     try {
-      const taxRestDoc = await db.collection(collections.restaurants).doc(currentOrder.restaurantId).get();
+      const taxRestDoc = await getCachedRestDoc(currentOrder.restaurantId);
       if (taxRestDoc.exists) {
         const taxRestData = taxRestDoc.data();
         const taxSettings = taxRestData.taxSettings || getDefaultTaxSettings(taxRestData);
@@ -13425,7 +13441,7 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
     }
 
     // Update daily analytics stats (fire-and-forget)
-    const nonCountedStatuses = ['saved', 'cancelled', 'deleted'];
+    const nonCountedStatuses = ['saved', 'cancelled', 'deleted', 'refunded'];
     const prevCounted = !nonCountedStatuses.includes(currentOrder.status);
     const newStatus = status || currentOrder.status;
     const nowCounted = !nonCountedStatuses.includes(newStatus);
@@ -13668,7 +13684,7 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
           kotPrinted: false
         });
 
-        const restaurantDoc = await db.collection(collections.restaurants).doc(currentOrder.restaurantId).get();
+        const restaurantDoc = await getCachedRestDoc(currentOrder.restaurantId);
         const printSettings = restaurantDoc.exists ? (restaurantDoc.data().printSettings || {}) : {};
 
         if (printSettings.kotPrinterEnabled !== false && printSettings.usePusherForKOT === true) {
@@ -13708,7 +13724,7 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
     // If status changed to completed, trigger billing print
     if (status === 'completed' && currentOrder.status !== 'completed') {
       try {
-        const restaurantDoc = await db.collection(collections.restaurants).doc(currentOrder.restaurantId).get();
+        const restaurantDoc = await getCachedRestDoc(currentOrder.restaurantId);
         const printSettings = restaurantDoc.exists ? (restaurantDoc.data().printSettings || {}) : {};
 
         if (printSettings.kotPrinterEnabled !== false && printSettings.usePusherForKOT === true) {
@@ -13833,7 +13849,7 @@ app.post('/api/orders/:orderId/manual-print', authenticateToken, async (req, res
     const shouldPrintBill = printType === 'bill' || order.status === 'completed';
 
     // Get restaurant info for print settings
-    const restaurantDoc = await db.collection(collections.restaurants).doc(order.restaurantId).get();
+    const restaurantDoc = await getCachedRestDoc(order.restaurantId);
     const restaurantData = restaurantDoc.exists ? restaurantDoc.data() : {};
     const printSettings = restaurantData.printSettings || {};
 
@@ -13970,7 +13986,7 @@ app.delete('/api/orders/:orderId', authenticateToken, async (req, res) => {
     const order = orderDoc.data();
 
     // Fetch restaurant document (reused for setting check + role verification below)
-    const restaurantDoc = await db.collection(collections.restaurants).doc(order.restaurantId).get();
+    const restaurantDoc = await getCachedRestDoc(order.restaurantId);
     const restaurantData = restaurantDoc.exists ? restaurantDoc.data() : null;
 
     // Check if order deletion is enabled for this restaurant (super-admin setting)
@@ -14152,7 +14168,7 @@ app.post('/api/public/delete-order', async (req, res) => {
     }
     const order = orderDoc.data();
     // Update daily analytics stats before hard delete (fire-and-forget) — only if order was counted
-    const _nonCountedStatuses = ['saved', 'cancelled', 'deleted'];
+    const _nonCountedStatuses = ['saved', 'cancelled', 'deleted', 'refunded'];
     if (!_nonCountedStatuses.includes(order.status)) {
       updateDailyStats(order.restaurantId, order, 'delete', parseTZ(req));
     }
@@ -14663,7 +14679,7 @@ app.post('/api/menus/bulk-upload/:restaurantId', authenticateToken, chatgptUsage
       return res.status(403).json({ error: 'Access denied' });
     }
 
-    const restaurant = await db.collection(collections.restaurants).doc(restaurantId).get();
+    const restaurant = await getCachedRestDoc(restaurantId);
     if (!restaurant.exists) {
       return res.status(404).json({ error: 'Restaurant not found' });
     }
@@ -14863,7 +14879,7 @@ app.post('/api/menus/bulk-save/:restaurantId', authenticateToken, async (req, re
       return res.status(403).json({ error: 'Access denied' });
     }
 
-    const restaurantDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
+    const restaurantDoc = await getCachedRestDoc(restaurantId);
     if (!restaurantDoc.exists) {
       return res.status(404).json({ error: 'Restaurant not found' });
     }
@@ -15066,7 +15082,7 @@ app.get('/api/menus/upload-status/:restaurantId', authenticateToken, async (req,
     const { userId } = req.user;
 
     // Check if user owns the restaurant
-    const restaurant = await db.collection(collections.restaurants).doc(restaurantId).get();
+    const restaurant = await getCachedRestDoc(restaurantId);
     if (!restaurant.exists || restaurant.data().ownerId !== userId) {
       return res.status(403).json({ error: 'Access denied' });
     }
@@ -16736,19 +16752,24 @@ app.get('/api/analytics/:restaurantId', authenticateToken, async (req, res) => {
     let totalRevenue = 0;
     let totalOrders = 0;
     const dailyStats = {};
+    const nonCountedStatuses = ['cancelled', 'deleted', 'saved', 'refunded'];
 
     ordersSnapshot.forEach(doc => {
       const order = doc.data();
+      if (nonCountedStatuses.includes(order.status)) return;
+
       const date = order.createdAt.toDate().toDateString();
+      const refundAdj = order.refundAmount || 0;
+      const revenue = (order.totalAmount || 0) - refundAdj;
 
       totalOrders++;
-      totalRevenue += order.totalAmount;
+      totalRevenue += revenue;
 
       if (!dailyStats[date]) {
         dailyStats[date] = { orders: 0, revenue: 0 };
       }
       dailyStats[date].orders++;
-      dailyStats[date].revenue += order.totalAmount;
+      dailyStats[date].revenue += revenue;
     });
 
     res.json({
@@ -17223,7 +17244,7 @@ app.post('/api/staff/:staffId/restaurants', authenticateToken, requireOwnerRole,
     }
 
     // Verify restaurant belongs to this owner (admin uses ownerId from JWT)
-    const restDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
+    const restDoc = await getCachedRestDoc(restaurantId);
     if (!restDoc.exists) return res.status(404).json({ error: 'Restaurant not found' });
     const callerOwnerId = req.user.role === 'admin' ? req.user.ownerId : req.user.userId;
     if (restDoc.data().ownerId !== callerOwnerId) {
@@ -17317,7 +17338,7 @@ app.get('/api/staff/:staffId/restaurants', authenticateToken, requireOwnerRole, 
     const restaurantIds = assignments.docs.map(d => d.data().restaurantId).filter(Boolean);
     const restaurants = [];
     const rDocs = await Promise.all(
-      restaurantIds.map(rid => db.collection(collections.restaurants).doc(rid).get())
+      restaurantIds.map(rid => getCachedRestDoc(rid))
     );
     for (const rDoc of rDocs) {
       if (rDoc.exists) {
@@ -17574,7 +17595,7 @@ app.get('/api/user/profile', authenticateToken, async (req, res) => {
     let ownerData = null;
     
     if (userData.restaurantId) {
-      const restaurantDoc = await db.collection(collections.restaurants).doc(userData.restaurantId).get();
+      const restaurantDoc = await getCachedRestDoc(userData.restaurantId);
       if (restaurantDoc.exists) {
         restaurantData = restaurantDoc.data();
         
@@ -17654,7 +17675,7 @@ app.post('/api/auth/staff/login', async (req, res) => {
     }
 
     // Get restaurant details
-    const restaurantDoc = await db.collection(collections.restaurants).doc(staffData.restaurantId).get();
+    const restaurantDoc = await getCachedRestDoc(staffData.restaurantId);
     const restaurantData = restaurantDoc.exists ? restaurantDoc.data() : null;
 
     // Get owner details from restaurant
@@ -17681,7 +17702,7 @@ app.post('/api/auth/staff/login', async (req, res) => {
         multiRestaurant = true;
         // Fetch restaurant details for each
         const restDocs = await Promise.all(
-          [...restaurantIds].map(rid => db.collection(collections.restaurants).doc(rid).get())
+          [...restaurantIds].map(rid => getCachedRestDoc(rid))
         );
         staffRestaurants = restDocs
           .filter(d => d.exists)
@@ -17816,7 +17837,7 @@ app.post('/api/auth/staff/switch-restaurant', authenticateToken, async (req, res
     }
 
     // Fetch the target restaurant
-    const restaurantDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
+    const restaurantDoc = await getCachedRestDoc(restaurantId);
     if (!restaurantDoc.exists) {
       return res.status(404).json({ error: 'Restaurant not found' });
     }
@@ -18561,7 +18582,7 @@ app.get('/api/admin/print-settings/:restaurantId', authenticateToken, async (req
       return res.status(403).json({ error: 'Access denied to Print settings.' });
     }
 
-    const restaurantDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
+    const restaurantDoc = await getCachedRestDoc(restaurantId);
     if (!restaurantDoc.exists) {
       return res.status(404).json({ error: 'Restaurant not found' });
     }
@@ -18788,7 +18809,7 @@ app.get('/api/admin/print-stations/:restaurantId', authenticateToken, async (req
       return res.status(403).json({ error: 'Access denied. Print settings permission required.' });
     }
     const { restaurantId } = req.params;
-    const restaurantDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
+    const restaurantDoc = await getCachedRestDoc(restaurantId);
     if (!restaurantDoc.exists) {
       return res.status(404).json({ error: 'Restaurant not found' });
     }
@@ -19617,7 +19638,7 @@ app.get('/api/kot/pending-print/:restaurantId', async (req, res) => {
     console.log(`🖨️ KOT Print API - Getting pending print orders for restaurant: ${restaurantId}, maxHours: ${maxHours || 4}`);
 
     // Fetch restaurant's print settings
-    const restaurantDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
+    const restaurantDoc = await getCachedRestDoc(restaurantId);
     const printSettings = restaurantDoc.exists ? (restaurantDoc.data().printSettings || {}) : {};
 
     // Default values (backward compatible - all defaults enable existing behavior)
@@ -19808,7 +19829,7 @@ app.patch('/api/kot/:orderId/printed', async (req, res) => {
 
       // Check if ALL enabled stations are now printed
       const orderData = orderDoc.data();
-      const restaurantDoc = await db.collection(collections.restaurants).doc(orderData.restaurantId).get();
+      const restaurantDoc = await getCachedRestDoc(orderData.restaurantId);
       const printStations = restaurantDoc.exists ? (restaurantDoc.data().printStations || []) : [];
       const enabledStations = printStations.filter(s => s.enabled);
 
@@ -19851,7 +19872,7 @@ app.get('/api/billing/pending-print/:restaurantId', async (req, res) => {
     console.log(`🧾 Billing Print API - Getting pending billing prints for restaurant: ${restaurantId}, maxHours: ${maxHours || 4}`);
 
     // Fetch restaurant's print settings
-    const restaurantDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
+    const restaurantDoc = await getCachedRestDoc(restaurantId);
     const printSettings = restaurantDoc.exists ? (restaurantDoc.data().printSettings || {}) : {};
 
     // Default values (backward compatible)
@@ -19997,7 +20018,7 @@ app.get('/api/restaurant/info/:restaurantId', async (req, res) => {
   try {
     const { restaurantId } = req.params;
 
-    const restaurantDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
+    const restaurantDoc = await getCachedRestDoc(restaurantId);
 
     if (!restaurantDoc.exists) {
       return res.status(404).json({ error: 'Restaurant not found' });
@@ -20384,7 +20405,7 @@ app.get('/api/bill/render/:restaurantId/:orderId', async (req, res) => {
 
     const [orderDoc, restaurantDoc] = await Promise.all([
       db.collection(collections.orders).doc(orderId).get(),
-      db.collection(collections.restaurants).doc(restaurantId).get()
+      getCachedRestDoc(restaurantId)
     ]);
 
     if (!orderDoc.exists) return res.status(404).json({ error: 'Order not found' });
@@ -20411,7 +20432,7 @@ app.get('/api/kot/render/:restaurantId/:orderId', async (req, res) => {
 
     const [orderDoc, restaurantDoc] = await Promise.all([
       db.collection(collections.orders).doc(orderId).get(),
-      db.collection(collections.restaurants).doc(restaurantId).get()
+      getCachedRestDoc(restaurantId)
     ]);
 
     if (!orderDoc.exists) return res.status(404).json({ error: 'Order not found' });
@@ -20514,7 +20535,7 @@ app.get('/api/token/render/:restaurantId/:orderId', async (req, res) => {
 
     const [orderDoc, restaurantDoc] = await Promise.all([
       db.collection(collections.orders).doc(orderId).get(),
-      db.collection(collections.restaurants).doc(restaurantId).get()
+      getCachedRestDoc(restaurantId)
     ]);
 
     if (!orderDoc.exists) return res.status(404).json({ error: 'Order not found' });
@@ -20819,7 +20840,7 @@ app.patch('/api/orders/:orderId/cancel', authenticateToken, async (req, res) => 
     // Non-blocking WhatsApp notification to owner on cancel (if enabled)
     (async () => {
       try {
-        const restDoc = await db.collection(collections.restaurants).doc(orderData.restaurantId).get();
+        const restDoc = await getCachedRestDoc(orderData.restaurantId);
         if (!restDoc.exists) return;
         const restData = restDoc.data();
         if (!restData.orderSettings?.notifyOwnerOnCancelWhatsApp) return;
@@ -20948,7 +20969,7 @@ app.post('/api/voice/process-order', authenticateToken, aiUsageLimiter.middlewar
     console.log('🎤 Voice order processing:', { transcript, restaurantId });
 
     // Get menu items from restaurant document (menu is stored in restaurant.menu.items)
-    const restaurantDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
+    const restaurantDoc = await getCachedRestDoc(restaurantId);
     
     if (!restaurantDoc.exists) {
       return res.status(404).json({ error: 'Restaurant not found' });
@@ -21104,7 +21125,7 @@ app.post('/api/voice/smart-process', authenticateToken, aiUsageLimiter.middlewar
     });
 
     // Get menu items from restaurant
-    const restaurantDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
+    const restaurantDoc = await getCachedRestDoc(restaurantId);
 
     if (!restaurantDoc.exists) {
       return res.status(404).json({ error: 'Restaurant not found' });
@@ -22222,7 +22243,7 @@ app.post('/api/inventory/:restaurantId/quick-order', authenticateToken, aiUsageL
     }
 
     // Load restaurant menu items
-    const restaurantDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
+    const restaurantDoc = await getCachedRestDoc(restaurantId);
     if (!restaurantDoc.exists) {
       return res.status(404).json({ error: 'Restaurant not found' });
     }
@@ -24080,7 +24101,7 @@ app.post('/api/inventory/:restaurantId/smart-import/parse', authenticateToken, a
     // Load existing inventory items and menu for duplicate detection
     const [inventorySnap, restaurantDoc] = await Promise.all([
       db.collection(collections.inventory).where('restaurantId', '==', restaurantId).get(),
-      db.collection(collections.restaurants).doc(restaurantId).get()
+      getCachedRestDoc(restaurantId)
     ]);
 
     if (!restaurantDoc.exists) {
@@ -24465,7 +24486,7 @@ app.post('/api/inventory/:restaurantId/smart-import/confirm', authenticateToken,
     }
 
     // 2. Add menu categories
-    const restaurantDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
+    const restaurantDoc = await getCachedRestDoc(restaurantId);
     if (!restaurantDoc.exists) {
       return res.status(404).json({ error: 'Restaurant not found' });
     }
@@ -25442,7 +25463,7 @@ app.post('/api/purchase-orders/:restaurantId/:orderId/email', authenticateToken,
     const orderData = orderDoc.data();
     
     // Get restaurant details
-    const restaurantDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
+    const restaurantDoc = await getCachedRestDoc(restaurantId);
     const restaurantData = restaurantDoc.exists ? restaurantDoc.data() : {};
 
     // Generate purchase order invoice HTML
@@ -28399,7 +28420,7 @@ app.put('/api/admin/settings/:restaurantId/status', authenticateToken, async (re
 // ── Helper: Sync POS customer to Invoice module (inv_customers) ──
 async function syncCustomerToInvModule(db, collections, { restaurantId, name, phone, email }) {
   try {
-    const restDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
+    const restDoc = await getCachedRestDoc(restaurantId);
     if (!restDoc.exists) return;
     const ownerId = restDoc.data().ownerId;
     if (!ownerId) return;
@@ -28680,7 +28701,7 @@ app.get('/api/customers/reports', authenticateToken, async (req, res) => {
 
     // Verify ownership for all requested restaurants
     const restaurantDocs = await Promise.all(
-      restaurantIds.map(id => db.collection(collections.restaurants).doc(id).get())
+      restaurantIds.map(id => getCachedRestDoc(id))
     );
     const restaurantNames = {};
     for (const doc of restaurantDocs) {
@@ -28842,7 +28863,7 @@ app.get('/api/customers/:restaurantId', authenticateToken, async (req, res) => {
     const search = (req.query.search || '').trim().toLowerCase();
 
     // Verify user has access to this restaurant
-    const restaurant = await db.collection(collections.restaurants).doc(restaurantId).get();
+    const restaurant = await getCachedRestDoc(restaurantId);
     if (!restaurant.exists || restaurant.data().ownerId !== userId) {
       return res.status(403).json({ error: 'Access denied' });
     }
@@ -28965,7 +28986,7 @@ app.get('/api/customers/detail/:customerId', authenticateToken, async (req, res)
     const customerData = customerDoc.data();
 
     // Verify user has access to this customer's restaurant
-    const restaurant = await db.collection(collections.restaurants).doc(customerData.restaurantId).get();
+    const restaurant = await getCachedRestDoc(customerData.restaurantId);
     if (!restaurant.exists || restaurant.data().ownerId !== userId) {
       return res.status(403).json({ error: 'Access denied' });
     }
@@ -28994,7 +29015,7 @@ app.patch('/api/customers/:customerId', authenticateToken, async (req, res) => {
     }
 
     const customerData = customerDoc.data();
-    const restaurant = await db.collection(collections.restaurants).doc(customerData.restaurantId).get();
+    const restaurant = await getCachedRestDoc(customerData.restaurantId);
     if (!restaurant.exists || restaurant.data().ownerId !== userId) {
       return res.status(403).json({ error: 'Access denied' });
     }
@@ -29044,7 +29065,7 @@ app.delete('/api/customers/:customerId', authenticateToken, async (req, res) => 
     }
 
     const customerData = customerDoc.data();
-    const restaurant = await db.collection(collections.restaurants).doc(customerData.restaurantId).get();
+    const restaurant = await getCachedRestDoc(customerData.restaurantId);
     if (!restaurant.exists || restaurant.data().ownerId !== userId) {
       return res.status(403).json({ error: 'Access denied' });
     }
@@ -29088,7 +29109,7 @@ app.post('/api/customers/bulk-import', authenticateToken, async (req, res) => {
     }
     let hasAccess = userData.restaurantId === restaurantId;
     if (!hasAccess) {
-      const restDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
+      const restDoc = await getCachedRestDoc(restaurantId);
       if (restDoc.exists && restDoc.data().ownerId === userId) hasAccess = true;
     }
     if (!hasAccess) {
@@ -29232,7 +29253,7 @@ app.post('/api/customers/bulk-delete', authenticateToken, async (req, res) => {
       if (!firstCustDoc.exists) return res.status(404).json({ error: 'Customer not found' });
       restaurantId = firstCustDoc.data().restaurantId;
       // Verify owner owns this restaurant
-      const restDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
+      const restDoc = await getCachedRestDoc(restaurantId);
       if (!restDoc.exists || restDoc.data().ownerId !== userId) {
         return res.status(403).json({ error: 'Access denied' });
       }
@@ -29306,7 +29327,7 @@ app.get('/api/offers/:restaurantId', authenticateToken, async (req, res) => {
     const { userId } = req.user;
 
     // Verify user has access to this restaurant
-    const restaurant = await db.collection(collections.restaurants).doc(restaurantId).get();
+    const restaurant = await getCachedRestDoc(restaurantId);
     if (!restaurant.exists || restaurant.data().ownerId !== userId) {
       return res.status(403).json({ error: 'Access denied' });
     }
@@ -30057,7 +30078,7 @@ app.get('/api/offers/:restaurantId/active', authenticateToken, async (req, res) 
       .get();
 
     // Also fetch offers targeting 'all' restaurants from same owner
-    const restaurant = await db.collection(collections.restaurants).doc(restaurantId).get();
+    const restaurant = await getCachedRestDoc(restaurantId);
     const ownerId = restaurant.exists ? restaurant.data().ownerId : null;
     let crossRestaurantOffers = [];
     if (ownerId) {
@@ -30316,7 +30337,7 @@ app.post('/api/offers/:restaurantId', authenticateToken, async (req, res) => {
     } = req.body;
 
     // Verify user has access to this restaurant
-    const restaurant = await db.collection(collections.restaurants).doc(restaurantId).get();
+    const restaurant = await getCachedRestDoc(restaurantId);
     if (!restaurant.exists || restaurant.data().ownerId !== userId) {
       return res.status(403).json({ error: 'Access denied' });
     }
@@ -30406,7 +30427,7 @@ app.put('/api/offers/:restaurantId/:offerId', authenticateToken, async (req, res
     const updateData = req.body;
 
     // Verify user has access to this restaurant
-    const restaurant = await db.collection(collections.restaurants).doc(restaurantId).get();
+    const restaurant = await getCachedRestDoc(restaurantId);
     if (!restaurant.exists || restaurant.data().ownerId !== userId) {
       return res.status(403).json({ error: 'Access denied' });
     }
@@ -30478,7 +30499,7 @@ app.delete('/api/offers/:restaurantId/:offerId', authenticateToken, async (req, 
     const { userId } = req.user;
 
     // Verify user has access to this restaurant
-    const restaurant = await db.collection(collections.restaurants).doc(restaurantId).get();
+    const restaurant = await getCachedRestDoc(restaurantId);
     if (!restaurant.exists || restaurant.data().ownerId !== userId) {
       return res.status(403).json({ error: 'Access denied' });
     }
@@ -31017,7 +31038,7 @@ app.post('/api/billing/validate-manager-pin', authenticateToken, async (req, res
       return res.status(400).json({ error: 'Restaurant ID and PIN are required' });
     }
 
-    const restaurantDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
+    const restaurantDoc = await getCachedRestDoc(restaurantId);
     if (!restaurantDoc.exists) {
       return res.status(404).json({ error: 'Restaurant not found' });
     }
@@ -31435,7 +31456,7 @@ app.patch('/api/orders/:orderId/edit-completed-items', authenticateToken, async 
     }
 
     // PIN check
-    const restaurantDoc = await db.collection(collections.restaurants).doc(currentOrder.restaurantId).get();
+    const restaurantDoc = await getCachedRestDoc(currentOrder.restaurantId);
     const restaurantData = restaurantDoc.exists ? restaurantDoc.data() : {};
     const posSettings = restaurantData.posSettings || {};
     if (posSettings.requirePinForCompletedOrderEdit) {
@@ -32501,7 +32522,7 @@ app.post('/api/categories/:restaurantId', authenticateToken, async (req, res) =>
     }
 
     // Get restaurant document
-    const restaurantDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
+    const restaurantDoc = await getCachedRestDoc(restaurantId);
     if (!restaurantDoc.exists) {
       return res.status(404).json({ error: 'Restaurant not found' });
     }
@@ -32557,7 +32578,7 @@ app.patch('/api/categories/:restaurantId/:categoryId', authenticateToken, async 
     const { name, emoji, description, taxGroupId } = req.body;
 
     // Get restaurant document
-    const restaurantDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
+    const restaurantDoc = await getCachedRestDoc(restaurantId);
     if (!restaurantDoc.exists) {
       return res.status(404).json({ error: 'Restaurant not found' });
     }
@@ -32611,7 +32632,7 @@ app.delete('/api/categories/:restaurantId/:categoryId', authenticateToken, async
     const { restaurantId, categoryId } = req.params;
 
     // Get restaurant document
-    const restaurantDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
+    const restaurantDoc = await getCachedRestDoc(restaurantId);
     if (!restaurantDoc.exists) {
       return res.status(404).json({ error: 'Restaurant not found' });
     }
@@ -32788,7 +32809,7 @@ app.post('/api/dinebot/query', vercelSecurityMiddleware.chatbotAPI, chatgptUsage
         return { orders };
       },
       getMenu: async (restaurantId) => {
-        const restaurantDoc = await db.collection('restaurants').doc(restaurantId).get();
+        const restaurantDoc = await getCachedRestDoc(restaurantId);
         if (restaurantDoc.exists) {
           const restaurantData = restaurantDoc.data();
           return { menuItems: restaurantData.menu?.items || [] };
@@ -32941,7 +32962,7 @@ app.post('/api/email/weekly-analytics', authenticateToken, async (req, res) => {
     }
 
     // Get restaurant data
-    const restaurantDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
+    const restaurantDoc = await getCachedRestDoc(restaurantId);
     if (!restaurantDoc.exists) {
       return res.status(404).json({
         success: false,
@@ -33865,7 +33886,7 @@ app.post('/api/automation/:restaurantId/coupons/validate', authenticateToken, as
     }
 
     // Check if coupons are enabled for this restaurant
-    const restaurantDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
+    const restaurantDoc = await getCachedRestDoc(restaurantId);
     if (restaurantDoc.exists) {
       const customerAppSettings = restaurantDoc.data()?.customerAppSettings || {};
       if (!(customerAppSettings.offerSettings?.couponsEnabled)) {

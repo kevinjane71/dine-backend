@@ -7,6 +7,7 @@ const { authenticateToken } = require('../middleware/auth');
 const admin = require('firebase-admin');
 // const pusherService = require('../services/pusherService'); // COMMENTED OUT — replaced by Firebase RTDB
 const pusherService = require('../services/firebaseRealtimeService');
+const { getCachedRestDoc } = require('../utils/kvCache');
 
 const COLLECTION = 'customerGroups';
 const FieldValue = admin.firestore.FieldValue;
@@ -31,7 +32,7 @@ function sanitizeGroupInput(body = {}) {
 
 async function ensureRestaurantOwnership(req, restaurantId) {
   const userId = req.user.userId || req.user.id;
-  const snap = await db.collection(collections.restaurants).doc(restaurantId).get();
+  const snap = await getCachedRestDoc(db, collections.restaurants, restaurantId);
   if (!snap.exists) return { ok: false, code: 404, error: 'Restaurant not found' };
   const data = snap.data();
   // owners + staff with same restaurant access (loose check; downstream APIs do similar)

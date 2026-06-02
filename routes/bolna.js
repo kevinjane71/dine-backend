@@ -8,6 +8,7 @@ const router = express.Router();
 const bolnaService = require('../services/bolna/BolnaService');
 const { authenticateToken, requireOwnerRole } = require('../middleware/auth');
 const { getDb, collections } = require('../firebase');
+const { getCachedRestDoc } = require('../utils/kvCache');
 
 // ==================== Setup Endpoints (Authenticated) ====================
 
@@ -34,7 +35,7 @@ router.post('/bolna/setup', authenticateToken, async (req, res) => {
 
     // Get restaurant data
     const db = getDb();
-    const restaurantDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
+    const restaurantDoc = await getCachedRestDoc(getDb(), collections.restaurants, restaurantId);
     if (!restaurantDoc.exists) {
       return res.status(404).json({ success: false, error: 'Restaurant not found' });
     }

@@ -3,6 +3,7 @@ const router = express.Router();
 const { db, collections } = require('../firebase');
 const { authenticateToken, requireOwnerRole } = require('../middleware/auth');
 const { requireOrgAccess, requireOrgFeature, isRestaurantInOrg, getOrgOutlets, getOwnerId } = require('../middleware/orgAccess');
+const { getCachedRestDoc } = require('../utils/kvCache');
 
 // All routes require authentication, owner role, org access, and centralizedMenu feature
 router.use('/:orgId', authenticateToken, requireOwnerRole, requireOrgAccess, requireOrgFeature('centralizedMenu'));
@@ -779,7 +780,7 @@ router.get('/:orgId/sync-status', async (req, res) => {
     for (const outlet of outlets) {
       const outletId = outlet.id;
       if (!outletId) continue;
-      const restaurantDoc = await db.collection(collections.restaurants).doc(outletId).get();
+      const restaurantDoc = await getCachedRestDoc(db, collections.restaurants, outletId);
 
       if (!restaurantDoc.exists) {
         outletStatuses.push({ outletId, status: 'error', error: 'Restaurant not found' });
@@ -881,7 +882,7 @@ router.post('/:orgId/import-from-outlet/:restaurantId', async (req, res) => {
       return res.status(403).json({ success: false, error: 'Restaurant does not belong to this organization' });
     }
 
-    const restaurantDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
+    const restaurantDoc = await getCachedRestDoc(db, collections.restaurants, restaurantId);
 
     if (!restaurantDoc.exists) {
       return res.status(404).json({ success: false, error: 'Restaurant not found' });

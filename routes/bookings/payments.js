@@ -2,6 +2,7 @@ const express = require('express');
 const router = express.Router();
 const { FieldValue } = require('firebase-admin/firestore');
 const { createExpenseEntry } = require('./helpers');
+const { getCachedRestDoc } = require('../utils/kvCache');
 
 module.exports = function(db, collections, authenticateToken, checkFeaturePermission) {
 
@@ -140,7 +141,7 @@ module.exports = function(db, collections, authenticateToken, checkFeaturePermis
       const booking = doc.data();
 
       // Get restaurant info for invoice header
-      const restaurantDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
+      const restaurantDoc = await getCachedRestDoc(db, collections.restaurants, restaurantId);
       const restaurant = restaurantDoc.exists ? restaurantDoc.data() : {};
 
       const invoice = {

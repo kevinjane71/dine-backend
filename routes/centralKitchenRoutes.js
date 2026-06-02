@@ -3,6 +3,7 @@ const router = express.Router();
 const { db, collections } = require('../firebase');
 const { authenticateToken } = require('../middleware/auth');
 const { requireOrgFeature, isRestaurantInOrg, requireOrgMember, getActorId } = require('../middleware/orgAccess');
+const { getCachedRestDoc } = require('../utils/kvCache');
 
 // ============================================
 // CENTRAL KITCHEN PRODUCTION & DISTRIBUTION APIs
@@ -30,7 +31,7 @@ async function generateOrderNumber(orgId) {
 
 // ─── Helper: Verify outlet is a central kitchen in org ───────────────────────
 async function verifyCentralKitchen(orgId, kitchenId) {
-  const doc = await db.collection(collections.restaurants).doc(kitchenId).get();
+  const doc = await getCachedRestDoc(db, collections.restaurants, kitchenId);
   if (!doc.exists) return null;
   const data = doc.data();
   if (data.organizationId !== orgId || data.outletType !== 'central_kitchen') return null;

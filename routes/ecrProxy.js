@@ -7,6 +7,7 @@
 
 const express = require('express');
 const https = require('https');
+const { getCachedRestDoc } = require('../utils/kvCache');
 const router = express.Router();
 
 const ECR_TIMEOUT_MS = 120000; // 2 minutes for card tap
@@ -26,7 +27,7 @@ module.exports = (db, collections, authenticateToken) => {
 
     // Validate that restaurant has ECR enabled and IP matches stored config
     try {
-      const restaurantDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
+      const restaurantDoc = await getCachedRestDoc(db, collections.restaurants, restaurantId);
       if (!restaurantDoc.exists) {
         return res.status(404).json({ error: 'Restaurant not found' });
       }

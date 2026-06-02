@@ -7,6 +7,7 @@ const { authenticateSuperAdmin, requireSuperAdmin } = require('../middleware/sup
 const { checkPermission } = require('../middleware/checkPermission');
 const { parseTZ, todayInTZ, dateStrInTZ, dateBoundsInTZ } = require('../utils/timezone');
 const subAdminRoutes = require('./subAdmin');
+const { getCachedRestDoc } = require('../utils/kvCache');
 
 // ─── Constants ───────────────────────────────────────────────────────
 const DEFAULT_PAGE_SIZE = 50;
@@ -1429,7 +1430,7 @@ router.post('/orders/soft-delete', authenticateSuperAdmin, requireSuperAdmin, as
     }
 
     // Verify restaurant exists (so admin doesn't blindly nuke a typo'd id)
-    const restDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
+    const restDoc = await getCachedRestDoc(db, collections.restaurants, restaurantId);
     if (!restDoc.exists) {
       return res.status(404).json({ success: false, error: 'Restaurant not found' });
     }
@@ -1573,7 +1574,7 @@ router.post('/reset-restaurant-data', authenticateSuperAdmin, requireSuperAdmin,
     }
 
     // Verify restaurant exists
-    const restDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
+    const restDoc = await getCachedRestDoc(db, collections.restaurants, restaurantId);
     if (!restDoc.exists) {
       return res.status(404).json({ success: false, error: 'Restaurant not found' });
     }
@@ -1709,7 +1710,7 @@ router.post('/reset-restaurant-data', authenticateSuperAdmin, requireSuperAdmin,
 router.get('/restaurants/:restaurantId/settings', authenticateSuperAdmin, requireSuperAdmin, async (req, res) => {
   try {
     const { restaurantId } = req.params;
-    const restaurant = await db.collection(collections.restaurants).doc(restaurantId).get();
+    const restaurant = await getCachedRestDoc(db, collections.restaurants, restaurantId);
     if (!restaurant.exists) {
       return res.status(404).json({ success: false, error: 'Restaurant not found' });
     }

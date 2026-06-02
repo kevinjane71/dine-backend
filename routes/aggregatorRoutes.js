@@ -22,6 +22,7 @@ let pusherService;
 function getPusherService() {
   if (!pusherService) {
     pusherService = require('../services/firebaseRealtimeService');
+const { getCachedRestDoc } = require('../utils/kvCache');
   }
   return pusherService;
 }
@@ -339,7 +340,7 @@ router.post('/talabat/connect/:restaurantId', authenticateToken, async (req, res
     }
 
     // Verify restaurant exists and user has access
-    const restaurantDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
+    const restaurantDoc = await getCachedRestDoc(db, collections.restaurants, restaurantId);
     if (!restaurantDoc.exists) {
       return res.status(404).json({ error: 'Restaurant not found' });
     }
@@ -423,7 +424,7 @@ router.get('/talabat/status/:restaurantId', authenticateToken, async (req, res) 
   try {
     const { restaurantId } = req.params;
 
-    const restaurantDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
+    const restaurantDoc = await getCachedRestDoc(db, collections.restaurants, restaurantId);
     if (!restaurantDoc.exists) {
       return res.status(404).json({ error: 'Restaurant not found' });
     }
@@ -609,7 +610,7 @@ router.post('/talabat/accept-order/:restaurantId/:orderId', authenticateToken, a
     }
 
     // Get Talabat config
-    const restaurantDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
+    const restaurantDoc = await getCachedRestDoc(db, collections.restaurants, restaurantId);
     const talabatConfig = restaurantDoc.data().aggregatorConfig?.talabat;
 
     if (!talabatConfig || !talabatConfig.enabled) {
@@ -662,7 +663,7 @@ router.post('/talabat/reject-order/:restaurantId/:orderId', authenticateToken, a
       return res.status(400).json({ error: 'This is not a Talabat order' });
     }
 
-    const restaurantDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
+    const restaurantDoc = await getCachedRestDoc(db, collections.restaurants, restaurantId);
     const talabatConfig = restaurantDoc.data().aggregatorConfig?.talabat;
 
     if (!talabatConfig || !talabatConfig.enabled) {
@@ -714,7 +715,7 @@ router.post('/talabat/mark-prepared/:restaurantId/:orderId', authenticateToken, 
       return res.status(400).json({ error: 'This is not a Talabat order' });
     }
 
-    const restaurantDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
+    const restaurantDoc = await getCachedRestDoc(db, collections.restaurants, restaurantId);
     const talabatConfig = restaurantDoc.data().aggregatorConfig?.talabat;
 
     if (!talabatConfig || !talabatConfig.enabled) {

@@ -2,6 +2,7 @@ const express = require('express');
 const router = express.Router();
 const { db, collections } = require('../firebase');
 const { authenticateToken } = require('../middleware/auth');
+const { getCachedRestDoc } = require('../utils/kvCache');
 
 // ============================================
 // SPACE BOOKING APIs
@@ -23,7 +24,7 @@ router.get('/availability/:spaceId', async (req, res) => {
     const date = req.query.date || new Date().toISOString().split('T')[0];
 
     // Fetch space info
-    const spaceDoc = await db.collection(collections.restaurants).doc(spaceId).get();
+    const spaceDoc = await getCachedRestDoc(db, collections.restaurants, spaceId);
     if (!spaceDoc.exists) {
       return res.status(404).json({ success: false, error: 'Space not found' });
     }
@@ -85,7 +86,7 @@ router.get('/availability/:spaceId/today', async (req, res) => {
     const { spaceId } = req.params;
     const today = new Date().toISOString().split('T')[0];
 
-    const spaceDoc = await db.collection(collections.restaurants).doc(spaceId).get();
+    const spaceDoc = await getCachedRestDoc(db, collections.restaurants, spaceId);
     if (!spaceDoc.exists) {
       return res.status(404).json({ success: false, error: 'Space not found' });
     }
@@ -152,7 +153,7 @@ router.post('/book/:spaceId', async (req, res) => {
     }
 
     // Fetch space info
-    const spaceDoc = await db.collection(collections.restaurants).doc(spaceId).get();
+    const spaceDoc = await getCachedRestDoc(db, collections.restaurants, spaceId);
     if (!spaceDoc.exists) {
       return res.status(404).json({ success: false, error: 'Space not found' });
     }

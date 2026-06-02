@@ -7,13 +7,14 @@
 const express = require('express');
 const router = express.Router();
 const sadadService = require('../services/sadadService');
+const { getCachedRestDoc } = require('../utils/kvCache');
 
 module.exports = (db, collections, authenticateToken) => {
 
   // ── Helper: load Sadad config from restaurant doc ──
 
   async function loadSadadConfig(restaurantId) {
-    const doc = await db.collection(collections.restaurants).doc(restaurantId).get();
+    const doc = await getCachedRestDoc(db, collections.restaurants, restaurantId);
     if (!doc.exists) throw { status: 404, message: 'Restaurant not found' };
 
     const ecr = doc.data().ecrSettings;
@@ -259,7 +260,7 @@ module.exports = (db, collections, authenticateToken) => {
       // Verify signature if we have the public key
       if (txn.restaurantId) {
         try {
-          const restaurantDoc = await db.collection(collections.restaurants).doc(txn.restaurantId).get();
+          const restaurantDoc = await getCachedRestDoc(db, collections.restaurants, txn.restaurantId);
           const sadadPublicKey = restaurantDoc.data()?.ecrSettings?.sadadPublicKey;
           if (sadadPublicKey) {
             const isValid = sadadService.verifyCallback(payload, sadadPublicKey);

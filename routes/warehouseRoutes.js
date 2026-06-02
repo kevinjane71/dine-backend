@@ -3,6 +3,7 @@ const router = express.Router();
 const { db, collections } = require('../firebase');
 const { authenticateToken } = require('../middleware/auth');
 const { requireOrgFeature, isRestaurantInOrg, requireOrgMember, getActorId } = require('../middleware/orgAccess');
+const { getCachedRestDoc } = require('../utils/kvCache');
 
 // ============================================
 // CENTRAL WAREHOUSE + INDENT SYSTEM
@@ -66,7 +67,7 @@ router.post('/:orgId/indents', ...commonMiddleware, async (req, res) => {
     }
 
     // Validate warehouseId has outletType='warehouse'
-    const warehouseDoc = await db.collection(collections.restaurants).doc(warehouseId).get();
+    const warehouseDoc = await getCachedRestDoc(db, collections.restaurants, warehouseId);
     if (!warehouseDoc.exists || warehouseDoc.data().outletType !== 'warehouse') {
       return res.status(400).json({ success: false, error: 'Specified warehouseId is not a warehouse outlet' });
     }
@@ -762,7 +763,7 @@ router.get('/:orgId/warehouse/:warehouseId/stock', ...commonMiddleware, async (r
     }
 
     // Verify it's actually a warehouse
-    const warehouseDoc = await db.collection(collections.restaurants).doc(warehouseId).get();
+    const warehouseDoc = await getCachedRestDoc(db, collections.restaurants, warehouseId);
     if (!warehouseDoc.exists || warehouseDoc.data().outletType !== 'warehouse') {
       return res.status(400).json({ success: false, error: 'Specified outlet is not a warehouse' });
     }

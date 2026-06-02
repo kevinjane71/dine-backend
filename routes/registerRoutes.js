@@ -3,6 +3,7 @@ const router = express.Router();
 const { db, collections } = require('../firebase');
 const { authenticateToken } = require('../middleware/auth');
 const { FieldValue } = require('firebase-admin/firestore');
+const { getCachedRestDoc } = require('../utils/kvCache');
 
 router.use(authenticateToken);
 
@@ -45,7 +46,7 @@ router.post('/:restaurantId/open', async (req, res) => {
     }
 
     // Look up restaurant to get organizationId
-    const restaurantDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
+    const restaurantDoc = await getCachedRestDoc(db, collections.restaurants, restaurantId);
     const restaurantData = restaurantDoc.exists ? restaurantDoc.data() : {};
 
     const registerDoc = {

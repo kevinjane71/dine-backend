@@ -1,6 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const { db, collections } = require('../firebase');
+const { getCachedRestDoc } = require('../utils/kvCache');
 const { authenticateToken, requireOwnerRole } = require('../middleware/auth');
 const { parseTZ, buildDateRange, dateStrInTZ, dateBoundsInTZ } = require('../utils/timezone');
 
@@ -115,17 +116,20 @@ router.get('/dashboard', authenticateToken, requireOwnerRole, async (req, res) =
     let totalLowStockItems = 0;
 
     const restaurantData = restaurants.map((restaurant, index) => {
-      // Process orders for the period — exclude cancelled/deleted/saved orders
-      const nonCountedStatuses = ['cancelled', 'deleted', 'saved'];
+      // Process orders for the period — exclude cancelled/deleted/saved/refunded orders
+      const nonCountedStatuses = ['cancelled', 'deleted', 'saved', 'refunded'];
       const orders = ordersResults[index].docs.filter(doc => !nonCountedStatuses.includes(doc.data().status));
       const periodOrders = orders.length;
+      // Subtract partial refund amounts from revenue (full refunds already excluded by status filter)
       const periodRevenue = orders.reduce((sum, doc) => {
         const order = doc.data();
-        return sum + (order.totalAmount || 0);
+        const refundAdj = order.refundAmount || 0;
+        return sum + (order.totalAmount || 0) - refundAdj;
       }, 0);
       const periodRevenueWithTax = orders.reduce((sum, doc) => {
         const order = doc.data();
-        return sum + (order.finalAmount || order.totalAmount || 0);
+        const refundAdj = order.refundAmount || 0;
+        return sum + (order.finalAmount || order.totalAmount || 0) - refundAdj;
       }, 0);
 
       // Process staff (exclude owners and customers)
@@ -267,7 +271,7 @@ router.get('/analytics', authenticateToken, requireOwnerRole, async (req, res) =
 
     // Get restaurant details for names
     const restaurantDetailsPromises = restaurantIds.map(id =>
-      db.collection(collections.restaurants).doc(id).get()
+      getCachedRestDoc(db, collections.restaurants, id)
     );
     const restaurantDetails = await Promise.all(restaurantDetailsPromises);
     const restaurantMap = {};
@@ -302,18 +306,21 @@ router.get('/analytics', authenticateToken, requireOwnerRole, async (req, res) =
     const revenueByRestaurant = [];
     const allOrders = [];
 
-    const nonCountedStatuses = ['cancelled', 'deleted', 'saved'];
+    const nonCountedStatuses = ['cancelled', 'deleted', 'saved', 'refunded'];
 
     restaurantIds.forEach((restaurantId, index) => {
-      // Exclude cancelled/deleted/saved orders from analytics
+      // Exclude cancelled/deleted/saved/refunded orders from analytics
       const orders = ordersResults[index].docs.filter(doc => !nonCountedStatuses.includes(doc.data().status));
+      // Subtract partial refund amounts from revenue (full refunds already excluded by status filter)
       const restaurantRevenue = orders.reduce((sum, doc) => {
         const order = doc.data();
-        return sum + (order.totalAmount || 0);
+        const refundAdj = order.refundAmount || 0;
+        return sum + (order.totalAmount || 0) - refundAdj;
       }, 0);
       const restaurantRevenueWithTax = orders.reduce((sum, doc) => {
         const order = doc.data();
-        return sum + (order.finalAmount || order.totalAmount || 0);
+        const refundAdj = order.refundAmount || 0;
+        return sum + (order.finalAmount || order.totalAmount || 0) - refundAdj;
       }, 0);
 
       totalRevenue += restaurantRevenue;

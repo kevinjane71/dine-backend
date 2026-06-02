@@ -8,6 +8,7 @@
 const express = require('express');
 const router = express.Router();
 const { getDb, collections } = require('../firebase');
+const { getCachedRestDoc } = require('../utils/kvCache');
 const { authenticateToken } = require('../middleware/auth');
 const whatsappService = require('../services/whatsappService');
 const orderingService = require('../services/whatsappOrderingService');
@@ -220,7 +221,7 @@ router.post('/config/:restaurantId', authenticateToken, async (req, res) => {
     const db = getDb();
 
     // Get restaurant name for welcome message
-    const restaurantDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
+    const restaurantDoc = await getCachedRestDoc(db, collections.restaurants, restaurantId);
     const restaurantName = restaurantDoc.exists ? restaurantDoc.data().name : 'Restaurant';
     const currencySymbol = restaurantDoc.exists ? (restaurantDoc.data().currencySymbol || '₹') : '₹';
 
