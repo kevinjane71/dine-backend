@@ -187,6 +187,8 @@ Respond with JSON format:
         .collection('restaurants')
         .doc(restaurantId)
         .collection('tables')
+        .select('name', 'status', 'capacity', 'section')
+        .limit(500)
         .get();
 
       const tables = [];
@@ -214,6 +216,7 @@ Respond with JSON format:
         .collection('restaurants')
         .doc(restaurantId)
         .collection('menu')
+        .limit(1000)
         .get();
 
       const menuItems = [];

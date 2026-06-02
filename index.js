@@ -5090,6 +5090,7 @@ app.post('/api/auth/phone/verify-otp', async (req, res) => {
 
     let userDoc = await db.collection(collections.users)
       .where('phone', '==', phone)
+      .limit(1)
       .get();
 
     let userId, isNewUser = false, hasRestaurants = false;
@@ -6003,9 +6004,11 @@ app.get('/api/restaurants', authenticateToken, async (req, res) => {
         assignedRestaurantIds.push(restaurantId);
       }
 
-      // Fetch each restaurant but verify it belongs to the same owner (safety check)
-      for (const rid of assignedRestaurantIds) {
-        const rDoc = await db.collection(collections.restaurants).doc(rid).get();
+      // Fetch all restaurants in parallel and verify they belong to the same owner
+      const rDocs = await Promise.all(
+        assignedRestaurantIds.map(rid => db.collection(collections.restaurants).doc(rid).get())
+      );
+      for (const rDoc of rDocs) {
         if (rDoc.exists) {
           const rData = rDoc.data();
           // Only include if restaurant belongs to the admin's owner
@@ -8169,6 +8172,7 @@ app.post('/api/public/orders/:restaurantId', vercelSecurityMiddleware.publicAPI,
     const customerQuery = await db.collection('customers')
       .where('restaurantId', '==', restaurantId)
       .where('phone', '==', customerPhone)
+      .limit(1)
       .get();
 
     if (!customerQuery.empty) {
@@ -8186,19 +8190,22 @@ app.post('/api/public/orders/:restaurantId', vercelSecurityMiddleware.publicAPI,
           }
         }
 
-        // Step 3: Full scan only if both exact match and cache miss
+        // Step 3: Scan with phone-only projection if both exact match and cache miss
         if (!existingCustomer) {
           const allCustomers = await db.collection('customers')
             .where('restaurantId', '==', restaurantId)
+            .select('phone')
             .get();
 
-          existingCustomer = allCustomers.docs.find(doc => {
+          const matchedDoc = allCustomers.docs.find(doc => {
             const custPhone = normalizePhone(doc.data().phone);
             return custPhone === normalizedPhone;
           });
 
-          // Cache the result for future lookups
-          if (existingCustomer) {
+          // Re-fetch full doc since select('phone') doesn't include all fields
+          if (matchedDoc) {
+            existingCustomer = await matchedDoc.ref.get();
+            // Cache the result for future lookups
             cacheCustomerByPhone(restaurantId, normalizedPhone, {
               id: existingCustomer.id, phone: existingCustomer.data().phone
             }).catch(() => {});
@@ -17309,8 +17316,10 @@ app.get('/api/staff/:staffId/restaurants', authenticateToken, requireOwnerRole, 
       .where('userId', '==', staffId).get();
     const restaurantIds = assignments.docs.map(d => d.data().restaurantId).filter(Boolean);
     const restaurants = [];
-    for (const rid of restaurantIds) {
-      const rDoc = await db.collection(collections.restaurants).doc(rid).get();
+    const rDocs = await Promise.all(
+      restaurantIds.map(rid => db.collection(collections.restaurants).doc(rid).get())
+    );
+    for (const rDoc of rDocs) {
       if (rDoc.exists) {
         const { qrCode, menu, ...rest } = rDoc.data();
         restaurants.push({ id: rDoc.id, ...rest });
@@ -19436,6 +19445,8 @@ app.get('/api/kot/:restaurantId', async (req, res) => {
       query.limit(100).get(),
       db.collection(collections.tables)
         .where('restaurantId', '==', restaurantId)
+        .select('number', 'name', 'floor', 'floorId', 'capacity', 'status', 'section')
+        .limit(500)
         .get()
     ]);
 
@@ -19633,7 +19644,7 @@ app.get('/api/kot/pending-print/:restaurantId', async (req, res) => {
       .where('createdAt', '>=', cutoffTime)
       .orderBy('createdAt', 'asc');
 
-    const ordersSnapshot = await query.get();
+    const ordersSnapshot = await query.limit(200).get();
 
     const pendingOrders = [];
 
@@ -19861,6 +19872,7 @@ app.get('/api/billing/pending-print/:restaurantId', async (req, res) => {
       .where('status', '==', 'completed')
       .where('createdAt', '>=', cutoffTime)
       .orderBy('createdAt', 'asc')
+      .limit(200)
       .get();
 
     const pendingBills = [];
@@ -21960,6 +21972,8 @@ app.get('/api/inventory/:restaurantId/dashboard', authenticateToken, async (req,
 
     const snapshot = await db.collection(collections.inventory)
       .where('restaurantId', '==', restaurantId)
+      .select('category', 'currentStock', 'minStock', 'costPerUnit', 'expiryDate')
+      .limit(5000)
       .get();
 
     let totalItems = 0;
@@ -21971,19 +21985,19 @@ app.get('/api/inventory/:restaurantId/dashboard', authenticateToken, async (req,
     snapshot.forEach(doc => {
       const itemData = doc.data();
       totalItems++;
-      
+
       if (itemData.category) {
         categories.add(itemData.category);
       }
-      
+
       if (itemData.currentStock <= itemData.minStock) {
         lowStockItems++;
       }
-      
+
       if (itemData.expiryDate && new Date(itemData.expiryDate) < new Date()) {
         expiredItems++;
       }
-      
+
       totalValue += (itemData.currentStock || 0) * (itemData.costPerUnit || 0);
     });
 
@@ -21993,6 +22007,8 @@ app.get('/api/inventory/:restaurantId/dashboard', authenticateToken, async (req,
     try {
       const batchesSnapshot = await db.collection(collections.stockBatches)
         .where('restaurantId', '==', restaurantId)
+        .select('expiryDate', 'remainingQty', 'costPerUnit', 'inventoryItemId')
+        .limit(5000)
         .get();
       const now = new Date();
       const wastedItemIds = new Set();
@@ -22075,7 +22091,9 @@ app.get('/api/inventory/:restaurantId/transactions', authenticateToken, async (r
     const limitNum = Math.min(parseInt(limit, 10) || 50, 200);
     const offset = (pageNum - 1) * limitNum;
 
-    const snapshot = await query.limit(limitNum + offset).get();
+    const snapshot = await query
+      .limit(limitNum + offset)
+      .get();
     const allDocs = [];
     snapshot.forEach(doc => allDocs.push({ id: doc.id, ...doc.data() }));
     const transactions = allDocs.slice(offset, offset + limitNum);
@@ -28164,6 +28182,7 @@ app.put('/api/admin/settings/:restaurantId', authenticateToken, async (req, res)
     // Check if settings document exists
     const existingSettingsSnapshot = await db.collection(collections.restaurantSettings)
       .where('restaurantId', '==', restaurantId)
+      .limit(1)
       .get();
 
     if (existingSettingsSnapshot.empty) {

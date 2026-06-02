@@ -50,6 +50,8 @@ async function getDeliveryPartners(restaurantId) {
     .where('restaurantId', '==', restaurantId)
     .where('isDeliveryPartner', '==', true)
     .where('status', '==', 'active')
+    .select('name', 'phone', 'role')
+    .limit(200)
     .get();
 
   return snap.docs.map(doc => ({
@@ -74,6 +76,8 @@ async function getDeliveryPartnersWithStatus(restaurantId) {
     .collection(collections.orders)
     .where('restaurantId', '==', restaurantId)
     .where('deliveryStatus', 'in', activeStatuses)
+    .select('assignedStaff')
+    .limit(500)
     .get();
 
   const busyPartnerIds = new Set();

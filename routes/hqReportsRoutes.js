@@ -59,22 +59,19 @@ function parseDateRange(query) {
 // ─── Helper: Get completed/paid orders for an outlet in date range ───────────
 async function getOutletOrders(outletId, startDate, endDate) {
   const validStatuses = ['completed', 'paid', 'settled'];
+
+  // Single query using 'in' operator + date range filter at DB level
+  const snapshot = await db.collection(collections.orders)
+    .where('restaurantId', '==', outletId)
+    .where('status', 'in', validStatuses)
+    .where('createdAt', '>=', startDate)
+    .where('createdAt', '<=', endDate)
+    .get();
+
   const orders = [];
-
-  for (const status of validStatuses) {
-    const snapshot = await db.collection(collections.orders)
-      .where('restaurantId', '==', outletId)
-      .where('status', '==', status)
-      .get();
-
-    snapshot.forEach(doc => {
-      const data = doc.data();
-      const orderDate = data.createdAt ? (data.createdAt.toDate ? data.createdAt.toDate() : new Date(data.createdAt)) : null;
-      if (orderDate && orderDate >= startDate && orderDate <= endDate) {
-        orders.push({ id: doc.id, ...data });
-      }
-    });
-  }
+  snapshot.forEach(doc => {
+    orders.push({ id: doc.id, ...doc.data() });
+  });
 
   return orders;
 }
@@ -83,15 +80,13 @@ async function getOutletOrders(outletId, startDate, endDate) {
 async function getOutletExpenses(outletId, startDate, endDate) {
   const snapshot = await db.collection(collections.expenses)
     .where('restaurantId', '==', outletId)
+    .where('date', '>=', startDate)
+    .where('date', '<=', endDate)
     .get();
 
   const expenses = [];
   snapshot.forEach(doc => {
-    const data = doc.data();
-    const expDate = data.date ? (data.date.toDate ? data.date.toDate() : new Date(data.date)) : null;
-    if (expDate && expDate >= startDate && expDate <= endDate) {
-      expenses.push({ id: doc.id, ...data });
-    }
+    expenses.push({ id: doc.id, ...doc.data() });
   });
   return expenses;
 }
@@ -168,11 +163,12 @@ router.get('/:orgId/summaries', ...reportMiddleware, async (req, res) => {
       });
     });
 
-    // Low stock count across all outlets
+    // Low stock count across all outlets (select only stock fields to reduce read size)
     let lowStockCount = 0;
     const inventoryPromises = outlets.map(outlet =>
       db.collection(collections.inventory || 'inventory')
         .where('restaurantId', '==', outlet.id)
+        .select('currentStock', 'quantity', 'minStock', 'reorderLevel', 'reorderPoint')
         .get()
     );
     const inventoryResults = await Promise.all(inventoryPromises);
@@ -390,18 +386,16 @@ router.get('/:orgId/kitchen-reports', ...reportMiddleware, async (req, res) => {
     const { orgId } = req.params;
     const { startDate, endDate } = parseDateRange(req.query);
 
-    // Query production orders for this org
+    // Query production orders for this org within date range
     const prodSnapshot = await db.collection(collections.productionOrders)
       .where('organizationId', '==', orgId)
+      .where('createdAt', '>=', startDate)
+      .where('createdAt', '<=', endDate)
       .get();
 
     const productionOrders = [];
     prodSnapshot.forEach(doc => {
-      const data = doc.data();
-      const orderDate = data.createdAt ? (data.createdAt.toDate ? data.createdAt.toDate() : new Date(data.createdAt)) : null;
-      if (orderDate && orderDate >= startDate && orderDate <= endDate) {
-        productionOrders.push({ id: doc.id, ...data });
-      }
+      productionOrders.push({ id: doc.id, ...doc.data() });
     });
 
     // Overall stats
@@ -448,15 +442,13 @@ router.get('/:orgId/kitchen-reports', ...reportMiddleware, async (req, res) => {
     const wastePromises = outlets.map(async (outlet) => {
       const wasteSnapshot = await db.collection(collections.wasteEntries)
         .where('restaurantId', '==', outlet.id)
+        .where('date', '>=', startDate)
+        .where('date', '<=', endDate)
         .get();
 
       const entries = [];
       wasteSnapshot.forEach(doc => {
-        const data = doc.data();
-        const wasteDate = data.date ? (data.date.toDate ? data.date.toDate() : new Date(data.date)) : null;
-        if (wasteDate && wasteDate >= startDate && wasteDate <= endDate) {
-          entries.push(data);
-        }
+        entries.push(doc.data());
       });
       return entries;
     });
@@ -515,16 +507,13 @@ router.get('/:orgId/warehouse-metrics', ...reportMiddleware, async (req, res) =>
 
     const snapshot = await db.collection(collections.indentRequests)
       .where('organizationId', '==', orgId)
+      .where('createdAt', '>=', startDate)
+      .where('createdAt', '<=', endDate)
       .get();
 
     const indents = [];
     snapshot.forEach(doc => {
-      const data = doc.data();
-      const requestDate = data.requestedAt || data.createdAt;
-      const indentDate = requestDate ? (requestDate.toDate ? requestDate.toDate() : new Date(requestDate)) : null;
-      if (indentDate && indentDate >= startDate && indentDate <= endDate) {
-        indents.push({ id: doc.id, ...data });
-      }
+      indents.push({ id: doc.id, ...doc.data() });
     });
 
     const totalIndents = indents.length;

@@ -899,6 +899,7 @@ router.get('/:orgId/kitchen/:kitchenId/dashboard', ...ckMiddleware, async (req, 
       .where('centralKitchenId', '==', kitchenId)
       .where('scheduledDate', '>=', todayStart)
       .where('scheduledDate', '<=', todayEnd)
+      .limit(500)
       .get();
 
     const todayOrders = [];
@@ -910,12 +911,19 @@ router.get('/:orgId/kitchen/:kitchenId/dashboard', ...ckMiddleware, async (req, 
     const ingredientRequirements = {};
     const plannedOrders = todayOrders.filter(o => o.status === 'planned' || o.status === 'in_production');
 
-    for (const order of plannedOrders) {
-      if (!order.recipeId) continue;
-      const recipeDoc = await db.collection(collections.recipes).doc(order.recipeId).get();
-      if (!recipeDoc.exists) continue;
+    // Batch-fetch unique recipes instead of N+1 per-order lookups
+    const uniqueRecipeIds = [...new Set(plannedOrders.map(o => o.recipeId).filter(Boolean))];
+    const recipeMap = {};
+    const recipeDocs = await Promise.all(
+      uniqueRecipeIds.map(id => db.collection(collections.recipes).doc(id).get())
+    );
+    recipeDocs.forEach(doc => {
+      if (doc.exists) recipeMap[doc.id] = doc.data();
+    });
 
-      const recipe = recipeDoc.data();
+    for (const order of plannedOrders) {
+      if (!order.recipeId || !recipeMap[order.recipeId]) continue;
+      const recipe = recipeMap[order.recipeId];
       const ingredients = recipe.ingredients || [];
 
       for (const ing of ingredients) {
@@ -937,6 +945,8 @@ router.get('/:orgId/kitchen/:kitchenId/dashboard', ...ckMiddleware, async (req, 
       .where('centralKitchenId', '==', kitchenId)
       .where('status', '==', 'completed')
       .where('completedDate', '>=', sevenDaysAgo)
+      .select('orderNumber', 'recipeName', 'producedQuantity', 'unit', 'completedDate')
+      .limit(100)
       .get();
 
     const recentCompletions = [];

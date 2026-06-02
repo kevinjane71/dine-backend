@@ -58,8 +58,12 @@ async function getLeaveConfig(restaurantId) {
 
 async function getAllStaff(restaurantId) {
   const [staffSnap, usersSnap] = await Promise.all([
-    db.collection('staffUsers').where('restaurantId', '==', restaurantId).get(),
-    db.collection('users').where('restaurantId', '==', restaurantId).get(),
+    db.collection('staffUsers').where('restaurantId', '==', restaurantId)
+      .select('name', 'staffName', 'email', 'role', 'phone', 'status')
+      .limit(1000).get(),
+    db.collection('users').where('restaurantId', '==', restaurantId)
+      .select('name', 'staffName', 'email', 'role', 'phone', 'status')
+      .limit(1000).get(),
   ]);
   const staffMap = new Map();
   staffSnap.docs.forEach(d => {

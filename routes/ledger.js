@@ -164,9 +164,10 @@ router.get('/:restaurantId/trial-balance', async (req, res) => {
     const { restaurantId } = req.params;
     const { startDate, endDate } = req.query;
 
-    // Get all accounts
+    // Get all accounts (limited to reasonable max for a single restaurant)
     const accountSnap = await db.collection('chartOfAccounts')
       .where('restaurantId', '==', restaurantId)
+      .limit(500)
       .get();
 
     const accounts = {};
@@ -235,11 +236,13 @@ router.get('/:restaurantId/summary', async (req, res) => {
         .where('restaurantId', '==', restaurantId)
         .where('createdAt', '>=', yearStart)
         .where('createdAt', '<=', yearEnd)
+        .select('createdAt', 'totalAmount', 'finalAmount', 'taxAmount', 'status')
         .get(),
       db.collection('expenses')
         .where('restaurantId', '==', restaurantId)
         .where('date', '>=', yearStart)
         .where('date', '<=', yearEnd)
+        .select('date', 'amount', 'category')
         .get(),
     ]);
 

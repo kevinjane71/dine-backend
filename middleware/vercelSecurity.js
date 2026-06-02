@@ -1,6 +1,11 @@
 const { vercelRateLimiter, maybeCleanup } = require('./vercelRateLimiter');
 const { db, collections } = require('../firebase');
 
+// In-memory cache for blocked IPs to avoid Firestore reads on every request
+let _blockedIPsCache = null;
+let _blockedIPsCacheTime = 0;
+const BLOCKED_IPS_CACHE_TTL = 5 * 60 * 1000; // 5 minutes
+
 // Vercel-compatible security middleware using Firestore
 const vercelSecurityMiddleware = {
   // Suspicious patterns to detect
@@ -28,23 +33,31 @@ const vercelSecurityMiddleware = {
     /go-http/i,
   ],
 
-  // Get blocked IPs from Firestore
+  // Get blocked IPs from Firestore (cached in memory for 5 minutes)
   async getBlockedIPs() {
     try {
+      const now = Date.now();
+      if (_blockedIPsCache && (now - _blockedIPsCacheTime) < BLOCKED_IPS_CACHE_TTL) {
+        return _blockedIPsCache;
+      }
+
       const snapshot = await db.collection('blockedIPs')
         .where('blockedUntil', '>', new Date().toISOString())
         .get();
-      
+
       const blockedIPs = new Set();
       snapshot.docs.forEach(doc => {
         const data = doc.data();
         blockedIPs.add(data.ip);
       });
-      
+
+      _blockedIPsCache = blockedIPs;
+      _blockedIPsCacheTime = now;
+
       return blockedIPs;
     } catch (error) {
       console.error('Error getting blocked IPs:', error);
-      return new Set();
+      return _blockedIPsCache || new Set();
     }
   },
 
@@ -58,7 +71,11 @@ const vercelSecurityMiddleware = {
         blockedAt: new Date().toISOString(),
         reason: 'Suspicious activity'
       });
-      
+
+      // Invalidate cache so newly blocked IP takes effect immediately
+      _blockedIPsCache = null;
+      _blockedIPsCacheTime = 0;
+
       console.log(`🚫 Blocked IP: ${ip} until ${blockedUntil}`);
     } catch (error) {
       console.error('Error blocking IP:', error);

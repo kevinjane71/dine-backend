@@ -138,13 +138,15 @@ router.get('/config/:restaurantId/dashboard-stats', async (req, res) => {
       zones.push({ id: doc.id, zoneName: z.zoneName, zoneCode: z.zoneCode, totalSlots: z.totalSlots || 0, occupiedSlots: z.occupiedSlots || 0 });
     });
 
-    // Get today's revenue
+    // Get today's revenue (select only needed fields)
     const today = new Date();
     const startOfDay = new Date(today.getFullYear(), today.getMonth(), today.getDate());
     const ticketsSnap = await db.collection(collections.parkingTickets)
       .where('restaurantId', '==', restaurantId)
       .where('status', '==', 'completed')
       .where('exitTime', '>=', startOfDay)
+      .select('finalAmount')
+      .limit(5000)
       .get();
 
     let todayRevenue = 0;
@@ -155,10 +157,12 @@ router.get('/config/:restaurantId/dashboard-stats', async (req, res) => {
       todayVehicles++;
     });
 
-    // Active tickets count
+    // Active tickets count (only need count, select minimal fields)
     const activeSnap = await db.collection(collections.parkingTickets)
       .where('restaurantId', '==', restaurantId)
       .where('status', '==', 'active')
+      .select('status')
+      .limit(5000)
       .get();
 
     res.json({

@@ -71,24 +71,27 @@ router.get('/dashboard', authenticateToken, requireOwnerRole, async (req, res) =
         .get()
     );
 
-    // Fetch staff count for all restaurants (from both staffUsers and users)
+    // Fetch staff count for all restaurants (select only role field since we only need count by role)
     const staffNewPromises = restaurantIds.map(restaurantId =>
       db.collection(collections.staffUsers)
         .where('restaurantId', '==', restaurantId)
         .where('status', '==', 'active')
+        .select('role')
         .get()
     );
     const staffLegacyPromises = restaurantIds.map(restaurantId =>
       db.collection(collections.users)
         .where('restaurantId', '==', restaurantId)
         .where('status', '==', 'active')
+        .select('role')
         .get()
     );
 
-    // Fetch inventory with low stock for all restaurants
+    // Fetch inventory with low stock for all restaurants (select only needed fields to reduce read size)
     const inventoryPromises = restaurantIds.map(restaurantId =>
       db.collection(collections.inventory)
         .where('restaurantId', '==', restaurantId)
+        .select('currentStock', 'minStock', 'reorderLevel')
         .get()
     );
 

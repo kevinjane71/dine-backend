@@ -331,8 +331,10 @@ router.get('/:restaurantId/analytics/overview', authenticateToken, async (req, r
     const since = new Date(Date.now() - daysBack * 24 * 60 * 60 * 1000).toISOString();
 
     const [formsSnap, responsesSnap] = await Promise.all([
-      db.collection(collections.feedbackForms).where('restaurantId', '==', restaurantId).where('status', 'in', ['draft', 'active', 'archived']).get(),
-      db.collection(collections.feedbackResponses).where('restaurantId', '==', restaurantId).where('submittedAt', '>=', since).orderBy('submittedAt', 'desc').get(),
+      db.collection(collections.feedbackForms).where('restaurantId', '==', restaurantId).where('status', 'in', ['draft', 'active', 'archived'])
+        .select('title', 'status', 'responseCount').limit(100).get(),
+      db.collection(collections.feedbackResponses).where('restaurantId', '==', restaurantId).where('submittedAt', '>=', since).orderBy('submittedAt', 'desc')
+        .limit(1000).get(),
     ]);
 
     const forms = formsSnap.docs.map(d => ({ id: d.id, ...d.data() }));

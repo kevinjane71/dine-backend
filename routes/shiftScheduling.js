@@ -152,19 +152,30 @@ router.post('/shifts/:restaurantId/bulk', authenticateToken, requireOwnerRole, a
     const batch = db.batch();
     const createdShifts = [];
 
+    // Pre-fetch all existing shifts for this restaurant to avoid N+1 queries
+    const uniqueDates = [...new Set(shifts.map(s => s.date).filter(Boolean))];
+    const existingShiftsMap = new Map(); // key: `${staffId}_${date}` -> doc
+
+    // Firestore 'in' supports max 30 values, batch if needed
+    for (let i = 0; i < uniqueDates.length; i += 30) {
+      const dateBatch = uniqueDates.slice(i, i + 30);
+      const existingSnap = await db.collection('staffShifts')
+        .where('restaurantId', '==', restaurantId)
+        .where('date', 'in', dateBatch)
+        .select('staffId', 'date')
+        .get();
+      existingSnap.docs.forEach(doc => {
+        const d = doc.data();
+        existingShiftsMap.set(`${d.staffId}_${d.date}`, doc);
+      });
+    }
+
     for (const shift of shifts) {
       const { staffId, date, startTime, endTime, role, notes } = shift;
-      
+
       if (!staffId || !date || !startTime || !endTime) {
         continue; // Skip invalid shifts
       }
-
-      // Check if shift already exists
-      const existingShift = await db.collection('staffShifts')
-        .where('restaurantId', '==', restaurantId)
-        .where('staffId', '==', staffId)
-        .where('date', '==', date)
-        .get();
 
       const shiftData = {
         restaurantId,
@@ -178,12 +189,12 @@ router.post('/shifts/:restaurantId/bulk', authenticateToken, requireOwnerRole, a
         updatedAt: new Date()
       };
 
-      if (!existingShift.empty) {
+      const existingDoc = existingShiftsMap.get(`${staffId}_${date}`);
+      if (existingDoc) {
         // Update existing
-        const shiftId = existingShift.docs[0].id;
-        const shiftRef = db.collection('staffShifts').doc(shiftId);
+        const shiftRef = db.collection('staffShifts').doc(existingDoc.id);
         batch.update(shiftRef, { ...shiftData, updatedAt: new Date() });
-        createdShifts.push({ id: shiftId, ...shiftData });
+        createdShifts.push({ id: existingDoc.id, ...shiftData });
       } else {
         // Create new
         const shiftRef = db.collection('staffShifts').doc();

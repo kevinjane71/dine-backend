@@ -443,12 +443,13 @@ async function sendInvoiceEmail({ orderId, restaurantId }) {
           customerEmail = custQuery.docs[0].data().email || '';
         }
 
-        // Try normalized phone if direct match failed
+        // Try normalized phone if direct match failed (select only phone+email to reduce read size)
         if (!customerEmail) {
           const np = normPhone(phone);
           if (np) {
             const allCust = await db.collection(collections.customers)
               .where('restaurantId', '==', restaurantId)
+              .select('phone', 'email')
               .get();
             const match = allCust.docs.find(d => normPhone(d.data().phone) === np);
             if (match) {

@@ -393,26 +393,32 @@ router.get('/insights', authenticateToken, requireOwnerRole, async (req, res) =>
         dateStart = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
     }
 
-    // Fetch orders for analytics
+    // Fetch orders for analytics (select only fields needed for aggregation)
     const ordersPromises = restaurantIds.map(id =>
       db.collection(collections.orders)
         .where('restaurantId', '==', id)
         .where('createdAt', '>=', dateStart)
+        .select('createdAt', 'totalAmount', 'finalAmount', 'status', 'items', 'orderType', 'paymentMethod')
+        .limit(5000)
         .get()
     );
 
-    // Fetch staff count
+    // Fetch staff count (only need count by role)
     const staffPromises = restaurantIds.map(id =>
       db.collection(collections.users)
         .where('restaurantId', '==', id)
         .where('status', '==', 'active')
+        .select('role')
+        .limit(1000)
         .get()
     );
 
-    // Fetch inventory
+    // Fetch inventory (only need stock levels)
     const inventoryPromises = restaurantIds.map(id =>
       db.collection(collections.inventory)
         .where('restaurantId', '==', id)
+        .select('name', 'currentStock', 'minStock', 'reorderLevel', 'unit', 'category')
+        .limit(2000)
         .get()
     );
 
