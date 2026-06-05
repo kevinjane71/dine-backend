@@ -18723,7 +18723,7 @@ app.put('/api/admin/print-settings/:restaurantId', authenticateToken, async (req
         sanitizedSettings.receiptLogo = {
           url: typeof logo.url === 'string' ? logo.url : '',
           position: ['left', 'center', 'right'].includes(logo.position) ? logo.position : 'center',
-          size: Math.max(40, Math.min(120, parseInt(logo.size) || 60)),
+          size: Math.max(40, Math.min(200, parseInt(logo.size) || 80)),
           nameAlignment: ['left', 'center', 'right'].includes(logo.nameAlignment) ? logo.nameAlignment : 'center',
           enabled: Boolean(logo.enabled)
         };
@@ -18770,6 +18770,11 @@ app.put('/api/admin/print-settings/:restaurantId', authenticateToken, async (req
     if (printSettings.receiptPhone !== undefined) {
       sanitizedSettings.receiptPhone = typeof printSettings.receiptPhone === 'string'
         ? printSettings.receiptPhone.trim().slice(0, 20) : '';
+    }
+    // printLanguage: 'en' | 'ar' | 'dual'
+    if (printSettings.printLanguage !== undefined) {
+      sanitizedSettings.printLanguage = ['en', 'ar', 'dual'].includes(printSettings.printLanguage)
+        ? printSettings.printLanguage : 'en';
     }
 
     const restaurantDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
@@ -20189,6 +20194,8 @@ const DEFAULT_PRINT_SETTINGS = {
     showDate: true,
     showOrderType: true,
   },
+  // Print language: 'en' (English), 'ar' (Arabic), 'dual' (English + Arabic)
+  printLanguage: 'en',
 };
 
 // Business-type aware labels — mirrors the web InvoiceModal map so server can

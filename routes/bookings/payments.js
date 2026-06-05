@@ -2,7 +2,7 @@ const express = require('express');
 const router = express.Router();
 const { FieldValue } = require('firebase-admin/firestore');
 const { createExpenseEntry } = require('./helpers');
-const { getCachedRestDoc } = require('../utils/kvCache');
+const { getCachedRestDoc } = require('../../utils/kvCache');
 
 module.exports = function(db, collections, authenticateToken, checkFeaturePermission) {
 
