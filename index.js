@@ -9140,6 +9140,7 @@ app.post('/api/orders', async (req, res) => {
         orderItems.push({
           menuItemId: item.menuItemId,
           name: typeof item.name === 'string' ? item.name.substring(0, 200) : 'Custom Item',
+          nameAr: typeof item.nameAr === 'string' ? item.nameAr.substring(0, 200) : null,
           price: fePrice,
           quantity: itemQuantity,
           total: itemTotal,
@@ -9255,6 +9256,7 @@ app.post('/api/orders', async (req, res) => {
       orderItems.push({
         menuItemId: item.menuItemId,
         name: menuItem.name,
+        nameAr: menuItem.nameAr || null,
         price: unitPrice,
         quantity: itemQuantity,
         total: itemTotal,
@@ -14618,6 +14620,77 @@ app.delete('/api/menu-items/:itemId/images/:imageIndex', authenticateToken, asyn
   } catch (error) {
     console.error('Error deleting menu item image:', error);
     res.status(500).json({ error: 'Failed to delete image' });
+  }
+});
+
+// ── Generate Arabic names for all menu items ──────────────────────────────────
+app.post('/api/menus/:restaurantId/generate-arabic-names', authenticateToken, chatgptUsageLimiter.middleware(), async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+    const { userId } = req.user;
+
+    const hasAccess = await validateRestaurantAccess(userId, restaurantId);
+    if (!hasAccess) return res.status(403).json({ error: 'Access denied' });
+
+    const restaurantDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
+    if (!restaurantDoc.exists) return res.status(404).json({ error: 'Restaurant not found' });
+
+    const restaurantData = restaurantDoc.data();
+    const menuItems = [...(restaurantData.menu?.items || [])];
+
+    // Find items without Arabic names
+    const needsTranslation = menuItems.filter(item => item.name && !item.nameAr?.trim());
+    if (needsTranslation.length === 0) {
+      return res.json({ success: true, message: 'All menu items already have Arabic names.', updatedCount: 0 });
+    }
+
+    // Batch translate — send all names in one prompt
+    const names = needsTranslation.map(item => item.name);
+    const batchSize = 100;
+    const translations = {};
+
+    for (let i = 0; i < names.length; i += batchSize) {
+      const batch = names.slice(i, i + batchSize);
+      try {
+        const response = await openai.chat.completions.create({
+          model: 'gpt-4o-mini',
+          messages: [
+            { role: 'system', content: 'Translate the following food/menu item names to Arabic. Return a JSON object where each key is the original English name and the value is the Arabic translation. Return ONLY valid JSON, no markdown or explanation.' },
+            { role: 'user', content: JSON.stringify(batch) }
+          ],
+          temperature: 0.1,
+          max_tokens: 4000,
+        });
+        const content = response.choices[0].message.content.trim();
+        const jsonStr = content.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
+        const batchTranslations = JSON.parse(jsonStr);
+        Object.assign(translations, batchTranslations);
+      } catch (e) {
+        console.error(`Arabic translation batch ${i / batchSize + 1} failed:`, e.message);
+      }
+    }
+
+    // Apply translations to menu items
+    let updatedCount = 0;
+    for (const item of menuItems) {
+      if (!item.nameAr?.trim() && translations[item.name]) {
+        item.nameAr = translations[item.name];
+        updatedCount++;
+      }
+    }
+
+    if (updatedCount > 0) {
+      await db.collection(collections.restaurants).doc(restaurantId).update({
+        'menu.items': menuItems,
+        updatedAt: new Date()
+      });
+      invalidateRestaurantCache(restaurantId);
+    }
+
+    res.json({ success: true, message: `Generated Arabic names for ${updatedCount} menu items.`, updatedCount });
+  } catch (error) {
+    console.error('Generate Arabic names error:', error);
+    res.status(500).json({ error: 'Failed to generate Arabic names' });
   }
 });
 
