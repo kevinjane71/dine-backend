@@ -2910,7 +2910,7 @@ const extractMenuFromImage = async (imageUrl, businessType = 'restaurant') => {
     // Build type-specific extraction instructions
     let typeInstructions = '';
     if (businessType === 'bar') {
-      typeInstructions = `\nBUSINESS TYPE: This is a BAR menu. For each drink item, also extract:\n- "spiritCategory": one of "whiskey","vodka","rum","gin","tequila","beer","wine","cocktail","mocktail","shots","mixer","bar_snack" or null\n- "abv": alcohol percentage as number or null\n- "servingUnit": "ml","peg","glass","bottle","pint" or null\n- "bottleSize": e.g. "180ml","375ml","750ml","1L" or null\n`;
+      typeInstructions = `\nBUSINESS TYPE: This is a BAR menu. For each drink item, also extract:\n- "spiritCategory": one of "whiskey","vodka","rum","gin","tequila","beer","wine","cocktail","mocktail","shots","mixer","bar_snack" or null\n- "abv": alcohol percentage as number or null\n- "servingUnit": "ml","peg","glass","bottle","pint" or null\n- "bottleSize": e.g. "180ml","375ml","500ml","750ml","1L" or null\n`;
     } else if (businessType === 'bakery') {
       typeInstructions = `\nBUSINESS TYPE: This is a BAKERY menu. For each item, also extract:\n- "unit": "piece","kg","gram","dozen","box","slice" or null\n- "weight": e.g. "250g","500g","1kg" or null\n`;
     } else if (businessType === 'ice_cream') {
@@ -18723,7 +18723,7 @@ app.put('/api/admin/print-settings/:restaurantId', authenticateToken, async (req
         sanitizedSettings.receiptLogo = {
           url: typeof logo.url === 'string' ? logo.url : '',
           position: ['left', 'center', 'right'].includes(logo.position) ? logo.position : 'center',
-          size: Math.max(40, Math.min(200, parseInt(logo.size) || 80)),
+          size: Math.max(40, Math.min(400, parseInt(logo.size) || 80)),
           nameAlignment: ['left', 'center', 'right'].includes(logo.nameAlignment) ? logo.nameAlignment : 'center',
           enabled: Boolean(logo.enabled)
         };
@@ -18760,6 +18760,26 @@ app.put('/api/admin/print-settings/:restaurantId', authenticateToken, async (req
     // kotExcludedCategories: array of category IDs to exclude from KOTs
     if (printSettings.kotExcludedCategories !== undefined && Array.isArray(printSettings.kotExcludedCategories)) {
       sanitizedSettings.kotExcludedCategories = printSettings.kotExcludedCategories.filter(id => typeof id === 'string');
+    }
+    // receiptHeader: custom header text on receipts
+    if (printSettings.receiptHeader !== undefined) {
+      sanitizedSettings.receiptHeader = typeof printSettings.receiptHeader === 'string'
+        ? printSettings.receiptHeader.trim().slice(0, 500) : '';
+    }
+    // receiptFooter: custom footer text on receipts
+    if (printSettings.receiptFooter !== undefined) {
+      sanitizedSettings.receiptFooter = typeof printSettings.receiptFooter === 'string'
+        ? printSettings.receiptFooter.trim().slice(0, 500) : '';
+    }
+    // receiptLogoUrl: legacy logo URL field (kept for backward compat)
+    if (printSettings.receiptLogoUrl !== undefined) {
+      sanitizedSettings.receiptLogoUrl = typeof printSettings.receiptLogoUrl === 'string'
+        ? printSettings.receiptLogoUrl.trim().slice(0, 2000) : '';
+    }
+    // invoicePhoneNumber: phone number displayed on printed receipts
+    if (printSettings.invoicePhoneNumber !== undefined) {
+      sanitizedSettings.invoicePhoneNumber = typeof printSettings.invoicePhoneNumber === 'string'
+        ? printSettings.invoicePhoneNumber.trim().slice(0, 30) : '';
     }
     // receiptAddress: optional override for address printed on receipts
     if (printSettings.receiptAddress !== undefined) {
