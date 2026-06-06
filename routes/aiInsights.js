@@ -16,15 +16,31 @@ const { parseTZ, todayInTZ, dateStrInTZ, dateBoundsInTZ } = require('../utils/ti
  */
 function convertToUTCHour(timeStr, tz) {
   try {
-    const [hours] = timeStr.split(':').map(Number);
-    // Create a reference date and format it in both timezones to find offset
-    const ref = new Date('2024-06-15T12:00:00Z'); // Use a fixed date to avoid DST issues
-    const localStr = ref.toLocaleString('en-US', { timeZone: tz, hour: 'numeric', hour12: false, minute: 'numeric' });
-    const utcStr = ref.toLocaleString('en-US', { timeZone: 'UTC', hour: 'numeric', hour12: false, minute: 'numeric' });
-    const localHour = parseInt(localStr.split(':')[0]);
-    const utcHour = parseInt(utcStr.split(':')[0]);
-    const offsetHours = localHour - utcHour;
-    return ((hours - offsetHours) % 24 + 24) % 24;
+    const [hours, minutes = 0] = timeStr.split(':').map(Number);
+    // Create a date string as if in the target timezone, then read UTC hour
+    // Use June 15 to avoid DST edge cases
+    const dateStr = `2024-06-15T${String(hours).padStart(2, '0')}:${String(minutes).padStart(2, '0')}:00`;
+    // Intl to find the UTC offset for this timezone
+    const formatter = new Intl.DateTimeFormat('en-US', {
+      timeZone: tz,
+      year: 'numeric', month: '2-digit', day: '2-digit',
+      hour: '2-digit', minute: '2-digit', second: '2-digit',
+      hour12: false
+    });
+    // Find offset by: create a UTC date, format in tz, compare
+    // Use a noon reference to avoid day-boundary confusion
+    const ref = new Date('2024-06-15T12:00:00Z');
+    const parts = formatter.formatToParts(ref);
+    const lH = parseInt(parts.find(p => p.type === 'hour')?.value || '12');
+    const lM = parseInt(parts.find(p => p.type === 'minute')?.value || '0');
+    const lD = parseInt(parts.find(p => p.type === 'day')?.value || '15');
+    // UTC is 12:00 on June 15. Local might be different day.
+    const dayDiff = lD - 15; // -1, 0, or +1
+    const offsetMinutes = (dayDiff * 24 * 60) + (lH * 60 + lM) - (12 * 60);
+    // Convert desired local time to UTC
+    const desiredLocalMinutes = hours * 60 + minutes;
+    const utcMinutes = ((desiredLocalMinutes - offsetMinutes) % 1440 + 1440) % 1440;
+    return Math.floor(utcMinutes / 60);
   } catch {
     return 2; // Default: 08:00 IST = 02:30 UTC → hour 2
   }
