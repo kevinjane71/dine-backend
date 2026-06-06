@@ -2372,7 +2372,7 @@ const downloadFileBuffer = async (url) => {
 // Helper: parse Excel/CSV file buffer to text table
 const parseSpreadsheetToText = (buffer, fileName) => {
   const XLSX = require('xlsx');
-  const workbook = XLSX.read(buffer, { type: 'buffer' });
+  const workbook = XLSX.read(buffer, { type: 'buffer', codepage: 65001 });
   const lines = [];
   for (const sheetName of workbook.SheetNames) {
     const sheet = workbook.Sheets[sheetName];
@@ -2402,7 +2402,7 @@ const parseDocumentToText = async (buffer, fileName) => {
 const tryParseStructuredCSV = (buffer, fileName) => {
   try {
     const XLSX = require('xlsx');
-    const workbook = XLSX.read(buffer, { type: 'buffer' });
+    const workbook = XLSX.read(buffer, { type: 'buffer', codepage: 65001 });
     const sheet = workbook.Sheets[workbook.SheetNames[0]];
     const rows = XLSX.utils.sheet_to_json(sheet, { defval: '' });
     if (!rows || rows.length === 0) return null;
@@ -24052,7 +24052,7 @@ app.post('/api/inventory/:restaurantId/smart-import/parse', authenticateToken, a
     // ── FILE MODE: parse spreadsheet (CSV/XLS/XLSX) directly without AI ──
     if (isFileMode) {
       const XLSX = require('xlsx');
-      const workbook = XLSX.read(spreadsheetFile.buffer, { type: 'buffer' });
+      const workbook = XLSX.read(spreadsheetFile.buffer, { type: 'buffer', codepage: 65001 });
       const sheet = workbook.Sheets[workbook.SheetNames[0]];
       const raw = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: '' });
 
