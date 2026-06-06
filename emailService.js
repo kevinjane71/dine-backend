@@ -24,8 +24,9 @@ class EmailService {
       tls: {
         rejectUnauthorized: false
       },
-      connectionTimeout: 15000,
-      socketTimeout: 15000
+      connectionTimeout: 30000,
+      socketTimeout: 30000,
+      greetingTimeout: 15000
     });
 
     this.templates = {
@@ -612,23 +613,30 @@ DineOpen Analytics Team`,
     };
   }
 
-  async sendEmail({ to, subject, text, html, attachments = [] }) {
-    try {
-      const mailOptions = {
-        from: process.env.GODADY_EMAIL || "noreply@dineopen.com",
-        to,
-        subject,
-        text,
-        html,
-        attachments
-      };
-      
-      const info = await this.transporter.sendMail(mailOptions);
-      console.log('✅ Email sent successfully:', info.messageId);
-      return { success: true, messageId: info.messageId };
-    } catch (error) {
-      console.error('❌ Email send error:', error);
-      throw new Error(`Failed to send email: ${error.message}`);
+  async sendEmail({ to, subject, text, html, attachments = [] }, retries = 2) {
+    const mailOptions = {
+      from: process.env.GODADY_EMAIL || "noreply@dineopen.com",
+      to,
+      subject,
+      text,
+      html,
+      attachments
+    };
+
+    for (let attempt = 0; attempt <= retries; attempt++) {
+      try {
+        const info = await this.transporter.sendMail(mailOptions);
+        console.log('✅ Email sent successfully:', info.messageId);
+        return { success: true, messageId: info.messageId };
+      } catch (error) {
+        console.error(`❌ Email send error (attempt ${attempt + 1}/${retries + 1}):`, error.message);
+        if (attempt < retries && (error.code === 'ECONNRESET' || error.code === 'ETIMEDOUT' || error.code === 'ESOCKET')) {
+          console.log(`🔄 Retrying email send in ${(attempt + 1) * 2}s...`);
+          await new Promise(r => setTimeout(r, (attempt + 1) * 2000));
+          continue;
+        }
+        throw new Error(`Failed to send email: ${error.message}`);
+      }
     }
   }
 
