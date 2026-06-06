@@ -1,6 +1,7 @@
 const express = require('express');
 const cors = require('cors');
 const helmet = require('helmet');
+// v1.5.2 — UTF-8 codepage fix, logo size increase, print settings save fix, 500ml bottle size
 const morgan = require('morgan');
 const bodyParser = require('body-parser');
 const jwt = require('jsonwebtoken');
