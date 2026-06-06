@@ -91,9 +91,20 @@ async function getOutletExpenses(outletId, startDate, endDate) {
   return expenses;
 }
 
-// ─── Helper: Get order revenue ───────────────────────────────────────────────
+// ─── Helper: Get order revenue (excludes unpaid due amounts) ─────────────────
 function getOrderRevenue(order) {
+  const ps = order.paymentStatus;
+  if (ps === 'due') return 0;
+  if (ps === 'partial' && order.paidAmount != null) return Number(order.paidAmount) || 0;
   return Number(order.totalAmount) || Number(order.total) || 0;
+}
+
+// ─── Helper: Get due amount for an order ─────────────────────────────────────
+function getOrderDueAmount(order) {
+  const ps = order.paymentStatus;
+  if (ps === 'due') return Number(order.finalAmount) || Number(order.totalAmount) || 0;
+  if (ps === 'partial') return Number(order.outstandingAmount) || 0;
+  return 0;
 }
 
 // ─── Helper: Parse restaurantIds filter from query params ────────────────────
@@ -849,7 +860,7 @@ router.get('/:orgId/sales-summary', ...reportMiddleware, async (req, res) => {
     const serviceBuckets = { dine_in: { count: 0, amount: 0 }, takeaway: { count: 0, amount: 0 }, delivery: { count: 0, amount: 0 }, aggregator: { count: 0, amount: 0 } };
     const dailyMap = {};
     const hourMap = {};
-    let totalRevenue = 0, totalOrders = 0, totalTips = 0, totalServiceCharge = 0;
+    let totalRevenue = 0, totalOrders = 0, totalTips = 0, totalServiceCharge = 0, totalDueAmount = 0, dueOrderCount = 0;
     const outletResults = [];
 
     const outletPromises = outlets.map(async (outlet) => {
@@ -858,14 +869,19 @@ router.get('/:orgId/sales-summary', ...reportMiddleware, async (req, res) => {
 
       orders.forEach(order => {
         const revenue = getOrderRevenue(order);
+        const dueAmt = getOrderDueAmount(order);
         totalRevenue += revenue;
         outletRevenue += revenue;
+        totalDueAmount += dueAmt;
+        if (dueAmt > 0) dueOrderCount++;
         totalOrders++;
         totalTips += Number(order.tipAmount) || 0;
         totalServiceCharge += Number(order.serviceChargeAmount) || 0;
 
-        // Payment breakdown
-        if (order.splitPayments && Array.isArray(order.splitPayments) && order.splitPayments.length > 0) {
+        // Payment breakdown (skip fully due orders — no actual payment received)
+        if (order.paymentStatus === 'due') {
+          // Don't add to payment buckets
+        } else if (order.splitPayments && Array.isArray(order.splitPayments) && order.splitPayments.length > 0) {
           order.splitPayments.forEach(sp => {
             const bucket = normalizePaymentMethod(sp.method || sp.paymentMethod, order);
             paymentBuckets[bucket].count++;
@@ -927,7 +943,7 @@ router.get('/:orgId/sales-summary', ...reportMiddleware, async (req, res) => {
       success: true,
       startDate: startDate.toISOString(),
       endDate: endDate.toISOString(),
-      summary: { totalRevenue: round(totalRevenue), totalOrders, avgTicketSize: totalOrders > 0 ? round(totalRevenue / totalOrders) : 0, totalTips: round(totalTips), totalServiceCharge: round(totalServiceCharge) },
+      summary: { totalRevenue: round(totalRevenue), totalOrders, avgTicketSize: totalOrders > 0 ? round(totalRevenue / totalOrders) : 0, totalTips: round(totalTips), totalServiceCharge: round(totalServiceCharge), totalDueAmount: round(totalDueAmount), dueOrderCount },
       paymentBreakdown,
       serviceTypeBreakdown,
       dailyTrend,
@@ -1935,6 +1951,7 @@ router.get('/:orgId/payment-analytics', ...reportMiddleware, async (req, res) =>
       const orders = await getOutletOrders(outlet.id, startDate, endDate);
 
       orders.forEach(order => {
+        if (order.paymentStatus === 'due') return; // Skip fully unpaid orders from payment analytics
         const revenue = getOrderRevenue(order);
         totalRevenue += revenue;
         totalTransactions++;

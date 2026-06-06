@@ -188,6 +188,18 @@ function parseTZ(req) {
   return isNaN(n) ? undefined : n;
 }
 
+// Helper: get effective revenue for an order (excludes unpaid due amounts)
+function getEffectiveOrderRevenue(order) {
+  const ps = order.paymentStatus;
+  if (ps === 'due') return { amount: 0, amountWithTax: 0, dueAmount: order.finalAmount || order.totalAmount || 0 };
+  if (ps === 'partial' && order.paidAmount != null) {
+    const paid = Number(order.paidAmount) || 0;
+    const due = Number(order.outstandingAmount) || 0;
+    return { amount: paid, amountWithTax: paid, dueAmount: due };
+  }
+  return { amount: order.totalAmount || 0, amountWithTax: order.finalAmount || order.totalAmount || 0, dueAmount: 0 };
+}
+
 // Pre-compute daily analytics stats on every order write (fire-and-forget)
 // Doc ID: {restaurantId}_{YYYY-MM-DD} in 'dailyStats' collection
 function updateDailyStats(restaurantId, order, operation, tzOffset) {
@@ -199,8 +211,9 @@ function updateDailyStats(restaurantId, order, operation, tzOffset) {
     const statsRef = db.collection('dailyStats').doc(docId);
 
     const sign = operation === 'add' ? 1 : -1;
-    const amount = (order.totalAmount || 0) * sign;
-    const amountWithTax = (order.finalAmount || order.totalAmount || 0) * sign;
+    const effective = getEffectiveOrderRevenue(order);
+    const amount = effective.amount * sign;
+    const amountWithTax = effective.amountWithTax * sign;
 
     // Build atomic update
     const update = {
@@ -211,6 +224,11 @@ function updateDailyStats(restaurantId, order, operation, tzOffset) {
       totalRevenueWithTax: FieldValue.increment(amountWithTax),
       updatedAt: FieldValue.serverTimestamp()
     };
+
+    // Track due amounts separately
+    if (effective.dueAmount > 0) {
+      update.totalDueAmount = FieldValue.increment(effective.dueAmount * sign);
+    }
 
     // Order type bucket
     const orderType = (order.orderType || 'dine_in').toLowerCase().replace(/[\s-]+/g, '_');
@@ -9995,13 +10013,14 @@ app.post('/api/orders', async (req, res) => {
 
           if (isCompletedOrder) {
             // Direct billing — add to order history and update stats immediately
+            // Use paidAmount for due/partial orders instead of finalAmount
             const existingHistory = custData.orderHistory || [];
             const newHistory = [...existingHistory, orderHistoryEntry];
             await existingCustomer.ref.update({
               name: customerInfo.name || custData.name,
               orderHistory: newHistory,
               totalOrders: newHistory.length,
-              totalSpent: newHistory.reduce((s, o) => s + (o.finalAmount || o.totalAmount || 0), 0),
+              totalSpent: newHistory.reduce((s, o) => s + (o.paidAmount != null ? o.paidAmount : (o.finalAmount || o.totalAmount || 0)), 0),
               lastOrderDate: new Date(),
               updatedAt: new Date()
             });
@@ -10028,7 +10047,8 @@ app.post('/api/orders', async (req, res) => {
             ...(isCompletedOrder ? {
               orderHistory: [orderHistoryEntry],
               totalOrders: 1,
-              totalSpent: Math.round(finalAmount * 100) / 100,
+              // Use paidAmount for due/partial orders (don't count unpaid amount as spent)
+              totalSpent: Math.round((orderHistoryEntry.paidAmount != null && orderHistoryEntry.paymentStatus !== 'paid' ? orderHistoryEntry.paidAmount : finalAmount) * 100) / 100,
             } : {
               orderHistory: [],
               totalOrders: 0,
@@ -11321,14 +11341,19 @@ function calculateAnalytics(orders, period) {
     };
   }
 
-  // Subtract partial refund amounts from revenue (full refunds are already excluded by status filter)
+  // Subtract partial refund amounts from revenue; exclude unpaid due amounts
+  let totalDueAmount = 0;
+  let dueOrders = 0;
   const totalRevenue = orders.reduce((sum, order) => {
     const refundAdj = order.refundAmount || 0;
-    return sum + (order.totalAmount || 0) - refundAdj;
+    const eff = getEffectiveOrderRevenue(order);
+    if (eff.dueAmount > 0) { totalDueAmount += eff.dueAmount; dueOrders++; }
+    return sum + eff.amount - refundAdj;
   }, 0);
   const totalRevenueWithTax = orders.reduce((sum, order) => {
     const refundAdj = order.refundAmount || 0;
-    return sum + (order.finalAmount || order.totalAmount || 0) - refundAdj;
+    const eff = getEffectiveOrderRevenue(order);
+    return sum + eff.amountWithTax - refundAdj;
   }, 0);
   const totalOrders = orders.length;
   const avgOrderValue = totalOrders > 0 ? Math.round(totalRevenue / totalOrders) : 0;
@@ -11362,7 +11387,7 @@ function calculateAnalytics(orders, period) {
   orders.forEach(order => {
     const orderDate = order.createdAt?.toDate ? order.createdAt.toDate() : new Date(order.createdAt);
     const dayName = dayNames[orderDate.getDay()];
-    revenueByDay[dayName] = (revenueByDay[dayName] || 0) + (order.totalAmount || 0);
+    revenueByDay[dayName] = (revenueByDay[dayName] || 0) + getEffectiveOrderRevenue(order).amount;
   });
 
   const revenueData = dayNames.map(day => ({ day, revenue: revenueByDay[day] || 0 }));
@@ -11393,14 +11418,16 @@ function calculateAnalytics(orders, period) {
     .sort((a, b) => b.orders - a.orders)
     .slice(0, 6);
 
-  // Payment method breakdown
+  // Payment method breakdown (exclude due orders; partial orders use paidAmount)
   const paymentBreakdown = {};
   orders.forEach(order => {
+    if (order.paymentStatus === 'due') return; // Skip fully unpaid orders
     const method = (order.paymentMethod || 'cash').toLowerCase();
     const refundAdj = order.refundAmount || 0;
+    const eff = getEffectiveOrderRevenue(order);
     if (!paymentBreakdown[method]) paymentBreakdown[method] = { count: 0, total: 0 };
     paymentBreakdown[method].count += 1;
-    paymentBreakdown[method].total += (order.finalAmount || order.totalAmount || 0) - refundAdj;
+    paymentBreakdown[method].total += eff.amountWithTax - refundAdj;
   });
   // Round totals
   Object.keys(paymentBreakdown).forEach(method => {
@@ -11409,7 +11436,8 @@ function calculateAnalytics(orders, period) {
 
   return {
     totalRevenue, totalRevenueWithTax, totalOrders, avgOrderValue, newCustomers,
-    popularItems, revenueData, ordersByType: ordersByTypeArray, busyHours, paymentBreakdown
+    popularItems, revenueData, ordersByType: ordersByTypeArray, busyHours, paymentBreakdown,
+    totalDueAmount: Math.round(totalDueAmount * 100) / 100, dueOrders
   };
 }
 
@@ -11955,7 +11983,7 @@ app.patch('/api/orders/:orderId/status', authenticateToken, async (req, res) => 
             await custDoc.ref.update({
               orderHistory: nh,
               totalOrders: nh.length,
-              totalSpent: nh.reduce((s, o) => s + (o.finalAmount || o.totalAmount || 0), 0),
+              totalSpent: nh.reduce((s, o) => s + (o.paidAmount != null ? o.paidAmount : (o.finalAmount || o.totalAmount || 0)), 0),
               lastOrderDate: new Date(),
               updatedAt: new Date()
             });
@@ -13362,7 +13390,7 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
               await db.collection(collections.customers).doc(custId).update({
                 orderHistory: newHistory,
                 totalOrders: newHistory.length,
-                totalSpent: newHistory.reduce((s, o) => s + (o.finalAmount || o.totalAmount || 0), 0),
+                totalSpent: newHistory.reduce((s, o) => s + (o.paidAmount != null ? o.paidAmount : (o.finalAmount || o.totalAmount || 0)), 0),
                 lastOrderDate: new Date(),
                 updatedAt: new Date()
               });
@@ -20785,7 +20813,7 @@ async function reverseOrderSideEffects(orderId, orderData) {
         // Remove this order from orderHistory
         const updatedHistory = orderHistory.filter(h => h.orderId !== orderId);
         const newTotalOrders = updatedHistory.length;
-        const newTotalSpent = updatedHistory.reduce((sum, o) => sum + (o.finalAmount || o.totalAmount || 0), 0);
+        const newTotalSpent = updatedHistory.reduce((sum, o) => sum + (o.paidAmount != null ? o.paidAmount : (o.finalAmount || o.totalAmount || 0)), 0);
 
         const custUpdate = {
           orderHistory: updatedHistory,
@@ -28735,7 +28763,7 @@ app.post('/api/customers', authenticateToken, async (req, res) => {
           invoiceGenerated: order.invoiceId ? true : false
         }))],
         totalOrders: ((customerData.orderHistory || []).length + (orderHistory.length || 0)),
-        totalSpent: ((customerData.orderHistory || []).reduce((sum, o) => sum + (o.finalAmount || o.totalAmount || 0), 0)) + orderHistory.reduce((sum, order) => sum + (order.finalAmount || order.totalAmount || 0), 0),
+        totalSpent: ((customerData.orderHistory || []).reduce((sum, o) => sum + (o.paidAmount != null ? o.paidAmount : (o.finalAmount || o.totalAmount || 0)), 0)) + orderHistory.reduce((sum, order) => sum + (order.paidAmount != null ? order.paidAmount : (order.finalAmount || order.totalAmount || 0)), 0),
         lastOrderDate: orderHistory.length > 0 ? new Date() : customerData.lastOrderDate,
         updatedAt: new Date()
       };
@@ -28774,7 +28802,7 @@ app.post('/api/customers', authenticateToken, async (req, res) => {
           invoiceGenerated: order.invoiceId ? true : false
         })),
         totalOrders: orderHistory.length,
-        totalSpent: orderHistory.reduce((sum, order) => sum + (order.finalAmount || order.totalAmount || 0), 0),
+        totalSpent: orderHistory.reduce((sum, order) => sum + (order.paidAmount != null ? order.paidAmount : (order.finalAmount || order.totalAmount || 0)), 0),
         lastOrderDate: orderHistory.length > 0 ? new Date() : null,
         createdAt: new Date(),
         updatedAt: new Date()
@@ -28897,7 +28925,7 @@ app.get('/api/customers/reports', authenticateToken, async (req, res) => {
         const disc = o.totalDiscountAmount || ((o.discountAmount || 0) + (o.manualDiscount || 0) + (o.loyaltyDiscount || 0) + (o.couponDiscount || 0));
         return sum + disc;
       }, 0);
-      const totalSpent = orders.reduce((sum, o) => sum + (o.finalAmount || o.totalAmount || 0), 0);
+      const totalSpent = orders.reduce((sum, o) => sum + (o.paidAmount != null ? o.paidAmount : (o.finalAmount || o.totalAmount || 0)), 0);
 
       return {
         id: c.id,
@@ -32035,10 +32063,21 @@ app.post('/api/customers/:customerId/settle-credit', authenticateToken, async (r
         const newPaid = Math.round(((orderData.paidAmount || 0) + settleAmount) * 100) / 100;
         const newOutstanding = Math.max(0, Math.round(((orderData.outstandingAmount || 0) - settleAmount) * 100) / 100);
         const newPaymentStatus = newOutstanding <= 0 ? 'paid' : 'partial';
-        await orderRef.update({
+        const orderUpdate = {
           paidAmount: newPaid,
           outstandingAmount: newOutstanding,
-          paymentStatus: newPaymentStatus
+          paymentStatus: newPaymentStatus,
+          settledAt: new Date().toISOString(),
+        };
+        // Update payment method to the settlement method (so revenue shows under correct method)
+        if (paymentMethod && newPaymentStatus === 'paid') {
+          orderUpdate.paymentMethod = paymentMethod;
+        }
+        await orderRef.update(orderUpdate);
+
+        // Update customer totalSpent (was not counted when order was created as due)
+        await customerRef.update({
+          totalSpent: FieldValue.increment(settleAmount),
         });
 
         // Also update the embedded orderHistory entry on the customer doc
@@ -32052,6 +32091,10 @@ app.post('/api/customers/:customerId/settle-credit', authenticateToken, async (r
         if (JSON.stringify(updatedOrderHistory) !== JSON.stringify(orderHistory)) {
           await customerRef.update({ orderHistory: updatedOrderHistory });
         }
+
+        // Update daily stats: add settled amount to revenue for the order's original date
+        const tzOffset = parseTZ(req);
+        updateDailyStatsRevenueDiff(orderData.restaurantId, orderData, 0, settleAmount, 0, settleAmount, tzOffset);
       }
     }
 
@@ -32102,13 +32145,22 @@ app.post('/api/customers/:customerId/bulk-settle-credit', authenticateToken, asy
         paidAmount: Math.round(finalAmt * 100) / 100,
         outstandingAmount: 0,
         paymentStatus: 'paid',
+        settledAt: new Date().toISOString(),
       };
+      // Update payment method to the settlement method
+      if (paymentMethod) {
+        orderUpdate.paymentMethod = paymentMethod;
+      }
       if (updateOrderStatus) {
         orderUpdate.status = 'completed';
       }
       await orderRef.update(orderUpdate);
       settledOrderNumbers.push(orderData.orderNumber || orderData.dailyOrderId || oid);
       settledDetails.push({ orderId: oid, orderNumber: orderData.orderNumber, amount: outstanding });
+
+      // Update daily stats: add settled amount to revenue for the order's original date
+      const tzOffset = parseTZ(req);
+      updateDailyStatsRevenueDiff(orderData.restaurantId, orderData, 0, outstanding, 0, outstanding, tzOffset);
     }
 
     // Update customer: decrement balance, mark credit history entries as settled
@@ -32151,6 +32203,8 @@ app.post('/api/customers/:customerId/bulk-settle-credit', authenticateToken, asy
       creditHistory: updatedHistory,
       settlementHistory,
       orderHistory: updatedOrderHistory,
+      // Increment totalSpent by the actual settled amount (was excluded when orders were created as due)
+      totalSpent: FieldValue.increment(settledTotal),
     });
 
     res.json({ success: true, newBalance, settledTotal: Math.round(settledTotal * 100) / 100, settledOrders: settledOrderNumbers });

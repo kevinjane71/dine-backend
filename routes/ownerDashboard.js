@@ -10,6 +10,18 @@ const { parseTZ, buildDateRange, dateStrInTZ, dateBoundsInTZ } = require('../uti
 // All endpoints require owner (or admin co-owner) role
 // ============================================
 
+// Helper: get effective revenue for an order (excludes unpaid due amounts)
+function getEffectiveOrderRevenue(order) {
+  const ps = order.paymentStatus;
+  if (ps === 'due') return { amount: 0, amountWithTax: 0, dueAmount: order.finalAmount || order.totalAmount || 0 };
+  if (ps === 'partial' && order.paidAmount != null) {
+    const paid = Number(order.paidAmount) || 0;
+    const due = Number(order.outstandingAmount) || 0;
+    return { amount: paid, amountWithTax: paid, dueAmount: due };
+  }
+  return { amount: order.totalAmount || 0, amountWithTax: order.finalAmount || order.totalAmount || 0, dueAmount: 0 };
+}
+
 // Admin staff have ownerId in JWT pointing to their owner's userId.
 // Owner users use their own userId. This helper resolves the correct ownerId for queries.
 function getOwnerId(req) {
@@ -112,6 +124,7 @@ router.get('/dashboard', authenticateToken, requireOwnerRole, async (req, res) =
     let totalOrders = 0;
     let totalRevenue = 0;
     let totalRevenueWithTax = 0;
+    let totalDueAmount = 0;
     let totalStaff = 0;
     let totalLowStockItems = 0;
 
@@ -120,16 +133,20 @@ router.get('/dashboard', authenticateToken, requireOwnerRole, async (req, res) =
       const nonCountedStatuses = ['cancelled', 'deleted', 'saved', 'refunded'];
       const orders = ordersResults[index].docs.filter(doc => !nonCountedStatuses.includes(doc.data().status));
       const periodOrders = orders.length;
-      // Subtract partial refund amounts from revenue (full refunds already excluded by status filter)
+      // Subtract partial refund amounts; exclude unpaid due amounts from revenue
+      let periodDueAmount = 0;
       const periodRevenue = orders.reduce((sum, doc) => {
         const order = doc.data();
         const refundAdj = order.refundAmount || 0;
-        return sum + (order.totalAmount || 0) - refundAdj;
+        const eff = getEffectiveOrderRevenue(order);
+        periodDueAmount += eff.dueAmount;
+        return sum + eff.amount - refundAdj;
       }, 0);
       const periodRevenueWithTax = orders.reduce((sum, doc) => {
         const order = doc.data();
         const refundAdj = order.refundAmount || 0;
-        return sum + (order.finalAmount || order.totalAmount || 0) - refundAdj;
+        const eff = getEffectiveOrderRevenue(order);
+        return sum + eff.amountWithTax - refundAdj;
       }, 0);
 
       // Process staff (exclude owners and customers)
@@ -150,6 +167,7 @@ router.get('/dashboard', authenticateToken, requireOwnerRole, async (req, res) =
       totalOrders += periodOrders;
       totalRevenue += periodRevenue;
       totalRevenueWithTax += periodRevenueWithTax;
+      totalDueAmount += periodDueAmount;
       totalStaff += activeStaff;
       totalLowStockItems += lowStockItems;
 
@@ -187,6 +205,7 @@ router.get('/dashboard', authenticateToken, requireOwnerRole, async (req, res) =
         totalOrders,
         totalRevenue: Math.round(totalRevenue * 100) / 100,
         totalRevenueWithTax: Math.round(totalRevenueWithTax * 100) / 100,
+        totalDueAmount: Math.round(totalDueAmount * 100) / 100,
         totalStaff,
         totalLowStockItems
       },
@@ -302,6 +321,7 @@ router.get('/analytics', authenticateToken, requireOwnerRole, async (req, res) =
     // Aggregate analytics
     let totalRevenue = 0;
     let totalRevenueWithTax = 0;
+    let totalDueAmount = 0;
     let totalOrders = 0;
     const revenueByRestaurant = [];
     const allOrders = [];
@@ -311,20 +331,25 @@ router.get('/analytics', authenticateToken, requireOwnerRole, async (req, res) =
     restaurantIds.forEach((restaurantId, index) => {
       // Exclude cancelled/deleted/saved/refunded orders from analytics
       const orders = ordersResults[index].docs.filter(doc => !nonCountedStatuses.includes(doc.data().status));
-      // Subtract partial refund amounts from revenue (full refunds already excluded by status filter)
+      // Subtract partial refund amounts; exclude unpaid due amounts from revenue
+      let restaurantDueAmount = 0;
       const restaurantRevenue = orders.reduce((sum, doc) => {
         const order = doc.data();
         const refundAdj = order.refundAmount || 0;
-        return sum + (order.totalAmount || 0) - refundAdj;
+        const eff = getEffectiveOrderRevenue(order);
+        restaurantDueAmount += eff.dueAmount;
+        return sum + eff.amount - refundAdj;
       }, 0);
       const restaurantRevenueWithTax = orders.reduce((sum, doc) => {
         const order = doc.data();
         const refundAdj = order.refundAmount || 0;
-        return sum + (order.finalAmount || order.totalAmount || 0) - refundAdj;
+        const eff = getEffectiveOrderRevenue(order);
+        return sum + eff.amountWithTax - refundAdj;
       }, 0);
 
       totalRevenue += restaurantRevenue;
       totalRevenueWithTax += restaurantRevenueWithTax;
+      totalDueAmount += restaurantDueAmount;
       totalOrders += orders.length;
 
       revenueByRestaurant.push({
@@ -351,7 +376,7 @@ router.get('/analytics', authenticateToken, requireOwnerRole, async (req, res) =
 
     restaurantIds.forEach((restaurantId, index) => {
       const prevOrders = prevOrdersResults[index].docs.filter(doc => !nonCountedStatuses.includes(doc.data().status));
-      previousTotalRevenue += prevOrders.reduce((sum, doc) => sum + (doc.data().totalAmount || 0), 0);
+      previousTotalRevenue += prevOrders.reduce((sum, doc) => sum + getEffectiveOrderRevenue(doc.data()).amount, 0);
       previousTotalOrders += prevOrders.length;
       prevOrders.forEach(doc => {
         prevAllOrders.push({ ...doc.data(), restaurantId });
@@ -384,7 +409,7 @@ router.get('/analytics', authenticateToken, requireOwnerRole, async (req, res) =
       if (!revenueByDay[dateKey]) {
         revenueByDay[dateKey] = { date: dateKey, revenue: 0, orders: 0 };
       }
-      revenueByDay[dateKey].revenue += (order.totalAmount || order.finalAmount || 0);
+      revenueByDay[dateKey].revenue += getEffectiveOrderRevenue(order).amount;
       revenueByDay[dateKey].orders += 1;
     });
 
@@ -449,7 +474,7 @@ router.get('/analytics', authenticateToken, requireOwnerRole, async (req, res) =
         const shifted = _shiftToTZ(orderDate);
         const hour = String(shifted.getUTCHours()).padStart(2, '0');
         if (!prevHourly[hour]) prevHourly[hour] = { hour, revenue: 0, orders: 0 };
-        prevHourly[hour].revenue += (order.totalAmount || order.finalAmount || 0);
+        prevHourly[hour].revenue += getEffectiveOrderRevenue(order).amount;
         prevHourly[hour].orders += 1;
       });
       previousDayRevenueByHour = Object.values(prevHourly).sort((a, b) => a.hour.localeCompare(b.hour));
@@ -462,6 +487,7 @@ router.get('/analytics', authenticateToken, requireOwnerRole, async (req, res) =
       analytics: {
         totalRevenue: Math.round(totalRevenue * 100) / 100,
         totalRevenueWithTax: Math.round(totalRevenueWithTax * 100) / 100,
+        totalDueAmount: Math.round(totalDueAmount * 100) / 100,
         totalOrders,
         avgOrderValue: currentAvgOrderValue,
         revenueByRestaurant: revenueByRestaurant.sort((a, b) => b.revenue - a.revenue),
