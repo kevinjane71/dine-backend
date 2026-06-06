@@ -657,6 +657,198 @@ DineOpen Analytics Team`,
     });
   }
 
+  // Generate a professional PDF report from analytics data
+  async generateReportPDF(data) {
+    return new Promise((resolve, reject) => {
+      const PDFDocument = require('pdfkit');
+      const doc = new PDFDocument({ margin: 50, size: 'A4' });
+      const chunks = [];
+      doc.on('data', chunk => chunks.push(chunk));
+      doc.on('end', () => resolve(Buffer.concat(chunks)));
+      doc.on('error', reject);
+
+      const currency = data.currencySymbol || '\u20B9';
+      const pageWidth = doc.page.width - 100; // 50px margin each side
+      const brandColor = '#dc2626';
+      const headerBg = '#f9fafb';
+      const altRowBg = '#f3f4f6';
+
+      // --- Helper: draw a section header with colored underline ---
+      const drawSectionHeader = (title, y) => {
+        doc.fontSize(14).font('Helvetica-Bold').fillColor('#1f2937').text(title, 50, y);
+        const textWidth = doc.widthOfString(title);
+        doc.moveTo(50, y + 18).lineTo(50 + textWidth + 10, y + 18).lineWidth(2).strokeColor(brandColor).stroke();
+        return y + 30;
+      };
+
+      // --- Helper: draw a table row ---
+      const drawTableRow = (columns, y, widths, options = {}) => {
+        const { bold, bg, fontSize: fs } = options;
+        const rowHeight = 22;
+        if (bg) {
+          doc.rect(50, y - 2, pageWidth, rowHeight).fill(bg);
+        }
+        doc.fillColor(options.headerRow ? '#ffffff' : '#1f2937');
+        if (options.headerRow) {
+          doc.rect(50, y - 2, pageWidth, rowHeight).fill('#374151');
+          doc.fillColor('#ffffff');
+        }
+        let x = 50;
+        columns.forEach((col, i) => {
+          doc.fontSize(fs || 10).font(bold || options.headerRow ? 'Helvetica-Bold' : 'Helvetica')
+            .text(String(col), x + 4, y + 2, { width: widths[i] - 8, align: i === 0 ? 'left' : 'right' });
+          x += widths[i];
+        });
+        doc.fillColor('#1f2937');
+        return y + rowHeight;
+      };
+
+      // ========================
+      // HEADER
+      // ========================
+      doc.rect(0, 0, doc.page.width, 90).fill(brandColor);
+      doc.fontSize(22).font('Helvetica-Bold').fillColor('#ffffff').text('Daily Sales Report', 50, 30);
+      doc.fontSize(11).font('Helvetica').fillColor('rgba(255,255,255,0.85)').text(data.date || new Date().toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' }), 50, 58);
+      doc.fontSize(10).font('Helvetica-Bold').text('DineOpen', doc.page.width - 130, 35, { width: 80, align: 'right' });
+
+      let y = 110;
+
+      // ========================
+      // SUMMARY STATS
+      // ========================
+      const totalRevenue = typeof data.analytics.totalRevenue === 'number' ? data.analytics.totalRevenue.toLocaleString() : data.analytics.totalRevenue;
+      const totalOrders = typeof data.analytics.totalOrders === 'number' ? data.analytics.totalOrders.toLocaleString() : data.analytics.totalOrders;
+      const avgOrderValue = typeof data.analytics.avgOrderValue === 'number' ? Math.round(data.analytics.avgOrderValue).toLocaleString() : data.analytics.avgOrderValue;
+      const locations = data.restaurantCount || 1;
+
+      const statBoxWidth = pageWidth / 4;
+      const stats = [
+        { label: 'Total Revenue', value: `${currency}${totalRevenue}` },
+        { label: 'Total Orders', value: totalOrders },
+        { label: 'Avg Order Value', value: `${currency}${avgOrderValue}` },
+        { label: 'Locations', value: locations }
+      ];
+
+      doc.rect(50, y, pageWidth, 50).fill(headerBg);
+      stats.forEach((stat, i) => {
+        const x = 50 + i * statBoxWidth;
+        doc.fontSize(14).font('Helvetica-Bold').fillColor('#1f2937').text(String(stat.value), x + 6, y + 8, { width: statBoxWidth - 12, align: 'center' });
+        doc.fontSize(8).font('Helvetica').fillColor('#6b7280').text(stat.label, x + 6, y + 28, { width: statBoxWidth - 12, align: 'center' });
+      });
+
+      y += 65;
+
+      // ========================
+      // AI SUMMARY
+      // ========================
+      if (data.insights && data.insights.summary) {
+        y = drawSectionHeader('AI Summary', y);
+        doc.fontSize(10).font('Helvetica').fillColor('#374151');
+        doc.text(data.insights.summary, 50, y, { width: pageWidth, lineGap: 3 });
+        y = doc.y + 20;
+      }
+
+      // ========================
+      // POPULAR ITEMS TABLE
+      // ========================
+      if (data.analytics.popularItems && data.analytics.popularItems.length > 0) {
+        // Check if we need a new page
+        if (y > 650) { doc.addPage(); y = 50; }
+
+        y = drawSectionHeader('Popular Items', y);
+        const colWidths = [40, pageWidth - 40 - 80 - 100, 80, 100];
+        y = drawTableRow(['#', 'Item Name', 'Orders', 'Revenue'], y, colWidths, { headerRow: true });
+
+        const items = data.analytics.popularItems.slice(0, 10);
+        items.forEach((item, i) => {
+          if (y > 750) { doc.addPage(); y = 50; }
+          const bg = i % 2 === 1 ? altRowBg : null;
+          const revenue = typeof item.revenue === 'number' ? `${currency}${item.revenue.toLocaleString()}` : `${currency}${item.revenue}`;
+          const orders = typeof item.orders === 'number' ? item.orders.toLocaleString() : item.orders;
+          y = drawTableRow([i + 1, item.name || 'Unknown', orders, revenue], y, colWidths, { bg });
+        });
+
+        y += 15;
+      }
+
+      // ========================
+      // BUSY HOURS
+      // ========================
+      if (data.analytics.busyHours && data.analytics.busyHours.length > 0) {
+        if (y > 650) { doc.addPage(); y = 50; }
+
+        y = drawSectionHeader('Busiest Hours', y);
+        const colWidths = [pageWidth / 2, pageWidth / 2];
+        y = drawTableRow(['Hour', 'Orders'], y, colWidths, { headerRow: true });
+
+        const hours = data.analytics.busyHours.slice(0, 5);
+        hours.forEach((h, i) => {
+          if (y > 750) { doc.addPage(); y = 50; }
+          const bg = i % 2 === 1 ? altRowBg : null;
+          const hourLabel = typeof h.hour === 'number' ? `${h.hour}:00` : h.hour;
+          const orders = typeof h.orders === 'number' ? h.orders.toLocaleString() : h.orders;
+          y = drawTableRow([hourLabel, orders], y, colWidths, { bg });
+        });
+
+        y += 15;
+      }
+
+      // ========================
+      // REVENUE TREND (Last 7 days)
+      // ========================
+      if (data.analytics.revenueByDay && data.analytics.revenueByDay.length > 0) {
+        if (y > 600) { doc.addPage(); y = 50; }
+
+        y = drawSectionHeader('Revenue Trend (Last 7 Days)', y);
+        const colWidths = [pageWidth / 3, pageWidth / 3, pageWidth / 3];
+        y = drawTableRow(['Date', 'Revenue', 'Orders'], y, colWidths, { headerRow: true });
+
+        const days = data.analytics.revenueByDay.slice(-7);
+        days.forEach((d, i) => {
+          if (y > 750) { doc.addPage(); y = 50; }
+          const bg = i % 2 === 1 ? altRowBg : null;
+          const revenue = typeof d.revenue === 'number' ? `${currency}${d.revenue.toLocaleString()}` : `${currency}${d.revenue}`;
+          const orders = typeof d.orders === 'number' ? d.orders.toLocaleString() : d.orders;
+          y = drawTableRow([d.date || '', revenue, orders], y, colWidths, { bg });
+        });
+
+        y += 15;
+      }
+
+      // ========================
+      // ORDER TYPES
+      // ========================
+      if (data.analytics.ordersByType && data.analytics.ordersByType.length > 0) {
+        if (y > 650) { doc.addPage(); y = 50; }
+
+        y = drawSectionHeader('Order Types', y);
+        const colWidths = [pageWidth / 3, pageWidth / 3, pageWidth / 3];
+        y = drawTableRow(['Type', 'Count', 'Percentage'], y, colWidths, { headerRow: true });
+
+        data.analytics.ordersByType.forEach((t, i) => {
+          if (y > 750) { doc.addPage(); y = 50; }
+          const bg = i % 2 === 1 ? altRowBg : null;
+          const count = typeof t.count === 'number' ? t.count.toLocaleString() : t.count;
+          const pct = t.percentage != null ? `${t.percentage}%` : '-';
+          y = drawTableRow([t.type || 'Unknown', count, pct], y, colWidths, { bg });
+        });
+
+        y += 15;
+      }
+
+      // ========================
+      // FOOTER
+      // ========================
+      if (y > 750) { doc.addPage(); y = 50; }
+      doc.moveTo(50, y).lineTo(50 + pageWidth, y).lineWidth(0.5).strokeColor('#d1d5db').stroke();
+      y += 10;
+      doc.fontSize(8).font('Helvetica').fillColor('#9ca3af')
+        .text(`Generated by DineOpen on ${new Date().toLocaleString()} | www.dineopen.com`, 50, y, { width: pageWidth, align: 'center' });
+
+      doc.end();
+    });
+  }
+
   // Send AI Insights daily report email
   async sendAIInsightsReport(reportData) {
     console.log('🤖 Sending AI Insights report to:', reportData.ownerEmail);
@@ -678,11 +870,30 @@ DineOpen Analytics Team`,
       date: today
     };
 
+    // Generate PDF attachment
+    let pdfBuffer;
+    try {
+      pdfBuffer = await this.generateReportPDF(data);
+    } catch (e) {
+      console.error('PDF generation error:', e.message);
+    }
+
+    const attachments = [];
+    if (pdfBuffer) {
+      const dateStr = new Date().toISOString().split('T')[0];
+      attachments.push({
+        filename: `DineOpen-Report-${dateStr}.pdf`,
+        content: pdfBuffer,
+        contentType: 'application/pdf'
+      });
+    }
+
     return this.sendEmail({
       to: reportData.ownerEmail,
       subject: template.getSubject(reportData.ownerName, today),
       text: template.text(data),
-      html: template.html(data)
+      html: template.html(data),
+      attachments
     });
   }
 
