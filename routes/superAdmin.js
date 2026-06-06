@@ -434,6 +434,80 @@ router.post('/users/merge', authenticateSuperAdmin, requireSuperAdmin, async (re
   }
 });
 
+// ─── Link Email/Phone to User (Admin — no OTP required) ─────────────
+router.post('/users/link-contact', authenticateSuperAdmin, requireSuperAdmin, async (req, res) => {
+  try {
+    const { userId, email, phone } = req.body;
+
+    if (!userId) {
+      return res.status(400).json({ success: false, error: 'userId is required' });
+    }
+    if (!email && !phone) {
+      return res.status(400).json({ success: false, error: 'At least one of email or phone is required' });
+    }
+
+    const userDoc = await db.collection(collections.users).doc(userId).get();
+    if (!userDoc.exists) {
+      return res.status(404).json({ success: false, error: 'User not found' });
+    }
+
+    const updateFields = { updatedAt: new Date() };
+
+    // Link email
+    if (email) {
+      const normalizedEmail = email.toLowerCase().trim();
+      // Check uniqueness — no other user should have this email
+      const emailCheck = await db.collection(collections.users)
+        .where('email', '==', normalizedEmail)
+        .limit(1)
+        .get();
+      if (!emailCheck.empty && emailCheck.docs[0].id !== userId) {
+        return res.status(400).json({ success: false, error: `Email "${normalizedEmail}" is already used by another account` });
+      }
+      updateFields.email = normalizedEmail;
+      updateFields.emailVerified = true;
+    }
+
+    // Link phone
+    if (phone) {
+      const normalizedPhone = phone.startsWith('+') ? phone : `+${phone}`;
+      // Check uniqueness — no other user should have this phone
+      const phoneCheck = await db.collection(collections.users)
+        .where('phone', '==', normalizedPhone)
+        .limit(1)
+        .get();
+      if (!phoneCheck.empty && phoneCheck.docs[0].id !== userId) {
+        return res.status(400).json({ success: false, error: `Phone "${normalizedPhone}" is already used by another account` });
+      }
+      updateFields.phone = normalizedPhone;
+      updateFields.phoneVerified = true;
+    }
+
+    await db.collection(collections.users).doc(userId).update(updateFields);
+
+    const updatedDoc = await db.collection(collections.users).doc(userId).get();
+    const updatedData = updatedDoc.data();
+
+    console.log(`[super-admin] Linked contact for user ${userId}: ${email ? 'email=' + email : ''} ${phone ? 'phone=' + phone : ''}`);
+
+    res.json({
+      success: true,
+      message: 'Account linked successfully',
+      user: {
+        id: userId,
+        name: updatedData.name || '',
+        email: updatedData.email || '',
+        phone: updatedData.phone || '',
+        emailVerified: updatedData.emailVerified || false,
+        phoneVerified: updatedData.phoneVerified || false,
+      },
+    });
+  } catch (error) {
+    console.error('Super admin link-contact error:', error);
+    res.status(500).json({ success: false, error: 'Failed to link contact: ' + error.message });
+  }
+});
+
 // ─── Create Owner Account (or set temp password for existing) ────────
 router.post('/users/create-owner', authenticateSuperAdmin, checkPermission('dine:create-user'), async (req, res) => {
   try {
