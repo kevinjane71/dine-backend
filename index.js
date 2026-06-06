@@ -7966,6 +7966,7 @@ app.delete('/api/menus/:restaurantId/bulk-delete', authenticateToken, async (req
     }
     const { restaurantId } = req.params;
     const { userId } = req.user;
+    const { reason } = req.body || {};
 
     // Get the restaurant
     const restaurantDoc = await getCachedRestDoc(restaurantId);
@@ -8026,7 +8027,36 @@ app.delete('/api/menus/:restaurantId/bulk-delete', authenticateToken, async (req
     });
     invalidateRestaurantCache(restaurantId);
 
-    console.log(`✅ Bulk deleted ${activeItemsCount} menu items for restaurant ${restaurantId}`);
+    // Log the bulk deletion with reason and user info
+    const userDoc = await db.collection(collections.users).doc(userId).get();
+    const userData = userDoc.exists ? userDoc.data() : {};
+    // Also check staffUsers if not found in users
+    let logUserName = userData.name || '';
+    let logUserEmail = userData.email || '';
+    let logUserPhone = userData.phone || '';
+    if (!logUserName && !logUserEmail) {
+      const staffDoc = await db.collection(collections.staffUsers).doc(userId).get();
+      if (staffDoc.exists) {
+        const staffData = staffDoc.data();
+        logUserName = staffData.name || '';
+        logUserEmail = staffData.email || '';
+        logUserPhone = staffData.phone || '';
+      }
+    }
+
+    await db.collection('menuBulkDeleteLogs').add({
+      restaurantId,
+      restaurantName: restaurantData.name || '',
+      deletedBy: userId,
+      deletedByName: logUserName,
+      deletedByEmail: logUserEmail,
+      deletedByPhone: logUserPhone,
+      reason: typeof reason === 'string' ? reason.substring(0, 1000) : '',
+      deletedCount: activeItemsCount,
+      deletedAt: deletedTimestamp,
+    });
+
+    console.log(`✅ Bulk deleted ${activeItemsCount} menu items for restaurant ${restaurantId} | Reason: ${reason || 'N/A'}`);
 
     res.json({
       message: `Successfully deleted all ${activeItemsCount} menu items`,
