@@ -287,7 +287,7 @@ router.get('/:restaurantId/history', async (req, res) => {
 
     query = query.orderBy('date', 'desc');
 
-    const snap = await query.get();
+    const snap = await query.limit(2000).get();
     let records = snap.docs.map(d => ({ id: d.id, ...d.data() }));
 
     if (status) {
@@ -320,6 +320,7 @@ router.get('/:restaurantId/summary', async (req, res) => {
       .where('restaurantId', '==', restaurantId)
       .where('date', '>=', startDate)
       .where('date', '<=', endDate)
+      .limit(5000)
       .get();
 
     const records = snap.docs.map(d => d.data());
@@ -800,6 +801,7 @@ router.get('/:restaurantId/payroll-data', async (req, res) => {
       .where('restaurantId', '==', restaurantId)
       .where('date', '>=', startDate)
       .where('date', '<=', endDate)
+      .limit(5000)
       .get();
 
     const records = snap.docs.map(d => d.data());
@@ -913,6 +915,8 @@ router.get('/:restaurantId/live-locations', async (req, res) => {
 
     const snap = await db.collection('staffLocations_latest')
       .where('restaurantId', '==', restaurantId)
+      .select('staffId', 'staffName', 'lat', 'lng', 'timestamp')
+      .limit(500)
       .get();
 
     const locations = snap.docs.map(d => ({ id: d.id, ...d.data() }));

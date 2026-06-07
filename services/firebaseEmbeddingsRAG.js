@@ -190,6 +190,7 @@ class FirebaseEmbeddingsRAGService {
       // SECURE QUERY: Double-check restaurantId in query
       const chunksSnapshot = await this.db.collection('rag_knowledge')
         .where('restaurantId', '==', restaurantId)
+        .limit(500)
         .get();
 
       if (chunksSnapshot.empty) {
@@ -277,8 +278,8 @@ class FirebaseEmbeddingsRAGService {
   async getRestaurantData(restaurantId) {
     try {
       const restaurantDoc = await this.db.collection('restaurants').doc(restaurantId).get();
-      const menuSnapshot = await this.db.collection('restaurants').doc(restaurantId).collection('menu').get();
-      const tablesSnapshot = await this.db.collection('restaurants').doc(restaurantId).collection('tables').get();
+      const menuSnapshot = await this.db.collection('restaurants').doc(restaurantId).collection('menu').limit(500).get();
+      const tablesSnapshot = await this.db.collection('restaurants').doc(restaurantId).collection('tables').limit(500).get();
 
       return {
         restaurant: restaurantDoc.exists ? restaurantDoc.data() : null,

@@ -236,18 +236,20 @@ router.get('/:orgId/inventory-comparison', ...reportMiddleware, async (req, res)
     const inventoryPromises = outlets.map(async (outlet) => {
       const snapshot = await db.collection(collections.inventory)
         .where('restaurantId', '==', outlet.id)
+        .select('name', 'currentStock', 'reorderLevel', 'unit', 'category')
+        .limit(2000)
         .get();
 
       const items = [];
       snapshot.forEach(doc => {
         const data = doc.data();
-        const itemName = data.name || data.itemName || 'Unnamed Item';
+        const itemName = data.name || 'Unnamed Item';
         allItemNames.add(itemName);
         items.push({
           id: doc.id,
           name: itemName,
-          currentStock: Number(data.currentStock) || Number(data.quantity) || 0,
-          reorderLevel: Number(data.reorderLevel) || Number(data.reorderPoint) || 0,
+          currentStock: Number(data.currentStock) || 0,
+          reorderLevel: Number(data.reorderLevel) || 0,
           unit: data.unit || '',
           category: data.category || ''
         });
@@ -626,6 +628,7 @@ router.get('/:orgId/indent-tracking', ...reportMiddleware, async (req, res) => {
 
     const snapshot = await db.collection(collections.indentRequests)
       .where('organizationId', '==', orgId)
+      .limit(1000)
       .get();
 
     const terminalStatuses = ['received', 'cancelled', 'rejected'];
@@ -1003,6 +1006,7 @@ router.get('/:orgId/staff-performance', ...reportMiddleware, async (req, res) =>
       const staffEnrichPromises = outlets.map(async (outlet) => {
         const staffSnap = await db.collection(collections.staffUsers || 'staffUsers')
           .where('restaurantId', '==', outlet.id)
+          .select('name', 'role', 'designation')
           .get();
         staffSnap.forEach(doc => {
           const data = doc.data();
@@ -1482,16 +1486,18 @@ router.get('/:orgId/export/:reportType', ...reportMiddleware, async (req, res) =
         const invPromises = outlets.map(async (outlet) => {
           const snapshot = await db.collection(collections.inventory)
             .where('restaurantId', '==', outlet.id)
+            .select('name', 'currentStock', 'reorderLevel', 'unit', 'category')
+            .limit(2000)
             .get();
 
           const items = [];
           snapshot.forEach(doc => {
             const data = doc.data();
-            const itemName = data.name || data.itemName || 'Unnamed Item';
+            const itemName = data.name || 'Unnamed Item';
             allItemNames.add(itemName);
             items.push({
               name: itemName,
-              currentStock: Number(data.currentStock) || Number(data.quantity) || 0,
+              currentStock: Number(data.currentStock) || 0,
               unit: data.unit || ''
             });
           });
@@ -1573,6 +1579,7 @@ router.get('/:orgId/export/:reportType', ...reportMiddleware, async (req, res) =
 
         const indentSnapshot = await db.collection(collections.indentRequests)
           .where('organizationId', '==', orgId)
+          .limit(1000)
           .get();
 
         const indents = [];

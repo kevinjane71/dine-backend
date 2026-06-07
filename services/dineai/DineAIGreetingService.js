@@ -65,6 +65,7 @@ class DineAIGreetingService {
       const pendingOrdersSnapshot = await db.collection('orders')
         .where('restaurantId', '==', restaurantId)
         .where('status', 'in', ['pending', 'preparing'])
+        .limit(50)
         .get();
       state.pendingOrders = pendingOrdersSnapshot.size;
 

@@ -437,9 +437,8 @@ class AutomationService {
       // Initialize WhatsApp service
       await whatsappService.initialize(restaurantId, credentials);
 
-      // Get restaurant name
-      const restaurantDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
-      const restaurantName = restaurantDoc.exists ? (restaurantDoc.data().name || 'Restaurant') : 'Restaurant';
+      // Reuse restaurant doc fetched earlier
+      const restaurantName = restDoc.exists ? (restDoc.data().name || 'Restaurant') : 'Restaurant';
 
       // Format customer name
       const customerName = order.customerInfo?.name || order.customerDisplay?.name || order.customer?.name || 'Valued Customer';
@@ -449,7 +448,7 @@ class AutomationService {
       const orderItems = order.items || [];
       const totalAmount = order.finalAmount || order.grandTotal || order.totalAmount || 0;
       const tableNumber = order.tableNumber || null;
-      const currencySymbol = restaurantDoc.exists ? (restaurantDoc.data().currencySymbol || '₹') : '₹';
+      const currencySymbol = restDoc.exists ? (restDoc.data().currencySymbol || '₹') : '₹';
 
       // Build order details text
       let orderDetailsText = '';

@@ -312,6 +312,7 @@ async function getActiveDeliveries(restaurantId) {
     .where('restaurantId', '==', restaurantId)
     .where('deliveryStatus', 'in', activeStatuses)
     .orderBy('deliveryAssignedAt', 'desc')
+    .limit(200)
     .get();
 
   return snap.docs.map(doc => {

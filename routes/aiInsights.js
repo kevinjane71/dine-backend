@@ -740,12 +740,29 @@ async function generateReportForOwner(userId) {
   const ordersByType = {};
   const hourCounts = {};
 
-  for (const restaurantId of restaurantIds) {
-    const ordersSnap = await db.collection(collections.orders)
-      .where('restaurantId', '==', restaurantId)
-      .where('createdAt', '>=', sevenDaysAgo)
-      .get();
+  await Promise.all(restaurantIds.map(async (restaurantId) => {
+    const [ordersSnap, staffNewSnap, staffLegacySnap, invSnap] = await Promise.all([
+      db.collection(collections.orders)
+        .where('restaurantId', '==', restaurantId)
+        .where('createdAt', '>=', sevenDaysAgo)
+        .get(),
+      db.collection(collections.staffUsers)
+        .where('restaurantId', '==', restaurantId)
+        .where('status', '==', 'active')
+        .select('role')
+        .get(),
+      db.collection(collections.users)
+        .where('restaurantId', '==', restaurantId)
+        .where('status', '==', 'active')
+        .select('role')
+        .get(),
+      db.collection(collections.inventory)
+        .where('restaurantId', '==', restaurantId)
+        .select('currentStock', 'minStock', 'reorderLevel')
+        .get()
+    ]);
 
+    // Process orders
     const restaurant = restaurants.find(r => r.id === restaurantId);
     let restaurantRevenue = 0;
     let restaurantOrders = 0;
@@ -787,30 +804,15 @@ async function generateReportForOwner(userId) {
       restaurant.revenue = restaurantRevenue;
       restaurant.orders = restaurantOrders;
     }
-  }
 
-  for (const restaurantId of restaurantIds) {
-    const [staffNewSnap, staffLegacySnap] = await Promise.all([
-      db.collection(collections.staffUsers)
-        .where('restaurantId', '==', restaurantId)
-        .where('status', '==', 'active')
-        .get(),
-      db.collection(collections.users)
-        .where('restaurantId', '==', restaurantId)
-        .where('status', '==', 'active')
-        .get()
-    ]);
+    // Process staff
     staffNewSnap.docs.forEach(() => staffCount++);
     staffLegacySnap.docs.forEach(doc => {
       const role = (doc.data().role || '').toLowerCase();
       if (role !== 'owner' && role !== 'customer') staffCount++;
     });
-  }
 
-  for (const restaurantId of restaurantIds) {
-    const invSnap = await db.collection(collections.inventory)
-      .where('restaurantId', '==', restaurantId)
-      .get();
+    // Process inventory
     invSnap.docs.forEach(doc => {
       const data = doc.data();
       const currentStock = data.currentStock || 0;
@@ -818,7 +820,7 @@ async function generateReportForOwner(userId) {
       if (currentStock <= 0) outOfStockCount++;
       else if (currentStock <= minStock) lowStockCount++;
     });
-  }
+  }));
 
   const popularItems = Object.keys(itemCounts)
     .map(name => ({ name, orders: itemCounts[name], revenue: itemRevenue[name] }))

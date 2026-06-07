@@ -241,22 +241,28 @@ router.post('/shifts/:restaurantId/auto-generate', authenticateToken, requireOwn
     const staffSnapshot = { docs: [...staffNewSnap.docs, ...staffLegacySnap.docs] };
 
     const staff = [];
+
+    // Batch-fetch all staff availability docs to avoid N+1
+    const availabilityMap = new Map();
+    if (staffSnapshot.docs.length > 0) {
+      try {
+        const availRefs = staffSnapshot.docs.map(doc => db.collection('staffAvailability').doc(doc.id));
+        const availDocs = await db.getAll(...availRefs);
+        availDocs.forEach(doc => {
+          if (doc.exists) {
+            availabilityMap.set(doc.id, doc.data());
+          }
+        });
+      } catch (error) {
+        console.log('Error batch-fetching staff availability:', error);
+      }
+    }
+
     for (const doc of staffSnapshot.docs) {
       const staffData = doc.data();
-      
-      // Fetch employee availability and preferences
-      let availability = null;
-      let employeePreferences = null;
-      try {
-        const availabilityDoc = await db.collection('staffAvailability').doc(doc.id).get();
-        if (availabilityDoc.exists) {
-          const availData = availabilityDoc.data();
-          availability = availData.availability || null;
-          employeePreferences = availData.preferences || null;
-        }
-      } catch (error) {
-        console.log('Error fetching availability for staff:', doc.id, error);
-      }
+      const availData = availabilityMap.get(doc.id);
+      const availability = availData?.availability || null;
+      const employeePreferences = availData?.preferences || null;
 
       staff.push({
         id: doc.id,

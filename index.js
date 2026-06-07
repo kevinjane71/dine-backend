@@ -735,6 +735,8 @@ async function adjustDirectMenuItemStock(restaurantId, orderItems, mode = 'decre
     const invSnap = await db.collection(collections.inventory)
       .where('restaurantId', '==', restaurantId)
       .where('linkedMenuItemId', '!=', null)
+      .select('linkedMenuItemId', 'currentStock', 'restaurantId')
+      .limit(500)
       .get();
 
     const inventoryLinkedIds = new Set();
@@ -1582,12 +1584,12 @@ async function getStaffForRestaurant(restaurantId) {
 
   // From staffUsers (new) — primary restaurantId
   const newStaff = await db.collection(collections.staffUsers)
-    .where('restaurantId', '==', restaurantId).get();
+    .where('restaurantId', '==', restaurantId).limit(500).get();
   newStaff.forEach(doc => resultMap.set(doc.id, { id: doc.id, ...doc.data(), _collection: 'staffUsers' }));
 
   // From users (legacy) — primary restaurantId
   const oldStaff = await db.collection(collections.users)
-    .where('restaurantId', '==', restaurantId).get();
+    .where('restaurantId', '==', restaurantId).limit(500).get();
   oldStaff.forEach(doc => {
     const d = doc.data();
     const role = (d.role || '').toLowerCase();
@@ -1598,7 +1600,7 @@ async function getStaffForRestaurant(restaurantId) {
 
   // From userRestaurants junction table — staff assigned to this restaurant but primary is elsewhere
   const junctionDocs = await db.collection(collections.userRestaurants)
-    .where('restaurantId', '==', restaurantId).get();
+    .where('restaurantId', '==', restaurantId).limit(500).get();
   for (const jDoc of junctionDocs.docs) {
     const userId = jDoc.data().userId;
     if (resultMap.has(userId)) continue; // already found via primary
@@ -3319,6 +3321,7 @@ app.post('/api/auth/register', async (req, res) => {
 
     const existingUser = await db.collection(collections.users)
       .where('email', '==', email)
+      .limit(1)
       .get();
 
     if (!existingUser.empty) {
@@ -3369,6 +3372,7 @@ app.post('/api/auth/verify-email', async (req, res) => {
 
     const userQuery = await db.collection(collections.users)
       .where('email', '==', email)
+      .limit(1)
       .get();
 
     if (userQuery.empty) {
@@ -3427,6 +3431,7 @@ app.post('/api/auth/login', async (req, res) => {
 
     const userQuery = await db.collection(collections.users)
       .where('email', '==', email)
+      .limit(1)
       .get();
 
     if (userQuery.empty) {
@@ -4674,6 +4679,7 @@ app.post('/api/auth/apple', async (req, res) => {
     // Smart linking: Check by email first
     let userDoc = await db.collection(collections.users)
       .where('email', '==', email)
+      .limit(1)
       .get();
 
     let userId;
@@ -7531,15 +7537,7 @@ app.patch('/api/menus/item/:id', authenticateToken, async (req, res) => {
       }
     }
 
-    // Fallback: full scan (backward compatible for old clients)
-    if (!foundRestaurant) {
-      const restaurantsSnapshot = await db.collection(collections.restaurants).get();
-      for (const restaurantDoc of restaurantsSnapshot.docs) {
-        const menuData = restaurantDoc.data().menu || { items: [] };
-        const item = menuData.items.find(item => item.id === id);
-        if (item) { foundRestaurant = restaurantDoc; foundItem = item; break; }
-      }
-    }
+    // Full collection scan fallback removed to prevent excessive Firestore reads
 
     if (!foundRestaurant || !foundItem) {
       return res.status(404).json({ error: 'Menu item not found' });
@@ -7859,15 +7857,7 @@ app.delete('/api/menus/item/:id', authenticateToken, async (req, res) => {
       }
     }
 
-    // Fallback: full scan (backward compatible for old clients)
-    if (!foundRestaurant) {
-      const restaurantsSnapshot = await db.collection(collections.restaurants).get();
-      for (const restaurantDoc of restaurantsSnapshot.docs) {
-        const menuData = restaurantDoc.data().menu || { items: [] };
-        const item = menuData.items.find(item => item.id === id);
-        if (item) { foundRestaurant = restaurantDoc; foundItem = item; break; }
-      }
-    }
+    // Full collection scan fallback removed to prevent excessive Firestore reads
 
     if (!foundRestaurant || !foundItem) {
       return res.status(404).json({ error: 'Menu item not found' });
@@ -10946,7 +10936,7 @@ app.get('/api/orders/:restaurantId', authenticateToken, async (req, res) => {
     // --- SEARCH/FILTER PATH: Load capped set, filter in memory ---
     // Uses simpler Firestore query (no 'in' filter) to avoid composite index requirements.
     // Deleted/expired orders are filtered out in memory instead.
-    const MAX_SEARCH_DOCS = 5000;
+    const MAX_SEARCH_DOCS = 1000;
 
     let searchQuery = db.collection(collections.orders)
       .where('restaurantId', '==', restaurantId);
@@ -11998,12 +11988,35 @@ app.patch('/api/orders/:orderId/status', authenticateToken, async (req, res) => 
           if (!pq.empty) {
             custDoc = pq.docs[0];
           } else {
+            // Try common phone format variations instead of scanning all customers
             const np = normPhone(customerPhone);
-            if (np) {
-              const all = await db.collection(collections.customers).where('restaurantId', '==', orderData.restaurantId).select('phone').get();
-              const matched = all.docs.find(d => normPhone(d.data().phone) === np) || null;
-              // Re-fetch full doc since select('phone') doesn't include orderHistory
-              if (matched) custDoc = await matched.ref.get();
+            if (np && np !== customerPhone) {
+              // Try normalized phone as direct query
+              const npq = await db.collection(collections.customers)
+                .where('restaurantId', '==', orderData.restaurantId)
+                .where('phone', '==', np)
+                .limit(1).get();
+              if (!npq.empty) {
+                custDoc = npq.docs[0];
+              }
+            }
+            // Try with/without country code prefix variations
+            if (!custDoc && customerPhone) {
+              const variations = [];
+              const digits = customerPhone.replace(/\D/g, '');
+              if (digits.length > 10) variations.push(digits.slice(-10)); // without country code
+              if (digits.length === 10) {
+                variations.push('91' + digits);   // with India code
+                variations.push('+91' + digits);  // with +91
+              }
+              for (const v of variations) {
+                if (v === customerPhone) continue; // skip already tried
+                const vq = await db.collection(collections.customers)
+                  .where('restaurantId', '==', orderData.restaurantId)
+                  .where('phone', '==', v)
+                  .limit(1).get();
+                if (!vq.empty) { custDoc = vq.docs[0]; break; }
+              }
             }
           }
           if (custDoc) {
@@ -14142,19 +14155,54 @@ app.delete('/api/orders/:orderId', authenticateToken, async (req, res) => {
     }
 
     // Release table if assigned
-    if (order.tableNumber) {
+    if (order.tableNumber && order.tableNumber.trim()) {
       try {
-        const tablesSnapshot = await db.collection(collections.tables)
-          .where('restaurantId', '==', order.restaurantId)
-          .where('number', '==', order.tableNumber)
-          .limit(1)
-          .get();
-        if (!tablesSnapshot.empty) {
-          await db.collection(collections.tables).doc(tablesSnapshot.docs[0].id).update({
-            status: 'available',
-            currentOrderId: null,
-            updatedAt: new Date()
-          });
+        let tableReleased = false;
+
+        // FAST PATH: Use stored floorId + tableId from the order
+        if (order.floorId && order.tableId) {
+          const directRef = db.collection('restaurants').doc(order.restaurantId)
+            .collection('floors').doc(order.floorId)
+            .collection('tables').doc(order.tableId);
+          await directRef.update({ status: 'available', currentOrderId: null, updatedAt: new Date() });
+          console.log(`🔄 Table released after deletion (direct path): ${order.tableNumber}`);
+          pusherService.triggerTableStatusUpdated(order.restaurantId, {
+            tableId: order.tableId, status: 'available', orderId: null, tableNumber: order.tableNumber,
+          }).catch(err => console.error('RTDB table-status-updated error:', err));
+          tableReleased = true;
+        }
+
+        // FALLBACK: Search by table name across all floors
+        if (!tableReleased) {
+          const floorsSnapshot = await db.collection('restaurants')
+            .doc(order.restaurantId)
+            .collection('floors')
+            .get();
+
+          for (const floorDoc of floorsSnapshot.docs) {
+            const tablesSnapshot = await db.collection('restaurants')
+              .doc(order.restaurantId)
+              .collection('floors')
+              .doc(floorDoc.id)
+              .collection('tables')
+              .where('name', '==', order.tableNumber.trim())
+              .get();
+
+            if (!tablesSnapshot.empty) {
+              const tableDoc = tablesSnapshot.docs[0];
+              await tableDoc.ref.update({ status: 'available', currentOrderId: null, updatedAt: new Date() });
+              console.log(`🔄 Table released after deletion (fallback): ${order.tableNumber}`);
+              pusherService.triggerTableStatusUpdated(order.restaurantId, {
+                tableId: tableDoc.id, status: 'available', orderId: null, tableNumber: order.tableNumber,
+              }).catch(err => console.error('RTDB table-status-updated error:', err));
+              tableReleased = true;
+              break;
+            }
+          }
+        }
+
+        if (!tableReleased) {
+          console.log(`⚠️ Table not found for release after deletion: ${order.tableNumber}`);
         }
       } catch (tableErr) {
         console.error('Error releasing table after delete:', tableErr);
@@ -14241,6 +14289,40 @@ app.post('/api/public/delete-order', async (req, res) => {
     const _nonCountedStatuses = ['saved', 'cancelled', 'deleted', 'refunded'];
     if (!_nonCountedStatuses.includes(order.status)) {
       updateDailyStats(order.restaurantId, order, 'delete', parseTZ(req));
+    }
+    // Release table if assigned
+    if (order.tableNumber && order.tableNumber.trim()) {
+      try {
+        let tableReleased = false;
+        if (order.floorId && order.tableId) {
+          const directRef = db.collection('restaurants').doc(order.restaurantId)
+            .collection('floors').doc(order.floorId)
+            .collection('tables').doc(order.tableId);
+          await directRef.update({ status: 'available', currentOrderId: null, updatedAt: new Date() });
+          pusherService.triggerTableStatusUpdated(order.restaurantId, {
+            tableId: order.tableId, status: 'available', orderId: null, tableNumber: order.tableNumber,
+          }).catch(() => {});
+          tableReleased = true;
+        }
+        if (!tableReleased) {
+          const floorsSnapshot = await db.collection('restaurants').doc(order.restaurantId).collection('floors').get();
+          for (const floorDoc of floorsSnapshot.docs) {
+            const tablesSnapshot = await db.collection('restaurants').doc(order.restaurantId)
+              .collection('floors').doc(floorDoc.id).collection('tables')
+              .where('name', '==', order.tableNumber.trim()).get();
+            if (!tablesSnapshot.empty) {
+              const tableDoc = tablesSnapshot.docs[0];
+              await tableDoc.ref.update({ status: 'available', currentOrderId: null, updatedAt: new Date() });
+              pusherService.triggerTableStatusUpdated(order.restaurantId, {
+                tableId: tableDoc.id, status: 'available', orderId: null, tableNumber: order.tableNumber,
+              }).catch(() => {});
+              break;
+            }
+          }
+        }
+      } catch (tableErr) {
+        console.error('Error releasing table after public delete:', tableErr);
+      }
     }
     await orderRef.delete();
     pusherService.notifyOrderDeleted(order.restaurantId, id).catch(err => console.error('Pusher delete-order (non-blocking):', err));
@@ -14500,19 +14582,7 @@ app.post('/api/menu-items/:itemId/images', authenticateToken, upload.array('imag
       }
     }
 
-    // Fallback: full scan (backward compatible for old clients)
-    if (!menuItem) {
-      const restaurantsSnapshot = await db.collection('restaurants').get();
-      for (const restaurantDocSnapshot of restaurantsSnapshot.docs) {
-        const restaurantData = restaurantDocSnapshot.data();
-        const restId = restaurantDocSnapshot.id;
-        const hasAccess = restaurantData.ownerId === userId || accessibleRestaurantIds.has(restId);
-        if (hasAccess && restaurantData.menu && restaurantData.menu.items) {
-          const foundItem = restaurantData.menu.items.find(item => item.id === itemId);
-          if (foundItem) { menuItem = foundItem; restaurantId = restId; restaurantDoc = restaurantDocSnapshot; break; }
-        }
-      }
-    }
+    // Full collection scan fallback removed to prevent excessive Firestore reads
 
     if (!menuItem) {
       console.log('❌ Menu item not found in any restaurant');
@@ -14624,19 +14694,7 @@ app.delete('/api/menu-items/:itemId/images/:imageIndex', authenticateToken, asyn
       }
     }
 
-    // Fallback: full scan (backward compatible for old clients)
-    if (!menuItem) {
-      const restaurantsSnapshot = await db.collection('restaurants').get();
-      for (const restaurantDocSnapshot of restaurantsSnapshot.docs) {
-        const restaurantData = restaurantDocSnapshot.data();
-        const restId = restaurantDocSnapshot.id;
-        const hasAccess = restaurantData.ownerId === userId || accessibleRestaurantIds.has(restId);
-        if (hasAccess && restaurantData.menu && restaurantData.menu.items) {
-          const foundItem = restaurantData.menu.items.find(item => item.id === itemId);
-          if (foundItem) { menuItem = foundItem; restaurantId = restId; restaurantDoc = restaurantDocSnapshot; break; }
-        }
-      }
-    }
+    // Full collection scan fallback removed to prevent excessive Firestore reads
 
     if (!menuItem) {
       return res.status(404).json({ error: 'Menu item not found or access denied' });
@@ -15790,7 +15848,9 @@ app.get('/api/floors/:restaurantId', async (req, res) => {
       .get();
 
     const floors = [];
-    
+    const allTables = [];
+    const orderIds = new Set();
+
     for (const floorDoc of floorsSnapshot.docs) {
       const floorData = floorDoc.data();
       
@@ -15802,31 +15862,45 @@ app.get('/api/floors/:restaurantId', async (req, res) => {
         .collection('tables')
         .get();
 
-      const tables = [];
+      const floorTables = [];
       for (const tableDoc of tablesSnapshot.docs) {
         const tableData = tableDoc.data();
-        let currentOrderTotal = null;
-
-        // If table has a current order, fetch the order total
+        const tbl = { id: tableDoc.id, ...tableData, currentOrderTotal: null };
+        floorTables.push(tbl);
         if (tableData.currentOrderId && tableData.status === 'occupied') {
-          try {
-            const orderDoc = await db.collection(collections.orders).doc(tableData.currentOrderId).get();
-            if (orderDoc.exists) {
-              const orderData = orderDoc.data();
-              currentOrderTotal = orderData.finalAmount || orderData.totalAmount || 0;
-            }
-          } catch (orderErr) {
-            console.log(`Failed to fetch order ${tableData.currentOrderId} for table:`, orderErr.message);
-          }
+          orderIds.add(tableData.currentOrderId);
         }
+      }
+      allTables.push({ floorDoc, floorData, tables: floorTables });
+    }
 
-        tables.push({
-          id: tableDoc.id,
-          ...tableData,
-          currentOrderTotal
+    // Batch-read all orders at once (instead of N+1 individual reads)
+    const orderTotals = {};
+    if (orderIds.size > 0) {
+      const orderRefs = [...orderIds].map(id => db.collection(collections.orders).doc(id));
+      // getAll supports up to 100 refs; chunk if needed
+      const chunks = [];
+      for (let i = 0; i < orderRefs.length; i += 100) {
+        chunks.push(orderRefs.slice(i, i + 100));
+      }
+      for (const chunk of chunks) {
+        const docs = await db.getAll(...chunk);
+        docs.forEach(doc => {
+          if (doc.exists) {
+            const data = doc.data();
+            orderTotals[doc.id] = data.finalAmount || data.totalAmount || 0;
+          }
         });
       }
+    }
 
+    // Assign order totals and build floors array
+    for (const { floorDoc, floorData, tables } of allTables) {
+      tables.forEach(tbl => {
+        if (tbl.currentOrderId && orderTotals[tbl.currentOrderId] !== undefined) {
+          tbl.currentOrderTotal = orderTotals[tbl.currentOrderId];
+        }
+      });
       floors.push({
         id: floorDoc.id,
         name: floorData.name,
@@ -15836,7 +15910,7 @@ app.get('/api/floors/:restaurantId', async (req, res) => {
         areaChargeValue: floorData.areaChargeValue || 0,
         order: floorData.order !== undefined ? floorData.order : Infinity,
         restaurantId,
-        tables: tables
+        tables
       });
     }
 
@@ -17196,8 +17270,8 @@ app.post('/api/staff/:restaurantId', authenticateToken, requireOwnerRole, async 
       }
       usernameLower = raw.toLowerCase();
       // Check username uniqueness in both staffUsers and users collections
-      const existingInStaff = await db.collection(collections.staffUsers).where('usernameLower', '==', usernameLower).get();
-      const existingInUsers = await db.collection(collections.users).where('usernameLower', '==', usernameLower).get();
+      const existingInStaff = await db.collection(collections.staffUsers).where('usernameLower', '==', usernameLower).limit(1).get();
+      const existingInUsers = await db.collection(collections.users).where('usernameLower', '==', usernameLower).limit(1).get();
       if (!existingInStaff.empty || !existingInUsers.empty) {
         return res.status(400).json({ error: 'Username already exists. Choose a different username.' });
       }
@@ -17207,8 +17281,8 @@ app.post('/api/staff/:restaurantId', authenticateToken, requireOwnerRole, async 
 
     // Check if email already exists in both collections (only if email is provided)
     if (email) {
-      const existingInStaff = await db.collection(collections.staffUsers).where('email', '==', email).get();
-      const existingInUsers = await db.collection(collections.users).where('email', '==', email).get();
+      const existingInStaff = await db.collection(collections.staffUsers).where('email', '==', email).limit(1).get();
+      const existingInUsers = await db.collection(collections.users).where('email', '==', email).limit(1).get();
       if (!existingInStaff.empty || !existingInUsers.empty) {
         return res.status(400).json({ error: 'Email already registered' });
       }
@@ -17219,8 +17293,8 @@ app.post('/api/staff/:restaurantId', authenticateToken, requireOwnerRole, async 
     let isUnique = false;
     while (!isUnique) {
       userId = Math.floor(10000 + Math.random() * 90000).toString(); // 5-digit number
-      const existInStaff = await db.collection(collections.staffUsers).where('loginId', '==', userId).get();
-      const existInUsers = await db.collection(collections.users).where('loginId', '==', userId).get();
+      const existInStaff = await db.collection(collections.staffUsers).where('loginId', '==', userId).limit(1).get();
+      const existInUsers = await db.collection(collections.users).where('loginId', '==', userId).limit(1).get();
       isUnique = existInStaff.empty && existInUsers.empty;
     }
 
@@ -20964,22 +21038,55 @@ app.patch('/api/orders/:orderId/cancel', authenticateToken, async (req, res) => 
       updateDailyStats(orderData.restaurantId, orderData, 'cancel', parseTZ(req));
     }
 
-    // If order has a table, update table status
-    if (orderData.tableNumber) {
+    // If order has a table, release it back to available
+    if (orderData.tableNumber && orderData.tableNumber.trim()) {
       try {
-        const tablesSnapshot = await db.collection(collections.tables)
-          .where('restaurantId', '==', orderData.restaurantId)
-          .where('number', '==', orderData.tableNumber)
-          .limit(1)
-          .get();
+        let tableReleased = false;
 
-        if (!tablesSnapshot.empty) {
-          await db.collection(collections.tables).doc(tablesSnapshot.docs[0].id).update({
-            status: 'available',
-            currentOrderId: null,
-            updatedAt: new Date()
-          });
-          console.log(`🔄 Updated table ${orderData.tableNumber} to available after order cancellation`);
+        // FAST PATH: Use stored floorId + tableId from the order
+        if (orderData.floorId && orderData.tableId) {
+          const directRef = db.collection('restaurants').doc(orderData.restaurantId)
+            .collection('floors').doc(orderData.floorId)
+            .collection('tables').doc(orderData.tableId);
+          await directRef.update({ status: 'available', currentOrderId: null, updatedAt: new Date() });
+          console.log(`🔄 Table released after cancellation (direct path): ${orderData.tableNumber}`);
+          pusherService.triggerTableStatusUpdated(orderData.restaurantId, {
+            tableId: orderData.tableId, status: 'available', orderId: null, tableNumber: orderData.tableNumber,
+          }).catch(err => console.error('RTDB table-status-updated error:', err));
+          tableReleased = true;
+        }
+
+        // FALLBACK: Search by table name across all floors
+        if (!tableReleased) {
+          const floorsSnapshot = await db.collection('restaurants')
+            .doc(orderData.restaurantId)
+            .collection('floors')
+            .get();
+
+          for (const floorDoc of floorsSnapshot.docs) {
+            const tablesSnapshot = await db.collection('restaurants')
+              .doc(orderData.restaurantId)
+              .collection('floors')
+              .doc(floorDoc.id)
+              .collection('tables')
+              .where('name', '==', orderData.tableNumber.trim())
+              .get();
+
+            if (!tablesSnapshot.empty) {
+              const tableDoc = tablesSnapshot.docs[0];
+              await tableDoc.ref.update({ status: 'available', currentOrderId: null, updatedAt: new Date() });
+              console.log(`🔄 Table released after cancellation (fallback): ${orderData.tableNumber}`);
+              pusherService.triggerTableStatusUpdated(orderData.restaurantId, {
+                tableId: tableDoc.id, status: 'available', orderId: null, tableNumber: orderData.tableNumber,
+              }).catch(err => console.error('RTDB table-status-updated error:', err));
+              tableReleased = true;
+              break;
+            }
+          }
+        }
+
+        if (!tableReleased) {
+          console.log(`⚠️ Table not found for release after cancellation: ${orderData.tableNumber}`);
         }
       } catch (error) {
         console.error('Error updating table status after cancellation:', error);
@@ -21443,8 +21550,10 @@ app.post('/api/voice/process-purchase-order', authenticateToken, aiUsageLimiter.
     // Get inventory items and suppliers
     const inventorySnapshot = await db.collection(collections.inventory)
       .where('restaurantId', '==', restaurantId)
+      .select('name', 'unit', 'currentStock')
+      .limit(500)
       .get();
-    
+
     const inventoryItems = [];
     inventorySnapshot.forEach(doc => {
       inventoryItems.push({ id: doc.id, ...doc.data() });
@@ -21452,8 +21561,10 @@ app.post('/api/voice/process-purchase-order', authenticateToken, aiUsageLimiter.
 
     const suppliersSnapshot = await db.collection(collections.suppliers)
       .where('restaurantId', '==', restaurantId)
+      .select('name', 'contactPerson', 'phone')
+      .limit(200)
       .get();
-    
+
     const suppliers = [];
     suppliersSnapshot.forEach(doc => {
       suppliers.push({ id: doc.id, ...doc.data() });
@@ -22064,6 +22175,7 @@ app.get('/api/inventory/:restaurantId', authenticateToken, async (req, res) => {
       // 1. Waste entries (logged waste — this week)
       const wasteSnap = await db.collection(collections.wasteEntries)
         .where('restaurantId', '==', restaurantId)
+        .limit(2000)
         .get();
       wasteSnap.forEach(doc => {
         const data = doc.data();
@@ -22081,6 +22193,7 @@ app.get('/api/inventory/:restaurantId', authenticateToken, async (req, res) => {
       // 2. Expired batches with remaining qty (not yet logged as waste)
       const batchesSnapshot = await db.collection(collections.stockBatches)
         .where('restaurantId', '==', restaurantId)
+        .limit(2000)
         .get();
       batchesSnapshot.forEach(doc => {
         const data = doc.data();
@@ -22126,6 +22239,8 @@ app.get('/api/inventory/:restaurantId/categories', authenticateToken, async (req
 
     const snapshot = await db.collection(collections.inventory)
       .where('restaurantId', '==', restaurantId)
+      .select('category')
+      .limit(2000)
       .get();
 
     console.log(`📊 Categories query result: ${snapshot.size} documents found`);
@@ -27682,7 +27797,7 @@ app.get('/api/books/:restaurantId/cogs', authenticateToken, async (req, res) => 
 
     // Get inventory items for costPerUnit lookup
     const invSnap = await db.collection(collections.inventory)
-      .where('restaurantId', '==', restaurantId).get();
+      .where('restaurantId', '==', restaurantId).select('costPerUnit').get();
     const invMap = {};
     invSnap.forEach(doc => { invMap[doc.id] = doc.data(); });
 
@@ -28008,7 +28123,7 @@ app.get('/api/books/:restaurantId/pnl', authenticateToken, async (req, res) => {
     });
 
     // COGS
-    const invSnap = await db.collection(collections.inventory).where('restaurantId', '==', restaurantId).get();
+    const invSnap = await db.collection(collections.inventory).where('restaurantId', '==', restaurantId).select('costPerUnit').get();
     const invMap = {};
     invSnap.forEach(doc => { invMap[doc.id] = doc.data(); });
 
@@ -28111,7 +28226,7 @@ app.get('/api/books/:restaurantId/overview', authenticateToken, async (req, res)
     });
 
     // COGS
-    const invItemSnap = await db.collection(collections.inventory).where('restaurantId', '==', restaurantId).get();
+    const invItemSnap = await db.collection(collections.inventory).where('restaurantId', '==', restaurantId).select('costPerUnit').get();
     const invMap = {};
     invItemSnap.forEach(doc => { invMap[doc.id] = doc.data(); });
     let cogs = 0;
@@ -29431,19 +29546,21 @@ app.post('/api/customers/bulk-delete', authenticateToken, async (req, res) => {
       }
     }
 
-    // Delete in batches of 10
+    // Fetch all customer docs in a single getAll call, then delete in batches
     let deletedCount = 0;
+    const allRefs = customerIds.map(custId => db.collection(collections.customers).doc(custId));
+    const allDocs = await db.getAll(...allRefs);
+    const validRefs = allDocs
+      .filter(doc => doc.exists && doc.data().restaurantId === restaurantId)
+      .map(doc => doc.ref);
+
     const batchSize = 10;
-    for (let i = 0; i < customerIds.length; i += batchSize) {
+    for (let i = 0; i < validRefs.length; i += batchSize) {
       const batch = db.batch();
-      const chunk = customerIds.slice(i, i + batchSize);
-      for (const custId of chunk) {
-        const custRef = db.collection(collections.customers).doc(custId);
-        const custDoc = await custRef.get();
-        if (custDoc.exists && custDoc.data().restaurantId === restaurantId) {
-          batch.delete(custRef);
-          deletedCount++;
-        }
+      const chunk = validRefs.slice(i, i + batchSize);
+      for (const ref of chunk) {
+        batch.delete(ref);
+        deletedCount++;
       }
       await batch.commit();
     }
@@ -30064,7 +30181,8 @@ app.get('/api/public/customer/:customerId/orders', vercelSecurityMiddleware.publ
     // Fetch orders for this customer from the orders collection
     let ordersQuery = db.collection(collections.orders)
       .where('customerId', '==', customerId)
-      .orderBy('createdAt', 'desc');
+      .orderBy('createdAt', 'desc')
+      .limit(100);
 
     const ordersSnapshot = await ordersQuery.get();
 
@@ -30258,9 +30376,11 @@ app.get('/api/offers/:restaurantId/active', authenticateToken, async (req, res) 
         .where('ownerId', '==', ownerId)
         .get();
       const ownerRestaurantIds = ownerRestaurants.docs.map(d => d.id).filter(id => id !== restaurantId);
-      for (const rId of ownerRestaurantIds) {
+      // Use batched 'in' queries instead of N+1 serial lookups (Firestore 'in' limit is 30)
+      for (let i = 0; i < ownerRestaurantIds.length; i += 30) {
+        const chunk = ownerRestaurantIds.slice(i, i + 30);
         const otherOffers = await db.collection('offers')
-          .where('restaurantId', '==', rId)
+          .where('restaurantId', 'in', chunk)
           .where('isActive', '==', true)
           .get();
         otherOffers.forEach(doc => {
@@ -33913,6 +34033,7 @@ app.get('/api/automation/:restaurantId/analytics', authenticateToken, async (req
     // Get customers
     const customersSnapshot = await db.collection(collections.customers)
       .where('restaurantId', '==', restaurantId)
+      .select('segment')
       .get();
 
     const customers = customersSnapshot.docs.map(doc => doc.data());

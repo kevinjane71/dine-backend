@@ -376,6 +376,7 @@ Always check menu for prices when asked. Confirm before placing orders. Be conci
       const ordersSnapshot = await db.collection('orders')
         .where('restaurantId', '==', restaurantId)
         .where('status', 'in', ['pending', 'preparing'])
+        .limit(100)
         .get();
       pendingOrders = ordersSnapshot.size;
 

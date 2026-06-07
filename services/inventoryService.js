@@ -388,6 +388,7 @@ class InventoryService {
                   const batchesSnapshot = await db.collection(collections.stockBatches)
                     .where('inventoryItemId', '==', inventoryItem.id)
                     .where('status', '==', 'active')
+                    .limit(50)
                     .get();
 
                   const activeBatches = [];
@@ -616,21 +617,21 @@ class InventoryService {
 
         // Restore batch quantities if FIFO batches were used
         if (tx.batchIds && tx.batchIds.length > 0) {
-          for (const batchId of tx.batchIds) {
-            try {
-              const batchRef = db.collection(collections.stockBatches).doc(batchId);
-              const batchDoc = await batchRef.get();
+          try {
+            const batchRefs = tx.batchIds.map(batchId => db.collection(collections.stockBatches).doc(batchId));
+            const batchDocs = await db.getAll(...batchRefs);
+            batchDocs.forEach(batchDoc => {
               if (batchDoc.exists) {
                 const batchData = batchDoc.data();
-                batch.update(batchRef, {
+                batch.update(batchDoc.ref, {
                   remainingQty: (batchData.remainingQty || 0) + restoreQty / tx.batchIds.length,
                   status: 'active',
                   updatedAt: new Date()
                 });
               }
-            } catch (batchErr) {
-              console.warn(`⚠️ Could not restore batch ${batchId}:`, batchErr.message);
-            }
+            });
+          } catch (batchErr) {
+            console.warn(`⚠️ Could not restore batches for tx ${txDoc.id}:`, batchErr.message);
           }
         }
 

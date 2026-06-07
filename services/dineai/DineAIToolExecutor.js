@@ -2002,6 +2002,7 @@ class DineAIToolExecutor {
     const ordersSnapshot = await db.collection('orders')
       .where('restaurantId', '==', restaurantId)
       .where('createdAt', '>=', today)
+      .limit(500)
       .get();
 
     let totalRevenue = 0;

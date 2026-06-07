@@ -195,7 +195,7 @@ router.get('/hotel/checkins/:restaurantId', authenticateToken, async (req, res) 
       }
     }
 
-    const snapshot = await query.orderBy('checkInAt', 'desc').get();
+    const snapshot = await query.orderBy('checkInAt', 'desc').limit(500).get();
 
     const checkIns = [];
     snapshot.forEach(doc => {
@@ -1533,7 +1533,7 @@ router.get('/hotel/history', authenticateToken, async (req, res) => {
       query = query.where('status', '==', 'checked-out');
     }
 
-    const snapshot = await query.orderBy('actualCheckOutAt', 'desc').get();
+    const snapshot = await query.orderBy('actualCheckOutAt', 'desc').limit(200).get();
 
     let history = [];
     snapshot.forEach(doc => {

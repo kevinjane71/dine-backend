@@ -245,6 +245,7 @@ router.get('/:restaurantId/export/:type', async (req, res) => {
         .where('restaurantId', '==', restaurantId)
         .where('createdAt', '>=', start)
         .where('createdAt', '<=', end)
+        .limit(5000)
         .get();
 
       const rows = [['Order#', 'Date', 'Customer', 'Type', 'Taxable Value', 'CGST', 'SGST', 'IGST', 'Total', 'Payment']];
@@ -274,6 +275,7 @@ router.get('/:restaurantId/export/:type', async (req, res) => {
         .where('restaurantId', '==', restaurantId)
         .where('createdAt', '>=', start)
         .where('createdAt', '<=', end)
+        .limit(5000)
         .get();
       let outTaxable = 0, outTax = 0;
       gstr3bSnap.docs.forEach(doc => {
@@ -309,6 +311,7 @@ router.get('/:restaurantId/export/:type', async (req, res) => {
         .where('restaurantId', '==', restaurantId)
         .where('createdAt', '>=', start)
         .where('createdAt', '<=', end)
+        .limit(5000)
         .get();
       const hsnMap = {};
       hsnSnap.docs.forEach(doc => {

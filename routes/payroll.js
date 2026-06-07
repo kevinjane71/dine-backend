@@ -87,6 +87,7 @@ router.get('/:restaurantId/runs', async (req, res) => {
     const snap = await db.collection('payrollRuns')
       .where('restaurantId', '==', restaurantId)
       .orderBy('createdAt', 'desc')
+      .limit(100)
       .get();
 
     const runs = snap.docs.map(d => ({ id: d.id, ...d.data() }));

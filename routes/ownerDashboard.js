@@ -81,6 +81,7 @@ router.get('/dashboard', authenticateToken, requireOwnerRole, async (req, res) =
         .where('restaurantId', '==', restaurantId)
         .where('createdAt', '>=', dateStart)
         .where('createdAt', '<=', dateEnd)
+        .select('createdAt', 'totalAmount', 'finalAmount', 'status', 'paymentStatus', 'paidAmount', 'outstandingAmount', 'refundAmount')
         .get()
     );
 
@@ -105,6 +106,7 @@ router.get('/dashboard', authenticateToken, requireOwnerRole, async (req, res) =
       db.collection(collections.inventory)
         .where('restaurantId', '==', restaurantId)
         .select('currentStock', 'minStock', 'reorderLevel')
+        .limit(1000)
         .get()
     );
 
@@ -307,6 +309,7 @@ router.get('/analytics', authenticateToken, requireOwnerRole, async (req, res) =
           .where('restaurantId', '==', restaurantId)
           .where('createdAt', '>=', dateStart)
           .where('createdAt', '<=', dateEnd)
+          .select('createdAt', 'totalAmount', 'finalAmount', 'status', 'items', 'orderType', 'paymentMethod', 'paymentStatus', 'paidAmount', 'outstandingAmount')
           .get()
       )),
       Promise.all(restaurantIds.map(restaurantId =>
@@ -314,6 +317,7 @@ router.get('/analytics', authenticateToken, requireOwnerRole, async (req, res) =
           .where('restaurantId', '==', restaurantId)
           .where('createdAt', '>=', prevDateStart)
           .where('createdAt', '<=', prevDateEnd)
+          .select('createdAt', 'totalAmount', 'finalAmount', 'status', 'items', 'orderType', 'paymentMethod', 'paymentStatus', 'paidAmount', 'outstandingAmount')
           .get()
       ))
     ]);
@@ -583,13 +587,15 @@ router.get('/staff', authenticateToken, requireOwnerRole, async (req, res) => {
 
       // Query staffUsers collection
       let staffQuery = db.collection(collections.staffUsers)
-        .where('restaurantId', 'in', batch);
+        .where('restaurantId', 'in', batch)
+        .select('name', 'phone', 'email', 'role', 'status', 'restaurantId', 'loginId', 'username', 'lastLogin', 'createdAt');
       if (status) staffQuery = staffQuery.where('status', '==', status);
       staffPromises.push(staffQuery.get());
 
       // Query legacy users collection
       let usersQuery = db.collection(collections.users)
-        .where('restaurantId', 'in', batch);
+        .where('restaurantId', 'in', batch)
+        .select('name', 'phone', 'email', 'role', 'status', 'restaurantId', 'loginId', 'username', 'lastLogin', 'createdAt');
       if (status) usersQuery = usersQuery.where('status', '==', status);
       staffPromises.push(usersQuery.get());
     }
@@ -834,6 +840,7 @@ router.get('/inventory', authenticateToken, requireOwnerRole, async (req, res) =
       inventoryPromises.push(
         db.collection(collections.inventory)
           .where('restaurantId', 'in', batch)
+          .select('name', 'category', 'currentStock', 'minStock', 'reorderLevel', 'unit', 'costPerUnit', 'restaurantId')
           .get()
       );
     }
