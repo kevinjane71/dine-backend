@@ -14597,7 +14597,7 @@ app.post('/api/menu-items/:itemId/images', authenticateToken, upload.array('imag
     for (let i = 0; i < files.length; i++) {
       const file = files[i];
       try {
-        const filename = `menu-items/${menuItem.restaurantId}/${itemId}/${Date.now()}-${i}-${file.originalname}`;
+        const filename = `menu-items/${restaurantId}/${itemId}/${Date.now()}-${i}-${file.originalname}`;
         const blob = bucket.file(filename);
         
         await blob.save(file.buffer, {
@@ -17847,7 +17847,11 @@ app.get('/api/user/profile', authenticateToken, async (req, res) => {
         description: restaurantData.description,
         ownerId: restaurantData.ownerId,
         status: restaurantData.status,
-        createdAt: restaurantData.createdAt
+        createdAt: restaurantData.createdAt,
+        billingSettings: restaurantData.billingSettings || {},
+        posSettings: restaurantData.posSettings || {},
+        currencySettings: restaurantData.currencySettings || null,
+        ecrSettings: restaurantData.ecrSettings || null,
       } : null,
       owner: ownerData ? {
         id: restaurantData.ownerId,
@@ -17995,6 +17999,10 @@ app.post('/api/auth/staff/login', async (req, res) => {
         legalBusinessName: restaurantData.legalBusinessName || '',
         gstin: restaurantData.gstin || '',
         showGstOnInvoice: restaurantData.showGstOnInvoice === true, // Default false
+        billingSettings: restaurantData.billingSettings || {},
+        posSettings: restaurantData.posSettings || {},
+        currencySettings: restaurantData.currencySettings || null,
+        ecrSettings: restaurantData.ecrSettings || null,
       } : null,
       owner: ownerData ? {
         id: restaurantData.ownerId,
