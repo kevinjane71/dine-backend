@@ -31217,6 +31217,8 @@ app.get('/api/restaurants/:restaurantId/billing-settings', authenticateToken, as
       partialPaymentRoles: Array.isArray(existing.partialPaymentRoles) ? existing.partialPaymentRoles : [],
       compVoidRoles: Array.isArray(existing.compVoidRoles) ? existing.compVoidRoles : [],
       refundsRoles: Array.isArray(existing.refundsRoles) ? existing.refundsRoles : [],
+      customItemRoles: Array.isArray(existing.customItemRoles) ? existing.customItemRoles : [],
+      priceEditRoles: Array.isArray(existing.priceEditRoles) ? existing.priceEditRoles : [],
       settlementMethods: Array.isArray(existing.settlementMethods) ? existing.settlementMethods
         : [{ id: 'cash', label: 'Cash', enabled: true }, { id: 'card', label: 'Card', enabled: true }, { id: 'upi', label: 'UPI', enabled: true }],
     };
@@ -31295,6 +31297,12 @@ app.put('/api/restaurants/:restaurantId/billing-settings', authenticateToken, as
         : [],
       refundsRoles: Array.isArray(settings.refundsRoles)
         ? settings.refundsRoles.filter(r => typeof r === 'string' && r.length > 0 && r.length <= 50)
+        : [],
+      customItemRoles: Array.isArray(settings.customItemRoles)
+        ? settings.customItemRoles.filter(r => typeof r === 'string' && r.length > 0 && r.length <= 50)
+        : [],
+      priceEditRoles: Array.isArray(settings.priceEditRoles)
+        ? settings.priceEditRoles.filter(r => typeof r === 'string' && r.length > 0 && r.length <= 50)
         : [],
       settlementMethods: Array.isArray(settings.settlementMethods)
         ? settings.settlementMethods
