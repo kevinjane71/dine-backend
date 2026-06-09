@@ -217,6 +217,47 @@ function validateSplitPayments(splitPayments, grandTotal) {
 }
 
 /**
+ * Validate split bill (dividing order among guests).
+ * @param {Object} splitBill - { method, guestCount, splits: [{ guestIndex, subtotal, totalAmount, paymentMethod, ... }] }
+ * @param {number} grandTotal - Expected order total
+ * @returns {{ valid: boolean, error?: string }}
+ */
+function validateSplitBill(splitBill, grandTotal) {
+  if (!splitBill) return { valid: true };
+
+  const validMethods = ['equal', 'by-item', 'by-amount'];
+  if (!validMethods.includes(splitBill.method)) {
+    return { valid: false, error: `Invalid split bill method: ${splitBill.method}` };
+  }
+
+  if (!Array.isArray(splitBill.splits) || splitBill.splits.length < 2) {
+    return { valid: false, error: 'Split bill must have at least 2 splits' };
+  }
+
+  if (splitBill.splits.length > 20) {
+    return { valid: false, error: 'Split bill cannot have more than 20 splits' };
+  }
+
+  for (let i = 0; i < splitBill.splits.length; i++) {
+    const s = splitBill.splits[i];
+    const amt = parseFloat(s.totalAmount);
+    if (isNaN(amt) || amt <= 0) {
+      return { valid: false, error: `Split #${i + 1} has invalid total amount: ${s.totalAmount}` };
+    }
+    if (!s.paymentMethod) {
+      return { valid: false, error: `Split #${i + 1} is missing payment method` };
+    }
+  }
+
+  const splitTotal = round2(splitBill.splits.reduce((sum, s) => sum + (parseFloat(s.totalAmount) || 0), 0));
+  if (Math.abs(splitTotal - grandTotal) > 1) {
+    return { valid: false, error: `Split bill total (${splitTotal}) does not match order total (${grandTotal})` };
+  }
+
+  return { valid: true };
+}
+
+/**
  * Validate cash tendered and change calculation.
  * @param {number} cashAmount - Cash given by customer
  * @param {number} grandTotal - Order total
@@ -325,6 +366,7 @@ module.exports = {
   calculatePerItemTax,
   calculateStackedDiscounts,
   validateSplitPayments,
+  validateSplitBill,
   validateCashPayment,
   validateOrderItems,
   calculateInvoiceTotals

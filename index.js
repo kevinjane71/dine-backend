@@ -254,8 +254,9 @@ function updateDailyStats(restaurantId, order, operation, tzOffset) {
     if (order.items && Array.isArray(order.items)) {
       const itemCounts = {};
       order.items.forEach(item => {
-        const name = item.name || item.itemName;
-        if (name) {
+        const baseName = item.name || item.itemName;
+        if (baseName) {
+          const name = item.selectedVariant?.name ? `${baseName} (${item.selectedVariant.name})` : baseName;
           const key = name.replace(/[.\/]/g, '_'); // Firestore key-safe
           if (!itemCounts[key]) itemCounts[key] = { qty: 0, revenue: 0 };
           itemCounts[key].qty += (item.quantity || 1) * sign;
@@ -850,6 +851,44 @@ function resolveItemPriceForRule(menuItem, ruleId, rules) {
   return null; // no adjustment — use base price
 }
 
+// Generate a composite key for an order item that uniquely identifies it.
+// Used everywhere items are matched, deduped, or compared for KOT diffs.
+// Key format: "menuItemId|variantName|custId1,custId2" (sorted customizations)
+function getOrderItemKey(item) {
+  const id = item.menuItemId || item.id || '';
+  const variant = item.selectedVariant?.name || '';
+  const custs = Array.isArray(item.selectedCustomizations) && item.selectedCustomizations.length > 0
+    ? [...item.selectedCustomizations].map(c => c.id || c.name || '').sort().join(',')
+    : '';
+  return `${id}|${variant}|${custs}`;
+}
+
+// Server-side deduplication: merge items with the same composite key (menuItemId + variant + customizations).
+// This is a safety net — FE should already deduplicate, but this prevents billing errors regardless.
+function deduplicateOrderItems(items) {
+  const map = new Map();
+  for (const item of items) {
+    const key = getOrderItemKey(item);
+    if (map.has(key)) {
+      const existing = map.get(key);
+      const newQty = (existing.quantity || 1) + (item.quantity || 1);
+      existing.quantity = newQty;
+      existing.total = (existing.price || 0) * newQty;
+      console.warn(`⚠️ Dedup: merged duplicate item "${item.name}" variant="${item.selectedVariant?.name || 'none'}" — qty now ${newQty}`);
+    } else {
+      // Deep clone nested objects to prevent shared reference mutation
+      map.set(key, {
+        ...item,
+        selectedVariant: item.selectedVariant ? { ...item.selectedVariant } : null,
+        selectedCustomizations: Array.isArray(item.selectedCustomizations)
+          ? item.selectedCustomizations.map(c => ({ ...c }))
+          : [],
+      });
+    }
+  }
+  return Array.from(map.values());
+}
+
 // Multi-tier pricing: resolve which pricing rule applies based on floor name
 function resolveTablePricingRule(floorName, multiPricing) {
   if (!multiPricing?.enabled || !floorName) return null;
@@ -1150,6 +1189,7 @@ const ledgerRoutes = require('./routes/ledger');
 const spaceBookingRoutes = require('./routes/spaceBooking');
 const parkingRoutes = require('./routes/parking');
 const registerRoutes = require('./routes/registerRoutes');
+const shiftRoutes = require('./routes/shiftRoutes');
 const bookingRoutes = require('./routes/bookings');
 
 // Move Order
@@ -7439,6 +7479,9 @@ app.post('/api/menus/:restaurantId', authenticateToken, async (req, res) => {
               .map(([k, v]) => [k, Math.round(v * 100) / 100])
           )
         : {},
+      // Weighing scale: sold-by-weight items (price per weight unit)
+      soldByWeight: req.body.soldByWeight || false,
+      priceUnit: req.body.priceUnit || 'per_kg', // 'per_kg' | 'per_100g' | 'per_lb'
       // Discount applicability (default true — item participates in discount distribution)
       discountApplicable: req.body.discountApplicable !== undefined ? req.body.discountApplicable : true,
       createdAt: new Date(),
@@ -7561,7 +7604,7 @@ app.patch('/api/menus/item/:id', authenticateToken, async (req, res) => {
       'spiritCategory', 'ingredients', 'abv', 'servingUnit', 'bottleSize',
       'unit', 'weight', 'shelfLife', 'mfgDate', 'expiryDate',
       'servingSize', 'scoopOptions', 'pricingRules', 'taxGroupId',
-      'discountApplicable', 'taxInclusive'
+      'discountApplicable', 'taxInclusive', 'soldByWeight', 'priceUnit'
     ];
     
     allowedFields.forEach(field => {
@@ -8874,6 +8917,7 @@ app.post('/api/orders', async (req, res) => {
     const cashReceived = req.body.cashReceived || null;
     const changeReturned = req.body.changeReturned || null;
     const splitPayments = req.body.splitPayments || null;
+    const splitBill = req.body.splitBill || null;
     const roundOffAmount = req.body.roundOffAmount || null;
 
     // Extract offline/sync fields
@@ -9235,8 +9279,9 @@ app.post('/api/orders', async (req, res) => {
 
       if (selectedVariant && typeof selectedVariant.price === 'number') {
         // Variant selected — validate variant exists in menu item
+        // Prefer name match; only fall back to price match when name is absent
         const matchedVariant = (menuItem.variants || []).find(v =>
-          v.name === selectedVariant.name || v.price === selectedVariant.price
+          selectedVariant.name ? v.name === selectedVariant.name : v.price === selectedVariant.price
         );
         basePrice = matchedVariant ? matchedVariant.price : selectedVariant.price;
         expectedMenuPrice = basePrice; // variant price is the expected price
@@ -9336,6 +9381,16 @@ app.post('/api/orders', async (req, res) => {
         menuPrice: allowPriceEdit && unitPrice !== expectedUnitPrice ? expectedMenuPrice : null,
         priceEdited: allowPriceEdit && unitPrice !== expectedUnitPrice,
       });
+    }
+
+    // Server-side safety net: merge any duplicate items (same menuItemId + variant + customizations)
+    // that may have slipped through from FE. Recalculate totalAmount from deduped items.
+    const dedupedItems = deduplicateOrderItems(orderItems);
+    if (dedupedItems.length < orderItems.length) {
+      console.warn(`⚠️ POST /api/orders: Deduped ${orderItems.length} → ${dedupedItems.length} items for order`);
+      orderItems.length = 0;
+      dedupedItems.forEach(item => orderItems.push(item));
+      totalAmount = orderItems.reduce((sum, item) => sum + (item.total || 0), 0);
     }
 
     // Apply zone pricing surcharge (before tax) — skip if multi-tier pricing rule is active
@@ -9606,6 +9661,24 @@ app.post('/api/orders', async (req, res) => {
       }
     }
 
+    // Validate split bill (mutually exclusive with splitPayments)
+    if (splitBill && splitPayments) {
+      return res.status(400).json({ error: 'Split bill and split payments cannot be used together' });
+    }
+    if (splitBill) {
+      const validMethods = ['equal', 'by-item', 'by-amount'];
+      if (!validMethods.includes(splitBill.method)) {
+        return res.status(400).json({ error: `Invalid split bill method: ${splitBill.method}` });
+      }
+      if (!Array.isArray(splitBill.splits) || splitBill.splits.length < 2) {
+        return res.status(400).json({ error: 'Split bill must have at least 2 guest splits' });
+      }
+      const sbTotal = splitBill.splits.reduce((sum, s) => sum + (parseFloat(s.totalAmount) || 0), 0);
+      if (Math.abs(sbTotal - finalAmount) > 1) {
+        console.warn(`⚠️ Split bill total (₹${sbTotal}) differs from finalAmount (₹${finalAmount}) by ₹${Math.abs(sbTotal - finalAmount)}`);
+      }
+    }
+
     // Validate cash/change consistency
     if (cashReceived != null && cashReceived < 0) {
       return res.status(400).json({ error: 'Cash received cannot be negative' });
@@ -9684,6 +9757,7 @@ app.post('/api/orders', async (req, res) => {
       cashReceived: cashReceived ? Math.round(cashReceived * 100) / 100 : null,
       changeReturned: changeReturned ? Math.round(changeReturned * 100) / 100 : null,
       splitPayments: splitPayments,
+      splitBill: splitBill || null,
       roundOffAmount: roundOffAmount ? Math.round(roundOffAmount * 100) / 100 : null,
       paidAmount: (req.body.partialPayAmount != null) ? Math.round(Number(req.body.partialPayAmount) * 100) / 100 : null,
       // Derive outstanding from rounded paidAmount to ensure paidAmount + outstandingAmount = finalAmount
@@ -12693,7 +12767,14 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
       const existingItems = currentOrder.items || [];
       const allowPriceEditPatch = restaurantData?.posSettings?.allowPriceEdit === true;
       const processedItems = items.map(newItem => {
-        const existingItem = existingItems.find(existing => existing.menuItemId === newItem.menuItemId);
+        // Match by menuItemId + variant name so items with different variants
+        // (e.g., Half vs Full) are correctly treated as separate line items
+        const newVariantName = newItem.selectedVariant?.name || null;
+        const existingItem = existingItems.find(existing => {
+          if (existing.menuItemId !== newItem.menuItemId) return false;
+          const existingVariantName = existing.selectedVariant?.name || null;
+          return existingVariantName === newVariantName;
+        });
 
         // Clear any previous KOT diff flags to avoid stale flags from prior updates
         const { isNew: _isNew, isUpdated: _isUpdated, isRemoved: _isRemoved, addedAt: _addedAt, updatedAt: _updatedAt, removedAt: _removedAt, previousQuantity: _prevQty, quantityDelta: _qtyDelta, ...cleanItem } = newItem;
@@ -12721,8 +12802,9 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
 
           if (selectedVariant && typeof selectedVariant.price === 'number') {
             // Variant selected — validate against menu
+            // Prefer name match; only fall back to price match when name is absent
             const matchedVariant = (menuItem.variants || []).find(v =>
-              v.name === selectedVariant.name || v.price === selectedVariant.price
+              selectedVariant.name ? v.name === selectedVariant.name : v.price === selectedVariant.price
             );
             resolvedBasePrice = matchedVariant ? matchedVariant.price : selectedVariant.price;
             expectedMenuPricePatch = resolvedBasePrice; // variant price is the expected price
@@ -12812,8 +12894,12 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
       });
 
       // Detect removed items — items that existed before but are NOT in the new items list
+      // Match by menuItemId + variant name (consistent with existingItem matching above)
       const removedItems = existingItems
-        .filter(existing => !items.find(newItem => newItem.menuItemId === existing.menuItemId))
+        .filter(existing => !items.find(newItem => {
+          if (newItem.menuItemId !== existing.menuItemId) return false;
+          return (newItem.selectedVariant?.name || null) === (existing.selectedVariant?.name || null);
+        }))
         .map(removedItem => ({
           ...removedItem,
           isRemoved: true,
@@ -12822,16 +12908,22 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
           quantity: 0
         }));
 
+      // Server-side safety net: merge any duplicate items before saving
+      const dedupedPatchItems = deduplicateOrderItems(processedItems);
+      if (dedupedPatchItems.length < processedItems.length) {
+        console.warn(`⚠️ PATCH /api/orders: Deduped ${processedItems.length} → ${dedupedPatchItems.length} items`);
+      }
+
       // Store removed items separately so they don't affect totals but are available for KOT display
       updateData.removedItems = removedItems;
-      updateData.items = processedItems;
-      updateData.itemCount = processedItems.reduce((sum, item) => sum + item.quantity, 0);
-      let itemsSubtotal = await calculateOrderTotal(processedItems);
+      updateData.items = dedupedPatchItems;
+      updateData.itemCount = dedupedPatchItems.reduce((sum, item) => sum + item.quantity, 0);
+      let itemsSubtotal = await calculateOrderTotal(dedupedPatchItems);
 
       // Double-check subtotal calculation
-      if (itemsSubtotal === 0 && processedItems.length > 0) {
+      if (itemsSubtotal === 0 && dedupedPatchItems.length > 0) {
         console.warn('⚠️ Total amount calculated as 0, recalculating from items...');
-        itemsSubtotal = processedItems.reduce((sum, item) => sum + (item.total || 0), 0);
+        itemsSubtotal = dedupedPatchItems.reduce((sum, item) => sum + (item.total || 0), 0);
       }
 
       // Store raw subtotal — tax and finalAmount will be computed AFTER discounts below
@@ -12877,6 +12969,13 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
       }
       updateData.splitPayments = req.body.splitPayments;
     }
+    if (req.body.splitBill !== undefined) {
+      updateData.splitBill = req.body.splitBill || null;
+      // Split bill and split payments are mutually exclusive
+      if (req.body.splitBill && updateData.splitPayments) {
+        return res.status(400).json({ error: 'Split bill and split payments cannot be used together' });
+      }
+    }
     if (req.body.roundOffAmount !== undefined) updateData.roundOffAmount = req.body.roundOffAmount;
     if (req.body.paidAmount !== undefined) updateData.paidAmount = req.body.paidAmount;
     if (req.body.outstandingAmount !== undefined) updateData.outstandingAmount = req.body.outstandingAmount;
@@ -12917,6 +13016,9 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
     // Override payment method if split
     if (req.body.splitPayments && req.body.splitPayments.length > 1) {
       updateData.paymentMethod = 'split';
+    }
+    if (req.body.splitBill && req.body.splitBill.splits && req.body.splitBill.splits.length >= 2) {
+      updateData.paymentMethod = 'split-bill';
     }
     // Discount/offer fields — server-side validation when completing order
     const offerIds = req.body.offerIds;
@@ -13294,6 +13396,23 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
       }
     }
 
+    // Split payment staleness: if items/total changed but splitPayments not re-sent, flag as stale
+    if (items && !req.body.splitPayments) {
+      const existingSplits = currentOrder.splitPayments;
+      if (existingSplits && Array.isArray(existingSplits) && existingSplits.length > 0) {
+        const splitTotal = existingSplits.reduce((sum, sp) => sum + (sp.amount || 0), 0);
+        const newFinal = updateData.finalAmount || updateData.totalAmount || currentOrder.finalAmount || 0;
+        if (Math.abs(splitTotal - newFinal) > 0.01) {
+          updateData.splitPaymentsStale = true;
+          console.warn('⚠️ Split payments stale: splitTotal=', splitTotal, 'newFinal=', newFinal);
+        }
+      }
+    }
+    // Clear stale flag if split payments are re-sent in this update
+    if (req.body.splitPayments) {
+      updateData.splitPaymentsStale = false;
+    }
+
     // Add update history
     const updateHistory = currentOrder.updateHistory || [];
     updateHistory.push({
@@ -13310,6 +13429,8 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
       }
     });
     updateData.updateHistory = updateHistory;
+    // Track how many times this order has been updated after initial placement
+    updateData.updateCount = (currentOrder.updateCount || 0) + 1;
 
     console.log('🔄 Backend - Updating order:', orderId, 'with data:', updateData);
     await db.collection(collections.orders).doc(orderId).update(updateData);
@@ -13320,15 +13441,16 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
         const oldItems = currentOrder.items || [];
         const newItems = updateData.items || [];
 
-        // Build maps: menuItemId → total quantity
+        // Build maps using composite key (menuItemId + variant + customizations)
+        // so variant items are tracked separately for inventory
         const oldQtyMap = {};
         oldItems.forEach(i => {
-          const key = i.menuItemId || i.id;
+          const key = getOrderItemKey(i);
           oldQtyMap[key] = (oldQtyMap[key] || 0) + (i.quantity || 1);
         });
         const newQtyMap = {};
         newItems.forEach(i => {
-          const key = i.menuItemId || i.id;
+          const key = getOrderItemKey(i);
           newQtyMap[key] = (newQtyMap[key] || 0) + (i.quantity || 1);
         });
 
@@ -13344,13 +13466,13 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
 
           if (delta > 0) {
             // More of this item — need to deduct additional inventory
-            const itemData = newItems.find(i => (i.menuItemId || i.id) === key);
+            const itemData = newItems.find(i => getOrderItemKey(i) === key);
             if (itemData) {
               addedItems.push({ ...itemData, quantity: delta });
             }
           } else if (delta < 0) {
             // Less of this item — need to restore inventory
-            const itemData = oldItems.find(i => (i.menuItemId || i.id) === key);
+            const itemData = oldItems.find(i => getOrderItemKey(i) === key);
             if (itemData) {
               removedItems.push({ ...itemData, quantity: Math.abs(delta) });
             }
@@ -13539,9 +13661,13 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
         updateDailyStats(currentOrder.restaurantId, currentOrder, 'cancel', parseTZ(req));
       }
     } else if (prevCounted && nowCounted) {
-      // Order stayed counted — check if amount changed
-      if (updateData.totalAmount !== undefined && updateData.totalAmount !== currentOrder.totalAmount) {
-        updateDailyStatsRevenueDiff(currentOrder.restaurantId, currentOrder, currentOrder.totalAmount, updateData.totalAmount, currentOrder.finalAmount, updateData.finalAmount, parseTZ(req));
+      // Order stayed counted — check if amount changed (items update, billing fields, or payment status change)
+      const newTotal = updateData.totalAmount !== undefined ? updateData.totalAmount : currentOrder.totalAmount;
+      const newFinal = updateData.finalAmount !== undefined ? updateData.finalAmount : currentOrder.finalAmount;
+      const oldTotal = currentOrder.totalAmount || 0;
+      const oldFinal = currentOrder.finalAmount || 0;
+      if (newTotal !== oldTotal || newFinal !== oldFinal) {
+        updateDailyStatsRevenueDiff(currentOrder.restaurantId, currentOrder, oldTotal, newTotal, oldFinal, newFinal, parseTZ(req));
       }
     }
 
@@ -14133,10 +14259,12 @@ app.delete('/api/orders/:orderId', authenticateToken, async (req, res) => {
       updateData.deleteReason = reason.trim();
     }
 
-    // If order was completed/billed, auto-create refund record
+    // If order was completed/billed, record refund metadata for audit trail
+    // Note: do NOT set refundAmount here — stats are already decremented by updateDailyStats below,
+    // and the dashboard excludes 'deleted' orders. Setting refundAmount would cause double-subtraction.
     if (wasCompleted) {
-      const refundAmount = order.finalAmount || order.totalAmount || 0;
-      updateData.refundAmount = refundAmount;
+      const deletedRefundAmount = order.finalAmount || order.totalAmount || 0;
+      updateData.deletedRefundAmount = deletedRefundAmount;
       updateData.refundType = 'full';
       updateData.refundedAt = new Date().toISOString();
       updateData.refundedBy = userId;
@@ -17773,12 +17901,13 @@ app.get('/api/auth/me', authenticateToken, async (req, res) => {
 app.patch('/api/user/preferences', authenticateToken, async (req, res) => {
   try {
     const userId = req.user.userId;
-    const { defaultRestaurantId, language, setupComplete } = req.body;
+    const { defaultRestaurantId, language, setupComplete, tabModes } = req.body;
 
     const updateData = { updatedAt: new Date() };
     if (defaultRestaurantId !== undefined) updateData.defaultRestaurantId = defaultRestaurantId;
     if (language !== undefined) updateData.language = language;
     if (setupComplete === true) updateData.setupComplete = true;
+    if (tabModes !== undefined && typeof tabModes === 'object') updateData.tabModes = tabModes;
 
     const collName = req.user.source === 'staffUsers' ? collections.staffUsers : collections.users;
     await db.collection(collName).doc(userId).update(updateData);
@@ -18508,6 +18637,7 @@ app.use('/api/ledger', ledgerRoutes);
 
 // ==================== CASH REGISTER / SHIFT MANAGEMENT ====================
 app.use('/api/register', registerRoutes);
+app.use('/api/shifts-cash', shiftRoutes);
 
 // ==================== CHAIN / ENTERPRISE MODULE ====================
 app.use('/api/organizations', organizationRoutes);
@@ -20612,6 +20742,7 @@ const assembleBillRenderPayload = (orderId, orderData, restaurantId, restaurantD
     tipPercentage: orderData.tipPercentage || null,
     roundOffAmount,
     splitPayments: orderData.splitPayments || null,
+    splitBill: orderData.splitBill || null,
     cashReceived: orderData.cashReceived ? r2(orderData.cashReceived) : null,
     changeReturned: orderData.changeReturned ? r2(orderData.changeReturned) : null,
     paidAmount: orderData.paidAmount ? r2(orderData.paidAmount) : null,
@@ -31227,6 +31358,11 @@ app.get('/api/restaurants/:restaurantId/billing-settings', authenticateToken, as
       refundsRoles: Array.isArray(existing.refundsRoles) ? existing.refundsRoles : [],
       customItemRoles: Array.isArray(existing.customItemRoles) ? existing.customItemRoles : [],
       priceEditRoles: Array.isArray(existing.priceEditRoles) ? existing.priceEditRoles : [],
+      // Split Bill (divide order among guests)
+      splitBillEnabled: existing.splitBillEnabled ?? false,
+      splitBillDefaultMethod: ['equal','by-item','by-amount'].includes(existing.splitBillDefaultMethod) ? existing.splitBillDefaultMethod : 'equal',
+      splitBillMaxGuests: existing.splitBillMaxGuests ?? 10,
+      splitBillRoles: Array.isArray(existing.splitBillRoles) ? existing.splitBillRoles : [],
       settlementMethods: Array.isArray(existing.settlementMethods) ? existing.settlementMethods
         : [{ id: 'cash', label: 'Cash', enabled: true }, { id: 'card', label: 'Card', enabled: true }, { id: 'upi', label: 'UPI', enabled: true }],
     };
@@ -31311,6 +31447,13 @@ app.put('/api/restaurants/:restaurantId/billing-settings', authenticateToken, as
         : [],
       priceEditRoles: Array.isArray(settings.priceEditRoles)
         ? settings.priceEditRoles.filter(r => typeof r === 'string' && r.length > 0 && r.length <= 50)
+        : [],
+      // Split Bill (divide order among guests)
+      splitBillEnabled: settings.splitBillEnabled ?? false,
+      splitBillDefaultMethod: ['equal','by-item','by-amount'].includes(settings.splitBillDefaultMethod) ? settings.splitBillDefaultMethod : 'equal',
+      splitBillMaxGuests: Math.max(2, Math.min(20, Number(settings.splitBillMaxGuests) || 10)),
+      splitBillRoles: Array.isArray(settings.splitBillRoles)
+        ? settings.splitBillRoles.filter(r => typeof r === 'string' && r.length > 0 && r.length <= 50)
         : [],
       settlementMethods: Array.isArray(settings.settlementMethods)
         ? settings.settlementMethods
@@ -31811,7 +31954,9 @@ app.patch('/api/orders/:orderId/edit-completed-items', authenticateToken, async 
       let resolvedBasePrice;
       if (menuItem) {
         if (selectedVariant && typeof selectedVariant.price === 'number') {
-          const matchedVariant = (menuItem.variants || []).find(v => v.name === selectedVariant.name || v.price === selectedVariant.price);
+          const matchedVariant = (menuItem.variants || []).find(v =>
+            selectedVariant.name ? v.name === selectedVariant.name : v.price === selectedVariant.price
+          );
           resolvedBasePrice = matchedVariant ? matchedVariant.price : selectedVariant.price;
         } else if (allowPriceEdit && cleanItem.price != null) {
           resolvedBasePrice = cleanItem.price;
@@ -31828,7 +31973,13 @@ app.patch('/api/orders/:orderId/edit-completed-items', authenticateToken, async 
 
       const customizationPrice = customizations.reduce((sum, c) => sum + (typeof c.price === 'number' ? c.price : 0), 0);
       const resolvedUnitPrice = (resolvedBasePrice || 0) + customizationPrice;
-      const itemQuantity = Math.max(1, parseInt(cleanItem.quantity, 10) || 1);
+
+      // Validate quantity — reject zero/negative (consistent with PATCH handler)
+      const parsedQtyEdit = parseInt(cleanItem.quantity, 10);
+      if (parsedQtyEdit != null && parsedQtyEdit <= 0) {
+        throw new Error(`Invalid quantity for item "${cleanItem.name || menuItem?.name}": quantity must be positive`);
+      }
+      const itemQuantity = Math.max(1, parsedQtyEdit || 1);
 
       return {
         ...cleanItem,
@@ -31845,9 +31996,15 @@ app.patch('/api/orders/:orderId/edit-completed-items', authenticateToken, async 
       };
     });
 
-    updateData.items = processedItems;
-    updateData.itemCount = processedItems.reduce((sum, item) => sum + item.quantity, 0);
-    const itemsSubtotal = processedItems.reduce((sum, item) => sum + (item.total || 0), 0);
+    // Server-side safety net: merge any duplicate items before saving
+    const dedupedEditItems = deduplicateOrderItems(processedItems);
+    if (dedupedEditItems.length < processedItems.length) {
+      console.warn(`⚠️ edit-completed-items: Deduped ${processedItems.length} → ${dedupedEditItems.length} items`);
+    }
+
+    updateData.items = dedupedEditItems;
+    updateData.itemCount = dedupedEditItems.reduce((sum, item) => sum + item.quantity, 0);
+    const itemsSubtotal = dedupedEditItems.reduce((sum, item) => sum + (item.total || 0), 0);
     updateData.subtotal = itemsSubtotal;
 
     // Preserve existing discounts (recalculate percentage-based manual discount)
@@ -31859,11 +32016,35 @@ app.patch('/api/orders/:orderId/edit-completed-items', authenticateToken, async 
     updateData.manualDiscountType = currentOrder.manualDiscountType || null;
     updateData.manualDiscountValue = currentOrder.manualDiscountValue || null;
 
-    const offerDiscount = currentOrder.discountAmount || currentOrder.offerDiscount || 0;
+    // Recalculate offer discount based on new subtotal (not just preserve old value)
+    let offerDiscount = currentOrder.discountAmount || currentOrder.offerDiscount || 0;
+    if (offerDiscount > 0 && currentOrder.appliedOffers?.length > 0) {
+      // Recalculate percentage-based offers on new subtotal
+      let recalcDiscount = 0;
+      for (const ao of currentOrder.appliedOffers) {
+        if (ao.discountType === 'percentage' && ao.discountValue) {
+          recalcDiscount += Math.round((itemsSubtotal * ao.discountValue / 100) * 100) / 100;
+        } else {
+          recalcDiscount += ao.discountApplied || 0; // fixed amount stays same
+        }
+      }
+      offerDiscount = Math.min(recalcDiscount, itemsSubtotal); // cap at subtotal
+    }
+    // Cap offer discount — can't exceed new subtotal
+    offerDiscount = Math.min(offerDiscount, itemsSubtotal);
     updateData.discountAmount = offerDiscount;
     updateData.offerDiscount = offerDiscount;
-    const loyaltyDiscount = currentOrder.loyaltyDiscount || 0;
+
+    // Recalculate loyalty discount — cap against new subtotal and maxRedemptionPercent
+    let loyaltyDiscount = currentOrder.loyaltyDiscount || 0;
+    if (loyaltyDiscount > 0) {
+      const remainingAfterOffer = Math.max(0, itemsSubtotal - offerDiscount - manualDiscount);
+      const maxRedemptionPercent = restaurantData.loyaltySettings?.maxRedemptionPercent || 100;
+      const maxLoyaltyDiscount = Math.round((itemsSubtotal * maxRedemptionPercent / 100) * 100) / 100;
+      loyaltyDiscount = Math.min(loyaltyDiscount, maxLoyaltyDiscount, remainingAfterOffer);
+    }
     updateData.loyaltyDiscount = loyaltyDiscount;
+
     const couponDiscount = currentOrder.couponDiscount || 0;
     updateData.couponDiscount = couponDiscount;
     updateData.totalDiscountAmount = Math.round((offerDiscount + manualDiscount + loyaltyDiscount + couponDiscount) * 100) / 100;
@@ -31931,17 +32112,29 @@ app.patch('/api/orders/:orderId/edit-completed-items', authenticateToken, async 
     const roundOff = currentOrder.roundOffAmount || currentOrder.roundOff || 0;
     updateData.finalAmount = Math.max(0, Math.round((preTaxTotal + exclusiveTax + scAmt + tipAmt + roundOff) * 100) / 100);
 
+    // --- Recalculate loyalty points earned based on new subtotal ---
+    const loyaltySettings = restaurantData.loyaltySettings;
+    if (loyaltySettings?.enabled && currentOrder.loyaltyPointsEarned > 0) {
+      const pointsPerUnit = loyaltySettings.pointsPerUnit || 25; // e.g., 1 point per ₹25
+      const newPointsEarned = Math.floor(itemsSubtotal / pointsPerUnit);
+      if (newPointsEarned !== currentOrder.loyaltyPointsEarned) {
+        updateData.loyaltyPointsEarned = newPointsEarned;
+        console.log(`🔄 Edit: Loyalty points recalculated ${currentOrder.loyaltyPointsEarned} → ${newPointsEarned} (subtotal ₹${itemsSubtotal})`);
+      }
+    }
+
     // --- Edit count and history ---
     updateData.editCount = (currentOrder.editCount || 0) + 1;
 
+    // Use composite key (menuItemId + variant) so Half/Full of same item are tracked separately
     const oldItemMap = {};
-    existingItems.forEach(i => { oldItemMap[i.menuItemId] = i; });
+    existingItems.forEach(i => { oldItemMap[getOrderItemKey(i)] = i; });
     const newItemMap = {};
-    processedItems.forEach(i => { newItemMap[i.menuItemId] = i; });
-    const itemsAdded = processedItems.filter(i => !oldItemMap[i.menuItemId]).map(i => ({ name: i.name, quantity: i.quantity }));
-    const itemsRemoved = existingItems.filter(i => !newItemMap[i.menuItemId]).map(i => ({ name: i.name, quantity: i.quantity }));
-    const itemsModified = processedItems.filter(i => oldItemMap[i.menuItemId] && oldItemMap[i.menuItemId].quantity !== i.quantity)
-      .map(i => ({ name: i.name, from: oldItemMap[i.menuItemId].quantity, to: i.quantity }));
+    dedupedEditItems.forEach(i => { newItemMap[getOrderItemKey(i)] = i; });
+    const itemsAdded = dedupedEditItems.filter(i => !oldItemMap[getOrderItemKey(i)]).map(i => ({ name: i.name, variant: i.selectedVariant?.name || null, quantity: i.quantity }));
+    const itemsRemoved = existingItems.filter(i => !newItemMap[getOrderItemKey(i)]).map(i => ({ name: i.name, variant: i.selectedVariant?.name || null, quantity: i.quantity }));
+    const itemsModified = dedupedEditItems.filter(i => oldItemMap[getOrderItemKey(i)] && oldItemMap[getOrderItemKey(i)].quantity !== i.quantity)
+      .map(i => ({ name: i.name, variant: i.selectedVariant?.name || null, from: oldItemMap[getOrderItemKey(i)].quantity, to: i.quantity }));
 
     const editEntry = {
       editedAt: new Date().toISOString(),
@@ -31964,15 +32157,24 @@ app.patch('/api/orders/:orderId/edit-completed-items', authenticateToken, async 
       autoRefundCreated = true;
     }
 
+    // Split payment staleness: flag if completed order had split payments and total changed
+    if (currentOrder.splitPayments && Array.isArray(currentOrder.splitPayments) && currentOrder.splitPayments.length > 0) {
+      const splitTotal = currentOrder.splitPayments.reduce((sum, sp) => sum + (sp.amount || 0), 0);
+      if (Math.abs(splitTotal - updateData.finalAmount) > 0.01) {
+        updateData.splitPaymentsStale = true;
+      }
+    }
+
     // Save updated order
     await orderRef.update(updateData);
 
     // --- Inventory adjustment ---
     try {
+      // Use composite key for inventory so variant items are tracked separately
       const oldQtyMap = {};
-      existingItems.forEach(i => { const key = i.menuItemId || i.id; oldQtyMap[key] = (oldQtyMap[key] || 0) + (i.quantity || 1); });
+      existingItems.forEach(i => { const key = getOrderItemKey(i); oldQtyMap[key] = (oldQtyMap[key] || 0) + (i.quantity || 1); });
       const newQtyMap = {};
-      processedItems.forEach(i => { const key = i.menuItemId || i.id; newQtyMap[key] = (newQtyMap[key] || 0) + (i.quantity || 1); });
+      dedupedEditItems.forEach(i => { const key = getOrderItemKey(i); newQtyMap[key] = (newQtyMap[key] || 0) + (i.quantity || 1); });
       const allKeys = new Set([...Object.keys(oldQtyMap), ...Object.keys(newQtyMap)]);
       const addedInvItems = [];
       const removedInvItems = [];
@@ -31981,10 +32183,10 @@ app.patch('/api/orders/:orderId/edit-completed-items', authenticateToken, async 
         const newQty = newQtyMap[key] || 0;
         const delta = newQty - oldQty;
         if (delta > 0) {
-          const itemData = processedItems.find(i => (i.menuItemId || i.id) === key);
+          const itemData = dedupedEditItems.find(i => getOrderItemKey(i) === key);
           if (itemData) addedInvItems.push({ ...itemData, quantity: delta });
         } else if (delta < 0) {
-          const itemData = existingItems.find(i => (i.menuItemId || i.id) === key);
+          const itemData = existingItems.find(i => getOrderItemKey(i) === key);
           if (itemData) removedInvItems.push({ ...itemData, quantity: Math.abs(delta) });
         }
       }

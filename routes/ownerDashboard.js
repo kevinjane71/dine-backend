@@ -417,14 +417,15 @@ router.get('/analytics', authenticateToken, requireOwnerRole, async (req, res) =
       revenueByDay[dateKey].orders += 1;
     });
 
-    // Calculate popular items across chain
+    // Calculate popular items across chain (variant-aware: "Chicken Tandoori (Half)" separate from "Full")
     const itemCounts = {};
     const itemRevenue = {};
     allOrders.forEach(order => {
       if (order.items && Array.isArray(order.items)) {
         order.items.forEach(item => {
-          const itemName = item.name || item.itemName;
-          if (itemName) {
+          const baseName = item.name || item.itemName;
+          if (baseName) {
+            const itemName = item.selectedVariant?.name ? `${baseName} (${item.selectedVariant.name})` : baseName;
             itemCounts[itemName] = (itemCounts[itemName] || 0) + (item.quantity || 1);
             itemRevenue[itemName] = (itemRevenue[itemName] || 0) + (item.price || 0) * (item.quantity || 1);
           }

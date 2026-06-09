@@ -158,6 +158,7 @@ const collections = {
   orgSettings: 'orgSettings',
   // Cash Register / Shift Management
   cashRegisters: 'cashRegisters',
+  shifts: 'shifts',
   // Bolna AI Phone Agent
   bolnaAgents: 'bolnaAgents',
   phoneCalls: 'phoneCalls',

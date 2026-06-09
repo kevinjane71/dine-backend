@@ -44,9 +44,11 @@ router.get('/:restaurantId/gstr1', async (req, res) => {
     orderSnap.docs.forEach(doc => {
       const order = doc.data();
       if (order.status === 'cancelled' || order.status === 'deleted') return;
+      if (order.paymentStatus === 'due') return; // Exclude unpaid orders from GSTR-1
 
       const taxAmount = order.taxAmount || 0;
-      const taxableValue = (order.finalAmount || order.totalAmount || 0) - taxAmount;
+      const refund = order.autoRefundAmount || 0;
+      const taxableValue = (order.finalAmount || order.totalAmount || 0) - taxAmount - refund;
       const gstRate = order.taxBreakdown?.[0]?.rate || order.taxRate || 5;
       const gst = splitGST(taxAmount, gstRate);
 
@@ -54,7 +56,7 @@ router.get('/:restaurantId/gstr1', async (req, res) => {
       totalCGST += gst.cgst;
       totalSGST += gst.sgst;
       totalIGST += gst.igst;
-      totalInvoiceValue += order.finalAmount || order.totalAmount || 0;
+      totalInvoiceValue += (order.finalAmount || order.totalAmount || 0) - refund;
 
       invoices.push({
         orderId: doc.id,
@@ -115,8 +117,10 @@ router.get('/:restaurantId/gstr3b', async (req, res) => {
     orderSnap.docs.forEach(doc => {
       const o = doc.data();
       if (o.status === 'cancelled' || o.status === 'deleted') return;
+      if (o.paymentStatus === 'due') return;
       const tax = o.taxAmount || 0;
-      outwardTaxable += (o.finalAmount || o.totalAmount || 0) - tax;
+      const refund = o.autoRefundAmount || 0;
+      outwardTaxable += (o.finalAmount || o.totalAmount || 0) - tax - refund;
       outwardTax += tax;
     });
 
@@ -252,8 +256,10 @@ router.get('/:restaurantId/export/:type', async (req, res) => {
       orderSnap.docs.forEach(doc => {
         const o = doc.data();
         if (o.status === 'cancelled' || o.status === 'deleted') return;
+        if (o.paymentStatus === 'due') return;
         const tax = o.taxAmount || 0;
-        const taxable = (o.finalAmount || o.totalAmount || 0) - tax;
+        const refund = o.autoRefundAmount || 0;
+        const taxable = (o.finalAmount || o.totalAmount || 0) - tax - refund;
         const rate = o.taxBreakdown?.[0]?.rate || 5;
         rows.push([
           o.dailyOrderId || doc.id.slice(-6),
@@ -281,8 +287,10 @@ router.get('/:restaurantId/export/:type', async (req, res) => {
       gstr3bSnap.docs.forEach(doc => {
         const o = doc.data();
         if (o.status === 'cancelled' || o.status === 'deleted') return;
+        if (o.paymentStatus === 'due') return;
         const tax = o.taxAmount || 0;
-        outTaxable += (o.finalAmount || o.totalAmount || 0) - tax;
+        const refund = o.autoRefundAmount || 0;
+        outTaxable += (o.finalAmount || o.totalAmount || 0) - tax - refund;
         outTax += tax;
       });
       // Inward supplies (from supplier invoices)

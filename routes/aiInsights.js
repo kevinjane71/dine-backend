@@ -484,8 +484,9 @@ router.get('/insights', authenticateToken, requireOwnerRole, async (req, res) =>
         // Items
         if (order.items) {
           order.items.forEach(item => {
-            const name = item.name || item.itemName;
-            if (name) {
+            const baseName = item.name || item.itemName;
+            if (baseName) {
+              const name = item.selectedVariant?.name ? `${baseName} (${item.selectedVariant.name})` : baseName;
               itemCounts[name] = (itemCounts[name] || 0) + (item.quantity || 1);
               itemRevenue[name] = (itemRevenue[name] || 0) + (item.price || 0) * (item.quantity || 1);
             }
@@ -784,8 +785,9 @@ async function generateReportForOwner(userId) {
 
       if (order.items) {
         order.items.forEach(item => {
-          const name = item.name || item.itemName;
-          if (name) {
+          const baseName = item.name || item.itemName;
+          if (baseName) {
+            const name = item.selectedVariant?.name ? `${baseName} (${item.selectedVariant.name})` : baseName;
             itemCounts[name] = (itemCounts[name] || 0) + (item.quantity || 1);
             itemRevenue[name] = (itemRevenue[name] || 0) + (item.price || 0) * (item.quantity || 1);
           }
