@@ -153,19 +153,26 @@ const pusherService = require('./services/firebaseRealtimeService');
 // tzOffset = value of browser's getTimezoneOffset() (minutes from UTC, negative for east)
 // e.g. Qatar UTC+3 → tzOffset = -180, IST UTC+5:30 → tzOffset = -330
 
-// Get YYYY-MM-DD for a given Date in the client's timezone
-function dateStrInTZ(d, tzOffset) {
-  if (tzOffset === undefined || tzOffset === null) return d.toISOString().split('T')[0];
-  const ms = d.getTime() - tzOffset * 60000;
+// Get YYYY-MM-DD for a given Date in the client's timezone.
+// dayStartHour: custom business day start (0–23). When > 0, subtracts those hours
+// before computing the date, so timestamps between midnight and dayStartHour
+// fall into the previous business day.
+function dateStrInTZ(d, tzOffset, dayStartHour) {
+  const dsh = (dayStartHour && dayStartHour > 0) ? dayStartHour : 0;
+  const effective = dsh > 0 ? new Date(d.getTime() - dsh * 3600000) : d;
+  if (tzOffset === undefined || tzOffset === null) return effective.toISOString().split('T')[0];
+  const ms = effective.getTime() - tzOffset * 60000;
   const shifted = new Date(ms);
   return `${shifted.getUTCFullYear()}-${String(shifted.getUTCMonth() + 1).padStart(2, '0')}-${String(shifted.getUTCDate()).padStart(2, '0')}`;
 }
 
-// Get start-of-day and end-of-day as UTC Date objects for a date string in client TZ
-function dateBoundsInTZ(dateStr, tzOffset) {
+// Get start-of-day and end-of-day as UTC Date objects for a date string in client TZ.
+// When dayStartHour > 0, the day starts at dayStartHour:00 instead of midnight.
+function dateBoundsInTZ(dateStr, tzOffset, dayStartHour) {
+  const dsh = (dayStartHour && dayStartHour > 0) ? dayStartHour : 0;
   const [y, m, d] = dateStr.split('-').map(Number);
   const midnightUTC = Date.UTC(y, m - 1, d, 0, 0, 0, 0);
-  const startMs = midnightUTC + tzOffset * 60000;
+  const startMs = midnightUTC + tzOffset * 60000 + dsh * 3600000;
   return {
     start: new Date(startMs),
     end: new Date(startMs + 24 * 60 * 60 * 1000 - 1)
@@ -173,10 +180,10 @@ function dateBoundsInTZ(dateStr, tzOffset) {
 }
 
 // Get "today" date string and boundaries in client timezone
-function todayInTZ(tzOffset) {
+function todayInTZ(tzOffset, dayStartHour) {
   const now = new Date();
-  const todayStr = dateStrInTZ(now, tzOffset);
-  const bounds = dateBoundsInTZ(todayStr, tzOffset);
+  const todayStr = dateStrInTZ(now, tzOffset, dayStartHour);
+  const bounds = dateBoundsInTZ(todayStr, tzOffset, dayStartHour);
   return { dateStr: todayStr, ...bounds };
 }
 
@@ -186,6 +193,14 @@ function parseTZ(req) {
   if (tz === undefined || tz === null || tz === '') return undefined;
   const n = Number(tz);
   return isNaN(n) ? undefined : n;
+}
+
+// Parse dayStart query param (returns number 0–23, default 0 = midnight)
+function parseDayStart(req) {
+  const ds = req.query?.dayStart;
+  if (ds === undefined || ds === null || ds === '') return 0;
+  const n = Number(ds);
+  return (isNaN(n) || n < 0 || n > 23) ? 0 : Math.floor(n);
 }
 
 // Helper: get effective revenue for an order (excludes unpaid due amounts)
@@ -202,11 +217,11 @@ function getEffectiveOrderRevenue(order) {
 
 // Pre-compute daily analytics stats on every order write (fire-and-forget)
 // Doc ID: {restaurantId}_{YYYY-MM-DD} in 'dailyStats' collection
-function updateDailyStats(restaurantId, order, operation, tzOffset) {
+function updateDailyStats(restaurantId, order, operation, tzOffset, dayStartHour) {
   try {
     const orderDate = order.createdAt?.toDate ? order.createdAt.toDate()
       : (order.createdAt instanceof Date ? order.createdAt : new Date(order.createdAt || Date.now()));
-    const dateStr = dateStrInTZ(orderDate, tzOffset);
+    const dateStr = dateStrInTZ(orderDate, tzOffset, dayStartHour);
     const docId = `${restaurantId}_${dateStr}`;
     const statsRef = db.collection('dailyStats').doc(docId);
 
@@ -290,11 +305,11 @@ function updateDailyStats(restaurantId, order, operation, tzOffset) {
 }
 
 // Update dailyStats when order amount changes (PATCH with items update)
-function updateDailyStatsRevenueDiff(restaurantId, order, oldAmount, newAmount, oldFinalAmount, newFinalAmount, tzOffset) {
+function updateDailyStatsRevenueDiff(restaurantId, order, oldAmount, newAmount, oldFinalAmount, newFinalAmount, tzOffset, dayStartHour) {
   try {
     const orderDate = order.createdAt?.toDate ? order.createdAt.toDate()
       : (order.createdAt instanceof Date ? order.createdAt : new Date(order.createdAt || Date.now()));
-    const dateStr = dateStrInTZ(orderDate, tzOffset);
+    const dateStr = dateStrInTZ(orderDate, tzOffset, dayStartHour);
     const docId = `${restaurantId}_${dateStr}`;
     const statsRef = db.collection('dailyStats').doc(docId);
 
@@ -8807,7 +8822,7 @@ app.post('/api/public/orders/:restaurantId', vercelSecurityMiddleware.publicAPI,
     }
 
     // Update daily analytics stats (fire-and-forget)
-    updateDailyStats(restaurantId, orderData, 'add', parseTZ(req));
+    updateDailyStats(restaurantId, orderData, 'add', parseTZ(req), parseDayStart(req));
 
     // Run all Pusher notifications in parallel (saves 1-3s vs sequential awaits).
     // Still awaited before res.json() to prevent Vercel runtime from aborting them.
@@ -10401,7 +10416,7 @@ app.post('/api/orders', async (req, res) => {
 
     // Update daily analytics stats (fire-and-forget) — skip 'saved' orders (counted when placed)
     if (orderData.status !== 'saved') {
-      updateDailyStats(restaurantId, orderData, 'add', parseTZ(req));
+      updateDailyStats(restaurantId, orderData, 'add', parseTZ(req), parseDayStart(req));
     }
 
     // Run all Pusher notifications in parallel (saves 1-3s vs sequential awaits).
@@ -10526,7 +10541,6 @@ app.post('/api/orders', async (req, res) => {
           };
 
           const whatsappSvc = require('./services/whatsappService');
-          await whatsappSvc.initialize(restaurantId, credentials);
           const formatted = custPhone.replace(/[\s\-\(\)\+]/g, '');
 
           const templateParams = [
@@ -10538,12 +10552,12 @@ app.post('/api/orders', async (req, res) => {
 
           let result;
           try {
-            result = await whatsappSvc.sendTemplateMessage(formatted, 'bill_notification', 'en', templateParams);
+            result = await whatsappSvc.sendTemplateMessage(formatted, 'bill_notification', 'en', templateParams, credentials);
           } catch (templateErr) {
             console.warn('📱 Template send failed, falling back to text:', templateErr.message);
             const currencySymbol = restaurantData.currencySymbol || '₹';
             const message = `Dear ${customerName},\n\nYour bill for Order #${orderNum} is ready.\n\n💰 Amount: *${currencySymbol}${billTotal}*\n\n🔗 View Invoice: ${billUrl}\n\nThank you for choosing ${restaurantData.name || 'us'}! 🙏`;
-            result = await whatsappSvc.sendTextMessage(formatted, message);
+            result = await whatsappSvc.sendTextMessage(formatted, message, credentials);
           }
 
           await db.collection(collections.automationLogs).add({
@@ -10568,7 +10582,7 @@ app.post('/api/orders', async (req, res) => {
                   ? `${process.env.FRONTEND_URL || 'https://www.dineopen.com'}/f/${shortCode}?src=wa`
                   : `${process.env.FRONTEND_URL || 'https://www.dineopen.com'}/feedback/${fbSettings.defaultFormId}?src=wa`;
                 const fbMsg = `Hi ${customerName}! 😊\n\nWe hope you enjoyed your experience at ${restaurantData.name || 'our restaurant'}.\n\nWe'd love to hear your feedback:\n${feedbackUrl}\n\nThank you! 🙏`;
-                await whatsappSvc.sendTextMessage(formatted, fbMsg);
+                await whatsappSvc.sendTextMessage(formatted, fbMsg, credentials);
                 console.log('📱 Feedback form link sent via WhatsApp');
               }
             }
@@ -10887,7 +10901,7 @@ app.get('/api/orders/:restaurantId', authenticateToken, async (req, res) => {
         // If todayOnly, narrow down to today (timezone-aware)
         if (todayOnly === 'true') {
           const _tz = parseTZ(req);
-          const todayStart = _tz !== undefined ? todayInTZ(_tz).start : (() => { const d = new Date(); d.setHours(0, 0, 0, 0); return d; })();
+          const todayStart = _tz !== undefined ? todayInTZ(_tz, parseDayStart(req)).start : (() => { const d = new Date(); d.setHours(0, 0, 0, 0); return d; })();
           numQuery = db.collection(collections.orders)
             .where('restaurantId', '==', restaurantId)
             .where('dailyOrderId', '==', numericSearch)
@@ -10946,9 +10960,10 @@ app.get('/api/orders/:restaurantId', authenticateToken, async (req, res) => {
 
       if (todayOnly === 'true') {
         const _tz = parseTZ(req);
+        const _ds = parseDayStart(req);
         let todayStart, todayEnd;
         if (_tz !== undefined) {
-          const t = todayInTZ(_tz);
+          const t = todayInTZ(_tz, _ds);
           todayStart = t.start; todayEnd = t.end;
         } else {
           todayStart = new Date(); todayStart.setHours(0, 0, 0, 0);
@@ -10960,9 +10975,10 @@ app.get('/api/orders/:restaurantId', authenticateToken, async (req, res) => {
 
       if (date && todayOnly !== 'true') {
         const _tz = parseTZ(req);
+        const _ds = parseDayStart(req);
         let sDate, eDate;
         if (_tz !== undefined) {
-          const b = dateBoundsInTZ(date, _tz);
+          const b = dateBoundsInTZ(date, _tz, _ds);
           sDate = b.start; eDate = b.end;
         } else {
           sDate = new Date(date);
@@ -12222,10 +12238,10 @@ app.patch('/api/orders/:orderId/status', authenticateToken, async (req, res) => 
     const _nowCounted = !_nonCounted.includes(status);
     if (_prevCounted && !_nowCounted) {
       // active → cancelled/deleted
-      updateDailyStats(orderData.restaurantId, orderData, 'cancel', parseTZ(req));
+      updateDailyStats(orderData.restaurantId, orderData, 'cancel', parseTZ(req), parseDayStart(req));
     } else if (!_prevCounted && _nowCounted) {
       // saved/cancelled → active (e.g., saved order placed)
-      updateDailyStats(orderData.restaurantId, orderData, 'add', parseTZ(req));
+      updateDailyStats(orderData.restaurantId, orderData, 'add', parseTZ(req), parseDayStart(req));
     }
 
     // Run all Pusher notifications in parallel (saves 1-3s vs sequential awaits).
@@ -12373,7 +12389,6 @@ app.patch('/api/orders/:orderId/status', authenticateToken, async (req, res) => 
           };
 
           const whatsappSvc = require('./services/whatsappService');
-          await whatsappSvc.initialize(orderData.restaurantId, credentials);
           const formatted = custPhone.replace(/[\s\-\(\)\+]/g, '');
 
           // Use the approved bill_notification template: {{1}}=name, {{2}}=orderId, {{3}}=amount, {{4}}=billUrl
@@ -12387,7 +12402,7 @@ app.patch('/api/orders/:orderId/status', authenticateToken, async (req, res) => 
 
           let result;
           try {
-            result = await whatsappSvc.sendTemplateMessage(formatted, 'bill_notification', 'en', templateParams);
+            result = await whatsappSvc.sendTemplateMessage(formatted, 'bill_notification', 'en', templateParams, credentials);
           } catch (templateErr) {
             // Fallback to text message if template fails
             console.warn('📱 Template send failed, falling back to text:', templateErr.message);
@@ -12398,7 +12413,7 @@ app.patch('/api/orders/:orderId/status', authenticateToken, async (req, res) => 
               `📅 Date: ${dateStr}, ${timeStr}` +
               (invoiceLink ? `\n\n🔗 View Invoice: ${invoiceLink}` : '') +
               `\n\nThank you for choosing ${restaurantName}! 🙏`;
-            result = await whatsappSvc.sendTextMessage(formatted, message);
+            result = await whatsappSvc.sendTextMessage(formatted, message, credentials);
           }
 
           const logMessage = `Hi ${customerName}, Your bill for Order #${orderNum} is ready. Amount: ${currencySymbol}${totalAmount}. View: ${billUrl}`;
@@ -13655,10 +13670,10 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
       // Status transition: order entered or left the "counted" set
       if (nowCounted && !prevCounted) {
         // saved → placed, or cancelled/deleted → re-activated (edge case)
-        updateDailyStats(currentOrder.restaurantId, { ...currentOrder, ...updateData }, 'add', parseTZ(req));
+        updateDailyStats(currentOrder.restaurantId, { ...currentOrder, ...updateData }, 'add', parseTZ(req), parseDayStart(req));
       } else if (!nowCounted && prevCounted) {
         // active → cancelled/deleted via PATCH
-        updateDailyStats(currentOrder.restaurantId, currentOrder, 'cancel', parseTZ(req));
+        updateDailyStats(currentOrder.restaurantId, currentOrder, 'cancel', parseTZ(req), parseDayStart(req));
       }
     } else if (prevCounted && nowCounted) {
       // Order stayed counted — check if amount changed (items update, billing fields, or payment status change)
@@ -13667,7 +13682,7 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
       const oldTotal = currentOrder.totalAmount || 0;
       const oldFinal = currentOrder.finalAmount || 0;
       if (newTotal !== oldTotal || newFinal !== oldFinal) {
-        updateDailyStatsRevenueDiff(currentOrder.restaurantId, currentOrder, oldTotal, newTotal, oldFinal, newFinal, parseTZ(req));
+        updateDailyStatsRevenueDiff(currentOrder.restaurantId, currentOrder, oldTotal, newTotal, oldFinal, newFinal, parseTZ(req), parseDayStart(req));
       }
     }
 
@@ -14279,7 +14294,7 @@ app.delete('/api/orders/:orderId', authenticateToken, async (req, res) => {
 
     // Update daily analytics stats — only if order was counted (not saved/cancelled)
     if (!['saved', 'cancelled', 'deleted'].includes(order.status)) {
-      updateDailyStats(order.restaurantId, order, 'delete', parseTZ(req));
+      updateDailyStats(order.restaurantId, order, 'delete', parseTZ(req), parseDayStart(req));
     }
 
     // Release table if assigned
@@ -14368,7 +14383,6 @@ app.delete('/api/orders/:orderId', authenticateToken, async (req, res) => {
         };
 
         const whatsappSvc = require('./services/whatsappService');
-        await whatsappSvc.initialize(order.restaurantId, credentials);
         const formatted = ownerPhone.replace(/[\s\-\(\)\+]/g, '');
         const currencySymbol = restaurantData.currencySymbol || '₹';
         const amount = Number(order.finalAmount || order.totalAmount || 0).toFixed(2);
@@ -14376,7 +14390,7 @@ app.delete('/api/orders/:orderId', authenticateToken, async (req, res) => {
         const staffName = req.user?.name || req.user?.email || 'Staff';
         const message = `🗑️ *Order #${orderNum} DELETED*\n\nBy: ${staffName}\nReason: ${reason || 'No reason provided'}\nAmount: ${currencySymbol}${amount}\nItems: ${(order.items || []).length} items\nWas: ${lastStatus}\nTime: ${new Date().toLocaleString('en-IN')}\n\n— ${restaurantData.name || 'DineOpen'}`;
 
-        const result = await whatsappSvc.sendTextMessage(formatted, message);
+        const result = await whatsappSvc.sendTextMessage(formatted, message, credentials);
         await db.collection(collections.automationLogs).add({
           restaurantId: order.restaurantId, type: 'whatsapp_delete_alert',
           phone: formatted, message: `Delete alert: Order #${orderNum}`,
@@ -14416,7 +14430,7 @@ app.post('/api/public/delete-order', async (req, res) => {
     // Update daily analytics stats before hard delete (fire-and-forget) — only if order was counted
     const _nonCountedStatuses = ['saved', 'cancelled', 'deleted', 'refunded'];
     if (!_nonCountedStatuses.includes(order.status)) {
-      updateDailyStats(order.restaurantId, order, 'delete', parseTZ(req));
+      updateDailyStats(order.restaurantId, order, 'delete', parseTZ(req), parseDayStart(req));
     }
     // Release table if assigned
     if (order.tableNumber && order.tableNumber.trim()) {
@@ -19823,7 +19837,7 @@ app.get('/api/kot/:restaurantId', async (req, res) => {
     const _tz = parseTZ(req);
     let yesterdayStart;
     if (_tz !== undefined) {
-      const t = todayInTZ(_tz);
+      const t = todayInTZ(_tz, parseDayStart(req));
       yesterdayStart = new Date(t.start.getTime() - 24 * 60 * 60 * 1000);
     } else {
       yesterdayStart = new Date();
@@ -21174,7 +21188,7 @@ app.patch('/api/orders/:orderId/cancel', authenticateToken, async (req, res) => 
 
     // Update daily analytics stats — only if order was counted (not saved)
     if (!['saved', 'cancelled', 'deleted'].includes(orderData.status)) {
-      updateDailyStats(orderData.restaurantId, orderData, 'cancel', parseTZ(req));
+      updateDailyStats(orderData.restaurantId, orderData, 'cancel', parseTZ(req), parseDayStart(req));
     }
 
     // If order has a table, release it back to available
@@ -21281,7 +21295,6 @@ app.patch('/api/orders/:orderId/cancel', authenticateToken, async (req, res) => 
         };
 
         const whatsappSvc = require('./services/whatsappService');
-        await whatsappSvc.initialize(orderData.restaurantId, credentials);
         const formatted = ownerPhone.replace(/[\s\-\(\)\+]/g, '');
         const currencySymbol = restData.currencySymbol || '₹';
         const amount = Number(orderData.finalAmount || orderData.totalAmount || 0).toFixed(2);
@@ -21289,7 +21302,7 @@ app.patch('/api/orders/:orderId/cancel', authenticateToken, async (req, res) => 
         const staffName = req.user?.name || req.user?.email || 'Staff';
         const message = `🚫 *Order #${orderNum} CANCELLED*\n\nBy: ${staffName}\nReason: ${reason || 'No reason provided'}\nAmount: ${currencySymbol}${amount}\nItems: ${(orderData.items || []).length} items\nTime: ${new Date().toLocaleString('en-IN')}\n\n— ${restData.name || 'DineOpen'}`;
 
-        const result = await whatsappSvc.sendTextMessage(formatted, message);
+        const result = await whatsappSvc.sendTextMessage(formatted, message, credentials);
         await db.collection(collections.automationLogs).add({
           restaurantId: orderData.restaurantId, type: 'whatsapp_cancel_alert',
           phone: formatted, message: `Cancel alert: Order #${orderNum}`,
@@ -31586,14 +31599,14 @@ app.post('/api/orders/:orderId/refund', authenticateToken, async (req, res) => {
 
       // Update daily stats — full refund effectively removes from revenue
       if (!['saved', 'cancelled', 'deleted'].includes(orderData.status)) {
-        updateDailyStats(orderData.restaurantId, orderData, 'cancel', parseTZ(req));
+        updateDailyStats(orderData.restaurantId, orderData, 'cancel', parseTZ(req), parseDayStart(req));
       }
     } else {
       // Partial refund — subtract refund amount from daily stats revenue (order still counts)
       if (!['saved', 'cancelled', 'deleted'].includes(orderData.status)) {
         const oldFinal = orderData.finalAmount || orderData.totalAmount || 0;
         const oldBase = orderData.totalAmount || 0;
-        updateDailyStatsRevenueDiff(orderData.restaurantId, orderData, oldBase, oldBase - refundAmount, oldFinal, oldFinal - refundAmount, parseTZ(req));
+        updateDailyStatsRevenueDiff(orderData.restaurantId, orderData, oldBase, oldBase - refundAmount, oldFinal, oldFinal - refundAmount, parseTZ(req), parseDayStart(req));
       }
     }
 
@@ -32215,7 +32228,7 @@ app.patch('/api/orders/:orderId/edit-completed-items', authenticateToken, async 
           currentOrder.restaurantId, currentOrder,
           currentOrder.totalAmount || 0, updateData.totalAmount,
           oldFinalAmount, updateData.finalAmount,
-          parseTZ(req)
+          parseTZ(req), parseDayStart(req)
         );
       } catch (statErr) {
         console.error('Revenue stats adjustment error (non-blocking):', statErr);
@@ -32462,7 +32475,7 @@ app.post('/api/customers/:customerId/settle-credit', authenticateToken, async (r
 
         // Update daily stats: add settled amount to revenue for the order's original date
         const tzOffset = parseTZ(req);
-        updateDailyStatsRevenueDiff(orderData.restaurantId, orderData, 0, settleAmount, 0, settleAmount, tzOffset);
+        updateDailyStatsRevenueDiff(orderData.restaurantId, orderData, 0, settleAmount, 0, settleAmount, tzOffset, parseDayStart(req));
       }
     }
 
@@ -32528,7 +32541,7 @@ app.post('/api/customers/:customerId/bulk-settle-credit', authenticateToken, asy
 
       // Update daily stats: add settled amount to revenue for the order's original date
       const tzOffset = parseTZ(req);
-      updateDailyStatsRevenueDiff(orderData.restaurantId, orderData, 0, outstanding, 0, outstanding, tzOffset);
+      updateDailyStatsRevenueDiff(orderData.restaurantId, orderData, 0, outstanding, 0, outstanding, tzOffset, parseDayStart(req));
     }
 
     // Update customer: decrement balance, mark credit history entries as settled
@@ -34000,21 +34013,24 @@ app.post('/api/automation/webhook/whatsapp', async (req, res) => {
                 try {
                   const incomingPhoneNumberId = value?.metadata?.phone_number_id;
                   let settingsSnapshot;
+                  let matchedByPhoneId = false;
 
                   if (incomingPhoneNumberId) {
-                    // Match by specific phone number ID
+                    // Match by specific phone number ID (works for both restaurant-owned and dineopen numbers)
                     settingsSnapshot = await db.collection(collections.automationSettings)
                       .where('type', '==', 'whatsapp')
                       .where('connected', '==', true)
                       .where('phoneNumberId', '==', incomingPhoneNumberId)
                       .get();
+                    if (!settingsSnapshot.empty) matchedByPhoneId = true;
                   }
 
-                  // Fallback: get all connected restaurants (for dineopen mode)
-                  if (!settingsSnapshot || settingsSnapshot.empty) {
+                  // Fallback: only for DineOpen shared number — get dineopen-mode restaurants
+                  if (!matchedByPhoneId) {
                     settingsSnapshot = await db.collection(collections.automationSettings)
                       .where('type', '==', 'whatsapp')
                       .where('connected', '==', true)
+                      .where('mode', '==', 'dineopen')
                       .get();
                   }
 
@@ -34758,16 +34774,10 @@ app.post('/api/automation/:restaurantId/whatsapp/connect', authenticateToken, as
 
       // Verify credentials by making a test API call
       try {
-        await whatsappService.initialize(restaurantId, {
-          accessToken,
-          phoneNumberId,
-          businessAccountId
-        });
-
         // Test connection by getting phone number info
         const axios = require('axios');
         const testResponse = await axios.get(
-          `https://graph.facebook.com/v18.0/${phoneNumberId}`,
+          `https://graph.facebook.com/v22.0/${phoneNumberId}`,
           {
             headers: {
               'Authorization': `Bearer ${accessToken}`
@@ -34873,6 +34883,138 @@ app.post('/api/automation/:restaurantId/whatsapp/connect', authenticateToken, as
   }
 });
 
+// WhatsApp Embedded Signup — exchange authorization code for access token
+app.post('/api/automation/:restaurantId/whatsapp/embedded-signup', authenticateToken, async (req, res) => {
+  try {
+    if (!(await checkFeaturePermission(req, 'admin', 'read'))) {
+      return res.status(403).json({ error: 'Access denied.' });
+    }
+    const { restaurantId } = req.params;
+    const { code, phone_number_id, waba_id } = req.body;
+
+    if (!code) {
+      return res.status(400).json({ error: 'Authorization code is required' });
+    }
+    if (!phone_number_id || !waba_id) {
+      return res.status(400).json({ error: 'Phone Number ID and WABA ID are required. Please complete the full signup flow.' });
+    }
+
+    const appId = process.env.FACEBOOK_APP_ID;
+    const appSecret = process.env.FACEBOOK_APP_SECRET;
+    if (!appId || !appSecret) {
+      return res.status(500).json({ error: 'Facebook App credentials not configured on server' });
+    }
+
+    const axios = require('axios');
+    const graphApiVersion = 'v22.0';
+
+    // Step 1: Exchange authorization code for access token
+    let accessToken;
+    try {
+      const tokenRes = await axios.get(
+        `https://graph.facebook.com/${graphApiVersion}/oauth/access_token`,
+        {
+          params: {
+            client_id: appId,
+            client_secret: appSecret,
+            code: code
+          }
+        }
+      );
+      accessToken = tokenRes.data.access_token;
+      if (!accessToken) {
+        throw new Error('No access token in response');
+      }
+    } catch (err) {
+      console.error('Token exchange error:', err.response?.data || err.message);
+      return res.status(400).json({
+        error: 'Failed to exchange authorization code. It may have expired — please try again.',
+        details: err.response?.data?.error?.message || err.message
+      });
+    }
+
+    // Step 2: Subscribe app to WABA webhooks
+    try {
+      await axios.post(
+        `https://graph.facebook.com/${graphApiVersion}/${waba_id}/subscribed_apps`,
+        {},
+        { headers: { Authorization: `Bearer ${accessToken}` } }
+      );
+    } catch (err) {
+      console.error('Webhook subscription error:', err.response?.data || err.message);
+      // Non-fatal — continue, we can retry later
+    }
+
+    // Step 3: Register phone number for Cloud API messaging
+    try {
+      await axios.post(
+        `https://graph.facebook.com/${graphApiVersion}/${phone_number_id}/register`,
+        { messaging_product: 'whatsapp', pin: '654321' },
+        {
+          headers: {
+            Authorization: `Bearer ${accessToken}`,
+            'Content-Type': 'application/json'
+          }
+        }
+      );
+    } catch (err) {
+      // May already be registered — non-fatal
+      console.log('Phone registration note:', err.response?.data?.error?.message || err.message);
+    }
+
+    // Step 4: Get phone number display info
+    let phoneNumber = 'Connected';
+    try {
+      const phoneRes = await axios.get(
+        `https://graph.facebook.com/${graphApiVersion}/${phone_number_id}`,
+        {
+          headers: { Authorization: `Bearer ${accessToken}` },
+          params: { fields: 'verified_name,display_phone_number' }
+        }
+      );
+      phoneNumber = phoneRes.data.display_phone_number || phoneNumber;
+    } catch (err) {
+      console.log('Phone info fetch note:', err.message);
+    }
+
+    // Step 5: Save to Firestore
+    const settingsData = {
+      restaurantId,
+      type: 'whatsapp',
+      mode: 'restaurant',
+      connected: true,
+      accessToken,
+      phoneNumberId: phone_number_id,
+      businessAccountId: waba_id,
+      phoneNumber,
+      onboardingMethod: 'embedded_signup',
+      createdAt: new Date(),
+      updatedAt: new Date()
+    };
+
+    const existingSnapshot = await db.collection(collections.automationSettings)
+      .where('restaurantId', '==', restaurantId)
+      .where('type', '==', 'whatsapp')
+      .limit(1)
+      .get();
+
+    if (!existingSnapshot.empty) {
+      await existingSnapshot.docs[0].ref.update(settingsData);
+    } else {
+      await db.collection(collections.automationSettings).add(settingsData);
+    }
+
+    res.json({
+      success: true,
+      message: 'WhatsApp connected successfully via Embedded Signup',
+      phoneNumber
+    });
+  } catch (error) {
+    console.error('Embedded Signup error:', error);
+    res.status(500).json({ error: 'Failed to complete WhatsApp setup' });
+  }
+});
+
 // Send test WhatsApp message
 app.post('/api/automation/:restaurantId/whatsapp/test', authenticateToken, async (req, res) => {
   try {
@@ -34921,9 +35063,6 @@ app.post('/api/automation/:restaurantId/whatsapp/test', authenticateToken, async
       return res.status(400).json({ error: 'WhatsApp access token not configured' });
     }
 
-    // Initialize WhatsApp service
-    await whatsappService.initialize(restaurantId, credentials);
-
     // Send message
     let sendResult;
     if (templateName) {
@@ -34933,11 +35072,12 @@ app.post('/api/automation/:restaurantId/whatsapp/test', authenticateToken, async
         phoneNumber,
         templateName,
         templateLanguage || 'en_US',
-        params
+        params,
+        credentials
       );
     } else if (message) {
       // Send as text message (only within 24h window)
-      sendResult = await whatsappService.sendTextMessage(phoneNumber, message);
+      sendResult = await whatsappService.sendTextMessage(phoneNumber, message, credentials);
     } else {
       return res.status(400).json({ error: 'Message or template name is required' });
     }
@@ -35046,8 +35186,6 @@ app.post('/api/automation/:restaurantId/whatsapp/send-bill', authenticateToken, 
       return res.status(400).json({ error: 'WhatsApp access token not configured' });
     }
 
-    await whatsappService.initialize(restaurantId, credentials);
-
     // Look up order shareToken for bill link
     const baseUrl = process.env.FRONTEND_URL || 'https://www.dineopen.com';
     let billUrl = baseUrl;
@@ -35081,7 +35219,8 @@ app.post('/api/automation/:restaurantId/whatsapp/send-bill', authenticateToken, 
       customerPhone,
       'bill_notification',
       'en',
-      templateParams
+      templateParams,
+      credentials
     );
 
     // Fallback text for logging
@@ -35221,8 +35360,7 @@ app.post('/api/automation/:restaurantId/whatsapp/reply', authenticateToken, asyn
       return res.status(400).json({ error: 'WhatsApp access token not configured' });
     }
 
-    await whatsappService.initialize(restaurantId, credentials);
-    const sendResult = await whatsappService.sendTextMessage(phone, message);
+    const sendResult = await whatsappService.sendTextMessage(phone, message, credentials);
 
     if (sendResult.success) {
       await db.collection(collections.automationLogs).add({

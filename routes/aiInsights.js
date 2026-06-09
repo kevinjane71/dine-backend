@@ -3,7 +3,7 @@ const router = express.Router();
 const { db, collections } = require('../firebase');
 const { authenticateToken, requireOwnerRole } = require('../middleware/auth');
 const emailService = require('../emailService');
-const { parseTZ, todayInTZ, dateStrInTZ, dateBoundsInTZ } = require('../utils/timezone');
+const { parseTZ, parseDayStart, todayInTZ, dateStrInTZ, dateBoundsInTZ } = require('../utils/timezone');
 
 // ============================================
 // AI INSIGHTS & DAILY REPORTS
@@ -397,7 +397,7 @@ router.get('/insights', authenticateToken, requireOwnerRole, async (req, res) =>
     let dateStart;
     switch (period) {
       case 'today':
-        dateStart = tzOffset !== undefined ? todayInTZ(tzOffset).start : (() => { const d = new Date(now); d.setHours(0, 0, 0, 0); return d; })();
+        dateStart = tzOffset !== undefined ? todayInTZ(tzOffset, parseDayStart(req)).start : (() => { const d = new Date(now); d.setHours(0, 0, 0, 0); return d; })();
         break;
       case '7d':
         dateStart = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);

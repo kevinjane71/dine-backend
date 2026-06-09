@@ -97,12 +97,10 @@ async function sendOTPWhatsApp(restaurantId, phone, code) {
     if (!restDoc.exists) throw new Error('Restaurant not found');
     const restData = restDoc.data();
 
-    if (restData.whatsappCredentials) {
-      await whatsapp.initialize(restaurantId, restData.whatsappCredentials);
-    }
+    const waCreds = restData.whatsappCredentials || null;
 
     const message = `DineOpen Discount Approval\n\nYour OTP is: ${code}\n\nThis code expires in 5 minutes. Share it with your staff to authorize the discount.`;
-    return await whatsapp.sendTextMessage(phone, message);
+    return await whatsapp.sendTextMessage(phone, message, waCreds);
   } catch (error) {
     console.error('Failed to send OTP via WhatsApp:', error.message);
     return { success: false, error: error.message };

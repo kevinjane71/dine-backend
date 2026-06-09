@@ -110,19 +110,19 @@ router.post('/webhook', async (req, res) => {
       interactiveId
     );
 
-    // Initialize WhatsApp service with restaurant credentials
-    await whatsappService.initialize(restaurantId, {
+    // Build credentials for per-call usage (concurrency-safe)
+    const waCreds = {
       accessToken: config.accessToken,
       phoneNumberId: config.phoneNumberId,
       businessAccountId: config.businessAccountId
-    });
+    };
 
     // Send response messages
     for (const msg of result.messages) {
       try {
         switch (msg.type) {
           case 'text':
-            await whatsappService.sendTextMessage(customerPhone, msg.text);
+            await whatsappService.sendTextMessage(customerPhone, msg.text, waCreds);
             break;
           case 'list':
             await whatsappService.sendListMessage(customerPhone, {
@@ -131,13 +131,13 @@ router.post('/webhook', async (req, res) => {
               footerText: msg.footerText,
               buttonText: msg.buttonText,
               sections: msg.sections
-            });
+            }, waCreds);
             break;
           case 'interactive_button':
-            await whatsappService.sendInteractiveMessage(customerPhone, msg.text, msg.buttons);
+            await whatsappService.sendInteractiveMessage(customerPhone, msg.text, msg.buttons, waCreds);
             break;
           case 'template':
-            await whatsappService.sendTemplateMessage(customerPhone, msg.templateName, msg.language, msg.params);
+            await whatsappService.sendTemplateMessage(customerPhone, msg.templateName, msg.language, msg.params, waCreds);
             break;
         }
       } catch (sendError) {
@@ -393,15 +393,16 @@ router.post('/test-message/:restaurantId', authenticateToken, async (req, res) =
       return res.status(400).json({ success: false, error: 'Missing WhatsApp credentials' });
     }
 
-    await whatsappService.initialize(restaurantId, {
+    const testCreds = {
       accessToken: config.accessToken,
       phoneNumberId: config.phoneNumberId,
       businessAccountId: config.businessAccountId
-    });
+    };
 
     const result = await whatsappService.sendTextMessage(
       phoneNumber,
-      `✅ DineOpen WhatsApp Ordering is set up correctly for *${config.restaurantName}*!\n\nCustomers can now message this number to place orders.`
+      `✅ DineOpen WhatsApp Ordering is set up correctly for *${config.restaurantName}*!\n\nCustomers can now message this number to place orders.`,
+      testCreds
     );
 
     res.json({ success: result.success, messageId: result.messageId, error: result.error });

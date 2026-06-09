@@ -5,9 +5,11 @@
 
 const axios = require('axios');
 
+const BASE_URL = 'https://graph.facebook.com/v22.0';
+
 class WhatsAppService {
   constructor() {
-    this.baseURL = 'https://graph.facebook.com/v22.0';
+    this.baseURL = BASE_URL;
     this.accessToken = null;
     this.phoneNumberId = process.env.DINEOPEN_WHATSAPP_PHONE_NUMBER_ID || null;
     this.businessAccountId = null;
@@ -15,6 +17,7 @@ class WhatsAppService {
 
   /**
    * Initialize WhatsApp service with restaurant credentials
+   * @deprecated Use per-call credentials parameter instead for concurrency safety
    */
   async initialize(restaurantId, credentials) {
     this.accessToken = credentials.accessToken;
@@ -24,15 +27,31 @@ class WhatsAppService {
   }
 
   /**
-   * Send text message
+   * Resolve credentials: use per-call credentials if provided, else fall back to this.*
    */
-  async sendTextMessage(to, message) {
+  _creds(credentials) {
+    if (credentials) {
+      return {
+        accessToken: credentials.accessToken,
+        phoneNumberId: credentials.phoneNumberId || process.env.DINEOPEN_WHATSAPP_PHONE_NUMBER_ID,
+      };
+    }
+    return { accessToken: this.accessToken, phoneNumberId: this.phoneNumberId };
+  }
+
+  /**
+   * Send text message
+   * @param {string} to - Phone number
+   * @param {string} message - Text body
+   * @param {object} [credentials] - { accessToken, phoneNumberId } for concurrency-safe calls
+   */
+  async sendTextMessage(to, message, credentials) {
     try {
-      // Format phone number: remove +, spaces, and dashes
+      const { accessToken, phoneNumberId } = this._creds(credentials);
       const formattedPhone = to.replace(/[\s\+\-\(\)]/g, '');
-      
+
       const response = await axios.post(
-        `${this.baseURL}/${this.phoneNumberId}/messages`,
+        `${BASE_URL}/${phoneNumberId}/messages`,
         {
           messaging_product: 'whatsapp',
           recipient_type: 'individual',
@@ -45,7 +64,7 @@ class WhatsAppService {
         },
         {
           headers: {
-            'Authorization': `Bearer ${this.accessToken}`,
+            'Authorization': `Bearer ${accessToken}`,
             'Content-Type': 'application/json'
           }
         }
@@ -67,14 +86,15 @@ class WhatsAppService {
 
   /**
    * Send template message (pre-approved by Meta)
+   * @param {object} [credentials] - { accessToken, phoneNumberId } for concurrency-safe calls
    */
-  async sendTemplateMessage(to, templateName, languageCode = 'en', parameters = []) {
+  async sendTemplateMessage(to, templateName, languageCode = 'en', parameters = [], credentials) {
     try {
-      // Format phone number: remove +, spaces, and dashes
+      const { accessToken, phoneNumberId } = this._creds(credentials);
       const formattedPhone = to.replace(/[\s\+\-\(\)]/g, '');
-      
+
       const response = await axios.post(
-        `${this.baseURL}/${this.phoneNumberId}/messages`,
+        `${BASE_URL}/${phoneNumberId}/messages`,
         {
           messaging_product: 'whatsapp',
           recipient_type: 'individual',
@@ -96,7 +116,7 @@ class WhatsAppService {
         },
         {
           headers: {
-            'Authorization': `Bearer ${this.accessToken}`,
+            'Authorization': `Bearer ${accessToken}`,
             'Content-Type': 'application/json'
           }
         }
@@ -109,23 +129,21 @@ class WhatsAppService {
       };
     } catch (error) {
       console.error('WhatsApp template error:', error.response?.data || error.message);
-      return {
-        success: false,
-        error: error.response?.data || error.message
-      };
+      throw error; // Re-throw so callers can catch and fall back to text
     }
   }
 
   /**
    * Send interactive message with buttons
+   * @param {object} [credentials] - { accessToken, phoneNumberId } for concurrency-safe calls
    */
-  async sendInteractiveMessage(to, message, buttons) {
+  async sendInteractiveMessage(to, message, buttons, credentials) {
     try {
-      // Format phone number: remove +, spaces, and dashes
+      const { accessToken, phoneNumberId } = this._creds(credentials);
       const formattedPhone = to.replace(/[\s\+\-\(\)]/g, '');
-      
+
       const response = await axios.post(
-        `${this.baseURL}/${this.phoneNumberId}/messages`,
+        `${BASE_URL}/${phoneNumberId}/messages`,
         {
           messaging_product: 'whatsapp',
           recipient_type: 'individual',
@@ -149,7 +167,7 @@ class WhatsAppService {
         },
         {
           headers: {
-            'Authorization': `Bearer ${this.accessToken}`,
+            'Authorization': `Bearer ${accessToken}`,
             'Content-Type': 'application/json'
           }
         }
@@ -178,14 +196,14 @@ class WhatsAppService {
       .createHmac('sha256', secret)
       .update(JSON.stringify(payload))
       .digest('hex');
-    
+
     return hash === signature;
   }
 
   /**
    * Handle incoming webhook message
    */
-  async handleIncomingMessage(webhookData) {
+  handleIncomingMessage(webhookData) {
     try {
       const entry = webhookData.entry?.[0];
       const changes = entry?.changes?.[0];
@@ -215,13 +233,15 @@ class WhatsAppService {
 
   /**
    * Send interactive list message (for menus with many items)
+   * @param {object} [credentials] - { accessToken, phoneNumberId } for concurrency-safe calls
    */
-  async sendListMessage(to, { headerText, bodyText, footerText, buttonText, sections }) {
+  async sendListMessage(to, { headerText, bodyText, footerText, buttonText, sections }, credentials) {
     try {
+      const { accessToken, phoneNumberId } = this._creds(credentials);
       const formattedPhone = to.replace(/[\s\+\-\(\)]/g, '');
 
       const response = await axios.post(
-        `${this.baseURL}/${this.phoneNumberId}/messages`,
+        `${BASE_URL}/${phoneNumberId}/messages`,
         {
           messaging_product: 'whatsapp',
           recipient_type: 'individual',
@@ -240,7 +260,7 @@ class WhatsAppService {
         },
         {
           headers: {
-            'Authorization': `Bearer ${this.accessToken}`,
+            'Authorization': `Bearer ${accessToken}`,
             'Content-Type': 'application/json'
           }
         }
@@ -281,4 +301,3 @@ class WhatsAppService {
 }
 
 module.exports = new WhatsAppService();
-

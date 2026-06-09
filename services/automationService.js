@@ -140,13 +140,10 @@ class AutomationService {
         return result;
       }
 
-      // Initialize WhatsApp service
-      await whatsappService.initialize(automation.restaurantId, credentials);
-
       // Prepare message with personalization
       const message = this.personalizeMessage(automation.template.message, customer, triggerData);
 
-      // Send message
+      // Send message (pass credentials per-call for concurrency safety)
       let sendResult;
       if (automation.template.type === 'template') {
         // Use template message
@@ -154,11 +151,12 @@ class AutomationService {
           customer.phone,
           automation.template.name,
           automation.template.language || 'en',
-          this.getTemplateParameters(automation.template.message, customer, triggerData)
+          this.getTemplateParameters(automation.template.message, customer, triggerData),
+          credentials
         );
       } else {
         // Use text message
-        sendResult = await whatsappService.sendTextMessage(customer.phone, message);
+        sendResult = await whatsappService.sendTextMessage(customer.phone, message, credentials);
       }
 
       if (sendResult.success) {
@@ -434,9 +432,6 @@ class AutomationService {
         return { success: false, error: 'WhatsApp credentials not configured' };
       }
 
-      // Initialize WhatsApp service
-      await whatsappService.initialize(restaurantId, credentials);
-
       // Reuse restaurant doc fetched earlier
       const restaurantName = restDoc.exists ? (restDoc.data().name || 'Restaurant') : 'Restaurant';
 
@@ -477,7 +472,7 @@ class AutomationService {
       
       // For now, send as text message since template requires pre-approval
       // You can switch to template by uncommenting the template code below
-      sendResult = await whatsappService.sendTextMessage(phone, welcomeMessage);
+      sendResult = await whatsappService.sendTextMessage(phone, welcomeMessage, credentials);
 
       // Alternative: Use template message (requires template to be approved by Meta)
       // const templateParams = [

@@ -3,7 +3,7 @@ const router = express.Router();
 const { db, collections } = require('../firebase');
 const { getCachedRestDoc } = require('../utils/kvCache');
 const { authenticateToken, requireOwnerRole } = require('../middleware/auth');
-const { parseTZ, buildDateRange, dateStrInTZ, dateBoundsInTZ } = require('../utils/timezone');
+const { parseTZ, parseDayStart, buildDateRange, dateStrInTZ, dateBoundsInTZ } = require('../utils/timezone');
 
 // ============================================
 // OWNER CHAIN DASHBOARD APIs
@@ -71,7 +71,7 @@ router.get('/dashboard', authenticateToken, requireOwnerRole, async (req, res) =
     // Get date range based on period parameter (timezone-aware via client tz offset)
     const { period = 'today', startDate, endDate } = req.query;
     const tzOffset = parseTZ(req);
-    const { start: dateStart, end: dateEnd } = buildDateRange(period, startDate, endDate, tzOffset);
+    const { start: dateStart, end: dateEnd } = buildDateRange(period, startDate, endDate, tzOffset, parseDayStart(req));
 
     console.log(`📊 Dashboard date range: ${dateStart.toISOString()} to ${dateEnd.toISOString()}`);
 
@@ -282,7 +282,7 @@ router.get('/analytics', authenticateToken, requireOwnerRole, async (req, res) =
     }
 
     // Calculate date range (timezone-aware)
-    const { start: dateStart, end: dateEnd } = buildDateRange(period, startDate, endDate, tzOffset);
+    const { start: dateStart, end: dateEnd } = buildDateRange(period, startDate, endDate, tzOffset, parseDayStart(req));
 
     // Calculate previous period for comparison (same duration before current period)
     const periodMs = dateEnd.getTime() - dateStart.getTime();
