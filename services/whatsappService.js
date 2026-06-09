@@ -216,14 +216,80 @@ class WhatsAppService {
       const message = value.messages[0];
       const contact = value.contacts?.[0];
 
+      // Extract text and media info based on message type
+      let text = '';
+      let mediaId = null;
+      let mimeType = null;
+      let filename = null;
+      let caption = null;
+      let latitude = null;
+      let longitude = null;
+      let locationName = null;
+
+      switch (message.type) {
+        case 'text':
+          text = message.text?.body || '';
+          break;
+        case 'image':
+          mediaId = message.image?.id;
+          mimeType = message.image?.mime_type;
+          caption = message.image?.caption || '';
+          text = caption || '[Image]';
+          break;
+        case 'video':
+          mediaId = message.video?.id;
+          mimeType = message.video?.mime_type;
+          caption = message.video?.caption || '';
+          text = caption || '[Video]';
+          break;
+        case 'audio':
+          mediaId = message.audio?.id;
+          mimeType = message.audio?.mime_type;
+          text = '[Audio message]';
+          break;
+        case 'document':
+          mediaId = message.document?.id;
+          mimeType = message.document?.mime_type;
+          filename = message.document?.filename || 'document';
+          caption = message.document?.caption || '';
+          text = caption || `[Document: ${filename}]`;
+          break;
+        case 'sticker':
+          mediaId = message.sticker?.id;
+          mimeType = message.sticker?.mime_type;
+          text = '[Sticker]';
+          break;
+        case 'location':
+          latitude = message.location?.latitude;
+          longitude = message.location?.longitude;
+          locationName = message.location?.name || message.location?.address || '';
+          text = locationName || `[Location: ${latitude}, ${longitude}]`;
+          break;
+        case 'contacts':
+          text = '[Contact shared]';
+          break;
+        case 'reaction':
+          text = message.reaction?.emoji || '[Reaction]';
+          break;
+        default:
+          text = message.text?.body || '';
+      }
+
       return {
         from: message.from,
         messageId: message.id,
         timestamp: message.timestamp,
         type: message.type,
-        text: message.text?.body || '',
+        text,
         contactName: contact?.profile?.name || '',
-        contactPhone: message.from
+        contactPhone: message.from,
+        mediaId,
+        mimeType,
+        filename,
+        caption,
+        latitude,
+        longitude,
+        locationName
       };
     } catch (error) {
       console.error('Error handling incoming message:', error);

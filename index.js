@@ -34037,7 +34037,7 @@ app.post('/api/automation/webhook/whatsapp', async (req, res) => {
                   for (const settingDoc of settingsSnapshot.docs) {
                     const setting = settingDoc.data();
 
-                    await db.collection(collections.automationLogs).add({
+                    const logEntry = {
                       restaurantId: setting.restaurantId,
                       type: 'incoming',
                       direction: 'incoming',
@@ -34048,7 +34048,18 @@ app.post('/api/automation/webhook/whatsapp', async (req, res) => {
                       messageId: processedMessage.messageId,
                       timestamp: new Date(),
                       status: 'received'
-                    });
+                    };
+                    // Store media fields if present
+                    if (processedMessage.mediaId) logEntry.mediaId = processedMessage.mediaId;
+                    if (processedMessage.mimeType) logEntry.mimeType = processedMessage.mimeType;
+                    if (processedMessage.filename) logEntry.filename = processedMessage.filename;
+                    if (processedMessage.caption) logEntry.caption = processedMessage.caption;
+                    if (processedMessage.latitude != null) {
+                      logEntry.latitude = processedMessage.latitude;
+                      logEntry.longitude = processedMessage.longitude;
+                      logEntry.locationName = processedMessage.locationName || '';
+                    }
+                    await db.collection(collections.automationLogs).add(logEntry);
                   }
                 } catch (error) {
                   console.error('Error logging incoming message:', error);
@@ -35285,6 +35296,7 @@ app.get('/api/automation/:restaurantId/whatsapp/messages', authenticateToken, as
     }));
 
     // Group by phone number for conversation view
+    const now = new Date();
     const conversations = {};
     for (const msg of messages) {
       const phoneKey = msg.phone || 'unknown';
@@ -35292,15 +35304,33 @@ app.get('/api/automation/:restaurantId/whatsapp/messages', authenticateToken, as
         conversations[phoneKey] = {
           phone: phoneKey,
           customerName: msg.customerName || msg.contactName || '',
-          messages: [],
           lastMessage: msg.message || '',
           lastTimestamp: msg.timestamp,
-          unreadCount: 0
+          unreadCount: 0,
+          lastCustomerMessageAt: null,
+          sessionActive: false
         };
       }
-      conversations[phoneKey].messages.push(msg);
+      // Track last incoming message for 24h window
+      if (msg.direction === 'incoming' || msg.type === 'incoming') {
+        const msgTime = msg.timestamp instanceof Date ? msg.timestamp : new Date(msg.timestamp);
+        if (!conversations[phoneKey].lastCustomerMessageAt || msgTime > conversations[phoneKey].lastCustomerMessageAt) {
+          conversations[phoneKey].lastCustomerMessageAt = msgTime;
+        }
+      }
       if (msg.type === 'incoming' && msg.status !== 'read_by_staff') {
         conversations[phoneKey].unreadCount++;
+      }
+      // Use first customer name we find
+      if (!conversations[phoneKey].customerName && (msg.customerName || msg.contactName)) {
+        conversations[phoneKey].customerName = msg.customerName || msg.contactName;
+      }
+    }
+
+    // Compute sessionActive for each conversation (24h window)
+    for (const convo of Object.values(conversations)) {
+      if (convo.lastCustomerMessageAt) {
+        convo.sessionActive = (now - convo.lastCustomerMessageAt) < 24 * 60 * 60 * 1000;
       }
     }
 
@@ -35371,6 +35401,8 @@ app.post('/api/automation/:restaurantId/whatsapp/reply', authenticateToken, asyn
         messageId: sendResult.messageId,
         direction: 'outgoing',
         status: 'sent',
+        sentBy: req.user?.userId || req.user?.uid || null,
+        sentByName: req.user?.name || req.user?.displayName || req.user?.email || 'Staff',
         timestamp: new Date()
       });
 
@@ -35381,6 +35413,68 @@ app.post('/api/automation/:restaurantId/whatsapp/reply', authenticateToken, asyn
   } catch (error) {
     console.error('WhatsApp reply error:', error);
     res.status(500).json({ error: 'Failed to send reply' });
+  }
+});
+
+// Proxy media download from WhatsApp (avoids exposing access token to frontend)
+// Accepts auth via Authorization header OR ?token= query param (needed for img src tags)
+app.get('/api/automation/:restaurantId/whatsapp/media/:mediaId', (req, res, next) => {
+  if (!req.headers['authorization'] && req.query.token) {
+    req.headers['authorization'] = `Bearer ${req.query.token}`;
+  }
+  authenticateToken(req, res, next);
+}, async (req, res) => {
+  try {
+    const { restaurantId, mediaId } = req.params;
+
+    // Get WhatsApp settings for access token
+    const snapshot = await db.collection(collections.automationSettings)
+      .where('restaurantId', '==', restaurantId)
+      .where('type', '==', 'whatsapp')
+      .limit(1)
+      .get();
+
+    if (snapshot.empty || !snapshot.docs[0].data().connected) {
+      return res.status(400).json({ error: 'WhatsApp not connected' });
+    }
+
+    const settings = snapshot.docs[0].data();
+    const accessToken = settings.mode === 'dineopen'
+      ? process.env.DINEOPEN_WHATSAPP_ACCESS_TOKEN
+      : settings.accessToken;
+
+    if (!accessToken) {
+      return res.status(400).json({ error: 'Access token not configured' });
+    }
+
+    const axios = require('axios');
+
+    // Step 1: Get media URL from Meta
+    const mediaInfo = await axios.get(`https://graph.facebook.com/v22.0/${mediaId}`, {
+      headers: { Authorization: `Bearer ${accessToken}` }
+    });
+
+    const mediaUrl = mediaInfo.data.url;
+    if (!mediaUrl) {
+      return res.status(404).json({ error: 'Media not found' });
+    }
+
+    // Step 2: Download and proxy the media
+    const mediaResponse = await axios.get(mediaUrl, {
+      headers: { Authorization: `Bearer ${accessToken}` },
+      responseType: 'stream'
+    });
+
+    // Forward content-type and stream the data
+    res.setHeader('Content-Type', mediaResponse.headers['content-type'] || 'application/octet-stream');
+    if (mediaResponse.headers['content-length']) {
+      res.setHeader('Content-Length', mediaResponse.headers['content-length']);
+    }
+    res.setHeader('Cache-Control', 'private, max-age=3600');
+    mediaResponse.data.pipe(res);
+  } catch (error) {
+    console.error('Media proxy error:', error.response?.data || error.message);
+    res.status(500).json({ error: 'Failed to fetch media' });
   }
 });
 
