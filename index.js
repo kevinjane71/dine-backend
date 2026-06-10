@@ -7497,6 +7497,7 @@ app.post('/api/menus/:restaurantId', authenticateToken, async (req, res) => {
       // Weighing scale: sold-by-weight items (price per weight unit)
       soldByWeight: req.body.soldByWeight || false,
       priceUnit: req.body.priceUnit || 'per_kg', // 'per_kg' | 'per_100g' | 'per_lb'
+      pluCode: req.body.pluCode || null, // 4-digit PLU code for label-printing scale barcode lookup
       // Discount applicability (default true — item participates in discount distribution)
       discountApplicable: req.body.discountApplicable !== undefined ? req.body.discountApplicable : true,
       createdAt: new Date(),
@@ -7619,7 +7620,7 @@ app.patch('/api/menus/item/:id', authenticateToken, async (req, res) => {
       'spiritCategory', 'ingredients', 'abv', 'servingUnit', 'bottleSize',
       'unit', 'weight', 'shelfLife', 'mfgDate', 'expiryDate',
       'servingSize', 'scoopOptions', 'pricingRules', 'taxGroupId',
-      'discountApplicable', 'taxInclusive', 'soldByWeight', 'priceUnit'
+      'discountApplicable', 'taxInclusive', 'soldByWeight', 'priceUnit', 'pluCode'
     ];
     
     allowedFields.forEach(field => {
