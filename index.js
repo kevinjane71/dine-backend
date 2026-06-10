@@ -10186,22 +10186,7 @@ app.post('/api/orders', async (req, res) => {
       }
     }
 
-    // Award loyalty points when order is created as 'completed' (direct billing flow)
-    if (orderData.status === 'completed' && customerId && (loyaltyPointsEarned > 0 || loyaltyPointsRedeemed > 0)) {
-      const netPointsChange = loyaltyPointsEarned - loyaltyPointsRedeemed;
-      if (netPointsChange !== 0) {
-        try {
-          await db.collection('customers').doc(customerId).update({
-            loyaltyPoints: FieldValue.increment(netPointsChange)
-          });
-          console.log(`💎 POST: Customer ${customerId} loyalty updated: ${netPointsChange > 0 ? '+' : ''}${netPointsChange} points`);
-        } catch (loyaltyErr) {
-          console.error('Error updating customer loyalty on POST:', loyaltyErr);
-        }
-      }
-    }
-
-    // Track partial/due payment in customer credit
+    // Track partial/due payment in customer credit (fire-and-forget)
     // Use orderData.finalAmount (may have been overridden by POS billing values) instead of local finalAmount
     if (req.body.partialPayAmount != null && customerId) {
       const creditFinalAmount = orderData.finalAmount || finalAmount;
@@ -10229,269 +10214,165 @@ app.post('/api/orders', async (req, res) => {
       console.log(`👤 Customer ID: ${customerId}`);
     }
 
-    // SMART INVENTORY: Deduct stock (awaited, but non-blocking on failure)
-    try {
-      await inventoryService.deductInventoryForOrder(restaurantId, orderRef.id, orderItems);
-      await syncInventoryStockToMenuItems(restaurantId);
-      await adjustDirectMenuItemStock(restaurantId, orderItems, 'decrement');
-    } catch (invErr) {
-      console.error('⚠️ Inventory Deduction Error (order still created):', invErr);
-      // Record failure in order for later reconciliation
-      orderRef.update({ inventoryDeductionFailed: true, inventoryError: invErr.message }).catch(() => {});
-    }
+    // ===== POST-ORDER PARALLEL PROCESSING =====
+    // Run inventory, table update, automation, notifications, and stats in parallel
+    // to minimize total response time (parallel max vs sequential sum).
+    const postOrderTasks = [];
 
-    // NEW: Link order to hotel check-in if room number is provided
-    if (roomNumber && roomNumber.trim()) {
-      try {
-        console.log('🏨 Linking order to hotel room:', roomNumber);
-
-        // First check if order is already linked to a check-in or has been checked-out
-        const orderDoc = await orderRef.get();
-        const currentOrderData = orderDoc.data();
-        if (currentOrderData.linkedToHotel || currentOrderData.hotelCheckInId || currentOrderData.hotelBilledAndCheckedOut) {
-          console.log(`⚠️ Order ${orderRef.id} is already linked/billed (checkIn: ${currentOrderData.hotelCheckInId}) - skipping`);
-        } else {
-          // Find active check-in for this room
-          const checkInSnapshot = await db.collection('hotel_checkins')
-            .where('restaurantId', '==', restaurantId)
-            .where('roomNumber', '==', roomNumber.trim())
-            .where('status', '==', 'checked-in')
-            .limit(1)
-            .get();
-
-          if (!checkInSnapshot.empty) {
-            const checkInDoc = checkInSnapshot.docs[0];
-            const checkInData = checkInDoc.data();
-
-          // Add order to foodOrders array (with duplicate prevention)
-          const foodOrders = checkInData.foodOrders || [];
-
-          // Check if order is already linked to prevent duplicates
-          const existingOrder = foodOrders.find(order => order.orderId === orderRef.id);
-          if (existingOrder) {
-            console.log(`⚠️ Order ${orderRef.id} is already linked to check-in ${checkInDoc.id} - skipping duplicate`);
-          } else {
-            // Use finalAmount (with tax) instead of totalAmount for hotel billing
-            const orderFinalAmount = currentOrderData.finalAmount || (currentOrderData.totalAmount + (currentOrderData.taxAmount || 0));
-            foodOrders.push({
-              orderId: orderRef.id,
-              orderNumber: orderNumber,
-              amount: Math.round(orderFinalAmount * 100) / 100, // Use final amount with tax
-              linkedAt: new Date(),
-              status: currentOrderData.status || 'pending',
-              paymentStatus: currentOrderData.paymentStatus || 'pending',
-              createdAt: currentOrderData.createdAt || new Date(),
-              dailyOrderId: currentOrderData.dailyOrderId || null
-            });
-
-            // Update totals - use orderFinalAmount (with tax) instead of totalAmount
-            const totalFoodCharges = (checkInData.totalFoodCharges || 0) + orderFinalAmount;
-            const totalCharges = checkInData.totalRoomCharges + totalFoodCharges;
-            const balanceAmount = totalCharges - (checkInData.advancePayment || 0);
-
-            // Update check-in with linked order
-            await checkInDoc.ref.update({
-              foodOrders,
-              totalFoodCharges,
-              totalCharges,
-              balanceAmount,
-              lastUpdated: FieldValue.serverTimestamp()
-            });
-
-            // IMPORTANT: Mark order as linked to this check-in to prevent re-linking
-            await orderRef.update({
-              hotelCheckInId: checkInDoc.id,
-              linkedToHotel: true,
-              hotelLinkTimestamp: FieldValue.serverTimestamp()
-            });
-
-            console.log('✅ Order linked to hotel check-in:', checkInDoc.id);
-          }
-          } else {
-            console.log('⚠️ No active check-in found for room:', roomNumber);
-          }
+    // 1. INVENTORY: Deduct stock then sync to menu items (sequential internally)
+    // Note: syncInventoryStockToMenuItems removed — adjustDirectMenuItemStock already
+    // syncs inventory-linked items AND decrements stock-managed items in one transaction.
+    postOrderTasks.push(
+      (async () => {
+        try {
+          await inventoryService.deductInventoryForOrder(restaurantId, orderRef.id, orderItems);
+          await adjustDirectMenuItemStock(restaurantId, orderItems, 'decrement');
+        } catch (invErr) {
+          console.error('⚠️ Inventory Deduction Error (order still created):', invErr);
+          orderRef.update({ inventoryDeductionFailed: true, inventoryError: invErr.message }).catch(() => {});
         }
-      } catch (hotelLinkError) {
-        console.error('❌ Failed to link order to hotel check-in:', hotelLinkError);
-        // Don't fail the order if hotel linking fails
-      }
-    }
+      })()
+    );
 
-    // Update table status to "occupied" if table number is provided
-    // If table was already atomically claimed above, just set the currentOrderId
+    // 2. TABLE STATUS: Update to "occupied" if table number is provided
     if (tableNumber && tableNumber.trim()) {
-      try {
-        console.log('🔄 Updating table status to occupied:', tableNumber);
-
-        let tableUpdated = false;
-
-        // FAST PATH: Use stored floorId + tableId for direct update
-        if (orderData.floorId && orderData.tableId) {
-          const directRef = db.collection('restaurants').doc(restaurantId)
-            .collection('floors').doc(orderData.floorId)
-            .collection('tables').doc(orderData.tableId);
-          await directRef.update({
-            status: 'occupied',
-            currentOrderId: orderRef.id,
-            lastOrderTime: new Date(),
-            updatedAt: new Date()
-          });
-          console.log('✅ Table status updated (direct path):', tableNumber);
-          tableUpdated = true;
-        }
-
-        // FALLBACK: Find the table by name across all floors
-        if (!tableUpdated) {
-          const floorsSnapshot = await db.collection('restaurants')
-            .doc(restaurantId)
-            .collection('floors')
-            .get();
-
-          for (const floorDoc of floorsSnapshot.docs) {
-            const tablesSnapshot = await db.collection('restaurants')
-              .doc(restaurantId)
-              .collection('floors')
-              .doc(floorDoc.id)
-              .collection('tables')
-              .where('name', '==', tableNumber.trim())
-              .get();
-
-            if (!tablesSnapshot.empty) {
-              const tableDoc = tablesSnapshot.docs[0];
-              await tableDoc.ref.update({
+      postOrderTasks.push(
+        (async () => {
+          try {
+            let tableUpdated = false;
+            // FAST PATH: Use stored floorId + tableId for direct update
+            if (orderData.floorId && orderData.tableId) {
+              const directRef = db.collection('restaurants').doc(restaurantId)
+                .collection('floors').doc(orderData.floorId)
+                .collection('tables').doc(orderData.tableId);
+              await directRef.update({
                 status: 'occupied',
                 currentOrderId: orderRef.id,
                 lastOrderTime: new Date(),
                 updatedAt: new Date()
               });
-              console.log('✅ Table status updated to occupied:', tableNumber);
               tableUpdated = true;
-              break;
             }
+            // FALLBACK: Find the table by name across all floors
+            if (!tableUpdated) {
+              const floorsSnapshot = await db.collection('restaurants')
+                .doc(restaurantId).collection('floors').get();
+              for (const floorDoc of floorsSnapshot.docs) {
+                const tablesSnapshot = await db.collection('restaurants')
+                  .doc(restaurantId).collection('floors').doc(floorDoc.id)
+                  .collection('tables').where('name', '==', tableNumber.trim()).get();
+                if (!tablesSnapshot.empty) {
+                  await tablesSnapshot.docs[0].ref.update({
+                    status: 'occupied', currentOrderId: orderRef.id,
+                    lastOrderTime: new Date(), updatedAt: new Date()
+                  });
+                  tableUpdated = true;
+                  break;
+                }
+              }
+            }
+            if (!tableUpdated) console.log('⚠️ Table not found for status update:', tableNumber);
+          } catch (tableUpdateError) {
+            console.error('❌ Failed to update table status:', tableUpdateError);
+          }
+        })()
+      );
+    }
+
+    // 3. AUTOMATION: Sync customer, send WhatsApp confirmation, trigger automations
+    postOrderTasks.push(
+      (async () => {
+        try {
+          const autoCustomerId = await automationService.syncCustomerFromOrder({
+            ...orderData, id: orderRef.id, restaurantId
+          });
+          if (orderData.customerInfo?.phone || orderData.customerDisplay?.phone || orderData.customer?.phone) {
+            automationService.sendOrderConfirmationMessage(restaurantId, {
+              ...orderData, id: orderRef.id
+            }).catch(err => console.error('📱 WhatsApp order confirmation error (non-blocking):', err));
+          }
+          if (autoCustomerId && (orderData.customerInfo?.phone || orderData.customerDisplay?.phone || orderData.customer?.phone)) {
+            automationService.processTrigger(restaurantId, 'new_order', {
+              customerId: autoCustomerId, orderAmount: totalAmount,
+              orderNumber: dailyOrderId || orderNumber,
+              restaurantName: restaurantData.name || 'Restaurant'
+            }).catch(err => console.error('Automation trigger error (non-blocking):', err));
+          }
+        } catch (error) {
+          console.error('Automation sync error (non-blocking):', error);
+        }
+      })()
+    );
+
+    // 4. DAILY STATS (skip 'saved' orders — counted when placed)
+    if (orderData.status !== 'saved') {
+      postOrderTasks.push(
+        updateDailyStats(restaurantId, orderData, 'add', parseTZ(req), parseDayStart(req))
+      );
+    }
+
+    // 5. PUSHER/FIREBASE NOTIFICATIONS
+    postOrderTasks.push(
+      (async () => {
+        const pusherPromises = [];
+        pusherPromises.push(
+          pusherService.notifyOrderCreated(restaurantId, {
+            id: orderRef.id, orderNumber, dailyOrderId,
+            status: orderData.status, totalAmount, tableNumber,
+            tableId: orderData.tableId || null, floorId: orderData.floorId || null,
+            orderType
+          }).catch(err => console.error('Pusher notification error (non-blocking):', err))
+        );
+        const printSettings = restaurantData.printSettings || {};
+        if (orderData.status === 'confirmed' && printSettings.kotPrinterEnabled !== false && printSettings.usePusherForKOT === true) {
+          const stationGroups = splitOrderByPrintStation(orderItems, restaurantData.printStations, restaurantData.categories, { ...DEFAULT_PRINT_SETTINGS, ...printSettings });
+          for (const group of stationGroups) {
+            pusherPromises.push(
+              pusherService.notifyKOTPrintRequest(restaurantId, {
+                id: orderRef.id, dailyOrderId, orderNumber, tableNumber, roomNumber,
+                items: group.items, notes, specialInstructions: orderData.specialInstructions,
+                staffInfo: orderData.staffInfo, orderType,
+                createdAt: orderData.createdAt?.toISOString() || new Date().toISOString(),
+                printStationId: group.stationId, printStationName: group.stationName
+              }).catch(err => console.error('KOT print notification error (non-blocking):', err))
+            );
           }
         }
-
-        if (!tableUpdated) {
-          console.log('⚠️ Table not found for status update:', tableNumber);
+        if (orderData.status === 'completed' && printSettings.kotPrinterEnabled !== false && printSettings.usePusherForKOT === true) {
+          pusherPromises.push(
+            pusherService.notifyBillingPrintRequest(restaurantId, {
+              id: orderRef.id, dailyOrderId, orderNumber, tableNumber, roomNumber,
+              customerName: orderData.customerInfo?.name || '',
+              customerMobile: orderData.customerInfo?.phone || '',
+              items: orderItems, subtotal: subtotalForDiscount, totalAmount: preTaxTotal,
+              discountAmount, manualDiscount: manualDiscountAmount, loyaltyDiscount,
+              totalDiscountAmount, appliedOffer, appliedOffers,
+              selectedOfferName: req.body.selectedOfferName || (appliedOffer ? appliedOffer.name : null),
+              taxAmount, taxBreakdown, serviceChargeAmount: scAmt, serviceChargeRate: scRate,
+              finalAmount, paymentMethod, orderType,
+              createdAt: orderData.createdAt?.toISOString() || new Date().toISOString(),
+              completedAt: new Date(), tokenBillingEnabled: printSettings.tokenBillingEnabled || false
+            }).catch(err => console.error('Billing print notification error (non-blocking):', err))
+          );
         }
-      } catch (tableUpdateError) {
-        console.error('❌ Failed to update table status:', tableUpdateError);
-        // Don't fail the order if table status update fails
-      }
-    }
-
-    // Trigger automation: Sync customer, send WhatsApp confirmation, and trigger automations (non-blocking)
-    try {
-      const customerId = await automationService.syncCustomerFromOrder({
-        ...orderData,
-        id: orderRef.id,
-        restaurantId: restaurantId
-      });
-      
-      // Send WhatsApp order confirmation message if customer phone is available
-      if (orderData.customerInfo?.phone || orderData.customerDisplay?.phone || orderData.customer?.phone) {
-        automationService.sendOrderConfirmationMessage(restaurantId, {
-          ...orderData,
-          id: orderRef.id
-        }).catch(err => {
-          console.error('📱 WhatsApp order confirmation error (non-blocking):', err);
-        });
-      }
-      
-      // Trigger new_order automation if customer exists
-      if (customerId && (orderData.customerInfo?.phone || orderData.customerDisplay?.phone || orderData.customer?.phone)) {
-        automationService.processTrigger(restaurantId, 'new_order', {
-          customerId: customerId,
-          orderAmount: totalAmount,
-          orderNumber: dailyOrderId || orderNumber,
-          restaurantName: restaurantData.name || 'Restaurant'
-        }).catch(err => {
-          console.error('Automation trigger error (non-blocking):', err);
-        });
-      }
-    } catch (error) {
-      console.error('Automation sync error (non-blocking):', error);
-      // Don't fail order creation if automation fails
-    }
-
-    // Update daily analytics stats (fire-and-forget) — skip 'saved' orders (counted when placed)
-    if (orderData.status !== 'saved') {
-      updateDailyStats(restaurantId, orderData, 'add', parseTZ(req), parseDayStart(req));
-    }
-
-    // Run all Pusher notifications in parallel (saves 1-3s vs sequential awaits).
-    // Still awaited before res.json() to prevent Vercel runtime from aborting them.
-    const pusherPromises = [];
-    pusherPromises.push(
-      pusherService.notifyOrderCreated(restaurantId, {
-        id: orderRef.id,
-        orderNumber: orderNumber,
-        dailyOrderId: dailyOrderId,
-        status: orderData.status,
-        totalAmount: totalAmount,
-        tableNumber: tableNumber,
-        tableId: orderData.tableId || null,
-        floorId: orderData.floorId || null,
-        orderType: orderType
-      }).catch(err => console.error('Pusher notification error (non-blocking):', err))
+        await Promise.allSettled(pusherPromises);
+      })()
     );
-    const printSettings = restaurantData.printSettings || {};
-    if (orderData.status === 'confirmed' && printSettings.kotPrinterEnabled !== false && printSettings.usePusherForKOT === true) {
-      const stationGroups = splitOrderByPrintStation(orderItems, restaurantData.printStations, restaurantData.categories, { ...DEFAULT_PRINT_SETTINGS, ...printSettings });
-      for (const group of stationGroups) {
-        pusherPromises.push(
-          pusherService.notifyKOTPrintRequest(restaurantId, {
-            id: orderRef.id,
-            dailyOrderId: dailyOrderId,
-            orderNumber: orderNumber,
-            tableNumber: tableNumber,
-            roomNumber: roomNumber,
-            items: group.items,
-            notes: notes,
-            specialInstructions: orderData.specialInstructions,
-            staffInfo: orderData.staffInfo,
-            orderType: orderType,
-            createdAt: orderData.createdAt?.toISOString() || new Date().toISOString(),
-            printStationId: group.stationId,
-            printStationName: group.stationName
-          }).catch(err => console.error('KOT print Pusher notification error (non-blocking):', err))
+
+    // 6. LOYALTY POINTS (direct billing flow)
+    if (orderData.status === 'completed' && customerId && (loyaltyPointsEarned > 0 || loyaltyPointsRedeemed > 0)) {
+      const netPointsChange = loyaltyPointsEarned - loyaltyPointsRedeemed;
+      if (netPointsChange !== 0) {
+        postOrderTasks.push(
+          db.collection('customers').doc(customerId).update({
+            loyaltyPoints: FieldValue.increment(netPointsChange)
+          }).catch(err => console.error('Error updating customer loyalty on POST:', err))
         );
       }
     }
-    if (orderData.status === 'completed' && printSettings.kotPrinterEnabled !== false && printSettings.usePusherForKOT === true) {
-      pusherPromises.push(
-        pusherService.notifyBillingPrintRequest(restaurantId, {
-          id: orderRef.id,
-          dailyOrderId: dailyOrderId,
-          orderNumber: orderNumber,
-          tableNumber: tableNumber,
-          roomNumber: roomNumber,
-          customerName: orderData.customerInfo?.name || '',
-          customerMobile: orderData.customerInfo?.phone || '',
-          items: orderItems,
-          subtotal: subtotalForDiscount,
-          totalAmount: preTaxTotal,
-          discountAmount: discountAmount,
-          manualDiscount: manualDiscountAmount,
-          loyaltyDiscount: loyaltyDiscount,
-          totalDiscountAmount: totalDiscountAmount,
-          appliedOffer: appliedOffer,
-          appliedOffers: appliedOffers,
-          selectedOfferName: req.body.selectedOfferName || (appliedOffer ? appliedOffer.name : null),
-          taxAmount: taxAmount,
-          taxBreakdown: taxBreakdown,
-          serviceChargeAmount: scAmt,
-          serviceChargeRate: scRate,
-          finalAmount: finalAmount,
-          paymentMethod: paymentMethod,
-          orderType: orderType,
-          createdAt: orderData.createdAt?.toISOString() || new Date().toISOString(),
-          completedAt: new Date(),
-          tokenBillingEnabled: printSettings.tokenBillingEnabled || false
-        }).catch(err => console.error('Billing print Pusher notification error (non-blocking):', err))
-      );
-    }
-    await Promise.allSettled(pusherPromises);
+
+    // Wait for all parallel tasks (prevents Vercel from aborting)
+    await Promise.allSettled(postOrderTasks);
 
     // Generate shareToken and send WhatsApp bill_notification for direct billing (order created as completed)
     if (orderData.status === 'completed') {
