@@ -1444,6 +1444,40 @@ app.use((req, res, next) => {
   next();
 });
 
+// ── Global rate limiter via Upstash Redis (protects against FE retry loops) ──
+// Uses Redis INCR + EXPIRE for a sliding window. Each IP gets 300 requests
+// per minute. Zero Firestore reads. Falls through silently if Redis is down.
+const GLOBAL_RATE_MAX = 300;  // max requests per minute per IP
+const GLOBAL_RATE_TTL = 60;   // window in seconds
+
+app.use(async (req, res, next) => {
+  // Skip health checks
+  if (req.url === '/health' || req.url === '/api/health') return next();
+
+  try {
+    const { kvGet, kvSet } = require('./utils/kvCache');
+    const ip = req.headers['x-forwarded-for']?.split(',')[0]?.trim() ||
+               req.headers['x-real-ip'] ||
+               req.connection?.remoteAddress || 'unknown';
+    const key = `ratelimit:${ip}`;
+    const current = await kvGet(key);
+
+    if (current && parseInt(current) >= GLOBAL_RATE_MAX) {
+      console.warn(`⚠️ Rate limit exceeded: ${ip} — ${current} requests/min`);
+      res.setHeader('Retry-After', '60');
+      return res.status(429).json({ error: 'Too many requests. Please try again later.' });
+    }
+
+    // Increment counter — if new key, set with TTL; if existing, just increment
+    const count = current ? parseInt(current) + 1 : 1;
+    await kvSet(key, count, GLOBAL_RATE_TTL);
+  } catch {
+    // Redis down — fail open, don't block requests
+  }
+
+  next();
+});
+
 const authenticateToken = (req, res, next) => {
   const authHeader = req.headers['authorization'];
   const token = authHeader && authHeader.split(' ')[1];
