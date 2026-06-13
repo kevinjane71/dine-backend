@@ -1216,6 +1216,7 @@ const centralMenuRoutes = require('./routes/centralMenuRoutes');
 const warehouseRoutes = require('./routes/warehouseRoutes');
 const centralKitchenRoutes = require('./routes/centralKitchenRoutes');
 const hqReportsRoutes = require('./routes/hqReportsRoutes');
+const bulkStaffRoutes = require('./routes/bulkStaff');
 
 // Debug email service initialization
 console.log('📧 Email service loaded:', !!emailService);
@@ -14546,6 +14547,9 @@ app.use('/api/public/tools', vercelSecurityMiddleware.publicAPI, publicToolsRout
 
 // Feedback forms module
 app.use('/api/feedback', feedbackRoutes);
+
+// Bulk staff upload (CSV/image/text → batch create)
+app.use('/api/bulk-staff', bulkStaffRoutes);
 
 // Generic image upload API
 app.post('/api/upload/image', authenticateToken, upload.single('image'), async (req, res) => {
