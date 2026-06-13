@@ -11748,10 +11748,32 @@ app.get('/api/analytics/:restaurantId/daily-summary', authenticateToken, async (
             categoryMap[cat].revenue += ((item.price || 0) * (item.quantity || 1));
           });
         }
-        const pm = (order.paymentMethod || 'cash').toLowerCase();
-        if (!paymentMap[pm]) paymentMap[pm] = { transactions: 0, amount: 0 };
-        paymentMap[pm].transactions++;
-        paymentMap[pm].amount += (order.finalAmount || order.totalAmount || 0) - refundAdj;
+        // Payment method breakdown — respect paymentStatus so due amounts aren't counted as cash
+        const orderAmount = (order.finalAmount || order.totalAmount || 0) - refundAdj;
+        const ps = (order.paymentStatus || '').toLowerCase();
+        if (ps === 'due') {
+          if (!paymentMap['due']) paymentMap['due'] = { transactions: 0, amount: 0 };
+          paymentMap['due'].transactions++;
+          paymentMap['due'].amount += orderAmount;
+        } else if (ps === 'partial' && order.paidAmount != null) {
+          const paidAmt = Math.min(Number(order.paidAmount) || 0, orderAmount);
+          const dueAmt = Math.max(0, orderAmount - paidAmt);
+          const pm = (order.paymentMethod || 'cash').toLowerCase();
+          if (paidAmt > 0) {
+            if (!paymentMap[pm]) paymentMap[pm] = { transactions: 0, amount: 0 };
+            paymentMap[pm].transactions++;
+            paymentMap[pm].amount += paidAmt;
+          }
+          if (dueAmt > 0) {
+            if (!paymentMap['due']) paymentMap['due'] = { transactions: 0, amount: 0 };
+            paymentMap['due'].amount += dueAmt;
+          }
+        } else {
+          const pm = (order.paymentMethod || 'cash').toLowerCase();
+          if (!paymentMap[pm]) paymentMap[pm] = { transactions: 0, amount: 0 };
+          paymentMap[pm].transactions++;
+          paymentMap[pm].amount += orderAmount;
+        }
       });
     }
 
@@ -11828,11 +11850,32 @@ app.get('/api/analytics/:restaurantId/daily-summary', authenticateToken, async (
           });
         }
 
-        // Payment method breakdown
-        const pm = (order.paymentMethod || 'cash').toLowerCase();
-        if (!paymentMap[pm]) paymentMap[pm] = { transactions: 0, amount: 0 };
-        paymentMap[pm].transactions++;
-        paymentMap[pm].amount += (order.finalAmount || order.totalAmount || 0) - refundAdj;
+        // Payment method breakdown — respect paymentStatus so due amounts aren't counted as cash
+        const orderAmount = (order.finalAmount || order.totalAmount || 0) - refundAdj;
+        const ps = (order.paymentStatus || '').toLowerCase();
+        if (ps === 'due') {
+          if (!paymentMap['due']) paymentMap['due'] = { transactions: 0, amount: 0 };
+          paymentMap['due'].transactions++;
+          paymentMap['due'].amount += orderAmount;
+        } else if (ps === 'partial' && order.paidAmount != null) {
+          const paidAmt = Math.min(Number(order.paidAmount) || 0, orderAmount);
+          const dueAmt = Math.max(0, orderAmount - paidAmt);
+          const pm = (order.paymentMethod || 'cash').toLowerCase();
+          if (paidAmt > 0) {
+            if (!paymentMap[pm]) paymentMap[pm] = { transactions: 0, amount: 0 };
+            paymentMap[pm].transactions++;
+            paymentMap[pm].amount += paidAmt;
+          }
+          if (dueAmt > 0) {
+            if (!paymentMap['due']) paymentMap['due'] = { transactions: 0, amount: 0 };
+            paymentMap['due'].amount += dueAmt;
+          }
+        } else {
+          const pm = (order.paymentMethod || 'cash').toLowerCase();
+          if (!paymentMap[pm]) paymentMap[pm] = { transactions: 0, amount: 0 };
+          paymentMap[pm].transactions++;
+          paymentMap[pm].amount += orderAmount;
+        }
       });
 
       items = [];
@@ -27800,8 +27843,19 @@ app.get('/api/books/:restaurantId/revenue', authenticateToken, async (req, res) 
       if (o.refundAmount) refunds += o.refundAmount;
       orderCount++;
 
-      const pm = o.paymentMethod || 'cash';
-      byPaymentMethod[pm] = (byPaymentMethod[pm] || 0) + amount;
+      const ps = (o.paymentStatus || '').toLowerCase();
+      if (ps === 'due') {
+        byPaymentMethod['due'] = (byPaymentMethod['due'] || 0) + amount;
+      } else if (ps === 'partial' && o.paidAmount != null) {
+        const paidAmt = Math.min(Number(o.paidAmount) || 0, amount);
+        const dueAmt = Math.max(0, amount - paidAmt);
+        const pm = (o.paymentMethod || 'cash').toLowerCase();
+        if (paidAmt > 0) byPaymentMethod[pm] = (byPaymentMethod[pm] || 0) + paidAmt;
+        if (dueAmt > 0) byPaymentMethod['due'] = (byPaymentMethod['due'] || 0) + dueAmt;
+      } else {
+        const pm = (o.paymentMethod || 'cash').toLowerCase();
+        byPaymentMethod[pm] = (byPaymentMethod[pm] || 0) + amount;
+      }
 
       const ot = o.orderType || 'dine-in';
       byOrderType[ot] = (byOrderType[ot] || 0) + amount;
@@ -31691,7 +31745,8 @@ app.post('/api/orders/:orderId/comp-void', authenticateToken, async (req, res) =
 app.patch('/api/orders/:orderId/edit-completed', authenticateToken, async (req, res) => {
   try {
     const { orderId } = req.params;
-    const { orderType, paymentMethod, customerInfo, deliveryType, tableNumber, notes } = req.body;
+    const { orderType, paymentMethod, customerInfo, deliveryType, tableNumber, notes,
+            paymentStatus, splitPayments, cashReceived, changeReturned, paidAmount, outstandingAmount } = req.body;
     const user = req.user;
 
     // Check if user has allowEditCompletedOrders permission
@@ -31728,6 +31783,13 @@ app.patch('/api/orders/:orderId/edit-completed', authenticateToken, async (req, 
     if (paymentMethod && paymentMethod !== currentOrder.paymentMethod) {
       changes.push({ field: 'paymentMethod', from: currentOrder.paymentMethod || '', to: paymentMethod });
       updateData.paymentMethod = paymentMethod;
+      // Clean up stale fields when switching payment method
+      if (currentOrder.paymentMethod === 'split' && paymentMethod !== 'split') {
+        updateData.splitPayments = FieldValue.delete();
+      }
+      if (currentOrder.paymentMethod === 'cash' && paymentMethod !== 'cash') {
+        if (currentOrder.cashReceived) { updateData.cashReceived = 0; updateData.changeReturned = 0; }
+      }
     }
     if (deliveryType !== undefined && deliveryType !== currentOrder.deliveryType) {
       changes.push({ field: 'deliveryType', from: currentOrder.deliveryType || '', to: deliveryType });
@@ -31754,6 +31816,73 @@ app.patch('/api/orders/:orderId/edit-completed', authenticateToken, async (req, 
       }
     }
 
+    // Payment status
+    const validStatuses = ['paid', 'due', 'partial'];
+    if (paymentStatus && validStatuses.includes(paymentStatus) && paymentStatus !== currentOrder.paymentStatus) {
+      changes.push({ field: 'paymentStatus', from: currentOrder.paymentStatus || '', to: paymentStatus });
+      updateData.paymentStatus = paymentStatus;
+      const orderTotal = currentOrder.finalAmount || currentOrder.totalAmount || 0;
+      if (paymentStatus === 'paid') {
+        updateData.paidAmount = orderTotal;
+        updateData.outstandingAmount = 0;
+      } else if (paymentStatus === 'due') {
+        updateData.paidAmount = 0;
+        updateData.outstandingAmount = orderTotal;
+      }
+    }
+
+    // Split payments
+    if (splitPayments !== undefined) {
+      const currentSplit = currentOrder.splitPayments || [];
+      if (Array.isArray(splitPayments) && splitPayments.length >= 2) {
+        const validSplits = splitPayments.filter(s => s && typeof s.method === 'string' && typeof s.amount === 'number' && s.amount > 0);
+        if (validSplits.length >= 2) {
+          const changed = JSON.stringify(validSplits) !== JSON.stringify(currentSplit);
+          if (changed) {
+            changes.push({ field: 'splitPayments', from: currentSplit.map(s => `${s.method}:${s.amount}`).join(', ') || '(none)', to: validSplits.map(s => `${s.method}:${s.amount}`).join(', ') });
+            updateData.splitPayments = validSplits;
+          }
+        }
+      } else if (splitPayments === null && currentSplit.length > 0) {
+        // Clearing split payments (switched to single method)
+        changes.push({ field: 'splitPayments', from: currentSplit.map(s => `${s.method}:${s.amount}`).join(', '), to: '(none)' });
+        updateData.splitPayments = FieldValue.delete();
+      }
+    }
+
+    // Cash tendering
+    if (cashReceived !== undefined) {
+      const cr = Number(cashReceived) || 0;
+      const currentCR = currentOrder.cashReceived || 0;
+      if (cr !== currentCR) {
+        changes.push({ field: 'cashReceived', from: String(currentCR), to: String(cr) });
+        updateData.cashReceived = cr;
+        const chg = Number(changeReturned) || 0;
+        updateData.changeReturned = chg;
+        if (chg !== (currentOrder.changeReturned || 0)) {
+          changes.push({ field: 'changeReturned', from: String(currentOrder.changeReturned || 0), to: String(chg) });
+        }
+      }
+    }
+
+    // Paid amount / outstanding (for partial payments — only if paymentStatus wasn't already changed above)
+    if (paidAmount !== undefined && !updateData.hasOwnProperty('paidAmount')) {
+      const pa = Number(paidAmount) || 0;
+      const currentPA = currentOrder.paidAmount || 0;
+      if (pa !== currentPA) {
+        changes.push({ field: 'paidAmount', from: String(currentPA), to: String(pa) });
+        updateData.paidAmount = pa;
+      }
+    }
+    if (outstandingAmount !== undefined && !updateData.hasOwnProperty('outstandingAmount')) {
+      const oa = Number(outstandingAmount) || 0;
+      const currentOA = currentOrder.outstandingAmount || 0;
+      if (oa !== currentOA) {
+        changes.push({ field: 'outstandingAmount', from: String(currentOA), to: String(oa) });
+        updateData.outstandingAmount = oa;
+      }
+    }
+
     if (changes.length === 0) {
       return res.status(400).json({ error: 'No changes detected' });
     }
@@ -31774,6 +31903,26 @@ app.patch('/api/orders/:orderId/edit-completed', authenticateToken, async (req, 
     updateData.editHistory = [...existingHistory, editEntry];
 
     await orderRef.update(updateData);
+
+    // Correct dailyStats if payment status or amounts changed (affects revenue calculation)
+    if (updateData.paymentStatus || updateData.paidAmount !== undefined || updateData.outstandingAmount !== undefined) {
+      try {
+        const tz = parseTZ(req);
+        const ds = parseDayStart(req);
+        // Cancel old stats with old order data, re-add with updated payment fields
+        updateDailyStats(currentOrder.restaurantId, currentOrder, 'cancel', tz, ds);
+        const updatedOrder = {
+          ...currentOrder,
+          paymentStatus: updateData.paymentStatus || currentOrder.paymentStatus,
+          paidAmount: updateData.paidAmount !== undefined ? updateData.paidAmount : currentOrder.paidAmount,
+          outstandingAmount: updateData.outstandingAmount !== undefined ? updateData.outstandingAmount : currentOrder.outstandingAmount,
+          paymentMethod: updateData.paymentMethod || currentOrder.paymentMethod,
+        };
+        updateDailyStats(currentOrder.restaurantId, updatedOrder, 'add', tz, ds);
+      } catch (statsErr) {
+        console.error('dailyStats correction error (non-blocking):', statsErr);
+      }
+    }
 
     const updatedDoc = await orderRef.get();
     res.json({
