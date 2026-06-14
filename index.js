@@ -18907,10 +18907,8 @@ app.get('/api/admin/print-settings/:restaurantId', authenticateToken, async (req
   try {
     const { restaurantId } = req.params;
 
-    // Check granular admin tab permission
-    if (!(await checkFeaturePermission(req, 'admin', 'print'))) {
-      return res.status(403).json({ error: 'Access denied to Print settings.' });
-    }
+    // No permission check for GET — all staff need print settings for button visibility
+    // and auto-print functionality. The PUT endpoint remains admin-only.
 
     const restaurantDoc = await getCachedRestDoc(restaurantId);
     if (!restaurantDoc.exists) {
