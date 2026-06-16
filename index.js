@@ -130,12 +130,12 @@ const performanceOptimizer = require('./middleware/performanceOptimizer');
 const firestoreOptimizer = require('./utils/firestoreOptimizer');
 const { kvGet, kvSet, kvDel, getCachedRestaurant, invalidateRestaurantCache, invalidateUserCache } = require('./utils/kvCache');
 
-// Firestore profiler — always on, tracks reads/writes per collection and endpoint
+// Firestore daily counter — counts total reads/writes per day (2 Redis calls per request)
 try {
   const { enableProfiler } = require('./utils/firestoreProfiler');
   enableProfiler(db);
 } catch (err) {
-  console.error('Firestore profiler init error:', err.message);
+  console.error('Firestore counter init error:', err.message);
 }
 
 /**
@@ -1476,13 +1476,12 @@ app.use((req, res, next) => {
   next();
 });
 
-// Firestore profiler — per-endpoint tracking via AsyncLocalStorage
-// Always loaded so the admin panel toggle works even without env var
+// Firestore daily counter — flush counts at end of each request
 try {
   const { profilerMiddleware } = require('./utils/firestoreProfiler');
   app.use(profilerMiddleware);
 } catch (err) {
-  console.error('Failed to load profiler middleware:', err.message);
+  console.error('Firestore counter middleware error:', err.message);
 }
 
 // Security middleware setup

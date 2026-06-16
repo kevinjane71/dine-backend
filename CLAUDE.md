@@ -121,7 +121,70 @@ Payments: subscriptions, dodoPayments
 - AI features have token usage limits (aiUsageLimiter middleware)
 - Firestore named database "dine" (not default) — staging uses "dine-staging"
 
+## Firestore Cost Analysis (2026-06-16)
+
+**Problem:** ₹500/day for 18 restaurants, 150 orders. ~20M reads/month. ~69,000 reads per restaurant per day.
+
+### Profiler Findings (1-hour snapshot, production)
+
+**Top collections by reads:**
+| Collection | Reads | % |
+|-----------|-------|---|
+| orders | 407 | 33% |
+| inventory | 257 | 21% |
+| restaurants | 138 | 11% |
+| tables | 128 | 10% |
+| dailyStats | 77 | 6% |
+| menuItems | 62 | 5% |
+| others | ~172 | 14% |
+| **Total** | **1,241** | |
+
+**Top endpoints by reads:**
+| Endpoint | Reads | Writes |
+|----------|-------|--------|
+| GET /api/orders/:restaurantId | 242 | 0 |
+| POST /api/orders | 141 | 30 |
+| GET /api/kot/:restaurantId | 154 | 0 |
+| GET /api/floors/:restaurantId | 101 | 0 |
+| GET /api/owner/dashboard | 97 | 0 |
+
+**Writes:** 46 total in 1 hour (not a cost concern — reads dominate 97%)
+
+### Key Insights
+- `orders` collection is the #1 cost driver (33% of all reads)
+- `GET /api/orders/:restaurantId` alone = 20% of all reads (polls frequently from frontend)
+- Inventory reads are high (21%) — likely from stock checks during order placement
+- `restaurants` collection read on almost every request (auth/config lookup — mitigated by Redis cache)
+- Analytics/Books endpoints were optimized to use `dailyStats` (2026-06-16 session) — previously scanned raw orders
+
+### DailyStats Optimization Done
+- Enriched `updateDailyStats()` with: paymentMethod breakdown, categoryBreakdown, totalTax, totalDiscounts, totalRefunds, orderTypeRevenue
+- Analytics "today" path now reads 1 dailyStats doc instead of scanning raw orders
+- Daily-summary uses dailyStats for category/payment instead of raw order scan
+- Books revenue/P&L/overview endpoints use dailyStats batch reads
+- Expected daily read reduction: ~800K-1M reads/day saved
+
+### Firestore Query Coupling (migration assessment)
+- 153 unique collections, ~9,700 Firestore query calls across codebase
+- 56+ files directly use `db` — no repository/data access layer
+- 100+ uses of FieldValue.increment(), 21 transactions, 8+ batch writes
+- Migration to PostgreSQL requires Phase 0 (abstraction layer) first
+- Phase 1 (orders + dailyStats to PostgreSQL) would save 80% of cost
+
+### Profiler Status
+- **DISABLED** (2026-06-16) — was consuming too many Redis requests (28K in 30 min)
+- Code still exists in `utils/firestoreProfiler.js` and admin UI in `dine-admin` Firestore tab
+- To re-enable: uncomment profiler lines in index.js (lines ~133 and ~1480)
+
 ## Session Log
 
 ### 2026-05-28: Initial CLAUDE.md created
 - Documented full architecture, tech stack, patterns, and DB schema
+
+### 2026-06-16: Firestore cost optimization + profiler
+- Enriched dailyStats with payment/category/tax fields
+- Updated analytics, daily-summary, Books revenue/P&L/overview to use dailyStats
+- Built Firestore read/write profiler with per-endpoint tracking (AsyncLocalStorage)
+- Added Firestore tab to dine-admin dashboard
+- Profiler disabled after gathering data — Redis quota concern
+- Documented findings above for future reference

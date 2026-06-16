@@ -2288,30 +2288,18 @@ router.get('/my-users', authenticateSuperAdmin, async (req, res) => {
   }
 });
 
-// ─── Firestore Profiler ─────────────────────────────────────────────
+// ─── Firestore Daily Counter ────────────────────────────────────────
 
-// GET /api/super-admin/firestore-usage — view reads/writes per collection + endpoint
+// GET /api/super-admin/firestore-usage — daily read/write counts
 router.get('/firestore-usage', authenticateSuperAdmin, async (req, res) => {
   try {
-    const { getReport } = require('../utils/firestoreProfiler');
-    const hours = parseInt(req.query.hours) || 24;
-    const report = await getReport(Math.min(hours, 48));
-    res.json({ success: true, data: report });
+    const { getDailyCounts } = require('../utils/firestoreProfiler');
+    const days = parseInt(req.query.days) || 7;
+    const daily = await getDailyCounts(Math.min(days, 30));
+    res.json({ success: true, data: { daily } });
   } catch (error) {
     console.error('Firestore usage error:', error);
-    res.status(500).json({ success: false, error: 'Failed to fetch profiler data' });
-  }
-});
-
-// DELETE /api/super-admin/firestore-usage — clear profiler data
-router.delete('/firestore-usage', authenticateSuperAdmin, async (req, res) => {
-  try {
-    const { clearReport } = require('../utils/firestoreProfiler');
-    await clearReport();
-    res.json({ success: true, message: 'Profiler data cleared' });
-  } catch (error) {
-    console.error('Firestore profiler clear error:', error);
-    res.status(500).json({ success: false, error: 'Failed to clear profiler data' });
+    res.status(500).json({ success: false, error: 'Failed to fetch usage data' });
   }
 });
 
