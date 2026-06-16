@@ -34419,6 +34419,46 @@ app.post('/api/automation/webhook/whatsapp', async (req, res) => {
                     }
                     await db.collection(collections.automationLogs).add(logEntry);
                     console.log('📩 WhatsApp message logged for super-admin inbox (no restaurant match):', processedMessage.from);
+
+                    // Auto-create demo request on first WhatsApp message from new customer
+                    try {
+                      const custPhone = processedMessage.from;
+                      const custName = processedMessage.contactName || '';
+                      const msgText = processedMessage.text || '';
+
+                      const existingDemo = await db.collection('demoRequests')
+                        .where('phone', '==', custPhone)
+                        .where('source', '==', 'whatsapp')
+                        .limit(1)
+                        .get();
+
+                      if (existingDemo.empty) {
+                        const demoRef = db.collection('demoRequests').doc();
+                        await demoRef.set({
+                          id: demoRef.id,
+                          contactType: 'phone',
+                          phone: custPhone,
+                          email: null,
+                          restaurantName: custName || null,
+                          comment: msgText,
+                          source: 'whatsapp',
+                          status: 'pending',
+                          createdAt: new Date(),
+                          updatedAt: new Date(),
+                          ipAddress: '',
+                          userAgent: 'WhatsApp',
+                        });
+                        console.log(`📋 Demo request created for WhatsApp lead: ${custPhone}`);
+                      } else {
+                        const docId = existingDemo.docs[0].id;
+                        const updateData = { updatedAt: new Date() };
+                        if (msgText) updateData.comment = msgText;
+                        if (custName) updateData.restaurantName = custName;
+                        await db.collection('demoRequests').doc(docId).update(updateData);
+                      }
+                    } catch (demoErr) {
+                      console.error('Demo request auto-create error (non-blocking):', demoErr.message);
+                    }
                   }
                 } catch (error) {
                   console.error('Error logging incoming message:', error);

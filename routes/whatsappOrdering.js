@@ -92,6 +92,50 @@ router.post('/webhook', async (req, res) => {
       console.error('automationLogs log error (non-blocking):', logErr.message);
     }
 
+    // Auto-create demo request on first WhatsApp message from a new customer
+    try {
+      const db = getDb();
+      const customerPhone = message.from;
+      const contactName = contact?.profile?.name || '';
+      const msgText = message.text?.body || message.interactive?.list_reply?.title || message.interactive?.button_reply?.title || message.button?.text || '';
+
+      // Check if demo request already exists for this phone
+      const existingDemo = await db.collection('demoRequests')
+        .where('phone', '==', customerPhone)
+        .where('source', '==', 'whatsapp')
+        .limit(1)
+        .get();
+
+      if (existingDemo.empty) {
+        // First message — create new demo request
+        const demoRef = db.collection('demoRequests').doc();
+        await demoRef.set({
+          id: demoRef.id,
+          contactType: 'phone',
+          phone: customerPhone,
+          email: null,
+          restaurantName: contactName || null,
+          comment: msgText,
+          source: 'whatsapp',
+          status: 'pending',
+          createdAt: new Date(),
+          updatedAt: new Date(),
+          ipAddress: '',
+          userAgent: 'WhatsApp',
+        });
+        console.log(`📋 Demo request created for WhatsApp lead: ${customerPhone}`);
+      } else {
+        // Subsequent message — update last message and timestamp
+        const docId = existingDemo.docs[0].id;
+        const updateData = { updatedAt: new Date() };
+        if (msgText) updateData.comment = msgText;
+        if (contactName) updateData.restaurantName = contactName;
+        await db.collection('demoRequests').doc(docId).update(updateData);
+      }
+    } catch (demoErr) {
+      console.error('Demo request auto-create error (non-blocking):', demoErr.message);
+    }
+
     // Find which restaurant this phone number belongs to (for ordering flow)
     const match = await orderingService.findRestaurantByPhoneNumberId(phoneNumberId);
     if (!match) {

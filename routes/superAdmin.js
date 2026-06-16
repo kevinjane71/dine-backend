@@ -176,6 +176,7 @@ router.get('/demo-requests', authenticateSuperAdmin, requireSuperAdmin, async (r
         restaurantName: d.restaurantName || '',
         comment: d.comment || '',
         status: d.status || 'pending',
+        source: d.source || '',
         createdAt: toISO(d.createdAt),
         adminNote: d.adminNote || '',
       };
