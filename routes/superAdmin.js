@@ -2308,29 +2308,34 @@ router.get('/firestore-usage', authenticateSuperAdmin, async (req, res) => {
 const whatsappService = require('../services/whatsappService');
 
 // GET /api/super-admin/whatsapp/conversations — list conversations grouped by phone
-// Fetches all recent logs and filters in-memory (avoids needing Firestore composite indexes)
+// Uses indexed queries: type + timestamp composite index required
 router.get('/whatsapp/conversations', authenticateSuperAdmin, requireSuperAdmin, async (req, res) => {
   try {
-    // Fetch all recent automation logs — filter in-memory to avoid composite index requirement
-    const snapshot = await db.collection(collections.automationLogs)
-      .orderBy('timestamp', 'desc')
-      .limit(1000)
-      .get();
+    // Two indexed queries — only fetch what we need (incoming + replies)
+    // Requires composite index: automationLogs (type ASC, timestamp DESC)
+    const [incomingSnap, repliesSnap] = await Promise.all([
+      db.collection(collections.automationLogs)
+        .where('type', '==', 'incoming')
+        .orderBy('timestamp', 'desc')
+        .limit(500)
+        .get(),
+      db.collection(collections.automationLogs)
+        .where('type', '==', 'reply')
+        .orderBy('timestamp', 'desc')
+        .limit(200)
+        .get(),
+    ]);
 
-    // Only keep real conversation messages (incoming + manual replies), skip bills/alerts
-    const validTypes = new Set(['incoming', 'reply']);
     const convosMap = {};
+    const allDocs = [...incomingSnap.docs, ...repliesSnap.docs];
 
-    snapshot.docs.forEach(doc => {
+    allDocs.forEach(doc => {
       const d = doc.data();
-      const msgType = d.type || '';
-      if (!validTypes.has(msgType)) return; // Skip bills, alerts, test messages, etc.
-
       const phone = d.phone || d.customerPhone;
       if (!phone) return;
 
       const ts = toISO(d.timestamp);
-      const isIncoming = msgType === 'incoming' || d.direction === 'incoming';
+      const isIncoming = d.type === 'incoming';
 
       if (!convosMap[phone]) {
         convosMap[phone] = {
@@ -2346,7 +2351,6 @@ router.get('/whatsapp/conversations', authenticateSuperAdmin, requireSuperAdmin,
         };
       }
 
-      // Update last message if this one is newer
       if (ts && (!convosMap[phone].lastTimestamp || ts > convosMap[phone].lastTimestamp)) {
         convosMap[phone].lastMessage = d.message || '';
         convosMap[phone].lastTimestamp = ts;
@@ -2396,51 +2400,56 @@ router.get('/whatsapp/messages/:phone', authenticateSuperAdmin, requireSuperAdmi
     const phone = req.params.phone;
     const limit = Math.min(parseInt(req.query.limit) || 200, 500);
 
-    // Single query: all logs for this phone, filter in-memory (avoids composite index)
-    const snapshot = await db.collection(collections.automationLogs)
-      .where('phone', '==', phone)
-      .orderBy('timestamp', 'asc')
-      .limit(limit)
-      .get();
+    // Two indexed queries for this phone — incoming + replies
+    // Requires composite index: automationLogs (phone ASC, type ASC, timestamp ASC)
+    const [incomingSnap, repliesSnap] = await Promise.all([
+      db.collection(collections.automationLogs)
+        .where('phone', '==', phone)
+        .where('type', '==', 'incoming')
+        .orderBy('timestamp', 'asc')
+        .limit(limit)
+        .get(),
+      db.collection(collections.automationLogs)
+        .where('phone', '==', phone)
+        .where('type', '==', 'reply')
+        .orderBy('timestamp', 'asc')
+        .limit(limit)
+        .get(),
+    ]);
 
-    const validTypes = new Set(['incoming', 'reply']);
+    const allDocs = [...incomingSnap.docs, ...repliesSnap.docs];
     let lastIncomingAt = null;
     const unreadDocs = [];
 
-    const messages = snapshot.docs
-      .filter(doc => {
-        const d = doc.data();
-        return validTypes.has(d.type || '');
-      })
-      .map(doc => {
-        const d = doc.data();
-        const ts = toDate(d.timestamp);
-        const isIncoming = d.type === 'incoming' || d.direction === 'incoming';
-        if (isIncoming && ts) {
-          if (!lastIncomingAt || ts > lastIncomingAt) lastIncomingAt = ts;
-        }
-        if (isIncoming && d.status !== 'read_by_staff') {
-          unreadDocs.push(doc);
-        }
-        return {
-          id: doc.id,
-          phone: d.phone || d.customerPhone || phone,
-          contactName: d.contactName || d.customerName || '',
-          message: d.message || '',
-          messageType: d.messageType || d.incomingType || 'text',
-          direction: isIncoming ? 'incoming' : 'outgoing',
-          type: d.type || '',
-          status: d.status || '',
-          timestamp: toISO(d.timestamp),
-          messageId: d.messageId || '',
-          restaurantId: d.restaurantId || null,
-          mediaId: d.mediaId || null,
-          mimeType: d.mimeType || null,
-          filename: d.filename || null,
-          caption: d.caption || null,
-          sentByName: d.sentByName || null,
-        };
-      });
+    const messages = allDocs.map(doc => {
+      const d = doc.data();
+      const ts = toDate(d.timestamp);
+      const isIncoming = d.type === 'incoming';
+      if (isIncoming && ts) {
+        if (!lastIncomingAt || ts > lastIncomingAt) lastIncomingAt = ts;
+      }
+      if (isIncoming && d.status !== 'read_by_staff') {
+        unreadDocs.push(doc);
+      }
+      return {
+        id: doc.id,
+        phone: d.phone || d.customerPhone || phone,
+        contactName: d.contactName || d.customerName || '',
+        message: d.message || '',
+        messageType: d.messageType || d.incomingType || 'text',
+        direction: isIncoming ? 'incoming' : 'outgoing',
+        type: d.type || '',
+        status: d.status || '',
+        timestamp: toISO(d.timestamp),
+        messageId: d.messageId || '',
+        restaurantId: d.restaurantId || null,
+        mediaId: d.mediaId || null,
+        mimeType: d.mimeType || null,
+        filename: d.filename || null,
+        caption: d.caption || null,
+        sentByName: d.sentByName || null,
+      };
+    }).sort((a, b) => (a.timestamp || '').localeCompare(b.timestamp || ''));
 
     const sessionActive = lastIncomingAt ? (Date.now() - lastIncomingAt.getTime() < 24 * 60 * 60 * 1000) : false;
 
