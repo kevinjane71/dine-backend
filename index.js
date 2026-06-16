@@ -1,3 +1,4 @@
+// v1.5.0 — firestore profiler + dailyStats optimization
 const express = require('express');
 const cors = require('cors');
 const helmet = require('helmet');
