@@ -34189,7 +34189,7 @@ app.get('/api/automation/webhook/whatsapp', async (req, res) => {
       let tokenMatched = false;
 
       // First, try default token from environment
-      if (token === process.env.WHATSAPP_WEBHOOK_VERIFY_TOKEN) {
+      if (token === (process.env.WHATSAPP_WEBHOOK_VERIFY_TOKEN || 'dineopen_whatsapp_verify')) {
         tokenMatched = true;
         console.log('✅ Webhook verified with default token');
       } else {
