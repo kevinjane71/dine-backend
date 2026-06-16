@@ -145,7 +145,11 @@ async function flushToRedis() {
 }
 
 // Express middleware — wraps request in AsyncLocalStorage for endpoint tracking
+// Flushes buffers to Redis when response finishes (critical for Vercel serverless)
 function profilerMiddleware(req, res, next) {
+  res.on('finish', () => {
+    flushToRedis().catch(() => {});
+  });
   requestContext.run(req, next);
 }
 
