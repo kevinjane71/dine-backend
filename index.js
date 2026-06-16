@@ -1,4 +1,4 @@
-// v1.5.0 — firestore profiler + dailyStats optimization
+// v1.5.1 — profiler flush fix for serverless
 const express = require('express');
 const cors = require('cors');
 const helmet = require('helmet');
