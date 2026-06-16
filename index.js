@@ -129,6 +129,16 @@ const performanceOptimizer = require('./middleware/performanceOptimizer');
 const firestoreOptimizer = require('./utils/firestoreOptimizer');
 const { kvGet, kvSet, kvDel, getCachedRestaurant, invalidateRestaurantCache, invalidateUserCache } = require('./utils/kvCache');
 
+// Firestore read profiler — enable via FIRESTORE_PROFILER=true env var
+if (process.env.FIRESTORE_PROFILER === 'true') {
+  try {
+    const { enableProfiler } = require('./utils/firestoreProfiler');
+    enableProfiler(db);
+  } catch (err) {
+    console.error('Failed to enable Firestore profiler:', err.message);
+  }
+}
+
 /**
  * Cached restaurant doc read — returns a Firestore-doc-like object.
  * Uses Redis cache (3 min TTL) + automatic invalidation on writes.
@@ -245,9 +255,40 @@ function updateDailyStats(restaurantId, order, operation, tzOffset, dayStartHour
       update.totalDueAmount = FieldValue.increment(effective.dueAmount * sign);
     }
 
-    // Order type bucket
+    // Tax, discount, refund totals
+    update.totalTax = FieldValue.increment((order.taxAmount || 0) * sign);
+    update.totalDiscounts = FieldValue.increment((order.discountAmount || 0) * sign);
+    if (order.refundAmount) {
+      update.totalRefunds = FieldValue.increment(order.refundAmount * sign);
+    }
+
+    // Payment method bucket — respect paymentStatus so due amounts aren't counted as cash
+    const pm = (order.paymentMethod || 'cash').toLowerCase();
+    const ps = (order.paymentStatus || '').toLowerCase();
+    if (ps === 'due') {
+      update['paymentMethod_due.transactions'] = FieldValue.increment(sign);
+      // Use full order amount (not effective.amountWithTax which is 0 for due orders)
+      const dueFullAmount = (order.finalAmount || order.totalAmount || 0) * sign;
+      update['paymentMethod_due.amount'] = FieldValue.increment(dueFullAmount);
+    } else if (ps === 'partial' && order.paidAmount != null) {
+      const paidAmt = Number(order.paidAmount) || 0;
+      const dueAmt = Math.max(0, (order.finalAmount || order.totalAmount || 0) - paidAmt);
+      update[`paymentMethod_${pm}.transactions`] = FieldValue.increment(sign);
+      update[`paymentMethod_${pm}.amount`] = FieldValue.increment(paidAmt * sign);
+      if (dueAmt > 0) {
+        update['paymentMethod_due.amount'] = FieldValue.increment(dueAmt * sign);
+      }
+    } else {
+      update[`paymentMethod_${pm}.transactions`] = FieldValue.increment(sign);
+      update[`paymentMethod_${pm}.amount`] = FieldValue.increment(effective.amountWithTax * sign);
+    }
+
+    // Order type bucket (count + revenue)
     const orderType = (order.orderType || 'dine_in').toLowerCase().replace(/[\s-]+/g, '_');
     update[`ordersByType_${orderType}`] = FieldValue.increment(sign);
+    // Full amount including due — matches raw order scan logic (finalAmount || totalAmount)
+    const fullAmount = (order.finalAmount || order.totalAmount || 0) * sign;
+    update[`orderTypeRevenue_${orderType}`] = FieldValue.increment(fullAmount);
 
     // Busy hour bucket (timezone-aware)
     let hour;
@@ -282,6 +323,19 @@ function updateDailyStats(restaurantId, order, operation, tzOffset, dayStartHour
       for (const [key, val] of Object.entries(itemCounts)) {
         update[`itemCounts.${key}.qty`] = FieldValue.increment(val.qty);
         update[`itemCounts.${key}.revenue`] = FieldValue.increment(val.revenue);
+      }
+
+      // Category breakdown — track sales per category
+      const catCounts = {};
+      order.items.forEach(item => {
+        const cat = (item.category || 'Uncategorized').replace(/[.\/]/g, '_');
+        if (!catCounts[cat]) catCounts[cat] = { itemsSold: 0, revenue: 0 };
+        catCounts[cat].itemsSold += (item.quantity || 1) * sign;
+        catCounts[cat].revenue += ((item.price || 0) * (item.quantity || 1)) * sign;
+      });
+      for (const [cat, val] of Object.entries(catCounts)) {
+        update[`categoryBreakdown.${cat}.itemsSold`] = FieldValue.increment(val.itemsSold);
+        update[`categoryBreakdown.${cat}.revenue`] = FieldValue.increment(val.revenue);
       }
     }
 
@@ -1422,6 +1476,16 @@ app.use((req, res, next) => {
   res.setHeader('X-Request-ID', req.id);
   next();
 });
+
+// Firestore profiler — per-endpoint tracking via AsyncLocalStorage
+if (process.env.FIRESTORE_PROFILER === 'true') {
+  try {
+    const { profilerMiddleware } = require('./utils/firestoreProfiler');
+    app.use(profilerMiddleware);
+  } catch (err) {
+    console.error('Failed to load profiler middleware:', err.message);
+  }
+}
 
 // Security middleware setup
 console.log('🔒 Initializing security middleware...');
@@ -11178,8 +11242,19 @@ app.get('/api/analytics/:restaurantId', authenticateToken, async (req, res) => {
     const useRawOrders = (period === 'today' || period === '24h' || period === 'last24hours');
 
     if (useRawOrders) {
-      // For today/24h: read raw orders for real-time accuracy (small dataset)
+      // For today/24h: prefer dailyStats (updated atomically on every order)
       const now = new Date();
+      const todayDateStr = tzOffset !== undefined ? dateStrInTZ(now, tzOffset) : now.toISOString().split('T')[0];
+
+      // Try dailyStats first — 1 read instead of scanning all orders
+      const todayDoc = await db.collection('dailyStats').doc(`${restaurantId}_${todayDateStr}`).get();
+      if (todayDoc.exists && (todayDoc.data().totalOrders || 0) > 0) {
+        console.log(`📊 Analytics (${period}): using dailyStats doc for ${todayDateStr}`);
+        const analytics = aggregateDailyStats([todayDoc.data()], [todayDateStr]);
+        return res.json({ success: true, analytics, period, totalOrders: analytics.totalOrders });
+      }
+
+      // Fallback: no dailyStats yet (new restaurant or first order of day not completed)
       let qStart;
       if (period === 'today') {
         if (tzOffset !== undefined) {
@@ -11200,7 +11275,7 @@ app.get('/api/analytics/:restaurantId', authenticateToken, async (req, res) => {
 
       const orders = ordersQuery.docs.map(doc => ({ id: doc.id, ...doc.data() }));
       const limitReached = orders.length >= 2000;
-      console.log(`📊 Found ${orders.length} raw orders for analytics (${period})${limitReached ? ' (limit reached)' : ''}`);
+      console.log(`📊 Analytics (${period}) fallback: found ${orders.length} raw orders${limitReached ? ' (limit reached)' : ''}`);
 
       const analytics = calculateAnalytics(orders, period);
       return res.json({ success: true, analytics, period, totalOrders: orders.length, limitReached });
@@ -11275,6 +11350,7 @@ function aggregateDailyStats(dailyDocs, dateStrings) {
   const ordersByType = {};
   const hourCounts = {};
   const revenueByDay = {};
+  const paymentBreakdown = {};
   const dayNames = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
 
   for (const doc of dailyDocs) {
@@ -11310,6 +11386,16 @@ function aggregateDailyStats(dailyDocs, dateStrings) {
         if (!itemCounts[name]) itemCounts[name] = { qty: 0, revenue: 0 };
         itemCounts[name].qty += val.qty || 0;
         itemCounts[name].revenue += val.revenue || 0;
+      }
+    }
+
+    // Payment method breakdown (flat fields like paymentMethod_cash, paymentMethod_due)
+    for (const [key, val] of Object.entries(doc)) {
+      if (key.startsWith('paymentMethod_') && typeof val === 'object') {
+        const method = key.replace('paymentMethod_', '');
+        if (!paymentBreakdown[method]) paymentBreakdown[method] = { transactions: 0, amount: 0 };
+        paymentBreakdown[method].transactions += (val.transactions || 0);
+        paymentBreakdown[method].amount += (val.amount || 0);
       }
     }
 
@@ -11352,7 +11438,7 @@ function aggregateDailyStats(dailyDocs, dateStrings) {
     popularItems, revenueData,
     ordersByType: ordersByTypeArray,
     busyHours,
-    paymentBreakdown: {}
+    paymentBreakdown
   };
 }
 
@@ -11723,59 +11809,83 @@ app.get('/api/analytics/:restaurantId/daily-summary', authenticateToken, async (
     });
     } // end if (!isTodayOnly)
 
-    // For historical dates, query raw orders to get category/payment breakdown
-    // (dailyStats doesn't store this granularity)
+    // For historical dates, try to get category/payment breakdown from dailyStats first
     if (!isTodayOnly && usedDailyStats && Object.keys(categoryMap).length === 0) {
-      const [sy, sm, sd] = dates[0].split('-').map(Number);
-      const [ey, em, ed] = dates[dates.length - 1].split('-').map(Number);
-      const rangeStart = new Date(sy, sm - 1, sd, 0, 0, 0, 0);
-      const rangeEnd = new Date(ey, em - 1, ed, 23, 59, 59, 999);
-      let catPayQuery = db.collection(collections.orders)
-        .where('restaurantId', '==', restaurantId)
-        .where('createdAt', '>=', rangeStart)
-        .where('createdAt', '<=', rangeEnd);
-      if (subRestaurantId) catPayQuery = catPayQuery.where('subRestaurantId', '==', subRestaurantId);
-      const catPaySnap = await catPayQuery.get();
-      catPaySnap.docs.forEach(doc => {
-        const order = doc.data();
-        if (['cancelled', 'deleted', 'saved', 'refunded'].includes(order.status)) return;
-        // Subtract any partial refund from revenue
-        const refundAdj = (order.refundAmount && order.status !== 'refunded') ? order.refundAmount : 0;
-        if (order.items && Array.isArray(order.items)) {
-          order.items.forEach(item => {
-            const cat = item.category || 'Uncategorized';
+      // Aggregate from already-loaded dailyStats docs (no extra reads)
+      docs.forEach(doc => {
+        if (!doc.exists) return;
+        const data = doc.data();
+        // Category breakdown from dailyStats
+        if (data.categoryBreakdown && typeof data.categoryBreakdown === 'object') {
+          for (const [cat, val] of Object.entries(data.categoryBreakdown)) {
             if (!categoryMap[cat]) categoryMap[cat] = { itemsSold: 0, revenue: 0 };
-            categoryMap[cat].itemsSold += (item.quantity || 1);
-            categoryMap[cat].revenue += ((item.price || 0) * (item.quantity || 1));
-          });
+            categoryMap[cat].itemsSold += (val.itemsSold || 0);
+            categoryMap[cat].revenue += (val.revenue || 0);
+          }
         }
-        // Payment method breakdown — respect paymentStatus so due amounts aren't counted as cash
-        const orderAmount = (order.finalAmount || order.totalAmount || 0) - refundAdj;
-        const ps = (order.paymentStatus || '').toLowerCase();
-        if (ps === 'due') {
-          if (!paymentMap['due']) paymentMap['due'] = { transactions: 0, amount: 0 };
-          paymentMap['due'].transactions++;
-          paymentMap['due'].amount += orderAmount;
-        } else if (ps === 'partial' && order.paidAmount != null) {
-          const paidAmt = Math.min(Number(order.paidAmount) || 0, orderAmount);
-          const dueAmt = Math.max(0, orderAmount - paidAmt);
-          const pm = (order.paymentMethod || 'cash').toLowerCase();
-          if (paidAmt > 0) {
-            if (!paymentMap[pm]) paymentMap[pm] = { transactions: 0, amount: 0 };
-            paymentMap[pm].transactions++;
-            paymentMap[pm].amount += paidAmt;
+        // Payment method breakdown from dailyStats
+        for (const [key, val] of Object.entries(data)) {
+          if (key.startsWith('paymentMethod_') && typeof val === 'object') {
+            const method = key.replace('paymentMethod_', '');
+            if (!paymentMap[method]) paymentMap[method] = { transactions: 0, amount: 0 };
+            paymentMap[method].transactions += (val.transactions || 0);
+            paymentMap[method].amount += (val.amount || 0);
           }
-          if (dueAmt > 0) {
-            if (!paymentMap['due']) paymentMap['due'] = { transactions: 0, amount: 0 };
-            paymentMap['due'].amount += dueAmt;
-          }
-        } else {
-          const pm = (order.paymentMethod || 'cash').toLowerCase();
-          if (!paymentMap[pm]) paymentMap[pm] = { transactions: 0, amount: 0 };
-          paymentMap[pm].transactions++;
-          paymentMap[pm].amount += orderAmount;
         }
       });
+
+      // Backward compat: if dailyStats didn't have these fields (old data), fall back to raw orders
+      if (Object.keys(categoryMap).length === 0 && Object.keys(paymentMap).length === 0) {
+        console.log(`📊 daily-summary: dailyStats missing category/payment fields, falling back to raw orders`);
+        const [sy, sm, sd] = dates[0].split('-').map(Number);
+        const [ey, em, ed] = dates[dates.length - 1].split('-').map(Number);
+        const rangeStart = new Date(sy, sm - 1, sd, 0, 0, 0, 0);
+        const rangeEnd = new Date(ey, em - 1, ed, 23, 59, 59, 999);
+        let catPayQuery = db.collection(collections.orders)
+          .where('restaurantId', '==', restaurantId)
+          .where('createdAt', '>=', rangeStart)
+          .where('createdAt', '<=', rangeEnd);
+        if (subRestaurantId) catPayQuery = catPayQuery.where('subRestaurantId', '==', subRestaurantId);
+        const catPaySnap = await catPayQuery.get();
+        catPaySnap.docs.forEach(doc => {
+          const order = doc.data();
+          if (['cancelled', 'deleted', 'saved', 'refunded'].includes(order.status)) return;
+          const refundAdj = (order.refundAmount && order.status !== 'refunded') ? order.refundAmount : 0;
+          if (order.items && Array.isArray(order.items)) {
+            order.items.forEach(item => {
+              const cat = item.category || 'Uncategorized';
+              if (!categoryMap[cat]) categoryMap[cat] = { itemsSold: 0, revenue: 0 };
+              categoryMap[cat].itemsSold += (item.quantity || 1);
+              categoryMap[cat].revenue += ((item.price || 0) * (item.quantity || 1));
+            });
+          }
+          const orderAmount = (order.finalAmount || order.totalAmount || 0) - refundAdj;
+          const ps = (order.paymentStatus || '').toLowerCase();
+          if (ps === 'due') {
+            if (!paymentMap['due']) paymentMap['due'] = { transactions: 0, amount: 0 };
+            paymentMap['due'].transactions++;
+            paymentMap['due'].amount += orderAmount;
+          } else if (ps === 'partial' && order.paidAmount != null) {
+            const paidAmt = Math.min(Number(order.paidAmount) || 0, orderAmount);
+            const dueAmt = Math.max(0, orderAmount - paidAmt);
+            const pm = (order.paymentMethod || 'cash').toLowerCase();
+            if (paidAmt > 0) {
+              if (!paymentMap[pm]) paymentMap[pm] = { transactions: 0, amount: 0 };
+              paymentMap[pm].transactions++;
+              paymentMap[pm].amount += paidAmt;
+            }
+            if (dueAmt > 0) {
+              if (!paymentMap['due']) paymentMap['due'] = { transactions: 0, amount: 0 };
+              paymentMap['due'].amount += dueAmt;
+            }
+          } else {
+            const pm = (order.paymentMethod || 'cash').toLowerCase();
+            if (!paymentMap[pm]) paymentMap[pm] = { transactions: 0, amount: 0 };
+            paymentMap[pm].transactions++;
+            paymentMap[pm].amount += orderAmount;
+          }
+        });
+      }
     }
 
     // Build items array from aggregated map
@@ -27818,6 +27928,107 @@ app.get('/api/books/:restaurantId/revenue', authenticateToken, async (req, res) 
     const { start, end } = getDateRange(period, startDate, endDate);
     const prev = getPreviousRange(start, end);
 
+    // Build date string arrays for current and previous periods
+    const curDateStrings = [];
+    for (let d = new Date(start); d <= end; d.setDate(d.getDate() + 1)) {
+      curDateStrings.push(d.toISOString().split('T')[0]);
+    }
+    const prevDateStrings = [];
+    for (let d = new Date(prev.start); d <= prev.end; d.setDate(d.getDate() + 1)) {
+      prevDateStrings.push(d.toISOString().split('T')[0]);
+    }
+
+    // Sub-restaurant filter: if specified, use sub-restaurant dailyStats doc IDs
+    // Pattern must match updateDailyStats: {restaurantId}_sub_{subRestaurantId}_{dateStr}
+    const getDocId = (dateStr) => subRestaurantId
+      ? `${restaurantId}_sub_${subRestaurantId}_${dateStr}`
+      : `${restaurantId}_${dateStr}`;
+
+    // Batch-read dailyStats docs for both periods (1 read per day instead of scanning all orders)
+    const curRefs = curDateStrings.map(ds => db.collection('dailyStats').doc(getDocId(ds)));
+    const prevRefs = prevDateStrings.map(ds => db.collection('dailyStats').doc(getDocId(ds)));
+    const [curDocs, prevDocs] = await Promise.all([
+      curRefs.length > 0 ? db.getAll(...curRefs) : [],
+      prevRefs.length > 0 ? db.getAll(...prevRefs) : []
+    ]);
+
+    // Check if we got any dailyStats data
+    const hasDailyStats = curDocs.some(doc => doc.exists);
+
+    let totalRevenue = 0, totalTax = 0, totalDiscounts = 0, refunds = 0, orderCount = 0;
+    const byPaymentMethod = {};
+    const byOrderType = {};
+    const dailyMap = {};
+    const bySubRestaurant = {};
+
+    if (hasDailyStats) {
+      // Aggregate from dailyStats docs (efficient path)
+      console.log(`📊 Books revenue (${period}): using ${curDocs.filter(d => d.exists).length} dailyStats docs`);
+      curDocs.forEach((doc, i) => {
+        if (!doc.exists) return;
+        const data = doc.data();
+        // totalRevenueWithTax + totalDueAmount = full revenue (same as finalAmount || totalAmount for non-cancelled)
+        const docRevenue = (data.totalRevenueWithTax || 0) + (data.totalDueAmount || 0);
+        totalRevenue += docRevenue;
+        totalTax += data.totalTax || 0;
+        totalDiscounts += data.totalDiscounts || 0;
+        refunds += data.totalRefunds || 0;
+        orderCount += data.totalOrders || 0;
+
+        // Payment method breakdown from paymentMethod_* fields
+        for (const [key, val] of Object.entries(data)) {
+          if (key.startsWith('paymentMethod_') && typeof val === 'object') {
+            const method = key.replace('paymentMethod_', '');
+            byPaymentMethod[method] = (byPaymentMethod[method] || 0) + (val.amount || 0);
+          }
+        }
+
+        // Order type revenue breakdown from orderTypeRevenue_* fields (amounts)
+        for (const [key, val] of Object.entries(data)) {
+          if (key.startsWith('orderTypeRevenue_') && typeof val === 'number') {
+            const ot = key.replace('orderTypeRevenue_', '').replace(/_/g, '-');
+            byOrderType[ot] = (byOrderType[ot] || 0) + val;
+          }
+        }
+
+        // Daily breakdown
+        const dateKey = curDateStrings[i];
+        if (!dailyMap[dateKey]) dailyMap[dateKey] = { date: dateKey, revenue: 0, orders: 0, tax: 0 };
+        dailyMap[dateKey].revenue += docRevenue;
+        dailyMap[dateKey].orders += data.totalOrders || 0;
+        dailyMap[dateKey].tax += data.totalTax || 0;
+      });
+
+      // Previous period revenue from dailyStats
+      let prevRevenue = 0;
+      prevDocs.forEach(doc => {
+        if (!doc.exists) return;
+        const data = doc.data();
+        prevRevenue += (data.totalRevenueWithTax || 0) + (data.totalDueAmount || 0);
+      });
+
+      // Sub-restaurant breakdown: if no subRestaurantId filter, try to read sub-restaurant stats
+      // This is skipped for now — sub-restaurant dailyStats doc IDs use _sub_ pattern
+      // and would require listing sub-restaurants first. Falls back to no breakdown.
+
+      const dailyBreakdown = Object.values(dailyMap).sort((a, b) => a.date.localeCompare(b.date));
+      const changePercent = prevRevenue > 0 ? ((totalRevenue - prevRevenue) / prevRevenue * 100) : 0;
+
+      const responseData = {
+        totalRevenue, totalTax, totalDiscounts, refunds, orderCount,
+        avgOrderValue: orderCount > 0 ? totalRevenue / orderCount : 0,
+        byPaymentMethod, byOrderType, dailyBreakdown,
+        previousRevenue: prevRevenue, changePercent: Math.round(changePercent * 10) / 10
+      };
+      if (!subRestaurantId && Object.keys(bySubRestaurant).length > 0) {
+        responseData.bySubRestaurant = bySubRestaurant;
+      }
+
+      return res.json({ success: true, data: responseData });
+    }
+
+    // Fallback: raw order scan (for restaurants with no dailyStats yet)
+    console.log(`📊 Books revenue (${period}): fallback to raw orders (no dailyStats found)`);
     const ordersRef = db.collection(collections.orders);
     let curQuery = ordersRef.where('restaurantId', '==', restaurantId)
       .where('createdAt', '>=', start).where('createdAt', '<=', end);
@@ -27828,12 +28039,6 @@ app.get('/api/books/:restaurantId/revenue', authenticateToken, async (req, res) 
       prevQuery = prevQuery.where('subRestaurantId', '==', subRestaurantId);
     }
     const [currentSnap, prevSnap] = await Promise.all([curQuery.get(), prevQuery.get()]);
-
-    let totalRevenue = 0, totalTax = 0, totalDiscounts = 0, refunds = 0, orderCount = 0;
-    const byPaymentMethod = {};
-    const byOrderType = {};
-    const dailyMap = {};
-    const bySubRestaurant = {};
 
     currentSnap.forEach(doc => {
       const o = doc.data();
@@ -28217,36 +28422,69 @@ app.get('/api/books/:restaurantId/pnl', authenticateToken, async (req, res) => {
     const { start, end } = getDateRange(period, startDate, endDate);
     const prev = getPreviousRange(start, end);
 
-    // Fetch revenue, COGS, expenses, credits in parallel
-    const ordersRef = db.collection(collections.orders);
+    // Build date strings for dailyStats batch reads (revenue only)
+    const curDateStrings = [];
+    for (let d = new Date(start); d <= end; d.setDate(d.getDate() + 1)) {
+      curDateStrings.push(d.toISOString().split('T')[0]);
+    }
+    const prevDateStrings = [];
+    for (let d = new Date(prev.start); d <= prev.end; d.setDate(d.getDate() + 1)) {
+      prevDateStrings.push(d.toISOString().split('T')[0]);
+    }
+    const curStatsRefs = curDateStrings.map(ds => db.collection('dailyStats').doc(`${restaurantId}_${ds}`));
+    const prevStatsRefs = prevDateStrings.map(ds => db.collection('dailyStats').doc(`${restaurantId}_${ds}`));
+
+    // Fetch dailyStats (for revenue), COGS, expenses, credits in parallel
     const txRef = db.collection(collections.inventoryTransactions);
     const expRef = db.collection(collections.expenses);
     const retRef = db.collection(collections.supplierReturns);
 
-    const [orderSnap, prevOrderSnap, txSnap, expSnap, prevExpSnap, retSnap] = await Promise.all([
-      ordersRef.where('restaurantId', '==', restaurantId).where('createdAt', '>=', start).where('createdAt', '<=', end).get(),
-      ordersRef.where('restaurantId', '==', restaurantId).where('createdAt', '>=', prev.start).where('createdAt', '<=', prev.end).get(),
+    const [curStatsDocs, prevStatsDocs, txSnap, expSnap, prevExpSnap, retSnap] = await Promise.all([
+      curStatsRefs.length > 0 ? db.getAll(...curStatsRefs) : [],
+      prevStatsRefs.length > 0 ? db.getAll(...prevStatsRefs) : [],
       txRef.where('restaurantId', '==', restaurantId).where('type', '==', 'DEDUCTION').where('date', '>=', start).where('date', '<=', end).get(),
       expRef.where('restaurantId', '==', restaurantId).where('date', '>=', start).where('date', '<=', end).get(),
       expRef.where('restaurantId', '==', restaurantId).where('date', '>=', prev.start).where('date', '<=', prev.end).get(),
       retRef.where('restaurantId', '==', restaurantId).where('status', '==', 'credited').get()
     ]);
 
-    // Revenue
-    let revenue = 0;
-    orderSnap.forEach(doc => {
-      const o = doc.data();
-      if (o.status === 'cancelled' || o.status === 'deleted') return;
-      revenue += o.finalAmount || o.totalAmount || 0;
-    });
-    let prevRevenue = 0;
-    prevOrderSnap.forEach(doc => {
-      const o = doc.data();
-      if (o.status === 'cancelled' || o.status === 'deleted') return;
-      prevRevenue += o.finalAmount || o.totalAmount || 0;
-    });
+    // Revenue from dailyStats (1 doc per day instead of scanning all orders)
+    const hasDailyStats = curStatsDocs.some(doc => doc.exists);
+    let revenue = 0, prevRevenue = 0;
 
-    // COGS
+    if (hasDailyStats) {
+      console.log(`📊 Books P&L (${period}): using dailyStats for revenue`);
+      curStatsDocs.forEach(doc => {
+        if (!doc.exists) return;
+        const data = doc.data();
+        revenue += (data.totalRevenueWithTax || 0) + (data.totalDueAmount || 0);
+      });
+      prevStatsDocs.forEach(doc => {
+        if (!doc.exists) return;
+        const data = doc.data();
+        prevRevenue += (data.totalRevenueWithTax || 0) + (data.totalDueAmount || 0);
+      });
+    } else {
+      // Fallback: raw order scan (for restaurants with no dailyStats yet)
+      console.log(`📊 Books P&L (${period}): fallback to raw orders for revenue`);
+      const ordersRef = db.collection(collections.orders);
+      const [orderSnap, prevOrderSnap] = await Promise.all([
+        ordersRef.where('restaurantId', '==', restaurantId).where('createdAt', '>=', start).where('createdAt', '<=', end).get(),
+        ordersRef.where('restaurantId', '==', restaurantId).where('createdAt', '>=', prev.start).where('createdAt', '<=', prev.end).get()
+      ]);
+      orderSnap.forEach(doc => {
+        const o = doc.data();
+        if (o.status === 'cancelled' || o.status === 'deleted') return;
+        revenue += o.finalAmount || o.totalAmount || 0;
+      });
+      prevOrderSnap.forEach(doc => {
+        const o = doc.data();
+        if (o.status === 'cancelled' || o.status === 'deleted') return;
+        prevRevenue += o.finalAmount || o.totalAmount || 0;
+      });
+    }
+
+    // COGS (unchanged — reads inventory transactions, not orders)
     const invSnap = await db.collection(collections.inventory).where('restaurantId', '==', restaurantId).select('costPerUnit').get();
     const invMap = {};
     invSnap.forEach(doc => { invMap[doc.id] = doc.data(); });
@@ -28259,7 +28497,7 @@ app.get('/api/books/:restaurantId/pnl', authenticateToken, async (req, res) => {
       cogs += qty * cost;
     });
 
-    // Expenses by category
+    // Expenses by category (unchanged — reads expenses collection, not orders)
     let totalExpenses = 0;
     const expByCategory = {};
     expSnap.forEach(doc => {
@@ -28271,7 +28509,7 @@ app.get('/api/books/:restaurantId/pnl', authenticateToken, async (req, res) => {
     let prevExpenses = 0;
     prevExpSnap.forEach(doc => { prevExpenses += doc.data().amount || 0; });
 
-    // Supplier credits
+    // Supplier credits (unchanged — reads supplier returns, not orders)
     let supplierCredits = 0;
     retSnap.forEach(doc => {
       const r = doc.data();
@@ -28316,40 +28554,79 @@ app.get('/api/books/:restaurantId/overview', authenticateToken, async (req, res)
     const { start, end } = getDateRange(period, startDate, endDate);
     const prev = getPreviousRange(start, end);
 
-    const ordersRef = db.collection(collections.orders);
+    // Build date strings for dailyStats batch reads (revenue + dailyCashFlow)
+    const curDateStrings = [];
+    for (let d = new Date(start); d <= end; d.setDate(d.getDate() + 1)) {
+      curDateStrings.push(d.toISOString().split('T')[0]);
+    }
+    const prevDateStrings = [];
+    for (let d = new Date(prev.start); d <= prev.end; d.setDate(d.getDate() + 1)) {
+      prevDateStrings.push(d.toISOString().split('T')[0]);
+    }
+    const curStatsRefs = curDateStrings.map(ds => db.collection('dailyStats').doc(`${restaurantId}_${ds}`));
+    const prevStatsRefs = prevDateStrings.map(ds => db.collection('dailyStats').doc(`${restaurantId}_${ds}`));
+
     const txRef = db.collection(collections.inventoryTransactions);
     const expRef = db.collection(collections.expenses);
     const invRef = db.collection(collections.supplierInvoices);
 
-    const [orderSnap, prevOrderSnap, txSnap, expSnap, prevExpSnap, duesSnap] = await Promise.all([
-      ordersRef.where('restaurantId', '==', restaurantId).where('createdAt', '>=', start).where('createdAt', '<=', end).get(),
-      ordersRef.where('restaurantId', '==', restaurantId).where('createdAt', '>=', prev.start).where('createdAt', '<=', prev.end).get(),
+    const [curStatsDocs, prevStatsDocs, txSnap, expSnap, prevExpSnap, duesSnap] = await Promise.all([
+      curStatsRefs.length > 0 ? db.getAll(...curStatsRefs) : [],
+      prevStatsRefs.length > 0 ? db.getAll(...prevStatsRefs) : [],
       txRef.where('restaurantId', '==', restaurantId).where('type', '==', 'DEDUCTION').where('date', '>=', start).where('date', '<=', end).get(),
       expRef.where('restaurantId', '==', restaurantId).where('date', '>=', start).where('date', '<=', end).get(),
       expRef.where('restaurantId', '==', restaurantId).where('date', '>=', prev.start).where('date', '<=', prev.end).get(),
       invRef.where('restaurantId', '==', restaurantId).get()
     ]);
 
-    // Revenue
+    // Revenue + dailyCashFlow from dailyStats
+    const hasDailyStats = curStatsDocs.some(doc => doc.exists);
     let revenue = 0, prevRevenue = 0, activeOrderCount = 0;
     const dailyCashFlow = {};
-    orderSnap.forEach(doc => {
-      const o = doc.data();
-      if (o.status === 'cancelled' || o.status === 'deleted') return;
-      activeOrderCount++;
-      const amt = o.finalAmount || o.totalAmount || 0;
-      revenue += amt;
-      const dk = (o.createdAt?.toDate ? o.createdAt.toDate() : new Date(o.createdAt)).toISOString().split('T')[0];
-      if (!dailyCashFlow[dk]) dailyCashFlow[dk] = { date: dk, revenue: 0, expenses: 0 };
-      dailyCashFlow[dk].revenue += amt;
-    });
-    prevOrderSnap.forEach(doc => {
-      const o = doc.data();
-      if (o.status === 'cancelled' || o.status === 'deleted') return;
-      prevRevenue += o.finalAmount || o.totalAmount || 0;
-    });
 
-    // COGS
+    if (hasDailyStats) {
+      console.log(`📊 Books overview (${period}): using dailyStats for revenue`);
+      curStatsDocs.forEach((doc, i) => {
+        if (!doc.exists) return;
+        const data = doc.data();
+        const amt = (data.totalRevenueWithTax || 0) + (data.totalDueAmount || 0);
+        revenue += amt;
+        activeOrderCount += data.totalOrders || 0;
+        const dk = curDateStrings[i];
+        if (!dailyCashFlow[dk]) dailyCashFlow[dk] = { date: dk, revenue: 0, expenses: 0 };
+        dailyCashFlow[dk].revenue += amt;
+      });
+      prevStatsDocs.forEach(doc => {
+        if (!doc.exists) return;
+        const data = doc.data();
+        prevRevenue += (data.totalRevenueWithTax || 0) + (data.totalDueAmount || 0);
+      });
+    } else {
+      // Fallback: raw order scan (for restaurants with no dailyStats yet)
+      console.log(`📊 Books overview (${period}): fallback to raw orders for revenue`);
+      const ordersRef = db.collection(collections.orders);
+      const [orderSnap, prevOrderSnap] = await Promise.all([
+        ordersRef.where('restaurantId', '==', restaurantId).where('createdAt', '>=', start).where('createdAt', '<=', end).get(),
+        ordersRef.where('restaurantId', '==', restaurantId).where('createdAt', '>=', prev.start).where('createdAt', '<=', prev.end).get()
+      ]);
+      orderSnap.forEach(doc => {
+        const o = doc.data();
+        if (o.status === 'cancelled' || o.status === 'deleted') return;
+        activeOrderCount++;
+        const amt = o.finalAmount || o.totalAmount || 0;
+        revenue += amt;
+        const dk = (o.createdAt?.toDate ? o.createdAt.toDate() : new Date(o.createdAt)).toISOString().split('T')[0];
+        if (!dailyCashFlow[dk]) dailyCashFlow[dk] = { date: dk, revenue: 0, expenses: 0 };
+        dailyCashFlow[dk].revenue += amt;
+      });
+      prevOrderSnap.forEach(doc => {
+        const o = doc.data();
+        if (o.status === 'cancelled' || o.status === 'deleted') return;
+        prevRevenue += o.finalAmount || o.totalAmount || 0;
+      });
+    }
+
+    // COGS (unchanged — reads inventory transactions, not orders)
     const invItemSnap = await db.collection(collections.inventory).where('restaurantId', '==', restaurantId).select('costPerUnit').get();
     const invMap = {};
     invItemSnap.forEach(doc => { invMap[doc.id] = doc.data(); });
@@ -28360,7 +28637,7 @@ app.get('/api/books/:restaurantId/overview', authenticateToken, async (req, res)
       cogs += qty * (tx.costPerUnit || invMap[tx.inventoryItemId]?.costPerUnit || 0);
     });
 
-    // Expenses
+    // Expenses (unchanged — reads expenses collection, not orders)
     let expenses = 0, prevExpenses = 0;
     const topCategories = {};
     expSnap.forEach(doc => {
@@ -28374,7 +28651,7 @@ app.get('/api/books/:restaurantId/overview', authenticateToken, async (req, res)
     });
     prevExpSnap.forEach(doc => { prevExpenses += doc.data().amount || 0; });
 
-    // Supplier dues
+    // Supplier dues (unchanged — reads supplier invoices, not orders)
     let supplierDuesTotal = 0;
     duesSnap.forEach(doc => {
       const inv = doc.data();

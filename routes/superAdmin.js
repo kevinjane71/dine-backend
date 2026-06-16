@@ -2288,6 +2288,50 @@ router.get('/my-users', authenticateSuperAdmin, async (req, res) => {
   }
 });
 
+// ─── Firestore Profiler ─────────────────────────────────────────────
+
+// GET /api/super-admin/firestore-usage — view read counts per collection
+router.get('/firestore-usage', authenticateSuperAdmin, async (req, res) => {
+  try {
+    const { getReport, isEnabled } = require('../utils/firestoreProfiler');
+    const hours = parseInt(req.query.hours) || 24;
+    const report = await getReport(Math.min(hours, 48));
+    res.json({ success: true, data: report });
+  } catch (error) {
+    console.error('Firestore usage error:', error);
+    res.status(500).json({ success: false, error: 'Failed to fetch profiler data' });
+  }
+});
+
+// POST /api/super-admin/firestore-usage/toggle — enable/disable profiler
+router.post('/firestore-usage/toggle', authenticateSuperAdmin, async (req, res) => {
+  try {
+    const { enableProfiler, disableProfiler, isEnabled } = require('../utils/firestoreProfiler');
+    const { enable } = req.body;
+    if (enable) {
+      enableProfiler(db);
+    } else {
+      disableProfiler();
+    }
+    res.json({ success: true, enabled: isEnabled() });
+  } catch (error) {
+    console.error('Firestore profiler toggle error:', error);
+    res.status(500).json({ success: false, error: 'Failed to toggle profiler' });
+  }
+});
+
+// DELETE /api/super-admin/firestore-usage — clear profiler data
+router.delete('/firestore-usage', authenticateSuperAdmin, async (req, res) => {
+  try {
+    const { clearReport } = require('../utils/firestoreProfiler');
+    await clearReport();
+    res.json({ success: true, message: 'Profiler data cleared' });
+  } catch (error) {
+    console.error('Firestore profiler clear error:', error);
+    res.status(500).json({ success: false, error: 'Failed to clear profiler data' });
+  }
+});
+
 // ─── Mount sub-admin routes ─────────────────────────────────────────
 router.use('/sub-admins', subAdminRoutes);
 
