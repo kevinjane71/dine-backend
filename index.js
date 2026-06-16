@@ -34393,6 +34393,33 @@ app.post('/api/automation/webhook/whatsapp', async (req, res) => {
                     }
                     await db.collection(collections.automationLogs).add(logEntry);
                   }
+
+                  // Fallback: if no restaurant matched, still log for super-admin inbox
+                  if (settingsSnapshot.empty) {
+                    const logEntry = {
+                      restaurantId: null,
+                      type: 'incoming',
+                      direction: 'incoming',
+                      phone: processedMessage.from,
+                      contactName: processedMessage.contactName || '',
+                      message: processedMessage.text,
+                      messageType: processedMessage.type,
+                      messageId: processedMessage.messageId,
+                      timestamp: new Date(),
+                      status: 'received',
+                    };
+                    if (processedMessage.mediaId) logEntry.mediaId = processedMessage.mediaId;
+                    if (processedMessage.mimeType) logEntry.mimeType = processedMessage.mimeType;
+                    if (processedMessage.filename) logEntry.filename = processedMessage.filename;
+                    if (processedMessage.caption) logEntry.caption = processedMessage.caption;
+                    if (processedMessage.latitude != null) {
+                      logEntry.latitude = processedMessage.latitude;
+                      logEntry.longitude = processedMessage.longitude;
+                      logEntry.locationName = processedMessage.locationName || '';
+                    }
+                    await db.collection(collections.automationLogs).add(logEntry);
+                    console.log('📩 WhatsApp message logged for super-admin inbox (no restaurant match):', processedMessage.from);
+                  }
                 } catch (error) {
                   console.error('Error logging incoming message:', error);
                 }

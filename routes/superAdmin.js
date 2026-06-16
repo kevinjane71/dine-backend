@@ -2303,6 +2303,294 @@ router.get('/firestore-usage', authenticateSuperAdmin, async (req, res) => {
   }
 });
 
+// ─── WhatsApp Inbox (Super Admin) ───────────────────────────────────
+
+const whatsappService = require('../services/whatsappService');
+
+// GET /api/super-admin/whatsapp/conversations — list conversations grouped by phone
+router.get('/whatsapp/conversations', authenticateSuperAdmin, requireSuperAdmin, async (req, res) => {
+  try {
+    const limit = Math.min(parseInt(req.query.limit) || 500, 1000);
+    let query = db.collection(collections.automationLogs)
+      .orderBy('timestamp', 'desc')
+      .limit(limit);
+
+    const snapshot = await query.get();
+    const convosMap = {};
+
+    snapshot.docs.forEach(doc => {
+      const d = doc.data();
+      const phone = d.phone || d.customerPhone;
+      if (!phone) return;
+      if (!convosMap[phone]) {
+        convosMap[phone] = {
+          phone,
+          contactName: d.contactName || d.customerName || '',
+          lastMessage: d.message || '',
+          lastTimestamp: toISO(d.timestamp),
+          lastDirection: d.direction || d.type || '',
+          unreadCount: 0,
+          sessionActive: false,
+          lastIncomingAt: null,
+          restaurantId: d.restaurantId || null,
+        };
+      }
+      // Update contact name if empty
+      if (!convosMap[phone].contactName && (d.contactName || d.customerName)) {
+        convosMap[phone].contactName = d.contactName || d.customerName;
+      }
+      // Count unread incoming
+      if ((d.type === 'incoming' || d.direction === 'incoming') && d.status !== 'read_by_staff') {
+        convosMap[phone].unreadCount++;
+      }
+      // Track last incoming message time
+      if (d.type === 'incoming' || d.direction === 'incoming') {
+        const ts = toDate(d.timestamp);
+        if (ts && (!convosMap[phone].lastIncomingAt || ts > convosMap[phone].lastIncomingAt)) {
+          convosMap[phone].lastIncomingAt = ts;
+        }
+      }
+    });
+
+    // Compute sessionActive (24h window)
+    const now = Date.now();
+    const conversations = Object.values(convosMap).map(c => {
+      c.sessionActive = c.lastIncomingAt ? (now - c.lastIncomingAt.getTime() < 24 * 60 * 60 * 1000) : false;
+      delete c.lastIncomingAt;
+      return c;
+    });
+
+    // Sort by lastTimestamp desc
+    conversations.sort((a, b) => (b.lastTimestamp || '').localeCompare(a.lastTimestamp || ''));
+
+    res.json({ success: true, conversations });
+  } catch (error) {
+    console.error('WhatsApp conversations error:', error);
+    res.status(500).json({ success: false, error: 'Failed to fetch conversations' });
+  }
+});
+
+// GET /api/super-admin/whatsapp/messages/:phone — full chat thread
+router.get('/whatsapp/messages/:phone', authenticateSuperAdmin, requireSuperAdmin, async (req, res) => {
+  try {
+    const phone = req.params.phone;
+    const limit = Math.min(parseInt(req.query.limit) || 200, 500);
+
+    const snapshot = await db.collection(collections.automationLogs)
+      .where('phone', '==', phone)
+      .orderBy('timestamp', 'asc')
+      .limit(limit)
+      .get();
+
+    let lastIncomingAt = null;
+    const messages = snapshot.docs.map(doc => {
+      const d = doc.data();
+      const ts = toDate(d.timestamp);
+      if ((d.type === 'incoming' || d.direction === 'incoming') && ts) {
+        if (!lastIncomingAt || ts > lastIncomingAt) lastIncomingAt = ts;
+      }
+      return {
+        id: doc.id,
+        phone: d.phone || d.customerPhone || phone,
+        contactName: d.contactName || d.customerName || '',
+        message: d.message || '',
+        messageType: d.messageType || d.incomingType || 'text',
+        direction: d.direction || (d.type === 'incoming' ? 'incoming' : 'outgoing'),
+        type: d.type || '',
+        status: d.status || '',
+        timestamp: toISO(d.timestamp),
+        messageId: d.messageId || '',
+        restaurantId: d.restaurantId || null,
+        mediaId: d.mediaId || null,
+        mimeType: d.mimeType || null,
+        filename: d.filename || null,
+        caption: d.caption || null,
+        sentByName: d.sentByName || null,
+      };
+    });
+
+    const sessionActive = lastIncomingAt ? (Date.now() - lastIncomingAt.getTime() < 24 * 60 * 60 * 1000) : false;
+
+    // Auto mark-read
+    const unreadDocs = snapshot.docs.filter(doc => {
+      const d = doc.data();
+      return (d.type === 'incoming' || d.direction === 'incoming') && d.status !== 'read_by_staff';
+    });
+    if (unreadDocs.length > 0) {
+      const batch = db.batch();
+      unreadDocs.forEach(doc => batch.update(doc.ref, { status: 'read_by_staff' }));
+      await batch.commit();
+    }
+
+    res.json({ success: true, messages, sessionActive });
+  } catch (error) {
+    console.error('WhatsApp messages error:', error);
+    res.status(500).json({ success: false, error: 'Failed to fetch messages' });
+  }
+});
+
+// POST /api/super-admin/whatsapp/reply — send reply from DineOpen number
+router.post('/whatsapp/reply', authenticateSuperAdmin, requireSuperAdmin, async (req, res) => {
+  try {
+    const { phone, message } = req.body;
+    if (!phone || !message) return res.status(400).json({ error: 'phone and message required' });
+
+    const credentials = {
+      accessToken: process.env.DINEOPEN_WHATSAPP_ACCESS_TOKEN,
+      phoneNumberId: process.env.DINEOPEN_WHATSAPP_PHONE_NUMBER_ID,
+      businessAccountId: process.env.DINEOPEN_WHATSAPP_BUSINESS_ACCOUNT_ID,
+    };
+
+    if (!credentials.accessToken || !credentials.phoneNumberId) {
+      return res.status(500).json({ error: 'DineOpen WhatsApp credentials not configured' });
+    }
+
+    const result = await whatsappService.sendTextMessage(phone, message, credentials);
+    if (!result.success) {
+      return res.status(500).json({ error: 'Failed to send message', detail: result.error });
+    }
+
+    // Log outgoing message
+    await db.collection(collections.automationLogs).add({
+      restaurantId: null,
+      type: 'reply',
+      direction: 'outgoing',
+      phone,
+      message,
+      messageId: result.messageId,
+      status: 'sent',
+      sentBy: req.admin?.id || 'super-admin',
+      sentByName: req.admin?.name || req.admin?.username || 'Super Admin',
+      timestamp: new Date(),
+    });
+
+    res.json({ success: true, messageId: result.messageId });
+  } catch (error) {
+    console.error('WhatsApp reply error:', error);
+    res.status(500).json({ success: false, error: 'Failed to send reply' });
+  }
+});
+
+// POST /api/super-admin/whatsapp/mark-read — mark messages as read
+router.post('/whatsapp/mark-read', authenticateSuperAdmin, requireSuperAdmin, async (req, res) => {
+  try {
+    const { phone } = req.body;
+    if (!phone) return res.status(400).json({ error: 'phone required' });
+
+    const snapshot = await db.collection(collections.automationLogs)
+      .where('phone', '==', phone)
+      .where('type', '==', 'incoming')
+      .get();
+
+    const unread = snapshot.docs.filter(d => d.data().status !== 'read_by_staff');
+    if (unread.length > 0) {
+      const batch = db.batch();
+      unread.forEach(doc => batch.update(doc.ref, { status: 'read_by_staff' }));
+      await batch.commit();
+    }
+
+    res.json({ success: true, markedCount: unread.length });
+  } catch (error) {
+    console.error('WhatsApp mark-read error:', error);
+    res.status(500).json({ success: false, error: 'Failed to mark as read' });
+  }
+});
+
+// GET /api/super-admin/whatsapp/media/:mediaId — proxy media download
+// Supports ?token= query param for <img src> usage where Authorization header isn't possible
+router.get('/whatsapp/media/:mediaId', (req, res, next) => {
+  if (!req.headers['authorization'] && req.query.token) {
+    req.headers['authorization'] = `Bearer ${req.query.token}`;
+  }
+  next();
+}, authenticateSuperAdmin, async (req, res) => {
+  try {
+    const { mediaId } = req.params;
+    const accessToken = process.env.DINEOPEN_WHATSAPP_ACCESS_TOKEN;
+    if (!accessToken) return res.status(500).json({ error: 'WhatsApp credentials not configured' });
+
+    // Get media URL from Meta
+    const metaRes = await require('axios').get(`https://graph.facebook.com/v22.0/${mediaId}`, {
+      headers: { Authorization: `Bearer ${accessToken}` },
+    });
+    const mediaUrl = metaRes.data.url;
+    const mimeType = metaRes.data.mime_type || 'application/octet-stream';
+
+    // Stream media back
+    const mediaStream = await require('axios').get(mediaUrl, {
+      headers: { Authorization: `Bearer ${accessToken}` },
+      responseType: 'stream',
+    });
+
+    res.setHeader('Content-Type', mimeType);
+    mediaStream.data.pipe(res);
+  } catch (error) {
+    console.error('WhatsApp media proxy error:', error.response?.data || error.message);
+    res.status(500).json({ error: 'Failed to fetch media' });
+  }
+});
+
+// POST /api/super-admin/whatsapp/ai-reply — generate AI-suggested reply
+router.post('/whatsapp/ai-reply', authenticateSuperAdmin, requireSuperAdmin, async (req, res) => {
+  try {
+    const { conversationHistory } = req.body;
+    if (!conversationHistory || !Array.isArray(conversationHistory) || conversationHistory.length === 0) {
+      return res.status(400).json({ error: 'conversationHistory array required' });
+    }
+
+    const OpenAI = require('openai');
+    const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+
+    const systemPrompt = `You are a helpful sales and support assistant for DineOpen, a restaurant & retail SaaS platform.
+
+DineOpen provides: POS (Point of Sale), inventory management, billing, AI voice ordering, WhatsApp ordering, kitchen display (KOT), hotel management, parking management, loyalty programs, customer CRM, staff attendance, payroll, delivery management, multi-branch support, and more.
+
+Supported business types: restaurants, cafes, bars, cloud kitchens, bakeries, food trucks, hotels, fine dining, QSR, ice cream parlors, juice bars, sweet shops, catering, retail stores, jewellery stores.
+
+Key features:
+- Free tier available, paid plans from INR 999/month
+- Works on web, desktop (Windows/Mac), mobile (Android/iOS)
+- Supports 9 languages including Hindi, Arabic, Spanish, Chinese
+- WhatsApp ordering and billing
+- AI-powered voice ordering
+- Real-time kitchen display
+- Multi-currency support
+- Offline mode
+
+Website: dineopen.com
+Demo: Available on request
+
+Instructions:
+- Be helpful, professional, and friendly
+- Keep replies concise (2-4 sentences)
+- If user asks about pricing, mention the free tier and paid plans starting at INR 999/month
+- If user wants a demo, ask for their name, business type, and city
+- Reply in the same language the customer writes in
+- Don't make up features that aren't listed above`;
+
+    const messages = [
+      { role: 'system', content: systemPrompt },
+      ...conversationHistory.slice(-10).map(m => ({
+        role: m.direction === 'incoming' ? 'user' : 'assistant',
+        content: m.message || m.content || '',
+      })),
+    ];
+
+    const completion = await openai.chat.completions.create({
+      model: 'gpt-4o-mini',
+      messages,
+      max_tokens: 300,
+      temperature: 0.7,
+    });
+
+    const suggestedReply = completion.choices[0]?.message?.content || '';
+    res.json({ success: true, suggestedReply });
+  } catch (error) {
+    console.error('WhatsApp AI reply error:', error);
+    res.status(500).json({ success: false, error: 'Failed to generate AI reply' });
+  }
+});
+
 // ─── Mount sub-admin routes ─────────────────────────────────────────
 router.use('/sub-admins', subAdminRoutes);
 
