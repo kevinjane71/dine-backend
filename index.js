@@ -129,11 +129,12 @@ const performanceOptimizer = require('./middleware/performanceOptimizer');
 const firestoreOptimizer = require('./utils/firestoreOptimizer');
 const { kvGet, kvSet, kvDel, getCachedRestaurant, invalidateRestaurantCache, invalidateUserCache } = require('./utils/kvCache');
 
-// Firestore read profiler — enable via FIRESTORE_PROFILER=true env var
+// Firestore read profiler — auto-enable via FIRESTORE_PROFILER=true env var, or toggle from admin panel
 if (process.env.FIRESTORE_PROFILER === 'true') {
   try {
     const { enableProfiler } = require('./utils/firestoreProfiler');
     enableProfiler(db);
+    console.log('Firestore profiler auto-enabled via env var');
   } catch (err) {
     console.error('Failed to enable Firestore profiler:', err.message);
   }
@@ -1478,13 +1479,12 @@ app.use((req, res, next) => {
 });
 
 // Firestore profiler — per-endpoint tracking via AsyncLocalStorage
-if (process.env.FIRESTORE_PROFILER === 'true') {
-  try {
-    const { profilerMiddleware } = require('./utils/firestoreProfiler');
-    app.use(profilerMiddleware);
-  } catch (err) {
-    console.error('Failed to load profiler middleware:', err.message);
-  }
+// Always loaded so the admin panel toggle works even without env var
+try {
+  const { profilerMiddleware } = require('./utils/firestoreProfiler');
+  app.use(profilerMiddleware);
+} catch (err) {
+  console.error('Failed to load profiler middleware:', err.message);
 }
 
 // Security middleware setup
@@ -19112,7 +19112,7 @@ app.put('/api/admin/print-settings/:restaurantId', authenticateToken, async (req
       billFontSize: ['small', 'medium', 'large', 'xlarge'],
       billFontFamily: ['default', 'arial', 'verdana', 'tahoma', 'georgia', 'times'],
       kotTemplate: ['classic', 'compact', 'bold', 'grouped', 'numbered'],
-      billTemplate: ['classic', 'compact', 'detailed', 'elegant', 'minimal']
+      billTemplate: ['classic', 'compact', 'detailed', 'elegant', 'minimal', 'professional']
     };
 
     const sanitizedSettings = {};
