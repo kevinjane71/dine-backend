@@ -65,11 +65,38 @@ router.post('/webhook', async (req, res) => {
 
     if (!phoneNumberId) return;
 
-    // Find which restaurant this phone number belongs to
+    // Always log incoming message to automationLogs for super-admin inbox visibility
+    try {
+      const db = getDb();
+      const logEntry = {
+        type: 'incoming',
+        direction: 'incoming',
+        phone: message.from,
+        contactName: contact?.profile?.name || '',
+        message: message.text?.body || message.interactive?.list_reply?.title || message.interactive?.button_reply?.title || message.button?.text || '',
+        messageType: message.type,
+        messageId: message.id,
+        timestamp: new Date(),
+        status: 'received',
+      };
+      // Check if this message came from a restaurant's number or is a general inquiry
+      const automationMatch = await db.collection(collections.automationSettings)
+        .where('type', '==', 'whatsapp')
+        .where('connected', '==', true)
+        .where('phoneNumberId', '==', phoneNumberId)
+        .limit(1)
+        .get();
+      logEntry.restaurantId = automationMatch.empty ? null : automationMatch.docs[0].data().restaurantId;
+      await db.collection(collections.automationLogs).add(logEntry);
+    } catch (logErr) {
+      console.error('automationLogs log error (non-blocking):', logErr.message);
+    }
+
+    // Find which restaurant this phone number belongs to (for ordering flow)
     const match = await orderingService.findRestaurantByPhoneNumberId(phoneNumberId);
     if (!match) {
-      console.warn(`No restaurant found for WhatsApp phone number ID: ${phoneNumberId}`);
-      return;
+      console.warn(`No restaurant found for WhatsApp ordering phone number ID: ${phoneNumberId}`);
+      return; // Ordering flow stops, but message is already logged above for inbox
     }
 
     const { restaurantId, config } = match;
