@@ -1,33 +1,21 @@
 /**
- * Firestore Profiler (Reads + Writes + Per-Endpoint tracking)
- *
- * Monkey-patches Firestore SDK methods to count reads and writes per collection,
- * AND per API endpoint using AsyncLocalStorage to tie operations to requests.
- *
- * Enable via: FIRESTORE_PROFILER=true env var
- * View data via: GET /api/super-admin/firestore-usage
- *
- * Safe: all tracking is fire-and-forget. If Redis fails, profiling
- * silently stops. Zero impact on request handling.
- *
- * Works on Vercel Pro (Node.js 18+ required for AsyncLocalStorage).
+ * Firestore Profiler — always on, zero config.
+ * Counts every read & write per collection + per API endpoint.
+ * Data stored in Redis hourly buckets (48h TTL).
+ * View via: GET /api/super-admin/firestore-usage
  */
 
 const { AsyncLocalStorage } = require('node:async_hooks');
 const { kvGet, kvSet, kvDel } = require('./kvCache');
 
-let enabled = false;
 let patched = false;
-
-// AsyncLocalStorage to track which API endpoint is currently executing
 const requestContext = new AsyncLocalStorage();
 
-// In-memory buffers — flushed to Redis periodically
-const readBuffer = {};     // { collectionName: count }
-const writeBuffer = {};    // { collectionName: count }
-const endpointBuffer = {}; // { "METHOD /path": { reads: N, writes: N, cols: { col: [reads, writes] } } }
+// In-memory buffers — flushed to Redis every 10s
+const readBuffer = {};
+const writeBuffer = {};
+const endpointBuffer = {};
 let lastFlush = Date.now();
-const FLUSH_INTERVAL_MS = 10_000;
 
 function getHourKey(type) {
   const now = new Date();
@@ -40,60 +28,43 @@ function getHourKey(type) {
 
 function extractCollection(path) {
   if (!path) return 'unknown';
-  const first = path.split('/')[0];
-  return first || 'unknown';
+  return path.split('/')[0] || 'unknown';
 }
 
-/**
- * Get a normalized endpoint key from the current request.
- * Uses req.route.path (Express matched pattern) when available,
- * otherwise normalizes the URL by replacing dynamic IDs with :id.
- */
 function getEndpointKey() {
   const req = requestContext.getStore();
   if (!req) return null;
   const method = req.method || 'GET';
-  // Express route pattern (most accurate — gives /api/orders/:restaurantId)
   if (req.route && req.route.path) {
-    const base = req.baseUrl || '';
-    return `${method} ${base}${req.route.path}`;
+    return `${method} ${req.baseUrl || ''}${req.route.path}`;
   }
-  // Fallback: normalize path by replacing dynamic segments
   let path = (req.originalUrl || req.path || '/').split('?')[0];
   path = path
-    .replace(/\/[a-zA-Z0-9_-]{20,}/g, '/:id')     // Firestore doc IDs (20+ alphanumeric)
-    .replace(/\/[0-9a-f]{8}-[0-9a-f]{4}-/g, '/:id') // UUIDs
-    .replace(/\/\d{10,}/g, '/:id');                  // Timestamps
+    .replace(/\/[a-zA-Z0-9_-]{20,}/g, '/:id')
+    .replace(/\/[0-9a-f]{8}-[0-9a-f]{4}-/g, '/:id')
+    .replace(/\/\d{10,}/g, '/:id');
   return `${method} ${path}`;
 }
 
 function track(buf, collection, count, isWrite) {
-  if (!enabled || count <= 0) return;
+  if (count <= 0) return;
   buf[collection] = (buf[collection] || 0) + count;
 
-  // Also track per-endpoint
   const ep = getEndpointKey();
   if (ep) {
     if (!endpointBuffer[ep]) endpointBuffer[ep] = { reads: 0, writes: 0, cols: {} };
-    if (isWrite) {
-      endpointBuffer[ep].writes += count;
-    } else {
-      endpointBuffer[ep].reads += count;
-    }
+    if (isWrite) endpointBuffer[ep].writes += count;
+    else endpointBuffer[ep].reads += count;
     if (!endpointBuffer[ep].cols[collection]) endpointBuffer[ep].cols[collection] = [0, 0];
     endpointBuffer[ep].cols[collection][isWrite ? 1 : 0] += count;
   }
 
-  // Flush if interval elapsed
-  if (Date.now() - lastFlush > FLUSH_INTERVAL_MS) {
-    flushToRedis();
-  }
+  if (Date.now() - lastFlush > 10_000) flushToRedis();
 }
 
 async function flushBuffer(buf, type) {
   const snapshot = { ...buf };
   for (const key of Object.keys(buf)) delete buf[key];
-
   if (Object.keys(snapshot).length === 0) return;
 
   try {
@@ -119,7 +90,6 @@ async function flushBuffer(buf, type) {
 async function flushEndpointBuffer() {
   const snapshot = { ...endpointBuffer };
   for (const key of Object.keys(endpointBuffer)) delete endpointBuffer[key];
-
   if (Object.keys(snapshot).length === 0) return;
 
   try {
@@ -138,13 +108,12 @@ async function flushEndpointBuffer() {
       }
     }
 
-    // Cap: keep only top 100 endpoints per hour to avoid Redis bloat
+    // Cap: top 100 endpoints, top 15 collections per endpoint
     const entries = Object.entries(merged);
     if (entries.length > 100) {
       entries.sort((a, b) => (b[1].reads + b[1].writes) - (a[1].reads + a[1].writes));
       const trimmed = {};
       for (const [ep, val] of entries.slice(0, 100)) {
-        // Cap: top 15 collections per endpoint
         const colEntries = Object.entries(val.cols).sort((a, b) => (b[1][0] + b[1][1]) - (a[1][0] + a[1][1]));
         const trimmedCols = {};
         for (const [col, rw] of colEntries.slice(0, 15)) trimmedCols[col] = rw;
@@ -175,24 +144,14 @@ async function flushToRedis() {
   ]);
 }
 
-/**
- * Express middleware — wraps each request in AsyncLocalStorage context.
- * Add AFTER route matching or as early as possible.
- * Usage: app.use(profilerMiddleware);
- */
+// Express middleware — wraps request in AsyncLocalStorage for endpoint tracking
 function profilerMiddleware(req, res, next) {
-  if (!enabled) return next();
   requestContext.run(req, next);
 }
 
-/**
- * Enable the profiler by patching Firestore SDK prototypes.
- */
+// Patch Firestore SDK to intercept all reads and writes
 function enableProfiler(db) {
-  if (patched) {
-    enabled = true;
-    return;
-  }
+  if (patched) return;
 
   try {
     const tempCol = db.collection('__profiler_init__');
@@ -203,62 +162,45 @@ function enableProfiler(db) {
     const DocRefProto = Object.getPrototypeOf(tempDoc);
     const FirestoreProto = Object.getPrototypeOf(db);
 
-    // ─── READ PATCHES ──────────────────────────────────────────────
-
+    // --- READ patches ---
     const origQueryGet = QueryProto.get;
     const origDocGet = DocRefProto.get;
     const origGetAll = FirestoreProto.getAll;
 
     QueryProto.get = async function (...args) {
       const result = await origQueryGet.apply(this, args);
-      if (enabled) {
-        try {
-          let col = 'unknown';
-          if (this._queryOptions && this._queryOptions.collectionId) {
-            col = this._queryOptions.collectionId;
-          } else if (typeof this.path === 'string') {
-            col = extractCollection(this.path);
-          } else if (this._path && this._path.segments) {
-            col = this._path.segments[0] || 'unknown';
-          }
-          track(readBuffer, col, Math.max(1, result.size || 0), false);
-        } catch (e) { /* silent */ }
-      }
+      try {
+        let col = 'unknown';
+        if (this._queryOptions && this._queryOptions.collectionId) col = this._queryOptions.collectionId;
+        else if (typeof this.path === 'string') col = extractCollection(this.path);
+        else if (this._path && this._path.segments) col = this._path.segments[0] || 'unknown';
+        track(readBuffer, col, Math.max(1, result.size || 0), false);
+      } catch (e) { /* silent */ }
       return result;
     };
 
     DocRefProto.get = async function (...args) {
       const result = await origDocGet.apply(this, args);
-      if (enabled) {
-        try {
-          track(readBuffer, extractCollection(this.path), 1, false);
-        } catch (e) { /* silent */ }
-      }
+      try { track(readBuffer, extractCollection(this.path), 1, false); } catch (e) { /* silent */ }
       return result;
     };
 
     if (origGetAll) {
       FirestoreProto.getAll = async function (...args) {
         const result = await origGetAll.apply(this, args);
-        if (enabled) {
-          try {
-            const refs = args.filter(a => a && typeof a.path === 'string');
-            const cols = {};
-            refs.forEach(ref => {
-              const col = extractCollection(ref.path);
-              cols[col] = (cols[col] || 0) + 1;
-            });
-            for (const [col, count] of Object.entries(cols)) {
-              track(readBuffer, col, count, false);
-            }
-          } catch (e) { /* silent */ }
-        }
+        try {
+          const cols = {};
+          args.filter(a => a && typeof a.path === 'string').forEach(ref => {
+            const col = extractCollection(ref.path);
+            cols[col] = (cols[col] || 0) + 1;
+          });
+          for (const [col, count] of Object.entries(cols)) track(readBuffer, col, count, false);
+        } catch (e) { /* silent */ }
         return result;
       };
     }
 
-    // ─── WRITE PATCHES ─────────────────────────────────────────────
-
+    // --- WRITE patches ---
     const origDocSet = DocRefProto.set;
     const origDocUpdate = DocRefProto.update;
     const origDocDelete = DocRefProto.delete;
@@ -266,34 +208,26 @@ function enableProfiler(db) {
 
     DocRefProto.set = async function (...args) {
       const result = await origDocSet.apply(this, args);
-      if (enabled) {
-        try { track(writeBuffer, extractCollection(this.path), 1, true); } catch (e) { /* silent */ }
-      }
+      try { track(writeBuffer, extractCollection(this.path), 1, true); } catch (e) { /* silent */ }
       return result;
     };
 
     DocRefProto.update = async function (...args) {
       const result = await origDocUpdate.apply(this, args);
-      if (enabled) {
-        try { track(writeBuffer, extractCollection(this.path), 1, true); } catch (e) { /* silent */ }
-      }
+      try { track(writeBuffer, extractCollection(this.path), 1, true); } catch (e) { /* silent */ }
       return result;
     };
 
     DocRefProto.delete = async function (...args) {
       const result = await origDocDelete.apply(this, args);
-      if (enabled) {
-        try { track(writeBuffer, extractCollection(this.path), 1, true); } catch (e) { /* silent */ }
-      }
+      try { track(writeBuffer, extractCollection(this.path), 1, true); } catch (e) { /* silent */ }
       return result;
     };
 
     if (origDocCreate) {
       DocRefProto.create = async function (...args) {
         const result = await origDocCreate.apply(this, args);
-        if (enabled) {
-          try { track(writeBuffer, extractCollection(this.path), 1, true); } catch (e) { /* silent */ }
-        }
+        try { track(writeBuffer, extractCollection(this.path), 1, true); } catch (e) { /* silent */ }
         return result;
       };
     }
@@ -302,35 +236,22 @@ function enableProfiler(db) {
     if (origColAdd) {
       ColRefProto.add = async function (...args) {
         const result = await origColAdd.apply(this, args);
-        if (enabled) {
-          try {
-            const col = typeof this.path === 'string' ? extractCollection(this.path) : (this.id || 'unknown');
-            track(writeBuffer, col, 1, true);
-          } catch (e) { /* silent */ }
-        }
+        try {
+          const col = typeof this.path === 'string' ? extractCollection(this.path) : (this.id || 'unknown');
+          track(writeBuffer, col, 1, true);
+        } catch (e) { /* silent */ }
         return result;
       };
     }
 
     patched = true;
-    enabled = true;
-    console.log('📊 Firestore profiler: ENABLED (tracking reads + writes + endpoints)');
+    console.log('Firestore profiler: active');
   } catch (err) {
-    console.error('📊 Firestore profiler: failed to patch —', err.message);
+    console.error('Firestore profiler failed:', err.message);
   }
 }
 
-function disableProfiler() {
-  enabled = false;
-  flushToRedis().catch(() => {});
-  console.log('📊 Firestore profiler: DISABLED');
-}
-
-function isEnabled() {
-  return enabled;
-}
-
-// ─── Reports ────────────────────────────────────────────────────────
+// --- Reports ---
 
 async function getReportForType(type, lastNHours) {
   const indexKey = `fsprof:${type}:index`;
@@ -367,8 +288,7 @@ async function getEndpointReport(lastNHours) {
   const index = await kvGet(indexKey);
   const hourKeys = Array.isArray(index) ? index.slice(-lastNHours) : [];
 
-  const totals = {}; // { endpoint: { reads, writes, cols: { col: [r, w] } } }
-
+  const totals = {};
   const hourDataArray = await Promise.all(hourKeys.map(k => kvGet(k)));
   for (const data of hourDataArray) {
     if (!data || typeof data !== 'object') continue;
@@ -389,38 +309,32 @@ async function getEndpointReport(lastNHours) {
     }
   }
 
-  // Sort endpoints by total operations descending
-  const sorted = Object.entries(totals)
-    .sort((a, b) => (b[1].reads + b[1].writes) - (a[1].reads + a[1].writes));
-
-  return sorted.map(([endpoint, data]) => {
-    // Sort collections within endpoint by total ops
-    const colsSorted = Object.entries(data.cols)
-      .sort((a, b) => (b[1][0] + b[1][1]) - (a[1][0] + a[1][1]))
-      .map(([col, rw]) => ({ collection: col, reads: rw[0], writes: rw[1] }));
-    return { endpoint, reads: data.reads, writes: data.writes, total: data.reads + data.writes, collections: colsSorted };
-  });
+  return Object.entries(totals)
+    .sort((a, b) => (b[1].reads + b[1].writes) - (a[1].reads + a[1].writes))
+    .map(([endpoint, data]) => {
+      const collections = Object.entries(data.cols)
+        .sort((a, b) => (b[1][0] + b[1][1]) - (a[1][0] + a[1][1]))
+        .map(([col, rw]) => ({ collection: col, reads: rw[0], writes: rw[1] }));
+      return { endpoint, reads: data.reads, writes: data.writes, total: data.reads + data.writes, collections };
+    });
 }
 
 async function getReport(lastNHours = 24) {
   await flushToRedis();
-
   try {
     const [reads, writes, endpoints] = await Promise.all([
       getReportForType('reads', lastNHours),
       getReportForType('writes', lastNHours),
       getEndpointReport(lastNHours)
     ]);
-
     return {
-      enabled,
       hoursTracked: Math.max(reads.hourly.length, writes.hourly.length),
       reads: { total: reads.total, byCollection: reads.byCollection, hourly: reads.hourly },
       writes: { total: writes.total, byCollection: writes.byCollection, hourly: writes.hourly },
       endpoints
     };
   } catch (err) {
-    return { enabled, error: err.message, reads: { total: 0, byCollection: {} }, writes: { total: 0, byCollection: {} }, endpoints: [] };
+    return { error: err.message, reads: { total: 0, byCollection: {}, hourly: [] }, writes: { total: 0, byCollection: {}, hourly: [] }, endpoints: [] };
   }
 }
 
@@ -429,9 +343,7 @@ async function clearReport() {
     for (const type of ['reads', 'writes', 'ep']) {
       const indexKey = `fsprof:${type}:index`;
       const index = await kvGet(indexKey);
-      if (Array.isArray(index)) {
-        await Promise.all(index.map(k => kvDel(k)));
-      }
+      if (Array.isArray(index)) await Promise.all(index.map(k => kvDel(k)));
       await kvDel(indexKey);
     }
     for (const key of Object.keys(readBuffer)) delete readBuffer[key];
@@ -440,12 +352,4 @@ async function clearReport() {
   } catch (err) { /* silent */ }
 }
 
-module.exports = {
-  enableProfiler,
-  disableProfiler,
-  isEnabled,
-  getReport,
-  clearReport,
-  flushToRedis,
-  profilerMiddleware,
-};
+module.exports = { enableProfiler, getReport, clearReport, flushToRedis, profilerMiddleware };

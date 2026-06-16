@@ -129,15 +129,12 @@ const performanceOptimizer = require('./middleware/performanceOptimizer');
 const firestoreOptimizer = require('./utils/firestoreOptimizer');
 const { kvGet, kvSet, kvDel, getCachedRestaurant, invalidateRestaurantCache, invalidateUserCache } = require('./utils/kvCache');
 
-// Firestore read profiler — auto-enable via FIRESTORE_PROFILER=true env var, or toggle from admin panel
-if (process.env.FIRESTORE_PROFILER === 'true') {
-  try {
-    const { enableProfiler } = require('./utils/firestoreProfiler');
-    enableProfiler(db);
-    console.log('Firestore profiler auto-enabled via env var');
-  } catch (err) {
-    console.error('Failed to enable Firestore profiler:', err.message);
-  }
+// Firestore profiler — always on, tracks reads/writes per collection and endpoint
+try {
+  const { enableProfiler } = require('./utils/firestoreProfiler');
+  enableProfiler(db);
+} catch (err) {
+  console.error('Firestore profiler init error:', err.message);
 }
 
 /**
