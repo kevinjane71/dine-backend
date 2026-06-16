@@ -2308,57 +2308,85 @@ router.get('/firestore-usage', authenticateSuperAdmin, async (req, res) => {
 const whatsappService = require('../services/whatsappService');
 
 // GET /api/super-admin/whatsapp/conversations — list conversations grouped by phone
+// Only shows real conversations (incoming messages + manual replies), NOT automated bills/alerts
 router.get('/whatsapp/conversations', authenticateSuperAdmin, requireSuperAdmin, async (req, res) => {
   try {
-    const limit = Math.min(parseInt(req.query.limit) || 500, 1000);
-    let query = db.collection(collections.automationLogs)
+    // Fetch incoming messages (people who messaged the DineOpen number)
+    const incomingSnap = await db.collection(collections.automationLogs)
+      .where('type', '==', 'incoming')
       .orderBy('timestamp', 'desc')
-      .limit(limit);
+      .limit(500)
+      .get();
 
-    const snapshot = await query.get();
+    // Also fetch manual replies from super-admin (type: 'reply', restaurantId: null)
+    const repliesSnap = await db.collection(collections.automationLogs)
+      .where('type', '==', 'reply')
+      .orderBy('timestamp', 'desc')
+      .limit(200)
+      .get();
+
     const convosMap = {};
+    const allDocs = [...incomingSnap.docs, ...repliesSnap.docs];
 
-    snapshot.docs.forEach(doc => {
+    allDocs.forEach(doc => {
       const d = doc.data();
       const phone = d.phone || d.customerPhone;
       if (!phone) return;
+
+      const ts = toISO(d.timestamp);
+      const isIncoming = d.type === 'incoming' || d.direction === 'incoming';
+
       if (!convosMap[phone]) {
         convosMap[phone] = {
           phone,
           contactName: d.contactName || d.customerName || '',
           lastMessage: d.message || '',
-          lastTimestamp: toISO(d.timestamp),
-          lastDirection: d.direction || d.type || '',
+          lastTimestamp: ts,
+          lastDirection: isIncoming ? 'incoming' : 'outgoing',
           unreadCount: 0,
           sessionActive: false,
           lastIncomingAt: null,
-          restaurantId: d.restaurantId || null,
+          hasIncoming: false,
         };
       }
+
+      // Update last message if this one is newer
+      if (ts && (!convosMap[phone].lastTimestamp || ts > convosMap[phone].lastTimestamp)) {
+        convosMap[phone].lastMessage = d.message || '';
+        convosMap[phone].lastTimestamp = ts;
+        convosMap[phone].lastDirection = isIncoming ? 'incoming' : 'outgoing';
+      }
+
       // Update contact name if empty
       if (!convosMap[phone].contactName && (d.contactName || d.customerName)) {
         convosMap[phone].contactName = d.contactName || d.customerName;
       }
+
       // Count unread incoming
-      if ((d.type === 'incoming' || d.direction === 'incoming') && d.status !== 'read_by_staff') {
+      if (isIncoming && d.status !== 'read_by_staff') {
         convosMap[phone].unreadCount++;
       }
+
       // Track last incoming message time
-      if (d.type === 'incoming' || d.direction === 'incoming') {
-        const ts = toDate(d.timestamp);
-        if (ts && (!convosMap[phone].lastIncomingAt || ts > convosMap[phone].lastIncomingAt)) {
-          convosMap[phone].lastIncomingAt = ts;
+      if (isIncoming) {
+        convosMap[phone].hasIncoming = true;
+        const tsDate = toDate(d.timestamp);
+        if (tsDate && (!convosMap[phone].lastIncomingAt || tsDate > convosMap[phone].lastIncomingAt)) {
+          convosMap[phone].lastIncomingAt = tsDate;
         }
       }
     });
 
-    // Compute sessionActive (24h window)
+    // Compute sessionActive + only show conversations that have at least one incoming message
     const now = Date.now();
-    const conversations = Object.values(convosMap).map(c => {
-      c.sessionActive = c.lastIncomingAt ? (now - c.lastIncomingAt.getTime() < 24 * 60 * 60 * 1000) : false;
-      delete c.lastIncomingAt;
-      return c;
-    });
+    const conversations = Object.values(convosMap)
+      .filter(c => c.hasIncoming)
+      .map(c => {
+        c.sessionActive = c.lastIncomingAt ? (now - c.lastIncomingAt.getTime() < 24 * 60 * 60 * 1000) : false;
+        delete c.lastIncomingAt;
+        delete c.hasIncoming;
+        return c;
+      });
 
     // Sort by lastTimestamp desc
     conversations.sort((a, b) => (b.lastTimestamp || '').localeCompare(a.lastTimestamp || ''));
@@ -2371,22 +2399,37 @@ router.get('/whatsapp/conversations', authenticateSuperAdmin, requireSuperAdmin,
 });
 
 // GET /api/super-admin/whatsapp/messages/:phone — full chat thread
+// Only shows real conversation messages (incoming + replies), not automated bills/alerts
 router.get('/whatsapp/messages/:phone', authenticateSuperAdmin, requireSuperAdmin, async (req, res) => {
   try {
     const phone = req.params.phone;
     const limit = Math.min(parseInt(req.query.limit) || 200, 500);
 
-    const snapshot = await db.collection(collections.automationLogs)
+    // Fetch incoming messages from this phone
+    const incomingSnap = await db.collection(collections.automationLogs)
       .where('phone', '==', phone)
+      .where('type', '==', 'incoming')
       .orderBy('timestamp', 'asc')
       .limit(limit)
       .get();
 
+    // Fetch manual replies TO this phone
+    const repliesSnap = await db.collection(collections.automationLogs)
+      .where('phone', '==', phone)
+      .where('type', '==', 'reply')
+      .orderBy('timestamp', 'asc')
+      .limit(limit)
+      .get();
+
+    // Merge and sort chronologically
+    const allDocs = [...incomingSnap.docs, ...repliesSnap.docs];
     let lastIncomingAt = null;
-    const messages = snapshot.docs.map(doc => {
+
+    const messages = allDocs.map(doc => {
       const d = doc.data();
       const ts = toDate(d.timestamp);
-      if ((d.type === 'incoming' || d.direction === 'incoming') && ts) {
+      const isIncoming = d.type === 'incoming' || d.direction === 'incoming';
+      if (isIncoming && ts) {
         if (!lastIncomingAt || ts > lastIncomingAt) lastIncomingAt = ts;
       }
       return {
@@ -2395,7 +2438,7 @@ router.get('/whatsapp/messages/:phone', authenticateSuperAdmin, requireSuperAdmi
         contactName: d.contactName || d.customerName || '',
         message: d.message || '',
         messageType: d.messageType || d.incomingType || 'text',
-        direction: d.direction || (d.type === 'incoming' ? 'incoming' : 'outgoing'),
+        direction: isIncoming ? 'incoming' : 'outgoing',
         type: d.type || '',
         status: d.status || '',
         timestamp: toISO(d.timestamp),
@@ -2407,15 +2450,12 @@ router.get('/whatsapp/messages/:phone', authenticateSuperAdmin, requireSuperAdmi
         caption: d.caption || null,
         sentByName: d.sentByName || null,
       };
-    });
+    }).sort((a, b) => (a.timestamp || '').localeCompare(b.timestamp || ''));
 
     const sessionActive = lastIncomingAt ? (Date.now() - lastIncomingAt.getTime() < 24 * 60 * 60 * 1000) : false;
 
     // Auto mark-read
-    const unreadDocs = snapshot.docs.filter(doc => {
-      const d = doc.data();
-      return (d.type === 'incoming' || d.direction === 'incoming') && d.status !== 'read_by_staff';
-    });
+    const unreadDocs = incomingSnap.docs.filter(doc => doc.data().status !== 'read_by_staff');
     if (unreadDocs.length > 0) {
       const batch = db.batch();
       unreadDocs.forEach(doc => batch.update(doc.ref, { status: 'read_by_staff' }));
