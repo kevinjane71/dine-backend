@@ -1,27 +1,20 @@
 /**
- * Firestore Daily Counter — simple read/write count per day.
+ * Firestore Daily Counter — simple daily read/write totals.
  *
- * Monkey-patches Firestore SDK, counts in memory per request,
- * flushes to ONE Redis key per day at end of each request.
- *
- * Redis cost: 2 calls per request (1 kvGet + 1 kvSet).
- * ~2,000-10,000 Redis calls/day depending on traffic.
+ * Uses atomic Redis INCRBY — no race conditions on serverless.
+ * 2 Redis keys per day: fscount:r:YYYY-MM-DD and fscount:w:YYYY-MM-DD
+ * 2 Redis calls per request (one INCRBY for reads, one for writes).
  */
 
-const { kvGet, kvSet } = require('./kvCache');
+const { kvIncrBy, kvGet } = require('./kvCache');
 
 let patched = false;
-
-// Per-request counters (reset each request)
 let reqReads = 0;
 let reqWrites = 0;
 
-function getDateKey() {
-  const now = new Date();
-  const yyyy = now.getUTCFullYear();
-  const mm = String(now.getUTCMonth() + 1).padStart(2, '0');
-  const dd = String(now.getUTCDate()).padStart(2, '0');
-  return `fscount:${yyyy}-${mm}-${dd}`;
+function todayStr() {
+  const d = new Date();
+  return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}-${String(d.getUTCDate()).padStart(2, '0')}`;
 }
 
 async function flushToRedis() {
@@ -32,35 +25,29 @@ async function flushToRedis() {
   if (r === 0 && w === 0) return;
 
   try {
-    const key = getDateKey();
-    const current = await kvGet(key);
-    const data = current && typeof current === 'object' ? current : { r: 0, w: 0 };
-    data.r += r;
-    data.w += w;
-    await kvSet(key, data, 604800); // 7 day TTL
-  } catch (e) { /* silent — never block requests */ }
+    const date = todayStr();
+    const ttl = 2592000; // 30 days
+    if (r > 0) await kvIncrBy(`fscount:r:${date}`, r, ttl);
+    if (w > 0) await kvIncrBy(`fscount:w:${date}`, w, ttl);
+  } catch (e) { /* silent */ }
 }
 
-// Express middleware — flush counts at end of each request
 function profilerMiddleware(req, res, next) {
   res.on('finish', () => { flushToRedis().catch(() => {}); });
   next();
 }
 
-// Patch Firestore SDK to count reads and writes
 function enableProfiler(db) {
   if (patched) return;
 
   try {
     const tempCol = db.collection('__profiler_init__');
     const tempDoc = tempCol.doc('__temp__');
-
     const ColRefProto = Object.getPrototypeOf(tempCol);
     const QueryProto = Object.getPrototypeOf(ColRefProto);
     const DocRefProto = Object.getPrototypeOf(tempDoc);
     const FirestoreProto = Object.getPrototypeOf(db);
 
-    // --- READ patches ---
     const origQueryGet = QueryProto.get;
     QueryProto.get = async function (...args) {
       const result = await origQueryGet.apply(this, args);
@@ -84,7 +71,6 @@ function enableProfiler(db) {
       };
     }
 
-    // --- WRITE patches ---
     const origDocSet = DocRefProto.set;
     DocRefProto.set = async function (...args) {
       const result = await origDocSet.apply(this, args);
@@ -131,27 +117,24 @@ function enableProfiler(db) {
   }
 }
 
-// Get daily counts for last N days
 async function getDailyCounts(days = 7) {
   try {
-    const keys = [];
+    const dates = [];
     for (let i = 0; i < days; i++) {
       const d = new Date();
       d.setUTCDate(d.getUTCDate() - i);
-      const yyyy = d.getUTCFullYear();
-      const mm = String(d.getUTCMonth() + 1).padStart(2, '0');
-      const dd = String(d.getUTCDate()).padStart(2, '0');
-      keys.push(`fscount:${yyyy}-${mm}-${dd}`);
+      dates.push(`${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}-${String(d.getUTCDate()).padStart(2, '0')}`);
     }
 
-    const results = await Promise.all(keys.map(k => kvGet(k)));
-    const daily = [];
-    for (let i = 0; i < keys.length; i++) {
-      const date = keys[i].replace('fscount:', '');
-      const data = results[i] && typeof results[i] === 'object' ? results[i] : { r: 0, w: 0 };
-      daily.push({ date, reads: data.r || 0, writes: data.w || 0 });
-    }
-    return daily;
+    const results = await Promise.all(
+      dates.flatMap(date => [kvGet(`fscount:r:${date}`), kvGet(`fscount:w:${date}`)])
+    );
+
+    return dates.map((date, i) => ({
+      date,
+      reads: Number(results[i * 2]) || 0,
+      writes: Number(results[i * 2 + 1]) || 0,
+    }));
   } catch (err) {
     return [];
   }

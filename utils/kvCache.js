@@ -91,6 +91,25 @@ async function kvDel(key) {
 }
 
 /**
+ * Atomic increment — no race condition on serverless.
+ * Returns new value after increment.
+ */
+async function kvIncrBy(key, amount, ttlSeconds) {
+  try {
+    const client = getRedis();
+    if (!client) return 0;
+    const result = await withTimeout(client.incrby(key, amount), 2000);
+    if (ttlSeconds && result === amount) {
+      // First increment — set TTL (only when result equals amount, meaning key was new)
+      await withTimeout(client.expire(key, ttlSeconds), 1000);
+    }
+    return result || 0;
+  } catch (err) {
+    return 0;
+  }
+}
+
+/**
  * Get restaurant doc with KV caching (3 min TTL)
  */
 async function getCachedRestaurant(db, collection, restaurantId) {
@@ -177,6 +196,7 @@ module.exports = {
   kvGet,
   kvSet,
   kvDel,
+  kvIncrBy,
   getCachedRestaurant,
   getCachedRestDoc,
   invalidateRestaurantCache,
