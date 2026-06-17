@@ -9446,7 +9446,19 @@ app.post('/api/orders', async (req, res) => {
         return res.status(400).json({ error: `Invalid quantity for item "${menuItem.name}": quantity must be positive` });
       }
       const itemQuantity = Math.max(1, parsedQty || 1);
-      const itemTotal = unitPrice * itemQuantity;
+
+      // Weight-based item: calculate total using weight instead of quantity
+      const isSoldByWeight = menuItem.soldByWeight === true && typeof item.itemWeight === 'number' && item.itemWeight > 0;
+      const itemWeight = isSoldByWeight ? item.itemWeight : 0;
+      const priceUnit = isSoldByWeight ? (item.priceUnit || menuItem.priceUnit || 'per_kg') : null;
+      const weightUnit = isSoldByWeight ? (item.weightUnit || menuItem.weightUnit || 'kg') : null;
+      let itemTotal;
+      if (isSoldByWeight) {
+        const wt = priceUnit === 'per_100g' ? itemWeight / 100 : itemWeight;
+        itemTotal = unitPrice * wt;
+      } else {
+        itemTotal = unitPrice * itemQuantity;
+      }
       totalAmount += itemTotal;
 
       orderItems.push({
@@ -9483,6 +9495,13 @@ app.post('/api/orders', async (req, res) => {
         // (variant price or base menu price), NOT when variant selection changes the price
         menuPrice: allowPriceEdit && unitPrice !== expectedUnitPrice ? expectedMenuPrice : null,
         priceEdited: allowPriceEdit && unitPrice !== expectedUnitPrice,
+        // Weight-based item fields (for bill templates to show weight & calculated price)
+        ...(isSoldByWeight ? {
+          soldByWeight: true,
+          itemWeight: itemWeight,
+          priceUnit: priceUnit,
+          weightUnit: weightUnit,
+        } : {}),
       });
     }
 
@@ -12929,10 +12948,22 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
           throw new Error(`Invalid quantity for item "${cleanItem.name || menuItem?.name}": quantity must be positive`);
         }
         const itemQuantity = Math.max(1, parsedQtyPatch || 1);
+
+        // Weight-based item total calculation
+        const isSoldByWeightPatch = (cleanItem.soldByWeight || menuItem?.soldByWeight) && typeof cleanItem.itemWeight === 'number' && cleanItem.itemWeight > 0;
+        const patchPriceUnit = cleanItem.priceUnit || menuItem?.priceUnit || 'per_kg';
+        let patchItemTotal;
+        if (isSoldByWeightPatch) {
+          const wt = patchPriceUnit === 'per_100g' ? cleanItem.itemWeight / 100 : cleanItem.itemWeight;
+          patchItemTotal = resolvedUnitPrice * wt;
+        } else {
+          patchItemTotal = resolvedUnitPrice * itemQuantity;
+        }
+
         const itemWithTotals = {
           ...cleanItem,
           price: resolvedUnitPrice,
-          total: resolvedUnitPrice * itemQuantity,
+          total: patchItemTotal,
           selectedVariant: selectedVariant ? { name: selectedVariant.name, price: selectedVariant.price || 0 } : null,
           selectedCustomizations: customizations.map(c => ({ id: c.id || null, name: c.name || c, price: typeof c.price === 'number' ? c.price : 0 })),
           // Per-item price edit tracking — only flag genuine manual edits, not variant/rule price differences
@@ -14539,15 +14570,20 @@ async function calculateOrderTotal(items) {
   
   for (const item of items) {
     try {
-      // First try to use the embedded price data from the order item
-      if (item.price && item.quantity) {
-        total += item.price * item.quantity;
-        continue;
-      }
-      
-      // Fallback: try to use the total field if available
+      // First try to use the pre-calculated total (handles weight items correctly)
       if (item.total) {
         total += item.total;
+        continue;
+      }
+
+      // Fallback: use embedded price * quantity
+      if (item.price && item.quantity) {
+        if (item.soldByWeight && item.itemWeight) {
+          const wt = item.priceUnit === 'per_100g' ? item.itemWeight / 100 : item.itemWeight;
+          total += item.price * wt;
+        } else {
+          total += item.price * item.quantity;
+        }
         continue;
       }
       
@@ -20721,7 +20757,13 @@ const assembleBillRenderPayload = (orderId, orderData, restaurantId, restaurantD
   const taxSettings = restaurantData.taxSettings || getDefaultTaxSettings(restaurantData);
 
   const itemsSubtotal = (orderData.items || [])
-    .reduce((sum, it) => sum + ((it.price || 0) * (it.quantity || 1)), 0);
+    .reduce((sum, it) => {
+      if (it.soldByWeight && it.itemWeight) {
+        const wt = it.priceUnit === 'per_100g' ? it.itemWeight / 100 : it.itemWeight;
+        return sum + (it.price || 0) * wt;
+      }
+      return sum + ((it.price || 0) * (it.quantity || 1));
+    }, 0);
   const subtotal = r2(orderData.subtotal || itemsSubtotal);
 
   const discountAmount = r2(orderData.discountAmount);
@@ -32326,11 +32368,22 @@ app.patch('/api/orders/:orderId/edit-completed-items', authenticateToken, async 
       }
       const itemQuantity = Math.max(1, parsedQtyEdit || 1);
 
+      // Weight-based item total calculation
+      const isSoldByWeight = (cleanItem.soldByWeight || menuItem?.soldByWeight) && typeof cleanItem.itemWeight === 'number' && cleanItem.itemWeight > 0;
+      const itemPriceUnit = cleanItem.priceUnit || menuItem?.priceUnit || 'per_kg';
+      let itemTotal;
+      if (isSoldByWeight) {
+        const wt = itemPriceUnit === 'per_100g' ? cleanItem.itemWeight / 100 : cleanItem.itemWeight;
+        itemTotal = resolvedUnitPrice * wt;
+      } else {
+        itemTotal = resolvedUnitPrice * itemQuantity;
+      }
+
       return {
         ...cleanItem,
         name: cleanItem.name || menuItem?.name || 'Unknown Item',
         price: resolvedUnitPrice,
-        total: resolvedUnitPrice * itemQuantity,
+        total: itemTotal,
         quantity: itemQuantity,
         selectedVariant: selectedVariant ? { name: selectedVariant.name, price: selectedVariant.price || 0 } : null,
         selectedCustomizations: customizations.map(c => ({ id: c.id || null, name: c.name || c, price: typeof c.price === 'number' ? c.price : 0 })),
