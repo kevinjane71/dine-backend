@@ -11231,8 +11231,11 @@ app.get('/api/analytics/:restaurantId', authenticateToken, async (req, res) => {
     if (startDate && endDate) {
       let rangeStart, rangeEnd;
       if (tzOffset !== undefined) {
-        rangeStart = dateBoundsInTZ(startDate, tzOffset).start;
-        rangeEnd = dateBoundsInTZ(endDate, tzOffset).end;
+        // Extract YYYY-MM-DD from ISO timestamps (dateBoundsInTZ expects date-only strings)
+        const startDateStr = String(startDate).split('T')[0];
+        const endDateStr = String(endDate).split('T')[0];
+        rangeStart = dateBoundsInTZ(startDateStr, tzOffset, parseDayStart(req)).start;
+        rangeEnd = dateBoundsInTZ(endDateStr, tzOffset, parseDayStart(req)).end;
       } else {
         rangeStart = new Date(startDate); rangeStart.setHours(0, 0, 0, 0);
         rangeEnd = new Date(endDate); rangeEnd.setHours(23, 59, 59, 999);
