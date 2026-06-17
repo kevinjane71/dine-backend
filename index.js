@@ -2593,6 +2593,8 @@ const tryParseStructuredCSV = (buffer, fileName) => {
     const priceKey = findOrig(priceCol);
     const catCol = headers.find(h => /^(category_?name|category|type|group|section)$/i.test(h));
     const catKey = catCol ? findOrig(catCol) : null;
+    const nameArCol = headers.find(h => /^(name_?ar|arabic_?name|arabic|namear)$/i.test(h));
+    const nameArKey = nameArCol ? findOrig(nameArCol) : null;
 
     // Detect variant columns (variant1_name, variant1_price, variant2_name, etc.)
     const variantSets = [];
@@ -2605,7 +2607,7 @@ const tryParseStructuredCSV = (buffer, fileName) => {
     // Detect veg/non-veg heuristic keywords
     const nonVegKeywords = /chicken|mutton|fish|prawn|egg|lamb|pork|beef|meat|keema|gosht|surmai|pomfret|rawas|crab|lobster|shrimp|bacon|sausage|ham|salami|pepperoni/i;
 
-    console.log(`📊 Structured CSV detected: ${rows.length} rows, name="${nameKey}", price="${priceKey}", category="${catKey || 'none'}", variants=${variantSets.length}`);
+    console.log(`📊 Structured CSV detected: ${rows.length} rows, name="${nameKey}", price="${priceKey}", category="${catKey || 'none'}", nameAr="${nameArKey || 'none'}", variants=${variantSets.length}`);
 
     const categoriesMap = new Map();
     const menuItems = [];
@@ -2639,8 +2641,11 @@ const tryParseStructuredCSV = (buffer, fileName) => {
       // Generate imageKeyword
       const imageKeyword = name.toLowerCase().replace(/[^a-z0-9\s]/g, '').trim().split(/\s+/).slice(0, 3).join('-');
 
+      const nameAr = nameArKey ? String(row[nameArKey] || '').trim() : null;
+
       menuItems.push({
         name,
+        nameAr: nameAr || null,
         description: '',
         price,
         category: categoryName,
@@ -15424,6 +15429,7 @@ app.post('/api/menus/bulk-save/:restaurantId', authenticateToken, async (req, re
           id: `item_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
           restaurantId,
           name: item.name || 'Unnamed Item',
+          nameAr: typeof item.nameAr === 'string' && item.nameAr.trim() ? item.nameAr.trim() : null,
           description: item.description || '',
           price: basePrice,
           category: categoryId,
