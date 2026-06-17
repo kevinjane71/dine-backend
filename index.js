@@ -12083,6 +12083,21 @@ app.patch('/api/orders/:orderId/status', authenticateToken, async (req, res) => 
       return res.status(403).json({ error: `Access denied. Orders ${statusOp} permission required.` });
     }
 
+    // Additional billing settings role check for completeBill
+    if (statusOp === 'completeBill') {
+      const userRole = req.user?.role?.toLowerCase();
+      if (userRole !== 'owner' && userRole !== 'admin') {
+        const userRestId = req.user?.restaurantId;
+        if (userRestId) {
+          const restDoc = await db.collection(collections.restaurants).doc(userRestId).get();
+          const completeBillingRoles = restDoc.exists && restDoc.data()?.billingSettings?.completeBillingRoles;
+          if (Array.isArray(completeBillingRoles) && completeBillingRoles.length > 0 && !completeBillingRoles.includes(userRole)) {
+            return res.status(403).json({ error: 'Access denied. Your role is not permitted to complete billing.' });
+          }
+        }
+      }
+    }
+
     const validStatuses = ['pending', 'confirmed', 'preparing', 'ready', 'served', 'completed', 'cancelled', 'deleted'];
 
     if (!validStatuses.includes(status)) {
@@ -17410,11 +17425,14 @@ app.get('/api/staff/:staffId/credentials', authenticateToken, requireOwnerRole, 
         });
       }
     } else {
+      const hasLoginId = !!staffData.loginId;
       res.json({
         loginId: staffData.loginId,
         username: staffData.username || null,
         hasTemporaryPassword: false,
-        message: 'This staff member has already changed their password.'
+        message: hasLoginId
+          ? 'This staff member has already changed their password.'
+          : 'This account uses phone login. No staff credentials available.'
       });
     }
 
@@ -31650,6 +31668,10 @@ app.get('/api/restaurants/:restaurantId/billing-settings', authenticateToken, as
       refundsRoles: Array.isArray(existing.refundsRoles) ? existing.refundsRoles : [],
       customItemRoles: Array.isArray(existing.customItemRoles) ? existing.customItemRoles : [],
       priceEditRoles: Array.isArray(existing.priceEditRoles) ? existing.priceEditRoles : [],
+      // Action button role restrictions
+      completeBillingRoles: Array.isArray(existing.completeBillingRoles) ? existing.completeBillingRoles : [],
+      billAndPrintRoles: Array.isArray(existing.billAndPrintRoles) ? existing.billAndPrintRoles : [],
+      paymentMethodRoles: Array.isArray(existing.paymentMethodRoles) ? existing.paymentMethodRoles : [],
       // Split Bill (divide order among guests)
       splitBillEnabled: existing.splitBillEnabled ?? false,
       splitBillDefaultMethod: ['equal','by-item','by-amount'].includes(existing.splitBillDefaultMethod) ? existing.splitBillDefaultMethod : 'equal',
@@ -31739,6 +31761,16 @@ app.put('/api/restaurants/:restaurantId/billing-settings', authenticateToken, as
         : [],
       priceEditRoles: Array.isArray(settings.priceEditRoles)
         ? settings.priceEditRoles.filter(r => typeof r === 'string' && r.length > 0 && r.length <= 50)
+        : [],
+      // Action button role restrictions (empty array = all roles allowed)
+      completeBillingRoles: Array.isArray(settings.completeBillingRoles)
+        ? settings.completeBillingRoles.filter(r => typeof r === 'string' && r.length > 0 && r.length <= 50)
+        : [],
+      billAndPrintRoles: Array.isArray(settings.billAndPrintRoles)
+        ? settings.billAndPrintRoles.filter(r => typeof r === 'string' && r.length > 0 && r.length <= 50)
+        : [],
+      paymentMethodRoles: Array.isArray(settings.paymentMethodRoles)
+        ? settings.paymentMethodRoles.filter(r => typeof r === 'string' && r.length > 0 && r.length <= 50)
         : [],
       // Split Bill (divide order among guests)
       splitBillEnabled: settings.splitBillEnabled ?? false,
