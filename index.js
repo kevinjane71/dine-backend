@@ -19103,6 +19103,7 @@ app.get('/api/admin/print-settings/:restaurantId', authenticateToken, async (req
       enableUpdateWithoutKOT: false,       // Show "Update Order" button (save without KOT)
       enableKOTAndPrint: false,            // Show "KOT & Print" combined button
       enableSaveAndPrint: false,           // Show "Bill & Print" combined button
+      showPrintNotifications: true,        // Show indicator on desktop terminal for remote print commands
       kotTemplate: 'classic',              // KOT print template: classic, compact, bold, grouped, numbered
       billTemplate: 'classic'              // Bill print template: classic, compact, detailed, elegant, minimal
     };
@@ -19149,7 +19150,8 @@ app.put('/api/admin/print-settings/:restaurantId', authenticateToken, async (req
       'tokenBillingEnabled',
       'enableUpdateWithoutKOT',
       'enableKOTAndPrint',
-      'enableSaveAndPrint'
+      'enableSaveAndPrint',
+      'showPrintNotifications'
     ];
 
     // Numeric fields
