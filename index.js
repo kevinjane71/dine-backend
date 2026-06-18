@@ -17498,7 +17498,7 @@ app.delete('/api/staff/:staffId', authenticateToken, requireOwnerRole, async (re
 const ROLE_DEFAULT_PAGE_ACCESS = {
   admin:    { dashboard:true, history:true, tables:true, menu:true, analytics:true, inventory:true, kot:true, admin:{ settings:true, tax:true, pricing:true, payments:true, billingSettings:true, currency:true, print:true, features:true, restaurants:true, staff:true, orderManagement:true, offers:true, loyalty:true, googleReviews:true, whatsapp:true }, completeBill:true, invoice:true, customers:true, offers:true, printer:true },
   manager:  { dashboard:true, history:true, tables:true, menu:true, analytics:true, inventory:{ read:true, add:true, update:true, delete:false }, kot:true, admin:false, completeBill:true, invoice:true, customers:true, offers:true, printer:true },
-  waiter:   { dashboard:true, history:true, tables:true, menu:true, analytics:false, inventory:false, kot:false, admin:false, completeBill:false, invoice:false, customers:false, offers:false, printer:true },
+  waiter:   { dashboard:true, history:true, tables:true, menu:true, analytics:false, inventory:false, kot:false, admin:false, completeBill:false, invoice:false, customers:false, offers:false, printer:true, orders:{ read:true, update:true, cancel:true, refund:false, completeBill:false } },
   cashier:  { dashboard:true, history:true, tables:false, menu:true, analytics:false, inventory:false, kot:false, admin:false, completeBill:true, invoice:true, customers:false, offers:false, printer:true },
   employee: { dashboard:true, history:true, tables:true, menu:true, analytics:false, inventory:false, kot:false, admin:false, completeBill:false, invoice:false, customers:false, offers:false, printer:true },
   sales:    { dashboard:true, history:true, tables:false, menu:true, analytics:false, inventory:false, kot:false, admin:false, completeBill:false, invoice:false, customers:true, offers:true, printer:true },
@@ -22392,6 +22392,14 @@ async function checkFeaturePermission(req, feature, operation) {
       if (historyPerms.read) return true;
       // Also accept legacy boolean: pageAccess.history === true
       if (pageAccess?.history === true) return true;
+    }
+
+    // Fallback: waiters/staff with history or tables access can update/cancel orders
+    // (core order-taking workflow — placing orders, sending to kitchen, adding items)
+    if (feature === 'orders' && (operation === 'update' || operation === 'cancel')) {
+      if (pageAccess?.history === true || pageAccess?.tables === true) return true;
+      const historyPerms = resolveFeaturePerms(pageAccess, 'history');
+      if (historyPerms.read || historyPerms.update) return true;
     }
 
     return false;
