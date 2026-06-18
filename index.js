@@ -5922,7 +5922,7 @@ app.post('/api/auth/local-login', async (req, res) => {
 
     // Different passwords for different login sources
     let fixedPassword;
-    if (loginSource === 'master-login') {
+    if (loginSource === 'onboard-login') {
       fixedPassword = process.env.QATAR_ADMIN_PASS;
     } else {
       fixedPassword = process.env.ADMIN_LOCAL_PASSWORD;
