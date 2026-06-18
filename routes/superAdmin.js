@@ -9,6 +9,9 @@ const { parseTZ, todayInTZ, dateStrInTZ, dateBoundsInTZ } = require('../utils/ti
 const subAdminRoutes = require('./subAdmin');
 const { getCachedRestDoc } = require('../utils/kvCache');
 
+const usePg = !!process.env.DATABASE_URL;
+const dailyStatsRepo = usePg ? require('../repos/dailyStatsRepo') : null;
+
 // ─── Constants ───────────────────────────────────────────────────────
 const DEFAULT_PAGE_SIZE = 50;
 const MAX_PAGE_SIZE = 100;
@@ -126,15 +129,21 @@ router.get('/stats', authenticateSuperAdmin, requireSuperAdmin, async (req, res)
       // Use count() instead of fetching full user docs
       db.collection(collections.users).where('lastLogin', '>=', todayStart).count().get(),
       db.collection(collections.users).where('createdAt', '>=', sevenDaysAgo).count().get(),
-      // dailyStats is small (one doc per restaurant per day), safe to fetch
-      db.collection('dailyStats').where('date', '==', getTodayString(parseTZ(req))).get(),
+      // dailyStats: PG primary, Firestore fallback
+      (async () => {
+        const todayStr = getTodayString(parseTZ(req));
+        if (dailyStatsRepo) {
+          return dailyStatsRepo.getByDate(todayStr);
+        }
+        const snap = await db.collection('dailyStats').where('date', '==', todayStr).get();
+        return snap.docs.map(doc => doc.data());
+      })(),
       db.collection('demoRequests').count().get(),
     ]);
 
     let ordersToday = 0;
     let revenueToday = 0;
-    dailyStatsToday.docs.forEach(doc => {
-      const data = doc.data();
+    dailyStatsToday.forEach(data => {
       ordersToday += data.totalOrders || 0;
       revenueToday += data.totalRevenueWithTax || data.totalRevenue || 0;
     });
@@ -1268,19 +1277,20 @@ router.get('/orders/summary', authenticateSuperAdmin, requireSuperAdmin, async (
     const dateStrings = getDateStringsForPeriod(period, parseTZ(req));
     const perRestLimit = parseLimit(req.query.limit);
 
-    // dailyStats: one doc per restaurant per day — lightweight
-    // Firestore 'in' queries support up to 30 values, 7days = 7 values
-    let dailyStatsDocs = [];
-    if (dateStrings.length === 1) {
-      const snap = await db.collection('dailyStats')
-        .where('date', '==', dateStrings[0])
-        .get();
-      dailyStatsDocs = snap.docs;
+    // dailyStats: PG primary, Firestore fallback
+    let dailyStatsData = [];
+    if (dailyStatsRepo) {
+      dailyStatsData = dateStrings.length === 1
+        ? await dailyStatsRepo.getByDate(dateStrings[0])
+        : await dailyStatsRepo.getByDates(dateStrings);
     } else {
-      const snap = await db.collection('dailyStats')
-        .where('date', 'in', dateStrings)
-        .get();
-      dailyStatsDocs = snap.docs;
+      let snap;
+      if (dateStrings.length === 1) {
+        snap = await db.collection('dailyStats').where('date', '==', dateStrings[0]).get();
+      } else {
+        snap = await db.collection('dailyStats').where('date', 'in', dateStrings).get();
+      }
+      dailyStatsData = snap.docs.map(doc => doc.data());
     }
 
     let totalOrders = 0;
@@ -1289,8 +1299,7 @@ router.get('/orders/summary', authenticateSuperAdmin, requireSuperAdmin, async (
     const statsMap = {};
     const restaurantIds = new Set();
 
-    dailyStatsDocs.forEach(doc => {
-      const data = doc.data();
+    dailyStatsData.forEach(data => {
       const orders = data.totalOrders || 0;
       const revenue = data.totalRevenue || 0;
       const revenueWithTax = data.totalRevenueWithTax || data.totalRevenue || 0;

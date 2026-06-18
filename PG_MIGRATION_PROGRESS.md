@@ -26,9 +26,9 @@
 |-----------|-----------|----------|------|----------|-------------------|--------|
 | orders | 33% | ✅ `orders` | ✅ `ordersRepo.js` | ✅ 9,768 orders | ✅ 3 READ + 12 WRITE | **LIVE on Vercel** |
 | inventory | 21% | ❌ | ❌ | ❌ | ❌ | Not started |
-| restaurants | 11% | ❌ | ❌ | ❌ | ❌ | Not started |
-| tables | 10% | ❌ | ❌ | ❌ | ❌ | Not started |
-| dailyStats | 6% | ❌ | ❌ | ❌ | ❌ | Not started |
+| restaurants | 11% | ✅ `restaurants` | ✅ `restaurantsRepo.js` | ✅ 480 docs | ✅ 1 READ (via kvCache) + 8 WRITE | **READY for deploy** |
+| floors+tables | 10% | ✅ `floors` + `tables` | ✅ `floorsTablesRepo.js` | ✅ 497 floors, 8169 tables | ✅ 3 READ + 15 WRITE | **READY for deploy** |
+| dailyStats | 6% | ✅ `daily_stats` | ✅ `dailyStatsRepo.js` | ✅ 851 docs | ✅ 7 READ + 2 WRITE | **READY for deploy** |
 
 ### Orders — Endpoint Details
 
@@ -55,6 +55,88 @@
 | KOT printed endpoint | ~line 20472 | ✅ Dual-write |
 | Offline sync endpoint | ~line 36643 | ✅ Dual-write |
 
+### dailyStats — Endpoint Details
+
+**READ endpoints (PG primary, Firestore fallback):**
+| Endpoint | Location | Status |
+|----------|----------|--------|
+| GET /api/owner/analytics (today) | index.js ~11440 | ✅ Switched |
+| GET /api/owner/analytics (7d/30d/all) | index.js ~11500 | ✅ Switched |
+| GET /api/owner/dashboard daily-summary | index.js ~11968 | ✅ Switched |
+| GET /api/owner/analytics sub-restaurant breakdown | index.js ~12216 | ✅ Switched |
+| GET /api/books/revenue | index.js ~28255 | ✅ Switched |
+| GET /api/books/profit-loss | index.js ~28769 | ✅ Switched |
+| GET /api/books/overview | index.js ~28901 | ✅ Switched |
+| GET /api/super-admin/stats (dashboard) | routes/superAdmin.js ~130 | ✅ Switched |
+| GET /api/super-admin/orders/summary | routes/superAdmin.js ~1275 | ✅ Switched |
+
+**WRITE endpoints (dual-write: Firestore primary + PG fire-and-forget):**
+| Function | Location | Status |
+|----------|----------|--------|
+| updateDailyStats() | index.js ~347 | ✅ Dual-write |
+| updateDailyStatsRevenueDiff() | index.js ~455 | ✅ Dual-write |
+
+**Repo methods:** getById, getByIds, getByDate, getByDates, getSubRestaurantStats, atomicUpsert, upsertRevenueDiff, create
+
+**PG functions:** daily_stats_merge_jsonb (recursive JSONB deep merge with additive numbers), daily_stats_merge_array (array union with dedup)
+
+### Floors + Tables — Endpoint Details
+
+**READ endpoints (PG primary, Firestore fallback):**
+| Endpoint | Location | Status |
+|----------|----------|--------|
+| GET /api/floors/:restaurantId | index.js ~16336 | ✅ Switched (2 queries vs N+1) |
+| GET /api/tables/:restaurantId (legacy) | index.js ~15812 | ✅ Switched |
+| Table lookup during order creation | index.js ~9253 | ✅ Switched (findTableDirect/findTableByName) |
+
+**WRITE endpoints (dual-write: Firestore primary + PG fire-and-forget):**
+| Endpoint/Function | Location | Status |
+|----------|----------|--------|
+| POST /api/tables/:restaurantId (create) | index.js ~15938 | ✅ Dual-write |
+| POST /api/tables/:restaurantId/bulk | index.js ~16035 | ✅ Dual-write |
+| PATCH /api/tables/:tableId/status | index.js ~16189 | ✅ Dual-write |
+| PATCH /api/tables/:tableId | index.js ~16337 | ✅ Dual-write |
+| DELETE /api/tables/:tableId | index.js ~16404 | ✅ Dual-write |
+| POST /api/tables/:restaurantId/reset-all | index.js ~16277 | ✅ Dual-write |
+| POST /api/floors/:restaurantId (create) | index.js ~16616 | ✅ Dual-write |
+| PATCH /api/floors/:floorId (update) | index.js ~16675 | ✅ Dual-write |
+| PATCH /api/floors/reorder/:restaurantId | index.js ~16768 | ✅ Dual-write |
+| DELETE /api/floors/:floorId | index.js ~16807 | ✅ Dual-write |
+| Table claim (order creation) | index.js ~9330 | ✅ PG atomic claim (UPDATE...WHERE status='available') |
+| Table occupy (post-order) | index.js ~10503 | ✅ Dual-write |
+| Table release (order completion) | index.js ~14131 | ✅ Dual-write |
+| Table release (order deletion) | index.js ~14734 | ✅ Dual-write |
+| Table release (order cancellation) | index.js ~21694 | ✅ Dual-write |
+| Move order table swap | routes/moveOrder.js ~138 | ✅ Dual-write |
+
+**Repo methods (25):** getFloors, getFloorById, createFloor, updateFloor, reorderFloors, deleteFloor, getTablesByRestaurant, getTablesByFloor, getFloorsWithTables, findTableDirect, findTableById, findTableByName, claimTable, releaseTable, releaseTableByName, occupyTable, updateTableStatus, updateTable, resetAllTables, createTable, createTablesBatch, deleteTable, updateFloorNameOnTables, backfillFloor, backfillTable
+
+**Key design:** Firestore subcollection `restaurants/{rid}/floors/{fid}/tables/{tid}` flattened to 2 PG tables with explicit `restaurant_id` + `floor_id`. Floor IDs are slug-based (not globally unique) — composite PK `(id, restaurant_id)` required. Table claiming uses atomic `UPDATE...WHERE status='available'` instead of Firestore transaction. `getFloorsWithTables()` uses 2 parallel queries instead of N+1.
+
+### Restaurants — Endpoint Details
+
+**READ endpoints (PG primary via kvCache, Firestore fallback):**
+| Endpoint | Location | Status |
+|----------|----------|--------|
+| All 29 files using `getCachedRestDoc()` | utils/kvCache.js | ✅ Switched (Redis → PG → Firestore fallback) |
+
+**WRITE endpoints (dual-write: Firestore primary + PG fire-and-forget):**
+| Endpoint | Location | Status |
+|----------|----------|--------|
+| POST /api/restaurants (create) | index.js ~6491 | ✅ Dual-write |
+| PATCH /api/restaurants/:restaurantId (update) | index.js ~6657 | ✅ Dual-write |
+| DELETE /api/restaurants/:restaurantId | index.js ~6687 | ✅ Dual-write |
+| PUT /api/restaurants/:restaurantId/customer-app-settings | index.js ~32026 | ✅ Dual-write |
+| PUT /api/restaurants/:restaurantId/pricing-settings | index.js ~32148 | ✅ Dual-write |
+| PUT /api/restaurants/:restaurantId/billing-settings | index.js ~32341 | ✅ Dual-write |
+| POST /api/restaurants/:restaurantId/generate-code | index.js ~33936 | ✅ Dual-write |
+| POST /api/razorpay-oauth/callback (connect) | razorpayOAuth.js ~275 | ✅ Dual-write |
+| POST /api/razorpay-oauth/disconnect | razorpayOAuth.js ~134 | ✅ Dual-write |
+
+**Repo methods (11):** getById, getByIds, getAll, getSubRestaurants, getBySubdomain, getByUrlSlug, getByCode, create, update, remove, count
+
+**Key design:** PG integrated into `getCachedRestDoc()` as middle tier: Redis hit → return. Redis miss → PG read → cache. PG miss → Firestore fallback. Only 1 file change (utils/kvCache.js) covers all 29 files that read restaurant data. Restaurant schema has 52 columns: simple fields + 17 JSONB columns for complex settings.
+
 ### Files Created/Modified
 
 | File | Purpose | Status |
@@ -65,6 +147,16 @@
 | `scripts/backfill-orders-pg.js` | Idempotent Firestore → PG migration | ✅ Created |
 | `scripts/inspect-failed.js` | Debug/fix failed backfill rows | ✅ Created |
 | `index.js` | PG feature flag + endpoint switching | ✅ Modified |
+| `scripts/create-daily-stats-table.sql` | daily_stats PG schema (43 columns) | ✅ Created |
+| `repos/dailyStatsFieldMapper.js` | camelCase ↔ snake_case + dynamic key aggregation | ✅ Created |
+| `repos/dailyStatsRepo.js` | dailyStats data access (8 methods) | ✅ Created |
+| `scripts/backfill-daily-stats-pg.js` | Firestore → PG migration (851 docs migrated) | ✅ Created |
+| `routes/superAdmin.js` | PG switch for dailyStats reads | ✅ Modified |
+| `scripts/create-floors-tables.sql` | floors + tables PG schema | ✅ Created |
+| `repos/floorsTablesFieldMapper.js` | Floor/table camelCase ↔ snake_case mapping | ✅ Created |
+| `repos/floorsTablesRepo.js` | Floors+tables data access (25 methods) | ✅ Created |
+| `scripts/backfill-floors-tables-pg.js` | Two-pass Firestore → PG migration | ✅ Created |
+| `routes/moveOrder.js` | PG dual-write for table swap | ✅ Modified |
 
 ### Key Design Decisions
 
@@ -155,8 +247,10 @@
 - [ ] Add per-restaurant backend switching to frontends
 - [ ] Build inventory repo + PG table + backfill
 - [ ] Build restaurants repo + PG table + backfill
-- [ ] Build tables repo + PG table + backfill
-- [ ] Build dailyStats repo + PG table + backfill
+- [x] Build floors+tables repo + PG tables + backfill
+- [x] Switch floors+tables READ endpoints (3 endpoints) + dual-write (15 functions)
+- [x] Build dailyStats repo + PG table + backfill
+- [x] Switch dailyStats READ endpoints (9 endpoints) + dual-write (2 functions)
 - [ ] Gradual rollout to restaurants
 - [ ] Cleanup: remove Firestore code paths after full migration
 
@@ -184,3 +278,35 @@
 - index.js alone has 820 db.collection() calls (~2,381 total ops)
 - Documented top files, top collections, and migration priorities
 - Added full audit data to this progress file for future session reference
+
+### 2026-06-18 (Session 4): Phase 1 — dailyStats Migration Complete
+- Created `daily_stats` table on Cloud SQL (43 columns: aggregates, hour_00..hour_23, JSONB columns)
+- Created PG functions: `daily_stats_merge_jsonb` (recursive deep merge), `daily_stats_merge_array` (array union)
+- Created `dailyStatsFieldMapper.js` — handles dynamic Firestore keys (paymentMethod_*, ordersByType_*, orderTypeRevenue_*) → JSONB
+- Created `dailyStatsRepo.js` — 8 methods: getById, getByIds, getByDate, getByDates, getSubRestaurantStats, atomicUpsert, upsertRevenueDiff, create
+- Backfilled 851 docs (210 restaurants) with 0 errors
+- Switched 9 READ endpoints to PG primary:
+  - Analytics today, 7d/30d/all, daily-summary, sub-restaurant breakdown (index.js)
+  - Books revenue, P&L, overview (index.js)
+  - Super admin dashboard stats, orders/summary (routes/superAdmin.js)
+- Added dual-write to 2 WRITE functions: updateDailyStats(), updateDailyStatsRevenueDiff()
+- All Firestore dailyStats reads now have PG primary with Firestore fallback
+- Next: Phase 2 — floors + tables migration
+
+### 2026-06-18 (Session 5): Phase 2 — Floors + Tables Migration Complete
+- Created `floors` + `tables` PG tables with FK CASCADE, 5 indexes
+- Flattened Firestore subcollection `restaurants/{rid}/floors/{fid}/tables/{tid}` → 2 flat tables
+- Created `floorsTablesFieldMapper.js` — simple camelCase↔snake_case, Firestore `order` → PG `sort_order`
+- Created `floorsTablesRepo.js` — 25 methods including atomic `claimTable` (replaces Firestore transaction)
+- Backfill running: 478 restaurants, ~4000+ tables, 0 errors
+- Switched 3 READ endpoints to PG primary:
+  - GET /api/floors/:restaurantId (2 queries vs N+1 Firestore reads)
+  - GET /api/tables/:restaurantId (legacy)
+  - Table lookup in order creation (findTableDirect + findTableByName)
+- Added dual-write to 15 WRITE operations:
+  - Table CRUD, bulk create, status update, reset-all
+  - Floor CRUD, reorder, delete (CASCADE)
+  - Table claim/release during order lifecycle (create, complete, cancel, delete)
+  - Move order table swap (routes/moveOrder.js)
+- Key design: `claimTable()` uses atomic `UPDATE...WHERE status='available' RETURNING *` — race-safe without transaction
+- Next: Phase 3 — restaurants migration

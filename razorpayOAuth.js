@@ -132,6 +132,13 @@ async function markDisconnected(db, restaurantId) {
       paymentSettings.razorpayEnabled = false;
       settings.paymentSettings = paymentSettings;
       await restRef.update({ customerAppSettings: settings });
+
+      // PG dual-write: update Razorpay disconnection status
+      const restaurantsRepo = process.env.DATABASE_URL ? require('./repos/restaurantsRepo') : null;
+      if (restaurantsRepo) {
+        restaurantsRepo.update(restaurantId, { customerAppSettings: settings })
+          .catch(err => console.error('PG update Razorpay disconnect error:', err.message));
+      }
     }
   } catch (e) {
     console.error(`[RazorpayOAuth] Failed to mark disconnected for ${restaurantId}:`, e.message);
@@ -273,6 +280,13 @@ const initializeRazorpayOAuthRoutes = (db, authenticateToken) => {
         paymentSettings.razorpayAccountId = tokenData.razorpay_account_id;
         settings.paymentSettings = paymentSettings;
         await restRef.update({ customerAppSettings: settings });
+
+        // PG dual-write: update Razorpay connection status
+        const restaurantsRepo = process.env.DATABASE_URL ? require('./repos/restaurantsRepo') : null;
+        if (restaurantsRepo) {
+          restaurantsRepo.update(restaurantId, { customerAppSettings: settings })
+            .catch(err => console.error('PG update Razorpay connect error:', err.message));
+        }
       }
 
       console.log(`[RazorpayOAuth] Restaurant ${restaurantId} connected successfully (${tokenData.razorpay_account_id})`);

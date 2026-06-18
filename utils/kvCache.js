@@ -9,6 +9,9 @@
  * REDIS_URL alone is NOT enough (it's the Redis protocol URL, not the REST API).
  */
 
+// PG restaurant repo (optional — only used if DATABASE_URL is set)
+const restaurantsRepo = process.env.DATABASE_URL ? require('../repos/restaurantsRepo') : null;
+
 let redis = null;
 let redisDisabled = false;
 
@@ -111,6 +114,7 @@ async function kvIncrBy(key, amount, ttlSeconds) {
 
 /**
  * Get restaurant doc with KV caching (3 min TTL)
+ * Flow: Redis hit → return. Miss → PG read → cache. PG miss → Firestore → cache.
  */
 async function getCachedRestaurant(db, collection, restaurantId) {
   const cacheKey = `restaurant:${restaurantId}`;
@@ -118,6 +122,20 @@ async function getCachedRestaurant(db, collection, restaurantId) {
   const cached = await kvGet(cacheKey);
   if (cached) {
     return { data: cached, fromCache: true };
+  }
+
+  // Try PostgreSQL if available (faster + cheaper than Firestore)
+  if (restaurantsRepo) {
+    try {
+      const pgData = await restaurantsRepo.getById(restaurantId);
+      if (pgData) {
+        kvSet(cacheKey, pgData, 180).catch(() => {});
+        return { data: pgData, fromCache: true }; // fromCache=true since it's not a raw Firestore doc
+      }
+    } catch (err) {
+      // PG failed, fall through to Firestore
+      console.error('PG getCachedRestaurant error (falling back to Firestore):', err.message);
+    }
   }
 
   const doc = await db.collection(collection).doc(restaurantId).get();

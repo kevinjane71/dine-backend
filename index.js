@@ -128,10 +128,13 @@ const { db, collections } = require('./firebase');
 const { FieldValue } = require('firebase-admin/firestore');
 const performanceOptimizer = require('./middleware/performanceOptimizer');
 
-// PostgreSQL orders repo — only active when DATABASE_URL is set
+// PostgreSQL repos — only active when DATABASE_URL is set
 const usePg = !!process.env.DATABASE_URL;
 const ordersRepo = usePg ? require('./repos/ordersRepo') : null;
-if (usePg) console.log('✅ PostgreSQL orders repo enabled (DATABASE_URL set)');
+const dailyStatsRepo = usePg ? require('./repos/dailyStatsRepo') : null;
+const floorsTablesRepo = usePg ? require('./repos/floorsTablesRepo') : null;
+const restaurantsRepo = usePg ? require('./repos/restaurantsRepo') : null;
+if (usePg) console.log('✅ PostgreSQL repos enabled (DATABASE_URL set): orders, dailyStats, floors/tables, restaurants');
 const firestoreOptimizer = require('./utils/firestoreOptimizer');
 const { kvGet, kvSet, kvDel, getCachedRestaurant, invalidateRestaurantCache, invalidateUserCache } = require('./utils/kvCache');
 
@@ -357,6 +360,73 @@ function updateDailyStats(restaurantId, order, operation, tzOffset, dayStartHour
       }, { merge: true })
         .catch(err => console.error('sub-restaurant dailyStats error (non-blocking):', err));
     }
+
+    // Dual-write to PostgreSQL (fire-and-forget)
+    if (usePg) {
+      // Build payment methods object with raw values
+      const pgPaymentMethods = {};
+      if (ps === 'due') {
+        const dueFullAmount = (order.finalAmount || order.totalAmount || 0) * sign;
+        pgPaymentMethods.due = { transactions: sign, amount: dueFullAmount };
+      } else if (ps === 'partial' && order.paidAmount != null) {
+        const paidAmt = Number(order.paidAmount) || 0;
+        const dueAmt = Math.max(0, (order.finalAmount || order.totalAmount || 0) - paidAmt);
+        pgPaymentMethods[pm] = { transactions: sign, amount: paidAmt * sign };
+        if (dueAmt > 0) pgPaymentMethods.due = { transactions: 0, amount: dueAmt * sign };
+      } else {
+        pgPaymentMethods[pm] = { transactions: sign, amount: amountWithTax };
+      }
+
+      // Build item counts and category breakdown with raw values
+      const pgItemCounts = {};
+      const pgCategoryBreakdown = {};
+      if (order.items && Array.isArray(order.items)) {
+        order.items.forEach(item => {
+          const baseName = item.name || item.itemName;
+          if (baseName) {
+            const name = item.selectedVariant?.name ? `${baseName} (${item.selectedVariant.name})` : baseName;
+            const key = name.replace(/[.\/]/g, '_');
+            if (!pgItemCounts[key]) pgItemCounts[key] = { qty: 0, revenue: 0 };
+            pgItemCounts[key].qty += (item.quantity || 1) * sign;
+            pgItemCounts[key].revenue += ((item.price || 0) * (item.quantity || 1)) * sign;
+          }
+          const cat = (item.category || 'Uncategorized').replace(/[.\/]/g, '_');
+          if (!pgCategoryBreakdown[cat]) pgCategoryBreakdown[cat] = { itemsSold: 0, revenue: 0 };
+          pgCategoryBreakdown[cat].itemsSold += (item.quantity || 1) * sign;
+          pgCategoryBreakdown[cat].revenue += ((item.price || 0) * (item.quantity || 1)) * sign;
+        });
+      }
+
+      const pgIncrements = {
+        restaurantId, date: dateStr,
+        totalOrders: sign,
+        totalRevenue: amount,
+        totalRevenueWithTax: amountWithTax,
+        totalDueAmount: effective.dueAmount > 0 ? effective.dueAmount * sign : 0,
+        totalTax: (order.taxAmount || 0) * sign,
+        totalDiscounts: (order.discountAmount || 0) * sign,
+        totalRefunds: (order.refundAmount || 0) * sign,
+        paymentMethods: pgPaymentMethods,
+        orderTypes: { [orderType]: { count: sign, revenue: fullAmount } },
+        hourBucket: `hour_${hour.toString().padStart(2, '0')}`,
+        customerIds: customerId && operation === 'add' ? [customerId] : [],
+        itemCounts: pgItemCounts,
+        categoryBreakdown: pgCategoryBreakdown,
+      };
+
+      dailyStatsRepo.atomicUpsert(docId, pgIncrements)
+        .catch(err => console.error('⚠️ PG dual-write error (dailyStats):', err.message));
+
+      // Sub-restaurant PG upsert
+      if (order.subRestaurantId) {
+        const subDocId = `${restaurantId}_sub_${order.subRestaurantId}_${dateStr}`;
+        dailyStatsRepo.atomicUpsert(subDocId, {
+          ...pgIncrements,
+          subRestaurantId: order.subRestaurantId,
+          subRestaurantName: order.subRestaurantName || null,
+        }).catch(err => console.error('⚠️ PG dual-write error (sub dailyStats):', err.message));
+      }
+    }
   } catch (err) {
     console.error('dailyStats helper error (non-blocking):', err);
   }
@@ -397,6 +467,19 @@ function updateDailyStatsRevenueDiff(restaurantId, order, oldAmount, newAmount, 
         subRestaurantName: order.subRestaurantName || null,
       }, { merge: true })
         .catch(err => console.error('sub-restaurant dailyStats revenueDiff error (non-blocking):', err));
+    }
+
+    // Dual-write to PostgreSQL (fire-and-forget)
+    if (usePg) {
+      dailyStatsRepo.upsertRevenueDiff(docId, restaurantId, dateStr, diff, diffWithTax, null, null)
+        .catch(err => console.error('⚠️ PG dual-write error (dailyStats revenueDiff):', err.message));
+
+      if (order.subRestaurantId) {
+        const subDocId = `${restaurantId}_sub_${order.subRestaurantId}_${dateStr}`;
+        dailyStatsRepo.upsertRevenueDiff(subDocId, restaurantId, dateStr, diff, diffWithTax,
+          order.subRestaurantId, order.subRestaurantName || null)
+          .catch(err => console.error('⚠️ PG dual-write error (sub dailyStats revenueDiff):', err.message));
+      }
     }
   } catch (err) {
     console.error('dailyStats revenueDiff helper error (non-blocking):', err);
@@ -6446,6 +6529,12 @@ app.post('/api/restaurants', authenticateToken, async (req, res) => {
     const qrData = `${frontendUrl}/${urlSlug}`;
     await restaurantRef.update({ qrData });
 
+    // PG dual-write: create restaurant
+    if (restaurantsRepo) {
+      restaurantsRepo.create(restaurantRef.id, { ...restaurantData, subdomain: finalSubdomain, urlSlug, qrData })
+        .catch(err => console.error('PG create restaurant error:', err.message));
+    }
+
     res.status(201).json({
       message: 'Restaurant created successfully',
       restaurant: {
@@ -6568,6 +6657,12 @@ app.patch('/api/restaurants/:restaurantId', authenticateToken, async (req, res) 
     await db.collection(collections.restaurants).doc(restaurantId).update(updateData);
     invalidateRestaurantCache(restaurantId);
 
+    // PG dual-write: update restaurant
+    if (restaurantsRepo) {
+      restaurantsRepo.update(restaurantId, updateData)
+        .catch(err => console.error('PG update restaurant error:', err.message));
+    }
+
     res.json({ message: 'Restaurant updated successfully', updatedFields: Object.keys(updateData) });
 
   } catch (error) {
@@ -6590,6 +6685,12 @@ app.delete('/api/restaurants/:restaurantId', authenticateToken, async (req, res)
 
     // TODO: Also delete associated staff, menus, orders etc.
     await db.collection(collections.restaurants).doc(restaurantId).delete();
+
+    // PG dual-write: delete restaurant
+    if (restaurantsRepo) {
+      restaurantsRepo.remove(restaurantId)
+        .catch(err => console.error('PG delete restaurant error:', err.message));
+    }
 
     res.json({ message: 'Restaurant deleted successfully' });
 
@@ -9168,69 +9269,87 @@ app.post('/api/orders', async (req, res) => {
         // Use the new restaurant-centric structure
         console.log('🪑 Using new restaurant-centric structure for restaurant:', restaurantId);
 
-        // Get floors from restaurant subcollection
-        const floorsSnapshot = await db.collection('restaurants')
-          .doc(restaurantId)
-          .collection('floors')
-          .get();
-
-        console.log('🪑 Found floors:', floorsSnapshot.size);
-
         let tableFound = false;
         let tableStatus = null;
 
-        // FAST PATH: If floorId + tableId provided, fetch the exact table directly
-        if (floorId && tableId) {
-          try {
-            const directTableRef = db.collection('restaurants').doc(restaurantId)
-              .collection('floors').doc(floorId).collection('tables').doc(tableId);
-            const directTableDoc = await directTableRef.get();
-            if (directTableDoc.exists) {
-              const td = directTableDoc.data();
-              tableFound = true;
-              tableStatus = td.status;
-              tableId_resolved = directTableDoc.id;
-              tableFloorId_resolved = floorId;
-              const floorDoc = await db.collection('restaurants').doc(restaurantId).collection('floors').doc(floorId).get();
-              const floorData = floorDoc.exists ? floorDoc.data() : {};
-              tableFloor = floorData.name || floorName || null;
-              tableSection = td.section || floorData.section || null;
-              tableFloorData = floorData;
-              console.log('🪑 Direct table lookup:', { id: tableId_resolved, number: tableNumber, status: tableStatus, floor: tableFloor });
-            }
-          } catch (directErr) {
-            console.warn('🪑 Direct table lookup failed, falling back to iteration:', directErr.message);
+        if (floorsTablesRepo) {
+          // PG path: single query lookups
+          let pgTable = null;
+          if (floorId && tableId) {
+            pgTable = await floorsTablesRepo.findTableDirect(restaurantId, floorId, tableId);
           }
-        }
+          if (!pgTable) {
+            pgTable = await floorsTablesRepo.findTableByName(restaurantId, tableNumber);
+          }
+          if (pgTable) {
+            tableFound = true;
+            tableStatus = pgTable.status;
+            tableId_resolved = pgTable.id;
+            tableFloorId_resolved = pgTable.floorId;
+            tableFloor = pgTable.floor || floorName || null;
+            tableSection = pgTable.section || null;
+            // Fetch floor data for area charge
+            const pgFloor = await floorsTablesRepo.getFloorById(pgTable.floorId, restaurantId);
+            tableFloorData = pgFloor || {};
+            console.log('🪑 PG table lookup:', { id: tableId_resolved, number: tableNumber, status: tableStatus, floor: tableFloor });
+          }
+        } else {
+          // Firestore path
+          const floorsSnapshot = await db.collection('restaurants')
+            .doc(restaurantId).collection('floors').get();
 
-        // FALLBACK: Search for the table across all floors (backwards compat)
-        if (!tableFound) for (const floorDoc of floorsSnapshot.docs) {
-          const floorData = floorDoc.data();
+          console.log('🪑 Found floors:', floorsSnapshot.size);
 
-          const tablesSnapshot = await db.collection('restaurants')
-            .doc(restaurantId)
-            .collection('floors')
-            .doc(floorDoc.id)
-            .collection('tables')
-            .get();
-
-          for (const tableDoc of tablesSnapshot.docs) {
-            const tableData = tableDoc.data();
-
-            if (tableData.name && tableData.name.toString().toLowerCase() === tableNumber.trim().toLowerCase()) {
-              tableFound = true;
-              tableStatus = tableData.status;
-              tableId_resolved = tableDoc.id;
-              tableFloorId_resolved = floorDoc.id;
-              tableFloor = floorData.name;
-              tableSection = tableData.section || floorData.section || null;
-              tableFloorData = floorData;
-              console.log('🪑 Found table:', { id: tableId_resolved, number: tableNumber, status: tableStatus, floor: tableFloor, section: tableSection });
-              break;
+          // FAST PATH: If floorId + tableId provided, fetch the exact table directly
+          if (floorId && tableId) {
+            try {
+              const directTableRef = db.collection('restaurants').doc(restaurantId)
+                .collection('floors').doc(floorId).collection('tables').doc(tableId);
+              const directTableDoc = await directTableRef.get();
+              if (directTableDoc.exists) {
+                const td = directTableDoc.data();
+                tableFound = true;
+                tableStatus = td.status;
+                tableId_resolved = directTableDoc.id;
+                tableFloorId_resolved = floorId;
+                const floorDoc = await db.collection('restaurants').doc(restaurantId).collection('floors').doc(floorId).get();
+                const floorData = floorDoc.exists ? floorDoc.data() : {};
+                tableFloor = floorData.name || floorName || null;
+                tableSection = td.section || floorData.section || null;
+                tableFloorData = floorData;
+                console.log('🪑 Direct table lookup:', { id: tableId_resolved, number: tableNumber, status: tableStatus, floor: tableFloor });
+              }
+            } catch (directErr) {
+              console.warn('🪑 Direct table lookup failed, falling back to iteration:', directErr.message);
             }
           }
-          
-          if (tableFound) break;
+
+          // FALLBACK: Search for the table across all floors (backwards compat)
+          if (!tableFound) for (const floorDoc of floorsSnapshot.docs) {
+            const floorData = floorDoc.data();
+
+            const tablesSnapshot = await db.collection('restaurants')
+              .doc(restaurantId).collection('floors')
+              .doc(floorDoc.id).collection('tables').get();
+
+            for (const tableDoc of tablesSnapshot.docs) {
+              const tableData = tableDoc.data();
+
+              if (tableData.name && tableData.name.toString().toLowerCase() === tableNumber.trim().toLowerCase()) {
+                tableFound = true;
+                tableStatus = tableData.status;
+                tableId_resolved = tableDoc.id;
+                tableFloorId_resolved = floorDoc.id;
+                tableFloor = floorData.name;
+                tableSection = tableData.section || floorData.section || null;
+                tableFloorData = floorData;
+                console.log('🪑 Found table:', { id: tableId_resolved, number: tableNumber, status: tableStatus, floor: tableFloor, section: tableSection });
+                break;
+              }
+            }
+
+            if (tableFound) break;
+          }
         }
         
         if (!tableFound) {
@@ -9244,39 +9363,66 @@ app.post('/api/orders', async (req, res) => {
         // Skip this check for offline sync requests (they were already placed locally)
         const isOfflineSync = req.headers['x-sync-source'] === 'offline';
 
-        // Use Firestore transaction to atomically check + claim the table (prevents race conditions)
+        // Use atomic check + claim to prevent race conditions
         if (tableId_resolved && tableFloorId_resolved && !isOfflineSync) {
-          const tableRef = db.collection('restaurants').doc(restaurantId)
-            .collection('floors').doc(tableFloorId_resolved)
-            .collection('tables').doc(tableId_resolved);
-          try {
-            await db.runTransaction(async (transaction) => {
-              const tableSnap = await transaction.get(tableRef);
-              const currentStatus = tableSnap.exists ? tableSnap.data().status : 'available';
-              if (currentStatus !== 'available') {
-                const statusMessages = {
-                  'occupied': 'is currently occupied by another customer',
-                  'serving': 'is currently being served',
-                  'out-of-service': 'is out of service and cannot be used',
-                  'reserved': 'is reserved for another customer',
-                  'maintenance': 'is under maintenance',
-                };
-                throw new Error(`TABLE_UNAVAILABLE:Table "${tableNumber}" ${statusMessages[currentStatus] || `has status "${currentStatus}" and cannot be used`}. Please choose another table.`);
-              }
-              // Atomically claim the table by setting a pending status
-              transaction.update(tableRef, {
-                status: 'occupied',
-                lastOrderTime: new Date(),
-                updatedAt: new Date()
+          if (floorsTablesRepo) {
+            // PG atomic claim: UPDATE...WHERE status='available' RETURNING *
+            const claimed = await floorsTablesRepo.claimTable(restaurantId, tableFloorId_resolved, tableId_resolved, null);
+            if (!claimed) {
+              // Table not available — check current status for error message
+              const currentTable = await floorsTablesRepo.findTableById(restaurantId, tableId_resolved);
+              const currentStatus = currentTable ? currentTable.status : 'unknown';
+              const statusMessages = {
+                'occupied': 'is currently occupied by another customer',
+                'serving': 'is currently being served',
+                'out-of-service': 'is out of service and cannot be used',
+                'reserved': 'is reserved for another customer',
+                'maintenance': 'is under maintenance',
+              };
+              return res.status(400).json({
+                error: `Table "${tableNumber}" ${statusMessages[currentStatus] || `has status "${currentStatus}" and cannot be used`}. Please choose another table.`
               });
-            });
-            console.log('✅ Table atomically claimed:', { tableNumber, status: 'occupied' });
-          } catch (txError) {
-            if (txError.message && txError.message.startsWith('TABLE_UNAVAILABLE:')) {
-              console.log('❌ Table not available (atomic check):', { table: tableNumber });
-              return res.status(400).json({ error: txError.message.replace('TABLE_UNAVAILABLE:', '') });
             }
-            throw txError;
+            console.log('✅ Table atomically claimed (PG):', { tableNumber, status: 'occupied' });
+            // Also update Firestore for dual-write
+            db.collection('restaurants').doc(restaurantId)
+              .collection('floors').doc(tableFloorId_resolved)
+              .collection('tables').doc(tableId_resolved)
+              .update({ status: 'occupied', lastOrderTime: new Date(), updatedAt: new Date() })
+              .catch(err => console.error('Firestore table claim sync error:', err.message));
+          } else {
+            // Firestore transaction path
+            const tableRef = db.collection('restaurants').doc(restaurantId)
+              .collection('floors').doc(tableFloorId_resolved)
+              .collection('tables').doc(tableId_resolved);
+            try {
+              await db.runTransaction(async (transaction) => {
+                const tableSnap = await transaction.get(tableRef);
+                const currentStatus = tableSnap.exists ? tableSnap.data().status : 'available';
+                if (currentStatus !== 'available') {
+                  const statusMessages = {
+                    'occupied': 'is currently occupied by another customer',
+                    'serving': 'is currently being served',
+                    'out-of-service': 'is out of service and cannot be used',
+                    'reserved': 'is reserved for another customer',
+                    'maintenance': 'is under maintenance',
+                  };
+                  throw new Error(`TABLE_UNAVAILABLE:Table "${tableNumber}" ${statusMessages[currentStatus] || `has status "${currentStatus}" and cannot be used`}. Please choose another table.`);
+                }
+                transaction.update(tableRef, {
+                  status: 'occupied',
+                  lastOrderTime: new Date(),
+                  updatedAt: new Date()
+                });
+              });
+              console.log('✅ Table atomically claimed:', { tableNumber, status: 'occupied' });
+            } catch (txError) {
+              if (txError.message && txError.message.startsWith('TABLE_UNAVAILABLE:')) {
+                console.log('❌ Table not available (atomic check):', { table: tableNumber });
+                return res.status(400).json({ error: txError.message.replace('TABLE_UNAVAILABLE:', '') });
+              }
+              throw txError;
+            }
           }
         } else if (!isOfflineSync && tableStatus !== 'available') {
           let statusMessage = '';
@@ -10378,7 +10524,23 @@ app.post('/api/orders', async (req, res) => {
         (async () => {
           try {
             let tableUpdated = false;
-            // FAST PATH: Use stored floorId + tableId for direct update
+
+            // PG dual-write: update table status
+            if (floorsTablesRepo) {
+              if (orderData.tableId) {
+                await floorsTablesRepo.occupyTable(orderData.tableId, orderRef.id);
+                tableUpdated = true;
+              } else {
+                const pgTable = await floorsTablesRepo.findTableByName(restaurantId, tableNumber);
+                if (pgTable) {
+                  await floorsTablesRepo.occupyTable(pgTable.id, orderRef.id);
+                  tableUpdated = true;
+                }
+              }
+            }
+
+            // Firestore update (primary or dual-write)
+            let firestoreUpdated = false;
             if (orderData.floorId && orderData.tableId) {
               const directRef = db.collection('restaurants').doc(restaurantId)
                 .collection('floors').doc(orderData.floorId)
@@ -10389,10 +10551,9 @@ app.post('/api/orders', async (req, res) => {
                 lastOrderTime: new Date(),
                 updatedAt: new Date()
               });
-              tableUpdated = true;
+              firestoreUpdated = true;
             }
-            // FALLBACK: Find the table by name across all floors
-            if (!tableUpdated) {
+            if (!firestoreUpdated) {
               const floorsSnapshot = await db.collection('restaurants')
                 .doc(restaurantId).collection('floors').get();
               for (const floorDoc of floorsSnapshot.docs) {
@@ -10404,12 +10565,12 @@ app.post('/api/orders', async (req, res) => {
                     status: 'occupied', currentOrderId: orderRef.id,
                     lastOrderTime: new Date(), updatedAt: new Date()
                   });
-                  tableUpdated = true;
+                  firestoreUpdated = true;
                   break;
                 }
               }
             }
-            if (!tableUpdated) console.log('⚠️ Table not found for status update:', tableNumber);
+            if (!tableUpdated && !firestoreUpdated) console.log('⚠️ Table not found for status update:', tableNumber);
           } catch (tableUpdateError) {
             console.error('❌ Failed to update table status:', tableUpdateError);
           }
@@ -11355,10 +11516,16 @@ app.get('/api/analytics/:restaurantId', authenticateToken, async (req, res) => {
       const todayDateStr = tzOffset !== undefined ? dateStrInTZ(now, tzOffset) : now.toISOString().split('T')[0];
 
       // Try dailyStats first — 1 read instead of scanning all orders
-      const todayDoc = await db.collection('dailyStats').doc(`${restaurantId}_${todayDateStr}`).get();
-      if (todayDoc.exists && (todayDoc.data().totalOrders || 0) > 0) {
-        console.log(`📊 Analytics (${period}): using dailyStats doc for ${todayDateStr}`);
-        const analytics = aggregateDailyStats([todayDoc.data()], [todayDateStr]);
+      let todayData = null;
+      if (usePg) {
+        todayData = await dailyStatsRepo.getById(`${restaurantId}_${todayDateStr}`);
+      } else {
+        const todayDoc = await db.collection('dailyStats').doc(`${restaurantId}_${todayDateStr}`).get();
+        if (todayDoc.exists) todayData = todayDoc.data();
+      }
+      if (todayData && (todayData.totalOrders || 0) > 0) {
+        console.log(`📊 Analytics (${period}): using dailyStats ${usePg ? '(PG)' : '(Firestore)'} for ${todayDateStr}`);
+        const analytics = aggregateDailyStats([todayData], [todayDateStr]);
         return res.json({ success: true, analytics, period, totalOrders: analytics.totalOrders });
       }
 
@@ -11408,12 +11575,18 @@ app.get('/api/analytics/:restaurantId', authenticateToken, async (req, res) => {
       dateStrings.push(`${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}-${String(d.getUTCDate()).padStart(2, '0')}`);
     }
 
-    // Fetch dailyStats docs (Firestore getAll for batch read)
-    const statsRefs = dateStrings.map(ds => db.collection('dailyStats').doc(`${restaurantId}_${ds}`));
-    const statsDocs = await db.getAll(...statsRefs);
-    const dailyDocs = statsDocs.filter(d => d.exists).map(d => d.data());
+    // Fetch dailyStats docs
+    let dailyDocs;
+    if (usePg) {
+      const docIds = dateStrings.map(ds => `${restaurantId}_${ds}`);
+      dailyDocs = await dailyStatsRepo.getByIds(docIds);
+    } else {
+      const statsRefs = dateStrings.map(ds => db.collection('dailyStats').doc(`${restaurantId}_${ds}`));
+      const statsDocs = await db.getAll(...statsRefs);
+      dailyDocs = statsDocs.filter(d => d.exists).map(d => d.data());
+    }
 
-    console.log(`📊 Found ${dailyDocs.length} dailyStats docs for analytics (${period})`);
+    console.log(`📊 Found ${dailyDocs.length} dailyStats docs for analytics (${period}) ${usePg ? '(PG)' : '(Firestore)'}`);
 
     // Backward compatibility: if no dailyStats docs exist yet, fall back to raw orders
     if (dailyDocs.length === 0) {
@@ -11865,22 +12038,30 @@ app.get('/api/analytics/:restaurantId/daily-summary', authenticateToken, async (
 
     if (!isTodayOnly) {
       // Batch-read dailyStats docs for historical dates
-      const docRefs = dates.map(d => {
-        const docId = subRestaurantId
-          ? `${restaurantId}_sub_${subRestaurantId}_${d}`
-          : `${restaurantId}_${d}`;
-        return db.collection('dailyStats').doc(docId);
-      });
-      const docs = docRefs.length > 0 ? await db.getAll(...docRefs) : [];
+      const docIds = dates.map(d => subRestaurantId
+        ? `${restaurantId}_sub_${subRestaurantId}_${d}`
+        : `${restaurantId}_${d}`);
 
-      console.log(`📊 daily-summary: found ${docs.filter(d => d.exists).length}/${docs.length} dailyStats docs`);
+      let dailyDocsData;
+      if (usePg) {
+        const pgDocs = await dailyStatsRepo.getByIds(docIds);
+        // Map by id for ordered access
+        const pgMap = {};
+        pgDocs.forEach(d => { pgMap[d.id || `${d.restaurantId}_${d.date}`] = d; });
+        dailyDocsData = docIds.map(id => pgMap[id] || null);
+      } else {
+        const docRefs = docIds.map(id => db.collection('dailyStats').doc(id));
+        const docs = docRefs.length > 0 ? await db.getAll(...docRefs) : [];
+        dailyDocsData = docs.map(doc => doc.exists ? doc.data() : null);
+      }
 
-    docs.forEach((doc, idx) => {
-      if (!doc.exists) {
+      console.log(`📊 daily-summary: found ${dailyDocsData.filter(d => d).length}/${dailyDocsData.length} dailyStats docs ${usePg ? '(PG)' : '(Firestore)'}`);
+
+    dailyDocsData.forEach((data, idx) => {
+      if (!data) {
         dailyRevenue.push({ date: dates[idx], revenue: 0, orders: 0 });
         return;
       }
-      const data = doc.data();
       usedDailyStats = true;
       totalOrders += (data.totalOrders || 0);
       totalRevenue += (data.totalRevenue || 0);
@@ -12112,12 +12293,17 @@ app.get('/api/analytics/:restaurantId/daily-summary', authenticateToken, async (
     if (!subRestaurantId) {
       try {
         const subBreakdownMap = {};
-        const subSnap = await db.collection('dailyStats')
-          .where('restaurantId', '==', restaurantId)
-          .where('subRestaurantId', '!=', null)
-          .get();
-        subSnap.docs.forEach(doc => {
-          const d = doc.data();
+        let subDocs;
+        if (dailyStatsRepo) {
+          subDocs = await dailyStatsRepo.getSubRestaurantStats(restaurantId);
+        } else {
+          const subSnap = await db.collection('dailyStats')
+            .where('restaurantId', '==', restaurantId)
+            .where('subRestaurantId', '!=', null)
+            .get();
+          subDocs = subSnap.docs.map(doc => doc.data());
+        }
+        subDocs.forEach(d => {
           if (!dates.includes(d.date)) return;
           const sid = d.subRestaurantId;
           if (!subBreakdownMap[sid]) {
@@ -13965,6 +14151,17 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
       try {
         console.log('🔄 Releasing table due to order completion:', currentOrder.tableNumber);
 
+        // PG dual-write: release table
+        if (floorsTablesRepo) {
+          if (currentOrder.tableId) {
+            floorsTablesRepo.releaseTable(currentOrder.tableId)
+              .catch(err => console.error('PG releaseTable error:', err.message));
+          } else {
+            floorsTablesRepo.releaseTableByName(currentOrder.restaurantId, currentOrder.tableNumber)
+              .catch(err => console.error('PG releaseTableByName error:', err.message));
+          }
+        }
+
         let tableReleased = false;
 
         // FAST PATH: Use stored floorId + tableId from the order
@@ -14014,7 +14211,6 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
         }
       } catch (tableReleaseError) {
         console.error('❌ Failed to release table after order completion:', tableReleaseError);
-        // Don't fail the order update if table release fails
       }
     }
 
@@ -14024,13 +14220,23 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
         // Free up the old table if it exists
         if (currentOrder.tableNumber && currentOrder.tableNumber.trim()) {
           console.log('🔄 Freeing up old table:', currentOrder.tableNumber);
-          
-          // Use the new restaurant-centric structure
+
+          // PG dual-write: release old table
+          if (floorsTablesRepo) {
+            if (currentOrder.tableId) {
+              floorsTablesRepo.releaseTable(currentOrder.tableId)
+                .catch(err => console.error('PG releaseTable error:', err.message));
+            } else {
+              floorsTablesRepo.releaseTableByName(currentOrder.restaurantId, currentOrder.tableNumber)
+                .catch(err => console.error('PG releaseTableByName error:', err.message));
+            }
+          }
+
           const floorsSnapshot = await db.collection('restaurants')
             .doc(currentOrder.restaurantId)
             .collection('floors')
             .get();
-          
+
           let oldTableFreed = false;
           for (const floorDoc of floorsSnapshot.docs) {
             const oldTablesSnapshot = await db.collection('restaurants')
@@ -14040,7 +14246,7 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
               .collection('tables')
               .where('name', '==', currentOrder.tableNumber.trim())
               .get();
-            
+
             if (!oldTablesSnapshot.empty) {
               const oldTableDoc = oldTablesSnapshot.docs[0];
               await oldTableDoc.ref.update({
@@ -14053,7 +14259,7 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
               break;
             }
           }
-          
+
           if (!oldTableFreed) {
             console.log('⚠️ Old table not found for freeing:', currentOrder.tableNumber);
           }
@@ -14062,8 +14268,16 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
         // Occupy the new table if provided
         if (tableNumber && tableNumber.trim()) {
           console.log('🔄 Occupying new table:', tableNumber);
-          
-          // Use the new restaurant-centric structure
+
+          // PG dual-write: occupy new table
+          if (floorsTablesRepo) {
+            const pgNewTable = await floorsTablesRepo.findTableByName(currentOrder.restaurantId, tableNumber);
+            if (pgNewTable) {
+              floorsTablesRepo.occupyTable(pgNewTable.id, orderId)
+                .catch(err => console.error('PG occupyTable error:', err.message));
+            }
+          }
+
           const floorsSnapshot = await db.collection('restaurants')
             .doc(currentOrder.restaurantId)
             .collection('floors')
@@ -14537,6 +14751,17 @@ app.delete('/api/orders/:orderId', authenticateToken, async (req, res) => {
 
     // Release table if assigned
     if (order.tableNumber && order.tableNumber.trim()) {
+      // PG dual-write: release table
+      if (floorsTablesRepo) {
+        if (order.tableId) {
+          floorsTablesRepo.releaseTable(order.tableId)
+            .catch(err => console.error('PG releaseTable (delete) error:', err.message));
+        } else {
+          floorsTablesRepo.releaseTableByName(order.restaurantId, order.tableNumber)
+            .catch(err => console.error('PG releaseTableByName (delete) error:', err.message));
+        }
+      }
+
       try {
         let tableReleased = false;
 
@@ -15706,17 +15931,18 @@ app.get('/api/tables/:restaurantId', async (req, res) => {
   try {
     const { restaurantId } = req.params;
 
-    const snapshot = await db.collection(collections.tables)
-      .where('restaurantId', '==', restaurantId)
-      .get();
-
-    const tables = [];
-    snapshot.forEach(doc => {
-      tables.push({
-        id: doc.id,
-        ...doc.data()
+    let tables;
+    if (floorsTablesRepo) {
+      tables = await floorsTablesRepo.getTablesByRestaurant(restaurantId);
+    } else {
+      const snapshot = await db.collection(collections.tables)
+        .where('restaurantId', '==', restaurantId)
+        .get();
+      tables = [];
+      snapshot.forEach(doc => {
+        tables.push({ id: doc.id, ...doc.data() });
       });
-    });
+    }
 
     // Cache at Vercel Edge for 1 min, serve stale for 30s
     res.set('Cache-Control', 'public, s-maxage=60, stale-while-revalidate=30');
@@ -15770,6 +15996,12 @@ app.post('/api/tables/:restaurantId', authenticateToken, async (req, res) => {
         .doc(floorId)
         .set(floorData);
 
+      // PG dual-write: create floor
+      if (floorsTablesRepo) {
+        floorsTablesRepo.createFloor(floorId, restaurantId, floorData)
+          .catch(err => console.error('PG createFloor error:', err.message));
+      }
+
       // Re-fetch the floor document
       floorDoc = await db.collection('restaurants')
         .doc(restaurantId)
@@ -15809,6 +16041,12 @@ app.post('/api/tables/:restaurantId', authenticateToken, async (req, res) => {
       .doc(floorId)
       .collection('tables')
       .add(tableData);
+
+    // PG dual-write: create table
+    if (floorsTablesRepo) {
+      floorsTablesRepo.createTable(restaurantId, floorId, { id: tableRef.id, ...tableData })
+        .catch(err => console.error('PG createTable error:', err.message));
+    }
 
     res.status(201).json({
       message: 'Table created successfully',
@@ -15948,6 +16186,12 @@ app.post('/api/tables/:restaurantId/bulk', authenticateToken, async (req, res) =
     // Commit the batch
     await batch.commit();
 
+    // PG dual-write: bulk create tables
+    if (floorsTablesRepo) {
+      floorsTablesRepo.createTablesBatch(restaurantId, floorId, createdTables)
+        .catch(err => console.error('PG createTablesBatch error:', err.message));
+    }
+
     console.log(`✅ Created ${createdTables.length} tables (${from}-${to}) on floor "${floor}" for restaurant ${restaurantId}`);
     if (skippedTables.length > 0) {
       console.log(`⚠️  Skipped ${skippedTables.length} duplicate tables: ${skippedTables.join(', ')}`);
@@ -16033,6 +16277,12 @@ app.patch('/api/tables/:tableId/status', authenticateToken, async (req, res) => 
       return res.status(404).json({ error: 'Table not found' });
     }
 
+    // PG dual-write: update table status
+    if (floorsTablesRepo) {
+      floorsTablesRepo.updateTableStatus(tableId, status, orderId)
+        .catch(err => console.error('PG updateTableStatus error:', err.message));
+    }
+
     // Send real-time event for table sync (Firebase RTDB)
     pusherService.triggerTableStatusUpdated(restaurantId, {
       tableId,
@@ -16086,6 +16336,12 @@ app.post('/api/tables/:restaurantId/reset-all', authenticateToken, async (req, r
 
     if (resetCount > 0) {
       await batch.commit();
+
+      // PG dual-write: reset all tables
+      if (floorsTablesRepo) {
+        floorsTablesRepo.resetAllTables(restaurantId)
+          .catch(err => console.error('PG resetAllTables error:', err.message));
+      }
 
       // Send real-time event for table sync (Firebase RTDB)
       pusherService.pushEvent(restaurantId, 'tables', 'tables-reset', {
@@ -16161,6 +16417,12 @@ app.patch('/api/tables/:tableId', authenticateToken, async (req, res) => {
       return res.status(404).json({ error: 'Table not found' });
     }
 
+    // PG dual-write: update table
+    if (floorsTablesRepo) {
+      floorsTablesRepo.updateTable(tableId, { name, floor, capacity, section })
+        .catch(err => console.error('PG updateTable error:', err.message));
+    }
+
     res.json({ message: 'Table updated successfully' });
 
   } catch (error) {
@@ -16217,6 +16479,12 @@ app.delete('/api/tables/:tableId', authenticateToken, async (req, res) => {
       return res.status(404).json({ error: 'Table not found' });
     }
 
+    // PG dual-write: delete table
+    if (floorsTablesRepo) {
+      floorsTablesRepo.deleteTable(tableId)
+        .catch(err => console.error('PG deleteTable error:', err.message));
+    }
+
     res.json({ message: 'Table deleted successfully' });
 
   } catch (error) {
@@ -16230,76 +16498,90 @@ app.get('/api/floors/:restaurantId', async (req, res) => {
   try {
     const { restaurantId } = req.params;
 
-    // Get floors from restaurant subcollection
-    const floorsSnapshot = await db.collection('restaurants')
-      .doc(restaurantId)
-      .collection('floors')
-      .get();
-
-    const floors = [];
-    const allTables = [];
+    let floors = [];
     const orderIds = new Set();
 
-    for (const floorDoc of floorsSnapshot.docs) {
-      const floorData = floorDoc.data();
-      
-      // Get tables for this floor
-      const tablesSnapshot = await db.collection('restaurants')
-        .doc(restaurantId)
-        .collection('floors')
-        .doc(floorDoc.id)
-        .collection('tables')
-        .get();
-
-      const floorTables = [];
-      for (const tableDoc of tablesSnapshot.docs) {
-        const tableData = tableDoc.data();
-        const tbl = { id: tableDoc.id, ...tableData, currentOrderTotal: null };
-        floorTables.push(tbl);
-        if (tableData.currentOrderId && tableData.status === 'occupied') {
-          orderIds.add(tableData.currentOrderId);
-        }
+    if (floorsTablesRepo) {
+      // PG path: 2 queries instead of N+1
+      const pgFloors = await floorsTablesRepo.getFloorsWithTables(restaurantId);
+      for (const f of pgFloors) {
+        const tables = (f.tables || []).map(t => ({ ...t, currentOrderTotal: null }));
+        tables.forEach(t => {
+          if (t.currentOrderId && t.status === 'occupied') orderIds.add(t.currentOrderId);
+        });
+        floors.push({
+          id: f.id,
+          name: f.name,
+          description: f.description || '',
+          section: f.section || null,
+          areaChargeType: f.areaChargeType || 'none',
+          areaChargeValue: f.areaChargeValue || 0,
+          order: f.order !== undefined ? f.order : Infinity,
+          restaurantId,
+          tables,
+        });
       }
-      allTables.push({ floorDoc, floorData, tables: floorTables });
-    }
+    } else {
+      // Firestore path: N+1 reads
+      const floorsSnapshot = await db.collection('restaurants')
+        .doc(restaurantId).collection('floors').get();
 
-    // Batch-read all orders at once (instead of N+1 individual reads)
-    const orderTotals = {};
-    if (orderIds.size > 0) {
-      const orderRefs = [...orderIds].map(id => db.collection(collections.orders).doc(id));
-      // getAll supports up to 100 refs; chunk if needed
-      const chunks = [];
-      for (let i = 0; i < orderRefs.length; i += 100) {
-        chunks.push(orderRefs.slice(i, i + 100));
-      }
-      for (const chunk of chunks) {
-        const docs = await db.getAll(...chunk);
-        docs.forEach(doc => {
-          if (doc.exists) {
-            const data = doc.data();
-            orderTotals[doc.id] = data.finalAmount || data.totalAmount || 0;
+      for (const floorDoc of floorsSnapshot.docs) {
+        const floorData = floorDoc.data();
+        const tablesSnapshot = await db.collection('restaurants')
+          .doc(restaurantId).collection('floors')
+          .doc(floorDoc.id).collection('tables').get();
+
+        const floorTables = [];
+        for (const tableDoc of tablesSnapshot.docs) {
+          const tableData = tableDoc.data();
+          const tbl = { id: tableDoc.id, ...tableData, currentOrderTotal: null };
+          floorTables.push(tbl);
+          if (tableData.currentOrderId && tableData.status === 'occupied') {
+            orderIds.add(tableData.currentOrderId);
           }
+        }
+        floors.push({
+          id: floorDoc.id,
+          name: floorData.name,
+          description: floorData.description || '',
+          section: floorData.section || null,
+          areaChargeType: floorData.areaChargeType || 'none',
+          areaChargeValue: floorData.areaChargeValue || 0,
+          order: floorData.order !== undefined ? floorData.order : Infinity,
+          restaurantId,
+          tables: floorTables,
         });
       }
     }
 
-    // Assign order totals and build floors array
-    for (const { floorDoc, floorData, tables } of allTables) {
-      tables.forEach(tbl => {
+    // Batch-read all orders at once for currentOrderTotal
+    const orderTotals = {};
+    if (orderIds.size > 0) {
+      {
+        const orderRefs = [...orderIds].map(id => db.collection(collections.orders).doc(id));
+        const chunks = [];
+        for (let i = 0; i < orderRefs.length; i += 100) {
+          chunks.push(orderRefs.slice(i, i + 100));
+        }
+        for (const chunk of chunks) {
+          const docs = await db.getAll(...chunk);
+          docs.forEach(doc => {
+            if (doc.exists) {
+              const data = doc.data();
+              orderTotals[doc.id] = data.finalAmount || data.totalAmount || 0;
+            }
+          });
+        }
+      }
+    }
+
+    // Assign order totals
+    for (const floor of floors) {
+      floor.tables.forEach(tbl => {
         if (tbl.currentOrderId && orderTotals[tbl.currentOrderId] !== undefined) {
           tbl.currentOrderTotal = orderTotals[tbl.currentOrderId];
         }
-      });
-      floors.push({
-        id: floorDoc.id,
-        name: floorData.name,
-        description: floorData.description || '',
-        section: floorData.section || null,
-        areaChargeType: floorData.areaChargeType || 'none',
-        areaChargeValue: floorData.areaChargeValue || 0,
-        order: floorData.order !== undefined ? floorData.order : Infinity,
-        restaurantId,
-        tables
       });
     }
 
@@ -16314,7 +16596,7 @@ app.get('/api/floors/:restaurantId', async (req, res) => {
     // If no floors exist, create default floor structure
     if (floors.length === 0) {
       console.log(`🔄 No floors found, creating default "Ground Floor" for restaurant ${restaurantId}`);
-      
+
       const defaultFloorId = 'floor_ground_floor';
       const defaultFloorData = {
         name: 'Ground Floor',
@@ -16324,11 +16606,18 @@ app.get('/api/floors/:restaurantId', async (req, res) => {
         updatedAt: new Date()
       };
 
+      // Write to Firestore (primary)
       await db.collection('restaurants')
         .doc(restaurantId)
         .collection('floors')
         .doc(defaultFloorId)
         .set(defaultFloorData);
+
+      // Dual-write to PG
+      if (floorsTablesRepo) {
+        floorsTablesRepo.createFloor(defaultFloorId, restaurantId, defaultFloorData)
+          .catch(err => console.error('PG createFloor error:', err.message));
+      }
 
       floors.push({
         id: defaultFloorId,
@@ -16386,6 +16675,12 @@ app.post('/api/floors/:restaurantId', authenticateToken, async (req, res) => {
       .collection('floors')
       .doc(floorId)
       .set(floorData);
+
+    // PG dual-write: create floor
+    if (floorsTablesRepo) {
+      floorsTablesRepo.createFloor(floorId, restaurantId, floorData)
+        .catch(err => console.error('PG createFloor error:', err.message));
+    }
 
     res.status(201).json({
       message: 'Floor created successfully',
@@ -16486,6 +16781,16 @@ app.patch('/api/floors/:floorId', authenticateToken, async (req, res) => {
       }
     }
 
+    // PG dual-write: update floor + tables floor_name
+    if (floorsTablesRepo) {
+      floorsTablesRepo.updateFloor(floorId, { name, description, section, areaChargeType, areaChargeValue }, restaurantId)
+        .catch(err => console.error('PG updateFloor error:', err.message));
+      if (name !== originalFloorNameCapitalized) {
+        floorsTablesRepo.updateFloorNameOnTables(floorId, name, restaurantId)
+          .catch(err => console.error('PG updateFloorNameOnTables error:', err.message));
+      }
+    }
+
     res.json({ message: 'Floor updated successfully' });
 
   } catch (error) {
@@ -16515,6 +16820,13 @@ app.patch('/api/floors/reorder/:restaurantId', authenticateToken, async (req, re
     });
 
     await batch.commit();
+
+    // PG dual-write: reorder floors
+    if (floorsTablesRepo) {
+      floorsTablesRepo.reorderFloors(restaurantId, floorOrder)
+        .catch(err => console.error('PG reorderFloors error:', err.message));
+    }
+
     res.json({ message: 'Floor order updated successfully' });
 
   } catch (error) {
@@ -16555,6 +16867,12 @@ app.delete('/api/floors/:floorId', authenticateToken, async (req, res) => {
     batch.delete(floorRef);
 
     await batch.commit();
+
+    // PG dual-write: delete floor (CASCADE deletes tables)
+    if (floorsTablesRepo) {
+      floorsTablesRepo.deleteFloor(floorId, restaurantId)
+        .catch(err => console.error('PG deleteFloor error:', err.message));
+    }
 
     // Sync pricing rules: remove deleted floor name from tableMappings
     if (floorName) {
@@ -19275,7 +19593,8 @@ app.put('/api/admin/print-settings/:restaurantId', authenticateToken, async (req
       'tokenBillingEnabled',
       'enableUpdateWithoutKOT',
       'enableKOTAndPrint',
-      'enableSaveAndPrint'
+      'enableSaveAndPrint',
+      'showPrintNotifications'
     ];
 
     // Numeric fields
@@ -21463,6 +21782,17 @@ app.patch('/api/orders/:orderId/cancel', authenticateToken, async (req, res) => 
 
     // If order has a table, release it back to available
     if (orderData.tableNumber && orderData.tableNumber.trim()) {
+      // PG dual-write: release table
+      if (floorsTablesRepo) {
+        if (orderData.tableId) {
+          floorsTablesRepo.releaseTable(orderData.tableId)
+            .catch(err => console.error('PG releaseTable (cancel) error:', err.message));
+        } else {
+          floorsTablesRepo.releaseTableByName(orderData.restaurantId, orderData.tableNumber)
+            .catch(err => console.error('PG releaseTableByName (cancel) error:', err.message));
+        }
+      }
+
       try {
         let tableReleased = false;
 
@@ -28147,13 +28477,26 @@ app.get('/api/books/:restaurantId/revenue', authenticateToken, async (req, res) 
       ? `${restaurantId}_sub_${subRestaurantId}_${dateStr}`
       : `${restaurantId}_${dateStr}`;
 
-    // Batch-read dailyStats docs for both periods (1 read per day instead of scanning all orders)
-    const curRefs = curDateStrings.map(ds => db.collection('dailyStats').doc(getDocId(ds)));
-    const prevRefs = prevDateStrings.map(ds => db.collection('dailyStats').doc(getDocId(ds)));
-    const [curDocs, prevDocs] = await Promise.all([
-      curRefs.length > 0 ? db.getAll(...curRefs) : [],
-      prevRefs.length > 0 ? db.getAll(...prevRefs) : []
-    ]);
+    // Batch-read dailyStats docs for both periods
+    let curDocs, prevDocs;
+    if (usePg) {
+      const curIds = curDateStrings.map(ds => getDocId(ds));
+      const prevIds = prevDateStrings.map(ds => getDocId(ds));
+      const [curPg, prevPg] = await Promise.all([
+        dailyStatsRepo.getByIds(curIds),
+        dailyStatsRepo.getByIds(prevIds),
+      ]);
+      // Wrap in Firestore-like shape for downstream code: { exists, data() }
+      curDocs = curPg.map(d => ({ exists: true, data: () => d }));
+      prevDocs = prevPg.map(d => ({ exists: true, data: () => d }));
+    } else {
+      const curRefs = curDateStrings.map(ds => db.collection('dailyStats').doc(getDocId(ds)));
+      const prevRefs = prevDateStrings.map(ds => db.collection('dailyStats').doc(getDocId(ds)));
+      [curDocs, prevDocs] = await Promise.all([
+        curRefs.length > 0 ? db.getAll(...curRefs) : [],
+        prevRefs.length > 0 ? db.getAll(...prevRefs) : []
+      ]);
+    }
 
     // Check if we got any dailyStats data
     const hasDailyStats = curDocs.some(doc => doc.exists);
@@ -28634,17 +28977,34 @@ app.get('/api/books/:restaurantId/pnl', authenticateToken, async (req, res) => {
     for (let d = new Date(prev.start); d <= prev.end; d.setDate(d.getDate() + 1)) {
       prevDateStrings.push(d.toISOString().split('T')[0]);
     }
-    const curStatsRefs = curDateStrings.map(ds => db.collection('dailyStats').doc(`${restaurantId}_${ds}`));
-    const prevStatsRefs = prevDateStrings.map(ds => db.collection('dailyStats').doc(`${restaurantId}_${ds}`));
-
     // Fetch dailyStats (for revenue), COGS, expenses, credits in parallel
     const txRef = db.collection(collections.inventoryTransactions);
     const expRef = db.collection(collections.expenses);
     const retRef = db.collection(collections.supplierReturns);
 
-    const [curStatsDocs, prevStatsDocs, txSnap, expSnap, prevExpSnap, retSnap] = await Promise.all([
-      curStatsRefs.length > 0 ? db.getAll(...curStatsRefs) : [],
-      prevStatsRefs.length > 0 ? db.getAll(...prevStatsRefs) : [],
+    let curStatsDocs, prevStatsDocs;
+    const statsPromise = (async () => {
+      if (usePg) {
+        const curIds = curDateStrings.map(ds => `${restaurantId}_${ds}`);
+        const prevIds = prevDateStrings.map(ds => `${restaurantId}_${ds}`);
+        const [curPg, prevPg] = await Promise.all([
+          dailyStatsRepo.getByIds(curIds),
+          dailyStatsRepo.getByIds(prevIds),
+        ]);
+        curStatsDocs = curPg.map(d => ({ exists: true, data: () => d }));
+        prevStatsDocs = prevPg.map(d => ({ exists: true, data: () => d }));
+      } else {
+        const curStatsRefs = curDateStrings.map(ds => db.collection('dailyStats').doc(`${restaurantId}_${ds}`));
+        const prevStatsRefs = prevDateStrings.map(ds => db.collection('dailyStats').doc(`${restaurantId}_${ds}`));
+        [curStatsDocs, prevStatsDocs] = await Promise.all([
+          curStatsRefs.length > 0 ? db.getAll(...curStatsRefs) : [],
+          prevStatsRefs.length > 0 ? db.getAll(...prevStatsRefs) : []
+        ]);
+      }
+    })();
+
+    const [, txSnap, expSnap, prevExpSnap, retSnap] = await Promise.all([
+      statsPromise,
       txRef.where('restaurantId', '==', restaurantId).where('type', '==', 'DEDUCTION').where('date', '>=', start).where('date', '<=', end).get(),
       expRef.where('restaurantId', '==', restaurantId).where('date', '>=', start).where('date', '<=', end).get(),
       expRef.where('restaurantId', '==', restaurantId).where('date', '>=', prev.start).where('date', '<=', prev.end).get(),
@@ -28766,16 +29126,39 @@ app.get('/api/books/:restaurantId/overview', authenticateToken, async (req, res)
     for (let d = new Date(prev.start); d <= prev.end; d.setDate(d.getDate() + 1)) {
       prevDateStrings.push(d.toISOString().split('T')[0]);
     }
-    const curStatsRefs = curDateStrings.map(ds => db.collection('dailyStats').doc(`${restaurantId}_${ds}`));
-    const prevStatsRefs = prevDateStrings.map(ds => db.collection('dailyStats').doc(`${restaurantId}_${ds}`));
-
     const txRef = db.collection(collections.inventoryTransactions);
     const expRef = db.collection(collections.expenses);
     const invRef = db.collection(collections.supplierInvoices);
 
+    // dailyStats: PG primary, Firestore fallback
+    const curDocIds = curDateStrings.map(ds => `${restaurantId}_${ds}`);
+    const prevDocIds = prevDateStrings.map(ds => `${restaurantId}_${ds}`);
+
     const [curStatsDocs, prevStatsDocs, txSnap, expSnap, prevExpSnap, duesSnap] = await Promise.all([
-      curStatsRefs.length > 0 ? db.getAll(...curStatsRefs) : [],
-      prevStatsRefs.length > 0 ? db.getAll(...prevStatsRefs) : [],
+      (async () => {
+        if (curDocIds.length === 0) return [];
+        if (dailyStatsRepo) {
+          const rows = await dailyStatsRepo.getByIds(curDocIds);
+          const rowMap = {};
+          rows.forEach(d => { rowMap[d.id] = d; });
+          return curDocIds.map(id => rowMap[id]
+            ? { exists: true, data: () => rowMap[id] }
+            : { exists: false });
+        }
+        return db.getAll(...curDocIds.map(id => db.collection('dailyStats').doc(id)));
+      })(),
+      (async () => {
+        if (prevDocIds.length === 0) return [];
+        if (dailyStatsRepo) {
+          const rows = await dailyStatsRepo.getByIds(prevDocIds);
+          const rowMap = {};
+          rows.forEach(d => { rowMap[d.id] = d; });
+          return prevDocIds.map(id => rowMap[id]
+            ? { exists: true, data: () => rowMap[id] }
+            : { exists: false });
+        }
+        return db.getAll(...prevDocIds.map(id => db.collection('dailyStats').doc(id)));
+      })(),
       txRef.where('restaurantId', '==', restaurantId).where('type', '==', 'DEDUCTION').where('date', '>=', start).where('date', '<=', end).get(),
       expRef.where('restaurantId', '==', restaurantId).where('date', '>=', start).where('date', '<=', end).get(),
       expRef.where('restaurantId', '==', restaurantId).where('date', '>=', prev.start).where('date', '<=', prev.end).get(),
@@ -28791,7 +29174,7 @@ app.get('/api/books/:restaurantId/overview', authenticateToken, async (req, res)
       console.log(`📊 Books overview (${period}): using dailyStats for revenue`);
       curStatsDocs.forEach((doc, i) => {
         if (!doc.exists) return;
-        const data = doc.data();
+        const data = typeof doc.data === 'function' ? doc.data() : doc;
         const amt = (data.totalRevenueWithTax || 0) + (data.totalDueAmount || 0);
         revenue += amt;
         activeOrderCount += data.totalOrders || 0;
@@ -28801,7 +29184,7 @@ app.get('/api/books/:restaurantId/overview', authenticateToken, async (req, res)
       });
       prevStatsDocs.forEach(doc => {
         if (!doc.exists) return;
-        const data = doc.data();
+        const data = typeof doc.data === 'function' ? doc.data() : doc;
         prevRevenue += (data.totalRevenueWithTax || 0) + (data.totalDueAmount || 0);
       });
     } else {
@@ -31647,6 +32030,12 @@ app.put('/api/restaurants/:restaurantId/customer-app-settings', authenticateToke
     // Invalidate Redis cache so public endpoints serve fresh data
     invalidateRestaurantCache(restaurantId);
 
+    // PG dual-write: update customer app settings
+    if (restaurantsRepo) {
+      restaurantsRepo.update(restaurantId, { customerAppSettings })
+        .catch(err => console.error('PG update customerAppSettings error:', err.message));
+    }
+
     // Notify all connected clients about offer settings change
     pusherService.pushEvent(restaurantId, 'menu', 'offer-updated', { action: 'settings-updated' });
 
@@ -31760,6 +32149,12 @@ app.put('/api/restaurants/:restaurantId/pricing-settings', authenticateToken, as
 
     // Invalidate Redis cache so public endpoints serve fresh data
     invalidateRestaurantCache(restaurantId);
+
+    // PG dual-write: update pricing settings
+    if (restaurantsRepo) {
+      restaurantsRepo.update(restaurantId, { pricingSettings })
+        .catch(err => console.error('PG update pricingSettings error:', err.message));
+    }
 
     res.json({
       message: 'Pricing settings updated successfully',
@@ -31947,6 +32342,12 @@ app.put('/api/restaurants/:restaurantId/billing-settings', authenticateToken, as
 
     // Invalidate Redis cache so public endpoints serve fresh data
     invalidateRestaurantCache(restaurantId);
+
+    // PG dual-write: update billing settings
+    if (restaurantsRepo) {
+      restaurantsRepo.update(restaurantId, { billingSettings })
+        .catch(err => console.error('PG update billingSettings error:', err.message));
+    }
 
     res.json({
       message: 'Billing settings updated successfully',
@@ -33537,6 +33938,13 @@ app.post('/api/restaurants/:restaurantId/generate-code', authenticateToken, asyn
       'customerAppSettings.enabled': customerAppSettings.enabled ?? true,
       updatedAt: new Date()
     });
+
+    // PG dual-write: update restaurant code
+    if (restaurantsRepo) {
+      const updatedSettings = { ...customerAppSettings, restaurantCode: newCode, enabled: customerAppSettings.enabled ?? true };
+      restaurantsRepo.update(restaurantId, { customerAppSettings: updatedSettings, restaurantCode: newCode })
+        .catch(err => console.error('PG update restaurantCode error:', err.message));
+    }
 
     res.json({
       success: true,
