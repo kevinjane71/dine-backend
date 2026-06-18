@@ -5918,12 +5918,26 @@ app.get('/api/auth/desktop/session/:id', async (req, res) => {
 // Returns: Same response structure as /api/auth/phone/verify-otp
 app.post('/api/auth/local-login', async (req, res) => {
   try {
-    const { phone, email, password, name } = req.body;
-    const fixedPassword = process.env.ADMIN_LOCAL_PASSWORD || 'noni7190';
+    const { phone, email, password, name, loginSource } = req.body;
+
+    // Different passwords for different login sources
+    let fixedPassword;
+    if (loginSource === 'master-login') {
+      fixedPassword = process.env.QATAR_ADMIN_PASS;
+    } else {
+      fixedPassword = process.env.ADMIN_LOCAL_PASSWORD;
+    }
+
+    if (!fixedPassword) {
+      return res.status(500).json({
+        error: 'Login not configured',
+        message: 'Login password not set in environment'
+      });
+    }
 
     // Validate password
     if (!password || password !== fixedPassword) {
-      return res.status(401).json({ 
+      return res.status(401).json({
         error: 'Invalid password',
         message: 'Incorrect password'
       });
@@ -5974,7 +5988,7 @@ app.post('/api/auth/local-login', async (req, res) => {
         role: 'owner',
         emailVerified: !!normalizedEmail,
         phoneVerified: !!normalizedPhone,
-        provider: 'local-login',
+        provider: loginSource || 'local-login',
         setupComplete: false,
         createdAt: new Date(),
         updatedAt: new Date()
