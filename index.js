@@ -127,6 +127,11 @@ const bucket = lazyInit(() => {
 const { db, collections } = require('./firebase');
 const { FieldValue } = require('firebase-admin/firestore');
 const performanceOptimizer = require('./middleware/performanceOptimizer');
+
+// PostgreSQL orders repo — only active when DATABASE_URL is set
+const usePg = !!process.env.DATABASE_URL;
+const ordersRepo = usePg ? require('./repos/ordersRepo') : null;
+if (usePg) console.log('✅ PostgreSQL orders repo enabled (DATABASE_URL set)');
 const firestoreOptimizer = require('./utils/firestoreOptimizer');
 const { kvGet, kvSet, kvDel, getCachedRestaurant, invalidateRestaurantCache, invalidateUserCache } = require('./utils/kvCache');
 
@@ -10037,6 +10042,13 @@ app.post('/api/orders', async (req, res) => {
     const orderRef = await db.collection(collections.orders).add(orderData);
     console.log('🛒 Backend Order Creation - Order saved to DB with ID:', orderRef.id);
 
+    // Dual-write to PostgreSQL (fire-and-forget, non-blocking)
+    if (usePg) {
+      ordersRepo.create(orderRef.id, orderData).catch(pgErr => {
+        console.error('⚠️ PG dual-write error (create):', pgErr.message);
+      });
+    }
+
     // Store idempotency key for deduplication (use key as doc ID for atomic uniqueness)
     // Update idempotency key with the actual orderId (key was reserved atomically before creation)
     if (idempotencyKey) {
@@ -10755,16 +10767,29 @@ app.get('/api/orders/single/:orderId', authenticateToken, async (req, res) => {
 
     const { orderId } = req.params;
 
-    const orderRef = db.collection(collections.orders).doc(orderId);
-    const orderDoc = await orderRef.get();
+    let orderData, ordId;
 
-    if (!orderDoc.exists) {
-      return res.json({ orders: [], pagination: { currentPage: 1, totalPages: 0, totalOrders: 0, limit: 1, hasNextPage: false, hasPrevPage: false } });
+    if (usePg) {
+      // PostgreSQL path
+      const pgOrder = await ordersRepo.getById(orderId);
+      if (!pgOrder) {
+        return res.json({ orders: [], pagination: { currentPage: 1, totalPages: 0, totalOrders: 0, limit: 1, hasNextPage: false, hasPrevPage: false } });
+      }
+      orderData = pgOrder;
+      ordId = pgOrder.id;
+    } else {
+      // Firestore path (original)
+      const orderRef = db.collection(collections.orders).doc(orderId);
+      const orderDoc = await orderRef.get();
+      if (!orderDoc.exists) {
+        return res.json({ orders: [], pagination: { currentPage: 1, totalPages: 0, totalOrders: 0, limit: 1, hasNextPage: false, hasPrevPage: false } });
+      }
+      orderData = orderDoc.data();
+      ordId = orderDoc.id;
     }
 
-    const orderData = orderDoc.data();
     const order = {
-      id: orderDoc.id,
+      id: ordId,
       ...orderData,
       createdAt: orderData.createdAt,
       updatedAt: orderData.updatedAt,
@@ -10828,12 +10853,7 @@ app.get('/api/orders/:restaurantId', authenticateToken, async (req, res) => {
 
     console.log(`🔍 Orders API - Restaurant: ${restaurantId}, Page: ${page}, Limit: ${limit}, Status: ${status || 'all'}, Search: ${search || 'none'}, Waiter: ${waiterId || 'all'}, TodayOnly: ${todayOnly}, PaymentMethod: ${paymentMethod || 'all'}`);
 
-    // Calculate pagination
-    const pageNum = parseInt(page);
-    const limitNum = parseInt(limit);
-    const offset = (pageNum - 1) * limitNum;
-
-    // Helper: format a Firestore doc into the order response shape
+    // Helper: format order data into the response shape (works for both PG and Firestore)
     const formatOrder = (doc) => {
       const orderData = doc.data ? doc.data() : doc;
       const id = doc.id || orderData.id;
@@ -10866,6 +10886,65 @@ app.get('/api/orders/:restaurantId', authenticateToken, async (req, res) => {
         }
       };
     };
+
+    // --- PostgreSQL path ---
+    if (usePg) {
+      // Pre-compute timezone-aware date bounds for PG repo
+      const filters = {
+        page, limit, status, orderType, search, waiterId, myOrdersOnly,
+        paymentMethod, paymentStatus,
+        isScheduled: req.query.isScheduled === 'true',
+      };
+
+      if (todayOnly === 'true') {
+        const _tz = parseTZ(req);
+        const _ds = parseDayStart(req);
+        if (_tz !== undefined) {
+          const t = todayInTZ(_tz, _ds);
+          filters.todayOnly = true;
+          filters.todayStart = t.start;
+          filters.todayEnd = t.end;
+        } else {
+          const s = new Date(); s.setHours(0, 0, 0, 0);
+          const e = new Date(); e.setHours(23, 59, 59, 999);
+          filters.todayOnly = true;
+          filters.todayStart = s;
+          filters.todayEnd = e;
+        }
+      } else if (date) {
+        const _tz = parseTZ(req);
+        const _ds = parseDayStart(req);
+        if (_tz !== undefined) {
+          const b = dateBoundsInTZ(date, _tz, _ds);
+          filters.date = date;
+          filters.dateStart = b.start;
+          filters.dateEnd = b.end;
+        } else {
+          filters.date = date;
+          filters.dateStart = new Date(date);
+          const eDate = new Date(date);
+          eDate.setDate(eDate.getDate() + 1);
+          filters.dateEnd = eDate;
+        }
+      } else if (startDate && endDate) {
+        filters.startDate = startDate;
+        filters.endDate = endDate;
+      }
+
+      const result = await ordersRepo.getByRestaurant(restaurantId, filters);
+      const orders = result.orders.map(formatOrder);
+
+      console.log(`📋 Order History (PG) - Found ${orders.length} orders (page ${result.pagination.currentPage}/${result.pagination.totalPages}, total: ${result.pagination.totalOrders})`);
+
+      return res.json({ orders, pagination: result.pagination });
+    }
+
+    // --- Firestore path (original) ---
+
+    // Calculate pagination
+    const pageNum = parseInt(page);
+    const limitNum = parseInt(limit);
+    const offset = (pageNum - 1) * limitNum;
 
     // --- QUICK MATCH: If searching, try direct doc ID lookup first (1 read vs 5000) ---
     if (search && search.trim() && !waiterId) {
@@ -12332,6 +12411,15 @@ app.patch('/api/orders/:orderId/status', authenticateToken, async (req, res) => 
     }
     await db.collection(collections.orders).doc(orderId).update(orderUpdateData);
 
+    // Dual-write to PostgreSQL (fire-and-forget, non-blocking)
+    if (usePg) {
+      ordersRepo.updateStatus(orderId, status, {
+        ...(orderUpdateData.shareToken ? { shareToken: orderUpdateData.shareToken } : {}),
+      }).catch(pgErr => {
+        console.error('⚠️ PG dual-write error (updateStatus):', pgErr.message);
+      });
+    }
+
     // Update daily analytics stats for status transitions (fire-and-forget)
     const _nonCounted = ['saved', 'cancelled', 'deleted'];
     const _prevCounted = !_nonCounted.includes(orderData.status);
@@ -13562,6 +13650,13 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
     console.log('🔄 Backend - Updating order:', orderId, 'with data:', updateData);
     await db.collection(collections.orders).doc(orderId).update(updateData);
 
+    // Dual-write to PostgreSQL (fire-and-forget, non-blocking)
+    if (usePg) {
+      ordersRepo.update(orderId, updateData).catch(pgErr => {
+        console.error('⚠️ PG dual-write error (update):', pgErr.message);
+      });
+    }
+
     // Inventory adjustment: if items changed, compute delta and adjust stock
     if (items && updateData.items && currentOrder.items) {
       try {
@@ -14399,6 +14494,23 @@ app.delete('/api/orders/:orderId', authenticateToken, async (req, res) => {
     }
 
     await orderRef.update(updateData);
+
+    // Dual-write to PostgreSQL (fire-and-forget)
+    if (usePg) {
+      const pgDeleteUpdate = {
+        status: 'deleted',
+        lastStatus,
+        updatedAt: new Date(),
+      };
+      if (updateData.deleteReason) pgDeleteUpdate.editReason = updateData.deleteReason;
+      if (updateData.refundType) pgDeleteUpdate.refundType = updateData.refundType;
+      if (updateData.refundedAt) pgDeleteUpdate.refundedAt = updateData.refundedAt;
+      if (updateData.refundedBy) pgDeleteUpdate.refundedBy = updateData.refundedBy;
+      if (updateData.refundReason) pgDeleteUpdate.refundReason = updateData.refundReason;
+      ordersRepo.update(orderId, pgDeleteUpdate).catch(pgErr => {
+        console.error('⚠️ PG dual-write error (delete):', pgErr.message);
+      });
+    }
 
     // Reverse all side effects (inventory, customer, loyalty, offers)
     reverseOrderSideEffects(orderId, order)
@@ -19969,25 +20081,54 @@ app.get('/api/kot/:restaurantId', async (req, res) => {
 
     console.log(`📅 Filtering orders from: ${yesterdayStart.toISOString()}`);
 
-    // Use a simpler query to avoid Firestore composite index requirements
-    let query = db.collection(collections.orders)
+    // Helper: enrich orders with KOT-specific fields and table info
+    const enrichKotOrders = (rawOrders, tableMap) => {
+      const validKotStatuses = ['pending', 'confirmed', 'preparing', 'ready', 'completed'];
+      const enriched = [];
+
+      for (const orderData of rawOrders) {
+        // If specific status requested, filter by that
+        if (status && status !== 'all') {
+          if (orderData.status !== status) continue;
+        } else {
+          if (!validKotStatuses.includes(orderData.status)) continue;
+        }
+
+        const tableInfo = orderData.tableNumber != null ? (tableMap[orderData.tableNumber] || null) : null;
+
+        let estimatedTime = 15;
+        let kotTime = orderData.createdAt instanceof Date ? orderData.createdAt : (orderData.createdAt ? new Date(orderData.createdAt) : new Date());
+        if (orderData.kotTime) {
+          kotTime = orderData.kotTime instanceof Date ? orderData.kotTime : new Date(orderData.kotTime);
+        }
+
+        if (orderData.items && orderData.items.length > 0) {
+          estimatedTime = Math.max(15, orderData.items.length * 8);
+        }
+
+        const kotId = `KOT-${orderData.id.slice(-6).toUpperCase()}`;
+
+        enriched.push({
+          ...orderData,
+          kotId,
+          kotTime: kotTime.toISOString(),
+          estimatedTime,
+          tableInfo,
+          createdAt: (orderData.createdAt instanceof Date ? orderData.createdAt : (orderData.createdAt ? new Date(orderData.createdAt) : new Date())).toISOString(),
+          updatedAt: (orderData.updatedAt instanceof Date ? orderData.updatedAt : (orderData.updatedAt ? new Date(orderData.updatedAt) : new Date())).toISOString(),
+        });
+      }
+
+      return enriched;
+    };
+
+    // Fetch tables from Firestore (tables are NOT migrated to PG)
+    const tablesSnapshot = await db.collection(collections.tables)
       .where('restaurantId', '==', restaurantId)
-      .where('createdAt', '>=', yesterdayStart)
-      .orderBy('createdAt', 'desc');
+      .select('number', 'name', 'floor', 'floorId', 'capacity', 'status', 'section')
+      .limit(500)
+      .get();
 
-    // Fetch orders and all tables for this restaurant in parallel (avoids N+1 queries)
-    const [ordersSnapshot, tablesSnapshot] = await Promise.all([
-      query.limit(100).get(),
-      db.collection(collections.tables)
-        .where('restaurantId', '==', restaurantId)
-        .select('number', 'name', 'floor', 'floorId', 'capacity', 'status', 'section')
-        .limit(500)
-        .get()
-    ]);
-
-    console.log(`📊 Total orders found in DB: ${ordersSnapshot.docs.length}`);
-
-    // Build table lookup map: tableNumber -> tableInfo (one query instead of per-order)
     const tableMap = {};
     tablesSnapshot.forEach(tableDoc => {
       const tableData = tableDoc.data();
@@ -20001,64 +20142,37 @@ app.get('/api/kot/:restaurantId', async (req, res) => {
       }
     });
 
-    const orders = [];
-    const validKotStatuses = ['pending', 'confirmed', 'preparing', 'ready', 'completed'];
-    console.log(`✅ Valid KOT statuses: ${validKotStatuses.join(', ')}`);
+    let orders;
 
-    for (const doc of ordersSnapshot.docs) {
-      const orderData = { id: doc.id, ...doc.data() };
-      console.log(`📋 Order ${doc.id}: status="${orderData.status}", created="${orderData.createdAt?.toDate()?.toISOString()}"`);
+    if (usePg) {
+      // --- PostgreSQL path ---
+      const kotResult = await ordersRepo.getKotOrders(restaurantId, { status, yesterdayStart });
+      orders = enrichKotOrders(kotResult.orders, tableMap);
+      console.log(`🍽️ Final KOT result (PG): ${orders.length} orders`);
+    } else {
+      // --- Firestore path (original) ---
+      let query = db.collection(collections.orders)
+        .where('restaurantId', '==', restaurantId)
+        .where('createdAt', '>=', yesterdayStart)
+        .orderBy('createdAt', 'desc');
 
-      // If specific status requested, filter by that
-      if (status && status !== 'all') {
-        if (orderData.status !== status) {
-          console.log(`❌ Skipping order ${doc.id} - status "${orderData.status}" doesn't match filter "${status}"`);
-          continue;
-        }
-      } else {
-        // For 'all' or no status filter, show only kitchen-relevant orders
-        if (!validKotStatuses.includes(orderData.status)) {
-          console.log(`❌ Skipping order ${doc.id} - status "${orderData.status}" not in valid KOT statuses`);
-        continue; // Skip orders that don't need kitchen attention
-        }
-      }
+      const ordersSnapshot = await query.limit(100).get();
+      console.log(`📊 Total orders found in DB: ${ordersSnapshot.docs.length}`);
 
-      console.log(`✅ Including order ${doc.id} in KOT list`);
-
-      // Look up table info from pre-loaded map (instant, no Firestore call)
-      const tableInfo = orderData.tableNumber != null ? (tableMap[orderData.tableNumber] || null) : null;
-
-      // Calculate estimated cooking time and elapsed time
-      let estimatedTime = 15; // default 15 minutes
-      let kotTime = orderData.createdAt?.toDate() || new Date();
-
-      if (orderData.kotTime) {
-        kotTime = orderData.kotTime.toDate();
-      }
-
-      // Calculate estimated time based on items complexity
-      if (orderData.items && orderData.items.length > 0) {
-        estimatedTime = Math.max(15, orderData.items.length * 8); // Base time + items
-      }
-
-      // Generate KOT ID based on order ID
-      const kotId = `KOT-${doc.id.slice(-6).toUpperCase()}`;
-
-      orders.push({
-        ...orderData,
-        kotId,
-        kotTime: kotTime.toISOString(),
-        estimatedTime,
-        tableInfo,
-        createdAt: orderData.createdAt?.toDate()?.toISOString() || new Date().toISOString(),
-        updatedAt: orderData.updatedAt?.toDate()?.toISOString() || new Date().toISOString()
+      const rawOrders = ordersSnapshot.docs.map(doc => {
+        const data = doc.data();
+        return {
+          id: doc.id,
+          ...data,
+          createdAt: data.createdAt?.toDate() || new Date(),
+          updatedAt: data.updatedAt?.toDate() || new Date(),
+          kotTime: data.kotTime?.toDate ? data.kotTime.toDate() : data.kotTime,
+        };
       });
-    }
 
-    console.log(`🍽️ Final KOT result: ${orders.length} orders`);
-    orders.forEach(order => {
-      console.log(`   - Order ${order.id}: ${order.status} (${order.items?.length || 0} items)`);
-    });
+      orders = enrichKotOrders(rawOrders, tableMap);
+      console.log(`🍽️ Final KOT result (Firestore): ${orders.length} orders`);
+    }
 
     res.json({
       orders,
@@ -20360,6 +20474,13 @@ app.patch('/api/kot/:orderId/printed', async (req, res) => {
     }
 
     await orderRef.update(updateData);
+
+    // Dual-write to PostgreSQL (fire-and-forget)
+    if (usePg) {
+      ordersRepo.update(orderId, updateData).catch(pgErr => {
+        console.error('⚠️ PG dual-write error (kot-printed):', pgErr.message);
+      });
+    }
 
     console.log(`✅ Order ${orderId} marked as printed${stationId ? ` (station: ${stationId})` : ''}`);
 
@@ -21310,6 +21431,13 @@ app.patch('/api/orders/:orderId/cancel', authenticateToken, async (req, res) => 
     };
 
     await db.collection(collections.orders).doc(orderId).update(updateData);
+
+    // Dual-write to PostgreSQL (fire-and-forget)
+    if (usePg) {
+      ordersRepo.update(orderId, updateData).catch(pgErr => {
+        console.error('⚠️ PG dual-write error (cancel):', pgErr.message);
+      });
+    }
 
     // Reverse all side effects (inventory, customer, loyalty, offers)
     const reversal = await reverseOrderSideEffects(orderId, orderData);
@@ -22380,6 +22508,10 @@ async function checkFeaturePermission(req, feature, operation) {
       if (historyPerms.read) return true;
       // Also accept legacy boolean: pageAccess.history === true
       if (pageAccess?.history === true) return true;
+      // Staff with tables access can read orders (needed to view active table orders)
+      const tablesPerms = resolveFeaturePerms(pageAccess, 'tables');
+      if (tablesPerms.read) return true;
+      if (pageAccess?.tables === true) return true;
     }
 
     return false;
@@ -31907,6 +32039,13 @@ app.post('/api/orders/:orderId/refund', authenticateToken, async (req, res) => {
     };
     await orderRef.update(updateFields);
 
+    // Dual-write to PostgreSQL (fire-and-forget)
+    if (usePg) {
+      ordersRepo.update(orderId, updateFields).catch(pgErr => {
+        console.error('⚠️ PG dual-write error (refund):', pgErr.message);
+      });
+    }
+
     // On full refund, reverse all side effects (inventory, customer stats, loyalty, offers)
     let reversals = null;
     if (isFullRefund) {
@@ -31984,12 +32123,20 @@ app.post('/api/orders/:orderId/partial-payment', authenticateToken, async (req, 
     const totalPaid = previousPaid + Number(paidAmount);
     const outstanding = Math.max(0, Math.round((finalAmount - totalPaid) * 100) / 100);
 
-    await orderRef.update({
+    const partialPaymentUpdate = {
       paidAmount: totalPaid,
       outstandingAmount: outstanding,
       paymentStatus: outstanding <= 0 ? 'paid' : 'partial',
       paymentMethod: paymentMethod || orderData.paymentMethod || 'cash'
-    });
+    };
+    await orderRef.update(partialPaymentUpdate);
+
+    // Dual-write to PostgreSQL (fire-and-forget)
+    if (usePg) {
+      ordersRepo.update(orderId, partialPaymentUpdate).catch(pgErr => {
+        console.error('⚠️ PG dual-write error (partial-payment):', pgErr.message);
+      });
+    }
 
     // Update customer credit if customerId provided
     if (customerId && outstanding > 0) {
@@ -32073,6 +32220,20 @@ app.post('/api/orders/:orderId/comp-void', authenticateToken, async (req, res) =
       adjustedFinalAmount,
       updatedAt: new Date(),
     });
+
+    // Dual-write to PostgreSQL (fire-and-forget)
+    if (usePg) {
+      const pgCompVoidUpdate = {
+        compAmount: Math.round(newCompAmount * 100) / 100,
+        updatedAt: new Date(),
+      };
+      if (type === 'void') {
+        pgCompVoidUpdate.voidItems = [...(orderData.voidItems || []), ...newItems];
+      }
+      ordersRepo.update(orderId, pgCompVoidUpdate).catch(pgErr => {
+        console.error('⚠️ PG dual-write error (comp-void):', pgErr.message);
+      });
+    }
 
     res.json({
       success: true,
@@ -32253,6 +32414,23 @@ app.patch('/api/orders/:orderId/edit-completed', authenticateToken, async (req, 
     updateData.editHistory = [...existingHistory, editEntry];
 
     await orderRef.update(updateData);
+
+    // Dual-write to PostgreSQL (fire-and-forget)
+    if (usePg) {
+      // Filter out FieldValue sentinels (delete/serverTimestamp) — PG uses NULL/new Date() instead
+      const pgUpdateData = {};
+      for (const [k, v] of Object.entries(updateData)) {
+        if (v && typeof v === 'object' && typeof v.isEqual === 'function') {
+          // Firestore FieldValue sentinel — convert to null for PG
+          pgUpdateData[k] = null;
+        } else {
+          pgUpdateData[k] = v;
+        }
+      }
+      ordersRepo.update(orderId, pgUpdateData).catch(pgErr => {
+        console.error('⚠️ PG dual-write error (edit-completed):', pgErr.message);
+      });
+    }
 
     // Correct dailyStats if payment status or amounts changed (affects revenue calculation)
     if (updateData.paymentStatus || updateData.paidAmount !== undefined || updateData.outstandingAmount !== undefined) {
@@ -32606,6 +32784,13 @@ app.patch('/api/orders/:orderId/edit-completed-items', authenticateToken, async 
 
     // Save updated order
     await orderRef.update(updateData);
+
+    // Dual-write to PostgreSQL (fire-and-forget)
+    if (usePg) {
+      ordersRepo.update(orderId, updateData).catch(pgErr => {
+        console.error('⚠️ PG dual-write error (edit-completed-items):', pgErr.message);
+      });
+    }
 
     // --- Inventory adjustment ---
     try {
@@ -36453,6 +36638,14 @@ app.post('/api/sync/batch', authenticateToken, async (req, res) => {
             if (payload.items) updateData.items = payload.items;
 
             await orderRef.update(updateData);
+
+            // Dual-write to PostgreSQL (fire-and-forget)
+            if (usePg) {
+              ordersRepo.update(orderId, updateData).catch(pgErr => {
+                console.error('⚠️ PG dual-write error (offline-sync):', pgErr.message);
+              });
+            }
+
             result = { order: { id: orderId, ...updateData } };
             break;
           }
