@@ -8935,27 +8935,27 @@ app.post('/api/public/orders/:restaurantId', vercelSecurityMiddleware.publicAPI,
       }).catch(err => console.error('Pusher notification error (non-blocking):', err))
     );
     const printSettings = restaurantData.printSettings || {};
-    if (printSettings.kotPrinterEnabled !== false) {
-      const stationGroups = splitOrderByPrintStation(orderItems, restaurantData.printStations, restaurantData.categories, { ...DEFAULT_PRINT_SETTINGS, ...printSettings });
-      for (const group of stationGroups) {
-        pusherPromises.push(
-          pusherService.notifyKOTPrintRequest(restaurantId, {
-            id: orderRef.id,
-            dailyOrderId: orderData.dailyOrderId,
-            orderNumber: orderData.orderNumber,
-            tableNumber: tableNum,
-            roomNumber: orderData.roomNumber,
-            items: group.items,
-            notes: orderData.notes,
-            specialInstructions: orderData.specialInstructions,
-            staffInfo: orderData.staffInfo,
-            orderType: orderType,
-            createdAt: orderData.createdAt?.toISOString() || new Date().toISOString(),
-            printStationId: group.stationId,
-            printStationName: group.stationName
-          }).catch(err => console.error('KOT print Pusher notification error (non-blocking):', err))
-        );
-      }
+    // Always publish KOT events to RTDB — Electron client decides whether to print
+    // based on autoPrintOnKOT setting. kotPrinterEnabled is legacy (standalone KOT printer app).
+    const stationGroups = splitOrderByPrintStation(orderItems, restaurantData.printStations, restaurantData.categories, { ...DEFAULT_PRINT_SETTINGS, ...printSettings });
+    for (const group of stationGroups) {
+      pusherPromises.push(
+        pusherService.notifyKOTPrintRequest(restaurantId, {
+          id: orderRef.id,
+          dailyOrderId: orderData.dailyOrderId,
+          orderNumber: orderData.orderNumber,
+          tableNumber: tableNum,
+          roomNumber: orderData.roomNumber,
+          items: group.items,
+          notes: orderData.notes,
+          specialInstructions: orderData.specialInstructions,
+          staffInfo: orderData.staffInfo,
+          orderType: orderType,
+          createdAt: orderData.createdAt?.toISOString() || new Date().toISOString(),
+          printStationId: group.stationId,
+          printStationName: group.stationName
+        }).catch(err => console.error('KOT print Pusher notification error (non-blocking):', err))
+      );
     }
     await Promise.allSettled(pusherPromises);
 
@@ -10436,7 +10436,7 @@ app.post('/api/orders', async (req, res) => {
           }).catch(err => console.error('Pusher notification error (non-blocking):', err))
         );
         const printSettings = restaurantData.printSettings || {};
-        if (orderData.status === 'confirmed' && printSettings.kotPrinterEnabled !== false) {
+        if (orderData.status === 'confirmed') {
           const stationGroups = splitOrderByPrintStation(orderItems, restaurantData.printStations, restaurantData.categories, { ...DEFAULT_PRINT_SETTINGS, ...printSettings });
           for (const group of stationGroups) {
             pusherPromises.push(
@@ -10450,7 +10450,7 @@ app.post('/api/orders', async (req, res) => {
             );
           }
         }
-        if (orderData.status === 'completed' && printSettings.kotPrinterEnabled !== false) {
+        if (orderData.status === 'completed') {
           pusherPromises.push(
             pusherService.notifyBillingPrintRequest(restaurantId, {
               id: orderRef.id, dailyOrderId, orderNumber, tableNumber, roomNumber,
@@ -12362,7 +12362,7 @@ app.patch('/api/orders/:orderId/status', authenticateToken, async (req, res) => 
       const restaurantDoc = await getCachedRestDoc(orderData.restaurantId);
       const printSettings = restaurantDoc.exists ? (restaurantDoc.data().printSettings || {}) : {};
 
-      if (status === 'confirmed' && printSettings.kotPrinterEnabled !== false) {
+      if (status === 'confirmed') {
         const restaurantFullData = restaurantDoc.data();
         const stationGroups = splitOrderByPrintStation(orderData.items, restaurantFullData.printStations, restaurantFullData.categories, { ...DEFAULT_PRINT_SETTINGS, ...(restaurantFullData.printSettings || {}) });
         for (const group of stationGroups) {
@@ -12386,7 +12386,7 @@ app.patch('/api/orders/:orderId/status', authenticateToken, async (req, res) => 
         }
       }
 
-      if (status === 'completed' && printSettings.kotPrinterEnabled !== false) {
+      if (status === 'completed') {
         // Reset billPrinted flag before sending billing print notification
         await db.collection(collections.orders).doc(orderId).update({
           billPrinted: false
@@ -14023,7 +14023,7 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
         const restaurantDoc = await getCachedRestDoc(currentOrder.restaurantId);
         const printSettings = restaurantDoc.exists ? (restaurantDoc.data().printSettings || {}) : {};
 
-        if (printSettings.kotPrinterEnabled !== false) {
+        {
           console.log('🖨️ Order items updated, triggering KOT reprint for order:', orderId);
           const restaurantFullData = restaurantDoc.data();
           const reprintItems = updateData.items || items;
@@ -14063,7 +14063,7 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
         const restaurantDoc = await getCachedRestDoc(currentOrder.restaurantId);
         const printSettings = restaurantDoc.exists ? (restaurantDoc.data().printSettings || {}) : {};
 
-        if (printSettings.kotPrinterEnabled !== false) {
+        {
           // Reset billPrinted flag before sending billing print notification
           await db.collection(collections.orders).doc(orderId).update({
             billPrinted: false
@@ -14190,13 +14190,9 @@ app.post('/api/orders/:orderId/manual-print', authenticateToken, async (req, res
     const restaurantData = restaurantDoc.exists ? restaurantDoc.data() : {};
     const printSettings = restaurantData.printSettings || {};
 
-    // Check if KOT printer is enabled
-    if (printSettings.kotPrinterEnabled === false) {
-      return res.status(400).json({
-        error: 'KOT Printer is disabled for this restaurant',
-        fallbackToBrowser: true
-      });
-    }
+    // Skip kotPrinterEnabled check — this endpoint is used by both the legacy
+    // KOT printer app AND the new Electron auto-print flow (pre-bill, manual reprint).
+    // The auto-print settings (autoPrintOnKOT/autoPrintOnBilling) are the real gates.
 
     // Format timestamps
     const createdAt = order.createdAt?.toDate?.() || order.createdAt?._seconds
