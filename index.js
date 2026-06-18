@@ -19104,6 +19104,11 @@ app.get('/api/admin/print-settings/:restaurantId', authenticateToken, async (req
       enableKOTAndPrint: false,            // Show "KOT & Print" combined button
       enableSaveAndPrint: false,           // Show "Bill & Print" combined button
       showPrintNotifications: true,        // Show indicator on desktop terminal for remote print commands
+      showSuccessNotifications: true,      // Show success notifications after actions
+      autoPrintOnPlaceOrder: false,        // Native: silent print KOT on Place Order
+      autoPrintOnKOTAndPrint: true,        // Native: silent print KOT on KOT & Print
+      autoPrintOnCompleteBilling: false,   // Native: silent print bill on Complete Billing
+      autoPrintOnBillAndPrint: true,       // Native: silent print bill on Bill & Print
       kotTemplate: 'classic',              // KOT print template: classic, compact, bold, grouped, numbered
       billTemplate: 'classic'              // Bill print template: classic, compact, detailed, elegant, minimal
     };
@@ -19151,7 +19156,12 @@ app.put('/api/admin/print-settings/:restaurantId', authenticateToken, async (req
       'enableUpdateWithoutKOT',
       'enableKOTAndPrint',
       'enableSaveAndPrint',
-      'showPrintNotifications'
+      'showPrintNotifications',
+      'showSuccessNotifications',
+      'autoPrintOnPlaceOrder',
+      'autoPrintOnKOTAndPrint',
+      'autoPrintOnCompleteBilling',
+      'autoPrintOnBillAndPrint'
     ];
 
     // Numeric fields
