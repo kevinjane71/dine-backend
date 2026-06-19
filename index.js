@@ -7194,7 +7194,8 @@ app.get('/api/public/menu/:restaurantId', vercelSecurityMiddleware.publicAPI, as
         image: item.image || null,
         images: item.images || [],
         allergens: item.allergens || [],
-        ...(item.taxGroupId && { taxGroupId: item.taxGroupId })
+        ...(item.taxGroupId && { taxGroupId: item.taxGroupId }),
+        ...(item.hideImage && { hideImage: true })
       }));
 
     // Cache at Vercel Edge for 3 min, serve stale for 1 min while revalidating
@@ -7207,7 +7208,8 @@ app.get('/api/public/menu/:restaurantId', vercelSecurityMiddleware.publicAPI, as
         description: restaurantData.description || '',
         address: restaurantData.address || '',
         phone: restaurantData.phone || '',
-        email: restaurantData.email || ''
+        email: restaurantData.email || '',
+        ...(restaurantData.posSettings?.hideMenuImages && { posSettings: { hideMenuImages: true } })
       },
       menu: menuItems
     });
