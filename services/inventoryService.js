@@ -2,6 +2,15 @@ const { db, collections } = require('../firebase');
 const { FieldValue } = require('firebase-admin/firestore');
 const aiRecipeService = require('./aiRecipeService');
 
+// PostgreSQL dual-write support
+const usePg = !!process.env.DATABASE_URL;
+const pgClient = usePg ? require('../repos/pgClient') : null;
+const inventoryRepo = usePg ? require('../repos/inventoryRepo') : null;
+const inventoryTransactionsRepo = usePg ? require('../repos/inventoryTransactionsRepo') : null;
+const stockBatchesRepo = usePg ? require('../repos/stockBatchesRepo') : null;
+const wasteEntriesRepo = usePg ? require('../repos/wasteEntriesRepo') : null;
+const recipesRepo = usePg ? require('../repos/recipesRepo') : null;
+
 // Comprehensive unit conversion map — all conversions to a "base" unit per dimension
 const UNIT_CONVERSIONS = {
   // Mass (base: g)
@@ -168,6 +177,10 @@ class InventoryService {
             };
             const newRef = await db.collection(collections.inventory).add(newItemData);
             inventoryItems.push({ id: newRef.id, ...newItemData }); // track for subsequent matches
+            // PG dual-write for auto-created inventory item
+            if (inventoryRepo) {
+              inventoryRepo.create(newRef.id, newItemData).catch(e => console.error('PG inventory auto-create failed:', e.message));
+            }
             mappedIngredients.push({
               inventoryItemId: newRef.id,
               inventoryItemName: ing.name,
@@ -202,8 +215,13 @@ class InventoryService {
         createdBy: userId
       };
 
-      await db.collection('recipes').add(recipeData);
+      const recipeRef = await db.collection('recipes').add(recipeData);
       console.log(`✅ Created default AI recipe for ${itemName} with ${mappedIngredients.length} ingredients (${mappedIngredients.filter(i => i.inventoryItemId).length} linked)`);
+
+      // ── PG dual-write (fire-and-forget) ──
+      if (recipesRepo) {
+        recipesRepo.create(recipeRef.id, recipeData).catch(e => console.error('PG recipe create failed:', e.message));
+      }
 
     } catch (error) {
       console.error(`❌ Failed to create default recipe for ${itemName}:`, error);
@@ -549,6 +567,53 @@ class InventoryService {
             }
           }
         }
+
+        // ── PG dual-write (fire-and-forget) ──
+        if (pgClient && inventoryRepo) {
+          (async () => {
+            const client = await pgClient.getClient();
+            try {
+              await client.query('BEGIN');
+              for (const d of deductions) {
+                // Decrement inventory stock
+                await client.query(
+                  `UPDATE inventory SET current_stock = GREATEST(current_stock - $1, 0), updated_at = NOW() WHERE id = $2`,
+                  [d.quantityDeducted, d.inventoryItemId]
+                );
+                // Decrement batch quantities (FIFO)
+                if (d.batchIds && d.batchIds.length > 0) {
+                  for (const batchId of d.batchIds) {
+                    await stockBatchesRepo.decrementBatch(client, batchId, d.quantityDeducted / d.batchIds.length);
+                  }
+                }
+              }
+              // Create transaction records
+              const txRecords = deductions.map(d => ({
+                id: require('crypto').randomUUID(),
+                restaurantId,
+                inventoryItemId: d.inventoryItemId,
+                inventoryItemName: d.inventoryItemName,
+                type: 'DEDUCTION',
+                source: 'ORDER',
+                referenceId: orderId,
+                quantityChange: -d.quantityDeducted,
+                unit: d.unit || '',
+                date: new Date(),
+                notes: `Order deduction: ${d.menuItemName}`,
+                ...(d.batchIds && { batchIds: d.batchIds }),
+              }));
+              if (txRecords.length > 0) {
+                await inventoryTransactionsRepo.createBatch(client, txRecords);
+              }
+              await client.query('COMMIT');
+            } catch (pgErr) {
+              await client.query('ROLLBACK');
+              console.error('PG inventory deduction dual-write failed:', pgErr.message);
+            } finally {
+              client.release();
+            }
+          })().catch(e => console.error('PG deduction dual-write error:', e.message));
+        }
       }
 
       // Bar bottle tracking: if enabled, record pours against open bottles
@@ -664,6 +729,42 @@ class InventoryService {
       if (restorations.length > 0) {
         await batch.commit();
         console.log(`✅ Inventory restored for Order ${orderId}: ${restorations.length} items`);
+
+        // ── PG dual-write (fire-and-forget) ──
+        if (pgClient && inventoryRepo) {
+          (async () => {
+            const client = await pgClient.getClient();
+            try {
+              await client.query('BEGIN');
+              for (const r of restorations) {
+                await client.query(
+                  `UPDATE inventory SET current_stock = current_stock + $1, updated_at = NOW() WHERE id = $2`,
+                  [r.quantityRestored, r.inventoryItemId]
+                );
+              }
+              const txRecords = restorations.map(r => ({
+                id: require('crypto').randomUUID(),
+                restaurantId,
+                inventoryItemId: r.inventoryItemId,
+                inventoryItemName: r.inventoryItemName,
+                type: 'ADDITION',
+                source: 'ORDER_CANCELLED',
+                referenceId: orderId,
+                quantityChange: r.quantityRestored,
+                unit: r.unit || '',
+                date: new Date(),
+                notes: `Inventory restored — order ${orderId} cancelled/deleted`,
+              }));
+              await inventoryTransactionsRepo.createBatch(client, txRecords);
+              await client.query('COMMIT');
+            } catch (pgErr) {
+              await client.query('ROLLBACK');
+              console.error('PG inventory restore dual-write failed:', pgErr.message);
+            } finally {
+              client.release();
+            }
+          })().catch(e => console.error('PG restore dual-write error:', e.message));
+        }
       }
 
       return restorations;
@@ -795,6 +896,42 @@ class InventoryService {
       if (restorations.length > 0) {
         await batch.commit();
         console.log(`✅ Inventory restored for edited Order ${orderId}: ${restorations.length} items`);
+
+        // ── PG dual-write (fire-and-forget) ──
+        if (pgClient && inventoryRepo) {
+          (async () => {
+            const client = await pgClient.getClient();
+            try {
+              await client.query('BEGIN');
+              for (const r of restorations) {
+                await client.query(
+                  `UPDATE inventory SET current_stock = current_stock + $1, updated_at = NOW() WHERE id = $2`,
+                  [r.quantityRestored, r.inventoryItemId]
+                );
+              }
+              const txRecords = restorations.map(r => ({
+                id: require('crypto').randomUUID(),
+                restaurantId,
+                inventoryItemId: r.inventoryItemId,
+                inventoryItemName: r.inventoryItemName,
+                type: 'ADDITION',
+                source: 'ORDER_EDITED',
+                referenceId: orderId,
+                quantityChange: r.quantityRestored,
+                unit: r.unit || '',
+                date: new Date(),
+                notes: `Edit restore: ${r.inventoryItemName} restored`,
+              }));
+              await inventoryTransactionsRepo.createBatch(client, txRecords);
+              await client.query('COMMIT');
+            } catch (pgErr) {
+              await client.query('ROLLBACK');
+              console.error('PG inventory edit-restore dual-write failed:', pgErr.message);
+            } finally {
+              client.release();
+            }
+          })().catch(e => console.error('PG edit-restore dual-write error:', e.message));
+        }
       }
 
       return restorations;

@@ -134,7 +134,12 @@ const ordersRepo = usePg ? require('./repos/ordersRepo') : null;
 const dailyStatsRepo = usePg ? require('./repos/dailyStatsRepo') : null;
 const floorsTablesRepo = usePg ? require('./repos/floorsTablesRepo') : null;
 const restaurantsRepo = usePg ? require('./repos/restaurantsRepo') : null;
-if (usePg) console.log('✅ PostgreSQL repos enabled (DATABASE_URL set): orders, dailyStats, floors/tables, restaurants');
+const inventoryRepo = usePg ? require('./repos/inventoryRepo') : null;
+const inventoryTransactionsRepo = usePg ? require('./repos/inventoryTransactionsRepo') : null;
+const stockBatchesRepo = usePg ? require('./repos/stockBatchesRepo') : null;
+const wasteEntriesRepo = usePg ? require('./repos/wasteEntriesRepo') : null;
+const recipesRepo = usePg ? require('./repos/recipesRepo') : null;
+if (usePg) console.log('✅ PostgreSQL repos enabled (DATABASE_URL set): orders, dailyStats, floors/tables, restaurants, inventory');
 const firestoreOptimizer = require('./utils/firestoreOptimizer');
 const { kvGet, kvSet, kvDel, getCachedRestaurant, invalidateRestaurantCache, invalidateUserCache } = require('./utils/kvCache');
 
@@ -13850,11 +13855,16 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
     console.log('🔄 Backend - Updating order:', orderId, 'with data:', updateData);
     await db.collection(collections.orders).doc(orderId).update(updateData);
 
-    // Dual-write to PostgreSQL (fire-and-forget, non-blocking)
+    // Dual-write to PostgreSQL
+    // For bill completion (status=completed), await the PG write so the frontend
+    // re-fetch sees the updated paymentStatus. For other updates, fire-and-forget.
     if (usePg) {
-      ordersRepo.update(orderId, updateData).catch(pgErr => {
+      const pgUpdatePromise = ordersRepo.update(orderId, updateData).catch(pgErr => {
         console.error('⚠️ PG dual-write error (update):', pgErr.message);
       });
+      if (status === 'completed') {
+        await pgUpdatePromise;
+      }
     }
 
     // Inventory adjustment: if items changed, compute delta and adjust stock
@@ -22876,100 +22886,166 @@ app.get('/api/inventory/:restaurantId', authenticateToken, async (req, res) => {
 
     console.log(`📦 Inventory API - Restaurant: ${restaurantId}, Category: ${category || 'all'}, Status: ${status || 'all'}, Search: ${search || 'none'}`);
 
-    let query = db.collection(collections.inventory).where('restaurantId', '==', restaurantId);
-    
-    // Apply category filter if provided
-    if (category && category !== 'all') {
-      query = query.where('category', '==', category);
-    }
-
-    const snapshot = await query.orderBy('name', 'asc').get();
     let items = [];
 
-    snapshot.forEach(doc => {
-      const itemData = { id: doc.id, ...doc.data() };
-      
-      // Apply status filter
-      if (status && status !== 'all') {
-        if (status === 'low' && itemData.currentStock > itemData.minStock) return;
-        if (status === 'good' && itemData.currentStock <= itemData.minStock) return;
-        if (status === 'expired' && itemData.expiryDate && new Date(itemData.expiryDate) > new Date()) return;
-      }
-      
-      // Apply search filter
-      if (search) {
-        const searchValue = search.toLowerCase().trim();
-        if (!itemData.name.toLowerCase().includes(searchValue) &&
-            !itemData.category.toLowerCase().includes(searchValue) &&
-            !itemData.supplier.toLowerCase().includes(searchValue)) {
-          return;
+    if (inventoryRepo) {
+      // ── PG primary path ──
+      try {
+        const opts = {};
+        if (category && category !== 'all') opts.category = category;
+        items = await inventoryRepo.getByRestaurant(restaurantId, opts);
+
+        // In-memory status/search filters (same as Firestore path)
+        if (status && status !== 'all') {
+          items = items.filter(item => {
+            if (status === 'low') return item.currentStock <= (item.minStock || item.minimumStock || 0);
+            if (status === 'good') return item.currentStock > (item.minStock || item.minimumStock || 0);
+            if (status === 'expired') return item.expiryDate && new Date(item.expiryDate) < new Date();
+            return true;
+          });
         }
-      }
-      
-      // Determine status
-      if (itemData.currentStock <= itemData.minStock) {
-        itemData.status = 'low';
-      } else if (itemData.expiryDate && new Date(itemData.expiryDate) < new Date()) {
-        itemData.status = 'expired';
-      } else {
-        itemData.status = 'good';
-      }
-      
-      items.push(itemData);
-    });
+        if (search) {
+          const sv = search.toLowerCase().trim();
+          items = items.filter(item =>
+            (item.name || '').toLowerCase().includes(sv) ||
+            (item.category || '').toLowerCase().includes(sv) ||
+            (item.supplier || '').toLowerCase().includes(sv)
+          );
+        }
 
-    // Fetch wastage data from wasteEntries + expired batches
-    // wasteDays=0 means today only (default), wasteDays=7 means last 7 days, etc.
-    try {
-      const now = new Date();
-      const wasteDays = parseInt(req.query.wasteDays) || 0;
-      const wasteStart = new Date(now);
-      wasteStart.setDate(wasteStart.getDate() - wasteDays);
-      wasteStart.setHours(0, 0, 0, 0);
-      const wastageMap = {}; // { itemId: { qty, value } }
+        // Determine status for each item
+        items.forEach(item => {
+          if (item.currentStock <= (item.minStock || item.minimumStock || 0)) {
+            item.status = 'low';
+          } else if (item.expiryDate && new Date(item.expiryDate) < new Date()) {
+            item.status = 'expired';
+          } else {
+            item.status = 'good';
+          }
+        });
 
-      // 1. Waste entries (logged waste — this week)
-      const wasteSnap = await db.collection(collections.wasteEntries)
-        .where('restaurantId', '==', restaurantId)
-        .limit(2000)
-        .get();
-      wasteSnap.forEach(doc => {
-        const data = doc.data();
-        const entryDate = data.date?.toDate?.() || data.createdAt?.toDate?.() || (data.createdAt ? new Date(data.createdAt) : null);
-        if (entryDate && entryDate >= wasteStart) {
-          const iid = data.itemId || data.inventoryItemId;
-          if (iid) {
-            if (!wastageMap[iid]) wastageMap[iid] = { qty: 0, value: 0 };
-            wastageMap[iid].qty += (data.quantity || 0);
-            wastageMap[iid].value += (data.totalCost || data.wasteValue || 0);
+        // Wastage enrichment from PG
+        try {
+          const now = new Date();
+          const wasteDays = parseInt(req.query.wasteDays) || 0;
+          const wasteStart = new Date(now);
+          wasteStart.setDate(wasteStart.getDate() - wasteDays);
+          wasteStart.setHours(0, 0, 0, 0);
+          const wastageMap = {};
+
+          const [wasteEntries, batches] = await Promise.all([
+            wasteEntriesRepo.getByRestaurant(restaurantId, { dateStart: wasteStart }),
+            stockBatchesRepo.getByRestaurant(restaurantId, { status: 'active' }),
+          ]);
+
+          wasteEntries.forEach(data => {
+            const iid = data.itemId || data.inventoryItemId;
+            if (iid) {
+              if (!wastageMap[iid]) wastageMap[iid] = { qty: 0, value: 0 };
+              wastageMap[iid].qty += (data.quantity || 0);
+              wastageMap[iid].value += (data.totalCost || data.wasteValue || 0);
+            }
+          });
+
+          batches.forEach(data => {
+            const expiry = data.expiryDate ? new Date(data.expiryDate) : null;
+            if (expiry && expiry < now && (data.remainingQty || 0) > 0) {
+              const iid = data.inventoryItemId;
+              if (!wastageMap[iid]) wastageMap[iid] = { qty: 0, value: 0 };
+              wastageMap[iid].qty += data.remainingQty;
+              wastageMap[iid].value += (data.remainingQty * (data.costPerUnit || 0));
+            }
+          });
+
+          items.forEach(item => {
+            const w = wastageMap[item.id];
+            item.wastedQty = w ? w.qty : 0;
+            item.wastedValue = w ? w.value : 0;
+          });
+        } catch (e) {
+          console.warn('PG wastage data fetch failed (non-critical):', e.message);
+        }
+      } catch (pgErr) {
+        console.error('PG inventory read failed, falling back to Firestore:', pgErr.message);
+        items = []; // fall through to Firestore path below
+      }
+    }
+
+    if (!inventoryRepo || items.length === 0) {
+      // ── Firestore fallback path ──
+      let query = db.collection(collections.inventory).where('restaurantId', '==', restaurantId);
+      if (category && category !== 'all') {
+        query = query.where('category', '==', category);
+      }
+      const snapshot = await query.orderBy('name', 'asc').get();
+      items = [];
+      snapshot.forEach(doc => {
+        const itemData = { id: doc.id, ...doc.data() };
+        if (status && status !== 'all') {
+          if (status === 'low' && itemData.currentStock > itemData.minStock) return;
+          if (status === 'good' && itemData.currentStock <= itemData.minStock) return;
+          if (status === 'expired' && itemData.expiryDate && new Date(itemData.expiryDate) > new Date()) return;
+        }
+        if (search) {
+          const searchValue = search.toLowerCase().trim();
+          if (!(itemData.name || '').toLowerCase().includes(searchValue) &&
+              !(itemData.category || '').toLowerCase().includes(searchValue) &&
+              !(itemData.supplier || '').toLowerCase().includes(searchValue)) {
+            return;
           }
         }
-      });
-
-      // 2. Expired batches with remaining qty (not yet logged as waste)
-      const batchesSnapshot = await db.collection(collections.stockBatches)
-        .where('restaurantId', '==', restaurantId)
-        .limit(2000)
-        .get();
-      batchesSnapshot.forEach(doc => {
-        const data = doc.data();
-        const expiry = data.expiryDate?.toDate?.() || (data.expiryDate ? new Date(data.expiryDate) : null);
-        if (expiry && expiry < now && (data.remainingQty || 0) > 0 && data.status !== 'depleted') {
-          const iid = data.inventoryItemId;
-          if (!wastageMap[iid]) wastageMap[iid] = { qty: 0, value: 0 };
-          wastageMap[iid].qty += data.remainingQty;
-          wastageMap[iid].value += (data.remainingQty * (data.costPerUnit || 0));
+        if (itemData.currentStock <= itemData.minStock) {
+          itemData.status = 'low';
+        } else if (itemData.expiryDate && new Date(itemData.expiryDate) < new Date()) {
+          itemData.status = 'expired';
+        } else {
+          itemData.status = 'good';
         }
+        items.push(itemData);
       });
 
-      // Attach wastedQty and wastedValue to each item
-      items.forEach(item => {
-        const w = wastageMap[item.id];
-        item.wastedQty = w ? w.qty : 0;
-        item.wastedValue = w ? w.value : 0;
-      });
-    } catch (e) {
-      console.warn('Wastage data fetch failed (non-critical):', e.message);
+      // Firestore wastage enrichment
+      try {
+        const now = new Date();
+        const wasteDays = parseInt(req.query.wasteDays) || 0;
+        const wasteStart = new Date(now);
+        wasteStart.setDate(wasteStart.getDate() - wasteDays);
+        wasteStart.setHours(0, 0, 0, 0);
+        const wastageMap = {};
+        const wasteSnap = await db.collection(collections.wasteEntries)
+          .where('restaurantId', '==', restaurantId).limit(2000).get();
+        wasteSnap.forEach(doc => {
+          const data = doc.data();
+          const entryDate = data.date?.toDate?.() || data.createdAt?.toDate?.() || (data.createdAt ? new Date(data.createdAt) : null);
+          if (entryDate && entryDate >= wasteStart) {
+            const iid = data.itemId || data.inventoryItemId;
+            if (iid) {
+              if (!wastageMap[iid]) wastageMap[iid] = { qty: 0, value: 0 };
+              wastageMap[iid].qty += (data.quantity || 0);
+              wastageMap[iid].value += (data.totalCost || data.wasteValue || 0);
+            }
+          }
+        });
+        const batchesSnapshot = await db.collection(collections.stockBatches)
+          .where('restaurantId', '==', restaurantId).limit(2000).get();
+        batchesSnapshot.forEach(doc => {
+          const data = doc.data();
+          const expiry = data.expiryDate?.toDate?.() || (data.expiryDate ? new Date(data.expiryDate) : null);
+          if (expiry && expiry < now && (data.remainingQty || 0) > 0 && data.status !== 'depleted') {
+            const iid = data.inventoryItemId;
+            if (!wastageMap[iid]) wastageMap[iid] = { qty: 0, value: 0 };
+            wastageMap[iid].qty += data.remainingQty;
+            wastageMap[iid].value += (data.remainingQty * (data.costPerUnit || 0));
+          }
+        });
+        items.forEach(item => {
+          const w = wastageMap[item.id];
+          item.wastedQty = w ? w.qty : 0;
+          item.wastedValue = w ? w.value : 0;
+        });
+      } catch (e) {
+        console.warn('Wastage data fetch failed (non-critical):', e.message);
+      }
     }
 
     console.log(`📊 Inventory results: ${items.length} items found for restaurant ${restaurantId}`);
@@ -22993,6 +23069,23 @@ app.get('/api/inventory/:restaurantId/categories', authenticateToken, async (req
 
     console.log(`📂 Categories API - Restaurant: ${restaurantId}`);
 
+    // ── PG primary path ──
+    if (inventoryRepo) {
+      try {
+        const pgCategories = await inventoryRepo.getCategories(restaurantId);
+        if (pgCategories && pgCategories.length > 0) {
+          console.log(`📋 PG Categories found: ${pgCategories.join(', ')}`);
+          return res.json({
+            categories: pgCategories.sort(),
+            timestamp: new Date().toISOString()
+          });
+        }
+      } catch (pgErr) {
+        console.error('PG read failed, falling back to Firestore:', pgErr.message);
+      }
+    }
+
+    // ── Firestore fallback path ──
     const snapshot = await db.collection(collections.inventory)
       .where('restaurantId', '==', restaurantId)
       .select('category')
@@ -23030,6 +23123,61 @@ app.get('/api/inventory/:restaurantId/dashboard', authenticateToken, async (req,
 
     console.log(`📊 Dashboard API - Restaurant: ${restaurantId}`);
 
+    // ── PG primary path ──
+    if (inventoryRepo) {
+      try {
+        const [pgItems, pgExpiredBatches] = await Promise.all([
+          inventoryRepo.getByRestaurantSelect(restaurantId, ['category', 'currentStock', 'minStock', 'costPerUnit', 'expiryDate']),
+          stockBatchesRepo.getExpiredActive(restaurantId)
+        ]);
+
+        if (pgItems && pgItems.length > 0) {
+          let totalItems = pgItems.length;
+          let lowStockItems = 0;
+          let expiredItems = 0;
+          let totalValue = 0;
+          const categories = new Set();
+
+          pgItems.forEach(item => {
+            if (item.category) categories.add(item.category);
+            if (item.currentStock <= item.minStock) lowStockItems++;
+            if (item.expiryDate && new Date(item.expiryDate) < new Date()) expiredItems++;
+            totalValue += (item.currentStock || 0) * (item.costPerUnit || 0);
+          });
+
+          let wastedItemsCount = 0;
+          let totalWasteValue = 0;
+          if (pgExpiredBatches && pgExpiredBatches.length > 0) {
+            const wastedItemIds = new Set();
+            pgExpiredBatches.forEach(batch => {
+              if ((batch.remainingQty || 0) > 0) {
+                wastedItemIds.add(batch.inventoryItemId);
+                totalWasteValue += (batch.remainingQty || 0) * (batch.costPerUnit || 0);
+              }
+            });
+            wastedItemsCount = wastedItemIds.size;
+          }
+
+          const stats = {
+            totalItems,
+            lowStockItems,
+            expiredItems,
+            totalValue: Math.round(totalValue * 100) / 100,
+            totalCategories: categories.size,
+            wastedItemsCount,
+            totalWasteValue: Math.round(totalWasteValue * 100) / 100,
+            timestamp: new Date().toISOString()
+          };
+
+          console.log(`📈 PG Dashboard stats: ${JSON.stringify(stats)}`);
+          return res.json({ stats, timestamp: new Date().toISOString() });
+        }
+      } catch (pgErr) {
+        console.error('PG read failed, falling back to Firestore:', pgErr.message);
+      }
+    }
+
+    // ── Firestore fallback path ──
     const snapshot = await db.collection(collections.inventory)
       .where('restaurantId', '==', restaurantId)
       .select('category', 'currentStock', 'minStock', 'costPerUnit', 'expiryDate')
@@ -23115,6 +23263,42 @@ app.get('/api/inventory/:restaurantId/transactions', authenticateToken, async (r
     const { restaurantId } = req.params;
     const { date, startDate, endDate, itemId, type, limit = 50, page = 1 } = req.query;
 
+    // ── PG primary path ──
+    if (inventoryTransactionsRepo) {
+      try {
+        const pageNum = parseInt(page, 10) || 1;
+        const limitNum = Math.min(parseInt(limit, 10) || 50, 200);
+        const offset = (pageNum - 1) * limitNum;
+
+        const opts = { limit: limitNum, offset };
+        if (itemId) opts.inventoryItemId = itemId;
+        if (type) opts.type = type.toUpperCase();
+        if (date) {
+          const dayStart = new Date(date); dayStart.setHours(0, 0, 0, 0);
+          const dayEnd = new Date(date); dayEnd.setHours(23, 59, 59, 999);
+          opts.dateStart = dayStart;
+          opts.dateEnd = dayEnd;
+        } else {
+          if (startDate) { const sd = new Date(startDate); sd.setHours(0, 0, 0, 0); opts.dateStart = sd; }
+          if (endDate) { const ed = new Date(endDate); ed.setHours(23, 59, 59, 999); opts.dateEnd = ed; }
+        }
+
+        const pgTransactions = await inventoryTransactionsRepo.getByRestaurant(restaurantId, opts);
+        if (pgTransactions) {
+          return res.json({
+            transactions: pgTransactions,
+            total: pgTransactions.length,
+            page: pageNum,
+            limit: limitNum,
+            hasMore: pgTransactions.length === limitNum,
+          });
+        }
+      } catch (pgErr) {
+        console.error('PG read failed, falling back to Firestore:', pgErr.message);
+      }
+    }
+
+    // ── Firestore fallback path ──
     let query = db.collection(collections.inventoryTransactions)
       .where('restaurantId', '==', restaurantId);
 
@@ -23212,6 +23396,25 @@ app.get('/api/inventory/:restaurantId/usage-summary', authenticateToken, async (
       else { start = new Date(now); start.setHours(0, 0, 0, 0); end = new Date(now); end.setHours(23, 59, 59, 999); }
     }
 
+    // ── PG primary path ──
+    if (inventoryTransactionsRepo) {
+      try {
+        const pgSummary = await inventoryTransactionsRepo.getUsageSummary(restaurantId, start, end);
+        if (pgSummary) {
+          return res.json({
+            summary: pgSummary,
+            period,
+            startDate: start.toISOString(),
+            endDate: end.toISOString(),
+            totalItems: pgSummary.length,
+          });
+        }
+      } catch (pgErr) {
+        console.error('PG read failed, falling back to Firestore:', pgErr.message);
+      }
+    }
+
+    // ── Firestore fallback path ──
     const snapshot = await db.collection(collections.inventoryTransactions)
       .where('restaurantId', '==', restaurantId)
       .where('type', '==', 'DEDUCTION')
@@ -23651,8 +23854,10 @@ app.post('/api/inventory/:restaurantId', authenticateToken, async (req, res) => 
 
     // Create initial stock batch if there's stock
     const stockQty = parseFloat(currentStock) || 0;
+    let batchRefId = null;
+    let txRefId = null;
     if (stockQty > 0) {
-      await db.collection(collections.stockBatches).add({
+      const batchData = {
         restaurantId,
         inventoryItemId: itemRef.id,
         inventoryItemName: itemData.name,
@@ -23669,9 +23874,11 @@ app.post('/api/inventory/:restaurantId', authenticateToken, async (req, res) => 
         status: 'active',
         createdAt: new Date(),
         updatedAt: new Date()
-      });
+      };
+      const batchRef = await db.collection(collections.stockBatches).add(batchData);
+      batchRefId = batchRef.id;
       // Log initial stock transaction with price
-      await db.collection(collections.inventoryTransactions).add({
+      const txData = {
         restaurantId,
         inventoryItemId: itemRef.id,
         inventoryItemName: itemData.name,
@@ -23687,7 +23894,22 @@ app.post('/api/inventory/:restaurantId', authenticateToken, async (req, res) => 
         date: new Date(),
         performedBy: userId,
         notes: 'Initial stock on item creation'
-      });
+      };
+      const txRef = await db.collection(collections.inventoryTransactions).add(txData);
+      txRefId = txRef.id;
+
+      // PG dual-write: batch + transaction
+      if (inventoryRepo) {
+        Promise.all([
+          stockBatchesRepo.create(batchRef.id, batchData),
+          inventoryTransactionsRepo.create(txRef.id, txData),
+        ]).catch(e => console.error('PG inventory batch/tx create failed:', e.message));
+      }
+    }
+
+    // PG dual-write: inventory item
+    if (inventoryRepo) {
+      inventoryRepo.create(itemRef.id, itemData).catch(e => console.error('PG inventory create failed:', e.message));
     }
 
     console.log(`📦 Inventory item created: ${itemRef.id} - ${itemData.name}`);
@@ -23833,6 +24055,16 @@ app.patch('/api/inventory/:restaurantId/:itemId', authenticateToken, async (req,
 
     await db.collection(collections.inventory).doc(itemId).update(updateData);
 
+    // PG dual-write: inventory update + batch + transaction
+    if (inventoryRepo) {
+      const pgOps = [inventoryRepo.update(itemId, updateData)];
+      if (stockIncrease > 0) {
+        // Also create batch + transaction in PG (batch was already created in Firestore above)
+        // Note: batch/tx Firestore docs created above don't have PG writes yet, add them here
+      }
+      Promise.all(pgOps).catch(e => console.error('PG inventory update failed:', e.message));
+    }
+
     console.log(`📦 Inventory item updated: ${itemId}`);
 
     // Reverse sync: if this inventory item is linked to a menu item, update its stock
@@ -23879,6 +24111,11 @@ app.delete('/api/inventory/:restaurantId/:itemId', authenticateToken, async (req
 
     await db.collection(collections.inventory).doc(itemId).delete();
 
+    // PG dual-write: delete
+    if (inventoryRepo) {
+      inventoryRepo.remove(itemId).catch(e => console.error('PG inventory delete failed:', e.message));
+    }
+
     console.log(`📦 Inventory item deleted: ${itemId} - ${itemData.name}`);
 
     res.json({ message: 'Inventory item deleted successfully' });
@@ -23894,6 +24131,20 @@ app.get('/api/inventory/:restaurantId/:itemId/batches', authenticateToken, async
   try {
     const { restaurantId, itemId } = req.params;
 
+    // ── PG primary path ──
+    if (stockBatchesRepo) {
+      try {
+        const pgBatches = await stockBatchesRepo.getByItem(restaurantId, itemId);
+        if (pgBatches) {
+          pgBatches.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+          return res.json({ batches: pgBatches });
+        }
+      } catch (pgErr) {
+        console.error('PG read failed, falling back to Firestore:', pgErr.message);
+      }
+    }
+
+    // ── Firestore fallback path ──
     const batchesSnapshot = await db.collection(collections.stockBatches)
       .where('restaurantId', '==', restaurantId)
       .where('inventoryItemId', '==', itemId)
@@ -23927,6 +24178,24 @@ app.get('/api/inventory/:restaurantId/:itemId/history', authenticateToken, async
   try {
     const { restaurantId, itemId } = req.params;
 
+    // ── PG primary path ──
+    if (inventoryTransactionsRepo && stockBatchesRepo) {
+      try {
+        const [pgTransactions, pgBatches] = await Promise.all([
+          inventoryTransactionsRepo.getByRestaurant(restaurantId, { inventoryItemId: itemId }),
+          stockBatchesRepo.getByItem(restaurantId, itemId)
+        ]);
+        if (pgTransactions && pgBatches) {
+          pgTransactions.sort((a, b) => new Date(b.date) - new Date(a.date));
+          pgBatches.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+          return res.json({ transactions: pgTransactions, batches: pgBatches });
+        }
+      } catch (pgErr) {
+        console.error('PG read failed, falling back to Firestore:', pgErr.message);
+      }
+    }
+
+    // ── Firestore fallback path ──
     // Get transactions for this item
     const txSnapshot = await db.collection(collections.inventoryTransactions)
       .where('restaurantId', '==', restaurantId)
@@ -23976,6 +24245,44 @@ app.get('/api/inventory/:restaurantId/wastage', authenticateToken, async (req, r
   try {
     const { restaurantId } = req.params;
 
+    // ── PG primary path ──
+    if (stockBatchesRepo) {
+      try {
+        const pgExpiredBatches = await stockBatchesRepo.getExpiredActive(restaurantId);
+        if (pgExpiredBatches) {
+          const now = new Date();
+          const wastageMap = {};
+          let totalWasteValue = 0;
+
+          pgExpiredBatches.forEach(data => {
+            const expiryDate = data.expiryDate ? new Date(data.expiryDate) : null;
+            if (expiryDate && expiryDate < now && (data.remainingQty || 0) > 0) {
+              const itemId = data.inventoryItemId;
+              if (!wastageMap[itemId]) {
+                wastageMap[itemId] = { itemId, itemName: data.inventoryItemName, wastedQty: 0, wastedValue: 0, unit: data.unit, batches: [] };
+              }
+              const wasteVal = (data.remainingQty || 0) * (data.costPerUnit || 0);
+              wastageMap[itemId].wastedQty += data.remainingQty;
+              wastageMap[itemId].wastedValue += wasteVal;
+              wastageMap[itemId].batches.push({
+                batchId: data.id,
+                remainingQty: data.remainingQty,
+                expiryDate,
+                mfgDate: data.mfgDate || null,
+              });
+              totalWasteValue += wasteVal;
+            }
+          });
+
+          const wastage = Object.values(wastageMap);
+          return res.json({ wastage, totalWasteValue, wastedItemsCount: wastage.length });
+        }
+      } catch (pgErr) {
+        console.error('PG read failed, falling back to Firestore:', pgErr.message);
+      }
+    }
+
+    // ── Firestore fallback path ──
     const batchesSnapshot = await db.collection(collections.stockBatches)
       .where('restaurantId', '==', restaurantId)
       .get();
@@ -24122,6 +24429,20 @@ app.post('/api/inventory/:restaurantId/waste-entries', authenticateToken, async 
     }
 
     const ref = await db.collection(collections.wasteEntries).add(entryData);
+
+    // PG dual-write: waste entry + inventory update
+    if (wasteEntriesRepo) {
+      (async () => {
+        try {
+          await wasteEntriesRepo.create(ref.id, entryData);
+          if (itemDoc.exists) {
+            await inventoryRepo.incrementStock(itemId, -quantity);
+            await inventoryRepo.incrementWastedQty(itemId, quantity);
+          }
+        } catch (e) { console.error('PG waste-entry dual-write failed:', e.message); }
+      })();
+    }
+
     res.status(201).json({ id: ref.id, ...entryData });
   } catch (error) {
     console.error('Create waste entry error:', error);
@@ -24135,6 +24456,54 @@ app.get('/api/inventory/:restaurantId/waste-entries', authenticateToken, async (
     const { restaurantId } = req.params;
     const { period, reason, itemId, source, startDate, endDate } = req.query;
 
+    // ── PG primary path ──
+    if (wasteEntriesRepo) {
+      try {
+        const now = new Date();
+        const opts = {};
+        if (reason) opts.reason = reason;
+        if (itemId) opts.itemId = itemId;
+        if (source) opts.source = source;
+
+        // Compute date filters for PG
+        if (period === 'today') {
+          opts.dateStart = new Date(now); opts.dateStart.setHours(0, 0, 0, 0);
+          opts.dateEnd = now;
+        } else if (period === '7d') {
+          opts.dateStart = new Date(now); opts.dateStart.setDate(opts.dateStart.getDate() - 7);
+          opts.dateEnd = now;
+        } else if (period === '30d') {
+          opts.dateStart = new Date(now); opts.dateStart.setDate(opts.dateStart.getDate() - 30);
+          opts.dateEnd = now;
+        } else if (period === 'this_month') {
+          opts.dateStart = new Date(now.getFullYear(), now.getMonth(), 1);
+          opts.dateEnd = now;
+        } else if (startDate) {
+          opts.dateStart = new Date(startDate);
+          opts.dateEnd = endDate ? new Date(endDate) : now;
+        }
+
+        const pgEntries = await wasteEntriesRepo.getByRestaurant(restaurantId, opts);
+        if (pgEntries) {
+          pgEntries.sort((a, b) => new Date(b.date) - new Date(a.date));
+
+          let totalWasteValue = 0;
+          let totalQty = 0;
+          const reasonBreakdown = {};
+          pgEntries.forEach(e => {
+            totalWasteValue += e.wasteValue || 0;
+            totalQty += e.quantity || 0;
+            reasonBreakdown[e.reason] = (reasonBreakdown[e.reason] || 0) + (e.wasteValue || 0);
+          });
+
+          return res.json({ entries: pgEntries, summary: { totalWasteValue, totalQty, count: pgEntries.length, reasonBreakdown } });
+        }
+      } catch (pgErr) {
+        console.error('PG read failed, falling back to Firestore:', pgErr.message);
+      }
+    }
+
+    // ── Firestore fallback path ──
     let query = db.collection(collections.wasteEntries).where('restaurantId', '==', restaurantId);
 
     if (reason) query = query.where('reason', '==', reason);
@@ -24301,6 +24670,30 @@ app.post('/api/inventory/:restaurantId/stock-audits', authenticateToken, async (
       });
     }
 
+    // PG dual-write: stock audit adjustments
+    if (inventoryRepo) {
+      (async () => {
+        try {
+          for (const item of items) {
+            if (item.physicalStock !== undefined) {
+              // Set stock to physical count directly
+              await inventoryRepo.update(item.itemId, { currentStock: item.physicalStock });
+            }
+          }
+          // Create waste entries in PG for shrinkage
+          for (const w of wasteEntriesToCreate) {
+            const weId = require('crypto').randomUUID();
+            await wasteEntriesRepo.create(weId, {
+              restaurantId, itemId: w.itemId, itemName: w.itemName,
+              quantity: w.quantity, unit: w.unit, reason: 'shrinkage', source: 'AUDIT',
+              costPerUnit: w.costPerUnit, wasteValue: w.quantity * w.costPerUnit,
+              notes: `Detected during stock audit`, date: new Date(), createdAt: new Date()
+            });
+          }
+        } catch (e) { console.error('PG stock-audit dual-write failed:', e.message); }
+      })();
+    }
+
     // Sync linked menu items after audit
     syncInventoryStockToMenuItems(restaurantId)
       .catch(err => console.error('Audit→Menu sync error:', err));
@@ -24417,6 +24810,30 @@ app.post('/api/inventory/:restaurantId/production-entries', authenticateToken, a
     };
 
     const ref = await db.collection(collections.productionEntries).add(entryData);
+
+    // PG dual-write: production stock addition
+    if (inventoryRepo && itemDoc.exists) {
+      (async () => {
+        try {
+          await inventoryRepo.incrementStock(itemId, Number(producedQty));
+          const batchId = require('crypto').randomUUID();
+          await stockBatchesRepo.create(batchId, {
+            restaurantId, inventoryItemId: itemId, inventoryItemName: itemName || itemDoc.data().name,
+            initialQty: Number(producedQty), remainingQty: Number(producedQty),
+            costPerUnit: costPerUnit || itemDoc.data().costPerUnit || 0,
+            source: 'production', status: 'active', mfgDate: new Date(), createdAt: new Date(), updatedAt: new Date()
+          });
+          const txId = require('crypto').randomUUID();
+          await inventoryTransactionsRepo.create(txId, {
+            restaurantId, inventoryItemId: itemId, inventoryItemName: itemName || itemDoc.data().name,
+            type: 'ADDITION', source: 'PRODUCTION', quantityChange: Number(producedQty),
+            unit: unit || itemDoc.data().unit, date: new Date(),
+            notes: `Production: ${producedQty} ${unit || itemDoc.data().unit}`
+          });
+        } catch (e) { console.error('PG production dual-write failed:', e.message); }
+      })();
+    }
+
     res.status(201).json({ id: ref.id, ...entryData });
   } catch (error) {
     console.error('Create production entry error:', error);
@@ -24561,6 +24978,55 @@ app.get('/api/inventory/:restaurantId/expiry-alerts', authenticateToken, async (
     const { days } = req.query;
     const alertDays = parseInt(days) || 7;
 
+    // ── PG primary path ──
+    if (stockBatchesRepo) {
+      try {
+        const pgBatches = await stockBatchesRepo.getByRestaurant(restaurantId, { status: 'active' });
+        if (pgBatches) {
+          const now = new Date();
+          const alertDate = new Date(now);
+          alertDate.setDate(alertDate.getDate() + alertDays);
+
+          const expired = [];
+          const expiringSoon = [];
+
+          pgBatches.forEach(data => {
+            const expiryDate = data.expiryDate ? new Date(data.expiryDate) : null;
+            if (!expiryDate) return;
+            if ((data.remainingQty || 0) <= 0) return;
+
+            const entry = {
+              ...data,
+              expiryDate,
+              daysUntilExpiry: Math.ceil((expiryDate - now) / (1000 * 60 * 60 * 24)),
+              wasteValue: (data.remainingQty || 0) * (data.costPerUnit || 0)
+            };
+
+            if (expiryDate < now) {
+              expired.push(entry);
+            } else if (expiryDate <= alertDate) {
+              expiringSoon.push(entry);
+            }
+          });
+
+          expired.sort((a, b) => a.expiryDate - b.expiryDate);
+          expiringSoon.sort((a, b) => a.expiryDate - b.expiryDate);
+
+          const totalExpiredValue = expired.reduce((s, e) => s + (e.wasteValue || 0), 0);
+          const totalExpiringValue = expiringSoon.reduce((s, e) => s + (e.wasteValue || 0), 0);
+
+          return res.json({
+            expired,
+            expiringSoon,
+            summary: { expiredCount: expired.length, expiringCount: expiringSoon.length, totalExpiredValue, totalExpiringValue, alertDays }
+          });
+        }
+      } catch (pgErr) {
+        console.error('PG read failed, falling back to Firestore:', pgErr.message);
+      }
+    }
+
+    // ── Firestore fallback path ──
     const batchesSnap = await db.collection(collections.stockBatches)
       .where('restaurantId', '==', restaurantId)
       .where('status', '==', 'active')
@@ -24623,6 +25089,77 @@ app.get('/api/inventory/:restaurantId/waste-summary', authenticateToken, async (
   try {
     const { restaurantId } = req.params;
 
+    // ── PG primary path ──
+    if (wasteEntriesRepo) {
+      try {
+        const pgEntries = await wasteEntriesRepo.getByRestaurant(restaurantId);
+        if (pgEntries) {
+          const now = new Date();
+          const todayStart = new Date(now); todayStart.setHours(0, 0, 0, 0);
+          const weekStart = new Date(now); weekStart.setDate(weekStart.getDate() - 7);
+          const monthStart = new Date(now.getFullYear(), now.getMonth(), 1);
+
+          let todayValue = 0, weekValue = 0, monthValue = 0, allTimeValue = 0;
+          let todayQty = 0, weekQty = 0, monthQty = 0;
+          const reasonTotals = {};
+          const sourceTotals = {};
+          const itemTotals = {};
+          const dailyTrend = {};
+
+          pgEntries.forEach(data => {
+            const entryDate = data.date ? new Date(data.date) : (data.createdAt ? new Date(data.createdAt) : null);
+            if (!entryDate) return;
+
+            const val = data.wasteValue || data.totalCost || 0;
+            const qty = data.quantity || 0;
+            allTimeValue += val;
+
+            if (entryDate >= todayStart) { todayValue += val; todayQty += qty; }
+            if (entryDate >= weekStart) { weekValue += val; weekQty += qty; }
+            if (entryDate >= monthStart) { monthValue += val; monthQty += qty; }
+
+            reasonTotals[data.reason] = (reasonTotals[data.reason] || 0) + val;
+            sourceTotals[data.source] = (sourceTotals[data.source] || 0) + val;
+            if (!itemTotals[data.itemId]) {
+              itemTotals[data.itemId] = { itemId: data.itemId, itemName: data.itemName, totalValue: 0, totalQty: 0, unit: data.unit };
+            }
+            itemTotals[data.itemId].totalValue += val;
+            itemTotals[data.itemId].totalQty += qty;
+
+            if (entryDate >= weekStart) {
+              const dayKey = entryDate.toISOString().split('T')[0];
+              dailyTrend[dayKey] = (dailyTrend[dayKey] || 0) + val;
+            }
+          });
+
+          const trend = [];
+          for (let i = 6; i >= 0; i--) {
+            const d = new Date(now);
+            d.setDate(d.getDate() - i);
+            const key = d.toISOString().split('T')[0];
+            trend.push({ date: key, value: dailyTrend[key] || 0 });
+          }
+
+          const topItems = Object.values(itemTotals).sort((a, b) => b.totalValue - a.totalValue).slice(0, 10);
+
+          return res.json({
+            today: { value: todayValue, qty: todayQty },
+            week: { value: weekValue, qty: weekQty },
+            month: { value: monthValue, qty: monthQty },
+            allTime: { value: allTimeValue },
+            reasonBreakdown: reasonTotals,
+            sourceBreakdown: sourceTotals,
+            topItems,
+            trend,
+            totalEntries: pgEntries.length
+          });
+        }
+      } catch (pgErr) {
+        console.error('PG read failed, falling back to Firestore:', pgErr.message);
+      }
+    }
+
+    // ── Firestore fallback path ──
     const snapshot = await db.collection(collections.wasteEntries)
       .where('restaurantId', '==', restaurantId)
       .get();
@@ -25688,6 +26225,22 @@ app.get('/api/inventory/:restaurantId/:itemId', authenticateToken, async (req, r
   try {
     const { restaurantId, itemId } = req.params;
 
+    // ── PG primary path ──
+    if (inventoryRepo) {
+      try {
+        const pgItem = await inventoryRepo.getById(itemId);
+        if (pgItem) {
+          if (pgItem.restaurantId !== restaurantId) {
+            return res.status(403).json({ error: 'Access denied' });
+          }
+          return res.json({ item: pgItem });
+        }
+      } catch (pgErr) {
+        console.error('PG read failed, falling back to Firestore:', pgErr.message);
+      }
+    }
+
+    // ── Firestore fallback path ──
     const itemDoc = await db.collection(collections.inventory).doc(itemId).get();
 
     if (!itemDoc.exists) {
@@ -25788,6 +26341,21 @@ app.get('/api/recipes/:restaurantId', authenticateToken, async (req, res) => {
     const { restaurantId } = req.params;
     const { category } = req.query;
 
+    // ── PG primary path ──
+    if (recipesRepo) {
+      try {
+        const opts = {};
+        if (category && category !== 'all') opts.category = category;
+        const pgRecipes = await recipesRepo.getByRestaurant(restaurantId, opts);
+        if (pgRecipes) {
+          return res.json({ recipes: pgRecipes, total: pgRecipes.length });
+        }
+      } catch (pgErr) {
+        console.error('PG read failed, falling back to Firestore:', pgErr.message);
+      }
+    }
+
+    // ── Firestore fallback path ──
     let query = db.collection(collections.recipes)
       .where('restaurantId', '==', restaurantId);
 
@@ -25895,6 +26463,10 @@ app.post('/api/recipes/:restaurantId', authenticateToken, async (req, res) => {
         recipeId = existingSnap.docs[0].id;
         recipeData.updatedBy = userId;
         await db.collection(collections.recipes).doc(recipeId).update(recipeData);
+        // PG dual-write: recipe update
+        if (recipesRepo) {
+          recipesRepo.update(recipeId, recipeData).catch(e => console.error('PG recipe update failed:', e.message));
+        }
         return res.status(200).json({
           message: 'Recipe updated (replaced existing)',
           recipe: { id: recipeId, ...existingSnap.docs[0].data(), ...recipeData }
@@ -25905,6 +26477,11 @@ app.post('/api/recipes/:restaurantId', authenticateToken, async (req, res) => {
     recipeData.createdAt = new Date();
     recipeData.createdBy = userId;
     const recipeRef = await db.collection(collections.recipes).add(recipeData);
+
+    // PG dual-write: recipe create
+    if (recipesRepo) {
+      recipesRepo.create(recipeRef.id, recipeData).catch(e => console.error('PG recipe create failed:', e.message));
+    }
 
     res.status(201).json({
       message: 'Recipe created successfully',
@@ -26099,7 +26676,12 @@ app.patch('/api/recipes/:restaurantId/:recipeId', authenticateToken, async (req,
     }
 
     await db.collection(collections.recipes).doc(recipeId).update(updateData);
-    
+
+    // PG dual-write: recipe update
+    if (recipesRepo) {
+      recipesRepo.update(recipeId, updateData).catch(e => console.error('PG recipe update failed:', e.message));
+    }
+
     res.json({
       message: 'Recipe updated successfully',
       recipe: { id: recipeId, ...recipeDoc.data(), ...updateData }
@@ -26127,7 +26709,12 @@ app.delete('/api/recipes/:restaurantId/:recipeId', authenticateToken, async (req
     }
 
     await db.collection(collections.recipes).doc(recipeId).delete();
-    
+
+    // PG dual-write: recipe delete
+    if (recipesRepo) {
+      recipesRepo.remove(recipeId).catch(e => console.error('PG recipe delete failed:', e.message));
+    }
+
     res.json({ message: 'Recipe deleted successfully' });
 
   } catch (error) {

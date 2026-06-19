@@ -535,6 +535,25 @@ const initializePaymentRoutes = (db, razorpay) => {
           updatedAt: new Date()
         });
 
+        // PG dual-write (fire-and-forget) — must mirror the Firestore update above
+        const usePg = !!process.env.DATABASE_URL;
+        if (usePg) {
+          try {
+            const ordersRepo = require('./repos/ordersRepo');
+            ordersRepo.update(orderId, {
+              status: 'completed',
+              paymentStatus: preserveCredit ? orderData.paymentStatus : 'paid',
+              paymentMethod: offlineMethod,
+              completedAt: new Date(),
+              updatedAt: new Date(),
+            }).catch(pgErr => {
+              console.error('⚠️ PG dual-write error (payment-verify):', pgErr.message);
+            });
+          } catch (pgErr) {
+            console.error('⚠️ PG dual-write error (payment-verify):', pgErr.message);
+          }
+        }
+
         console.log('[PAYMENT] Offline payment completed successfully:', {
           orderId,
           paymentId,

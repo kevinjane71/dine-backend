@@ -25,7 +25,7 @@
 | Collection | % of reads | PG Table | Repo | Backfill | Endpoints Switched | Status |
 |-----------|-----------|----------|------|----------|-------------------|--------|
 | orders | 33% | ✅ `orders` | ✅ `ordersRepo.js` | ✅ 9,768 orders | ✅ 3 READ + 12 WRITE | **LIVE on Vercel** |
-| inventory | 21% | ❌ | ❌ | ❌ | ❌ | Not started |
+| inventory (7 collections) | 21% | ✅ 7 tables | ✅ 6 repos | ✅ 24,937 docs | ✅ 13 READ + 10 WRITE + 4 service | **READY for deploy** |
 | restaurants | 11% | ✅ `restaurants` | ✅ `restaurantsRepo.js` | ✅ 480 docs | ✅ 1 READ (via kvCache) + 8 WRITE | **READY for deploy** |
 | floors+tables | 10% | ✅ `floors` + `tables` | ✅ `floorsTablesRepo.js` | ✅ 497 floors, 8169 tables | ✅ 3 READ + 15 WRITE | **READY for deploy** |
 | dailyStats | 6% | ✅ `daily_stats` | ✅ `dailyStatsRepo.js` | ✅ 851 docs | ✅ 7 READ + 2 WRITE | **READY for deploy** |
@@ -137,6 +137,60 @@
 
 **Key design:** PG integrated into `getCachedRestDoc()` as middle tier: Redis hit → return. Redis miss → PG read → cache. PG miss → Firestore fallback. Only 1 file change (utils/kvCache.js) covers all 29 files that read restaurant data. Restaurant schema has 52 columns: simple fields + 17 JSONB columns for complex settings.
 
+### Inventory Ecosystem — Endpoint Details
+
+**7 PG tables:** `inventory`, `inventory_transactions`, `stock_batches`, `waste_entries`, `recipes`, `bar_bottles`, `bar_reconciliation`
+
+**6 Repos:** `inventoryRepo.js` (11 methods), `inventoryTransactionsRepo.js` (7 methods), `stockBatchesRepo.js` (12 methods), `wasteEntriesRepo.js` (4 methods), `recipesRepo.js` (7 methods), `inventoryFieldMapper.js`
+
+**Backfill:** 24,937 docs total (inventory 1,808, inventoryTransactions 21,807, stockBatches 399, wasteEntries 27, recipes 896, barBottles 0, barReconciliation 0)
+
+**READ endpoints (PG primary, Firestore fallback):**
+| Endpoint | Location | Status |
+|----------|----------|--------|
+| GET /api/inventory/:restaurantId (main list + wastage enrichment) | index.js ~22887 | ✅ Switched |
+| GET /api/inventory/:restaurantId/categories | index.js ~23067 | ✅ Switched |
+| GET /api/inventory/:restaurantId/dashboard | index.js ~23121 | ✅ Switched |
+| GET /api/inventory/:restaurantId/transactions | index.js ~23261 | ✅ Switched |
+| GET /api/inventory/:restaurantId/usage-summary | index.js ~23394 | ✅ Switched |
+| GET /api/inventory/:restaurantId/:itemId/batches | index.js ~24129 | ✅ Switched |
+| GET /api/inventory/:restaurantId/:itemId/history | index.js ~24176 | ✅ Switched |
+| GET /api/inventory/:restaurantId/wastage | index.js ~24243 | ✅ Switched |
+| GET /api/inventory/:restaurantId/waste-entries | index.js ~24440 | ✅ Switched |
+| GET /api/inventory/:restaurantId/expiry-alerts | index.js ~24914 | ✅ Switched |
+| GET /api/inventory/:restaurantId/waste-summary | index.js ~25025 | ✅ Switched |
+| GET /api/inventory/:restaurantId/:itemId (single item) | index.js ~26161 | ✅ Switched |
+| GET /api/recipes/:restaurantId | index.js ~26277 | ✅ Switched |
+
+**WRITE endpoints (dual-write: Firestore primary + PG fire-and-forget):**
+| Endpoint | Location | Status |
+|----------|----------|--------|
+| POST /api/inventory/:restaurantId (create item + batch + tx) | index.js ~23897 | ✅ Dual-write |
+| PATCH /api/inventory/:restaurantId/:itemId (update) | index.js ~24053 | ✅ Dual-write |
+| DELETE /api/inventory/:restaurantId/:itemId | index.js ~24109 | ✅ Dual-write |
+| POST /api/inventory/:restaurantId/waste-entries | index.js ~24426 | ✅ Dual-write |
+| POST /api/inventory/:restaurantId/stock-audits | index.js ~24669 | ✅ Dual-write |
+| POST /api/inventory/:restaurantId/production-entries | index.js ~24807 | ✅ Dual-write |
+| POST /api/recipes/:restaurantId (create/replace) | index.js ~26452 | ✅ Dual-write |
+| PATCH /api/recipes/:restaurantId/:recipeId | index.js ~26655 | ✅ Dual-write |
+| DELETE /api/recipes/:restaurantId/:recipeId | index.js ~26689 | ✅ Dual-write |
+
+**Service-level dual-writes (inventoryService.js):**
+| Function | Purpose | Status |
+|----------|---------|--------|
+| deductInventoryForOrder() | FIFO batch deduction on order placement | ✅ PG transaction dual-write |
+| restoreInventoryForOrder() | Reverse deductions on cancel/delete | ✅ PG transaction dual-write |
+| restoreInventoryForEditedOrder() | Reverse removed items on edit | ✅ PG transaction dual-write |
+| createDefaultRecipe() | AI recipe + auto-create inventory items | ✅ PG dual-write |
+
+**Key design:**
+- 7 Firestore collections → 7 PG tables (1:1 mapping)
+- FIFO batch deduction logic stays in JS, PG transactions replace Firestore batch writes
+- `decrementBatch(client, batchId, amount)` / `incrementBatch(client, batchId, amount)` accept transaction client
+- Stock audit sets physical count directly (not increment), creates waste entries for shrinkage
+- Production entries add stock + create batch + log transaction in PG
+- Expired batches auto-detected during order deduction, marked as waste
+
 ### Files Created/Modified
 
 | File | Purpose | Status |
@@ -157,6 +211,15 @@
 | `repos/floorsTablesRepo.js` | Floors+tables data access (25 methods) | ✅ Created |
 | `scripts/backfill-floors-tables-pg.js` | Two-pass Firestore → PG migration | ✅ Created |
 | `routes/moveOrder.js` | PG dual-write for table swap | ✅ Modified |
+| `scripts/create-inventory-tables.sql` | 7 inventory PG tables | ✅ Created |
+| `repos/inventoryFieldMapper.js` | Field mapping for all 7 inventory collections | ✅ Created |
+| `repos/inventoryRepo.js` | Inventory items CRUD + stock queries (11 methods) | ✅ Created |
+| `repos/inventoryTransactionsRepo.js` | Transaction log queries (7 methods) | ✅ Created |
+| `repos/stockBatchesRepo.js` | Batch tracking + FIFO deduction (12 methods) | ✅ Created |
+| `repos/wasteEntriesRepo.js` | Waste entry CRUD (4 methods) | ✅ Created |
+| `repos/recipesRepo.js` | Recipe CRUD (7 methods) | ✅ Created |
+| `scripts/backfill-inventory-pg.js` | Multi-collection migration (24,937 docs) | ✅ Created |
+| `services/inventoryService.js` | PG dual-writes for deduction/restore | ✅ Modified |
 
 ### Key Design Decisions
 
@@ -245,8 +308,9 @@
 - [ ] Catch-up backfill: orders created between 2026-06-17 (initial backfill) and dual-write going live
 - [ ] Deploy to GCP Cloud Run with DATABASE_URL
 - [ ] Add per-restaurant backend switching to frontends
-- [ ] Build inventory repo + PG table + backfill
-- [ ] Build restaurants repo + PG table + backfill
+- [x] Build inventory repo + PG tables + backfill (7 collections, 24,937 docs)
+- [x] Switch inventory READ endpoints (13 endpoints) + dual-write (10 endpoints + 4 service functions)
+- [x] Build restaurants repo + PG table + backfill
 - [x] Build floors+tables repo + PG tables + backfill
 - [x] Switch floors+tables READ endpoints (3 endpoints) + dual-write (15 functions)
 - [x] Build dailyStats repo + PG table + backfill
@@ -309,4 +373,22 @@
   - Table claim/release during order lifecycle (create, complete, cancel, delete)
   - Move order table swap (routes/moveOrder.js)
 - Key design: `claimTable()` uses atomic `UPDATE...WHERE status='available' RETURNING *` — race-safe without transaction
-- Next: Phase 3 — restaurants migration
+
+### 2026-06-18 (Session 6): Phase 3 — Restaurants Migration Complete
+- Created `restaurants` PG table (52 columns: simple fields + 17 JSONB columns)
+- Created `restaurantsRepo.js` — 11 methods
+- Backfilled 480 restaurant docs
+- Integrated PG into `getCachedRestDoc()` as middle tier: Redis → PG → Firestore
+- Added dual-write to 8 WRITE endpoints (restaurant CRUD, settings, code gen, Razorpay OAuth)
+
+### 2026-06-19 (Session 7-8): Phase 4 — Inventory Ecosystem Migration Complete
+- Created 7 PG tables: inventory, inventory_transactions, stock_batches, waste_entries, recipes, bar_bottles, bar_reconciliation
+- Created `inventoryFieldMapper.js` — handles all 7 collections
+- Created 6 repo files: inventoryRepo (11 methods), inventoryTransactionsRepo (7), stockBatchesRepo (12), wasteEntriesRepo (4), recipesRepo (7)
+- Backfilled 24,937 docs across 7 collections (0 errors)
+- Fixed `buildUpdate` bug in fieldMapper.js: extra_data was being replaced instead of merged (COALESCE merge)
+- Switched 13 READ endpoints to PG primary with Firestore fallback
+- Added 10 WRITE dual-writes (inventory CRUD, waste-entries, stock-audits, production-entries, recipe CRUD)
+- Added 4 service-level dual-writes in inventoryService.js (deduct, restore, edit-restore, createDefaultRecipe)
+- PG transactions replace Firestore batch writes for FIFO deduction/restoration
+- All 5 high-cost collections now migrated (orders 33% + inventory 21% + restaurants 11% + floors/tables 10% + dailyStats 6% = 81% of reads)

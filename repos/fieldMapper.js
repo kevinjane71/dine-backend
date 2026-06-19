@@ -336,7 +336,12 @@ function buildUpdate(orderId, pgRow) {
   for (const [col, val] of Object.entries(pgRow)) {
     if (col === 'id') continue; // never update the PK
     if (JSONB_COLUMNS.has(col)) {
-      setClauses.push(`${col} = $${i}::jsonb`);
+      if (col === 'extra_data') {
+        // Merge into existing extra_data instead of replacing
+        setClauses.push(`${col} = COALESCE(${col}, '{}'::jsonb) || $${i}::jsonb`);
+      } else {
+        setClauses.push(`${col} = $${i}::jsonb`);
+      }
       values.push(toJsonbValue(val));
     } else {
       setClauses.push(`${col} = $${i}`);
