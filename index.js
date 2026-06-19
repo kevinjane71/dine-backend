@@ -7714,7 +7714,8 @@ app.patch('/api/menus/item/:id', authenticateToken, async (req, res) => {
       'spiritCategory', 'ingredients', 'abv', 'servingUnit', 'bottleSize',
       'unit', 'weight', 'shelfLife', 'mfgDate', 'expiryDate',
       'servingSize', 'scoopOptions', 'pricingRules', 'taxGroupId',
-      'discountApplicable', 'taxInclusive', 'soldByWeight', 'priceUnit', 'pluCode'
+      'discountApplicable', 'taxInclusive', 'soldByWeight', 'priceUnit', 'pluCode',
+      'hideImage'
     ];
     
     allowedFields.forEach(field => {
