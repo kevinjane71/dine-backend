@@ -3,6 +3,7 @@ const { db, collections } = require('../firebase');
 const admin = require('firebase-admin');
 const { FieldValue } = require('firebase-admin/firestore');
 const inventoryService = require('./inventoryService');
+const productKnowledge = require('./dineai/productKnowledge');
 
 /**
  * DineAgent - OpenAI Function Calling Agent
@@ -705,6 +706,28 @@ class FunctionCallingAgent {
             }
           }
         }
+      },
+      {
+        type: 'function',
+        function: {
+          name: 'get_product_help',
+          description: 'Search the DineOpen product knowledge base for how-to guides, feature explanations, setup instructions, navigation help, and troubleshooting. Use this when the user asks "how do I...", "where can I...", "help with...", "what is...", "how to set up...", or any question about using the DineOpen system itself (not about their restaurant data like orders/revenue). Also use this for questions about connecting printers, uploading menus, inviting staff, configuring settings, downloading apps, etc.',
+          parameters: {
+            type: 'object',
+            properties: {
+              query: {
+                type: 'string',
+                description: 'The topic or question to search for in the product knowledge base'
+              },
+              category: {
+                type: 'string',
+                enum: ['menu', 'orders', 'billing', 'tables', 'inventory', 'customers', 'analytics', 'admin', 'printer', 'staff', 'ai', 'hotel', 'onboarding', 'general'],
+                description: 'Optional category to narrow results'
+              }
+            },
+            required: ['query']
+          }
+        }
       }
     ];
   }
@@ -724,6 +747,7 @@ class FunctionCallingAgent {
     'get_customer_history',
     'get_google_review_settings',
     'get_review_link',
+    'get_product_help',
   ]);
 
   /**
@@ -989,7 +1013,17 @@ class FunctionCallingAgent {
         
         case 'get_review_link':
           return await this.getReviewLink(restaurantId, arguments_.place_id);
-        
+
+        case 'get_product_help': {
+          const results = productKnowledge.searchArticles(arguments_.query, {
+            category: arguments_.category,
+            page: this._currentContext?.currentPage,
+            platform: this._currentContext?.platform,
+            role: this._currentContext?.userRole,
+          });
+          return { success: true, articles: results, count: results.length };
+        }
+
         default:
           return { error: `Unknown function: ${functionName}` };
       }
@@ -2719,8 +2753,11 @@ Generate a review that feels authentic and would be helpful to other customers. 
   /**
    * Process user query using OpenAI function calling
    */
-  async processQuery(query, restaurantId, userId, conversationHistory = [], userRole = null) {
+  async processQuery(query, restaurantId, userId, conversationHistory = [], userRole = null, context = {}) {
     try {
+      // Store context for use by executeFunction (e.g., get_product_help)
+      this._currentContext = context;
+
       // Fetch context (minimal for cost efficiency)
       const sessionSummary = await this.getSessionSummary(userId, restaurantId);
       const relevantFacts = await this.getRelevantFacts(query, restaurantId);
@@ -2749,6 +2786,7 @@ Your goals:
 - **Relevant facts:** ${JSON.stringify(relevantFacts)}
 - **System state:** ${JSON.stringify(systemState)}
 - **Recent conversation:** Last ${conversationHistory.length} messages
+${context.currentPage ? `\n**Current page:** The user is currently on \`${context.currentPage}\`` : ''}${context.platform ? `\n**Platform:** ${context.platform === 'electron' ? 'Desktop app (Electron)' : context.platform === 'capacitor' ? 'Mobile app' : 'Web browser'}` : ''}${context.userName ? `\n**User name:** ${context.userName}` : ''}${context.setupStatus ? `\n**Setup status:** Menu items: ${context.setupStatus.menuItemCount || 0}, Tables: ${context.setupStatus.hasTables ? 'configured' : 'not set up'}, Printer: ${context.setupStatus.hasPrinter ? 'connected' : 'not connected'}, Staff: ${context.setupStatus.hasStaff ? 'added' : 'not added'}, Business type: ${context.setupStatus.businessType || 'not set'}` : ''}
 
 ---
 
@@ -2764,6 +2802,13 @@ Your goals:
 - Don't show JSON, code, or internal system text to the user — only natural language output.
 
 ---
+
+### 📚 Product help:
+- When users ask about how to use DineOpen features, setup instructions, navigation help, or troubleshooting, use the \`get_product_help\` function to search the product knowledge base.
+- When returning help articles, include the relevant page URL so the user can navigate directly (e.g., "Go to **/admin** and click the **Print** tab").
+- If the user is already on the relevant page (check "Current page" above), acknowledge that and skip navigation steps — go straight to the action.
+- Adapt instructions based on the user's platform (desktop app, mobile app, or web browser have different UI and printer support).
+- If setup status shows something is not configured and it's relevant to their question, proactively mention it.
 
 ### ⚙️ Function calling:
 When the user's intent is to perform an action, use the appropriate function. Always execute the function call - do not just describe what you would do.

@@ -174,7 +174,7 @@ router.post('/chatbot/intelligent-query', authenticateToken, aiUsageLimiter.midd
 
     // Process query with function calling agent (pass user role for access control)
     const userRole = req.user.role || null;
-    const result = await functionCallingAgent.processQuery(query, restaurantId, userId, conversationHistory, userRole);
+    const result = await functionCallingAgent.processQuery(query, restaurantId, userId, conversationHistory, userRole, context || {});
 
     if (!result.success) {
       return res.status(400).json({
@@ -398,6 +398,189 @@ router.post('/chatbot/save-conversation', authenticateToken, async (req, res) =>
       success: false,
       error: 'Internal server error'
     });
+  }
+});
+
+// Context-aware suggestions endpoint (no OpenAI call — pure JS rules, <10ms)
+router.post('/chatbot/suggestions', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId, currentPage, platform, userRole, setupStatus } = req.body;
+    const suggestions = [];
+
+    // ── Setup-based global suggestions (highest priority) ──
+    if (setupStatus) {
+      if (!setupStatus.hasMenu || setupStatus.menuItemCount === 0) {
+        suggestions.push({ text: 'Help me set up my menu', icon: '🍽️', priority: 0, category: 'setup' });
+      }
+      if (!setupStatus.hasPrinter) {
+        suggestions.push({ text: 'Guide me through printer setup', icon: '🖨️', priority: 0, category: 'setup' });
+      }
+      if (!setupStatus.hasStaff) {
+        suggestions.push({ text: 'How do I invite staff?', icon: '👥', priority: 1, category: 'setup' });
+      }
+      if (!setupStatus.hasTables) {
+        suggestions.push({ text: 'Help me set up tables', icon: '🪑', priority: 1, category: 'setup' });
+      }
+      if (!setupStatus.businessType) {
+        suggestions.push({ text: 'How do I choose my business type?', icon: '🏪', priority: 0, category: 'setup' });
+      }
+    }
+
+    // ── Page-specific suggestions ──
+    const pageRules = {
+      '/home': [
+        { text: 'What should I set up next?', icon: '🚀', priority: 2, category: 'onboarding' },
+        { text: "What's today's revenue?", icon: '💰', priority: 3, category: 'data' },
+      ],
+      '/dashboard': [
+        { text: 'How many orders today?', icon: '📊', priority: 2, category: 'data' },
+        { text: "What's today's revenue?", icon: '💰', priority: 2, category: 'data' },
+        { text: 'Show available tables', icon: '🪑', priority: 3, category: 'data' },
+        { text: 'How do I place an order?', icon: '📋', priority: 4, category: 'help' },
+      ],
+      '/dashboard/v2': [
+        { text: 'How many orders today?', icon: '📊', priority: 2, category: 'data' },
+        { text: "What's today's revenue?", icon: '💰', priority: 2, category: 'data' },
+        { text: 'Show available tables', icon: '🪑', priority: 3, category: 'data' },
+      ],
+      '/dashboard/bar': [
+        { text: 'How many orders today?', icon: '📊', priority: 2, category: 'data' },
+        { text: "What's today's revenue?", icon: '💰', priority: 2, category: 'data' },
+      ],
+      '/menu': [
+        setupStatus && (!setupStatus.hasMenu || setupStatus.menuItemCount === 0)
+          ? { text: 'How do I upload my menu?', icon: '📤', priority: 1, category: 'help' }
+          : { text: 'How do I set up variants (Half/Full)?', icon: '🔀', priority: 3, category: 'help' },
+        { text: 'How do I add categories?', icon: '📂', priority: 3, category: 'help' },
+        { text: 'How do I bulk upload items?', icon: '📋', priority: 3, category: 'help' },
+      ],
+      '/orderhistory': [
+        { text: 'Show today\'s orders', icon: '📋', priority: 2, category: 'data' },
+        { text: 'How do I edit a completed order?', icon: '✏️', priority: 3, category: 'help' },
+        { text: 'Show cancelled orders', icon: '❌', priority: 4, category: 'data' },
+      ],
+      '/tables': [
+        setupStatus && !setupStatus.hasTables
+          ? { text: 'How do I create table layout?', icon: '🪑', priority: 1, category: 'help' }
+          : { text: 'Show table status', icon: '🪑', priority: 2, category: 'data' },
+        { text: 'How do I reserve a table?', icon: '📅', priority: 3, category: 'help' },
+      ],
+      '/inventory': [
+        { text: 'How do I add inventory items?', icon: '📦', priority: 2, category: 'help' },
+        { text: 'Show low stock items', icon: '⚠️', priority: 2, category: 'data' },
+        { text: 'How do recipes work?', icon: '🧾', priority: 3, category: 'help' },
+      ],
+      '/customers': [
+        { text: 'How do I set up loyalty program?', icon: '⭐', priority: 3, category: 'help' },
+        { text: 'Show top customers', icon: '👥', priority: 2, category: 'data' },
+      ],
+      '/analytics': [
+        { text: 'Show sales breakdown', icon: '📊', priority: 2, category: 'data' },
+        { text: 'What are popular items?', icon: '🔥', priority: 2, category: 'data' },
+      ],
+      '/admin': [
+        { text: 'How do I set up taxes?', icon: '💰', priority: 2, category: 'help' },
+        setupStatus && !setupStatus.hasPrinter
+          ? { text: 'Help me configure printer', icon: '🖨️', priority: 1, category: 'help' }
+          : { text: 'How do I customize bill template?', icon: '🧾', priority: 3, category: 'help' },
+        { text: 'How do I add staff?', icon: '👥', priority: 3, category: 'help' },
+        { text: 'How do I enable/disable features?', icon: '⚙️', priority: 3, category: 'help' },
+      ],
+      '/kot': [
+        { text: 'How does KOT printing work?', icon: '🖨️', priority: 2, category: 'help' },
+        { text: 'Show pending kitchen orders', icon: '🍳', priority: 2, category: 'data' },
+      ],
+      '/hotel': [
+        { text: 'How do I manage rooms?', icon: '🏨', priority: 2, category: 'help' },
+        { text: 'Show room status', icon: '🛏️', priority: 2, category: 'data' },
+      ],
+      '/billing': [
+        { text: 'How does billing work?', icon: '💳', priority: 2, category: 'help' },
+        { text: 'How do I split a bill?', icon: '➗', priority: 3, category: 'help' },
+      ],
+      '/bookings': [
+        { text: 'How do bookings work?', icon: '📅', priority: 2, category: 'help' },
+        { text: 'How do I set up catering orders?', icon: '🍽️', priority: 3, category: 'help' },
+      ],
+      '/attendance': [
+        { text: 'How does attendance tracking work?', icon: '⏰', priority: 2, category: 'help' },
+      ],
+      '/shifts': [
+        { text: 'How do I schedule shifts?', icon: '📅', priority: 2, category: 'help' },
+      ],
+      '/shifts-cash': [
+        { text: 'How does cash drawer tracking work?', icon: '💵', priority: 2, category: 'help' },
+      ],
+      '/dineai': [
+        { text: 'How do I use voice ordering?', icon: '🎤', priority: 2, category: 'help' },
+        { text: 'What can DineAI do?', icon: '🤖', priority: 3, category: 'help' },
+      ],
+      '/offers': [
+        { text: 'How do I create a discount offer?', icon: '🏷️', priority: 2, category: 'help' },
+      ],
+      '/feedback': [
+        { text: 'How do I set up feedback forms?', icon: '📝', priority: 2, category: 'help' },
+      ],
+      '/parking': [
+        { text: 'How does parking management work?', icon: '🅿️', priority: 2, category: 'help' },
+      ],
+      '/sales-summary': [
+        { text: 'Show today\'s sales report', icon: '📊', priority: 2, category: 'data' },
+        { text: 'How do I export reports?', icon: '📤', priority: 3, category: 'help' },
+      ],
+      '/books': [
+        { text: 'How do I track expenses?', icon: '💸', priority: 2, category: 'help' },
+        { text: 'Show profit & loss', icon: '📊', priority: 2, category: 'data' },
+      ],
+      '/headquarters': [
+        { text: 'How do I manage multiple locations?', icon: '🏢', priority: 2, category: 'help' },
+      ],
+    };
+
+    // Match page — try exact match first, then prefix match
+    let pageSpecific = pageRules[currentPage];
+    if (!pageSpecific && currentPage) {
+      const prefix = Object.keys(pageRules).find(p => currentPage.startsWith(p) && p !== '/');
+      if (prefix) pageSpecific = pageRules[prefix];
+    }
+
+    if (pageSpecific) {
+      suggestions.push(...pageSpecific.filter(Boolean));
+    }
+
+    // ── Time-based suggestions ──
+    const hour = new Date().getHours();
+    if (hour >= 22 || hour < 2) {
+      suggestions.push({ text: 'Show end-of-day summary', icon: '🌙', priority: 2, category: 'data' });
+    }
+    if (hour >= 6 && hour < 10) {
+      suggestions.push({ text: 'What\'s the plan for today?', icon: '☀️', priority: 4, category: 'help' });
+    }
+
+    // ── Role-based filtering ──
+    // Remove data suggestions for kitchen/delivery roles who can't see analytics
+    const dataRoles = ['owner', 'admin', 'manager', 'cashier'];
+    const filtered = suggestions.filter(s => {
+      if (s.category === 'data' && userRole && !dataRoles.includes(userRole)) return false;
+      return true;
+    });
+
+    // Deduplicate by text, sort by priority, limit to 6
+    const seen = new Set();
+    const deduped = filtered.filter(s => {
+      if (seen.has(s.text)) return false;
+      seen.add(s.text);
+      return true;
+    });
+    deduped.sort((a, b) => a.priority - b.priority);
+
+    res.json({
+      success: true,
+      suggestions: deduped.slice(0, 6)
+    });
+  } catch (error) {
+    console.error('Suggestions error:', error);
+    res.json({ success: true, suggestions: [] });
   }
 });
 
