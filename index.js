@@ -8931,8 +8931,8 @@ app.post('/api/public/orders/:restaurantId', vercelSecurityMiddleware.publicAPI,
         status: orderData.status,
         totalAmount: finalTotal,
         tableNumber: tableNum,
-        tableId: tableId_resolved || null,
-        floorId: tableFloorId_resolved || null,
+        tableId: null,
+        floorId: null,
         orderType: orderType,
         orderSource: resolvedOrderSource
       }).catch(err => console.error('Pusher notification error (non-blocking):', err))
