@@ -30708,6 +30708,13 @@ app.get('/api/public/customer/:customerId/orders', vercelSecurityMiddleware.publ
         discountAmount: orderData.discountAmount || 0,
         loyaltyDiscount: orderData.loyaltyDiscount || 0,
         totalAmount: orderData.totalAmount || 0,
+        finalAmount: orderData.finalAmount || orderData.totalAmount || 0,
+        taxAmount: orderData.taxAmount || 0,
+        taxBreakdown: orderData.taxBreakdown || [],
+        serviceCharge: orderData.serviceCharge || 0,
+        serviceChargeRate: orderData.serviceChargeRate || 0,
+        paymentMethod: orderData.paymentMethod || 'cash',
+        paymentStatus: orderData.paymentStatus || 'pending',
         appliedOffer: orderData.appliedOffer ? {
           name: orderData.appliedOffer.name,
           discountApplied: orderData.appliedOffer.discountApplied
