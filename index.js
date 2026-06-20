@@ -11773,6 +11773,7 @@ app.get('/api/analytics/:restaurantId/daily-summary', authenticateToken, async (
     let hasItemCounts = false;
     let usedDailyStats = false;
 
+    let docs = [];
     if (!isTodayOnly) {
       // Batch-read dailyStats docs for historical dates
       const docRefs = dates.map(d => {
@@ -11781,7 +11782,7 @@ app.get('/api/analytics/:restaurantId/daily-summary', authenticateToken, async (
           : `${restaurantId}_${d}`;
         return db.collection('dailyStats').doc(docId);
       });
-      const docs = docRefs.length > 0 ? await db.getAll(...docRefs) : [];
+      docs = docRefs.length > 0 ? await db.getAll(...docRefs) : [];
 
       console.log(`📊 daily-summary: found ${docs.filter(d => d.exists).length}/${docs.length} dailyStats docs`);
 
