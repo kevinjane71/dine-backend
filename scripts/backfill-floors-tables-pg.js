@@ -23,6 +23,7 @@ const { floorToPgRow, tableToPgRow } = require('../repos/floorsTablesFieldMapper
 const args = process.argv.slice(2);
 const DRY_RUN = args.includes('--dry-run');
 const RESTAURANT_FILTER = args.find(a => a.startsWith('--restaurant='))?.split('=')[1] || null;
+const UPSERT = args.includes('--upsert');
 
 const stats = {
   restaurants: 0,
@@ -122,7 +123,7 @@ async function main() {
 
         const result = await pool.query(
           `INSERT INTO floors (${cols.join(', ')}) VALUES (${placeholders})
-           ON CONFLICT (id, restaurant_id) DO NOTHING`,
+           ON CONFLICT (id, restaurant_id) ${UPSERT ? 'DO UPDATE SET ' + cols.filter(c => c !== 'id' && c !== 'restaurant_id').map(c => `${c} = EXCLUDED.${c}`).join(', ') : 'DO NOTHING'}`,
           values
         );
 
@@ -165,7 +166,7 @@ async function main() {
 
           const result = await pool.query(
             `INSERT INTO tables (${cols.join(', ')}) VALUES (${placeholders})
-             ON CONFLICT (id) DO NOTHING`,
+             ON CONFLICT (id) ${UPSERT ? 'DO UPDATE SET ' + cols.filter(c => c !== 'id').map(c => `${c} = EXCLUDED.${c}`).join(', ') : 'DO NOTHING'}`,
             values
           );
 

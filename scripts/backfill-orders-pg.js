@@ -31,6 +31,7 @@ const DRY_RUN = args.includes('--dry-run');
 const BATCH_SIZE = parseInt(args.find(a => a.startsWith('--batch='))?.split('=')[1]) || 500;
 const RESTAURANT_FILTER = args.find(a => a.startsWith('--restaurant='))?.split('=')[1] || null;
 const SINCE_DATE = args.find(a => a.startsWith('--since='))?.split('=')[1] || null;
+const UPSERT = args.includes('--upsert'); // Update existing rows instead of skipping
 
 // Stats
 const stats = {
@@ -262,7 +263,7 @@ async function batchInsert(pool, pgRows) {
         }
 
         const result = await client.query(
-          `INSERT INTO orders (${cols.join(', ')}) VALUES (${placeholders.join(', ')}) ON CONFLICT (id) DO NOTHING`,
+          `INSERT INTO orders (${cols.join(', ')}) VALUES (${placeholders.join(', ')}) ON CONFLICT (id) ${UPSERT ? 'DO UPDATE SET ' + cols.filter(c => c !== 'id').map(c => `${c} = EXCLUDED.${c}`).join(', ') : 'DO NOTHING'}`,
           values
         );
 

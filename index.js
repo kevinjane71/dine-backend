@@ -7319,7 +7319,8 @@ app.get('/api/public/menu/:restaurantId', vercelSecurityMiddleware.publicAPI, as
         image: item.image || null,
         images: item.images || [],
         allergens: item.allergens || [],
-        ...(item.taxGroupId && { taxGroupId: item.taxGroupId })
+        ...(item.taxGroupId && { taxGroupId: item.taxGroupId }),
+        ...(item.hideImage && { hideImage: true })
       }));
 
     // Cache at Vercel Edge for 3 min, serve stale for 1 min while revalidating
@@ -7332,7 +7333,8 @@ app.get('/api/public/menu/:restaurantId', vercelSecurityMiddleware.publicAPI, as
         description: restaurantData.description || '',
         address: restaurantData.address || '',
         phone: restaurantData.phone || '',
-        email: restaurantData.email || ''
+        email: restaurantData.email || '',
+        ...(restaurantData.posSettings?.hideMenuImages && { posSettings: { hideMenuImages: true } })
       },
       menu: menuItems
     });
@@ -7837,7 +7839,8 @@ app.patch('/api/menus/item/:id', authenticateToken, async (req, res) => {
       'spiritCategory', 'ingredients', 'abv', 'servingUnit', 'bottleSize',
       'unit', 'weight', 'shelfLife', 'mfgDate', 'expiryDate',
       'servingSize', 'scoopOptions', 'pricingRules', 'taxGroupId',
-      'discountApplicable', 'taxInclusive', 'soldByWeight', 'priceUnit', 'pluCode'
+      'discountApplicable', 'taxInclusive', 'soldByWeight', 'priceUnit', 'pluCode',
+      'hideImage'
     ];
     
     allowedFields.forEach(field => {
@@ -9053,34 +9056,34 @@ app.post('/api/public/orders/:restaurantId', vercelSecurityMiddleware.publicAPI,
         status: orderData.status,
         totalAmount: finalTotal,
         tableNumber: tableNum,
-        tableId: tableId_resolved || null,
-        floorId: tableFloorId_resolved || null,
+        tableId: null,
+        floorId: null,
         orderType: orderType,
         orderSource: resolvedOrderSource
       }).catch(err => console.error('Pusher notification error (non-blocking):', err))
     );
     const printSettings = restaurantData.printSettings || {};
-    if (printSettings.kotPrinterEnabled !== false && printSettings.usePusherForKOT === true) {
-      const stationGroups = splitOrderByPrintStation(orderItems, restaurantData.printStations, restaurantData.categories, { ...DEFAULT_PRINT_SETTINGS, ...printSettings });
-      for (const group of stationGroups) {
-        pusherPromises.push(
-          pusherService.notifyKOTPrintRequest(restaurantId, {
-            id: orderRef.id,
-            dailyOrderId: orderData.dailyOrderId,
-            orderNumber: orderData.orderNumber,
-            tableNumber: tableNum,
-            roomNumber: orderData.roomNumber,
-            items: group.items,
-            notes: orderData.notes,
-            specialInstructions: orderData.specialInstructions,
-            staffInfo: orderData.staffInfo,
-            orderType: orderType,
-            createdAt: orderData.createdAt?.toISOString() || new Date().toISOString(),
-            printStationId: group.stationId,
-            printStationName: group.stationName
-          }).catch(err => console.error('KOT print Pusher notification error (non-blocking):', err))
-        );
-      }
+    // Always publish KOT events to RTDB — Electron client decides whether to print
+    // based on autoPrintOnKOT setting. kotPrinterEnabled is legacy (standalone KOT printer app).
+    const stationGroups = splitOrderByPrintStation(orderItems, restaurantData.printStations, restaurantData.categories, { ...DEFAULT_PRINT_SETTINGS, ...printSettings });
+    for (const group of stationGroups) {
+      pusherPromises.push(
+        pusherService.notifyKOTPrintRequest(restaurantId, {
+          id: orderRef.id,
+          dailyOrderId: orderData.dailyOrderId,
+          orderNumber: orderData.orderNumber,
+          tableNumber: tableNum,
+          roomNumber: orderData.roomNumber,
+          items: group.items,
+          notes: orderData.notes,
+          specialInstructions: orderData.specialInstructions,
+          staffInfo: orderData.staffInfo,
+          orderType: orderType,
+          createdAt: orderData.createdAt?.toISOString() || new Date().toISOString(),
+          printStationId: group.stationId,
+          printStationName: group.stationName
+        }).catch(err => console.error('KOT print Pusher notification error (non-blocking):', err))
+      );
     }
     await Promise.allSettled(pusherPromises);
 
@@ -10628,7 +10631,7 @@ app.post('/api/orders', async (req, res) => {
           }).catch(err => console.error('Pusher notification error (non-blocking):', err))
         );
         const printSettings = restaurantData.printSettings || {};
-        if (orderData.status === 'confirmed' && printSettings.kotPrinterEnabled !== false && printSettings.usePusherForKOT === true) {
+        if (orderData.status === 'confirmed') {
           const stationGroups = splitOrderByPrintStation(orderItems, restaurantData.printStations, restaurantData.categories, { ...DEFAULT_PRINT_SETTINGS, ...printSettings });
           for (const group of stationGroups) {
             pusherPromises.push(
@@ -10642,7 +10645,7 @@ app.post('/api/orders', async (req, res) => {
             );
           }
         }
-        if (orderData.status === 'completed' && printSettings.kotPrinterEnabled !== false && printSettings.usePusherForKOT === true) {
+        if (orderData.status === 'completed') {
           pusherPromises.push(
             pusherService.notifyBillingPrintRequest(restaurantId, {
               id: orderRef.id, dailyOrderId, orderNumber, tableNumber, roomNumber,
@@ -12041,6 +12044,7 @@ app.get('/api/analytics/:restaurantId/daily-summary', authenticateToken, async (
     let hasItemCounts = false;
     let usedDailyStats = false;
 
+    let docs = [];
     if (!isTodayOnly) {
       // Batch-read dailyStats docs for historical dates
       const docIds = dates.map(d => subRestaurantId
@@ -12655,7 +12659,7 @@ app.patch('/api/orders/:orderId/status', authenticateToken, async (req, res) => 
       const restaurantDoc = await getCachedRestDoc(orderData.restaurantId);
       const printSettings = restaurantDoc.exists ? (restaurantDoc.data().printSettings || {}) : {};
 
-      if (status === 'confirmed' && printSettings.kotPrinterEnabled !== false && printSettings.usePusherForKOT === true) {
+      if (status === 'confirmed') {
         const restaurantFullData = restaurantDoc.data();
         const stationGroups = splitOrderByPrintStation(orderData.items, restaurantFullData.printStations, restaurantFullData.categories, { ...DEFAULT_PRINT_SETTINGS, ...(restaurantFullData.printSettings || {}) });
         for (const group of stationGroups) {
@@ -12679,7 +12683,7 @@ app.patch('/api/orders/:orderId/status', authenticateToken, async (req, res) => 
         }
       }
 
-      if (status === 'completed' && printSettings.kotPrinterEnabled !== false && printSettings.usePusherForKOT === true) {
+      if (status === 'completed') {
         // Reset billPrinted flag before sending billing print notification
         await db.collection(collections.orders).doc(orderId).update({
           billPrinted: false
@@ -14356,7 +14360,7 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
         const restaurantDoc = await getCachedRestDoc(currentOrder.restaurantId);
         const printSettings = restaurantDoc.exists ? (restaurantDoc.data().printSettings || {}) : {};
 
-        if (printSettings.kotPrinterEnabled !== false && printSettings.usePusherForKOT === true) {
+        {
           console.log('🖨️ Order items updated, triggering KOT reprint for order:', orderId);
           const restaurantFullData = restaurantDoc.data();
           const reprintItems = updateData.items || items;
@@ -14396,7 +14400,7 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
         const restaurantDoc = await getCachedRestDoc(currentOrder.restaurantId);
         const printSettings = restaurantDoc.exists ? (restaurantDoc.data().printSettings || {}) : {};
 
-        if (printSettings.kotPrinterEnabled !== false && printSettings.usePusherForKOT === true) {
+        {
           // Reset billPrinted flag before sending billing print notification
           await db.collection(collections.orders).doc(orderId).update({
             billPrinted: false
@@ -14515,20 +14519,17 @@ app.post('/api/orders/:orderId/manual-print', authenticateToken, async (req, res
     }
 
     // Determine print type: if status is 'completed', print bill; otherwise print KOT
-    const shouldPrintBill = printType === 'bill' || order.status === 'completed';
+    const isPreBill = printType === 'pre-bill';
+    const shouldPrintBill = isPreBill || printType === 'bill' || order.status === 'completed';
 
     // Get restaurant info for print settings
     const restaurantDoc = await getCachedRestDoc(order.restaurantId);
     const restaurantData = restaurantDoc.exists ? restaurantDoc.data() : {};
     const printSettings = restaurantData.printSettings || {};
 
-    // Check if KOT printer is enabled
-    if (printSettings.kotPrinterEnabled === false) {
-      return res.status(400).json({
-        error: 'KOT Printer is disabled for this restaurant',
-        fallbackToBrowser: true
-      });
-    }
+    // Skip kotPrinterEnabled check — this endpoint is used by both the legacy
+    // KOT printer app AND the new Electron auto-print flow (pre-bill, manual reprint).
+    // The auto-print settings (autoPrintOnKOT/autoPrintOnBilling) are the real gates.
 
     // Format timestamps
     const createdAt = order.createdAt?.toDate?.() || order.createdAt?._seconds
@@ -14547,50 +14548,68 @@ app.post('/api/orders/:orderId/manual-print', authenticateToken, async (req, res
     });
 
     if (shouldPrintBill) {
-      // Print Bill/Invoice
-      console.log('🖨️ Manual BILL print request for order:', orderId);
+      // Print Bill/Invoice (or Pre-Bill)
+      console.log(`🖨️ Manual ${isPreBill ? 'PRE-BILL' : 'BILL'} print request for order:`, orderId);
 
-      await pusherService.notifyBillingPrintRequest(order.restaurantId, {
-        id: orderId,
-        dailyOrderId: order.dailyOrderId,
-        orderNumber: order.orderNumber,
-        tableNumber: order.tableNumber,
-        roomNumber: order.roomNumber,
-        customerName: order.customerName || order.customerInfo?.name,
-        customerMobile: order.customerMobile || order.customerInfo?.phone,
-        items: order.items || [],
-        subtotal: order.subtotal || order.totalAmount || 0,
-        totalAmount: order.totalAmount || 0,
-        taxAmount: order.taxAmount || 0,
-        taxBreakdown: order.taxBreakdown || [],
-        finalAmount: order.finalAmount || order.totalAmount || 0,
-        discountAmount: order.discountAmount || 0,
-        manualDiscount: order.manualDiscount || 0,
-        loyaltyDiscount: order.loyaltyDiscount || 0,
-        totalDiscountAmount: order.totalDiscountAmount || 0,
-        appliedOffer: order.appliedOffer || null,
-        appliedOffers: order.appliedOffers || null,
-        paymentMethod: order.paymentMethod || 'cash',
-        orderType: order.orderType || 'dine-in',
-        serviceChargeAmount: order.serviceChargeAmount || null,
-        serviceChargeRate: order.serviceChargeRate || null,
-        tipAmount: order.tipAmount || null,
-        roundOffAmount: order.roundOffAmount || null,
-        splitPayments: order.splitPayments || null,
-        cashReceived: order.cashReceived || null,
-        changeReturned: order.changeReturned || null,
-        createdAt: createdAt.toISOString(),
-        completedAt: order.completedAt?.toDate?.()?.toISOString() || new Date().toISOString(),
-        formattedTime,
-        formattedDate,
-        forcePrint: true,  // Force print flag - bypasses local cache check in printer app
-        tokenBillingEnabled: printSettings.tokenBillingEnabled || false
-      });
+      // For pre-bill, push directly to RTDB with isPreBill flag
+      // notifyBillingPrintRequest doesn't support isPreBill, so use pushEvent directly
+      if (isPreBill) {
+        await pusherService.pushEvent(order.restaurantId, 'billing', 'billing-print-request', {
+          id: orderId,
+          orderId,
+          isPreBill: true,
+          dailyOrderId: order.dailyOrderId,
+          orderNumber: order.orderNumber,
+          tableNumber: order.tableNumber || '',
+          roomNumber: order.roomNumber || '',
+          orderType: order.orderType || 'dine-in',
+          itemsCount: (order.items || []).length,
+          totalAmount: order.finalAmount || order.totalAmount || 0,
+          forcePrint: true,
+        });
+      } else {
+        await pusherService.notifyBillingPrintRequest(order.restaurantId, {
+          id: orderId,
+          dailyOrderId: order.dailyOrderId,
+          orderNumber: order.orderNumber,
+          tableNumber: order.tableNumber,
+          roomNumber: order.roomNumber,
+          customerName: order.customerName || order.customerInfo?.name,
+          customerMobile: order.customerMobile || order.customerInfo?.phone,
+          items: order.items || [],
+          subtotal: order.subtotal || order.totalAmount || 0,
+          totalAmount: order.totalAmount || 0,
+          taxAmount: order.taxAmount || 0,
+          taxBreakdown: order.taxBreakdown || [],
+          finalAmount: order.finalAmount || order.totalAmount || 0,
+          discountAmount: order.discountAmount || 0,
+          manualDiscount: order.manualDiscount || 0,
+          loyaltyDiscount: order.loyaltyDiscount || 0,
+          totalDiscountAmount: order.totalDiscountAmount || 0,
+          appliedOffer: order.appliedOffer || null,
+          appliedOffers: order.appliedOffers || null,
+          paymentMethod: order.paymentMethod || 'cash',
+          orderType: order.orderType || 'dine-in',
+          serviceChargeAmount: order.serviceChargeAmount || null,
+          serviceChargeRate: order.serviceChargeRate || null,
+          tipAmount: order.tipAmount || null,
+          roundOffAmount: order.roundOffAmount || null,
+          splitPayments: order.splitPayments || null,
+          cashReceived: order.cashReceived || null,
+          changeReturned: order.changeReturned || null,
+          createdAt: createdAt.toISOString(),
+          completedAt: order.completedAt?.toDate?.()?.toISOString() || new Date().toISOString(),
+          formattedTime,
+          formattedDate,
+          forcePrint: true,
+          tokenBillingEnabled: printSettings.tokenBillingEnabled || false
+        });
+      }
 
       res.json({
         success: true,
-        message: 'Bill print request sent to printer app',
-        printType: 'bill'
+        message: `${isPreBill ? 'Pre-bill' : 'Bill'} print request sent to printer app`,
+        printType: isPreBill ? 'pre-bill' : 'bill'
       });
     } else {
       // Print KOT
@@ -17952,7 +17971,7 @@ app.delete('/api/staff/:staffId', authenticateToken, requireOwnerRole, async (re
 const ROLE_DEFAULT_PAGE_ACCESS = {
   admin:    { dashboard:true, history:true, tables:true, menu:true, analytics:true, inventory:true, kot:true, admin:{ settings:true, tax:true, pricing:true, payments:true, billingSettings:true, currency:true, print:true, features:true, restaurants:true, staff:true, orderManagement:true, offers:true, loyalty:true, googleReviews:true, whatsapp:true }, completeBill:true, invoice:true, customers:true, offers:true, printer:true },
   manager:  { dashboard:true, history:true, tables:true, menu:true, analytics:true, inventory:{ read:true, add:true, update:true, delete:false }, kot:true, admin:false, completeBill:true, invoice:true, customers:true, offers:true, printer:true },
-  waiter:   { dashboard:true, history:true, tables:true, menu:true, analytics:false, inventory:false, kot:false, admin:false, completeBill:false, invoice:false, customers:false, offers:false, printer:true },
+  waiter:   { dashboard:true, history:true, tables:true, menu:true, analytics:false, inventory:false, kot:false, admin:false, completeBill:false, invoice:false, customers:false, offers:false, printer:true, orders:{ read:true, update:true, cancel:true, refund:false, completeBill:false } },
   cashier:  { dashboard:true, history:true, tables:false, menu:true, analytics:false, inventory:false, kot:false, admin:false, completeBill:true, invoice:true, customers:false, offers:false, printer:true },
   employee: { dashboard:true, history:true, tables:true, menu:true, analytics:false, inventory:false, kot:false, admin:false, completeBill:false, invoice:false, customers:false, offers:false, printer:true },
   sales:    { dashboard:true, history:true, tables:false, menu:true, analytics:false, inventory:false, kot:false, admin:false, completeBill:false, invoice:false, customers:true, offers:true, printer:true },
@@ -19557,6 +19576,12 @@ app.get('/api/admin/print-settings/:restaurantId', authenticateToken, async (req
       enableUpdateWithoutKOT: false,       // Show "Update Order" button (save without KOT)
       enableKOTAndPrint: false,            // Show "KOT & Print" combined button
       enableSaveAndPrint: false,           // Show "Bill & Print" combined button
+      showPrintNotifications: true,        // Show indicator on desktop terminal for remote print commands
+      showSuccessNotifications: true,      // Show success notifications after actions
+      autoPrintOnPlaceOrder: false,        // Native: silent print KOT on Place Order
+      autoPrintOnKOTAndPrint: true,        // Native: silent print KOT on KOT & Print
+      autoPrintOnCompleteBilling: false,   // Native: silent print bill on Complete Billing
+      autoPrintOnBillAndPrint: true,       // Native: silent print bill on Bill & Print
       kotTemplate: 'classic',              // KOT print template: classic, compact, bold, grouped, numbered
       billTemplate: 'classic'              // Bill print template: classic, compact, detailed, elegant, minimal
     };
@@ -19604,7 +19629,12 @@ app.put('/api/admin/print-settings/:restaurantId', authenticateToken, async (req
       'enableUpdateWithoutKOT',
       'enableKOTAndPrint',
       'enableSaveAndPrint',
-      'showPrintNotifications'
+      'showPrintNotifications',
+      'showSuccessNotifications',
+      'autoPrintOnPlaceOrder',
+      'autoPrintOnKOTAndPrint',
+      'autoPrintOnCompleteBilling',
+      'autoPrintOnBillAndPrint'
     ];
 
     // Numeric fields
@@ -22866,6 +22896,14 @@ async function checkFeaturePermission(req, feature, operation) {
       const tablesPerms = resolveFeaturePerms(pageAccess, 'tables');
       if (tablesPerms.read) return true;
       if (pageAccess?.tables === true) return true;
+    }
+
+    // Fallback: waiters/staff with history or tables access can update/cancel orders
+    // (core order-taking workflow — placing orders, sending to kitchen, adding items)
+    if (feature === 'orders' && (operation === 'update' || operation === 'cancel')) {
+      if (pageAccess?.history === true || pageAccess?.tables === true) return true;
+      const historyPerms = resolveFeaturePerms(pageAccess, 'history');
+      if (historyPerms.read || historyPerms.update) return true;
     }
 
     return false;
@@ -31786,6 +31824,13 @@ app.get('/api/public/customer/:customerId/orders', vercelSecurityMiddleware.publ
         discountAmount: orderData.discountAmount || 0,
         loyaltyDiscount: orderData.loyaltyDiscount || 0,
         totalAmount: orderData.totalAmount || 0,
+        finalAmount: orderData.finalAmount || orderData.totalAmount || 0,
+        taxAmount: orderData.taxAmount || 0,
+        taxBreakdown: orderData.taxBreakdown || [],
+        serviceCharge: orderData.serviceCharge || 0,
+        serviceChargeRate: orderData.serviceChargeRate || 0,
+        paymentMethod: orderData.paymentMethod || 'cash',
+        paymentStatus: orderData.paymentStatus || 'pending',
         appliedOffer: orderData.appliedOffer ? {
           name: orderData.appliedOffer.name,
           discountApplied: orderData.appliedOffer.discountApplied

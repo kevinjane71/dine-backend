@@ -286,14 +286,26 @@ router.get('/users', authenticateSuperAdmin, requireSuperAdmin, async (req, res)
 // Must be BEFORE /users/:userId so Express doesn't match "lookup" as a userId
 router.get('/users/lookup', authenticateSuperAdmin, requireSuperAdmin, async (req, res) => {
   try {
-    const { email, phone } = req.query;
-    if (!email && !phone) {
-      return res.status(400).json({ success: false, error: 'Provide email or phone to search' });
+    const { email, phone, restaurantId } = req.query;
+    if (!email && !phone && !restaurantId) {
+      return res.status(400).json({ success: false, error: 'Provide email, phone, or restaurantId to search' });
     }
 
     let userDoc = null;
 
-    if (email) {
+    // Lookup by restaurantId — find restaurant owner
+    if (restaurantId) {
+      const restDoc = await db.collection(collections.restaurants).doc(restaurantId.trim()).get();
+      if (restDoc.exists) {
+        const ownerId = restDoc.data().ownerId;
+        if (ownerId) {
+          const ownerDoc = await db.collection(collections.users).doc(ownerId).get();
+          if (ownerDoc.exists) userDoc = ownerDoc;
+        }
+      }
+    }
+
+    if (!userDoc && email) {
       const snap = await db.collection(collections.users)
         .where('email', '==', email.trim())
         .limit(1)
@@ -339,7 +351,18 @@ router.get('/users/lookup', authenticateSuperAdmin, requireSuperAdmin, async (re
       };
     });
 
-    res.json({ success: true, user, restaurants });
+    // Fetch subscription data from dine_user_data
+    let subscription = null;
+    try {
+      const billingDoc = await db.collection('dine_user_data').doc(userDoc.id).get();
+      if (billingDoc.exists) {
+        subscription = billingDoc.data().subscription || null;
+      }
+    } catch (e) {
+      console.warn('Could not fetch subscription for user lookup:', e.message);
+    }
+
+    res.json({ success: true, user, restaurants, subscription });
   } catch (error) {
     console.error('Super admin user lookup error:', error);
     res.status(500).json({ success: false, error: 'Failed to lookup user' });
@@ -2636,6 +2659,123 @@ Instructions:
   } catch (error) {
     console.error('WhatsApp AI reply error:', error);
     res.status(500).json({ success: false, error: 'Failed to generate AI reply' });
+  }
+});
+
+// ─── Activate subscription (offline payment) ───────────────────────
+const PLAN_DETAILS = {
+  'starter-monthly': { name: 'Starter', duration: 'monthly' },
+  'starter-yearly': { name: 'Starter Annual', duration: 'yearly' },
+  'growth-monthly': { name: 'Growth', duration: 'monthly' },
+  'growth-yearly': { name: 'Growth Annual', duration: 'yearly' },
+  'pro-monthly': { name: 'Pro', duration: 'monthly' },
+  'pro-yearly': { name: 'Pro Annual', duration: 'yearly' },
+};
+
+const PLAN_PRICING = {
+  'starter-monthly': { amount: 299, currency: 'INR' },
+  'starter-yearly': { amount: 3000, currency: 'INR' },
+  'growth-monthly': { amount: 899, currency: 'INR' },
+  'growth-yearly': { amount: 8988, currency: 'INR' },
+  'pro-monthly': { amount: 1799, currency: 'INR' },
+  'pro-yearly': { amount: 17988, currency: 'INR' },
+};
+
+router.post('/activate-subscription', authenticateSuperAdmin, requireSuperAdmin, async (req, res) => {
+  try {
+    const { identifier, identifierType, planId } = req.body;
+
+    if (!identifier || !identifierType || !planId) {
+      return res.status(400).json({ success: false, error: 'identifier, identifierType, and planId are required' });
+    }
+
+    if (!PLAN_DETAILS[planId]) {
+      return res.status(400).json({ success: false, error: `Invalid planId. Available: ${Object.keys(PLAN_DETAILS).join(', ')}` });
+    }
+
+    // Find user
+    let userDoc = null;
+
+    if (identifierType === 'restaurantId') {
+      const restDoc = await db.collection(collections.restaurants).doc(identifier.trim()).get();
+      if (restDoc.exists && restDoc.data().ownerId) {
+        const ownerDoc = await db.collection(collections.users).doc(restDoc.data().ownerId).get();
+        if (ownerDoc.exists) userDoc = ownerDoc;
+      }
+    } else if (identifierType === 'email') {
+      const snap = await db.collection(collections.users).where('email', '==', identifier.trim()).limit(1).get();
+      if (!snap.empty) userDoc = snap.docs[0];
+    } else if (identifierType === 'phone') {
+      const snap = await db.collection(collections.users).where('phone', '==', identifier.trim()).limit(1).get();
+      if (!snap.empty) userDoc = snap.docs[0];
+    } else {
+      return res.status(400).json({ success: false, error: 'identifierType must be restaurantId, email, or phone' });
+    }
+
+    if (!userDoc) {
+      return res.status(404).json({ success: false, error: 'User not found' });
+    }
+
+    const userId = userDoc.id;
+    const userEmail = userDoc.data().email || '';
+
+    // Build subscription data (mirrors updateUserSubscriptionDoc in payment.js)
+    const now = new Date();
+    const endDate = new Date(now);
+    const isYearly = planId.includes('yearly');
+    if (isYearly) {
+      endDate.setFullYear(endDate.getFullYear() + 1);
+    } else {
+      endDate.setMonth(endDate.getMonth() + 1);
+    }
+
+    const plan = PLAN_DETAILS[planId];
+    const pricing = PLAN_PRICING[planId];
+
+    const subscriptionData = {
+      planId,
+      planName: plan.name,
+      status: 'active',
+      startDate: now.toISOString(),
+      endDate: endDate.toISOString(),
+      amount: pricing.amount,
+      currency: pricing.currency,
+      features: [],
+      paymentGateway: 'offline',
+      activatedBy: 'admin',
+      autoRenew: false,
+      lastUpdated: now.toISOString(),
+      app: 'Dine',
+    };
+
+    // Write to dine_user_data
+    const billingRef = db.collection('dine_user_data').doc(userId);
+    const billingDoc = await billingRef.get();
+
+    if (billingDoc.exists) {
+      await billingRef.update({ subscription: subscriptionData, lastUpdated: now });
+    } else {
+      await billingRef.set({
+        uid: userId,
+        email: userEmail,
+        subscription: subscriptionData,
+        createdAt: now.toISOString(),
+        lastUpdated: now.toISOString(),
+        app: 'Dine',
+      });
+    }
+
+    console.log(`[super-admin] Activated ${planId} subscription for user ${userId} (offline payment)`);
+
+    res.json({
+      success: true,
+      message: `${plan.name} subscription activated successfully`,
+      subscription: subscriptionData,
+      user: { id: userId, email: userEmail, name: userDoc.data().name || '' },
+    });
+  } catch (error) {
+    console.error('Activate subscription error:', error);
+    res.status(500).json({ success: false, error: 'Failed to activate subscription' });
   }
 });
 

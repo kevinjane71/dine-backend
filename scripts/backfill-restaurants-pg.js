@@ -19,6 +19,7 @@ const { toPgRow, JSONB_COLUMNS } = require('../repos/restaurantsFieldMapper');
 const args = process.argv.slice(2);
 const DRY_RUN = args.includes('--dry-run');
 const RESTAURANT_FILTER = args.find(a => a.startsWith('--restaurant='))?.split('=')[1] || null;
+const UPSERT = args.includes('--upsert');
 
 const stats = {
   total: 0,
@@ -110,7 +111,7 @@ async function main() {
 
       const result = await pool.query(
         `INSERT INTO restaurants (${cols.join(', ')}) VALUES (${placeholders})
-         ON CONFLICT (id) DO NOTHING`,
+         ON CONFLICT (id) ${UPSERT ? 'DO UPDATE SET ' + cols.filter(c => c !== 'id').map(c => `${c} = EXCLUDED.${c}`).join(', ') : 'DO NOTHING'}`,
         values
       );
 

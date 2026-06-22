@@ -25,6 +25,7 @@ const COLLECTION_FILTER = args.find(a => a.startsWith('--collection='))?.split('
 const SKIP_COLLECTIONS = new Set(
   args.filter(a => a.startsWith('--skip=')).map(a => a.split('=')[1])
 );
+const UPSERT = args.includes('--upsert');
 
 // Collection definitions: Firestore name → PG table + mapper
 const COLLECTIONS = [
@@ -110,7 +111,7 @@ async function migrateCollection(pool, collectionDef) {
 
         const result = await pool.query(
           `INSERT INTO ${pgTable} (${cols.join(', ')}) VALUES (${placeholders})
-           ON CONFLICT (id) DO NOTHING`,
+           ON CONFLICT (id) ${UPSERT ? 'DO UPDATE SET ' + cols.filter(c => c !== 'id').map(c => `${c} = EXCLUDED.${c}`).join(', ') : 'DO NOTHING'}`,
           values
         );
 
