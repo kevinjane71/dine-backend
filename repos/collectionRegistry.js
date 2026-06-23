@@ -347,6 +347,11 @@ const counterIdentity = (obj) => obj;
 const COUNTER_JSONB = new Set();
 
 // ═══════════════════════════════════════════════════════════════════════════
+// Generic identity + JSONB set (for simple collections with no field mapper)
+// ═══════════════════════════════════════════════════════════════════════════
+const GENERIC_JSONB = new Set(['extra_data']);
+
+// ═══════════════════════════════════════════════════════════════════════════
 // Registry — Firestore collection name → PG table config
 // ═══════════════════════════════════════════════════════════════════════════
 const REGISTRY = {
@@ -354,10 +359,11 @@ const REGISTRY = {
   'orders': { table: 'orders', fieldMap: ORDER_FIELD_MAP, toPgRow: orderToPgRow, toFirestoreObj: orderToFirestoreObj, jsonbCols: ORDER_JSONB_COLUMNS },
 
   // ── restaurants ─────────────────────────────────────────────────────────
-  'restaurants': { table: 'restaurants', fieldMap: REST_FIELD_MAP, toPgRow: restToPgRow, toFirestoreObj: restToFirestoreObj, jsonbCols: REST_JSONB_COLUMNS },
+  'restaurants': { table: 'restaurants', fieldMap: REST_FIELD_MAP, toPgRow: restToPgRow, toFirestoreObj: restToFirestoreObj, jsonbCols: REST_JSONB_COLUMNS, cacheTTL: 180 },
 
   // ── inventory (from inventoryFieldMapper — preferred, has FIELD_MAP) ───
-  'inventory':              { table: 'inventory',              fieldMap: invFM.inventory.FIELD_MAP,              toPgRow: invFM.inventory.toPgRow,              toFirestoreObj: invFM.inventory.toFirestoreObj,              jsonbCols: invFM.inventory.JSONB_COLUMNS },
+  'inventory':              { table: 'inventory',              fieldMap: invFM.inventory.FIELD_MAP,              toPgRow: invFM.inventory.toPgRow,              toFirestoreObj: invFM.inventory.toFirestoreObj,              jsonbCols: invFM.inventory.JSONB_COLUMNS, cacheTTL: 30 },
+  'inventoryCategories':    { table: 'inventory_categories',   fieldMap: {},                                             toPgRow: counterIdentity,                               toFirestoreObj: counterIdentity,                               jsonbCols: GENERIC_JSONB },
   'inventoryTransactions':  { table: 'inventory_transactions', fieldMap: invFM.inventoryTransactions.FIELD_MAP, toPgRow: invFM.inventoryTransactions.toPgRow, toFirestoreObj: invFM.inventoryTransactions.toFirestoreObj, jsonbCols: invFM.inventoryTransactions.JSONB_COLUMNS },
   'stockBatches':           { table: 'stock_batches',          fieldMap: invFM.stockBatches.FIELD_MAP,          toPgRow: invFM.stockBatches.toPgRow,          toFirestoreObj: invFM.stockBatches.toFirestoreObj,          jsonbCols: invFM.stockBatches.JSONB_COLUMNS },
   'wasteEntries':           { table: 'waste_entries',          fieldMap: invFM.wasteEntries.FIELD_MAP,          toPgRow: invFM.wasteEntries.toPgRow,          toFirestoreObj: invFM.wasteEntries.toFirestoreObj,          jsonbCols: invFM.wasteEntries.JSONB_COLUMNS },
@@ -369,19 +375,21 @@ const REGISTRY = {
   'dailyStats': { table: 'daily_stats', fieldMap: DS_FIELD_MAP, toPgRow: dsToPgRow, toFirestoreObj: dsToFirestoreObj, jsonbCols: DS_JSONB_COLUMNS },
 
   // ── floors & tables ─────────────────────────────────────────────────────
-  'floors': { table: 'floors', fieldMap: FLOOR_FIELD_MAP, toPgRow: floorToPgRow, toFirestoreObj: floorToFirestoreObj, jsonbCols: FT_JSONB_COLUMNS },
-  'tables': { table: 'tables', fieldMap: TABLE_FIELD_MAP, toPgRow: tableToPgRow, toFirestoreObj: tableToFirestoreObj, jsonbCols: FT_JSONB_COLUMNS },
+  'floors': { table: 'floors', fieldMap: FLOOR_FIELD_MAP, toPgRow: floorToPgRow, toFirestoreObj: floorToFirestoreObj, jsonbCols: FT_JSONB_COLUMNS, cacheTTL: 60 },
+  'tables': { table: 'tables', fieldMap: TABLE_FIELD_MAP, toPgRow: tableToPgRow, toFirestoreObj: tableToFirestoreObj, jsonbCols: FT_JSONB_COLUMNS, cacheTTL: 60 },
 
   // ── customers ───────────────────────────────────────────────────────────
   'customers': { table: 'customers', fieldMap: CUST_FIELD_MAP, toPgRow: custToPgRow, toFirestoreObj: custToFirestoreObj, jsonbCols: CUST_JSONB_COLUMNS },
 
   // ── offers ──────────────────────────────────────────────────────────────
-  'offers': { table: 'offers', fieldMap: OFFER_FIELD_MAP, toPgRow: offerToPgRow, toFirestoreObj: offerToFirestoreObj, jsonbCols: OFFER_JSONB_COLUMNS },
+  'offers': { table: 'offers', fieldMap: OFFER_FIELD_MAP, toPgRow: offerToPgRow, toFirestoreObj: offerToFirestoreObj, jsonbCols: OFFER_JSONB_COLUMNS, cacheTTL: 120 },
 
   // ── dine payments / subscriptions / razorpay orders ─────────────────────
   'dine_payments':         { table: 'dine_payments',         fieldMap: PAYMENTS_FIELD_MAP,      toPgRow: paymentsToPgRow,         toFirestoreObj: paymentsToFirestoreObj,         jsonbCols: PAYMENTS_JSONB_COLUMNS },
   'dine_subscriptions':    { table: 'dine_subscriptions',    fieldMap: SUBSCRIPTIONS_FIELD_MAP, toPgRow: subscriptionsToPgRow,    toFirestoreObj: subscriptionsToFirestoreObj,    jsonbCols: SUBSCRIPTIONS_JSONB_COLUMNS },
   'dine_razorpay_orders':  { table: 'dine_razorpay_orders',  fieldMap: RZP_ORDERS_FIELD_MAP,    toPgRow: rzpOrdersToPgRow,        toFirestoreObj: rzpOrdersToFirestoreObj,        jsonbCols: RZP_ORDERS_JSONB_COLUMNS },
+  'dine_orders':           { table: 'dine_orders',           fieldMap: {},                      toPgRow: counterIdentity,         toFirestoreObj: counterIdentity,               jsonbCols: GENERIC_JSONB },
+  'subscriptions':         { table: 'dine_subscriptions',    fieldMap: SUBSCRIPTIONS_FIELD_MAP, toPgRow: subscriptionsToPgRow,    toFirestoreObj: subscriptionsToFirestoreObj,    jsonbCols: SUBSCRIPTIONS_JSONB_COLUMNS },
 
   // ── cash registers & shifts ─────────────────────────────────────────────
   'cashRegisters':           { table: 'cash_registers',           fieldMap: REGISTER_FIELD_MAP,       toPgRow: registerToPgRow,       toFirestoreObj: registerToFirestoreObj,       jsonbCols: REGISTER_JSONB_COLUMNS },
@@ -391,7 +399,7 @@ const REGISTRY = {
   'staffAvailability':       { table: 'staff_availability',       fieldMap: STAFF_AVAIL_FIELD_MAP,    toPgRow: staffAvailToPgRow,     toFirestoreObj: staffAvailToFirestoreObj,     jsonbCols: STAFF_AVAIL_JSONB_COLUMNS },
 
   // ── staff HR ────────────────────────────────────────────────────────────
-  'staffUsers':     { table: 'staff_users',     fieldMap: SHR_STAFF_FIELD_MAP,    toPgRow: shrStaffToPgRow,       toFirestoreObj: shrStaffToFirestoreObj,       jsonbCols: SHR_STAFF_JSONB_COLUMNS },
+  'staffUsers':     { table: 'staff_users',     fieldMap: SHR_STAFF_FIELD_MAP,    toPgRow: shrStaffToPgRow,       toFirestoreObj: shrStaffToFirestoreObj,       jsonbCols: SHR_STAFF_JSONB_COLUMNS, cacheTTL: 120 },
   'attendance':     { table: 'attendance',       fieldMap: ATTENDANCE_FIELD_MAP,   toPgRow: attendanceToPgRow,     toFirestoreObj: attendanceToFirestoreObj,     jsonbCols: ATTENDANCE_JSONB_COLUMNS },
   'leaveRequests':  { table: 'leave_requests',   fieldMap: LEAVE_REQUEST_FIELD_MAP, toPgRow: leaveRequestToPgRow,  toFirestoreObj: leaveRequestToFirestoreObj,  jsonbCols: LEAVE_REQUEST_JSONB_COLUMNS },
   'leaveConfig':    { table: 'leave_config',     fieldMap: LEAVE_CONFIG_FIELD_MAP,  toPgRow: leaveConfigToPgRow,   toFirestoreObj: leaveConfigToFirestoreObj,   jsonbCols: LEAVE_CONFIG_JSONB_COLUMNS },
@@ -550,8 +558,8 @@ const REGISTRY = {
   'productionEntries':     { table: 'production_entries',      fieldMap: {}, toPgRow: productionEntryToPgRow,       toFirestoreObj: productionEntryToFirestoreObj,       jsonbCols: PRODUCTION_ENTRY_JSONB_COLUMNS },
 
   // ── auth & menu ─────────────────────────────────────────────────────────
-  'menus':             { table: 'menus',              fieldMap: MENU_FIELD_MAP,             toPgRow: menuToPgRow,             toFirestoreObj: menuToFirestoreObj,             jsonbCols: MENU_JSONB_COLUMNS },
-  'menuItems':         { table: 'menu_items',         fieldMap: MENU_ITEM_FIELD_MAP,        toPgRow: menuItemToPgRow,         toFirestoreObj: menuItemToFirestoreObj,         jsonbCols: MENU_ITEM_JSONB_COLUMNS },
+  'menus':             { table: 'menus',              fieldMap: MENU_FIELD_MAP,             toPgRow: menuToPgRow,             toFirestoreObj: menuToFirestoreObj,             jsonbCols: MENU_JSONB_COLUMNS, cacheTTL: 120 },
+  'menuItems':         { table: 'menu_items',         fieldMap: MENU_ITEM_FIELD_MAP,        toPgRow: menuItemToPgRow,         toFirestoreObj: menuItemToFirestoreObj,         jsonbCols: MENU_ITEM_JSONB_COLUMNS, cacheTTL: 120 },
   'users':             { table: 'app_users',          fieldMap: APP_USER_FIELD_MAP,         toPgRow: appUserToPgRow,          toFirestoreObj: appUserToFirestoreObj,          jsonbCols: APP_USER_JSONB_COLUMNS },
   'userRestaurants':   { table: 'user_restaurants',   fieldMap: USER_RESTAURANT_FIELD_MAP,  toPgRow: userRestaurantToPgRow,   toFirestoreObj: userRestaurantToFirestoreObj,   jsonbCols: USER_RESTAURANT_JSONB_COLUMNS },
   'staffCredentials':  { table: 'staff_credentials',  fieldMap: STAFF_CREDENTIAL_FIELD_MAP, toPgRow: staffCredentialToPgRow,  toFirestoreObj: staffCredentialToFirestoreObj,  jsonbCols: STAFF_CREDENTIAL_JSONB_COLUMNS },

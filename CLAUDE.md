@@ -7,11 +7,11 @@ Main REST API server for the DineOpen restaurant management platform. Handles PO
 ## Tech Stack
 
 - **Runtime**: Node.js with Express 5
-- **Database**: Firebase Firestore (named DB: "dine") + Firebase Realtime Database
+- **Database**: PostgreSQL on GCP Cloud SQL (primary, via pgAdapter) + Firebase Firestore (auth-coupled collections only) + Firebase Realtime Database
 - **Cache**: Upstash Redis
 - **Storage**: Google Cloud Storage (bucket: dine-menu-uploads)
 - **Auth**: Firebase Admin + JWT (jsonwebtoken) + bcryptjs
-- **Deployment**: Vercel (serverless, primary) + GCP Cloud Run (backup)
+- **Deployment**: GCP Cloud Run (pg-full-migration branch) + Vercel (serverless, Firestore branch)
 - **Testing**: Jest
 
 ## Project Structure
@@ -176,6 +176,215 @@ Payments: subscriptions, dodoPayments
 - Code still exists in `utils/firestoreProfiler.js` and admin UI in `dine-admin` Firestore tab
 - To re-enable: uncomment profiler lines in index.js (lines ~133 and ~1480)
 
+## PostgreSQL Migration (pg-full-migration branch)
+
+### Overview
+
+Full Firestore → PostgreSQL migration. When `DATABASE_URL` env var is set, ALL reads and writes go through PostgreSQL via the `pgAdapter` — a Firestore-compatible API layer that intercepts `db.collection().where().get()` calls and translates them to SQL. No application code changes needed.
+
+**Motivation**: Firestore costs ₹500/day for 18 restaurants. PG on Cloud SQL costs ~₹100/day.
+
+### Infrastructure
+
+| Component | Details |
+|-----------|---------|
+| Cloud SQL instance | `dine-orders` at `34.14.155.43:5432` |
+| Database | `dine`, user `dine_app` |
+| Region | `asia-south1` (Mumbai) — same as Cloud Run |
+| Cloud Run service | `dine-backend` → `https://dine-backend-1087929121342.asia-south1.run.app` |
+| DATABASE_URL | `postgresql://dine_app:DineOrders2026Pg@34.14.155.43:5432/dine?ssl=true&sslmode=no-verify` |
+
+### Architecture: pgAdapter (`repos/pgAdapter.js`)
+
+The pgAdapter mimics the Firestore SDK API. It is wired in `firebase.js`:
+
+```js
+// firebase.js — when DATABASE_URL is set:
+const REGISTRY = require('./repos/collectionRegistry');
+const { createPgDb } = require('./repos/pgAdapter');
+db = createPgDb(REGISTRY, firestoreDb);  // wraps all db.collection() calls
+```
+
+**Key classes:**
+- `PgDocRef` — `.get()`, `.set()`, `.update()`, `.delete()`, `.collection()` (subcollections)
+- `PgQuery` — `.where()`, `.orderBy()`, `.limit()`, `.offset()`, `.count()`, `.select()`, `.startAfter()`, `.get()`
+- `PgCollectionRef` — `.doc()`, `.add()`, `.get()`, `.where()`, `.orderBy()`, etc.
+- `PgScopedCollectionRef` — Handles subcollection patterns (e.g. `restaurants/{id}/floors`) with auto-scoping by parent doc ID + ancestor scope propagation
+- `PgBatch` — Batch writes via PG transactions
+- `PgTransaction` — `runTransaction()` support
+
+**Key behaviors:**
+- Unmapped collections fall back to Firestore automatically
+- `FieldValue.increment()` → `col = COALESCE(col, 0) + N`
+- `FieldValue.serverTimestamp()` → `NOW()`
+- `FieldValue.arrayUnion()` → JSONB `||` operator
+- `FieldValue.delete()` → `SET col = NULL`
+- Dot-notation WHERE on JSONB columns → `col->>'field' = $1`
+- Missing columns on `update()`/`set()` → auto-retry, overflow to `extra_data` JSONB
+- NUMERIC type parser → `parseFloat()` (prevents string concatenation bugs)
+- `doc.ref.parent.id` → returns collection name
+- **Redis query cache** — transparent caching via Upstash Redis for cacheable collections (see below)
+
+### Redis Cache Layer (pgAdapter)
+
+The pgAdapter has a built-in transparent cache using Upstash Redis (`utils/kvCache.js`). Collections with `cacheTTL` in their registry config automatically cache reads and invalidate on writes.
+
+**How it works:**
+- Each cached table has a **version counter** (`pg:{table}:ver`) in Redis
+- Doc reads cache as `pg:{table}:v{version}:{id}`
+- Query reads cache as `pg:{table}:v{version}:q:{hash}` (MD5 of WHERE/ORDER/LIMIT)
+- Any write (set/update/delete/add) bumps the version → all old cache keys auto-miss
+- No manual cache invalidation needed — version bump handles everything
+
+**Cached collections (set in `collectionRegistry.js`):**
+
+| Collection | Table | TTL | Why |
+|-----------|-------|-----|-----|
+| restaurants | restaurants | 180s | Config read on every request |
+| floors | floors | 60s | Layout rarely changes |
+| tables | tables | 60s | Layout rarely changes (status writes bump version) |
+| menus | menus | 120s | Menu structure changes infrequently |
+| menuItems | menu_items | 120s | Item details change infrequently |
+| staffUsers | staff_users | 120s | Staff list barely changes |
+| offers | offers | 120s | Offer config changes infrequently |
+| inventory | inventory | 30s | Stock changes on every order (short TTL) |
+
+**NOT cached (by design):** orders, dailyStats, counters, payments — these change too frequently.
+
+**To add caching to a new collection:** Add `cacheTTL: <seconds>` to its entry in `collectionRegistry.js`. That's it.
+
+### Subcollection Routing
+
+Firestore subcollections (e.g. `restaurants/{id}/floors/{floorId}/tables`) are flattened to PG tables with foreign key columns. The pgAdapter's `PgScopedCollectionRef` handles this:
+
+```
+db.collection('restaurants').doc(restaurantId).collection('floors')
+  → PgScopedCollectionRef: SELECT * FROM floors WHERE restaurant_id = $1
+
+db.collection('restaurants').doc(restaurantId).collection('floors').doc(floorId).collection('tables')
+  → PgScopedCollectionRef with ancestor scopes:
+    SELECT * FROM tables WHERE restaurant_id = $1 AND floor_id = $2
+```
+
+The scope chain propagates through `doc()` calls via `_scopeChain` on PgDocRef.
+
+### File Structure
+
+```
+repos/
+  pgAdapter.js              # Firestore-compatible API layer (core)
+  pgClient.js               # PG connection pool
+  collectionRegistry.js     # Maps 147+ Firestore collections → PG table configs
+  queryBuilder.js           # SQL builders: buildInsert, buildUpdate, buildUpsert
+
+  # Field mappers (per domain):
+  fieldMapper.js            # orders
+  floorsTablesFieldMapper.js
+  inventoryFieldMapper.js
+  restaurantsFieldMapper.js
+  dailyStatsFieldMapper.js
+  customersFieldMapper.js
+  offersFieldMapper.js
+  registerFieldMapper.js
+  staffHrFieldMapper.js
+  accountingFieldMapper.js
+  hotelFieldMapper.js
+  bookingsFieldMapper.js
+  invoiceFieldMapper.js
+  enterpriseFieldMapper.js
+  aiFieldMapper.js
+  systemMiscFieldMapper.js
+  authMenuFieldMapper.js    # users, userRestaurants, staffCredentials, dine_user_data
+
+  # Domain repos (used by some endpoints directly):
+  ordersRepo.js
+  counterRepo.js
+  floorsTablesRepo.js
+  ...
+
+scripts/
+  backfill-*-pg.js          # Firestore → PG backfill scripts (one per domain)
+  create-*-tables.js        # DDL scripts
+```
+
+### Collections Still on Firestore
+
+| Collection | Reason |
+|-----------|--------|
+| RTDB events/* | Real-time listeners (ephemeral) |
+| `__profiler_init__` | Internal (not a real collection) |
+
+All other collections (147+) are routed to PG when `DATABASE_URL` is set.
+
+### Known Issues & Common Debugging Patterns
+
+**1. "column X does not exist"**
+A Firestore field maps to a PG column that doesn't exist yet. Fix:
+```sql
+ALTER TABLE <table> ADD COLUMN IF NOT EXISTS <col> <type> DEFAULT <default>;
+```
+Then add the field to the appropriate `*FieldMapper.js` FIELD_MAP.
+The pgAdapter now auto-retries and puts unknown fields into `extra_data` JSONB, so this is non-fatal for `update()`/`set()` but still fails for `WHERE` clauses.
+
+**2. "missing FROM-clause entry for table X"**
+A dot-notation Firestore field (e.g. `staffInfo.userId`) is being used in a WHERE clause on a JSONB column. The pgAdapter handles this by converting to `col->>'key'` syntax. If a new dot-notation pattern appears, check that the top-level field is in the JSONB_COLUMNS set.
+
+**3. Empty results from subcollections**
+If `db.collection('restaurants').doc(id).collection('floors').get()` returns empty, check:
+- Is the collection name in `collectionRegistry.js`?
+- Does the PG table have data for this `restaurant_id`?
+- Is the ancestor scope propagating correctly?
+
+**4. NUMERIC fields returned as strings**
+Fixed globally with `pg.types.setTypeParser(1700, parseFloat)` in pgAdapter.js. If a new numeric type appears, add its OID parser.
+
+**5. Dual-write cleanup removed critical code**
+The dual-write removal (Phase 11) was aggressive and removed some Firestore read paths that were the ONLY code loading data (not just dual-write fire-and-forget). Symptoms: `undefined` variables, empty arrays, always-false conditions. Check git history:
+```bash
+git diff HEAD~1 -- index.js | grep -B5 "^-.*floorsTablesRepo\|^-.*ordersRepo\|^-.*usePg"
+```
+Key areas that were restored:
+- `GET /api/floors/:restaurantId` — floor+table loading loop
+- `GET /api/kot/:restaurantId` — order fetching query
+- `POST /api/orders` — table finding + atomic claim logic
+
+### Deployment
+
+```bash
+# Build and deploy to Cloud Run:
+gcloud builds submit --tag gcr.io/ascendant-idea-443107-f8/dine-backend --project ascendant-idea-443107-f8 --quiet
+gcloud run deploy dine-backend --image gcr.io/ascendant-idea-443107-f8/dine-backend --region asia-south1 --project ascendant-idea-443107-f8 --quiet
+
+# Check logs:
+gcloud run services logs read dine-backend --region asia-south1 --limit 100
+
+# Current revision: dine-backend-00011-hsk (as of 2026-06-23)
+# Env vars are set via --env-vars-file pointing to .env.local (44 vars)
+```
+
+### Testing the PG branch locally
+
+```bash
+# Frontend (localhost:3002) → Cloud Run PG backend:
+# In dine-frontend/.env.local:
+NEXT_PUBLIC_API_URL=https://dine-backend-1087929121342.asia-south1.run.app
+
+# To switch back to Firestore/Vercel production:
+NEXT_PUBLIC_API_URL=https://dine-backend-lake.vercel.app
+```
+
+### Backfill
+
+All backfill scripts are in `scripts/backfill-*-pg.js`. They support:
+- `--dry-run` — count without writing
+- `--upsert` — update existing rows
+- `--restaurant <id>` — single restaurant
+
+To re-backfill all orders (e.g. after production creates new ones):
+```bash
+node scripts/backfill-orders-pg.js --upsert
+```
+
 ## Session Log
 
 ### 2026-05-28: Initial CLAUDE.md created
@@ -188,3 +397,40 @@ Payments: subscriptions, dodoPayments
 - Added Firestore tab to dine-admin dashboard
 - Profiler disabled after gathering data — Redis quota concern
 - Documented findings above for future reference
+
+### 2026-06-23: Full PG migration — pgAdapter, Cloud Run deployment, bug fixes
+
+**pgAdapter infrastructure built:**
+- `repos/pgAdapter.js` — Firestore-compatible API backed by PG (PgDocRef, PgQuery, PgCollectionRef, PgScopedCollectionRef, PgBatch, PgTransaction)
+- `repos/collectionRegistry.js` — 147+ collection mappings
+- `repos/authMenuFieldMapper.js` — 6 collections: menus, menuItems, users→app_users, userRestaurants, staffCredentials, dine_user_data
+- `firebase.js` wired: when `DATABASE_URL` set, `db = createPgDb(REGISTRY, firestoreDb)`
+
+**Dual-write removal:**
+- Removed 526 fire-and-forget PG dual-write calls across 59 files
+- Some removals were too aggressive — restored critical Firestore read paths for:
+  - GET /api/floors (floor+table loading)
+  - GET /api/kot (order fetching)
+  - POST /api/orders (table finding + atomic claim)
+
+**Cloud Run deployment:**
+- 11 revisions deployed iteratively fixing issues
+- 44 env vars from .env.local
+- Dockerfile: node:20-slim, npm ci --production, port 3003
+
+**PG schema fixes (columns added during testing):**
+- `app_users`: status, language, default_restaurant_id, restaurant_id
+- `restaurants`: organization_id
+- `orders`: item_count
+- `saved_carts`: name, type, is_active, customer_info, order_type, table_number, payment_method, created_by
+
+**pgAdapter fixes applied:**
+- `getAll()` method for batch doc reads
+- `select()` no-op for API compat
+- `offset()` + `count()` methods for pagination
+- `parent` getter on PgDocRef (returns `{ id: collectionName }`)
+- Duplicate `updated_at` prevention in update()
+- Missing-column resilience: auto-retry with overflow to `extra_data` JSONB
+- NUMERIC/BIGINT type parsers (prevent string concatenation bugs)
+- JSONB dot-notation in WHERE clauses (`staffInfo.userId` → `staff_info->>'userId'`)
+- Subcollection routing via PgScopedCollectionRef with ancestor scope propagation

@@ -30,6 +30,43 @@ pg.types.setTypeParser(1700, (val) => parseFloat(val));
 pg.types.setTypeParser(20, (val) => parseInt(val, 10));
 
 // ---------------------------------------------------------------------------
+// Redis Cache Layer (Upstash — kvCache)
+// ---------------------------------------------------------------------------
+
+const { kvGet, kvSet, kvDel, kvIncrBy } = require('../utils/kvCache');
+const crypto = require('crypto');
+
+/**
+ * Table version keys track write generations. When any doc in a table is
+ * written, the version bumps. Query cache keys include the version so they
+ * auto-invalidate without needing to enumerate cached queries.
+ *
+ * Cache key patterns:
+ *   Doc read:   pg:{table}:v{version}:{id}
+ *   Query read: pg:{table}:v{version}:q:{hash}
+ *   Version:    pg:{table}:ver
+ */
+
+async function getTableVersion(table) {
+  const ver = await kvGet(`pg:${table}:ver`);
+  return ver || 0;
+}
+
+async function bumpTableVersion(table) {
+  // Increment version; TTL 1 hour (will auto-reset if it expires — cache just misses)
+  await kvIncrBy(`pg:${table}:ver`, 1, 3600).catch(() => {});
+}
+
+function docCacheKey(table, version, id) {
+  return `pg:${table}:v${version}:${id}`;
+}
+
+function queryCacheKey(table, version, queryDesc) {
+  const hash = crypto.createHash('md5').update(JSON.stringify(queryDesc)).digest('hex').slice(0, 12);
+  return `pg:${table}:v${version}:q:${hash}`;
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
@@ -167,15 +204,43 @@ class PgDocRef {
    */
   async get() {
     try {
-      const { table } = this._config;
+      const { table, cacheTTL } = this._config;
+
+      // Redis cache check (only for non-transactional reads on cacheable collections)
+      if (cacheTTL && !this._client) {
+        try {
+          const ver = await getTableVersion(table);
+          const cKey = docCacheKey(table, ver, this.id);
+          const cached = await kvGet(cKey);
+          if (cached) {
+            if (cached === '__null__') {
+              return makeDocumentSnapshot(this.id, null, this);
+            }
+            return makeDocumentSnapshot(this.id, cached, this);
+          }
+        } catch (_) { /* cache miss — fall through to PG */ }
+      }
+
       const result = await this._exec(
         `SELECT * FROM ${table} WHERE id = $1`,
         [this.id]
       );
       if (result.rows.length === 0) {
+        // Cache the miss briefly to avoid repeated queries for non-existent docs
+        if (cacheTTL && !this._client) {
+          const ver = await getTableVersion(table).catch(() => 0);
+          kvSet(docCacheKey(table, ver, this.id), '__null__', Math.min(cacheTTL, 30)).catch(() => {});
+        }
         return makeDocumentSnapshot(this.id, null, this);
       }
       const data = this._config.toFirestoreObj(result.rows[0]);
+
+      // Cache the result
+      if (cacheTTL && !this._client) {
+        const ver = await getTableVersion(table).catch(() => 0);
+        kvSet(docCacheKey(table, ver, this.id), data, cacheTTL).catch(() => {});
+      }
+
       return makeDocumentSnapshot(this.id, data, this);
     } catch (err) {
       console.error(`[pgAdapter] DocRef.get() error (${this.path}):`, err.message);
@@ -213,6 +278,8 @@ class PgDocRef {
           throw innerErr;
         }
       }
+      // Invalidate cache
+      if (this._config.cacheTTL) bumpTableVersion(table).catch(() => {});
     } catch (err) {
       console.error(`[pgAdapter] DocRef.set() error (${this.path}):`, err.message);
       throw err;
@@ -373,6 +440,8 @@ class PgDocRef {
         }
         throw innerErr;
       }
+      // Invalidate cache
+      if (this._config.cacheTTL) bumpTableVersion(table).catch(() => {});
     } catch (err) {
       console.error(
         `[pgAdapter] DocRef.update() error (${this.path}):`,
@@ -389,6 +458,8 @@ class PgDocRef {
     try {
       const { table } = this._config;
       await this._exec(`DELETE FROM ${table} WHERE id = $1`, [this.id]);
+      // Invalidate cache
+      if (this._config.cacheTTL) bumpTableVersion(table).catch(() => {});
     } catch (err) {
       console.error(
         `[pgAdapter] DocRef.delete() error (${this.path}):`,
@@ -571,7 +642,32 @@ class PgQuery {
    */
   async get() {
     try {
-      const { table, fieldMap, jsonbCols, toFirestoreObj } = this._config;
+      const { table, fieldMap, jsonbCols, toFirestoreObj, cacheTTL } = this._config;
+
+      // Redis query cache check — only for cacheable collections without cursor pagination
+      let qCacheKey = null;
+      if (cacheTTL && !this._startAfterSnap) {
+        try {
+          const ver = await getTableVersion(table);
+          const queryDesc = {
+            w: this._wheres.map(w => ({ f: w.field, o: w.op, v: w.value instanceof Date ? w.value.toISOString() : w.value })),
+            ob: this._orderBys,
+            l: this._limitVal,
+            off: this._offsetVal,
+          };
+          qCacheKey = queryCacheKey(table, ver, queryDesc);
+          const cached = await kvGet(qCacheKey);
+          if (cached && Array.isArray(cached)) {
+            // Reconstruct DocumentSnapshots from cached data
+            const docs = cached.map(item => {
+              const ref = new PgDocRef(this._collectionName, item.id, this._config, this._firestoreDb);
+              return makeDocumentSnapshot(item.id, item.data, ref);
+            });
+            return makeQuerySnapshot(docs);
+          }
+        } catch (_) { /* cache miss — fall through to PG */ }
+      }
+
       const conditions = [];
       const values = [];
       let paramIdx = 1;
@@ -705,6 +801,12 @@ class PgQuery {
         return makeDocumentSnapshot(id, data, ref);
       });
 
+      // Cache query results (only for cacheable collections, max 500 results to avoid huge cache entries)
+      if (qCacheKey && docs.length <= 500) {
+        const cachePayload = docs.map(d => ({ id: d.id, data: d.data() }));
+        kvSet(qCacheKey, cachePayload, cacheTTL).catch(() => {});
+      }
+
       return makeQuerySnapshot(docs);
     } catch (err) {
       console.error(
@@ -830,6 +932,8 @@ class PgCollectionRef {
 
       const { text, values } = buildInsert(table, pgRow, jsonbCols);
       await pgQuery(text, values);
+      // Invalidate cache
+      if (this._config.cacheTTL) bumpTableVersion(table).catch(() => {});
       return { id };
     } catch (err) {
       console.error(

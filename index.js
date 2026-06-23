@@ -36460,7 +36460,7 @@ app.post('/api/sync/batch', authenticateToken, async (req, res) => {
               createdAt: new Date(),
               syncSource: 'offline_batch',
             };
-            const wasteRef = await db.collection('waste_entries').add(wasteData);
+            const wasteRef = await db.collection('wasteEntries').add(wasteData);
             result = { wasteEntry: { id: wasteRef.id } };
             break;
           }
