@@ -90,6 +90,7 @@ router.post('/hotel/checkin', authenticateToken, async (req, res) => {
 
     const guestRef = await db.collection(COLLECTIONS.guests).add(guestData);
 
+
     // Validate dates
     const checkIn = new Date(checkInDate);
     const checkOut = new Date(checkOutDate);
@@ -136,6 +137,7 @@ router.post('/hotel/checkin', authenticateToken, async (req, res) => {
     };
 
     const checkInRef = await db.collection(COLLECTIONS.checkIns).add(checkInData);
+
 
     // Update room status to occupied
     const roomSnapshot = await db.collection('rooms')
@@ -359,6 +361,7 @@ router.post('/hotel/link-order', authenticateToken, async (req, res) => {
       balanceAmount,
       lastUpdated: FieldValue.serverTimestamp()
     });
+
 
     // IMPORTANT: Mark order as linked to this check-in to prevent re-linking
     await db.collection('orders').doc(orderId).update({
@@ -663,7 +666,8 @@ router.post('/hotel/checkout/:checkInId', authenticateToken, async (req, res) =>
             checkedOutAt: FieldValue.serverTimestamp(),
             updatedAt: FieldValue.serverTimestamp()
           });
-          
+
+
           console.log(`✅ Released booking ${bookingToRelease.id} after checkout`);
           
           // Update room status if it was reserved due to this booking
@@ -874,6 +878,7 @@ router.patch('/hotel/checkin/:checkInId', authenticateToken, async (req, res) =>
     updates.lastUpdated = FieldValue.serverTimestamp();
 
     await db.collection(COLLECTIONS.checkIns).doc(checkInId).update(updates);
+
 
     res.json({
       success: true,

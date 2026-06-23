@@ -345,15 +345,18 @@ async function trackUsageAsync(userId, restaurantId) {
   const db = getDb();
   const usageRef = db.collection('dineai_usage').doc(`${userId}_${restaurantId}_${dateStr}`);
 
+  let newCount;
   await db.runTransaction(async (transaction) => {
     const doc = await transaction.get(usageRef);
 
     if (doc.exists) {
+      newCount = (doc.data().count || 0) + 1;
       transaction.update(usageRef, {
-        count: (doc.data().count || 0) + 1,
+        count: newCount,
         updatedAt: new Date()
       });
     } else {
+      newCount = 1;
       transaction.set(usageRef, {
         userId,
         restaurantId,
@@ -364,6 +367,7 @@ async function trackUsageAsync(userId, restaurantId) {
       });
     }
   });
+
 }
 
 /**

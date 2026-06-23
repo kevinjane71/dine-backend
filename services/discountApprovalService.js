@@ -273,12 +273,8 @@ async function verifyApproval(approvalId, verificationData) {
       return { approved: false, message: 'Invalid OTP' };
     }
 
-    await ref.update({
-      status: 'approved',
-      approvedBy: 'otp-verified',
-      approvedByName: 'OTP Verification',
-      resolvedAt: now
-    });
+    const otpApproveData = { status: 'approved', approvedBy: 'otp-verified', approvedByName: 'OTP Verification', resolvedAt: now };
+    await ref.update(otpApproveData);
 
     return { approved: true, approvalId };
   }
@@ -300,12 +296,8 @@ async function verifyApproval(approvalId, verificationData) {
       return { approved: false, message: 'Invalid PIN' };
     }
 
-    await ref.update({
-      status: 'approved',
-      approvedBy: matchedApprover.userId,
-      approvedByName: matchedApprover.name,
-      resolvedAt: now
-    });
+    const pinApproveData = { status: 'approved', approvedBy: matchedApprover.userId, approvedByName: matchedApprover.name, resolvedAt: now };
+    await ref.update(pinApproveData);
 
     return { approved: true, approvalId, approvedBy: matchedApprover.name };
   }

@@ -200,7 +200,7 @@ Always check menu for prices when asked. Confirm before placing orders. Be conci
       });
 
       // Store in Firestore for tracking
-      await db.collection('dineai_realtime_sessions').doc(sessionId).set({
+      const rtSessionData = {
         sessionId,
         restaurantId,
         userId,
@@ -208,7 +208,8 @@ Always check menu for prices when asked. Confirm before placing orders. Be conci
         voiceMode: 'realtime',
         status: 'active',
         createdAt: new Date()
-      });
+      };
+      await db.collection('dineai_realtime_sessions').doc(sessionId).set(rtSessionData);
 
       console.log(`🎙️ DineAI Realtime session created: ${sessionId}`);
 
@@ -316,12 +317,13 @@ Always check menu for prices when asked. Confirm before placing orders. Be conci
   async logFunctionCall(sessionId, functionName, args, result) {
     try {
       const db = getDb();
-      await db.collection('dineai_realtime_sessions').doc(sessionId).collection('function_calls').add({
+      const funcCallData = {
         functionName,
         args,
         success: result.success,
         timestamp: new Date()
-      });
+      };
+      await db.collection('dineai_realtime_sessions').doc(sessionId).collection('function_calls').add(funcCallData);
     } catch (error) {
       console.error('Error logging function call:', error);
     }
@@ -335,10 +337,8 @@ Always check menu for prices when asked. Confirm before placing orders. Be conci
       const db = getDb();
 
       // Update session status
-      await db.collection('dineai_realtime_sessions').doc(sessionId).update({
-        status: 'ended',
-        endedAt: new Date()
-      });
+      const endData = { status: 'ended', endedAt: new Date() };
+      await db.collection('dineai_realtime_sessions').doc(sessionId).update(endData);
 
       // Remove from active sessions
       this.activeSessions.delete(sessionId);

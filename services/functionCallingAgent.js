@@ -1730,26 +1730,33 @@ class FunctionCallingAgent {
       const orderNumber = `ORD-${Date.now()}-${Math.random().toString(36).substr(2, 4).toUpperCase()}`;
       
       // Generate daily order ID
-      const today = new Date();
-      const todayStr = today.toISOString().split('T')[0];
-      const counterRef = db.collection('daily_order_counters').doc(`${restaurantId}_${todayStr}`);
-      const counterDoc = await counterRef.get();
       let dailyOrderId = 1;
-      if (counterDoc.exists) {
-        const counterData = counterDoc.data();
-        dailyOrderId = counterData.lastOrderId + 1;
-        await counterRef.update({
-          lastOrderId: dailyOrderId,
-          updatedAt: new Date()
-        });
+
+      // PG-first counter (atomic, no race conditions)
+      const counterRepo = process.env.DATABASE_URL ? require('../repos/counterRepo') : null;
+      if (counterRepo) {
+        dailyOrderId = await counterRepo.generateDailyOrderId(restaurantId);
       } else {
-        await counterRef.set({
-          restaurantId,
-          date: todayStr,
-          lastOrderId: 1,
-          createdAt: new Date(),
-          updatedAt: new Date()
-        });
+        const today = new Date();
+        const todayStr = today.toISOString().split('T')[0];
+        const counterRef = db.collection('daily_order_counters').doc(`${restaurantId}_${todayStr}`);
+        const counterDoc = await counterRef.get();
+        if (counterDoc.exists) {
+          const counterData = counterDoc.data();
+          dailyOrderId = counterData.lastOrderId + 1;
+          await counterRef.update({
+            lastOrderId: dailyOrderId,
+            updatedAt: new Date()
+          });
+        } else {
+          await counterRef.set({
+            restaurantId,
+            date: todayStr,
+            lastOrderId: 1,
+            createdAt: new Date(),
+            updatedAt: new Date()
+          });
+        }
       }
 
       // Get user info for staffInfo
@@ -2623,12 +2630,13 @@ class FunctionCallingAgent {
       });
 
       // Update settings with QR code
-      await db.collection('googleReviewSettings').doc(restaurantId).set({
+      const agentQrSettings = {
         restaurantId,
         qrCodeUrl: qrCodeDataUrl,
         googleReviewUrl: normalizedUrl,
         updatedAt: new Date()
-      }, { merge: true });
+      };
+      await db.collection('googleReviewSettings').doc(restaurantId).set(agentQrSettings, { merge: true });
 
       return {
         success: true,

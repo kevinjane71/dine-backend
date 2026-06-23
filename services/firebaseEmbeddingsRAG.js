@@ -158,7 +158,7 @@ class FirebaseEmbeddingsRAGService {
       
       chunks.forEach(chunk => {
         const docRef = this.db.collection('rag_knowledge').doc(chunk.id);
-        batch.set(docRef, {
+        const ragData = {
           type: chunk.type,
           text: chunk.text,
           fields: chunk.fields,
@@ -166,7 +166,8 @@ class FirebaseEmbeddingsRAGService {
           restaurantId: chunk.restaurantId,
           embedding: chunk.embedding || null,
           timestamp: admin.firestore.FieldValue.serverTimestamp()
-        });
+        };
+        batch.set(docRef, ragData);
       });
 
       await batch.commit();

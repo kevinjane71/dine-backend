@@ -5,6 +5,7 @@ const { authenticateToken } = require('../middleware/auth');
 // const pusherService = require('../services/pusherService'); // COMMENTED OUT — replaced by Firebase RTDB
 const pusherService = require('../services/firebaseRealtimeService');
 
+
 router.use(authenticateToken);
 
 // ── Helpers ─────────────────────────────────────────────────────────
@@ -150,7 +151,6 @@ router.post('/:restaurantId/clock-in', async (req, res) => {
     };
 
     await db.collection('attendance').doc(docId).set(attendanceData, { merge: true });
-
     // Check if continuous tracking is enabled for this staff
     const trackingConfig = leaveConfig.trackingConfig || {};
     const enabledStaffIds = trackingConfig.enabledStaffIds || [];
@@ -229,7 +229,6 @@ router.post('/:restaurantId/clock-out', async (req, res) => {
     };
 
     await db.collection('attendance').doc(docId).update(updateData);
-
     // Remove from live locations when clocking out
     try {
       await db.collection('staffLocations_latest').doc(staffId).delete();
@@ -421,7 +420,6 @@ router.post('/:restaurantId/manual-entry', async (req, res) => {
     };
 
     await db.collection('attendance').doc(docId).set(attendanceData);
-
     res.json({ id: docId, ...attendanceData });
   } catch (err) {
     console.error('Manual entry error:', err);
@@ -490,7 +488,6 @@ router.post('/:restaurantId/leave/apply', async (req, res) => {
     };
 
     const docRef = await db.collection('leaveRequests').add(leaveData);
-
     res.json({ id: docRef.id, ...leaveData });
   } catch (err) {
     console.error('Leave apply error:', err);
@@ -522,13 +519,13 @@ router.patch('/:restaurantId/leave/:id/approve', async (req, res) => {
     const approvedBy = req.user?.userId || req.user?.id;
 
     // Update leave request
-    await db.collection('leaveRequests').doc(id).update({
+    const approveUpdate = {
       status: 'approved',
       approvedBy,
       approvedAt: now,
       updatedAt: now,
-    });
-
+    };
+    await db.collection('leaveRequests').doc(id).update(approveUpdate);
     // Deduct from leave balances
     const leaveConfig = await getLeaveConfig(restaurantId);
     const leaveYear = getLeaveYear(leaveConfig.yearStart || 4);
@@ -607,13 +604,13 @@ router.patch('/:restaurantId/leave/:id/reject', async (req, res) => {
     const { reason } = req.body;
     const now = new Date().toISOString();
 
-    await db.collection('leaveRequests').doc(id).update({
+    const rejectUpdate = {
       status: 'rejected',
       rejectedReason: reason || '',
       approvedBy: req.user?.userId || req.user?.id,
       updatedAt: now,
-    });
-
+    };
+    await db.collection('leaveRequests').doc(id).update(rejectUpdate);
     const updatedDoc = await db.collection('leaveRequests').doc(id).get();
     res.json({ id, ...updatedDoc.data() });
   } catch (err) {
@@ -701,7 +698,6 @@ router.put('/:restaurantId/leave/config', async (req, res) => {
     };
 
     await db.collection('leaveConfig').doc(restaurantId).set(configData, { merge: true });
-
     const updatedDoc = await db.collection('leaveConfig').doc(restaurantId).get();
     res.json({ id: updatedDoc.id, ...updatedDoc.data() });
   } catch (err) {
@@ -876,7 +872,7 @@ router.post('/:restaurantId/location-ping', async (req, res) => {
     await db.collection('staffLocations').doc(historyDocId).set(locationData);
 
     // Update latest location (for live map)
-    await db.collection('staffLocations_latest').doc(staffId).set({
+    const latestData = {
       staffId,
       staffName: staffName || '',
       restaurantId,
@@ -886,7 +882,8 @@ router.post('/:restaurantId/location-ping', async (req, res) => {
       heading: heading || null,
       timestamp: ts,
       updatedAt: now.toISOString(),
-    });
+    };
+    await db.collection('staffLocations_latest').doc(staffId).set(latestData);
 
     // Push real-time update via Firebase RTDB
     try {

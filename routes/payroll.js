@@ -3,6 +3,7 @@ const router = express.Router();
 const { db } = require('../firebase');
 const { authenticateToken } = require('../middleware/auth');
 
+
 router.use(authenticateToken);
 
 // ── GET /api/payroll/:restaurantId/config ─────────────────────────
@@ -65,8 +66,9 @@ router.post('/:restaurantId/config', async (req, res) => {
     };
 
     if (!existing.empty) {
+      const existingId = existing.docs[0].id;
       await existing.docs[0].ref.update(data);
-      res.json({ id: existing.docs[0].id, ...data, message: 'Salary config updated' });
+      res.json({ id: existingId, ...data, message: 'Salary config updated' });
     } else {
       data.createdAt = new Date();
       data.createdBy = req.user?.userId || req.user?.id;
@@ -292,7 +294,6 @@ router.patch('/:restaurantId/runs/:runId', async (req, res) => {
     }
 
     await db.collection('payrollRuns').doc(runId).update(update);
-
     // If marked as paid, update all pay slips too
     if (status === 'paid') {
       const slipSnap = await db.collection('paySlips')

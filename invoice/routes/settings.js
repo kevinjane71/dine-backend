@@ -93,7 +93,7 @@ module.exports = (db, collections) => {
           createdAt: FieldValue.serverTimestamp(),
           updatedAt: FieldValue.serverTimestamp()
         };
-        await db.collection(collections.invSettings).add(settingsData);
+        const newSettingsRef = await db.collection(collections.invSettings).add(settingsData);
 
         snapshot = await db.collection(collections.invSettings)
           .where('orgId', '==', orgId)

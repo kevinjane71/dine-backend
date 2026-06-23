@@ -535,25 +535,6 @@ const initializePaymentRoutes = (db, razorpay) => {
           updatedAt: new Date()
         });
 
-        // PG dual-write (fire-and-forget) — must mirror the Firestore update above
-        const usePg = !!process.env.DATABASE_URL;
-        if (usePg) {
-          try {
-            const ordersRepo = require('./repos/ordersRepo');
-            ordersRepo.update(orderId, {
-              status: 'completed',
-              paymentStatus: preserveCredit ? orderData.paymentStatus : 'paid',
-              paymentMethod: offlineMethod,
-              completedAt: new Date(),
-              updatedAt: new Date(),
-            }).catch(pgErr => {
-              console.error('⚠️ PG dual-write error (payment-verify):', pgErr.message);
-            });
-          } catch (pgErr) {
-            console.error('⚠️ PG dual-write error (payment-verify):', pgErr.message);
-          }
-        }
-
         console.log('[PAYMENT] Offline payment completed successfully:', {
           orderId,
           paymentId,
@@ -618,7 +599,7 @@ const initializePaymentRoutes = (db, razorpay) => {
           event,
           app: 'Dine'
         };
-        await db.collection('dine_webhook_events').add(webhookDoc);
+        const webhookRef = await db.collection('dine_webhook_events').add(webhookDoc);
 
         // ── Handle SUBSCRIPTION events ──
         if (event.startsWith('subscription.')) {
@@ -662,7 +643,7 @@ const initializePaymentRoutes = (db, razorpay) => {
               }
               // Record payment
               if (payment) {
-                await db.collection('dine_payments').doc(payment.id).set({
+                const renewalPaymentDoc = {
                   subscriptionId: subId,
                   paymentId: payment.id,
                   planId: subPlanId,
@@ -674,7 +655,8 @@ const initializePaymentRoutes = (db, razorpay) => {
                   type: 'subscription_renewal',
                   app: 'Dine',
                   webhookAt: new Date()
-                });
+                };
+                await db.collection('dine_payments').doc(payment.id).set(renewalPaymentDoc);
               }
               await db.collection('dine_subscriptions').doc(subId).set({
                 status: 'active', lastChargedAt: new Date(), updatedAt: new Date()

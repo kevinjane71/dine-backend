@@ -1,6 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const { db, collections } = require('../firebase');
+
 const { authenticateToken, requireOwnerRole } = require('../middleware/auth');
 const emailService = require('../emailService');
 const { parseTZ, parseDayStart, todayInTZ, dateStrInTZ, dateBoundsInTZ } = require('../utils/timezone');
@@ -300,6 +301,7 @@ async function checkAIInsightsLimit(userId) {
       count: 1,
       updatedAt: new Date()
     });
+
     return { allowed: true, remaining: AI_INSIGHTS_DAILY_LIMIT - 1 };
   }
 
@@ -312,6 +314,7 @@ async function checkAIInsightsLimit(userId) {
       count: 1,
       updatedAt: new Date()
     });
+
     return { allowed: true, remaining: AI_INSIGHTS_DAILY_LIMIT - 1 };
   }
 
@@ -321,8 +324,9 @@ async function checkAIInsightsLimit(userId) {
   }
 
   // Increment count
+  const newCount = data.count + 1;
   await usageRef.update({
-    count: data.count + 1,
+    count: newCount,
     updatedAt: new Date()
   });
 
@@ -645,7 +649,7 @@ router.post('/email-preferences', authenticateToken, requireOwnerRole, async (re
     // Pre-compute UTC hour for cron job matching
     const reportTimeUTC = convertToUTCHour(reportTime, timezone);
 
-    await db.collection('ownerPreferences').doc(userId).set({
+    const ownerPrefData = {
       emailEnabled: !!emailEnabled,
       reportEmails: emails,
       reportEmail: emails[0] || req.user.email || '', // Legacy compat
@@ -653,7 +657,8 @@ router.post('/email-preferences', authenticateToken, requireOwnerRole, async (re
       reportTime,
       reportTimeUTC,
       updatedAt: new Date()
-    }, { merge: true });
+    };
+    await db.collection('ownerPreferences').doc(userId).set(ownerPrefData, { merge: true });
 
     res.json({
       success: true,

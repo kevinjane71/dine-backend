@@ -276,11 +276,12 @@ class AutomationService {
    */
   async logMessage(restaurantId, messageData) {
     try {
-      await db.collection(collections.automationLogs).add({
+      const logData = {
         restaurantId,
         ...messageData,
         createdAt: new Date()
-      });
+      };
+      await db.collection(collections.automationLogs).add(logData);
     } catch (error) {
       console.error('Error logging message:', error);
     }
@@ -307,10 +308,8 @@ class AutomationService {
 
       stats[statType] = (stats[statType] || 0) + 1;
 
-      await automationRef.update({
-        stats,
-        lastTriggered: new Date()
-      });
+      const updateData = { stats, lastTriggered: new Date() };
+      await automationRef.update(updateData);
     } catch (error) {
       console.error('Error updating automation stats:', error);
     }

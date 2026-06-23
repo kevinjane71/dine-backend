@@ -6,6 +6,7 @@ const { requireOrgAccess, getOwnerId, getOrgOutlets, requireOrgMember } = requir
 const { pushTemplateToOutlets } = require('./centralMenuRoutes');
 const { getCachedRestDoc } = require('../utils/kvCache');
 
+
 // ============================================
 // ORGANIZATION / CHAIN MANAGEMENT APIs
 // All endpoints require owner (or admin co-owner) role
@@ -78,13 +79,8 @@ router.post('/', authenticateToken, requireOwnerRole, async (req, res) => {
     }
 
     // Log audit
-    await db.collection(collections.orgAuditLog).add({
-      organizationId: orgId,
-      action: 'ORG_CREATED',
-      performedBy: userId,
-      details: { name: orgData.name, outlets: restaurantIds || [] },
-      createdAt: new Date()
-    });
+    const auditData1 = { organizationId: orgId, action: 'ORG_CREATED', performedBy: userId, details: { name: orgData.name, outlets: restaurantIds || [] }, createdAt: new Date() };
+    const auditRef1 = await db.collection(collections.orgAuditLog).add(auditData1);
 
     res.status(201).json({
       success: true,
@@ -232,20 +228,16 @@ router.post('/:orgId/outlets', authenticateToken, requireOwnerRole, requireOrgAc
     // Update org outlets array
     const currentOutlets = req.org.outlets || [];
     if (!currentOutlets.includes(restaurantId)) {
+      const newOutlets = [...currentOutlets, restaurantId];
       await db.collection(collections.organizations).doc(req.org.id).update({
-        outlets: [...currentOutlets, restaurantId],
+        outlets: newOutlets,
         updatedAt: new Date()
       });
     }
 
     // Audit log
-    await db.collection(collections.orgAuditLog).add({
-      organizationId: req.org.id,
-      action: 'OUTLET_ADDED',
-      performedBy: userId,
-      details: { restaurantId, outletType: type, restaurantName: restaurant.name },
-      createdAt: new Date()
-    });
+    const auditAddData = { organizationId: req.org.id, action: 'OUTLET_ADDED', performedBy: userId, details: { restaurantId, outletType: type, restaurantName: restaurant.name }, createdAt: new Date() };
+    const auditAddRef = await db.collection(collections.orgAuditLog).add(auditAddData);
 
     // Auto-push: find org's active template and push to the new outlet
     let menuAutoPushed = false;
@@ -275,13 +267,8 @@ router.post('/:orgId/outlets', authenticateToken, requireOwnerRole, requireOrgAc
         menuAutoPushed = true;
 
         // Audit log for auto-push
-        await db.collection(collections.orgAuditLog).add({
-          organizationId: req.org.id,
-          action: 'MENU_AUTO_PUSHED',
-          performedBy: userId,
-          details: { restaurantId, templateId, templateName, results, hadDefaultMenu: hasDefaultMenu },
-          createdAt: new Date()
-        });
+        const autoPushAuditData = { organizationId: req.org.id, action: 'MENU_AUTO_PUSHED', performedBy: userId, details: { restaurantId, templateId, templateName, results, hadDefaultMenu: hasDefaultMenu }, createdAt: new Date() };
+        const autoPushAuditRef = await db.collection(collections.orgAuditLog).add(autoPushAuditData);
       }
     } catch (pushErr) {
       console.error('Auto-push menu failed (non-blocking):', pushErr);
@@ -335,13 +322,8 @@ router.delete('/:orgId/outlets/:restaurantId', authenticateToken, requireOwnerRo
     });
 
     // Audit log
-    await db.collection(collections.orgAuditLog).add({
-      organizationId: req.org.id,
-      action: 'OUTLET_REMOVED',
-      performedBy: userId,
-      details: { restaurantId, restaurantName: restaurant.name },
-      createdAt: new Date()
-    });
+    const removeAuditData = { organizationId: req.org.id, action: 'OUTLET_REMOVED', performedBy: userId, details: { restaurantId, restaurantName: restaurant.name }, createdAt: new Date() };
+    const removeAuditRef = await db.collection(collections.orgAuditLog).add(removeAuditData);
 
     res.json({
       success: true,

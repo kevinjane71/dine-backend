@@ -4,6 +4,7 @@ const { db } = require('../firebase');
 const { FieldValue } = require('firebase-admin/firestore');
 const { authenticateToken } = require('../middleware/auth');
 
+
 // Room statuses: available, occupied, cleaning, maintenance, reserved, out-of-service
 
 // Add a single room
@@ -104,7 +105,6 @@ router.post('/rooms/bulk', authenticateToken, async (req, res) => {
     }
 
     await batch.commit();
-
     res.json({
       success: true,
       message: `${roomsToAdd.length} rooms added successfully`,
@@ -245,8 +245,8 @@ router.post('/room/:roomId/maintenance', authenticateToken, async (req, res) => 
       });
     }
 
-    res.json({ 
-      success: true, 
+    res.json({
+      success: true,
       message: 'Maintenance schedule created successfully',
       maintenanceId: maintenanceRef.id
     });
@@ -375,8 +375,8 @@ router.delete('/room/:roomId/maintenance', authenticateToken, async (req, res) =
 
     await batch.commit();
 
-    res.json({ 
-      success: true, 
+    res.json({
+      success: true,
       message: `Cancelled ${cancelledCount} maintenance schedule(s)`,
       cancelledCount
     });
@@ -691,11 +691,15 @@ router.patch('/booking/:bookingId/cancel', authenticateToken, async (req, res) =
     }
 
     // Update booking status
-    await db.collection('hotel_bookings').doc(bookingId).update({
+    const cancelUpdate = {
       status: 'cancelled',
       cancellationReason: reason.trim(),
-      cancelledAt: FieldValue.serverTimestamp(),
+      cancelledAt: new Date(),
       cancelledBy: req.user.userId,
+    };
+    await db.collection('hotel_bookings').doc(bookingId).update({
+      ...cancelUpdate,
+      cancelledAt: FieldValue.serverTimestamp(),
       updatedAt: FieldValue.serverTimestamp()
     });
 

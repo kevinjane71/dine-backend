@@ -65,12 +65,13 @@ const vercelSecurityMiddleware = {
   async blockIP(ip, duration = 60 * 60 * 1000) {
     try {
       const blockedUntil = new Date(Date.now() + duration).toISOString();
-      await db.collection('blockedIPs').doc(ip).set({
+      const blockData = {
         ip,
         blockedUntil,
         blockedAt: new Date().toISOString(),
         reason: 'Suspicious activity'
-      });
+      };
+      await db.collection('blockedIPs').doc(ip).set(blockData);
 
       // Invalidate cache so newly blocked IP takes effect immediately
       _blockedIPsCache = null;

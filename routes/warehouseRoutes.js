@@ -33,10 +33,10 @@ async function generateIndentNumber(orgId) {
 
     const year = new Date().getFullYear();
     const padded = String(newCount).padStart(4, '0');
-    return `IND-${year}-${padded}`;
+    return { indentNumber: `IND-${year}-${padded}`, newCount };
   });
 
-  return result;
+  return result.indentNumber;
 }
 
 // -------------------------------------------------------
@@ -114,7 +114,7 @@ router.post('/:orgId/indents', ...commonMiddleware, async (req, res) => {
     const docRef = await db.collection(collections.indentRequests).add(indentData);
 
     // Audit log
-    await db.collection(collections.orgAuditLog).add({
+    const createAuditData = {
       organizationId: orgId,
       action: 'INDENT_CREATED',
       entityType: 'indent',
@@ -122,7 +122,8 @@ router.post('/:orgId/indents', ...commonMiddleware, async (req, res) => {
       performedBy: userId,
       details: { indentNumber, requestingOutletId, warehouseId, itemCount: items.length, priority: indentPriority },
       createdAt: now
-    });
+    };
+    const createAuditRef = await db.collection(collections.orgAuditLog).add(createAuditData);
 
     return res.status(201).json({
       success: true,
@@ -360,7 +361,7 @@ router.patch('/:orgId/indents/:indentId/receive', ...commonMiddleware, async (re
     await batch.commit();
 
     // Audit log
-    await db.collection(collections.orgAuditLog).add({
+    const receiveAuditData = {
       organizationId: orgId,
       action: 'INDENT_RECEIVED',
       entityType: 'indent',
@@ -368,7 +369,8 @@ router.patch('/:orgId/indents/:indentId/receive', ...commonMiddleware, async (re
       performedBy: userId,
       details: { indentNumber: indent.indentNumber, itemCount: items.length },
       createdAt: now
-    });
+    };
+    const receiveAuditRef = await db.collection(collections.orgAuditLog).add(receiveAuditData);
 
     return res.json({
       success: true,
@@ -404,13 +406,11 @@ router.delete('/:orgId/indents/:indentId', ...commonMiddleware, async (req, res)
     }
 
     const now = new Date();
-    await db.collection(collections.indentRequests).doc(indentId).update({
-      status: 'cancelled',
-      updatedAt: now
-    });
+    const cancelUpdateData = { status: 'cancelled', updatedAt: now };
+    await db.collection(collections.indentRequests).doc(indentId).update(cancelUpdateData);
 
     // Audit log
-    await db.collection(collections.orgAuditLog).add({
+    const cancelAuditData = {
       organizationId: orgId,
       action: 'INDENT_CANCELLED',
       entityType: 'indent',
@@ -418,7 +418,8 @@ router.delete('/:orgId/indents/:indentId', ...commonMiddleware, async (req, res)
       performedBy: userId,
       details: { indentNumber: indent.indentNumber },
       createdAt: now
-    });
+    };
+    const cancelAuditRef = await db.collection(collections.orgAuditLog).add(cancelAuditData);
 
     return res.json({ success: true, message: 'Indent cancelled successfully' });
   } catch (error) {
@@ -468,16 +469,17 @@ router.patch('/:orgId/indents/:indentId/approve', ...commonMiddleware, async (re
     });
 
     const now = new Date();
-    await db.collection(collections.indentRequests).doc(indentId).update({
+    const approveUpdateData = {
       items: updatedItems,
       status: 'approved',
       approvedBy: userId,
       approvedAt: now,
       updatedAt: now
-    });
+    };
+    await db.collection(collections.indentRequests).doc(indentId).update(approveUpdateData);
 
     // Audit log
-    await db.collection(collections.orgAuditLog).add({
+    const approveAuditData = {
       organizationId: orgId,
       action: 'INDENT_APPROVED',
       entityType: 'indent',
@@ -485,7 +487,8 @@ router.patch('/:orgId/indents/:indentId/approve', ...commonMiddleware, async (re
       performedBy: userId,
       details: { indentNumber: indent.indentNumber },
       createdAt: now
-    });
+    };
+    const approveAuditRef = await db.collection(collections.orgAuditLog).add(approveAuditData);
 
     return res.json({
       success: true,
@@ -526,14 +529,15 @@ router.patch('/:orgId/indents/:indentId/reject', ...commonMiddleware, async (req
     }
 
     const now = new Date();
-    await db.collection(collections.indentRequests).doc(indentId).update({
+    const rejectUpdateData = {
       status: 'rejected',
       rejectionReason: reason.trim(),
       updatedAt: now
-    });
+    };
+    await db.collection(collections.indentRequests).doc(indentId).update(rejectUpdateData);
 
     // Audit log
-    await db.collection(collections.orgAuditLog).add({
+    const rejectAuditData = {
       organizationId: orgId,
       action: 'INDENT_REJECTED',
       entityType: 'indent',
@@ -541,7 +545,8 @@ router.patch('/:orgId/indents/:indentId/reject', ...commonMiddleware, async (req
       performedBy: userId,
       details: { indentNumber: indent.indentNumber, reason: reason.trim() },
       createdAt: now
-    });
+    };
+    const rejectAuditRef = await db.collection(collections.orgAuditLog).add(rejectAuditData);
 
     return res.json({ success: true, message: 'Indent rejected successfully' });
   } catch (error) {
@@ -573,13 +578,11 @@ router.patch('/:orgId/indents/:indentId/pick', ...commonMiddleware, async (req, 
     }
 
     const now = new Date();
-    await db.collection(collections.indentRequests).doc(indentId).update({
-      status: 'picking',
-      updatedAt: now
-    });
+    const pickUpdateData = { status: 'picking', updatedAt: now };
+    await db.collection(collections.indentRequests).doc(indentId).update(pickUpdateData);
 
     // Audit log
-    await db.collection(collections.orgAuditLog).add({
+    const pickAuditData = {
       organizationId: orgId,
       action: 'INDENT_PICKING',
       entityType: 'indent',
@@ -587,7 +590,8 @@ router.patch('/:orgId/indents/:indentId/pick', ...commonMiddleware, async (req, 
       performedBy: userId,
       details: { indentNumber: indent.indentNumber },
       createdAt: now
-    });
+    };
+    const pickAuditRef = await db.collection(collections.orgAuditLog).add(pickAuditData);
 
     return res.json({ success: true, message: 'Indent marked as picking' });
   } catch (error) {
@@ -728,7 +732,7 @@ router.patch('/:orgId/indents/:indentId/dispatch', ...commonMiddleware, async (r
     await firestoreBatch.commit();
 
     // Audit log
-    await db.collection(collections.orgAuditLog).add({
+    const dispatchAuditData = {
       organizationId: orgId,
       action: 'INDENT_DISPATCHED',
       entityType: 'indent',
@@ -736,7 +740,8 @@ router.patch('/:orgId/indents/:indentId/dispatch', ...commonMiddleware, async (r
       performedBy: userId,
       details: { indentNumber: indent.indentNumber, itemCount: items.length },
       createdAt: now
-    });
+    };
+    const dispatchAuditRef = await db.collection(collections.orgAuditLog).add(dispatchAuditData);
 
     return res.json({
       success: true,

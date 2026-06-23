@@ -177,7 +177,8 @@ class DineAIKnowledgeService {
 
     // Store document metadata in Firestore
     const db = getDb();
-    await db.collection('dineai_knowledge').doc(`${restaurantId}_${id}`).set({
+    const knowledgeDocId = `${restaurantId}_${id}`;
+    const knowledgeData = {
       restaurantId,
       documentId: id,
       title,
@@ -188,7 +189,8 @@ class DineAIKnowledgeService {
       chunkCount: chunks.length,
       createdAt: FieldValue.serverTimestamp(),
       updatedAt: FieldValue.serverTimestamp()
-    });
+    };
+    await db.collection('dineai_knowledge').doc(knowledgeDocId).set(knowledgeData);
 
     return {
       success: true,
@@ -304,6 +306,7 @@ class DineAIKnowledgeService {
     await this.index.deleteMany(idsToDelete);
 
     // Delete from Firestore
+    const knowledgeDocId = `${restaurantId}_${documentId}`;
     await docRef.delete();
 
     return {

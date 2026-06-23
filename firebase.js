@@ -4,6 +4,7 @@ const { getDatabase } = require('firebase-admin/database');
 require('dotenv').config();
 
 let db;
+let firestoreDb; // raw Firestore ref (kept for RTDB, auth, and pgAdapter fallback)
 let isInitialized = false;
 
 console.log('🔧 Initializing Firebase Admin...');
@@ -17,10 +18,11 @@ function initializeFirebase() {
   try {
     // Check if already initialized (for Vercel serverless reuse)
     try {
-      db = getFirestore(undefined, 'dine');
-      if (db) {
+      firestoreDb = getFirestore(undefined, 'dine');
+      if (firestoreDb) {
         isInitialized = true;
         console.log('✅ Firebase Admin reused (serverless optimization)');
+        db = firestoreDb;
         return db;
       }
     } catch (e) {
@@ -36,32 +38,34 @@ function initializeFirebase() {
     }),
     databaseURL: process.env.FIREBASE_DATABASE_URL
   });
-  
+
   console.log('✅ Firebase Admin initialized successfully');
-  
+
   // Use named database "dine" like your "esigntap" pattern
-  db = getFirestore(undefined, 'dine');
-    
+  firestoreDb = getFirestore(undefined, 'dine');
+
     // Optimize Firestore settings for better performance
     // These settings help reduce latency, especially from India to US regions
-    db.settings({
+    firestoreDb.settings({
       // Enable offline persistence (not available in serverless, but helps with connection reuse)
       ignoreUndefinedProperties: true,
     });
-    
+
     isInitialized = true;
   console.log('🎯 Using Firestore database: "dine"');
-    
+
+    db = firestoreDb;
     return db;
 } catch (error) {
     // If already initialized, return existing instance
     if (error.code === 'app/duplicate-app') {
-      db = getFirestore(undefined, 'dine');
+      firestoreDb = getFirestore(undefined, 'dine');
+      db = firestoreDb;
       isInitialized = true;
       console.log('✅ Firebase Admin reused (duplicate app detected)');
       return db;
     }
-    
+
   console.error('❌ Firebase initialization error:', error.message);
   console.error('Please check your Firebase environment variables');
     throw error;
@@ -70,6 +74,22 @@ function initializeFirebase() {
 
 // Initialize on module load
 db = initializeFirebase();
+
+// ── PostgreSQL adapter ──────────────────────────────────────────────────────
+// When DATABASE_URL is set, wrap the Firestore db with pgAdapter so all
+// collection reads/writes go to PostgreSQL instead of Firestore.
+// Unmapped collections fall back to Firestore automatically.
+if (process.env.DATABASE_URL) {
+  try {
+    const REGISTRY = require('./repos/collectionRegistry');
+    const { createPgDb } = require('./repos/pgAdapter');
+    db = createPgDb(REGISTRY, firestoreDb);
+    console.log('🐘 PostgreSQL adapter enabled — reads/writes routed to PG');
+  } catch (err) {
+    console.error('❌ Failed to initialize pgAdapter, staying on Firestore:', err.message);
+    // db remains as firestoreDb
+  }
+}
 
 const collections = {
   users: 'users',
@@ -183,6 +203,14 @@ function getDb() {
   return db;
 }
 
+// Get raw Firestore db (bypasses pgAdapter — use for auth/RTDB-coupled operations)
+function getFirestoreDb() {
+  if (!firestoreDb || !isInitialized) {
+    initializeFirebase();
+  }
+  return firestoreDb;
+}
+
 // Realtime Database getter (lazy init)
 let rtdb;
 function getRealtimeDb() {
@@ -199,6 +227,7 @@ module.exports = {
     return getDb();
   },
   getDb, // Export getter for lazy initialization
+  getFirestoreDb, // Raw Firestore (bypasses pgAdapter)
   getRealtimeDb,
   collections
 };

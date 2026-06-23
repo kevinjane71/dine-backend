@@ -141,6 +141,9 @@ async function update(restaurantId, updates) {
   // Remove id from updates
   delete pgRow.id;
 
+  // Remove updated_at from data — we always set it to NOW() explicitly
+  delete pgRow.updated_at;
+
   const cols = Object.keys(pgRow);
   if (cols.length === 0) return;
 

@@ -1029,7 +1029,7 @@ Respond with ONLY the intent name (e.g., GET_TABLE_STATUS). If unclear, respond 
           };
           
           const staffDoc = await db.collection('staff').add(staffData);
-          
+
           result = {
             success: true,
             response: `Staff member "${extractedData.name}" created successfully!`,
@@ -1242,7 +1242,7 @@ Respond with ONLY the intent name (e.g., GET_TABLE_STATUS). If unclear, respond 
           };
           
           const supplierDoc = await db.collection('suppliers').add(supplierData);
-          
+
           result = {
             success: true,
             response: `Supplier "${extractedData.name}" created successfully!`,
@@ -1388,7 +1388,7 @@ Respond with ONLY the intent name (e.g., GET_TABLE_STATUS). If unclear, respond 
           };
           
           const paymentDoc = await db.collection('payments').add(paymentData);
-          
+
           result = {
             success: true,
             response: `Payment of ₹${extractedData.amount} created successfully!`,

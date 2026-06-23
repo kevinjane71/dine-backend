@@ -88,6 +88,7 @@ async function updateInvoiceStatus(db, collections, invoiceId, status) {
   }
 
   await invoiceRef.update(updateData);
+
   return updateData;
 }
 

@@ -74,6 +74,7 @@ router.post('/rooms', checkHotelPermission('manage'), async (req, res) => {
       updatedAt: admin.firestore.FieldValue.serverTimestamp()
     });
 
+
     res.json({ id: roomRef.id, message: 'Room created successfully' });
   } catch (error) {
     console.error('Error creating room:', error);
@@ -92,6 +93,7 @@ router.patch('/rooms/:roomId', checkHotelPermission('manage'), async (req, res) 
       ...updateData,
       updatedAt: admin.firestore.FieldValue.serverTimestamp()
     });
+
 
     res.json({ message: 'Room updated successfully' });
   } catch (error) {
@@ -112,6 +114,7 @@ router.patch('/rooms/:roomId/status', checkHotelPermission('manage'), async (req
       updatedAt: admin.firestore.FieldValue.serverTimestamp()
     });
 
+
     res.json({ message: 'Room status updated successfully' });
   } catch (error) {
     console.error('Error updating room status:', error);
@@ -126,6 +129,7 @@ router.delete('/rooms/:roomId', checkHotelPermission('manage'), async (req, res)
     const db = admin.firestore();
 
     await db.collection('pms-rooms').doc(roomId).delete();
+
 
     res.json({ message: 'Room deleted successfully' });
   } catch (error) {
@@ -192,6 +196,7 @@ router.post('/bookings', checkHotelPermission('manage'), async (req, res) => {
       updatedAt: admin.firestore.FieldValue.serverTimestamp()
     });
 
+
     // Update room status to reserved
     if (bookingData.roomId) {
       await db.collection('pms-rooms').doc(bookingData.roomId).update({
@@ -228,6 +233,7 @@ router.post('/bookings/:bookingId/checkin', checkHotelPermission('checkin'), asy
       updatedAt: admin.firestore.FieldValue.serverTimestamp()
     });
 
+
     // Update room status to occupied
     if (booking.roomId) {
       await db.collection('pms-rooms').doc(booking.roomId).update({
@@ -263,6 +269,7 @@ router.post('/bookings/:bookingId/checkout', checkHotelPermission('checkin'), as
       updatedAt: admin.firestore.FieldValue.serverTimestamp()
     });
 
+
     // Update room status to cleaning
     if (booking.roomId) {
       await db.collection('pms-rooms').doc(booking.roomId).update({
@@ -290,6 +297,7 @@ router.patch('/bookings/:bookingId', checkHotelPermission('manage'), async (req,
       ...updateData,
       updatedAt: admin.firestore.FieldValue.serverTimestamp()
     });
+
 
     res.json({ message: 'Booking updated successfully' });
   } catch (error) {
@@ -319,6 +327,7 @@ router.delete('/bookings/:bookingId', checkHotelPermission('manage'), async (req
       cancelledAt: admin.firestore.FieldValue.serverTimestamp(),
       updatedAt: admin.firestore.FieldValue.serverTimestamp()
     });
+
 
     // Update room status back to available if it was reserved
     if (booking.roomId && booking.status === 'confirmed') {
@@ -375,6 +384,7 @@ router.post('/guests', checkHotelPermission('manage'), async (req, res) => {
       updatedAt: admin.firestore.FieldValue.serverTimestamp()
     });
 
+
     res.json({ id: guestRef.id, message: 'Guest created successfully' });
   } catch (error) {
     console.error('Error creating guest:', error);
@@ -393,6 +403,7 @@ router.patch('/guests/:guestId', checkHotelPermission('manage'), async (req, res
       ...updateData,
       updatedAt: admin.firestore.FieldValue.serverTimestamp()
     });
+
 
     res.json({ message: 'Guest updated successfully' });
   } catch (error) {
@@ -439,6 +450,7 @@ router.delete('/guests/:guestId', checkHotelPermission('manage'), async (req, re
     const db = admin.firestore();
 
     await db.collection('pms-guests').doc(guestId).delete();
+
 
     res.json({ message: 'Guest deleted successfully' });
   } catch (error) {
@@ -487,6 +499,7 @@ router.post('/housekeeping/tasks', checkHotelPermission('housekeeping'), async (
       updatedAt: admin.firestore.FieldValue.serverTimestamp()
     });
 
+
     res.json({ id: taskRef.id, message: 'Task created successfully' });
   } catch (error) {
     console.error('Error creating housekeeping task:', error);
@@ -506,6 +519,7 @@ router.patch('/housekeeping/tasks/:taskId', checkHotelPermission('housekeeping')
       updatedAt: admin.firestore.FieldValue.serverTimestamp()
     });
 
+
     res.json({ message: 'Task updated successfully' });
   } catch (error) {
     console.error('Error updating housekeeping task:', error);
@@ -520,6 +534,7 @@ router.delete('/housekeeping/tasks/:taskId', checkHotelPermission('housekeeping'
     const db = admin.firestore();
 
     await db.collection('pms-housekeeping').doc(taskId).delete();
+
 
     res.json({ message: 'Task deleted successfully' });
   } catch (error) {
@@ -568,6 +583,7 @@ router.post('/maintenance/requests', checkHotelPermission('manage'), async (req,
       updatedAt: admin.firestore.FieldValue.serverTimestamp()
     });
 
+
     res.json({ id: requestRef.id, message: 'Maintenance request created successfully' });
   } catch (error) {
     console.error('Error creating maintenance request:', error);
@@ -587,6 +603,7 @@ router.patch('/maintenance/requests/:requestId', checkHotelPermission('manage'),
       updatedAt: admin.firestore.FieldValue.serverTimestamp()
     });
 
+
     res.json({ message: 'Request updated successfully' });
   } catch (error) {
     console.error('Error updating maintenance request:', error);
@@ -601,6 +618,7 @@ router.delete('/maintenance/requests/:requestId', checkHotelPermission('manage')
     const db = admin.firestore();
 
     await db.collection('pms-maintenance').doc(requestId).delete();
+
 
     res.json({ message: 'Request deleted successfully' });
   } catch (error) {

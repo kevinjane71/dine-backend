@@ -929,22 +929,28 @@ class DineAIToolExecutor {
 
       // Generate order number and daily order ID (same as real API)
       const orderNumber = `ORD-${Date.now()}-${Math.random().toString(36).substr(2, 4).toUpperCase()}`;
-      const todayStr = new Date().toISOString().split('T')[0];
-      const counterRef = db.collection('daily_order_counters').doc(`${restaurantId}_${todayStr}`);
-      const counterDoc = await counterRef.get();
       let dailyOrderId = 1;
 
-      if (counterDoc.exists) {
-        dailyOrderId = counterDoc.data().lastOrderId + 1;
-        await counterRef.update({ lastOrderId: dailyOrderId, updatedAt: new Date() });
+      // PG-first counter (atomic, no race conditions)
+      const counterRepo = process.env.DATABASE_URL ? require('../../repos/counterRepo') : null;
+      if (counterRepo) {
+        dailyOrderId = await counterRepo.generateDailyOrderId(restaurantId);
       } else {
-        await counterRef.set({
-          restaurantId,
-          date: todayStr,
-          lastOrderId: 1,
-          createdAt: new Date(),
-          updatedAt: new Date()
-        });
+        const todayStr = new Date().toISOString().split('T')[0];
+        const counterRef = db.collection('daily_order_counters').doc(`${restaurantId}_${todayStr}`);
+        const counterDoc = await counterRef.get();
+        if (counterDoc.exists) {
+          dailyOrderId = counterDoc.data().lastOrderId + 1;
+          await counterRef.update({ lastOrderId: dailyOrderId, updatedAt: new Date() });
+        } else {
+          await counterRef.set({
+            restaurantId,
+            date: todayStr,
+            lastOrderId: 1,
+            createdAt: new Date(),
+            updatedAt: new Date()
+          });
+        }
       }
 
       console.log(`🍽️ Generated Order ID: ${dailyOrderId}, Number: ${orderNumber}`);

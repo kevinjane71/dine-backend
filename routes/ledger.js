@@ -3,6 +3,7 @@ const router = express.Router();
 const { db } = require('../firebase');
 const { authenticateToken } = require('../middleware/auth');
 
+
 router.use(authenticateToken);
 
 // Default chart of accounts for restaurants
@@ -65,6 +66,7 @@ router.get('/:restaurantId/accounts', async (req, res) => {
         .where('restaurantId', '==', restaurantId)
         .orderBy('code', 'asc')
         .get();
+
     }
 
     const accounts = snap.docs.map(d => ({ id: d.id, ...d.data() }));

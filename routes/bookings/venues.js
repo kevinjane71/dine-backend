@@ -56,6 +56,7 @@ module.exports = function(db, collections, authenticateToken, checkFeaturePermis
       };
 
       const ref = await db.collection(collections.bookingVenues).add(venueData);
+
       res.status(201).json({ success: true, venue: { id: ref.id, ...venueData } });
     } catch (error) {
       console.error('Create venue error:', error);
@@ -106,6 +107,7 @@ module.exports = function(db, collections, authenticateToken, checkFeaturePermis
       if (doc.data().restaurantId !== restaurantId) return res.status(403).json({ error: 'Access denied' });
 
       await db.collection(collections.bookingVenues).doc(venueId).delete();
+
       res.json({ success: true });
     } catch (error) {
       console.error('Delete venue error:', error);

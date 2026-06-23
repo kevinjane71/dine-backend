@@ -25,7 +25,7 @@ async function getNextNumber(db, collections, orgId, type) {
   const docId = `${orgId}_${type}`;
   const seqRef = db.collection(collections.invNumberSequences).doc(docId);
 
-  const result = await db.runTransaction(async (transaction) => {
+  const { formatted, seqPrefix, seqNumber } = await db.runTransaction(async (transaction) => {
     const seqDoc = await transaction.get(seqRef);
 
     let currentNumber;
@@ -67,7 +67,7 @@ async function getNextNumber(db, collections, orgId, type) {
         updatedAt: FieldValue.serverTimestamp()
       });
 
-      return `${prefix}${String(currentNumber).padStart(6, '0')}`;
+      return { formatted: `${prefix}${String(currentNumber).padStart(6, '0')}`, seqPrefix: prefix, seqNumber: currentNumber };
     } else {
       const data = seqDoc.data();
       currentNumber = (data.currentNumber || 0) + 1;
@@ -78,11 +78,11 @@ async function getNextNumber(db, collections, orgId, type) {
         updatedAt: FieldValue.serverTimestamp()
       });
 
-      return `${prefix}${String(currentNumber).padStart(6, '0')}`;
+      return { formatted: `${prefix}${String(currentNumber).padStart(6, '0')}`, seqPrefix: prefix, seqNumber: currentNumber };
     }
   });
 
-  return result;
+  return formatted;
 }
 
 module.exports = { getNextNumber };

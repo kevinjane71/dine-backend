@@ -204,6 +204,7 @@ router.post('/shifts/:restaurantId/bulk', authenticateToken, requireOwnerRole, a
     }
 
     await batch.commit();
+
     res.json({ success: true, shifts: createdShifts, count: createdShifts.length });
   } catch (error) {
     console.error('Error bulk creating shifts:', error);
@@ -601,9 +602,9 @@ Return a JSON array of shifts in this exact format (suitable for drag-and-drop c
 
     await batch.commit();
 
-    res.json({ 
-      success: true, 
-      shifts: savedShifts, 
+    res.json({
+      success: true,
+      shifts: savedShifts,
       count: savedShifts.length,
       message: `Generated ${savedShifts.length} shifts successfully`,
       shiftGroups: groupShiftsByShiftId(savedShifts) // Group by shift_id for calendar display

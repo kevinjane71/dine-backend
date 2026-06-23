@@ -10,6 +10,7 @@ const { authenticateToken, requireOwnerRole } = require('../middleware/auth');
 const { getDb, collections } = require('../firebase');
 const { getCachedRestDoc } = require('../utils/kvCache');
 
+
 // ==================== Setup Endpoints (Authenticated) ====================
 
 /**
@@ -227,11 +228,12 @@ router.post('/bolna/connect-provider', authenticateToken, async (req, res) => {
         if (!currentProviders.includes(provider)) {
           currentProviders.push(provider);
         }
-        await agentRef.update({
+        const connectUpdateData = {
           connectedProviders: currentProviders,
           preferredProvider: provider,
           updatedAt: require('firebase-admin/firestore').FieldValue.serverTimestamp()
-        });
+        };
+        await agentRef.update(connectUpdateData);
       }
     }
 

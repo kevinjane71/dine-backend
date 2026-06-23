@@ -89,13 +89,14 @@ router.post('/webhooks/talabat/order', async (req, res) => {
     }
 
     // Log webhook for debugging
-    await db.collection('aggregatorWebhookLogs').add({
+    const webhookLogData = {
       platform: 'talabat',
       restaurantId,
       eventType,
       payload: JSON.stringify(payload).substring(0, 5000), // Cap at 5KB
       receivedAt: new Date(),
-    });
+    };
+    await db.collection('aggregatorWebhookLogs').add(webhookLogData);
 
     return res.status(200).json({ received: true });
   } catch (err) {

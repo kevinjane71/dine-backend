@@ -128,18 +128,8 @@ const { db, collections } = require('./firebase');
 const { FieldValue } = require('firebase-admin/firestore');
 const performanceOptimizer = require('./middleware/performanceOptimizer');
 
-// PostgreSQL repos — only active when DATABASE_URL is set
-const usePg = !!process.env.DATABASE_URL;
-const ordersRepo = usePg ? require('./repos/ordersRepo') : null;
-const dailyStatsRepo = usePg ? require('./repos/dailyStatsRepo') : null;
-const floorsTablesRepo = usePg ? require('./repos/floorsTablesRepo') : null;
-const restaurantsRepo = usePg ? require('./repos/restaurantsRepo') : null;
-const inventoryRepo = usePg ? require('./repos/inventoryRepo') : null;
-const inventoryTransactionsRepo = usePg ? require('./repos/inventoryTransactionsRepo') : null;
-const stockBatchesRepo = usePg ? require('./repos/stockBatchesRepo') : null;
-const wasteEntriesRepo = usePg ? require('./repos/wasteEntriesRepo') : null;
-const recipesRepo = usePg ? require('./repos/recipesRepo') : null;
-if (usePg) console.log('✅ PostgreSQL repos enabled (DATABASE_URL set): orders, dailyStats, floors/tables, restaurants, inventory');
+// PostgreSQL counter repo — used for PG-first atomic counter operations
+const counterRepo = require('./repos/counterRepo');
 const firestoreOptimizer = require('./utils/firestoreOptimizer');
 const { kvGet, kvSet, kvDel, getCachedRestaurant, invalidateRestaurantCache, invalidateUserCache } = require('./utils/kvCache');
 
@@ -366,72 +356,6 @@ function updateDailyStats(restaurantId, order, operation, tzOffset, dayStartHour
         .catch(err => console.error('sub-restaurant dailyStats error (non-blocking):', err));
     }
 
-    // Dual-write to PostgreSQL (fire-and-forget)
-    if (usePg) {
-      // Build payment methods object with raw values
-      const pgPaymentMethods = {};
-      if (ps === 'due') {
-        const dueFullAmount = (order.finalAmount || order.totalAmount || 0) * sign;
-        pgPaymentMethods.due = { transactions: sign, amount: dueFullAmount };
-      } else if (ps === 'partial' && order.paidAmount != null) {
-        const paidAmt = Number(order.paidAmount) || 0;
-        const dueAmt = Math.max(0, (order.finalAmount || order.totalAmount || 0) - paidAmt);
-        pgPaymentMethods[pm] = { transactions: sign, amount: paidAmt * sign };
-        if (dueAmt > 0) pgPaymentMethods.due = { transactions: 0, amount: dueAmt * sign };
-      } else {
-        pgPaymentMethods[pm] = { transactions: sign, amount: amountWithTax };
-      }
-
-      // Build item counts and category breakdown with raw values
-      const pgItemCounts = {};
-      const pgCategoryBreakdown = {};
-      if (order.items && Array.isArray(order.items)) {
-        order.items.forEach(item => {
-          const baseName = item.name || item.itemName;
-          if (baseName) {
-            const name = item.selectedVariant?.name ? `${baseName} (${item.selectedVariant.name})` : baseName;
-            const key = name.replace(/[.\/]/g, '_');
-            if (!pgItemCounts[key]) pgItemCounts[key] = { qty: 0, revenue: 0 };
-            pgItemCounts[key].qty += (item.quantity || 1) * sign;
-            pgItemCounts[key].revenue += ((item.price || 0) * (item.quantity || 1)) * sign;
-          }
-          const cat = (item.category || 'Uncategorized').replace(/[.\/]/g, '_');
-          if (!pgCategoryBreakdown[cat]) pgCategoryBreakdown[cat] = { itemsSold: 0, revenue: 0 };
-          pgCategoryBreakdown[cat].itemsSold += (item.quantity || 1) * sign;
-          pgCategoryBreakdown[cat].revenue += ((item.price || 0) * (item.quantity || 1)) * sign;
-        });
-      }
-
-      const pgIncrements = {
-        restaurantId, date: dateStr,
-        totalOrders: sign,
-        totalRevenue: amount,
-        totalRevenueWithTax: amountWithTax,
-        totalDueAmount: effective.dueAmount > 0 ? effective.dueAmount * sign : 0,
-        totalTax: (order.taxAmount || 0) * sign,
-        totalDiscounts: (order.discountAmount || 0) * sign,
-        totalRefunds: (order.refundAmount || 0) * sign,
-        paymentMethods: pgPaymentMethods,
-        orderTypes: { [orderType]: { count: sign, revenue: fullAmount } },
-        hourBucket: `hour_${hour.toString().padStart(2, '0')}`,
-        customerIds: customerId && operation === 'add' ? [customerId] : [],
-        itemCounts: pgItemCounts,
-        categoryBreakdown: pgCategoryBreakdown,
-      };
-
-      dailyStatsRepo.atomicUpsert(docId, pgIncrements)
-        .catch(err => console.error('⚠️ PG dual-write error (dailyStats):', err.message));
-
-      // Sub-restaurant PG upsert
-      if (order.subRestaurantId) {
-        const subDocId = `${restaurantId}_sub_${order.subRestaurantId}_${dateStr}`;
-        dailyStatsRepo.atomicUpsert(subDocId, {
-          ...pgIncrements,
-          subRestaurantId: order.subRestaurantId,
-          subRestaurantName: order.subRestaurantName || null,
-        }).catch(err => console.error('⚠️ PG dual-write error (sub dailyStats):', err.message));
-      }
-    }
   } catch (err) {
     console.error('dailyStats helper error (non-blocking):', err);
   }
@@ -474,18 +398,6 @@ function updateDailyStatsRevenueDiff(restaurantId, order, oldAmount, newAmount, 
         .catch(err => console.error('sub-restaurant dailyStats revenueDiff error (non-blocking):', err));
     }
 
-    // Dual-write to PostgreSQL (fire-and-forget)
-    if (usePg) {
-      dailyStatsRepo.upsertRevenueDiff(docId, restaurantId, dateStr, diff, diffWithTax, null, null)
-        .catch(err => console.error('⚠️ PG dual-write error (dailyStats revenueDiff):', err.message));
-
-      if (order.subRestaurantId) {
-        const subDocId = `${restaurantId}_sub_${order.subRestaurantId}_${dateStr}`;
-        dailyStatsRepo.upsertRevenueDiff(subDocId, restaurantId, dateStr, diff, diffWithTax,
-          order.subRestaurantId, order.subRestaurantName || null)
-          .catch(err => console.error('⚠️ PG dual-write error (sub dailyStats revenueDiff):', err.message));
-      }
-    }
   } catch (err) {
     console.error('dailyStats revenueDiff helper error (non-blocking):', err);
   }
@@ -1064,38 +976,10 @@ function resolveTablePricingRule(floorName, multiPricing) {
   return null;
 }
 
-// Generate daily order ID (starts from 1 each day)
+// Generate daily order ID (starts from 1 each day) — PG atomic upsert
 async function generateDailyOrderId(restaurantId) {
   try {
-    const today = new Date();
-    const todayStr = today.toISOString().split('T')[0]; // YYYY-MM-DD format
-    
-    // Get or create daily counter document
-    const counterRef = db.collection('daily_order_counters').doc(`${restaurantId}_${todayStr}`);
-    const counterDoc = await counterRef.get();
-    
-    if (!counterDoc.exists) {
-      // First order of the day - start from 1
-      await counterRef.set({
-        restaurantId,
-        date: todayStr,
-        lastOrderId: 1,
-        createdAt: new Date(),
-        updatedAt: new Date()
-      });
-      return 1;
-    } else {
-      // Increment the counter
-      const counterData = counterDoc.data();
-      const newOrderId = counterData.lastOrderId + 1;
-      
-      await counterRef.update({
-        lastOrderId: newOrderId,
-        updatedAt: new Date()
-      });
-      
-      return newOrderId;
-    }
+    return await counterRepo.generateDailyOrderId(restaurantId);
   } catch (error) {
     console.error('Error generating daily order ID:', error);
     // Fallback to timestamp-based ID
@@ -1103,21 +987,10 @@ async function generateDailyOrderId(restaurantId) {
   }
 }
 
-// Generate sequential order ID (never resets; increments forever per restaurant). Uses transaction to avoid race conditions.
+// Generate sequential order ID (never resets; increments forever per restaurant) — PG atomic upsert
 async function generateSequentialOrderId(restaurantId) {
   try {
-    const counterRef = db.collection('order_id_counters').doc(restaurantId);
-    const result = await db.runTransaction(async (transaction) => {
-      const snap = await transaction.get(counterRef);
-      const nextId = snap.exists ? ((snap.data().lastOrderId || 0) + 1) : 1;
-      transaction.set(counterRef, {
-        restaurantId,
-        lastOrderId: nextId,
-        updatedAt: new Date()
-      }, { merge: true });
-      return nextId;
-    });
-    return result;
+    return await counterRepo.generateSequentialOrderId(restaurantId);
   } catch (error) {
     console.error('Error generating sequential order ID:', error);
     return Date.now() % 100000;
@@ -1138,28 +1011,10 @@ async function getNextOrderId(restaurantId, restaurantDataOrNull) {
   return await generateDailyOrderId(restaurantId);
 }
 
-// Generate next tab number for bar tabs (daily reset, atomic via transaction)
+// Generate next tab number for bar tabs (daily reset) — PG atomic upsert
 async function getNextTabNumber(restaurantId) {
   try {
-    const today = new Date().toISOString().split('T')[0]; // YYYY-MM-DD
-    const counterRef = db.collection('tab_counters').doc(restaurantId);
-    const result = await db.runTransaction(async (transaction) => {
-      const snap = await transaction.get(counterRef);
-      let nextNum = 1;
-      if (snap.exists) {
-        const data = snap.data();
-        // Reset if new day, otherwise increment
-        nextNum = (data.date === today) ? (data.lastTabNumber + 1) : 1;
-      }
-      transaction.set(counterRef, {
-        restaurantId,
-        date: today,
-        lastTabNumber: nextNum,
-        updatedAt: new Date()
-      });
-      return nextNum;
-    });
-    return result;
+    return await counterRepo.getNextTabNumber(restaurantId);
   } catch (error) {
     console.error('Error generating tab number:', error);
     return Date.now() % 1000; // fallback
@@ -3479,7 +3334,6 @@ app.post('/api/demo-request', async (req, res) => {
     };
 
     await demoRequestRef.set(demoRequestData);
-
     console.log('✅ Demo request saved:', demoRequestData.id);
 
     // Send email notification to admin
@@ -3869,7 +3723,7 @@ app.post('/api/auth/email/send-otp', async (req, res) => {
     // For registration, also store in temp if user doesn't exist
     if (purpose === 'linking' || existingUserQuery.empty) {
       // Store in temporary collection
-      await db.collection('email_otp_temp').add({
+      const emailOtpRef = await db.collection('email_otp_temp').add({
         email: normalizedEmail,
         otp: emailOTP,
         otpExpiry: emailOTPExpiry,
@@ -5080,8 +4934,7 @@ app.post('/api/auth/phone/send-otp', async (req, res) => {
       createdAt: new Date()
     };
 
-    await db.collection('otp_verification').add(otpRecord);
-
+    const otpRef = await db.collection('otp_verification').add(otpRecord);
     const smsSent = await sendOTP(phone, otp);
 
     if (!smsSent) {
@@ -6533,13 +6386,6 @@ app.post('/api/restaurants', authenticateToken, async (req, res) => {
     const frontendUrl = process.env.FRONTEND_URL || 'https://www.dineopen.com';
     const qrData = `${frontendUrl}/${urlSlug}`;
     await restaurantRef.update({ qrData });
-
-    // PG dual-write: create restaurant
-    if (restaurantsRepo) {
-      restaurantsRepo.create(restaurantRef.id, { ...restaurantData, subdomain: finalSubdomain, urlSlug, qrData })
-        .catch(err => console.error('PG create restaurant error:', err.message));
-    }
-
     res.status(201).json({
       message: 'Restaurant created successfully',
       restaurant: {
@@ -6661,13 +6507,6 @@ app.patch('/api/restaurants/:restaurantId', authenticateToken, async (req, res) 
 
     await db.collection(collections.restaurants).doc(restaurantId).update(updateData);
     invalidateRestaurantCache(restaurantId);
-
-    // PG dual-write: update restaurant
-    if (restaurantsRepo) {
-      restaurantsRepo.update(restaurantId, updateData)
-        .catch(err => console.error('PG update restaurant error:', err.message));
-    }
-
     res.json({ message: 'Restaurant updated successfully', updatedFields: Object.keys(updateData) });
 
   } catch (error) {
@@ -6690,13 +6529,6 @@ app.delete('/api/restaurants/:restaurantId', authenticateToken, async (req, res)
 
     // TODO: Also delete associated staff, menus, orders etc.
     await db.collection(collections.restaurants).doc(restaurantId).delete();
-
-    // PG dual-write: delete restaurant
-    if (restaurantsRepo) {
-      restaurantsRepo.remove(restaurantId)
-        .catch(err => console.error('PG delete restaurant error:', err.message));
-    }
-
     res.json({ message: 'Restaurant deleted successfully' });
 
   } catch (error) {
@@ -8313,7 +8145,7 @@ app.delete('/api/menus/:restaurantId/bulk-delete', authenticateToken, async (req
       }
     }
 
-    await db.collection('menuBulkDeleteLogs').add({
+    const bulkDeleteLogData = {
       restaurantId,
       restaurantName: restaurantData.name || '',
       deletedBy: userId,
@@ -8323,8 +8155,8 @@ app.delete('/api/menus/:restaurantId/bulk-delete', authenticateToken, async (req
       reason: typeof reason === 'string' ? reason.substring(0, 1000) : '',
       deletedCount: activeItemsCount,
       deletedAt: deletedTimestamp,
-    });
-
+    };
+    const bulkDeleteLogRef = await db.collection('menuBulkDeleteLogs').add(bulkDeleteLogData);
     console.log(`✅ Bulk deleted ${activeItemsCount} menu items for restaurant ${restaurantId} | Reason: ${reason || 'N/A'}`);
 
     res.json({
@@ -8510,7 +8342,7 @@ app.post('/api/public/orders/:restaurantId', vercelSecurityMiddleware.publicAPI,
     let existingCustomer = null;
     let customerData = null;
     let isFirstOrder = false;
-
+    if (!customerId) {
     // Step 1: Try exact Firestore match (fast, indexed)
     const customerQuery = await db.collection('customers')
       .where('restaurantId', '==', restaurantId)
@@ -8583,7 +8415,6 @@ app.post('/api/public/orders/:restaurantId', vercelSecurityMiddleware.publicAPI,
       }
 
       await existingCustomer.ref.update(updateData);
-    } else {
       // Create new customer
       isFirstOrder = true;
       console.log(`🆕 Creating new customer for public order with phone: ${customerPhone}, name: ${customerName}`);
@@ -8606,6 +8437,7 @@ app.post('/api/public/orders/:restaurantId', vercelSecurityMiddleware.publicAPI,
       const customerRef = await db.collection('customers').add(customerData);
       customerId = customerRef.id;
       console.log(`✅ New customer created for public order: ${customerRef.id} with phone: ${customerPhone}`);
+    }
     }
 
     // Validate menu items and calculate subtotal
@@ -9280,157 +9112,105 @@ app.post('/api/orders', async (req, res) => {
         let tableFound = false;
         let tableStatus = null;
 
-        if (floorsTablesRepo) {
-          // PG path: single query lookups
-          let pgTable = null;
-          if (floorId && tableId) {
-            pgTable = await floorsTablesRepo.findTableDirect(restaurantId, floorId, tableId);
-          }
-          if (!pgTable) {
-            pgTable = await floorsTablesRepo.findTableByName(restaurantId, tableNumber);
-          }
-          if (pgTable) {
-            tableFound = true;
-            tableStatus = pgTable.status;
-            tableId_resolved = pgTable.id;
-            tableFloorId_resolved = pgTable.floorId;
-            tableFloor = pgTable.floor || floorName || null;
-            tableSection = pgTable.section || null;
-            // Fetch floor data for area charge
-            const pgFloor = await floorsTablesRepo.getFloorById(pgTable.floorId, restaurantId);
-            tableFloorData = pgFloor || {};
-            console.log('🪑 PG table lookup:', { id: tableId_resolved, number: tableNumber, status: tableStatus, floor: tableFloor });
-          }
-        } else {
-          // Firestore path
-          const floorsSnapshot = await db.collection('restaurants')
-            .doc(restaurantId).collection('floors').get();
+        // Fetch floors and find table
+        const floorsSnapshot = await db.collection('restaurants')
+          .doc(restaurantId).collection('floors').get();
 
-          console.log('🪑 Found floors:', floorsSnapshot.size);
+        console.log('🪑 Found floors:', floorsSnapshot.size);
 
-          // FAST PATH: If floorId + tableId provided, fetch the exact table directly
-          if (floorId && tableId) {
-            try {
-              const directTableRef = db.collection('restaurants').doc(restaurantId)
-                .collection('floors').doc(floorId).collection('tables').doc(tableId);
-              const directTableDoc = await directTableRef.get();
-              if (directTableDoc.exists) {
-                const td = directTableDoc.data();
-                tableFound = true;
-                tableStatus = td.status;
-                tableId_resolved = directTableDoc.id;
-                tableFloorId_resolved = floorId;
-                const floorDoc = await db.collection('restaurants').doc(restaurantId).collection('floors').doc(floorId).get();
-                const floorData = floorDoc.exists ? floorDoc.data() : {};
-                tableFloor = floorData.name || floorName || null;
-                tableSection = td.section || floorData.section || null;
-                tableFloorData = floorData;
-                console.log('🪑 Direct table lookup:', { id: tableId_resolved, number: tableNumber, status: tableStatus, floor: tableFloor });
-              }
-            } catch (directErr) {
-              console.warn('🪑 Direct table lookup failed, falling back to iteration:', directErr.message);
+        // FAST PATH: If floorId + tableId provided, fetch the exact table directly
+        if (floorId && tableId) {
+          try {
+            const directTableRef = db.collection('restaurants').doc(restaurantId)
+              .collection('floors').doc(floorId).collection('tables').doc(tableId);
+            const directTableDoc = await directTableRef.get();
+            if (directTableDoc.exists) {
+              const td = directTableDoc.data();
+              tableFound = true;
+              tableStatus = td.status;
+              tableId_resolved = directTableDoc.id;
+              tableFloorId_resolved = floorId;
+              const floorDoc = await db.collection('restaurants').doc(restaurantId).collection('floors').doc(floorId).get();
+              const floorData = floorDoc.exists ? floorDoc.data() : {};
+              tableFloor = floorData.name || floorName || null;
+              tableSection = td.section || floorData.section || null;
+              tableFloorData = floorData;
+              console.log('🪑 Direct table lookup:', { id: tableId_resolved, number: tableNumber, status: tableStatus, floor: tableFloor });
             }
-          }
-
-          // FALLBACK: Search for the table across all floors (backwards compat)
-          if (!tableFound) for (const floorDoc of floorsSnapshot.docs) {
-            const floorData = floorDoc.data();
-
-            const tablesSnapshot = await db.collection('restaurants')
-              .doc(restaurantId).collection('floors')
-              .doc(floorDoc.id).collection('tables').get();
-
-            for (const tableDoc of tablesSnapshot.docs) {
-              const tableData = tableDoc.data();
-
-              if (tableData.name && tableData.name.toString().toLowerCase() === tableNumber.trim().toLowerCase()) {
-                tableFound = true;
-                tableStatus = tableData.status;
-                tableId_resolved = tableDoc.id;
-                tableFloorId_resolved = floorDoc.id;
-                tableFloor = floorData.name;
-                tableSection = tableData.section || floorData.section || null;
-                tableFloorData = floorData;
-                console.log('🪑 Found table:', { id: tableId_resolved, number: tableNumber, status: tableStatus, floor: tableFloor, section: tableSection });
-                break;
-              }
-            }
-
-            if (tableFound) break;
+          } catch (directErr) {
+            console.warn('🪑 Direct table lookup failed, falling back to iteration:', directErr.message);
           }
         }
-        
+
+        // FALLBACK: Search for the table across all floors (backwards compat)
+        if (!tableFound) for (const floorDoc of floorsSnapshot.docs) {
+          const floorData = floorDoc.data();
+
+          const tablesSnapshot = await db.collection('restaurants')
+            .doc(restaurantId).collection('floors')
+            .doc(floorDoc.id).collection('tables').get();
+
+          for (const tableDoc of tablesSnapshot.docs) {
+            const tableData = tableDoc.data();
+
+            if (tableData.name && tableData.name.toString().toLowerCase() === tableNumber.trim().toLowerCase()) {
+              tableFound = true;
+              tableStatus = tableData.status;
+              tableId_resolved = tableDoc.id;
+              tableFloorId_resolved = floorDoc.id;
+              tableFloor = floorData.name;
+              tableSection = tableData.section || floorData.section || null;
+              tableFloorData = floorData;
+              console.log('🪑 Found table:', { id: tableId_resolved, number: tableNumber, status: tableStatus, floor: tableFloor, section: tableSection });
+              break;
+            }
+          }
+
+          if (tableFound) break;
+        }
+
         if (!tableFound) {
           console.log('❌ Table not found:', tableNumber);
-          return res.status(400).json({ 
-            error: `Table "${tableNumber}" not found in this restaurant. Please check the table number.` 
+          return res.status(400).json({
+            error: `Table "${tableNumber}" not found in this restaurant. Please check the table number.`
           });
         }
-        
+
         // Check table availability - only allow "available" status
         // Skip this check for offline sync requests (they were already placed locally)
         const isOfflineSync = req.headers['x-sync-source'] === 'offline';
 
         // Use atomic check + claim to prevent race conditions
         if (tableId_resolved && tableFloorId_resolved && !isOfflineSync) {
-          if (floorsTablesRepo) {
-            // PG atomic claim: UPDATE...WHERE status='available' RETURNING *
-            const claimed = await floorsTablesRepo.claimTable(restaurantId, tableFloorId_resolved, tableId_resolved, null);
-            if (!claimed) {
-              // Table not available — check current status for error message
-              const currentTable = await floorsTablesRepo.findTableById(restaurantId, tableId_resolved);
-              const currentStatus = currentTable ? currentTable.status : 'unknown';
-              const statusMessages = {
-                'occupied': 'is currently occupied by another customer',
-                'serving': 'is currently being served',
-                'out-of-service': 'is out of service and cannot be used',
-                'reserved': 'is reserved for another customer',
-                'maintenance': 'is under maintenance',
-              };
-              return res.status(400).json({
-                error: `Table "${tableNumber}" ${statusMessages[currentStatus] || `has status "${currentStatus}" and cannot be used`}. Please choose another table.`
-              });
-            }
-            console.log('✅ Table atomically claimed (PG):', { tableNumber, status: 'occupied' });
-            // Also update Firestore for dual-write
-            db.collection('restaurants').doc(restaurantId)
-              .collection('floors').doc(tableFloorId_resolved)
-              .collection('tables').doc(tableId_resolved)
-              .update({ status: 'occupied', lastOrderTime: new Date(), updatedAt: new Date() })
-              .catch(err => console.error('Firestore table claim sync error:', err.message));
-          } else {
-            // Firestore transaction path
-            const tableRef = db.collection('restaurants').doc(restaurantId)
-              .collection('floors').doc(tableFloorId_resolved)
-              .collection('tables').doc(tableId_resolved);
-            try {
-              await db.runTransaction(async (transaction) => {
-                const tableSnap = await transaction.get(tableRef);
-                const currentStatus = tableSnap.exists ? tableSnap.data().status : 'available';
-                if (currentStatus !== 'available') {
-                  const statusMessages = {
-                    'occupied': 'is currently occupied by another customer',
-                    'serving': 'is currently being served',
-                    'out-of-service': 'is out of service and cannot be used',
-                    'reserved': 'is reserved for another customer',
-                    'maintenance': 'is under maintenance',
-                  };
-                  throw new Error(`TABLE_UNAVAILABLE:Table "${tableNumber}" ${statusMessages[currentStatus] || `has status "${currentStatus}" and cannot be used`}. Please choose another table.`);
-                }
-                transaction.update(tableRef, {
-                  status: 'occupied',
-                  lastOrderTime: new Date(),
-                  updatedAt: new Date()
-                });
-              });
-              console.log('✅ Table atomically claimed:', { tableNumber, status: 'occupied' });
-            } catch (txError) {
-              if (txError.message && txError.message.startsWith('TABLE_UNAVAILABLE:')) {
-                console.log('❌ Table not available (atomic check):', { table: tableNumber });
-                return res.status(400).json({ error: txError.message.replace('TABLE_UNAVAILABLE:', '') });
+          const tableRef = db.collection('restaurants').doc(restaurantId)
+            .collection('floors').doc(tableFloorId_resolved)
+            .collection('tables').doc(tableId_resolved);
+          try {
+            await db.runTransaction(async (transaction) => {
+              const tableSnap = await transaction.get(tableRef);
+              const currentStatus = tableSnap.exists ? tableSnap.data().status : 'available';
+              if (currentStatus !== 'available') {
+                const statusMessages = {
+                  'occupied': 'is currently occupied by another customer',
+                  'serving': 'is currently being served',
+                  'out-of-service': 'is out of service and cannot be used',
+                  'reserved': 'is reserved for another customer',
+                  'maintenance': 'is under maintenance',
+                };
+                throw new Error(`TABLE_UNAVAILABLE:Table "${tableNumber}" ${statusMessages[currentStatus] || `has status "${currentStatus}" and cannot be used`}. Please choose another table.`);
               }
-              throw txError;
+              transaction.update(tableRef, {
+                status: 'occupied',
+                lastOrderTime: new Date(),
+                updatedAt: new Date()
+              });
+            });
+            console.log('✅ Table atomically claimed:', { tableNumber, status: 'occupied' });
+          } catch (claimErr) {
+            if (claimErr.message && claimErr.message.startsWith('TABLE_UNAVAILABLE:')) {
+              return res.status(400).json({ error: claimErr.message.replace('TABLE_UNAVAILABLE:', '') });
             }
+            throw claimErr;
           }
         } else if (!isOfflineSync && tableStatus !== 'available') {
           let statusMessage = '';
@@ -10112,10 +9892,11 @@ app.post('/api/orders', async (req, res) => {
           .limit(1).get();
         if (existingStaff.empty) {
           const staffRef = db.collection('staffUsers').doc();
-          await staffRef.set({
+          const autoStaffData = {
             name: assignedStaff.name, restaurantId, role: 'waiter',
             status: 'active', createdAt: new Date().toISOString(),
-          });
+          };
+          await staffRef.set(autoStaffData);
           orderData.assignedStaff = { name: assignedStaff.name, id: staffRef.id };
         } else {
           orderData.assignedStaff = { name: assignedStaff.name, id: existingStaff.docs[0].id };
@@ -10209,13 +9990,6 @@ app.post('/api/orders', async (req, res) => {
     console.log('🛒 Creating order in database...');
     const orderRef = await db.collection(collections.orders).add(orderData);
     console.log('🛒 Backend Order Creation - Order saved to DB with ID:', orderRef.id);
-
-    // Dual-write to PostgreSQL (fire-and-forget, non-blocking)
-    if (usePg) {
-      ordersRepo.create(orderRef.id, orderData).catch(pgErr => {
-        console.error('⚠️ PG dual-write error (create):', pgErr.message);
-      });
-    }
 
     // Store idempotency key for deduplication (use key as doc ID for atomic uniqueness)
     // Update idempotency key with the actual orderId (key was reserved atomically before creation)
@@ -10484,16 +10258,17 @@ app.post('/api/orders', async (req, res) => {
       const creditFinalAmount = orderData.finalAmount || finalAmount;
       const outstanding = Math.round((creditFinalAmount - Number(req.body.partialPayAmount)) * 100) / 100;
       if (outstanding > 0) {
+        const creditEntry = {
+          orderId: orderRef.id,
+          orderNumber: orderNumber,
+          date: new Date().toISOString(),
+          totalAmount: Math.round(creditFinalAmount * 100) / 100,
+          paidAmount: Math.round(Number(req.body.partialPayAmount) * 100) / 100,
+          outstandingAmount: outstanding
+        };
         db.collection('customers').doc(customerId).update({
           outstandingBalance: FieldValue.increment(outstanding),
-          creditHistory: FieldValue.arrayUnion({
-            orderId: orderRef.id,
-            orderNumber: orderNumber,
-            date: new Date().toISOString(),
-            totalAmount: Math.round(creditFinalAmount * 100) / 100,
-            paidAmount: Math.round(Number(req.body.partialPayAmount) * 100) / 100,
-            outstandingAmount: outstanding
-          })
+          creditHistory: FieldValue.arrayUnion(creditEntry)
         }).catch(err => console.error('Error updating customer credit:', err));
       }
     }
@@ -10532,22 +10307,7 @@ app.post('/api/orders', async (req, res) => {
         (async () => {
           try {
             let tableUpdated = false;
-
-            // PG dual-write: update table status
-            if (floorsTablesRepo) {
-              if (orderData.tableId) {
-                await floorsTablesRepo.occupyTable(orderData.tableId, orderRef.id);
-                tableUpdated = true;
-              } else {
-                const pgTable = await floorsTablesRepo.findTableByName(restaurantId, tableNumber);
-                if (pgTable) {
-                  await floorsTablesRepo.occupyTable(pgTable.id, orderRef.id);
-                  tableUpdated = true;
-                }
-              }
-            }
-
-            // Firestore update (primary or dual-write)
+            // Firestore update
             let firestoreUpdated = false;
             if (orderData.floorId && orderData.tableId) {
               const directRef = db.collection('restaurants').doc(restaurantId)
@@ -10748,7 +10508,7 @@ app.post('/api/orders', async (req, res) => {
             result = await whatsappSvc.sendTextMessage(formatted, message, credentials);
           }
 
-          await db.collection(collections.automationLogs).add({
+          const waBillLogData = {
             restaurantId, type: 'whatsapp_bill',
             phone: formatted, customerName,
             message: `Bill #${orderNum} - ${billTotal} - ${billUrl}`,
@@ -10756,7 +10516,8 @@ app.post('/api/orders', async (req, res) => {
             orderId: orderRef.id, amount: orderData.finalAmount,
             direction: 'outgoing', status: result?.success ? 'sent' : 'failed',
             timestamp: new Date()
-          });
+          };
+          const waBillLogRef = await db.collection(collections.automationLogs).add(waBillLogData);
           console.log(`📱 WhatsApp bill sent for direct billing order ${orderRef.id}`);
 
           // Send feedback form link if enabled
@@ -10952,25 +10713,6 @@ app.get('/api/orders/single/:orderId', authenticateToken, async (req, res) => {
 
     let orderData, ordId;
 
-    if (usePg) {
-      // PostgreSQL path
-      const pgOrder = await ordersRepo.getById(orderId);
-      if (!pgOrder) {
-        return res.json({ orders: [], pagination: { currentPage: 1, totalPages: 0, totalOrders: 0, limit: 1, hasNextPage: false, hasPrevPage: false } });
-      }
-      orderData = pgOrder;
-      ordId = pgOrder.id;
-    } else {
-      // Firestore path (original)
-      const orderRef = db.collection(collections.orders).doc(orderId);
-      const orderDoc = await orderRef.get();
-      if (!orderDoc.exists) {
-        return res.json({ orders: [], pagination: { currentPage: 1, totalPages: 0, totalOrders: 0, limit: 1, hasNextPage: false, hasPrevPage: false } });
-      }
-      orderData = orderDoc.data();
-      ordId = orderDoc.id;
-    }
-
     const order = {
       id: ordId,
       ...orderData,
@@ -11069,58 +10811,6 @@ app.get('/api/orders/:restaurantId', authenticateToken, async (req, res) => {
         }
       };
     };
-
-    // --- PostgreSQL path ---
-    if (usePg) {
-      // Pre-compute timezone-aware date bounds for PG repo
-      const filters = {
-        page, limit, status, orderType, search, waiterId, myOrdersOnly,
-        paymentMethod, paymentStatus,
-        isScheduled: req.query.isScheduled === 'true',
-      };
-
-      if (todayOnly === 'true') {
-        const _tz = parseTZ(req);
-        const _ds = parseDayStart(req);
-        if (_tz !== undefined) {
-          const t = todayInTZ(_tz, _ds);
-          filters.todayOnly = true;
-          filters.todayStart = t.start;
-          filters.todayEnd = t.end;
-        } else {
-          const s = new Date(); s.setHours(0, 0, 0, 0);
-          const e = new Date(); e.setHours(23, 59, 59, 999);
-          filters.todayOnly = true;
-          filters.todayStart = s;
-          filters.todayEnd = e;
-        }
-      } else if (date) {
-        const _tz = parseTZ(req);
-        const _ds = parseDayStart(req);
-        if (_tz !== undefined) {
-          const b = dateBoundsInTZ(date, _tz, _ds);
-          filters.date = date;
-          filters.dateStart = b.start;
-          filters.dateEnd = b.end;
-        } else {
-          filters.date = date;
-          filters.dateStart = new Date(date);
-          const eDate = new Date(date);
-          eDate.setDate(eDate.getDate() + 1);
-          filters.dateEnd = eDate;
-        }
-      } else if (startDate && endDate) {
-        filters.startDate = startDate;
-        filters.endDate = endDate;
-      }
-
-      const result = await ordersRepo.getByRestaurant(restaurantId, filters);
-      const orders = result.orders.map(formatOrder);
-
-      console.log(`📋 Order History (PG) - Found ${orders.length} orders (page ${result.pagination.currentPage}/${result.pagination.totalPages}, total: ${result.pagination.totalOrders})`);
-
-      return res.json({ orders, pagination: result.pagination });
-    }
 
     // --- Firestore path (original) ---
 
@@ -11525,14 +11215,8 @@ app.get('/api/analytics/:restaurantId', authenticateToken, async (req, res) => {
 
       // Try dailyStats first — 1 read instead of scanning all orders
       let todayData = null;
-      if (usePg) {
-        todayData = await dailyStatsRepo.getById(`${restaurantId}_${todayDateStr}`);
-      } else {
-        const todayDoc = await db.collection('dailyStats').doc(`${restaurantId}_${todayDateStr}`).get();
-        if (todayDoc.exists) todayData = todayDoc.data();
-      }
       if (todayData && (todayData.totalOrders || 0) > 0) {
-        console.log(`📊 Analytics (${period}): using dailyStats ${usePg ? '(PG)' : '(Firestore)'} for ${todayDateStr}`);
+        console.log(`📊 Analytics (${period}): using dailyStats for ${todayDateStr}`);
         const analytics = aggregateDailyStats([todayData], [todayDateStr]);
         return res.json({ success: true, analytics, period, totalOrders: analytics.totalOrders });
       }
@@ -11585,16 +11269,7 @@ app.get('/api/analytics/:restaurantId', authenticateToken, async (req, res) => {
 
     // Fetch dailyStats docs
     let dailyDocs;
-    if (usePg) {
-      const docIds = dateStrings.map(ds => `${restaurantId}_${ds}`);
-      dailyDocs = await dailyStatsRepo.getByIds(docIds);
-    } else {
-      const statsRefs = dateStrings.map(ds => db.collection('dailyStats').doc(`${restaurantId}_${ds}`));
-      const statsDocs = await db.getAll(...statsRefs);
-      dailyDocs = statsDocs.filter(d => d.exists).map(d => d.data());
-    }
-
-    console.log(`📊 Found ${dailyDocs.length} dailyStats docs for analytics (${period}) ${usePg ? '(PG)' : '(Firestore)'}`);
+    console.log(`📊 Found ${dailyDocs.length} dailyStats docs for analytics (${period})`);
 
     // Backward compatibility: if no dailyStats docs exist yet, fall back to raw orders
     if (dailyDocs.length === 0) {
@@ -12052,19 +11727,7 @@ app.get('/api/analytics/:restaurantId/daily-summary', authenticateToken, async (
         : `${restaurantId}_${d}`);
 
       let dailyDocsData;
-      if (usePg) {
-        const pgDocs = await dailyStatsRepo.getByIds(docIds);
-        // Map by id for ordered access
-        const pgMap = {};
-        pgDocs.forEach(d => { pgMap[d.id || `${d.restaurantId}_${d.date}`] = d; });
-        dailyDocsData = docIds.map(id => pgMap[id] || null);
-      } else {
-        const docRefs = docIds.map(id => db.collection('dailyStats').doc(id));
-        const docs = docRefs.length > 0 ? await db.getAll(...docRefs) : [];
-        dailyDocsData = docs.map(doc => doc.exists ? doc.data() : null);
-      }
-
-      console.log(`📊 daily-summary: found ${dailyDocsData.filter(d => d).length}/${dailyDocsData.length} dailyStats docs ${usePg ? '(PG)' : '(Firestore)'}`);
+      console.log(`📊 daily-summary: found ${dailyDocsData.filter(d => d).length}/${dailyDocsData.length} dailyStats docs`);
 
     dailyDocsData.forEach((data, idx) => {
       if (!data) {
@@ -12303,15 +11966,6 @@ app.get('/api/analytics/:restaurantId/daily-summary', authenticateToken, async (
       try {
         const subBreakdownMap = {};
         let subDocs;
-        if (dailyStatsRepo) {
-          subDocs = await dailyStatsRepo.getSubRestaurantStats(restaurantId);
-        } else {
-          const subSnap = await db.collection('dailyStats')
-            .where('restaurantId', '==', restaurantId)
-            .where('subRestaurantId', '!=', null)
-            .get();
-          subDocs = subSnap.docs.map(doc => doc.data());
-        }
         subDocs.forEach(d => {
           if (!dates.includes(d.date)) return;
           const sid = d.subRestaurantId;
@@ -12569,7 +12223,7 @@ app.patch('/api/orders/:orderId/status', authenticateToken, async (req, res) => 
           
           await db.collection('customers').doc(customerId).update(customerUpdateData);
           console.log(`👤 Customer stats updated for ${customerId}. Points: ${netPointsChange > 0 ? '+' : ''}${netPointsChange}`);
-          
+
           // Add to order history
           const orderHistoryEntry = {
             orderId: orderId,
@@ -12619,15 +12273,6 @@ app.patch('/api/orders/:orderId/status', authenticateToken, async (req, res) => 
       orderUpdateData.shareToken = crypto.randomBytes(16).toString('hex');
     }
     await db.collection(collections.orders).doc(orderId).update(orderUpdateData);
-
-    // Dual-write to PostgreSQL (fire-and-forget, non-blocking)
-    if (usePg) {
-      ordersRepo.updateStatus(orderId, status, {
-        ...(orderUpdateData.shareToken ? { shareToken: orderUpdateData.shareToken } : {}),
-      }).catch(pgErr => {
-        console.error('⚠️ PG dual-write error (updateStatus):', pgErr.message);
-      });
-    }
 
     // Update daily analytics stats for status transitions (fire-and-forget)
     const _nonCounted = ['saved', 'cancelled', 'deleted'];
@@ -12814,14 +12459,15 @@ app.patch('/api/orders/:orderId/status', authenticateToken, async (req, res) => 
           }
 
           const logMessage = `Hi ${customerName}, Your bill for Order #${orderNum} is ready. Amount: ${currencySymbol}${totalAmount}. View: ${billUrl}`;
-          await db.collection(collections.automationLogs).add({
+          const payBillLogData = {
             restaurantId: orderData.restaurantId, type: 'whatsapp_bill',
             phone: formatted, customerName: customerName,
             message: logMessage, messageId: result?.messageId || null,
             orderId, amount: orderData.finalAmount || orderData.totalAmount,
             direction: 'outgoing', status: result?.success ? 'sent' : 'failed',
             timestamp: new Date()
-          });
+          };
+          const payBillLogRef = await db.collection(collections.automationLogs).add(payBillLogData);
           console.log(`📱 WhatsApp bill sent for order ${orderId}`);
         } catch (err) {
           console.error('📱 WhatsApp bill error (non-blocking):', err.message);
@@ -12865,7 +12511,7 @@ app.patch('/api/orders/:orderId/status', authenticateToken, async (req, res) => 
             if (!cSnap.empty) {
               invCustomerId = cSnap.docs[0].id;
             } else {
-              const newCRef = await db.collection(collections.invCustomers).add({
+              const newCustData = {
                 orgId, type: 'individual', salutation: '',
                 firstName: custName, lastName: '', companyName: '', displayName: custName,
                 email: '', workPhone: '', mobile: normP,
@@ -12876,7 +12522,8 @@ app.patch('/api/orders/:orderId/status', authenticateToken, async (req, res) => 
                 contactPersons: [], notes: '', customFields: {},
                 status: 'active', sourceApp: 'dineopen', sourceRef: orderData.restaurantId,
                 createdAt: new Date(), updatedAt: new Date()
-              });
+              };
+              const newCRef = await db.collection(collections.invCustomers).add(newCustData);
               invCustomerId = newCRef.id;
             }
           } else {
@@ -12889,7 +12536,7 @@ app.patch('/api/orders/:orderId/status', authenticateToken, async (req, res) => 
             if (!walkSnap.empty) {
               invCustomerId = walkSnap.docs[0].id;
             } else {
-              const wRef = await db.collection(collections.invCustomers).add({
+              const walkInData = {
                 orgId, type: 'individual', salutation: '',
                 firstName: 'Walk-in', lastName: '', companyName: '', displayName: 'Walk-in',
                 email: '', workPhone: '', mobile: '',
@@ -12900,7 +12547,8 @@ app.patch('/api/orders/:orderId/status', authenticateToken, async (req, res) => 
                 contactPersons: [], notes: '', customFields: {},
                 status: 'active', sourceApp: 'dineopen', sourceRef: orderData.restaurantId,
                 createdAt: new Date(), updatedAt: new Date()
-              });
+              };
+              const wRef = await db.collection(collections.invCustomers).add(walkInData);
               invCustomerId = wRef.id;
             }
           }
@@ -12924,7 +12572,7 @@ app.patch('/api/orders/:orderId/status', authenticateToken, async (req, res) => 
             amount: (item.quantity || 1) * (item.price || item.unitPrice || 0),
           }));
 
-          const invRef = await db.collection(collections.invInvoices).add({
+          const autoInvData = {
             orgId,
             customerId: invCustomerId,
             customerName: custName,
@@ -12957,11 +12605,11 @@ app.patch('/api/orders/:orderId/status', authenticateToken, async (req, res) => 
             sourceRef: orderId,
             createdAt: new Date(),
             updatedAt: new Date()
-          });
-
+          };
+          const invRef = await db.collection(collections.invInvoices).add(autoInvData);
           // Create payment record
           const payNumber = await getNextNumber(db, collections, orgId, 'payment');
-          await db.collection(collections.invPayments).add({
+          const autoPayData = {
             orgId,
             customerId: invCustomerId,
             invoiceId: invRef.id,
@@ -12972,8 +12620,8 @@ app.patch('/api/orders/:orderId/status', authenticateToken, async (req, res) => 
             referenceNumber: String(orderData.dailyOrderId || orderId.slice(-6)),
             notes: `POS order #${orderData.dailyOrderId || orderId.slice(-6)}`,
             createdAt: new Date()
-          });
-
+          };
+          const autoPayRef = await db.collection(collections.invPayments).add(autoPayData);
           console.log(`✅ inv_invoice ${invNumber} auto-created for POS order ${orderId}`);
         } catch (err) {
           console.error('POS→Invoice sync error (non-blocking):', err.message);
@@ -13859,18 +13507,6 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
     console.log('🔄 Backend - Updating order:', orderId, 'with data:', updateData);
     await db.collection(collections.orders).doc(orderId).update(updateData);
 
-    // Dual-write to PostgreSQL
-    // For bill completion (status=completed), await the PG write so the frontend
-    // re-fetch sees the updated paymentStatus. For other updates, fire-and-forget.
-    if (usePg) {
-      const pgUpdatePromise = ordersRepo.update(orderId, updateData).catch(pgErr => {
-        console.error('⚠️ PG dual-write error (update):', pgErr.message);
-      });
-      if (status === 'completed') {
-        await pgUpdatePromise;
-      }
-    }
-
     // Inventory adjustment: if items changed, compute delta and adjust stock
     if (items && updateData.items && currentOrder.items) {
       try {
@@ -14014,16 +13650,17 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
         console.log(`💳 PATCH credit calc: finalAmount=${creditFinalAmount}, paid=${creditPaid}, outstanding=${creditOutstanding}`);
         if (creditOutstanding > 0) {
           try {
+            const creditEntry = {
+              orderId: orderId,
+              orderNumber: currentOrder.orderNumber || updateData.orderNumber,
+              date: new Date().toISOString(),
+              totalAmount: Math.round(creditFinalAmount * 100) / 100,
+              paidAmount: Math.round(creditPaid * 100) / 100,
+              outstandingAmount: creditOutstanding
+            };
             await db.collection(collections.customers).doc(custId).update({
               outstandingBalance: FieldValue.increment(creditOutstanding),
-              creditHistory: FieldValue.arrayUnion({
-                orderId: orderId,
-                orderNumber: currentOrder.orderNumber || updateData.orderNumber,
-                date: new Date().toISOString(),
-                totalAmount: Math.round(creditFinalAmount * 100) / 100,
-                paidAmount: Math.round(creditPaid * 100) / 100,
-                outstandingAmount: creditOutstanding
-              })
+              creditHistory: FieldValue.arrayUnion(creditEntry)
             });
             creditUpdated = true;
             console.log(`💳 PATCH: Customer ${custId} credit updated: +₹${creditOutstanding} outstanding`);
@@ -14039,16 +13676,17 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
       if (!creditUpdated && (updateData.paymentStatus === 'due' || updateData.paymentStatus === 'partial') && custId && updateData.outstandingAmount > 0) {
         console.log(`💳 PATCH fallback: paymentStatus=${updateData.paymentStatus}, outstanding=${updateData.outstandingAmount}`);
         try {
+          const fallbackCreditEntry = {
+            orderId: orderId,
+            orderNumber: currentOrder.orderNumber || updateData.orderNumber,
+            date: new Date().toISOString(),
+            totalAmount: Math.round((updateData.finalAmount || currentOrder.finalAmount || 0) * 100) / 100,
+            paidAmount: Math.round((updateData.paidAmount || 0) * 100) / 100,
+            outstandingAmount: updateData.outstandingAmount
+          };
           await db.collection(collections.customers).doc(custId).update({
             outstandingBalance: FieldValue.increment(updateData.outstandingAmount),
-            creditHistory: FieldValue.arrayUnion({
-              orderId: orderId,
-              orderNumber: currentOrder.orderNumber || updateData.orderNumber,
-              date: new Date().toISOString(),
-              totalAmount: Math.round((updateData.finalAmount || currentOrder.finalAmount || 0) * 100) / 100,
-              paidAmount: Math.round((updateData.paidAmount || 0) * 100) / 100,
-              outstandingAmount: updateData.outstandingAmount
-            })
+            creditHistory: FieldValue.arrayUnion(fallbackCreditEntry)
           });
           creditUpdated = true;
           console.log(`💳 PATCH fallback: Customer ${custId} credit updated: +₹${updateData.outstandingAmount} outstanding`);
@@ -14164,18 +13802,6 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
     if (status === 'completed' && currentOrder.tableNumber && currentOrder.tableNumber.trim()) {
       try {
         console.log('🔄 Releasing table due to order completion:', currentOrder.tableNumber);
-
-        // PG dual-write: release table
-        if (floorsTablesRepo) {
-          if (currentOrder.tableId) {
-            floorsTablesRepo.releaseTable(currentOrder.tableId)
-              .catch(err => console.error('PG releaseTable error:', err.message));
-          } else {
-            floorsTablesRepo.releaseTableByName(currentOrder.restaurantId, currentOrder.tableNumber)
-              .catch(err => console.error('PG releaseTableByName error:', err.message));
-          }
-        }
-
         let tableReleased = false;
 
         // FAST PATH: Use stored floorId + tableId from the order
@@ -14234,18 +13860,6 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
         // Free up the old table if it exists
         if (currentOrder.tableNumber && currentOrder.tableNumber.trim()) {
           console.log('🔄 Freeing up old table:', currentOrder.tableNumber);
-
-          // PG dual-write: release old table
-          if (floorsTablesRepo) {
-            if (currentOrder.tableId) {
-              floorsTablesRepo.releaseTable(currentOrder.tableId)
-                .catch(err => console.error('PG releaseTable error:', err.message));
-            } else {
-              floorsTablesRepo.releaseTableByName(currentOrder.restaurantId, currentOrder.tableNumber)
-                .catch(err => console.error('PG releaseTableByName error:', err.message));
-            }
-          }
-
           const floorsSnapshot = await db.collection('restaurants')
             .doc(currentOrder.restaurantId)
             .collection('floors')
@@ -14282,16 +13896,6 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
         // Occupy the new table if provided
         if (tableNumber && tableNumber.trim()) {
           console.log('🔄 Occupying new table:', tableNumber);
-
-          // PG dual-write: occupy new table
-          if (floorsTablesRepo) {
-            const pgNewTable = await floorsTablesRepo.findTableByName(currentOrder.restaurantId, tableNumber);
-            if (pgNewTable) {
-              floorsTablesRepo.occupyTable(pgNewTable.id, orderId)
-                .catch(err => console.error('PG occupyTable error:', err.message));
-            }
-          }
-
           const floorsSnapshot = await db.collection('restaurants')
             .doc(currentOrder.restaurantId)
             .collection('floors')
@@ -14425,16 +14029,17 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
             if (creditCustomerId) {
               const outstanding = updateData.outstandingAmount;
               const finalAmt = updateData.finalAmount || currentOrder.finalAmount || currentOrder.totalAmount || 0;
+              const completionCreditEntry = {
+                orderId,
+                orderNumber: currentOrder.orderNumber,
+                date: new Date().toISOString(),
+                totalAmount: Math.round(finalAmt * 100) / 100,
+                paidAmount: updateData.paidAmount || 0,
+                outstandingAmount: outstanding
+              };
               db.collection('customers').doc(creditCustomerId).update({
                 outstandingBalance: FieldValue.increment(outstanding),
-                creditHistory: FieldValue.arrayUnion({
-                  orderId,
-                  orderNumber: currentOrder.orderNumber,
-                  date: new Date().toISOString(),
-                  totalAmount: Math.round(finalAmt * 100) / 100,
-                  paidAmount: updateData.paidAmount || 0,
-                  outstandingAmount: outstanding
-                })
+                creditHistory: FieldValue.arrayUnion(completionCreditEntry)
               }).catch(err => console.error('Customer credit tracking error (non-blocking):', err));
             }
           }
@@ -14752,23 +14357,6 @@ app.delete('/api/orders/:orderId', authenticateToken, async (req, res) => {
 
     await orderRef.update(updateData);
 
-    // Dual-write to PostgreSQL (fire-and-forget)
-    if (usePg) {
-      const pgDeleteUpdate = {
-        status: 'deleted',
-        lastStatus,
-        updatedAt: new Date(),
-      };
-      if (updateData.deleteReason) pgDeleteUpdate.editReason = updateData.deleteReason;
-      if (updateData.refundType) pgDeleteUpdate.refundType = updateData.refundType;
-      if (updateData.refundedAt) pgDeleteUpdate.refundedAt = updateData.refundedAt;
-      if (updateData.refundedBy) pgDeleteUpdate.refundedBy = updateData.refundedBy;
-      if (updateData.refundReason) pgDeleteUpdate.refundReason = updateData.refundReason;
-      ordersRepo.update(orderId, pgDeleteUpdate).catch(pgErr => {
-        console.error('⚠️ PG dual-write error (delete):', pgErr.message);
-      });
-    }
-
     // Reverse all side effects (inventory, customer, loyalty, offers)
     reverseOrderSideEffects(orderId, order)
       .catch(err => console.error('Side effect reversal error (non-blocking):', err));
@@ -14780,17 +14368,6 @@ app.delete('/api/orders/:orderId', authenticateToken, async (req, res) => {
 
     // Release table if assigned
     if (order.tableNumber && order.tableNumber.trim()) {
-      // PG dual-write: release table
-      if (floorsTablesRepo) {
-        if (order.tableId) {
-          floorsTablesRepo.releaseTable(order.tableId)
-            .catch(err => console.error('PG releaseTable (delete) error:', err.message));
-        } else {
-          floorsTablesRepo.releaseTableByName(order.restaurantId, order.tableNumber)
-            .catch(err => console.error('PG releaseTableByName (delete) error:', err.message));
-        }
-      }
-
       try {
         let tableReleased = false;
 
@@ -14883,13 +14460,14 @@ app.delete('/api/orders/:orderId', authenticateToken, async (req, res) => {
         const message = `🗑️ *Order #${orderNum} DELETED*\n\nBy: ${staffName}\nReason: ${reason || 'No reason provided'}\nAmount: ${currencySymbol}${amount}\nItems: ${(order.items || []).length} items\nWas: ${lastStatus}\nTime: ${new Date().toLocaleString('en-IN')}\n\n— ${restaurantData.name || 'DineOpen'}`;
 
         const result = await whatsappSvc.sendTextMessage(formatted, message, credentials);
-        await db.collection(collections.automationLogs).add({
+        const deleteAlertLogData = {
           restaurantId: order.restaurantId, type: 'whatsapp_delete_alert',
           phone: formatted, message: `Delete alert: Order #${orderNum}`,
           messageId: result?.messageId || null, orderId,
           direction: 'outgoing', status: result?.success ? 'sent' : 'failed',
           timestamp: new Date()
-        });
+        };
+        const deleteAlertLogRef = await db.collection(collections.automationLogs).add(deleteAlertLogData);
       } catch (waErr) {
         console.error('WhatsApp delete notification error (non-blocking):', waErr.message);
       }
@@ -15961,18 +15539,6 @@ app.get('/api/tables/:restaurantId', async (req, res) => {
     const { restaurantId } = req.params;
 
     let tables;
-    if (floorsTablesRepo) {
-      tables = await floorsTablesRepo.getTablesByRestaurant(restaurantId);
-    } else {
-      const snapshot = await db.collection(collections.tables)
-        .where('restaurantId', '==', restaurantId)
-        .get();
-      tables = [];
-      snapshot.forEach(doc => {
-        tables.push({ id: doc.id, ...doc.data() });
-      });
-    }
-
     // Cache at Vercel Edge for 1 min, serve stale for 30s
     res.set('Cache-Control', 'public, s-maxage=60, stale-while-revalidate=30');
     res.json({ tables });
@@ -16024,13 +15590,6 @@ app.post('/api/tables/:restaurantId', authenticateToken, async (req, res) => {
         .collection('floors')
         .doc(floorId)
         .set(floorData);
-
-      // PG dual-write: create floor
-      if (floorsTablesRepo) {
-        floorsTablesRepo.createFloor(floorId, restaurantId, floorData)
-          .catch(err => console.error('PG createFloor error:', err.message));
-      }
-
       // Re-fetch the floor document
       floorDoc = await db.collection('restaurants')
         .doc(restaurantId)
@@ -16070,13 +15629,6 @@ app.post('/api/tables/:restaurantId', authenticateToken, async (req, res) => {
       .doc(floorId)
       .collection('tables')
       .add(tableData);
-
-    // PG dual-write: create table
-    if (floorsTablesRepo) {
-      floorsTablesRepo.createTable(restaurantId, floorId, { id: tableRef.id, ...tableData })
-        .catch(err => console.error('PG createTable error:', err.message));
-    }
-
     res.status(201).json({
       message: 'Table created successfully',
       table: {
@@ -16214,13 +15766,6 @@ app.post('/api/tables/:restaurantId/bulk', authenticateToken, async (req, res) =
 
     // Commit the batch
     await batch.commit();
-
-    // PG dual-write: bulk create tables
-    if (floorsTablesRepo) {
-      floorsTablesRepo.createTablesBatch(restaurantId, floorId, createdTables)
-        .catch(err => console.error('PG createTablesBatch error:', err.message));
-    }
-
     console.log(`✅ Created ${createdTables.length} tables (${from}-${to}) on floor "${floor}" for restaurant ${restaurantId}`);
     if (skippedTables.length > 0) {
       console.log(`⚠️  Skipped ${skippedTables.length} duplicate tables: ${skippedTables.join(', ')}`);
@@ -16305,13 +15850,6 @@ app.patch('/api/tables/:tableId/status', authenticateToken, async (req, res) => 
     if (!tableFound) {
       return res.status(404).json({ error: 'Table not found' });
     }
-
-    // PG dual-write: update table status
-    if (floorsTablesRepo) {
-      floorsTablesRepo.updateTableStatus(tableId, status, orderId)
-        .catch(err => console.error('PG updateTableStatus error:', err.message));
-    }
-
     // Send real-time event for table sync (Firebase RTDB)
     pusherService.triggerTableStatusUpdated(restaurantId, {
       tableId,
@@ -16365,13 +15903,6 @@ app.post('/api/tables/:restaurantId/reset-all', authenticateToken, async (req, r
 
     if (resetCount > 0) {
       await batch.commit();
-
-      // PG dual-write: reset all tables
-      if (floorsTablesRepo) {
-        floorsTablesRepo.resetAllTables(restaurantId)
-          .catch(err => console.error('PG resetAllTables error:', err.message));
-      }
-
       // Send real-time event for table sync (Firebase RTDB)
       pusherService.pushEvent(restaurantId, 'tables', 'tables-reset', {
         resetCount,
@@ -16445,13 +15976,6 @@ app.patch('/api/tables/:tableId', authenticateToken, async (req, res) => {
     if (!tableFound) {
       return res.status(404).json({ error: 'Table not found' });
     }
-
-    // PG dual-write: update table
-    if (floorsTablesRepo) {
-      floorsTablesRepo.updateTable(tableId, { name, floor, capacity, section })
-        .catch(err => console.error('PG updateTable error:', err.message));
-    }
-
     res.json({ message: 'Table updated successfully' });
 
   } catch (error) {
@@ -16507,13 +16031,6 @@ app.delete('/api/tables/:tableId', authenticateToken, async (req, res) => {
     if (!tableFound) {
       return res.status(404).json({ error: 'Table not found' });
     }
-
-    // PG dual-write: delete table
-    if (floorsTablesRepo) {
-      floorsTablesRepo.deleteTable(tableId)
-        .catch(err => console.error('PG deleteTable error:', err.message));
-    }
-
     res.json({ message: 'Table deleted successfully' });
 
   } catch (error) {
@@ -16530,58 +16047,36 @@ app.get('/api/floors/:restaurantId', async (req, res) => {
     let floors = [];
     const orderIds = new Set();
 
-    if (floorsTablesRepo) {
-      // PG path: 2 queries instead of N+1
-      const pgFloors = await floorsTablesRepo.getFloorsWithTables(restaurantId);
-      for (const f of pgFloors) {
-        const tables = (f.tables || []).map(t => ({ ...t, currentOrderTotal: null }));
-        tables.forEach(t => {
-          if (t.currentOrderId && t.status === 'occupied') orderIds.add(t.currentOrderId);
-        });
-        floors.push({
-          id: f.id,
-          name: f.name,
-          description: f.description || '',
-          section: f.section || null,
-          areaChargeType: f.areaChargeType || 'none',
-          areaChargeValue: f.areaChargeValue || 0,
-          order: f.order !== undefined ? f.order : Infinity,
-          restaurantId,
-          tables,
-        });
-      }
-    } else {
-      // Firestore path: N+1 reads
-      const floorsSnapshot = await db.collection('restaurants')
-        .doc(restaurantId).collection('floors').get();
+    // Fetch floors and their tables
+    const floorsSnapshot = await db.collection('restaurants')
+      .doc(restaurantId).collection('floors').get();
 
-      for (const floorDoc of floorsSnapshot.docs) {
-        const floorData = floorDoc.data();
-        const tablesSnapshot = await db.collection('restaurants')
-          .doc(restaurantId).collection('floors')
-          .doc(floorDoc.id).collection('tables').get();
+    for (const floorDoc of floorsSnapshot.docs) {
+      const floorData = floorDoc.data();
+      const tablesSnapshot = await db.collection('restaurants')
+        .doc(restaurantId).collection('floors')
+        .doc(floorDoc.id).collection('tables').get();
 
-        const floorTables = [];
-        for (const tableDoc of tablesSnapshot.docs) {
-          const tableData = tableDoc.data();
-          const tbl = { id: tableDoc.id, ...tableData, currentOrderTotal: null };
-          floorTables.push(tbl);
-          if (tableData.currentOrderId && tableData.status === 'occupied') {
-            orderIds.add(tableData.currentOrderId);
-          }
+      const floorTables = [];
+      for (const tableDoc of tablesSnapshot.docs) {
+        const tableData = tableDoc.data();
+        const tbl = { id: tableDoc.id, ...tableData, currentOrderTotal: null };
+        floorTables.push(tbl);
+        if (tableData.currentOrderId && tableData.status === 'occupied') {
+          orderIds.add(tableData.currentOrderId);
         }
-        floors.push({
-          id: floorDoc.id,
-          name: floorData.name,
-          description: floorData.description || '',
-          section: floorData.section || null,
-          areaChargeType: floorData.areaChargeType || 'none',
-          areaChargeValue: floorData.areaChargeValue || 0,
-          order: floorData.order !== undefined ? floorData.order : Infinity,
-          restaurantId,
-          tables: floorTables,
-        });
       }
+      floors.push({
+        id: floorDoc.id,
+        name: floorData.name,
+        description: floorData.description || '',
+        section: floorData.section || null,
+        areaChargeType: floorData.areaChargeType || 'none',
+        areaChargeValue: floorData.areaChargeValue || 0,
+        order: floorData.order !== undefined ? floorData.order : Infinity,
+        restaurantId,
+        tables: floorTables,
+      });
     }
 
     // Batch-read all orders at once for currentOrderTotal
@@ -16642,12 +16137,6 @@ app.get('/api/floors/:restaurantId', async (req, res) => {
         .doc(defaultFloorId)
         .set(defaultFloorData);
 
-      // Dual-write to PG
-      if (floorsTablesRepo) {
-        floorsTablesRepo.createFloor(defaultFloorId, restaurantId, defaultFloorData)
-          .catch(err => console.error('PG createFloor error:', err.message));
-      }
-
       floors.push({
         id: defaultFloorId,
         name: 'Ground Floor',
@@ -16704,13 +16193,6 @@ app.post('/api/floors/:restaurantId', authenticateToken, async (req, res) => {
       .collection('floors')
       .doc(floorId)
       .set(floorData);
-
-    // PG dual-write: create floor
-    if (floorsTablesRepo) {
-      floorsTablesRepo.createFloor(floorId, restaurantId, floorData)
-        .catch(err => console.error('PG createFloor error:', err.message));
-    }
-
     res.status(201).json({
       message: 'Floor created successfully',
       floor: {
@@ -16809,17 +16291,6 @@ app.patch('/api/floors/:floorId', authenticateToken, async (req, res) => {
         console.error('⚠️ Failed to sync pricing rules on floor rename (non-blocking):', pricingError);
       }
     }
-
-    // PG dual-write: update floor + tables floor_name
-    if (floorsTablesRepo) {
-      floorsTablesRepo.updateFloor(floorId, { name, description, section, areaChargeType, areaChargeValue }, restaurantId)
-        .catch(err => console.error('PG updateFloor error:', err.message));
-      if (name !== originalFloorNameCapitalized) {
-        floorsTablesRepo.updateFloorNameOnTables(floorId, name, restaurantId)
-          .catch(err => console.error('PG updateFloorNameOnTables error:', err.message));
-      }
-    }
-
     res.json({ message: 'Floor updated successfully' });
 
   } catch (error) {
@@ -16849,13 +16320,6 @@ app.patch('/api/floors/reorder/:restaurantId', authenticateToken, async (req, re
     });
 
     await batch.commit();
-
-    // PG dual-write: reorder floors
-    if (floorsTablesRepo) {
-      floorsTablesRepo.reorderFloors(restaurantId, floorOrder)
-        .catch(err => console.error('PG reorderFloors error:', err.message));
-    }
-
     res.json({ message: 'Floor order updated successfully' });
 
   } catch (error) {
@@ -16896,13 +16360,6 @@ app.delete('/api/floors/:floorId', authenticateToken, async (req, res) => {
     batch.delete(floorRef);
 
     await batch.commit();
-
-    // PG dual-write: delete floor (CASCADE deletes tables)
-    if (floorsTablesRepo) {
-      floorsTablesRepo.deleteFloor(floorId, restaurantId)
-        .catch(err => console.error('PG deleteFloor error:', err.message));
-    }
-
     // Sync pricing rules: remove deleted floor name from tableMappings
     if (floorName) {
       try {
@@ -17108,12 +16565,8 @@ app.delete('/api/bookings/:restaurantId/:bookingId', authenticateToken, async (r
       return res.json({ success: true, message: 'Booking deleted' });
     }
     // Soft-cancel: mark as cancelled but keep the record
-    await db.collection('bookings_v2').doc(bookingId).update({
-      status: 'cancelled',
-      cancelReason: reason || null,
-      cancelledAt: new Date(),
-      updatedAt: new Date()
-    });
+    const cancelData = { status: 'cancelled', cancelReason: reason || null, cancelledAt: new Date() };
+    await db.collection('bookings_v2').doc(bookingId).update({ ...cancelData, updatedAt: new Date() });
     res.json({ success: true, message: 'Booking cancelled' });
   } catch (err) {
     console.error('Cancel booking error:', err.message);
@@ -18068,7 +17521,6 @@ app.post('/api/staff/:restaurantId', authenticateToken, requireOwnerRole, async 
     };
 
     const staffRef = await db.collection(collections.staffUsers).add(staffData);
-
     // Add to userRestaurants collection for access control
     await db.collection(collections.userRestaurants).add({
       userId: staffRef.id,
@@ -18269,10 +17721,11 @@ app.delete('/api/staff/:staffId/restaurants/:restaurantId', authenticateToken, r
     if (staffDoc.data().restaurantId === restaurantId) {
       const remaining = allAssignments.docs.find(d => d.data().restaurantId !== restaurantId);
       if (remaining) {
-        await db.collection(collections.staffUsers).doc(staffId).update({
+        const reassignData = {
           restaurantId: remaining.data().restaurantId,
           updatedAt: new Date()
-        });
+        };
+        await db.collection(collections.staffUsers).doc(staffId).update(reassignData);
       }
     }
 
@@ -20235,7 +19688,6 @@ app.post('/api/invoice/generate/:orderId', authenticateToken, async (req, res) =
     // Save invoice to database
     const invoiceRef = await db.collection('invoices').add(invoice);
     invoice.id = invoiceRef.id;
-
     // Update order with invoice ID
     await orderRef.update({
       invoiceId: invoice.id,
@@ -20515,37 +19967,27 @@ app.get('/api/kot/:restaurantId', async (req, res) => {
       }
     });
 
-    let orders;
+    let query = db.collection(collections.orders)
+      .where('restaurantId', '==', restaurantId)
+      .where('createdAt', '>=', yesterdayStart)
+      .orderBy('createdAt', 'desc');
 
-    if (usePg) {
-      // --- PostgreSQL path ---
-      const kotResult = await ordersRepo.getKotOrders(restaurantId, { status, yesterdayStart });
-      orders = enrichKotOrders(kotResult.orders, tableMap);
-      console.log(`🍽️ Final KOT result (PG): ${orders.length} orders`);
-    } else {
-      // --- Firestore path (original) ---
-      let query = db.collection(collections.orders)
-        .where('restaurantId', '==', restaurantId)
-        .where('createdAt', '>=', yesterdayStart)
-        .orderBy('createdAt', 'desc');
+    const ordersSnapshot = await query.limit(100).get();
+    console.log(`📊 Total orders found in DB: ${ordersSnapshot.docs.length}`);
 
-      const ordersSnapshot = await query.limit(100).get();
-      console.log(`📊 Total orders found in DB: ${ordersSnapshot.docs.length}`);
+    const rawOrders = ordersSnapshot.docs.map(doc => {
+      const data = doc.data();
+      return {
+        id: doc.id,
+        ...data,
+        createdAt: data.createdAt instanceof Date ? data.createdAt : (data.createdAt ? new Date(data.createdAt) : new Date()),
+        updatedAt: data.updatedAt instanceof Date ? data.updatedAt : (data.updatedAt ? new Date(data.updatedAt) : new Date()),
+        kotTime: data.kotTime instanceof Date ? data.kotTime : (data.kotTime ? new Date(data.kotTime) : null),
+      };
+    });
 
-      const rawOrders = ordersSnapshot.docs.map(doc => {
-        const data = doc.data();
-        return {
-          id: doc.id,
-          ...data,
-          createdAt: data.createdAt?.toDate() || new Date(),
-          updatedAt: data.updatedAt?.toDate() || new Date(),
-          kotTime: data.kotTime?.toDate ? data.kotTime.toDate() : data.kotTime,
-        };
-      });
-
-      orders = enrichKotOrders(rawOrders, tableMap);
-      console.log(`🍽️ Final KOT result (Firestore): ${orders.length} orders`);
-    }
+    const orders = enrichKotOrders(rawOrders, tableMap);
+    console.log(`🍽️ Final KOT result: ${orders.length} orders`);
 
     res.json({
       orders,
@@ -20847,13 +20289,6 @@ app.patch('/api/kot/:orderId/printed', async (req, res) => {
     }
 
     await orderRef.update(updateData);
-
-    // Dual-write to PostgreSQL (fire-and-forget)
-    if (usePg) {
-      ordersRepo.update(orderId, updateData).catch(pgErr => {
-        console.error('⚠️ PG dual-write error (kot-printed):', pgErr.message);
-      });
-    }
 
     console.log(`✅ Order ${orderId} marked as printed${stationId ? ` (station: ${stationId})` : ''}`);
 
@@ -21805,13 +21240,6 @@ app.patch('/api/orders/:orderId/cancel', authenticateToken, async (req, res) => 
 
     await db.collection(collections.orders).doc(orderId).update(updateData);
 
-    // Dual-write to PostgreSQL (fire-and-forget)
-    if (usePg) {
-      ordersRepo.update(orderId, updateData).catch(pgErr => {
-        console.error('⚠️ PG dual-write error (cancel):', pgErr.message);
-      });
-    }
-
     // Reverse all side effects (inventory, customer, loyalty, offers)
     const reversal = await reverseOrderSideEffects(orderId, orderData);
 
@@ -21822,17 +21250,6 @@ app.patch('/api/orders/:orderId/cancel', authenticateToken, async (req, res) => 
 
     // If order has a table, release it back to available
     if (orderData.tableNumber && orderData.tableNumber.trim()) {
-      // PG dual-write: release table
-      if (floorsTablesRepo) {
-        if (orderData.tableId) {
-          floorsTablesRepo.releaseTable(orderData.tableId)
-            .catch(err => console.error('PG releaseTable (cancel) error:', err.message));
-        } else {
-          floorsTablesRepo.releaseTableByName(orderData.restaurantId, orderData.tableNumber)
-            .catch(err => console.error('PG releaseTableByName (cancel) error:', err.message));
-        }
-      }
-
       try {
         let tableReleased = false;
 
@@ -21943,13 +21360,14 @@ app.patch('/api/orders/:orderId/cancel', authenticateToken, async (req, res) => 
         const message = `🚫 *Order #${orderNum} CANCELLED*\n\nBy: ${staffName}\nReason: ${reason || 'No reason provided'}\nAmount: ${currencySymbol}${amount}\nItems: ${(orderData.items || []).length} items\nTime: ${new Date().toLocaleString('en-IN')}\n\n— ${restData.name || 'DineOpen'}`;
 
         const result = await whatsappSvc.sendTextMessage(formatted, message, credentials);
-        await db.collection(collections.automationLogs).add({
+        const cancelAlertLogData = {
           restaurantId: orderData.restaurantId, type: 'whatsapp_cancel_alert',
           phone: formatted, message: `Cancel alert: Order #${orderNum}`,
           messageId: result?.messageId || null, orderId,
           direction: 'outgoing', status: result?.success ? 'sent' : 'failed',
           timestamp: new Date()
-        });
+        };
+        const cancelAlertLogRef = await db.collection(collections.automationLogs).add(cancelAlertLogData);
       } catch (waErr) {
         console.error('WhatsApp cancel notification error (non-blocking):', waErr.message);
       }
@@ -22926,91 +22344,7 @@ app.get('/api/inventory/:restaurantId', authenticateToken, async (req, res) => {
 
     let items = [];
 
-    if (inventoryRepo) {
-      // ── PG primary path ──
-      try {
-        const opts = {};
-        if (category && category !== 'all') opts.category = category;
-        items = await inventoryRepo.getByRestaurant(restaurantId, opts);
-
-        // In-memory status/search filters (same as Firestore path)
-        if (status && status !== 'all') {
-          items = items.filter(item => {
-            if (status === 'low') return item.currentStock <= (item.minStock || item.minimumStock || 0);
-            if (status === 'good') return item.currentStock > (item.minStock || item.minimumStock || 0);
-            if (status === 'expired') return item.expiryDate && new Date(item.expiryDate) < new Date();
-            return true;
-          });
-        }
-        if (search) {
-          const sv = search.toLowerCase().trim();
-          items = items.filter(item =>
-            (item.name || '').toLowerCase().includes(sv) ||
-            (item.category || '').toLowerCase().includes(sv) ||
-            (item.supplier || '').toLowerCase().includes(sv)
-          );
-        }
-
-        // Determine status for each item
-        items.forEach(item => {
-          if (item.currentStock <= (item.minStock || item.minimumStock || 0)) {
-            item.status = 'low';
-          } else if (item.expiryDate && new Date(item.expiryDate) < new Date()) {
-            item.status = 'expired';
-          } else {
-            item.status = 'good';
-          }
-        });
-
-        // Wastage enrichment from PG
-        try {
-          const now = new Date();
-          const wasteDays = parseInt(req.query.wasteDays) || 0;
-          const wasteStart = new Date(now);
-          wasteStart.setDate(wasteStart.getDate() - wasteDays);
-          wasteStart.setHours(0, 0, 0, 0);
-          const wastageMap = {};
-
-          const [wasteEntries, batches] = await Promise.all([
-            wasteEntriesRepo.getByRestaurant(restaurantId, { dateStart: wasteStart }),
-            stockBatchesRepo.getByRestaurant(restaurantId, { status: 'active' }),
-          ]);
-
-          wasteEntries.forEach(data => {
-            const iid = data.itemId || data.inventoryItemId;
-            if (iid) {
-              if (!wastageMap[iid]) wastageMap[iid] = { qty: 0, value: 0 };
-              wastageMap[iid].qty += (data.quantity || 0);
-              wastageMap[iid].value += (data.totalCost || data.wasteValue || 0);
-            }
-          });
-
-          batches.forEach(data => {
-            const expiry = data.expiryDate ? new Date(data.expiryDate) : null;
-            if (expiry && expiry < now && (data.remainingQty || 0) > 0) {
-              const iid = data.inventoryItemId;
-              if (!wastageMap[iid]) wastageMap[iid] = { qty: 0, value: 0 };
-              wastageMap[iid].qty += data.remainingQty;
-              wastageMap[iid].value += (data.remainingQty * (data.costPerUnit || 0));
-            }
-          });
-
-          items.forEach(item => {
-            const w = wastageMap[item.id];
-            item.wastedQty = w ? w.qty : 0;
-            item.wastedValue = w ? w.value : 0;
-          });
-        } catch (e) {
-          console.warn('PG wastage data fetch failed (non-critical):', e.message);
-        }
-      } catch (pgErr) {
-        console.error('PG inventory read failed, falling back to Firestore:', pgErr.message);
-        items = []; // fall through to Firestore path below
-      }
-    }
-
-    if (!inventoryRepo || items.length === 0) {
-      // ── Firestore fallback path ──
+    {
       let query = db.collection(collections.inventory).where('restaurantId', '==', restaurantId);
       if (category && category !== 'all') {
         query = query.where('category', '==', category);
@@ -23107,23 +22441,6 @@ app.get('/api/inventory/:restaurantId/categories', authenticateToken, async (req
 
     console.log(`📂 Categories API - Restaurant: ${restaurantId}`);
 
-    // ── PG primary path ──
-    if (inventoryRepo) {
-      try {
-        const pgCategories = await inventoryRepo.getCategories(restaurantId);
-        if (pgCategories && pgCategories.length > 0) {
-          console.log(`📋 PG Categories found: ${pgCategories.join(', ')}`);
-          return res.json({
-            categories: pgCategories.sort(),
-            timestamp: new Date().toISOString()
-          });
-        }
-      } catch (pgErr) {
-        console.error('PG read failed, falling back to Firestore:', pgErr.message);
-      }
-    }
-
-    // ── Firestore fallback path ──
     const snapshot = await db.collection(collections.inventory)
       .where('restaurantId', '==', restaurantId)
       .select('category')
@@ -23161,61 +22478,6 @@ app.get('/api/inventory/:restaurantId/dashboard', authenticateToken, async (req,
 
     console.log(`📊 Dashboard API - Restaurant: ${restaurantId}`);
 
-    // ── PG primary path ──
-    if (inventoryRepo) {
-      try {
-        const [pgItems, pgExpiredBatches] = await Promise.all([
-          inventoryRepo.getByRestaurantSelect(restaurantId, ['category', 'currentStock', 'minStock', 'costPerUnit', 'expiryDate']),
-          stockBatchesRepo.getExpiredActive(restaurantId)
-        ]);
-
-        if (pgItems && pgItems.length > 0) {
-          let totalItems = pgItems.length;
-          let lowStockItems = 0;
-          let expiredItems = 0;
-          let totalValue = 0;
-          const categories = new Set();
-
-          pgItems.forEach(item => {
-            if (item.category) categories.add(item.category);
-            if (item.currentStock <= item.minStock) lowStockItems++;
-            if (item.expiryDate && new Date(item.expiryDate) < new Date()) expiredItems++;
-            totalValue += (item.currentStock || 0) * (item.costPerUnit || 0);
-          });
-
-          let wastedItemsCount = 0;
-          let totalWasteValue = 0;
-          if (pgExpiredBatches && pgExpiredBatches.length > 0) {
-            const wastedItemIds = new Set();
-            pgExpiredBatches.forEach(batch => {
-              if ((batch.remainingQty || 0) > 0) {
-                wastedItemIds.add(batch.inventoryItemId);
-                totalWasteValue += (batch.remainingQty || 0) * (batch.costPerUnit || 0);
-              }
-            });
-            wastedItemsCount = wastedItemIds.size;
-          }
-
-          const stats = {
-            totalItems,
-            lowStockItems,
-            expiredItems,
-            totalValue: Math.round(totalValue * 100) / 100,
-            totalCategories: categories.size,
-            wastedItemsCount,
-            totalWasteValue: Math.round(totalWasteValue * 100) / 100,
-            timestamp: new Date().toISOString()
-          };
-
-          console.log(`📈 PG Dashboard stats: ${JSON.stringify(stats)}`);
-          return res.json({ stats, timestamp: new Date().toISOString() });
-        }
-      } catch (pgErr) {
-        console.error('PG read failed, falling back to Firestore:', pgErr.message);
-      }
-    }
-
-    // ── Firestore fallback path ──
     const snapshot = await db.collection(collections.inventory)
       .where('restaurantId', '==', restaurantId)
       .select('category', 'currentStock', 'minStock', 'costPerUnit', 'expiryDate')
@@ -23301,42 +22563,6 @@ app.get('/api/inventory/:restaurantId/transactions', authenticateToken, async (r
     const { restaurantId } = req.params;
     const { date, startDate, endDate, itemId, type, limit = 50, page = 1 } = req.query;
 
-    // ── PG primary path ──
-    if (inventoryTransactionsRepo) {
-      try {
-        const pageNum = parseInt(page, 10) || 1;
-        const limitNum = Math.min(parseInt(limit, 10) || 50, 200);
-        const offset = (pageNum - 1) * limitNum;
-
-        const opts = { limit: limitNum, offset };
-        if (itemId) opts.inventoryItemId = itemId;
-        if (type) opts.type = type.toUpperCase();
-        if (date) {
-          const dayStart = new Date(date); dayStart.setHours(0, 0, 0, 0);
-          const dayEnd = new Date(date); dayEnd.setHours(23, 59, 59, 999);
-          opts.dateStart = dayStart;
-          opts.dateEnd = dayEnd;
-        } else {
-          if (startDate) { const sd = new Date(startDate); sd.setHours(0, 0, 0, 0); opts.dateStart = sd; }
-          if (endDate) { const ed = new Date(endDate); ed.setHours(23, 59, 59, 999); opts.dateEnd = ed; }
-        }
-
-        const pgTransactions = await inventoryTransactionsRepo.getByRestaurant(restaurantId, opts);
-        if (pgTransactions) {
-          return res.json({
-            transactions: pgTransactions,
-            total: pgTransactions.length,
-            page: pageNum,
-            limit: limitNum,
-            hasMore: pgTransactions.length === limitNum,
-          });
-        }
-      } catch (pgErr) {
-        console.error('PG read failed, falling back to Firestore:', pgErr.message);
-      }
-    }
-
-    // ── Firestore fallback path ──
     let query = db.collection(collections.inventoryTransactions)
       .where('restaurantId', '==', restaurantId);
 
@@ -23434,25 +22660,6 @@ app.get('/api/inventory/:restaurantId/usage-summary', authenticateToken, async (
       else { start = new Date(now); start.setHours(0, 0, 0, 0); end = new Date(now); end.setHours(23, 59, 59, 999); }
     }
 
-    // ── PG primary path ──
-    if (inventoryTransactionsRepo) {
-      try {
-        const pgSummary = await inventoryTransactionsRepo.getUsageSummary(restaurantId, start, end);
-        if (pgSummary) {
-          return res.json({
-            summary: pgSummary,
-            period,
-            startDate: start.toISOString(),
-            endDate: end.toISOString(),
-            totalItems: pgSummary.length,
-          });
-        }
-      } catch (pgErr) {
-        console.error('PG read failed, falling back to Firestore:', pgErr.message);
-      }
-    }
-
-    // ── Firestore fallback path ──
     const snapshot = await db.collection(collections.inventoryTransactions)
       .where('restaurantId', '==', restaurantId)
       .where('type', '==', 'DEDUCTION')
@@ -23935,21 +23142,7 @@ app.post('/api/inventory/:restaurantId', authenticateToken, async (req, res) => 
       };
       const txRef = await db.collection(collections.inventoryTransactions).add(txData);
       txRefId = txRef.id;
-
-      // PG dual-write: batch + transaction
-      if (inventoryRepo) {
-        Promise.all([
-          stockBatchesRepo.create(batchRef.id, batchData),
-          inventoryTransactionsRepo.create(txRef.id, txData),
-        ]).catch(e => console.error('PG inventory batch/tx create failed:', e.message));
-      }
     }
-
-    // PG dual-write: inventory item
-    if (inventoryRepo) {
-      inventoryRepo.create(itemRef.id, itemData).catch(e => console.error('PG inventory create failed:', e.message));
-    }
-
     console.log(`📦 Inventory item created: ${itemRef.id} - ${itemData.name}`);
 
     res.status(201).json({
@@ -24092,17 +23285,6 @@ app.patch('/api/inventory/:restaurantId/:itemId', authenticateToken, async (req,
     }
 
     await db.collection(collections.inventory).doc(itemId).update(updateData);
-
-    // PG dual-write: inventory update + batch + transaction
-    if (inventoryRepo) {
-      const pgOps = [inventoryRepo.update(itemId, updateData)];
-      if (stockIncrease > 0) {
-        // Also create batch + transaction in PG (batch was already created in Firestore above)
-        // Note: batch/tx Firestore docs created above don't have PG writes yet, add them here
-      }
-      Promise.all(pgOps).catch(e => console.error('PG inventory update failed:', e.message));
-    }
-
     console.log(`📦 Inventory item updated: ${itemId}`);
 
     // Reverse sync: if this inventory item is linked to a menu item, update its stock
@@ -24148,12 +23330,6 @@ app.delete('/api/inventory/:restaurantId/:itemId', authenticateToken, async (req
     }
 
     await db.collection(collections.inventory).doc(itemId).delete();
-
-    // PG dual-write: delete
-    if (inventoryRepo) {
-      inventoryRepo.remove(itemId).catch(e => console.error('PG inventory delete failed:', e.message));
-    }
-
     console.log(`📦 Inventory item deleted: ${itemId} - ${itemData.name}`);
 
     res.json({ message: 'Inventory item deleted successfully' });
@@ -24169,20 +23345,6 @@ app.get('/api/inventory/:restaurantId/:itemId/batches', authenticateToken, async
   try {
     const { restaurantId, itemId } = req.params;
 
-    // ── PG primary path ──
-    if (stockBatchesRepo) {
-      try {
-        const pgBatches = await stockBatchesRepo.getByItem(restaurantId, itemId);
-        if (pgBatches) {
-          pgBatches.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
-          return res.json({ batches: pgBatches });
-        }
-      } catch (pgErr) {
-        console.error('PG read failed, falling back to Firestore:', pgErr.message);
-      }
-    }
-
-    // ── Firestore fallback path ──
     const batchesSnapshot = await db.collection(collections.stockBatches)
       .where('restaurantId', '==', restaurantId)
       .where('inventoryItemId', '==', itemId)
@@ -24216,24 +23378,7 @@ app.get('/api/inventory/:restaurantId/:itemId/history', authenticateToken, async
   try {
     const { restaurantId, itemId } = req.params;
 
-    // ── PG primary path ──
-    if (inventoryTransactionsRepo && stockBatchesRepo) {
-      try {
-        const [pgTransactions, pgBatches] = await Promise.all([
-          inventoryTransactionsRepo.getByRestaurant(restaurantId, { inventoryItemId: itemId }),
-          stockBatchesRepo.getByItem(restaurantId, itemId)
-        ]);
-        if (pgTransactions && pgBatches) {
-          pgTransactions.sort((a, b) => new Date(b.date) - new Date(a.date));
-          pgBatches.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
-          return res.json({ transactions: pgTransactions, batches: pgBatches });
-        }
-      } catch (pgErr) {
-        console.error('PG read failed, falling back to Firestore:', pgErr.message);
-      }
-    }
 
-    // ── Firestore fallback path ──
     // Get transactions for this item
     const txSnapshot = await db.collection(collections.inventoryTransactions)
       .where('restaurantId', '==', restaurantId)
@@ -24283,44 +23428,6 @@ app.get('/api/inventory/:restaurantId/wastage', authenticateToken, async (req, r
   try {
     const { restaurantId } = req.params;
 
-    // ── PG primary path ──
-    if (stockBatchesRepo) {
-      try {
-        const pgExpiredBatches = await stockBatchesRepo.getExpiredActive(restaurantId);
-        if (pgExpiredBatches) {
-          const now = new Date();
-          const wastageMap = {};
-          let totalWasteValue = 0;
-
-          pgExpiredBatches.forEach(data => {
-            const expiryDate = data.expiryDate ? new Date(data.expiryDate) : null;
-            if (expiryDate && expiryDate < now && (data.remainingQty || 0) > 0) {
-              const itemId = data.inventoryItemId;
-              if (!wastageMap[itemId]) {
-                wastageMap[itemId] = { itemId, itemName: data.inventoryItemName, wastedQty: 0, wastedValue: 0, unit: data.unit, batches: [] };
-              }
-              const wasteVal = (data.remainingQty || 0) * (data.costPerUnit || 0);
-              wastageMap[itemId].wastedQty += data.remainingQty;
-              wastageMap[itemId].wastedValue += wasteVal;
-              wastageMap[itemId].batches.push({
-                batchId: data.id,
-                remainingQty: data.remainingQty,
-                expiryDate,
-                mfgDate: data.mfgDate || null,
-              });
-              totalWasteValue += wasteVal;
-            }
-          });
-
-          const wastage = Object.values(wastageMap);
-          return res.json({ wastage, totalWasteValue, wastedItemsCount: wastage.length });
-        }
-      } catch (pgErr) {
-        console.error('PG read failed, falling back to Firestore:', pgErr.message);
-      }
-    }
-
-    // ── Firestore fallback path ──
     const batchesSnapshot = await db.collection(collections.stockBatches)
       .where('restaurantId', '==', restaurantId)
       .get();
@@ -24467,20 +23574,6 @@ app.post('/api/inventory/:restaurantId/waste-entries', authenticateToken, async 
     }
 
     const ref = await db.collection(collections.wasteEntries).add(entryData);
-
-    // PG dual-write: waste entry + inventory update
-    if (wasteEntriesRepo) {
-      (async () => {
-        try {
-          await wasteEntriesRepo.create(ref.id, entryData);
-          if (itemDoc.exists) {
-            await inventoryRepo.incrementStock(itemId, -quantity);
-            await inventoryRepo.incrementWastedQty(itemId, quantity);
-          }
-        } catch (e) { console.error('PG waste-entry dual-write failed:', e.message); }
-      })();
-    }
-
     res.status(201).json({ id: ref.id, ...entryData });
   } catch (error) {
     console.error('Create waste entry error:', error);
@@ -24494,54 +23587,6 @@ app.get('/api/inventory/:restaurantId/waste-entries', authenticateToken, async (
     const { restaurantId } = req.params;
     const { period, reason, itemId, source, startDate, endDate } = req.query;
 
-    // ── PG primary path ──
-    if (wasteEntriesRepo) {
-      try {
-        const now = new Date();
-        const opts = {};
-        if (reason) opts.reason = reason;
-        if (itemId) opts.itemId = itemId;
-        if (source) opts.source = source;
-
-        // Compute date filters for PG
-        if (period === 'today') {
-          opts.dateStart = new Date(now); opts.dateStart.setHours(0, 0, 0, 0);
-          opts.dateEnd = now;
-        } else if (period === '7d') {
-          opts.dateStart = new Date(now); opts.dateStart.setDate(opts.dateStart.getDate() - 7);
-          opts.dateEnd = now;
-        } else if (period === '30d') {
-          opts.dateStart = new Date(now); opts.dateStart.setDate(opts.dateStart.getDate() - 30);
-          opts.dateEnd = now;
-        } else if (period === 'this_month') {
-          opts.dateStart = new Date(now.getFullYear(), now.getMonth(), 1);
-          opts.dateEnd = now;
-        } else if (startDate) {
-          opts.dateStart = new Date(startDate);
-          opts.dateEnd = endDate ? new Date(endDate) : now;
-        }
-
-        const pgEntries = await wasteEntriesRepo.getByRestaurant(restaurantId, opts);
-        if (pgEntries) {
-          pgEntries.sort((a, b) => new Date(b.date) - new Date(a.date));
-
-          let totalWasteValue = 0;
-          let totalQty = 0;
-          const reasonBreakdown = {};
-          pgEntries.forEach(e => {
-            totalWasteValue += e.wasteValue || 0;
-            totalQty += e.quantity || 0;
-            reasonBreakdown[e.reason] = (reasonBreakdown[e.reason] || 0) + (e.wasteValue || 0);
-          });
-
-          return res.json({ entries: pgEntries, summary: { totalWasteValue, totalQty, count: pgEntries.length, reasonBreakdown } });
-        }
-      } catch (pgErr) {
-        console.error('PG read failed, falling back to Firestore:', pgErr.message);
-      }
-    }
-
-    // ── Firestore fallback path ──
     let query = db.collection(collections.wasteEntries).where('restaurantId', '==', restaurantId);
 
     if (reason) query = query.where('reason', '==', reason);
@@ -24707,31 +23752,6 @@ app.post('/api/inventory/:restaurantId/stock-audits', authenticateToken, async (
         createdAt: new Date()
       });
     }
-
-    // PG dual-write: stock audit adjustments
-    if (inventoryRepo) {
-      (async () => {
-        try {
-          for (const item of items) {
-            if (item.physicalStock !== undefined) {
-              // Set stock to physical count directly
-              await inventoryRepo.update(item.itemId, { currentStock: item.physicalStock });
-            }
-          }
-          // Create waste entries in PG for shrinkage
-          for (const w of wasteEntriesToCreate) {
-            const weId = require('crypto').randomUUID();
-            await wasteEntriesRepo.create(weId, {
-              restaurantId, itemId: w.itemId, itemName: w.itemName,
-              quantity: w.quantity, unit: w.unit, reason: 'shrinkage', source: 'AUDIT',
-              costPerUnit: w.costPerUnit, wasteValue: w.quantity * w.costPerUnit,
-              notes: `Detected during stock audit`, date: new Date(), createdAt: new Date()
-            });
-          }
-        } catch (e) { console.error('PG stock-audit dual-write failed:', e.message); }
-      })();
-    }
-
     // Sync linked menu items after audit
     syncInventoryStockToMenuItems(restaurantId)
       .catch(err => console.error('Audit→Menu sync error:', err));
@@ -24848,29 +23868,6 @@ app.post('/api/inventory/:restaurantId/production-entries', authenticateToken, a
     };
 
     const ref = await db.collection(collections.productionEntries).add(entryData);
-
-    // PG dual-write: production stock addition
-    if (inventoryRepo && itemDoc.exists) {
-      (async () => {
-        try {
-          await inventoryRepo.incrementStock(itemId, Number(producedQty));
-          const batchId = require('crypto').randomUUID();
-          await stockBatchesRepo.create(batchId, {
-            restaurantId, inventoryItemId: itemId, inventoryItemName: itemName || itemDoc.data().name,
-            initialQty: Number(producedQty), remainingQty: Number(producedQty),
-            costPerUnit: costPerUnit || itemDoc.data().costPerUnit || 0,
-            source: 'production', status: 'active', mfgDate: new Date(), createdAt: new Date(), updatedAt: new Date()
-          });
-          const txId = require('crypto').randomUUID();
-          await inventoryTransactionsRepo.create(txId, {
-            restaurantId, inventoryItemId: itemId, inventoryItemName: itemName || itemDoc.data().name,
-            type: 'ADDITION', source: 'PRODUCTION', quantityChange: Number(producedQty),
-            unit: unit || itemDoc.data().unit, date: new Date(),
-            notes: `Production: ${producedQty} ${unit || itemDoc.data().unit}`
-          });
-        } catch (e) { console.error('PG production dual-write failed:', e.message); }
-      })();
-    }
 
     res.status(201).json({ id: ref.id, ...entryData });
   } catch (error) {
@@ -25016,55 +24013,6 @@ app.get('/api/inventory/:restaurantId/expiry-alerts', authenticateToken, async (
     const { days } = req.query;
     const alertDays = parseInt(days) || 7;
 
-    // ── PG primary path ──
-    if (stockBatchesRepo) {
-      try {
-        const pgBatches = await stockBatchesRepo.getByRestaurant(restaurantId, { status: 'active' });
-        if (pgBatches) {
-          const now = new Date();
-          const alertDate = new Date(now);
-          alertDate.setDate(alertDate.getDate() + alertDays);
-
-          const expired = [];
-          const expiringSoon = [];
-
-          pgBatches.forEach(data => {
-            const expiryDate = data.expiryDate ? new Date(data.expiryDate) : null;
-            if (!expiryDate) return;
-            if ((data.remainingQty || 0) <= 0) return;
-
-            const entry = {
-              ...data,
-              expiryDate,
-              daysUntilExpiry: Math.ceil((expiryDate - now) / (1000 * 60 * 60 * 24)),
-              wasteValue: (data.remainingQty || 0) * (data.costPerUnit || 0)
-            };
-
-            if (expiryDate < now) {
-              expired.push(entry);
-            } else if (expiryDate <= alertDate) {
-              expiringSoon.push(entry);
-            }
-          });
-
-          expired.sort((a, b) => a.expiryDate - b.expiryDate);
-          expiringSoon.sort((a, b) => a.expiryDate - b.expiryDate);
-
-          const totalExpiredValue = expired.reduce((s, e) => s + (e.wasteValue || 0), 0);
-          const totalExpiringValue = expiringSoon.reduce((s, e) => s + (e.wasteValue || 0), 0);
-
-          return res.json({
-            expired,
-            expiringSoon,
-            summary: { expiredCount: expired.length, expiringCount: expiringSoon.length, totalExpiredValue, totalExpiringValue, alertDays }
-          });
-        }
-      } catch (pgErr) {
-        console.error('PG read failed, falling back to Firestore:', pgErr.message);
-      }
-    }
-
-    // ── Firestore fallback path ──
     const batchesSnap = await db.collection(collections.stockBatches)
       .where('restaurantId', '==', restaurantId)
       .where('status', '==', 'active')
@@ -25127,77 +24075,6 @@ app.get('/api/inventory/:restaurantId/waste-summary', authenticateToken, async (
   try {
     const { restaurantId } = req.params;
 
-    // ── PG primary path ──
-    if (wasteEntriesRepo) {
-      try {
-        const pgEntries = await wasteEntriesRepo.getByRestaurant(restaurantId);
-        if (pgEntries) {
-          const now = new Date();
-          const todayStart = new Date(now); todayStart.setHours(0, 0, 0, 0);
-          const weekStart = new Date(now); weekStart.setDate(weekStart.getDate() - 7);
-          const monthStart = new Date(now.getFullYear(), now.getMonth(), 1);
-
-          let todayValue = 0, weekValue = 0, monthValue = 0, allTimeValue = 0;
-          let todayQty = 0, weekQty = 0, monthQty = 0;
-          const reasonTotals = {};
-          const sourceTotals = {};
-          const itemTotals = {};
-          const dailyTrend = {};
-
-          pgEntries.forEach(data => {
-            const entryDate = data.date ? new Date(data.date) : (data.createdAt ? new Date(data.createdAt) : null);
-            if (!entryDate) return;
-
-            const val = data.wasteValue || data.totalCost || 0;
-            const qty = data.quantity || 0;
-            allTimeValue += val;
-
-            if (entryDate >= todayStart) { todayValue += val; todayQty += qty; }
-            if (entryDate >= weekStart) { weekValue += val; weekQty += qty; }
-            if (entryDate >= monthStart) { monthValue += val; monthQty += qty; }
-
-            reasonTotals[data.reason] = (reasonTotals[data.reason] || 0) + val;
-            sourceTotals[data.source] = (sourceTotals[data.source] || 0) + val;
-            if (!itemTotals[data.itemId]) {
-              itemTotals[data.itemId] = { itemId: data.itemId, itemName: data.itemName, totalValue: 0, totalQty: 0, unit: data.unit };
-            }
-            itemTotals[data.itemId].totalValue += val;
-            itemTotals[data.itemId].totalQty += qty;
-
-            if (entryDate >= weekStart) {
-              const dayKey = entryDate.toISOString().split('T')[0];
-              dailyTrend[dayKey] = (dailyTrend[dayKey] || 0) + val;
-            }
-          });
-
-          const trend = [];
-          for (let i = 6; i >= 0; i--) {
-            const d = new Date(now);
-            d.setDate(d.getDate() - i);
-            const key = d.toISOString().split('T')[0];
-            trend.push({ date: key, value: dailyTrend[key] || 0 });
-          }
-
-          const topItems = Object.values(itemTotals).sort((a, b) => b.totalValue - a.totalValue).slice(0, 10);
-
-          return res.json({
-            today: { value: todayValue, qty: todayQty },
-            week: { value: weekValue, qty: weekQty },
-            month: { value: monthValue, qty: monthQty },
-            allTime: { value: allTimeValue },
-            reasonBreakdown: reasonTotals,
-            sourceBreakdown: sourceTotals,
-            topItems,
-            trend,
-            totalEntries: pgEntries.length
-          });
-        }
-      } catch (pgErr) {
-        console.error('PG read failed, falling back to Firestore:', pgErr.message);
-      }
-    }
-
-    // ── Firestore fallback path ──
     const snapshot = await db.collection(collections.wasteEntries)
       .where('restaurantId', '==', restaurantId)
       .get();
@@ -26263,22 +25140,6 @@ app.get('/api/inventory/:restaurantId/:itemId', authenticateToken, async (req, r
   try {
     const { restaurantId, itemId } = req.params;
 
-    // ── PG primary path ──
-    if (inventoryRepo) {
-      try {
-        const pgItem = await inventoryRepo.getById(itemId);
-        if (pgItem) {
-          if (pgItem.restaurantId !== restaurantId) {
-            return res.status(403).json({ error: 'Access denied' });
-          }
-          return res.json({ item: pgItem });
-        }
-      } catch (pgErr) {
-        console.error('PG read failed, falling back to Firestore:', pgErr.message);
-      }
-    }
-
-    // ── Firestore fallback path ──
     const itemDoc = await db.collection(collections.inventory).doc(itemId).get();
 
     if (!itemDoc.exists) {
@@ -26379,21 +25240,6 @@ app.get('/api/recipes/:restaurantId', authenticateToken, async (req, res) => {
     const { restaurantId } = req.params;
     const { category } = req.query;
 
-    // ── PG primary path ──
-    if (recipesRepo) {
-      try {
-        const opts = {};
-        if (category && category !== 'all') opts.category = category;
-        const pgRecipes = await recipesRepo.getByRestaurant(restaurantId, opts);
-        if (pgRecipes) {
-          return res.json({ recipes: pgRecipes, total: pgRecipes.length });
-        }
-      } catch (pgErr) {
-        console.error('PG read failed, falling back to Firestore:', pgErr.message);
-      }
-    }
-
-    // ── Firestore fallback path ──
     let query = db.collection(collections.recipes)
       .where('restaurantId', '==', restaurantId);
 
@@ -26501,10 +25347,6 @@ app.post('/api/recipes/:restaurantId', authenticateToken, async (req, res) => {
         recipeId = existingSnap.docs[0].id;
         recipeData.updatedBy = userId;
         await db.collection(collections.recipes).doc(recipeId).update(recipeData);
-        // PG dual-write: recipe update
-        if (recipesRepo) {
-          recipesRepo.update(recipeId, recipeData).catch(e => console.error('PG recipe update failed:', e.message));
-        }
         return res.status(200).json({
           message: 'Recipe updated (replaced existing)',
           recipe: { id: recipeId, ...existingSnap.docs[0].data(), ...recipeData }
@@ -26515,12 +25357,6 @@ app.post('/api/recipes/:restaurantId', authenticateToken, async (req, res) => {
     recipeData.createdAt = new Date();
     recipeData.createdBy = userId;
     const recipeRef = await db.collection(collections.recipes).add(recipeData);
-
-    // PG dual-write: recipe create
-    if (recipesRepo) {
-      recipesRepo.create(recipeRef.id, recipeData).catch(e => console.error('PG recipe create failed:', e.message));
-    }
-
     res.status(201).json({
       message: 'Recipe created successfully',
       recipe: { id: recipeRef.id, ...recipeData }
@@ -26714,12 +25550,6 @@ app.patch('/api/recipes/:restaurantId/:recipeId', authenticateToken, async (req,
     }
 
     await db.collection(collections.recipes).doc(recipeId).update(updateData);
-
-    // PG dual-write: recipe update
-    if (recipesRepo) {
-      recipesRepo.update(recipeId, updateData).catch(e => console.error('PG recipe update failed:', e.message));
-    }
-
     res.json({
       message: 'Recipe updated successfully',
       recipe: { id: recipeId, ...recipeDoc.data(), ...updateData }
@@ -26747,12 +25577,6 @@ app.delete('/api/recipes/:restaurantId/:recipeId', authenticateToken, async (req
     }
 
     await db.collection(collections.recipes).doc(recipeId).delete();
-
-    // PG dual-write: recipe delete
-    if (recipesRepo) {
-      recipesRepo.remove(recipeId).catch(e => console.error('PG recipe delete failed:', e.message));
-    }
-
     res.json({ message: 'Recipe deleted successfully' });
 
   } catch (error) {
@@ -29104,25 +27928,6 @@ app.get('/api/books/:restaurantId/revenue', authenticateToken, async (req, res) 
 
     // Batch-read dailyStats docs for both periods
     let curDocs, prevDocs;
-    if (usePg) {
-      const curIds = curDateStrings.map(ds => getDocId(ds));
-      const prevIds = prevDateStrings.map(ds => getDocId(ds));
-      const [curPg, prevPg] = await Promise.all([
-        dailyStatsRepo.getByIds(curIds),
-        dailyStatsRepo.getByIds(prevIds),
-      ]);
-      // Wrap in Firestore-like shape for downstream code: { exists, data() }
-      curDocs = curPg.map(d => ({ exists: true, data: () => d }));
-      prevDocs = prevPg.map(d => ({ exists: true, data: () => d }));
-    } else {
-      const curRefs = curDateStrings.map(ds => db.collection('dailyStats').doc(getDocId(ds)));
-      const prevRefs = prevDateStrings.map(ds => db.collection('dailyStats').doc(getDocId(ds)));
-      [curDocs, prevDocs] = await Promise.all([
-        curRefs.length > 0 ? db.getAll(...curRefs) : [],
-        prevRefs.length > 0 ? db.getAll(...prevRefs) : []
-      ]);
-    }
-
     // Check if we got any dailyStats data
     const hasDailyStats = curDocs.some(doc => doc.exists);
 
@@ -29609,23 +28414,6 @@ app.get('/api/books/:restaurantId/pnl', authenticateToken, async (req, res) => {
 
     let curStatsDocs, prevStatsDocs;
     const statsPromise = (async () => {
-      if (usePg) {
-        const curIds = curDateStrings.map(ds => `${restaurantId}_${ds}`);
-        const prevIds = prevDateStrings.map(ds => `${restaurantId}_${ds}`);
-        const [curPg, prevPg] = await Promise.all([
-          dailyStatsRepo.getByIds(curIds),
-          dailyStatsRepo.getByIds(prevIds),
-        ]);
-        curStatsDocs = curPg.map(d => ({ exists: true, data: () => d }));
-        prevStatsDocs = prevPg.map(d => ({ exists: true, data: () => d }));
-      } else {
-        const curStatsRefs = curDateStrings.map(ds => db.collection('dailyStats').doc(`${restaurantId}_${ds}`));
-        const prevStatsRefs = prevDateStrings.map(ds => db.collection('dailyStats').doc(`${restaurantId}_${ds}`));
-        [curStatsDocs, prevStatsDocs] = await Promise.all([
-          curStatsRefs.length > 0 ? db.getAll(...curStatsRefs) : [],
-          prevStatsRefs.length > 0 ? db.getAll(...prevStatsRefs) : []
-        ]);
-      }
     })();
 
     const [, txSnap, expSnap, prevExpSnap, retSnap] = await Promise.all([
@@ -29755,33 +28543,17 @@ app.get('/api/books/:restaurantId/overview', authenticateToken, async (req, res)
     const expRef = db.collection(collections.expenses);
     const invRef = db.collection(collections.supplierInvoices);
 
-    // dailyStats: PG primary, Firestore fallback
+    // Fetch dailyStats docs for both periods
     const curDocIds = curDateStrings.map(ds => `${restaurantId}_${ds}`);
     const prevDocIds = prevDateStrings.map(ds => `${restaurantId}_${ds}`);
 
     const [curStatsDocs, prevStatsDocs, txSnap, expSnap, prevExpSnap, duesSnap] = await Promise.all([
       (async () => {
         if (curDocIds.length === 0) return [];
-        if (dailyStatsRepo) {
-          const rows = await dailyStatsRepo.getByIds(curDocIds);
-          const rowMap = {};
-          rows.forEach(d => { rowMap[d.id] = d; });
-          return curDocIds.map(id => rowMap[id]
-            ? { exists: true, data: () => rowMap[id] }
-            : { exists: false });
-        }
         return db.getAll(...curDocIds.map(id => db.collection('dailyStats').doc(id)));
       })(),
       (async () => {
         if (prevDocIds.length === 0) return [];
-        if (dailyStatsRepo) {
-          const rows = await dailyStatsRepo.getByIds(prevDocIds);
-          const rowMap = {};
-          rows.forEach(d => { rowMap[d.id] = d; });
-          return prevDocIds.map(id => rowMap[id]
-            ? { exists: true, data: () => rowMap[id] }
-            : { exists: false });
-        }
         return db.getAll(...prevDocIds.map(id => db.collection('dailyStats').doc(id)));
       })(),
       txRef.where('restaurantId', '==', restaurantId).where('type', '==', 'DEDUCTION').where('date', '>=', start).where('date', '<=', end).get(),
@@ -30350,15 +29122,16 @@ async function syncCustomerToInvModule(db, collections, { restaurantId, name, ph
     const displayName = name || (normalizedPhone ? `Customer ${normalizedPhone}` : 'Walk-in');
 
     if (existingInvCust) {
-      await existingInvCust.ref.update({
+      const syncUpdateData = {
         displayName,
         mobile: normalizedPhone || existingInvCust.data().mobile,
         email: email || existingInvCust.data().email,
         sourceApp: 'dineopen',
         updatedAt: new Date()
-      });
+      };
+      await existingInvCust.ref.update(syncUpdateData);
     } else {
-      await db.collection(collections.invCustomers).add({
+      const syncCustData = {
         orgId, type: 'individual', salutation: '',
         firstName: name || '', lastName: '', companyName: '', displayName,
         email: email || '', workPhone: '', mobile: normalizedPhone || '',
@@ -30369,7 +29142,8 @@ async function syncCustomerToInvModule(db, collections, { restaurantId, name, ph
         contactPersons: [], notes: '', customFields: {},
         status: 'active', sourceApp: 'dineopen', sourceRef: restaurantId,
         createdAt: new Date(), updatedAt: new Date()
-      });
+      };
+      const syncRef = await db.collection(collections.invCustomers).add(syncCustData);
     }
   } catch (err) {
     console.error('Customer inv sync error (non-blocking):', err.message);
@@ -30526,7 +29300,6 @@ app.post('/api/customers', authenticateToken, async (req, res) => {
       };
 
       await existingCustomer.ref.update(updatedData);
-
       // Sync to Invoice module (fire-and-forget)
       syncCustomerToInvModule(db, collections, { restaurantId, name: updatedData.name, phone: updatedData.phone, email: updatedData.email }).catch(() => {});
 
@@ -30567,7 +29340,6 @@ app.post('/api/customers', authenticateToken, async (req, res) => {
 
       const customerRef = await db.collection(collections.customers).add(customerData);
       console.log(`✅ New customer created: ${customerRef.id} with phone: ${phone}`);
-
       // Sync to Invoice module (fire-and-forget)
       syncCustomerToInvModule(db, collections, { restaurantId, name, phone, email }).catch(() => {});
 
@@ -30766,11 +29538,7 @@ app.get('/api/customers/:restaurantId', authenticateToken, async (req, res) => {
     if (!restaurant.exists || restaurant.data().ownerId !== userId) {
       return res.status(403).json({ error: 'Access denied' });
     }
-
     if (search) {
-      // Fetch restaurant customers and filter in memory
-      // Firestore doesn't support full-text search; we use a capped scan
-      // select() only fields needed for search matching + display (skip orderHistory to reduce data transfer)
       const scanLimit = 5000;
       const allSnapshot = await db.collection(collections.customers)
         .where('restaurantId', '==', restaurantId)
@@ -30816,9 +29584,7 @@ app.get('/api/customers/:restaurantId', authenticateToken, async (req, res) => {
       .get();
     const total = countSnapshot.data().count;
 
-    // Fetch paginated customers (select only fields needed for list view, skip orderHistory to reduce transfer)
-    // Supports cursor-based pagination (preferred, avoids reading skipped docs) and offset fallback
-    const cursor = req.query.cursor; // last document ID from previous page
+    const cursor = req.query.cursor;
     const listFields = ['name', 'phone', 'email', 'city', 'totalOrders', 'totalSpent', 'loyaltyPoints', 'lastOrderDate', 'source', 'createdAt', 'dob', 'outstandingBalance', 'restaurantId'];
 
     let query = db.collection(collections.customers)
@@ -30827,13 +29593,11 @@ app.get('/api/customers/:restaurantId', authenticateToken, async (req, res) => {
       .select(...listFields);
 
     if (cursor) {
-      // Cursor-based: start after the last doc from previous page (no wasted reads)
       const cursorDoc = await db.collection(collections.customers).doc(cursor).get();
       if (cursorDoc.exists) {
         query = query.startAfter(cursorDoc);
       }
     } else if (page > 1) {
-      // Fallback: offset-based for backward compatibility
       const skip = (page - 1) * pageSize;
       query = query.offset(skip);
     }
@@ -30851,7 +29615,6 @@ app.get('/api/customers/:restaurantId', authenticateToken, async (req, res) => {
       });
     });
 
-    // Include nextCursor for efficient next-page fetching
     const nextCursor = customers.length === pageSize ? customers[customers.length - 1].id : null;
 
     res.json({
@@ -30877,12 +29640,14 @@ app.get('/api/customers/detail/:customerId', authenticateToken, async (req, res)
     const { customerId } = req.params;
     const { userId } = req.user;
 
-    const customerDoc = await db.collection(collections.customers).doc(customerId).get();
-    if (!customerDoc.exists) {
-      return res.status(404).json({ error: 'Customer not found' });
+    let customerData = null;
+    {
+      const customerDoc = await db.collection(collections.customers).doc(customerId).get();
+      if (!customerDoc.exists) {
+        return res.status(404).json({ error: 'Customer not found' });
+      }
+      customerData = customerDoc.data();
     }
-
-    const customerData = customerDoc.data();
 
     // Verify user has access to this customer's restaurant
     const restaurant = await getCachedRestDoc(customerData.restaurantId);
@@ -30890,7 +29655,7 @@ app.get('/api/customers/detail/:customerId', authenticateToken, async (req, res)
       return res.status(403).json({ error: 'Access denied' });
     }
 
-    res.json({ customer: { id: customerDoc.id, ...customerData } });
+    res.json({ customer: { id: customerId, ...customerData } });
   } catch (error) {
     console.error('Get single customer error:', error);
     res.status(500).json({ error: 'Failed to fetch customer' });
@@ -30925,7 +29690,6 @@ app.patch('/api/customers/:customerId', authenticateToken, async (req, res) => {
     };
 
     await customerDoc.ref.update(updatedData);
-
     // Sync to Invoice module (fire-and-forget)
     syncCustomerToInvModule(db, collections, {
       restaurantId: customerData.restaurantId,
@@ -30971,7 +29735,6 @@ app.delete('/api/customers/:customerId', authenticateToken, async (req, res) => 
 
     // Delete customer
     await customerDoc.ref.delete();
-
     res.json({
       message: 'Customer deleted successfully'
     });
@@ -31106,7 +29869,6 @@ app.post('/api/customers/bulk-import', authenticateToken, async (req, res) => {
     }
 
     await batch.commit();
-
     res.json({
       created,
       updated,
@@ -31189,7 +29951,6 @@ app.post('/api/customers/bulk-delete', authenticateToken, async (req, res) => {
         }
       }
     }
-
     console.log(`🗑️ Bulk deleted ${deletedCount} customers for restaurant ${restaurantId}. Reason: ${reason || 'not specified'}`);
     res.json({ message: `${deletedCount} customers deleted successfully`, deletedCount });
   } catch (error) {
@@ -31577,17 +30338,11 @@ app.post('/api/crave-app/auth/firebase/verify', vercelSecurityMiddleware.publicA
       const loyaltyTier = calculateTier(lifetimePoints);
 
       if (name && (!customerData.name || customerData.name === 'Customer')) {
-        await db.collection('customers').doc(customerDoc.id).update({
-          name: name,
-          loyaltyTier: loyaltyTier,
-          updatedAt: new Date()
-        });
+        const tierUpdate = { name, loyaltyTier, updatedAt: new Date() };
+        await db.collection('customers').doc(customerDoc.id).update(tierUpdate);
       } else if (customerData.loyaltyTier !== loyaltyTier) {
-        // Update tier if changed
-        await db.collection('customers').doc(customerDoc.id).update({
-          loyaltyTier: loyaltyTier,
-          updatedAt: new Date()
-        });
+        const tierUpdate = { loyaltyTier, updatedAt: new Date() };
+        await db.collection('customers').doc(customerDoc.id).update(tierUpdate);
       }
 
       customer = {
@@ -32306,7 +31061,6 @@ app.post('/api/offers/:restaurantId', authenticateToken, async (req, res) => {
     };
 
     const offerRef = await db.collection('offers').add(offerData);
-
     // Invalidate offers cache so public endpoint serves fresh data
     kvDel(`offers:${restaurantId}`).catch(() => {});
 
@@ -32378,7 +31132,6 @@ app.put('/api/offers/:restaurantId/:offerId', authenticateToken, async (req, res
     delete updatedData.id;
 
     await offerDoc.ref.update(updatedData);
-
     // Invalidate offers cache so public endpoint serves fresh data
     kvDel(`offers:${restaurantId}`).catch(() => {});
 
@@ -32426,7 +31179,6 @@ app.delete('/api/offers/:restaurantId/:offerId', authenticateToken, async (req, 
     }
 
     await offerDoc.ref.delete();
-
     // Invalidate offers cache so public endpoint serves fresh data
     kvDel(`offers:${restaurantId}`).catch(() => {});
 
@@ -32661,13 +31413,6 @@ app.put('/api/restaurants/:restaurantId/customer-app-settings', authenticateToke
 
     // Invalidate Redis cache so public endpoints serve fresh data
     invalidateRestaurantCache(restaurantId);
-
-    // PG dual-write: update customer app settings
-    if (restaurantsRepo) {
-      restaurantsRepo.update(restaurantId, { customerAppSettings })
-        .catch(err => console.error('PG update customerAppSettings error:', err.message));
-    }
-
     // Notify all connected clients about offer settings change
     pusherService.pushEvent(restaurantId, 'menu', 'offer-updated', { action: 'settings-updated' });
 
@@ -32781,13 +31526,6 @@ app.put('/api/restaurants/:restaurantId/pricing-settings', authenticateToken, as
 
     // Invalidate Redis cache so public endpoints serve fresh data
     invalidateRestaurantCache(restaurantId);
-
-    // PG dual-write: update pricing settings
-    if (restaurantsRepo) {
-      restaurantsRepo.update(restaurantId, { pricingSettings })
-        .catch(err => console.error('PG update pricingSettings error:', err.message));
-    }
-
     res.json({
       message: 'Pricing settings updated successfully',
       settings: pricingSettings
@@ -32974,13 +31712,6 @@ app.put('/api/restaurants/:restaurantId/billing-settings', authenticateToken, as
 
     // Invalidate Redis cache so public endpoints serve fresh data
     invalidateRestaurantCache(restaurantId);
-
-    // PG dual-write: update billing settings
-    if (restaurantsRepo) {
-      restaurantsRepo.update(restaurantId, { billingSettings })
-        .catch(err => console.error('PG update billingSettings error:', err.message));
-    }
-
     res.json({
       message: 'Billing settings updated successfully',
       settings: billingSettings,
@@ -33086,13 +31817,6 @@ app.post('/api/orders/:orderId/refund', authenticateToken, async (req, res) => {
     };
     await orderRef.update(updateFields);
 
-    // Dual-write to PostgreSQL (fire-and-forget)
-    if (usePg) {
-      ordersRepo.update(orderId, updateFields).catch(pgErr => {
-        console.error('⚠️ PG dual-write error (refund):', pgErr.message);
-      });
-    }
-
     // On full refund, reverse all side effects (inventory, customer stats, loyalty, offers)
     let reversals = null;
     if (isFullRefund) {
@@ -33178,26 +31902,20 @@ app.post('/api/orders/:orderId/partial-payment', authenticateToken, async (req, 
     };
     await orderRef.update(partialPaymentUpdate);
 
-    // Dual-write to PostgreSQL (fire-and-forget)
-    if (usePg) {
-      ordersRepo.update(orderId, partialPaymentUpdate).catch(pgErr => {
-        console.error('⚠️ PG dual-write error (partial-payment):', pgErr.message);
-      });
-    }
-
     // Update customer credit if customerId provided
     if (customerId && outstanding > 0) {
+      const partialCreditEntry = {
+        orderId,
+        orderNumber: orderData.orderNumber || orderId,
+        date: new Date().toISOString(),
+        totalAmount: finalAmount,
+        paidAmount: totalPaid,
+        outstandingAmount: outstanding
+      };
       const customerRef = db.collection(collections.customers).doc(customerId);
       await customerRef.update({
         outstandingBalance: FieldValue.increment(outstanding),
-        creditHistory: FieldValue.arrayUnion({
-          orderId,
-          orderNumber: orderData.orderNumber || orderId,
-          date: new Date().toISOString(),
-          totalAmount: finalAmount,
-          paidAmount: totalPaid,
-          outstandingAmount: outstanding
-        })
+        creditHistory: FieldValue.arrayUnion(partialCreditEntry)
       });
     }
 
@@ -33267,20 +31985,6 @@ app.post('/api/orders/:orderId/comp-void', authenticateToken, async (req, res) =
       adjustedFinalAmount,
       updatedAt: new Date(),
     });
-
-    // Dual-write to PostgreSQL (fire-and-forget)
-    if (usePg) {
-      const pgCompVoidUpdate = {
-        compAmount: Math.round(newCompAmount * 100) / 100,
-        updatedAt: new Date(),
-      };
-      if (type === 'void') {
-        pgCompVoidUpdate.voidItems = [...(orderData.voidItems || []), ...newItems];
-      }
-      ordersRepo.update(orderId, pgCompVoidUpdate).catch(pgErr => {
-        console.error('⚠️ PG dual-write error (comp-void):', pgErr.message);
-      });
-    }
 
     res.json({
       success: true,
@@ -33461,23 +32165,6 @@ app.patch('/api/orders/:orderId/edit-completed', authenticateToken, async (req, 
     updateData.editHistory = [...existingHistory, editEntry];
 
     await orderRef.update(updateData);
-
-    // Dual-write to PostgreSQL (fire-and-forget)
-    if (usePg) {
-      // Filter out FieldValue sentinels (delete/serverTimestamp) — PG uses NULL/new Date() instead
-      const pgUpdateData = {};
-      for (const [k, v] of Object.entries(updateData)) {
-        if (v && typeof v === 'object' && typeof v.isEqual === 'function') {
-          // Firestore FieldValue sentinel — convert to null for PG
-          pgUpdateData[k] = null;
-        } else {
-          pgUpdateData[k] = v;
-        }
-      }
-      ordersRepo.update(orderId, pgUpdateData).catch(pgErr => {
-        console.error('⚠️ PG dual-write error (edit-completed):', pgErr.message);
-      });
-    }
 
     // Correct dailyStats if payment status or amounts changed (affects revenue calculation)
     if (updateData.paymentStatus || updateData.paidAmount !== undefined || updateData.outstandingAmount !== undefined) {
@@ -33832,13 +32519,6 @@ app.patch('/api/orders/:orderId/edit-completed-items', authenticateToken, async 
     // Save updated order
     await orderRef.update(updateData);
 
-    // Dual-write to PostgreSQL (fire-and-forget)
-    if (usePg) {
-      ordersRepo.update(orderId, updateData).catch(pgErr => {
-        console.error('⚠️ PG dual-write error (edit-completed-items):', pgErr.message);
-      });
-    }
-
     // --- Inventory adjustment ---
     try {
       // Use composite key for inventory so variant items are tracked separately
@@ -34092,7 +32772,6 @@ app.post('/api/customers/:customerId/settle-credit', authenticateToken, async (r
     }
 
     await customerRef.update(updateData);
-
     // Also update the order document if orderId provided
     if (orderId) {
       const orderRef = db.collection(collections.orders).doc(orderId);
@@ -34108,7 +32787,6 @@ app.post('/api/customers/:customerId/settle-credit', authenticateToken, async (r
           paymentStatus: newPaymentStatus,
           settledAt: new Date().toISOString(),
         };
-        // Update payment method to the settlement method (so revenue shows under correct method)
         if (paymentMethod && newPaymentStatus === 'paid') {
           orderUpdate.paymentMethod = paymentMethod;
         }
@@ -34118,7 +32796,6 @@ app.post('/api/customers/:customerId/settle-credit', authenticateToken, async (r
         await customerRef.update({
           totalSpent: FieldValue.increment(settleAmount),
         });
-
         // Also update the embedded orderHistory entry on the customer doc
         const orderHistory = customerData.orderHistory || [];
         const updatedOrderHistory = orderHistory.map(entry => {
@@ -34131,7 +32808,6 @@ app.post('/api/customers/:customerId/settle-credit', authenticateToken, async (r
           await customerRef.update({ orderHistory: updatedOrderHistory });
         }
 
-        // Update daily stats: add settled amount to revenue for the order's original date
         const tzOffset = parseTZ(req);
         updateDailyStatsRevenueDiff(orderData.restaurantId, orderData, 0, settleAmount, 0, settleAmount, tzOffset, parseDayStart(req));
       }
@@ -34245,7 +32921,6 @@ app.post('/api/customers/:customerId/bulk-settle-credit', authenticateToken, asy
       // Increment totalSpent by the actual settled amount (was excluded when orders were created as due)
       totalSpent: FieldValue.increment(settledTotal),
     });
-
     res.json({ success: true, newBalance, settledTotal: Math.round(settledTotal * 100) / 100, settledOrders: settledOrderNumbers });
   } catch (error) {
     console.error('Error bulk settling credit:', error);
@@ -34312,7 +32987,6 @@ app.post('/api/customers/:customerId/wallet/credit', authenticateToken, async (r
       walletHistory: walletHistory,
       updatedAt: new Date().toISOString()
     });
-
     res.json({
       success: true,
       walletBalance: newBalance,
@@ -34370,7 +33044,6 @@ app.post('/api/customers/:customerId/wallet/redeem', authenticateToken, async (r
       walletHistory: walletHistory,
       updatedAt: new Date().toISOString()
     });
-
     res.json({
       success: true,
       walletBalance: newBalance,
@@ -34570,14 +33243,6 @@ app.post('/api/restaurants/:restaurantId/generate-code', authenticateToken, asyn
       'customerAppSettings.enabled': customerAppSettings.enabled ?? true,
       updatedAt: new Date()
     });
-
-    // PG dual-write: update restaurant code
-    if (restaurantsRepo) {
-      const updatedSettings = { ...customerAppSettings, restaurantCode: newCode, enabled: customerAppSettings.enabled ?? true };
-      restaurantsRepo.update(restaurantId, { customerAppSettings: updatedSettings, restaurantCode: newCode })
-        .catch(err => console.error('PG update restaurantCode error:', err.message));
-    }
-
     res.json({
       success: true,
       restaurantCode: newCode,
@@ -35724,7 +34389,7 @@ app.post('/api/automation/webhook/whatsapp', async (req, res) => {
                       logEntry.longitude = processedMessage.longitude;
                       logEntry.locationName = processedMessage.locationName || '';
                     }
-                    await db.collection(collections.automationLogs).add(logEntry);
+                    const triggerLogRef = await db.collection(collections.automationLogs).add(logEntry);
                   }
 
                   // Fallback: if no restaurant matched, still log for super-admin inbox
@@ -35750,7 +34415,7 @@ app.post('/api/automation/webhook/whatsapp', async (req, res) => {
                       logEntry.longitude = processedMessage.longitude;
                       logEntry.locationName = processedMessage.locationName || '';
                     }
-                    await db.collection(collections.automationLogs).add(logEntry);
+                    const noMatchLogRef = await db.collection(collections.automationLogs).add(logEntry);
                     console.log('📩 WhatsApp message logged for super-admin inbox (no restaurant match):', processedMessage.from);
 
                     // Auto-create demo request on first WhatsApp message from new customer
@@ -35767,7 +34432,7 @@ app.post('/api/automation/webhook/whatsapp', async (req, res) => {
 
                       if (existingDemo.empty) {
                         const demoRef = db.collection('demoRequests').doc();
-                        await demoRef.set({
+                        const whatsappDemoData = {
                           id: demoRef.id,
                           contactType: 'phone',
                           phone: custPhone,
@@ -35780,7 +34445,8 @@ app.post('/api/automation/webhook/whatsapp', async (req, res) => {
                           updatedAt: new Date(),
                           ipAddress: '',
                           userAgent: 'WhatsApp',
-                        });
+                        };
+                        await demoRef.set(whatsappDemoData);
                         console.log(`📋 Demo request created for WhatsApp lead: ${custPhone}`);
                       } else {
                         const docId = existingDemo.docs[0].id;
@@ -36558,11 +35224,11 @@ app.post('/api/automation/:restaurantId/whatsapp/connect', authenticateToken, as
         if (!existingSnapshot.empty) {
           await existingSnapshot.docs[0].ref.update(settingsData);
         } else {
-          await db.collection(collections.automationSettings).add(settingsData);
+          const settingsRef = await db.collection(collections.automationSettings).add(settingsData);
         }
 
-        res.json({ 
-          success: true, 
+        res.json({
+          success: true,
           message: 'Restaurant WhatsApp connected successfully',
           phoneNumber: phoneNumber
         });
@@ -36609,11 +35275,11 @@ app.post('/api/automation/:restaurantId/whatsapp/connect', authenticateToken, as
       if (!existingSnapshot.empty) {
         await existingSnapshot.docs[0].ref.update(settingsData);
       } else {
-        await db.collection(collections.automationSettings).add(settingsData);
+        const dineopenSettingsRef = await db.collection(collections.automationSettings).add(settingsData);
       }
 
-      res.json({ 
-        success: true, 
+      res.json({
+        success: true,
         message: 'DineOpen WhatsApp enabled successfully',
         note: 'Messages will be sent from DineOpen\'s shared number'
       });
@@ -36744,7 +35410,7 @@ app.post('/api/automation/:restaurantId/whatsapp/embedded-signup', authenticateT
     if (!existingSnapshot.empty) {
       await existingSnapshot.docs[0].ref.update(settingsData);
     } else {
-      await db.collection(collections.automationSettings).add(settingsData);
+      const embeddedSettingsRef = await db.collection(collections.automationSettings).add(settingsData);
     }
 
     res.json({
@@ -36827,7 +35493,7 @@ app.post('/api/automation/:restaurantId/whatsapp/test', authenticateToken, async
 
     if (sendResult.success) {
       // Log test message
-      await db.collection(collections.automationLogs).add({
+      const testMsgLogData = {
         restaurantId,
         type: 'test_message',
         phone: phoneNumber,
@@ -36835,8 +35501,8 @@ app.post('/api/automation/:restaurantId/whatsapp/test', authenticateToken, async
         messageId: sendResult.messageId,
         status: 'sent',
         timestamp: new Date()
-      });
-
+      };
+      const testMsgLogRef = await db.collection(collections.automationLogs).add(testMsgLogData);
       res.json({
         success: true,
         messageId: sendResult.messageId,
@@ -36971,7 +35637,7 @@ app.post('/api/automation/:restaurantId/whatsapp/send-bill', authenticateToken, 
 
     if (sendResult.success) {
       // Log the sent bill
-      await db.collection(collections.automationLogs).add({
+      const billSentLogData = {
         restaurantId,
         type: 'bill_sent',
         phone: customerPhone,
@@ -36983,8 +35649,8 @@ app.post('/api/automation/:restaurantId/whatsapp/send-bill', authenticateToken, 
         direction: 'outgoing',
         status: 'sent',
         timestamp: new Date()
-      });
-
+      };
+      const billSentLogRef = await db.collection(collections.automationLogs).add(billSentLogData);
       res.json({ success: true, messageId: sendResult.messageId, message: 'Bill sent on WhatsApp!' });
     } else {
       res.status(500).json({ success: false, error: sendResult.error || 'Failed to send bill' });
@@ -37125,7 +35791,7 @@ app.post('/api/automation/:restaurantId/whatsapp/reply', authenticateToken, asyn
     const sendResult = await whatsappService.sendTextMessage(phone, message, credentials);
 
     if (sendResult.success) {
-      await db.collection(collections.automationLogs).add({
+      const replyLogData = {
         restaurantId,
         type: 'reply',
         phone,
@@ -37136,8 +35802,8 @@ app.post('/api/automation/:restaurantId/whatsapp/reply', authenticateToken, asyn
         sentBy: req.user?.userId || req.user?.uid || null,
         sentByName: req.user?.name || req.user?.displayName || req.user?.email || 'Staff',
         timestamp: new Date()
-      });
-
+      };
+      const replyLogRef = await db.collection(collections.automationLogs).add(replyLogData);
       res.json({ success: true, messageId: sendResult.messageId });
     } else {
       res.status(500).json({ success: false, error: sendResult.error || 'Failed to send reply' });
@@ -37692,13 +36358,6 @@ app.post('/api/sync/batch', authenticateToken, async (req, res) => {
             if (payload.items) updateData.items = payload.items;
 
             await orderRef.update(updateData);
-
-            // Dual-write to PostgreSQL (fire-and-forget)
-            if (usePg) {
-              ordersRepo.update(orderId, updateData).catch(pgErr => {
-                console.error('⚠️ PG dual-write error (offline-sync):', pgErr.message);
-              });
-            }
 
             result = { order: { id: orderId, ...updateData } };
             break;

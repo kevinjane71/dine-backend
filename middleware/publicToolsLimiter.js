@@ -45,17 +45,15 @@ const publicToolsLimiter = {
       const docId = `ip_${this.sanitizeIP(ip)}_${todayKey}`;
       const ref = db.collection('publicToolUsage').doc(docId);
 
-      await ref.set(
-        {
-          ipAddress: ip,
-          date: todayKey,
-          callCount: 1,
-          lastCallAt: now,
-          lastTool: tool,
-          createdAt: now,
-        },
-        { merge: true }
-      );
+      const setData = {
+        ipAddress: ip,
+        date: todayKey,
+        callCount: 1,
+        lastCallAt: now,
+        lastTool: tool,
+        createdAt: now,
+      };
+      await ref.set(setData, { merge: true });
 
       await ref.update({
         callCount: db.FieldValue.increment(1),

@@ -52,6 +52,9 @@ const FIELD_MAP = {
   // Menu flag
   hasDefaultMenu:              'has_default_menu',
 
+  // Menu (embedded items + categories)
+  menu:                        'menu',
+
   // JSONB complex settings
   operatingHours:              'operating_hours',
   features:                    'features',
@@ -89,13 +92,12 @@ const JSONB_COLUMNS = new Set([
   'currency_settings', 'customer_app_settings', 'billing_settings',
   'billing_audit', 'booking_settings', 'feedback_settings',
   'bar_inventory_settings', 'discount_approval_settings', 'kot_settings',
-  'extra_data',
+  'menu', 'extra_data',
 ]);
 
 // Fields to skip entirely (too large / separate concern)
 const SKIP_FIELDS = new Set([
   'qrCode',     // Huge base64 string, fetched separately
-  'menu',       // Huge object, fetched via /api/menus
 ]);
 
 /**

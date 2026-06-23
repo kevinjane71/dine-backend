@@ -220,13 +220,14 @@ class BolnaService {
 
     // Update Firestore with phone number
     const assignedNumber = inboundResult.phone_number || buyResult.phone_number || selectedNumber.phone_number;
-    await db.collection('bolnaAgents').doc(restaurantId).update({
+    const phoneUpdateData = {
       phoneNumber: assignedNumber,
       phoneNumberId: phoneNumberId,
       telephonyProvider: provider || selectedNumber.provider || 'bolna',
       status: 'active',
       updatedAt: FieldValue.serverTimestamp()
-    });
+    };
+    await db.collection('bolnaAgents').doc(restaurantId).update(phoneUpdateData);
 
     return {
       success: true,

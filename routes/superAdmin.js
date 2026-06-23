@@ -9,8 +9,6 @@ const { parseTZ, todayInTZ, dateStrInTZ, dateBoundsInTZ } = require('../utils/ti
 const subAdminRoutes = require('./subAdmin');
 const { getCachedRestDoc } = require('../utils/kvCache');
 
-const usePg = !!process.env.DATABASE_URL;
-const dailyStatsRepo = usePg ? require('../repos/dailyStatsRepo') : null;
 
 // ─── Constants ───────────────────────────────────────────────────────
 const DEFAULT_PAGE_SIZE = 50;
@@ -132,9 +130,6 @@ router.get('/stats', authenticateSuperAdmin, requireSuperAdmin, async (req, res)
       // dailyStats: PG primary, Firestore fallback
       (async () => {
         const todayStr = getTodayString(parseTZ(req));
-        if (dailyStatsRepo) {
-          return dailyStatsRepo.getByDate(todayStr);
-        }
         const snap = await db.collection('dailyStats').where('date', '==', todayStr).get();
         return snap.docs.map(doc => doc.data());
       })(),
@@ -1300,21 +1295,13 @@ router.get('/orders/summary', authenticateSuperAdmin, requireSuperAdmin, async (
     const dateStrings = getDateStringsForPeriod(period, parseTZ(req));
     const perRestLimit = parseLimit(req.query.limit);
 
-    // dailyStats: PG primary, Firestore fallback
-    let dailyStatsData = [];
-    if (dailyStatsRepo) {
-      dailyStatsData = dateStrings.length === 1
-        ? await dailyStatsRepo.getByDate(dateStrings[0])
-        : await dailyStatsRepo.getByDates(dateStrings);
+    let snap;
+    if (dateStrings.length === 1) {
+      snap = await db.collection('dailyStats').where('date', '==', dateStrings[0]).get();
     } else {
-      let snap;
-      if (dateStrings.length === 1) {
-        snap = await db.collection('dailyStats').where('date', '==', dateStrings[0]).get();
-      } else {
-        snap = await db.collection('dailyStats').where('date', 'in', dateStrings).get();
-      }
-      dailyStatsData = snap.docs.map(doc => doc.data());
+      snap = await db.collection('dailyStats').where('date', 'in', dateStrings).get();
     }
+    const dailyStatsData = snap.docs.map(doc => doc.data());
 
     let totalOrders = 0;
     let totalRevenue = 0;
@@ -2522,7 +2509,7 @@ router.post('/whatsapp/reply', authenticateSuperAdmin, requireSuperAdmin, async 
     }
 
     // Log outgoing message
-    await db.collection(collections.automationLogs).add({
+    const logData = {
       restaurantId: null,
       type: 'reply',
       direction: 'outgoing',
@@ -2533,7 +2520,8 @@ router.post('/whatsapp/reply', authenticateSuperAdmin, requireSuperAdmin, async 
       sentBy: req.admin?.id || 'super-admin',
       sentByName: req.admin?.name || req.admin?.username || 'Super Admin',
       timestamp: new Date(),
-    });
+    };
+    const logRef = await db.collection(collections.automationLogs).add(logData);
 
     res.json({ success: true, messageId: result.messageId });
   } catch (error) {

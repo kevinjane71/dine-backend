@@ -56,10 +56,11 @@ const vercelRateLimiter = {
   // Save rate limit data to Firestore
   async saveClientData(clientId, data) {
     try {
-      await db.collection('rateLimits').doc(clientId).set({
+      const saveData = {
         ...data,
         lastUpdated: new Date().toISOString()
-      }, { merge: true });
+      };
+      await db.collection('rateLimits').doc(clientId).set(saveData, { merge: true });
     } catch (error) {
       console.error('Error saving client data:', error);
     }

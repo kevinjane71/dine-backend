@@ -110,7 +110,7 @@ When user says "stop", "close", "bye", "cancel" - say goodbye briefly.`;
       });
 
       // Store in Firestore
-      await db.collection('dineai_cheap_sessions').doc(sessionId).set({
+      const cheapSessionData = {
         sessionId,
         restaurantId,
         userId,
@@ -119,7 +119,8 @@ When user says "stop", "close", "bye", "cancel" - say goodbye briefly.`;
         status: 'active',
         messageCount: 0,
         createdAt: new Date()
-      });
+      };
+      await db.collection('dineai_cheap_sessions').doc(sessionId).set(cheapSessionData);
 
       console.log(`🎤 Cheap voice session created: ${sessionId}`);
 
@@ -279,10 +280,8 @@ When user says "stop", "close", "bye", "cancel" - say goodbye briefly.`;
 
       // Update session in Firestore
       const db = getDb();
-      await db.collection('dineai_cheap_sessions').doc(sessionId).update({
-        messageCount: session.conversationHistory.length,
-        lastMessageAt: new Date()
-      });
+      const cheapUpdateData = { messageCount: session.conversationHistory.length, lastMessageAt: new Date() };
+      await db.collection('dineai_cheap_sessions').doc(sessionId).update(cheapUpdateData);
 
       // Log token usage
       const tokensUsed = completion.usage?.total_tokens || 0;
@@ -347,10 +346,8 @@ When user says "stop", "close", "bye", "cancel" - say goodbye briefly.`;
       const session = this.activeSessions.get(sessionId);
 
       const db = getDb();
-      await db.collection('dineai_cheap_sessions').doc(sessionId).update({
-        status: 'ended',
-        endedAt: new Date()
-      });
+      const cheapEndData = { status: 'ended', endedAt: new Date() };
+      await db.collection('dineai_cheap_sessions').doc(sessionId).update(cheapEndData);
 
       this.activeSessions.delete(sessionId);
 

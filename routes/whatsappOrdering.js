@@ -8,6 +8,7 @@
 const express = require('express');
 const router = express.Router();
 const { getDb, collections } = require('../firebase');
+
 const { getCachedRestDoc } = require('../utils/kvCache');
 const { authenticateToken } = require('../middleware/auth');
 const whatsappService = require('../services/whatsappService');
@@ -87,7 +88,7 @@ router.post('/webhook', async (req, res) => {
         .limit(1)
         .get();
       logEntry.restaurantId = automationMatch.empty ? null : automationMatch.docs[0].data().restaurantId;
-      await db.collection(collections.automationLogs).add(logEntry);
+      const automationLogRef = await db.collection(collections.automationLogs).add(logEntry);
     } catch (logErr) {
       console.error('automationLogs log error (non-blocking):', logErr.message);
     }
@@ -109,7 +110,7 @@ router.post('/webhook', async (req, res) => {
       if (existingDemo.empty) {
         // First message — create new demo request
         const demoRef = db.collection('demoRequests').doc();
-        await demoRef.set({
+        const demoData = {
           id: demoRef.id,
           contactType: 'phone',
           phone: customerPhone,
@@ -122,7 +123,8 @@ router.post('/webhook', async (req, res) => {
           updatedAt: new Date(),
           ipAddress: '',
           userAgent: 'WhatsApp',
-        });
+        };
+        await demoRef.set(demoData);
         console.log(`📋 Demo request created for WhatsApp lead: ${customerPhone}`);
       } else {
         // Subsequent message — update last message and timestamp
@@ -219,7 +221,7 @@ router.post('/webhook', async (req, res) => {
     // Log the conversation
     try {
       const db = getDb();
-      await db.collection('whatsappConversationLogs').add({
+      const convLogData = {
         restaurantId,
         customerPhone,
         contactName: contact?.profile?.name || '',
@@ -228,7 +230,8 @@ router.post('/webhook', async (req, res) => {
         interactiveId,
         responseCount: result.messages.length,
         createdAt: new Date().toISOString()
-      });
+      };
+      const convLogRef = await db.collection('whatsappConversationLogs').add(convLogData);
     } catch (logErr) {
       console.error('Conversation log error (non-blocking):', logErr.message);
     }
@@ -357,10 +360,8 @@ router.put('/toggle/:restaurantId', authenticateToken, async (req, res) => {
       return res.status(400).json({ success: false, error: 'Please configure your WhatsApp credentials first' });
     }
 
-    await db.collection('whatsappOrderingConfig').doc(restaurantId).update({
-      enabled: !!enabled,
-      updatedAt: new Date().toISOString()
-    });
+    const toggleData = { enabled: !!enabled, updatedAt: new Date().toISOString() };
+    await db.collection('whatsappOrderingConfig').doc(restaurantId).update(toggleData);
 
     res.json({ success: true, enabled: !!enabled });
   } catch (error) {

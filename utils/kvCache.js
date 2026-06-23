@@ -130,7 +130,7 @@ async function getCachedRestaurant(db, collection, restaurantId) {
       const pgData = await restaurantsRepo.getById(restaurantId);
       if (pgData) {
         kvSet(cacheKey, pgData, 180).catch(() => {});
-        return { data: pgData, fromCache: true }; // fromCache=true since it's not a raw Firestore doc
+        return { data: pgData, fromCache: true };
       }
     } catch (err) {
       // PG failed, fall through to Firestore

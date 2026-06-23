@@ -199,10 +199,11 @@ router.delete('/:orgId/templates/:templateId', async (req, res) => {
       return res.status(403).json({ success: false, error: 'Template does not belong to this organization' });
     }
 
-    await templateRef.update({
+    const archiveUpdates = {
       status: 'archived',
       updatedAt: new Date().toISOString(),
-    });
+    };
+    await templateRef.update(archiveUpdates);
 
     return res.json({ success: true, message: 'Template archived successfully' });
   } catch (error) {
@@ -384,10 +385,11 @@ router.delete('/:orgId/templates/:templateId/items/:itemId', async (req, res) =>
       return res.status(403).json({ success: false, error: 'Item does not belong to this template or organization' });
     }
 
-    await itemRef.update({
+    const deactivateUpdates = {
       status: 'inactive',
       updatedAt: new Date().toISOString(),
-    });
+    };
+    await itemRef.update(deactivateUpdates);
 
     return res.json({ success: true, message: 'Item deactivated successfully' });
   } catch (error) {
@@ -541,11 +543,12 @@ async function pushTemplateToOutlets(templateId, outletIds, overwriteExisting = 
   const existingOutlets = template.assignedOutlets || [];
   const allOutlets = [...new Set([...existingOutlets, ...outletIds])];
 
-  await templateRef.update({
+  const pushUpdates = {
     assignedOutlets: allOutlets,
     lastPushedAt: now,
     updatedAt: now,
-  });
+  };
+  await templateRef.update(pushUpdates);
 
   return { results, template };
 }
@@ -583,7 +586,7 @@ router.post('/:orgId/templates/:templateId/push', async (req, res) => {
 
     // Log to audit
     const auditRef = db.collection(collections.orgAuditLog).doc();
-    await auditRef.set({
+    const auditData = {
       id: auditRef.id,
       organizationId: orgId,
       action: 'template_push',
@@ -594,7 +597,8 @@ router.post('/:orgId/templates/:templateId/push', async (req, res) => {
       results,
       performedBy: req.user.uid,
       performedAt: new Date().toISOString(),
-    });
+    };
+    await auditRef.set(auditData);
 
     return res.json({
       success: true,
@@ -719,14 +723,15 @@ router.post('/:orgId/templates/:templateId/sync', async (req, res) => {
     }
 
     // Update template metadata
-    await templateRef.update({
+    const syncTemplateUpdates = {
       lastPushedAt: now,
       updatedAt: now,
-    });
+    };
+    await templateRef.update(syncTemplateUpdates);
 
     // Log to audit
     const auditRef = db.collection(collections.orgAuditLog).doc();
-    await auditRef.set({
+    const syncAuditData = {
       id: auditRef.id,
       organizationId: orgId,
       action: 'template_sync',
@@ -736,7 +741,8 @@ router.post('/:orgId/templates/:templateId/sync', async (req, res) => {
       results,
       performedBy: req.user.uid,
       performedAt: now,
-    });
+    };
+    await auditRef.set(syncAuditData);
 
     return res.json({
       success: true,
@@ -983,7 +989,7 @@ router.post('/:orgId/import-from-outlet/:restaurantId', async (req, res) => {
 
     // Log to audit
     const auditRef = db.collection(collections.orgAuditLog).doc();
-    await auditRef.set({
+    const importAuditData = {
       id: auditRef.id,
       organizationId: orgId,
       action: 'menu_import',
@@ -992,7 +998,8 @@ router.post('/:orgId/import-from-outlet/:restaurantId', async (req, res) => {
       itemCount: createdItems.length,
       performedBy: req.user.uid,
       performedAt: now,
-    });
+    };
+    await auditRef.set(importAuditData);
 
     return res.status(201).json({
       success: true,

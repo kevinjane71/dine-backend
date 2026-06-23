@@ -57,11 +57,13 @@ const initializeDodoPaymentRoutes = (db) => {
 
   /** Helper: log a billing event to dine_dodo_billing collection */
   async function logBillingEvent(data) {
-    return db.collection('dine_dodo_billing').add({
+    const billingDoc = {
       ...data,
       app: 'Dine',
       createdAt: new Date().toISOString(),
-    });
+    };
+    const ref = await db.collection('dine_dodo_billing').add(billingDoc);
+    return ref;
   }
 
   /** Helper: find user by Dodo info (metadata.userId → subscriptionId → email) */
@@ -302,11 +304,12 @@ const initializeDodoPaymentRoutes = (db) => {
         });
 
         // Update order record
-        await latestDoc.ref.update({
+        const verifyUpdateData = {
           status: 'paid',
           dodoSubscriptionId: subscription_id,
           completedAt: new Date().toISOString(),
-        });
+        };
+        await latestDoc.ref.update(verifyUpdateData);
 
         await logBillingEvent({
           userId,
@@ -396,7 +399,8 @@ const initializeDodoPaymentRoutes = (db) => {
         eventType: 'manual-sync',
       });
 
-      await latestDoc.ref.update({ status: 'paid', syncedAt: new Date().toISOString() });
+      const syncUpdateData = { status: 'paid', syncedAt: new Date().toISOString() };
+      await latestDoc.ref.update(syncUpdateData);
 
       await logBillingEvent({
         userId,
@@ -581,7 +585,7 @@ const initializeDodoPaymentRoutes = (db) => {
       console.log('[DODO] Webhook received:', { eventType, dataKeys: Object.keys(data) });
 
       // Store every webhook event for audit trail
-      const eventRef = await db.collection('dine_dodo_webhook_events').add({
+      const webhookEventDoc = {
         eventType,
         payload,
         headers: {
@@ -591,7 +595,8 @@ const initializeDodoPaymentRoutes = (db) => {
         receivedAt: new Date().toISOString(),
         processed: false,
         app: 'Dine'
-      });
+      };
+      const eventRef = await db.collection('dine_dodo_webhook_events').add(webhookEventDoc);
 
       try {
         // Helper to extract userId from event data
@@ -628,11 +633,13 @@ const initializeDodoPaymentRoutes = (db) => {
                   const t = new Date(doc.data().createdAt).getTime();
                   if (t > latestTime) { latestTime = t; latestDoc = doc; }
                 });
-                await latestDoc.ref.update({
+                const paidUpdateData = {
                   status: 'paid',
                   paymentId: paymentData.id || paymentData.payment_id,
                   paidAt: new Date().toISOString()
-                });
+                };
+                await latestDoc.ref.update(paidUpdateData);
+
               }
 
               // Activate subscription
@@ -674,10 +681,12 @@ const initializeDodoPaymentRoutes = (db) => {
                   const t = new Date(doc.data().createdAt).getTime();
                   if (t > latestTime) { latestTime = t; latestDoc = doc; }
                 });
-                await latestDoc.ref.update({
+                const failedUpdateData = {
                   status: 'failed',
                   failedAt: new Date().toISOString()
-                });
+                };
+                await latestDoc.ref.update(failedUpdateData);
+
               }
             }
 
@@ -719,10 +728,12 @@ const initializeDodoPaymentRoutes = (db) => {
                   const t = new Date(doc.data().createdAt).getTime();
                   if (t > latestTime) { latestTime = t; latestDoc = doc; }
                 });
-                await latestDoc.ref.update({
+                const cancelledUpdateData = {
                   status: 'cancelled',
                   cancelledAt: new Date().toISOString()
-                });
+                };
+                await latestDoc.ref.update(cancelledUpdateData);
+
               }
             }
 
@@ -914,7 +925,7 @@ const initializeDodoPaymentRoutes = (db) => {
             const refundData = data.refund || data;
             const userId = extractUserId(refundData);
 
-            await db.collection('dine_dodo_refunds').add({
+            const refundSucceededDoc = {
               refundId: refundData.id || refundData.refund_id,
               paymentId: refundData.payment_id,
               amount: refundData.amount,
@@ -924,7 +935,8 @@ const initializeDodoPaymentRoutes = (db) => {
               reason: refundData.reason || '',
               refundedAt: new Date().toISOString(),
               app: 'Dine'
-            });
+            };
+            await db.collection('dine_dodo_refunds').add(refundSucceededDoc);
 
             // Downgrade subscription on refund
             if (userId) {
@@ -949,7 +961,7 @@ const initializeDodoPaymentRoutes = (db) => {
             const refundData = data.refund || data;
             const userId = extractUserId(refundData);
 
-            await db.collection('dine_dodo_refunds').add({
+            const refundFailedDoc = {
               refundId: refundData.id || refundData.refund_id,
               paymentId: refundData.payment_id,
               amount: refundData.amount,
@@ -957,7 +969,8 @@ const initializeDodoPaymentRoutes = (db) => {
               status: 'failed',
               failedAt: new Date().toISOString(),
               app: 'Dine'
-            });
+            };
+            await db.collection('dine_dodo_refunds').add(refundFailedDoc);
 
             await logBillingEvent({ userId, type: 'refund_failed', dodoPaymentId: refundData.payment_id });
             console.log(`[DODO] Refund failed for user: ${userId}`);
@@ -969,7 +982,7 @@ const initializeDodoPaymentRoutes = (db) => {
             const disputeData = data.dispute || data;
             const userId = extractUserId(disputeData);
 
-            await db.collection('dine_dodo_disputes').add({
+            const disputeOpenedDoc = {
               disputeId: disputeData.id || disputeData.dispute_id,
               paymentId: disputeData.payment_id,
               amount: disputeData.amount,
@@ -979,7 +992,8 @@ const initializeDodoPaymentRoutes = (db) => {
               reason: disputeData.reason || '',
               openedAt: new Date().toISOString(),
               app: 'Dine'
-            });
+            };
+            await db.collection('dine_dodo_disputes').add(disputeOpenedDoc);
 
             if (userId) {
               await updateDodoSubscription(db, userId, {
@@ -997,13 +1011,14 @@ const initializeDodoPaymentRoutes = (db) => {
             const disputeData = data.dispute || data;
             const userId = extractUserId(disputeData);
 
-            await db.collection('dine_dodo_disputes').add({
+            const disputeWonDoc = {
               disputeId: disputeData.id || disputeData.dispute_id,
               userId: userId,
               status: 'won',
               resolvedAt: new Date().toISOString(),
               app: 'Dine'
-            });
+            };
+            await db.collection('dine_dodo_disputes').add(disputeWonDoc);
 
             // Reactivate — merchant won
             if (userId) {
@@ -1022,13 +1037,14 @@ const initializeDodoPaymentRoutes = (db) => {
             const disputeData = data.dispute || data;
             const userId = extractUserId(disputeData);
 
-            await db.collection('dine_dodo_disputes').add({
+            const disputeLostDoc = {
               disputeId: disputeData.id || disputeData.dispute_id,
               userId: userId,
               status: 'lost',
               resolvedAt: new Date().toISOString(),
               app: 'Dine'
-            });
+            };
+            await db.collection('dine_dodo_disputes').add(disputeLostDoc);
 
             // Deactivate — merchant lost
             if (userId) {
@@ -1050,13 +1066,14 @@ const initializeDodoPaymentRoutes = (db) => {
             const disputeData = data.dispute || data;
             const userId = extractUserId(disputeData);
 
-            await db.collection('dine_dodo_disputes').add({
+            const disputeOtherDoc = {
               disputeId: disputeData.id || disputeData.dispute_id,
               userId: userId,
               status: eventType.split('.')[1],
               resolvedAt: new Date().toISOString(),
               app: 'Dine'
-            });
+            };
+            await db.collection('dine_dodo_disputes').add(disputeOtherDoc);
 
             // Reactivate if dispute was cancelled and sub was disputed
             if (eventType === 'dispute.cancelled' && userId) {
@@ -1075,13 +1092,14 @@ const initializeDodoPaymentRoutes = (db) => {
             const disputeData = data.dispute || data;
             const userId = extractUserId(disputeData);
 
-            await db.collection('dine_dodo_disputes').add({
+            const disputeCancelledDoc = {
               disputeId: disputeData.id || disputeData.dispute_id,
               userId: userId,
               status: 'cancelled',
               resolvedAt: new Date().toISOString(),
               app: 'Dine'
-            });
+            };
+            await db.collection('dine_dodo_disputes').add(disputeCancelledDoc);
 
             // Reactivate if subscription was disputed
             if (userId) {
@@ -1107,15 +1125,17 @@ const initializeDodoPaymentRoutes = (db) => {
         }
 
         // Mark event as processed
-        await eventRef.update({ processed: true, processedAt: new Date().toISOString() });
+        const processedUpdate = { processed: true, processedAt: new Date().toISOString() };
+        await eventRef.update(processedUpdate);
 
       } catch (processingError) {
         console.error(`[DODO] Error processing ${eventType}:`, processingError.message);
-        await eventRef.update({
+        const errorUpdate = {
           processed: false,
           error: processingError.message,
           errorAt: new Date().toISOString(),
-        });
+        };
+        await eventRef.update(errorUpdate);
       }
 
       // ALWAYS return 200 to prevent retries
@@ -1176,7 +1196,8 @@ const initializeDodoPaymentRoutes = (db) => {
                   dodoSubscriptionId: checkout.dodoSubscriptionId || null,
                   eventType: 'auto-recover',
                 });
-                await latestDoc.ref.update({ status: 'paid', recoveredAt: new Date().toISOString() });
+                const recoverUpdateData = { status: 'paid', recoveredAt: new Date().toISOString() };
+                await latestDoc.ref.update(recoverUpdateData);
 
                 await logBillingEvent({
                   userId,

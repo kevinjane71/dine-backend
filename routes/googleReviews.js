@@ -1,6 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const { db, collections } = require('../firebase');
+
 const { authenticateToken, requireOwnerRole } = require('../middleware/auth');
 const QRCode = require('qrcode');
 const OpenAI = require('openai');
@@ -54,6 +55,7 @@ async function getValidAccessToken(restaurantId) {
     }
 
     await db.collection('googleBusinessTokens').doc(restaurantId).update(updatedFields);
+
     return credentials.access_token;
   } catch (error) {
     console.error('Error getting valid access token:', error);
@@ -126,6 +128,7 @@ async function getGbpAccountAndLocation(restaurantId, accessToken) {
           gbpAccountId: accountId,
           gbpLocationId: locationId
         });
+
         return { accountId, locationId };
       }
     }
@@ -300,12 +303,13 @@ router.post('/generate-qr/:restaurantId', authenticateToken, requireOwnerRole, a
     });
 
     // Update settings with QR code and normalized URL (use set with merge to create if doesn't exist)
-    await db.collection('googleReviewSettings').doc(restaurantId).set({
+    const qrSettings = {
       restaurantId,
       qrCodeUrl: qrCodeDataUrl,
       googleReviewUrl: url,
       updatedAt: new Date()
-    }, { merge: true });
+    };
+    await db.collection('googleReviewSettings').doc(restaurantId).set(qrSettings, { merge: true });
 
     res.json({ success: true, qrCodeUrl: qrCodeDataUrl, reviewUrl: url });
   } catch (error) {
@@ -500,7 +504,7 @@ router.get('/auth/callback', async (req, res) => {
     }
 
     // Store tokens in Firestore
-    await db.collection('googleBusinessTokens').doc(restaurantId).set({
+    const tokenData = {
       accessToken: tokens.access_token,
       refreshToken: tokens.refresh_token,
       expiresAt: tokens.expiry_date || (Date.now() + 3600 * 1000),
@@ -508,14 +512,16 @@ router.get('/auth/callback', async (req, res) => {
       userId,
       connectedEmail,
       connectedAt: new Date()
-    });
+    };
+    await db.collection('googleBusinessTokens').doc(restaurantId).set(tokenData);
 
     // Update settings to mark as connected
-    await db.collection('googleReviewSettings').doc(restaurantId).set({
+    const connectedSettings = {
       googleAccountConnected: true,
       connectedEmail,
       updatedAt: new Date()
-    }, { merge: true });
+    };
+    await db.collection('googleReviewSettings').doc(restaurantId).set(connectedSettings, { merge: true });
 
     res.redirect(`${FRONTEND_URL}/admin?tab=google-reviews&connected=true`);
   } catch (error) {
@@ -535,11 +541,12 @@ router.post('/auth/disconnect/:restaurantId', authenticateToken, requireOwnerRol
     await db.collection('googleBusinessTokens').doc(restaurantId).delete();
 
     // Clear connection flag from settings
-    await db.collection('googleReviewSettings').doc(restaurantId).set({
+    const disconnectSettings = {
       googleAccountConnected: false,
       connectedEmail: null,
       updatedAt: new Date()
-    }, { merge: true });
+    };
+    await db.collection('googleReviewSettings').doc(restaurantId).set(disconnectSettings, { merge: true });
 
     res.json({ success: true, message: 'Google account disconnected successfully' });
   } catch (error) {
@@ -636,10 +643,8 @@ router.get('/reviews/:restaurantId', authenticateToken, async (req, res) => {
 
             // Cache the response (only for first page)
             if (!pageToken) {
-              await db.collection('googleReviewsCache').doc(restaurantId).set({
-                response,
-                cachedAt: Date.now()
-              });
+              const cachePayload = { response, cachedAt: Date.now() };
+              await db.collection('googleReviewsCache').doc(restaurantId).set(cachePayload);
             }
 
             return res.json(response);
@@ -737,10 +742,8 @@ router.get('/reviews/:restaurantId', authenticateToken, async (req, res) => {
       };
 
       // Cache the response
-      await db.collection('googleReviewsCache').doc(restaurantId).set({
-        response,
-        cachedAt: Date.now()
-      });
+      const placesCachePayload = { response, cachedAt: Date.now() };
+      await db.collection('googleReviewsCache').doc(restaurantId).set(placesCachePayload);
 
       return res.json(response);
     } catch (placesError) {

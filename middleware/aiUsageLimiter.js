@@ -138,6 +138,7 @@ class AIUsageLimiter {
       };
 
       await db.collection('aiUsage').doc(userId).set(initialData);
+
       return initialData;
     } catch (error) {
       console.error('Error getting AI usage:', error);

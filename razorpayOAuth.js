@@ -132,13 +132,6 @@ async function markDisconnected(db, restaurantId) {
       paymentSettings.razorpayEnabled = false;
       settings.paymentSettings = paymentSettings;
       await restRef.update({ customerAppSettings: settings });
-
-      // PG dual-write: update Razorpay disconnection status
-      const restaurantsRepo = process.env.DATABASE_URL ? require('./repos/restaurantsRepo') : null;
-      if (restaurantsRepo) {
-        restaurantsRepo.update(restaurantId, { customerAppSettings: settings })
-          .catch(err => console.error('PG update Razorpay disconnect error:', err.message));
-      }
     }
   } catch (e) {
     console.error(`[RazorpayOAuth] Failed to mark disconnected for ${restaurantId}:`, e.message);
@@ -260,7 +253,7 @@ const initializeRazorpayOAuthRoutes = (db, authenticateToken) => {
       const tokenData = await tokenResponse.json();
 
       // Encrypt and store tokens
-      await db.collection('razorpay_tokens').doc(restaurantId).set({
+      const razorpayTokenDoc = {
         accessToken: encryptToken(tokenData.access_token),
         refreshToken: encryptToken(tokenData.refresh_token),
         publicToken: tokenData.public_token,
@@ -268,7 +261,8 @@ const initializeRazorpayOAuthRoutes = (db, authenticateToken) => {
         expiresAt: new Date(Date.now() + tokenData.expires_in * 1000),
         createdAt: new Date(),
         updatedAt: new Date(),
-      });
+      };
+      await db.collection('razorpay_tokens').doc(restaurantId).set(razorpayTokenDoc);
 
       // Update customerAppSettings to mark as connected
       const restRef = db.collection('restaurants').doc(restaurantId);
@@ -280,13 +274,6 @@ const initializeRazorpayOAuthRoutes = (db, authenticateToken) => {
         paymentSettings.razorpayAccountId = tokenData.razorpay_account_id;
         settings.paymentSettings = paymentSettings;
         await restRef.update({ customerAppSettings: settings });
-
-        // PG dual-write: update Razorpay connection status
-        const restaurantsRepo = process.env.DATABASE_URL ? require('./repos/restaurantsRepo') : null;
-        if (restaurantsRepo) {
-          restaurantsRepo.update(restaurantId, { customerAppSettings: settings })
-            .catch(err => console.error('PG update Razorpay connect error:', err.message));
-        }
       }
 
       console.log(`[RazorpayOAuth] Restaurant ${restaurantId} connected successfully (${tokenData.razorpay_account_id})`);

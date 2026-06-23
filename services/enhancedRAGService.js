@@ -595,7 +595,7 @@ Table status values: available, occupied, reserved, out-of-service, cleaning`;
   // Save conversation for learning
   async saveConversation(restaurantId, userId, query, response, intent) {
     try {
-      await this.db.collection('conversations').add({
+      const convData = {
         restaurantId,
         userId: userId || 'anonymous',
         query,
@@ -603,7 +603,8 @@ Table status values: available, occupied, reserved, out-of-service, cleaning`;
         intent,
         action: response.action,
         timestamp: admin.firestore.FieldValue.serverTimestamp()
-      });
+      };
+      await this.db.collection('conversations').add(convData);
     } catch (error) {
       console.error('Save conversation error:', error);
     }

@@ -564,7 +564,7 @@ async function createWhatsAppOrder(restaurantId, phoneNumber, session, config) {
 
     // Log the WhatsApp order
     try {
-      await db.collection('whatsappOrderLogs').add({
+      const whatsappLogData = {
         restaurantId,
         orderId: orderRef.id,
         orderNumber,
@@ -573,7 +573,8 @@ async function createWhatsAppOrder(restaurantId, phoneNumber, session, config) {
         totalAmount,
         itemCount: items.length,
         createdAt: now.toISOString()
-      });
+      };
+      await db.collection('whatsappOrderLogs').add(whatsappLogData);
     } catch (e) {
       console.error('WhatsApp order log error (non-blocking):', e.message);
     }

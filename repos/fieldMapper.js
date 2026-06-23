@@ -158,6 +158,9 @@ const FIELD_MAP = {
   voidItems: 'void_items',
   removedItems: 'removed_items',
 
+  // Item count
+  itemCount: 'item_count',
+
   // Misc
   shareToken: 'share_token',
   billPrinted: 'bill_printed',

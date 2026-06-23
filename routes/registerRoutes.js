@@ -5,6 +5,7 @@ const { authenticateToken } = require('../middleware/auth');
 const { FieldValue } = require('firebase-admin/firestore');
 const { getCachedRestDoc } = require('../utils/kvCache');
 
+
 router.use(authenticateToken);
 
 // Helper to categorize a payment method into sales buckets

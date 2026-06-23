@@ -14,6 +14,7 @@ const ROLE_DEFAULT_PAGE_ACCESS = {
   sales:    { dashboard:true, history:true, tables:false, menu:true, analytics:false, inventory:false, kot:false, admin:false, completeBill:false, invoice:false, customers:true, offers:true, printer:true },
 };
 
+
 const VALID_ROLES = ['admin', 'manager', 'waiter', 'cashier', 'employee', 'sales', 'kitchen', 'delivery'];
 
 // Generate unique 5-digit login ID (checks both staffUsers and users collections)
@@ -339,7 +340,6 @@ router.post('/:restaurantId/save', authenticateToken, requireOwnerRole, async (r
       });
 
       await batch.commit();
-
       created.push({
         id: staffRef.id,
         name,

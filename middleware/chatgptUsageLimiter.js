@@ -33,12 +33,13 @@ const chatgptUsageLimiter = {
   // Update configuration in database
   async updateConfig(newConfig) {
     try {
-      await db.collection('systemConfig').doc('chatgptLimits').set({
+      const configData = {
         ...newConfig,
         updatedAt: new Date().toISOString(),
         updatedBy: 'admin'
-      }, { merge: true });
-      
+      };
+      await db.collection('systemConfig').doc('chatgptLimits').set(configData, { merge: true });
+
       console.log('✅ ChatGPT limits configuration updated:', newConfig);
       return true;
     } catch (error) {
@@ -127,7 +128,8 @@ const chatgptUsageLimiter = {
       });
 
       // Update IP usage
-      const ipUsageRef = db.collection('chatgptUsage').doc(`ip_${ipAddress}_${todayKey}`);
+      const ipDocId = `ip_${ipAddress}_${todayKey}`;
+      const ipUsageRef = db.collection('chatgptUsage').doc(ipDocId);
       await ipUsageRef.set({
         ipAddress,
         date: todayKey,
@@ -303,7 +305,7 @@ const chatgptUsageLimiter = {
         
         if (!canMakeCall.allowed) {
           // Log the blocked attempt
-          await db.collection('chatgptUsage').add({
+          const blockedData = {
             type: 'BLOCKED_ATTEMPT',
             userId,
             ipAddress,
@@ -314,7 +316,8 @@ const chatgptUsageLimiter = {
             timestamp: new Date().toISOString(),
             url: req.url,
             method: req.method
-          });
+          };
+          await db.collection('chatgptUsage').add(blockedData);
 
           return res.status(429).json({
             error: 'Daily ChatGPT API limit exceeded',

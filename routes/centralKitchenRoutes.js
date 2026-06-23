@@ -231,10 +231,11 @@ router.patch('/:orgId/production-orders/:orderId/start', ...ckMiddleware, async 
       return res.status(400).json({ error: `Cannot start order with status '${order.status}'. Must be 'planned'.` });
     }
 
-    await db.collection(collections.productionOrders).doc(orderId).update({
+    const startUpdateData = {
       status: 'in_production',
       updatedAt: new Date()
-    });
+    };
+    await db.collection(collections.productionOrders).doc(orderId).update(startUpdateData);
 
     res.json({ message: 'Production started', orderId, status: 'in_production' });
   } catch (error) {
@@ -392,17 +393,18 @@ router.patch('/:orgId/production-orders/:orderId/complete', ...ckMiddleware, asy
     const peRef = await db.collection(collections.productionEntries).add(productionEntry);
 
     // Update production order
-    await db.collection(collections.productionOrders).doc(orderId).update({
+    const completeUpdateData = {
       status: 'completed',
       completedDate: new Date(),
       producedQuantity: Number(producedQuantity),
       ingredientsConsumed,
       productionEntryId: peRef.id,
       updatedAt: new Date()
-    });
+    };
+    await db.collection(collections.productionOrders).doc(orderId).update(completeUpdateData);
 
     // Audit log
-    await db.collection(collections.orgAuditLog).add({
+    const completeAuditData = {
       organizationId: orgId,
       action: 'PRODUCTION_ORDER_COMPLETED',
       entityType: 'productionOrder',
@@ -415,7 +417,8 @@ router.patch('/:orgId/production-orders/:orderId/complete', ...ckMiddleware, asy
       },
       performedBy: userId,
       createdAt: new Date()
-    });
+    };
+    const completeAuditRef = await db.collection(collections.orgAuditLog).add(completeAuditData);
 
     res.json({
       message: 'Production completed',
@@ -459,14 +462,15 @@ router.patch('/:orgId/production-orders/:orderId/cancel', ...ckMiddleware, async
       ? 'Order cancelled while in production. No ingredient reversal performed.'
       : 'Order cancelled before production started.';
 
-    await db.collection(collections.productionOrders).doc(orderId).update({
+    const cancelUpdateData = {
       status: 'cancelled',
       notes: order.notes ? `${order.notes}\n${note}` : note,
       updatedAt: new Date()
-    });
+    };
+    await db.collection(collections.productionOrders).doc(orderId).update(cancelUpdateData);
 
     // Audit log
-    await db.collection(collections.orgAuditLog).add({
+    const cancelAuditData = {
       organizationId: orgId,
       action: 'PRODUCTION_ORDER_CANCELLED',
       entityType: 'productionOrder',
@@ -478,7 +482,8 @@ router.patch('/:orgId/production-orders/:orderId/cancel', ...ckMiddleware, async
       },
       performedBy: userId,
       createdAt: new Date()
-    });
+    };
+    const cancelAuditRef = await db.collection(collections.orgAuditLog).add(cancelAuditData);
 
     res.json({ message: 'Production order cancelled', orderId, status: 'cancelled', note });
   } catch (error) {
@@ -561,10 +566,11 @@ router.post('/:orgId/distribution-plans', ...ckMiddleware, async (req, res) => {
 
     // Link distribution plan to production order if provided
     if (productionOrderId) {
-      await db.collection(collections.productionOrders).doc(productionOrderId).update({
+      const linkUpdateData = {
         distributionPlanId: ref.id,
         updatedAt: new Date()
-      });
+      };
+      await db.collection(collections.productionOrders).doc(productionOrderId).update(linkUpdateData);
     }
 
     res.status(201).json({ id: ref.id, ...planData });
@@ -714,11 +720,12 @@ router.patch('/:orgId/distribution-plans/:planId/dispatch/:outletId', ...ckMiddl
     const allDispatched = updatedAllocations.every(a => ['dispatched', 'in_transit', 'received'].includes(a.status));
     const planStatus = allDispatched ? 'fully_dispatched' : 'partially_dispatched';
 
-    await db.collection(collections.distributionPlans).doc(planId).update({
+    const dispatchUpdateData = {
       allocations: updatedAllocations,
       status: planStatus,
       updatedAt: new Date()
-    });
+    };
+    await db.collection(collections.distributionPlans).doc(planId).update(dispatchUpdateData);
 
     res.json({
       message: `Dispatched to ${allocation.outletName || outletId}`,
@@ -849,11 +856,12 @@ router.patch('/:orgId/distribution-plans/:planId/receive/:outletId', ...ckMiddle
     const allReceived = updatedAllocations.every(a => a.status === 'received');
     const planStatus = allReceived ? 'completed' : plan.status;
 
-    await db.collection(collections.distributionPlans).doc(planId).update({
+    const receiveUpdateData = {
       allocations: updatedAllocations,
       status: planStatus,
       updatedAt: new Date()
-    });
+    };
+    await db.collection(collections.distributionPlans).doc(planId).update(receiveUpdateData);
 
     res.json({
       message: `Received at outlet ${allocation.outletName || outletId}`,

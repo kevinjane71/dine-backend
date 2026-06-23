@@ -5,8 +5,6 @@ const { authenticateToken } = require('../middleware/auth');
 // const pusherService = require('../services/pusherService'); // COMMENTED OUT — replaced by Firebase RTDB
 const pusherService = require('../services/firebaseRealtimeService');
 
-const usePg = !!process.env.DATABASE_URL;
-const floorsTablesRepo = usePg ? require('../repos/floorsTablesRepo') : null;
 
 // ==========================================
 // Move Order to Another Table
@@ -144,19 +142,6 @@ router.post('/:orderId/move-table', authenticateToken, async (req, res) => {
       lastOrderTime: new Date(),
       updatedAt: new Date(),
     });
-
-    // PG dual-write: release old + occupy new
-    if (floorsTablesRepo) {
-      if (oldTableId) {
-        floorsTablesRepo.releaseTable(oldTableId)
-          .catch(err => console.error('PG releaseTable (move) error:', err.message));
-      } else if (oldTableNumber) {
-        floorsTablesRepo.releaseTableByName(rid, oldTableNumber)
-          .catch(err => console.error('PG releaseTableByName (move) error:', err.message));
-      }
-      floorsTablesRepo.occupyTable(targetTableId, orderId)
-        .catch(err => console.error('PG occupyTable (move) error:', err.message));
-    }
 
     // 6. Real-time events for table sync (Firebase RTDB)
     if (oldTableId) {
