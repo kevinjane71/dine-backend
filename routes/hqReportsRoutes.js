@@ -836,7 +836,7 @@ function normalizePaymentMethod(method, order) {
   if (m === 'cash') return 'cash';
   if (['card', 'credit_card', 'debit_card'].includes(m)) return 'card';
   if (['upi', 'razorpay', 'phonepe', 'gpay', 'paytm'].includes(m)) return 'upi';
-  return m || 'other'; // Preserve custom method names (e.g. 'check', 'bank_transfer')
+  return 'other';
 }
 
 // ─── Helper: Normalize order/service type ────────────────────────────────────

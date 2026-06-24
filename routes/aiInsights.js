@@ -717,22 +717,106 @@ router.get('/email-preferences', authenticateToken, requireOwnerRole, async (req
  * Generate a full AI insights report for an owner (reusable by test + cron)
  * Returns { insights, analytics, restaurantCount } or null if no restaurants
  */
-async function generateReportForOwner(userId) {
+/**
+ * Convert IANA timezone string to tzOffset (minutes from UTC, same as getTimezoneOffset).
+ * E.g. "Asia/Kolkata" → -330, "America/New_York" → 300 (EST) or 240 (EDT)
+ */
+function ianaToTzOffset(tz) {
+  try {
+    const now = new Date();
+    const formatter = new Intl.DateTimeFormat('en-US', {
+      timeZone: tz,
+      year: 'numeric', month: '2-digit', day: '2-digit',
+      hour: '2-digit', minute: '2-digit', second: '2-digit',
+      hour12: false
+    });
+    const parts = formatter.formatToParts(now);
+    const lY = parseInt(parts.find(p => p.type === 'year')?.value);
+    const lM = parseInt(parts.find(p => p.type === 'month')?.value) - 1;
+    const lD = parseInt(parts.find(p => p.type === 'day')?.value);
+    const lH = parseInt(parts.find(p => p.type === 'hour')?.value);
+    const lMin = parseInt(parts.find(p => p.type === 'minute')?.value);
+    const lS = parseInt(parts.find(p => p.type === 'second')?.value);
+    const localAsUTC = Date.UTC(lY, lM, lD, lH === 24 ? 0 : lH, lMin, lS);
+    const utcMs = now.getTime();
+    // tzOffset = UTC - local (in minutes), same as JS getTimezoneOffset()
+    return Math.round((utcMs - localAsUTC) / 60000);
+  } catch (_) {
+    return -330; // fallback to IST
+  }
+}
+
+async function generateReportForOwner(userId, timezone) {
+  // --- Find ALL restaurants for this owner ---
+  // 1. Direct ownership via ownerId
   const restaurantsSnap = await db.collection(collections.restaurants)
     .where('ownerId', '==', userId)
     .get();
 
-  if (restaurantsSnap.empty) return null;
-
-  const restaurants = [];
-  const restaurantIds = [];
+  const restaurantMap = new Map();
   restaurantsSnap.docs.forEach(doc => {
-    restaurantIds.push(doc.id);
-    restaurants.push({ id: doc.id, ...doc.data() });
+    restaurantMap.set(doc.id, { id: doc.id, ...doc.data() });
   });
 
-  const sevenDaysAgo = new Date();
-  sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 7);
+  // 2. Also check userRestaurants collection for additional access
+  try {
+    const urSnap = await db.collection(collections.userRestaurants)
+      .where('userId', '==', userId)
+      .get();
+    const extraIds = urSnap.docs
+      .map(d => d.data().restaurantId)
+      .filter(rid => rid && !restaurantMap.has(rid));
+    if (extraIds.length > 0) {
+      const extraDocs = await Promise.all(
+        extraIds.map(rid => db.collection(collections.restaurants).doc(rid).get())
+      );
+      extraDocs.forEach(doc => {
+        if (doc.exists) restaurantMap.set(doc.id, { id: doc.id, ...doc.data() });
+      });
+    }
+  } catch (_) {}
+
+  // 3. Check if any found restaurant has an organizationId — if so, include all org restaurants
+  const orgIds = new Set();
+  for (const r of restaurantMap.values()) {
+    if (r.organizationId) orgIds.add(r.organizationId);
+  }
+  for (const orgId of orgIds) {
+    try {
+      const orgSnap = await db.collection(collections.restaurants)
+        .where('organizationId', '==', orgId)
+        .get();
+      orgSnap.docs.forEach(doc => {
+        if (!restaurantMap.has(doc.id)) {
+          restaurantMap.set(doc.id, { id: doc.id, ...doc.data() });
+        }
+      });
+    } catch (_) {}
+  }
+
+  if (restaurantMap.size === 0) return null;
+
+  const restaurants = Array.from(restaurantMap.values());
+  const restaurantIds = restaurants.map(r => r.id);
+
+  // --- Resolve timezone and business day start from settings ---
+  // timezone param comes from ownerPreferences (IANA string) or fallback
+  let ownerTz = timezone;
+  if (!ownerTz) {
+    try {
+      const prefDoc = await db.collection('ownerPreferences').doc(userId).get();
+      if (prefDoc.exists) ownerTz = prefDoc.data().timezone;
+    } catch (_) {}
+  }
+  const tzOffset = ownerTz ? ianaToTzOffset(ownerTz) : -330; // fallback IST
+  const dayStartHour = restaurants[0]?.posSettings?.businessDayStartHour || 0;
+
+  // --- 7-day analytics (timezone-aware) ---
+  const today = todayInTZ(tzOffset, dayStartHour);
+  const sevenDaysAgoStr = dateStrInTZ(
+    new Date(Date.now() - 7 * 24 * 60 * 60 * 1000), tzOffset, dayStartHour
+  );
+  const sevenDaysAgo = dateBoundsInTZ(sevenDaysAgoStr, tzOffset, dayStartHour).start;
 
   let totalRevenue = 0;
   let totalOrders = 0;
@@ -768,7 +852,6 @@ async function generateReportForOwner(userId) {
         .get()
     ]);
 
-    // Process orders
     const restaurant = restaurants.find(r => r.id === restaurantId);
     let restaurantRevenue = 0;
     let restaurantOrders = 0;
@@ -812,14 +895,12 @@ async function generateReportForOwner(userId) {
       restaurant.orders = restaurantOrders;
     }
 
-    // Process staff
     staffNewSnap.docs.forEach(() => staffCount++);
     staffLegacySnap.docs.forEach(doc => {
       const role = (doc.data().role || '').toLowerCase();
       if (role !== 'owner' && role !== 'customer') staffCount++;
     });
 
-    // Process inventory
     invSnap.docs.forEach(doc => {
       const data = doc.data();
       const currentStock = data.currentStock || 0;
@@ -865,7 +946,189 @@ async function generateReportForOwner(userId) {
     outOfStockCount
   });
 
-  return { insights, analytics, restaurantCount: restaurants.length };
+  // --- Today's detailed EOD-style report across ALL restaurants (timezone-aware) ---
+  const startOfDay = today.start;
+  const endOfDay = today.end;
+
+  let todayRevenue = 0, todayOrderCount = 0, todayCashCollected = 0;
+  let cashSales = 0, cardSales = 0, upiSales = 0, splitSales = 0, otherSales = 0;
+  let totalTax = 0, totalDiscount = 0;
+  let cancelledCount = 0, refundedCount = 0, refundedAmount = 0;
+  const taxBreakdown = {}; // dynamic: collects all tax names from orders
+  const categoryWise = {};
+  const todayItemCounts = {};
+  const staffWise = {};
+
+  for (const restaurantId of restaurantIds) {
+    const todayOrdersSnap = await db.collection(collections.orders)
+      .where('restaurantId', '==', restaurantId)
+      .where('createdAt', '>=', startOfDay)
+      .where('createdAt', '<=', endOfDay)
+      .get();
+
+    todayOrdersSnap.forEach(doc => {
+      const order = doc.data();
+
+      if (order.status === 'cancelled' || order.status === 'deleted') {
+        cancelledCount++;
+        return;
+      }
+      if (order.status === 'refunded') {
+        refundedCount++;
+        refundedAmount += order.finalAmount || order.totalAmount || 0;
+        return;
+      }
+
+      const amount = order.finalAmount || order.totalAmount || 0;
+      todayRevenue += amount;
+      todayOrderCount++;
+
+      // Payment method breakdown
+      const method = (order.paymentMethod || 'cash').toLowerCase();
+      if (method === 'cash') { cashSales += amount; todayCashCollected += amount; }
+      else if (method === 'card' || method === 'credit_card' || method === 'debit_card') cardSales += amount;
+      else if (method === 'upi' || method === 'razorpay' || method === 'phonepe' || method === 'gpay' || method === 'paytm') upiSales += amount;
+      else if (method === 'split') {
+        splitSales += amount;
+        if (order.splitPayments) {
+          order.splitPayments.forEach(sp => {
+            if ((sp.method || 'cash').toLowerCase() === 'cash') {
+              todayCashCollected += sp.amount || 0;
+            }
+          });
+        }
+      } else {
+        otherSales += amount;
+      }
+
+      // Staff-wise tracking
+      const staffId = order.staffInfo?.userId || order.staffInfo?.waiterId || order.waiterId || 'unknown';
+      const staffName = order.staffInfo?.waiterName || order.staffInfo?.name || order.waiterName || 'Owner';
+      const staffRole = order.staffInfo?.role || '';
+      if (!staffWise[staffId]) {
+        staffWise[staffId] = { staffName, role: staffRole, orderCount: 0, totalSales: 0, payments: { cash: 0, card: 0, upi: 0 } };
+      }
+      staffWise[staffId].orderCount += 1;
+      staffWise[staffId].totalSales += amount;
+      if (method === 'cash') staffWise[staffId].payments.cash += amount;
+      else if (method === 'card' || method === 'credit_card' || method === 'debit_card') staffWise[staffId].payments.card += amount;
+      else if (method === 'upi' || method === 'razorpay' || method === 'phonepe' || method === 'gpay' || method === 'paytm') staffWise[staffId].payments.upi += amount;
+
+      // Tax breakdown — dynamically collect all tax names
+      totalTax += order.taxAmount || 0;
+      if (order.taxBreakdown && Array.isArray(order.taxBreakdown)) {
+        order.taxBreakdown.forEach(tax => {
+          const name = (tax.name || 'Tax').toUpperCase().trim();
+          if (name && tax.amount) {
+            taxBreakdown[name] = (taxBreakdown[name] || 0) + (tax.amount || 0);
+          }
+        });
+      }
+
+      // Discount tracking
+      totalDiscount += (order.discountAmount || 0) + (order.manualDiscount || 0) + (order.loyaltyDiscount || 0);
+
+      // Item-level and category tracking
+      if (order.items && Array.isArray(order.items)) {
+        order.items.forEach(item => {
+          const itemKey = item.name || 'Unknown';
+          if (!todayItemCounts[itemKey]) {
+            todayItemCounts[itemKey] = { name: itemKey, qty: 0, revenue: 0 };
+          }
+          todayItemCounts[itemKey].qty += item.quantity || 1;
+          todayItemCounts[itemKey].revenue += (item.price || 0) * (item.quantity || 1);
+
+          const cat = item.category || 'Uncategorized';
+          if (!categoryWise[cat]) categoryWise[cat] = { name: cat, revenue: 0 };
+          categoryWise[cat].revenue += (item.price || 0) * (item.quantity || 1);
+        });
+      }
+    });
+  }
+
+  const topItems = Object.values(todayItemCounts).sort((a, b) => b.qty - a.qty).slice(0, 15);
+  const categorySales = Object.values(categoryWise).sort((a, b) => b.revenue - a.revenue);
+
+  // Shifts for today
+  const allShifts = [];
+  for (const restaurantId of restaurantIds) {
+    const restaurant = restaurants.find(r => r.id === restaurantId);
+    const storeName = restaurant?.name || restaurantId;
+    try {
+      const shiftsSnap = await db.collection(collections.shifts || 'shifts')
+        .where('restaurantId', '==', restaurantId)
+        .where('openedAt', '>=', startOfDay)
+        .where('openedAt', '<=', endOfDay)
+        .get();
+      shiftsSnap.forEach(doc => {
+        const s = doc.data();
+        allShifts.push({
+          storeName,
+          openedBy: s.openedBy || s.staffName || '',
+          openedAt: s.openedAt?.toDate ? s.openedAt.toDate().toISOString() : s.openedAt,
+          closedAt: s.closedAt?.toDate ? s.closedAt.toDate().toISOString() : s.closedAt,
+          status: s.status,
+          totalSales: s.totalSales || 0,
+          orderCount: s.orderCount || 0,
+        });
+      });
+    } catch (_) {}
+  }
+
+  // Currency: pick most common symbol across restaurants
+  const currencyVotes = {};
+  restaurants.forEach(r => {
+    const sym = r.currencySymbol || r.currencySettings?.symbol || '₹';
+    currencyVotes[sym] = (currencyVotes[sym] || 0) + 1;
+  });
+  const currencySymbol = Object.entries(currencyVotes).sort((a, b) => b[1] - a[1])[0]?.[0] || '₹';
+
+  const round = v => Math.round(v * 100) / 100;
+  const todayReport = {
+    reportDate: today.dateStr,
+    timezone: ownerTz || 'Asia/Kolkata',
+    summary: {
+      totalRevenue: round(todayRevenue),
+      orderCount: todayOrderCount,
+      avgOrderValue: todayOrderCount > 0 ? round(todayRevenue / todayOrderCount) : 0,
+      cashCollected: round(todayCashCollected),
+    },
+    payments: {
+      cash: round(cashSales),
+      card: round(cardSales),
+      upi: round(upiSales),
+      split: round(splitSales),
+      other: round(otherSales),
+    },
+    tax: {
+      total: round(totalTax),
+      breakdown: Object.entries(taxBreakdown).map(([name, amount]) => ({
+        name,
+        amount: round(amount),
+      })).sort((a, b) => b.amount - a.amount),
+    },
+    discounts: { total: round(totalDiscount) },
+    returns: { count: 0, amount: 0 },
+    cancelled: { count: cancelledCount },
+    refunded: { count: refundedCount, amount: round(refundedAmount) },
+    topItems,
+    categorySales,
+    shifts: allShifts,
+    staffBreakdown: Object.values(staffWise).map(s => ({
+      staffName: s.staffName,
+      role: s.role,
+      orderCount: s.orderCount,
+      totalSales: round(s.totalSales),
+      payments: {
+        cash: round(s.payments.cash),
+        card: round(s.payments.card),
+        upi: round(s.payments.upi),
+      }
+    })).sort((a, b) => b.totalSales - a.totalSales),
+    currencySymbol,
+  };
+
+  return { insights, analytics, restaurantCount: restaurants.length, todayReport, currencySymbol };
 }
 
 /**
@@ -875,7 +1138,7 @@ async function generateReportForOwner(userId) {
 router.post('/send-test-report', authenticateToken, requireOwnerRole, async (req, res) => {
   try {
     const userId = req.user.userId || req.user.id;
-    const { email, emails } = req.body;
+    const { email, emails, timezone } = req.body;
 
     // Support both single email (legacy) and array
     const recipients = (emails && emails.length > 0) ? emails : (email ? [email] : []);
@@ -885,7 +1148,7 @@ router.post('/send-test-report', authenticateToken, requireOwnerRole, async (req
 
     console.log(`🤖 Generating AI insights report for ${recipients.join(', ')}...`);
 
-    const reportData = await generateReportForOwner(userId);
+    const reportData = await generateReportForOwner(userId, timezone);
     if (!reportData) {
       return res.status(400).json({ success: false, error: 'No restaurants found for this owner' });
     }
@@ -899,7 +1162,9 @@ router.post('/send-test-report', authenticateToken, requireOwnerRole, async (req
         ownerName,
         insights: reportData.insights,
         analytics: reportData.analytics,
-        restaurantCount: reportData.restaurantCount
+        restaurantCount: reportData.restaurantCount,
+        todayReport: reportData.todayReport,
+        currencySymbol: reportData.currencySymbol
       });
     }
 
