@@ -14089,7 +14089,15 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
 
     res.json({
       message: 'Order updated successfully',
-      data: { orderId }
+      data: { orderId },
+      order: {
+        id: orderId,
+        dailyOrderId: currentOrder.dailyOrderId || null,
+        orderNumber: currentOrder.orderNumber || null,
+        tableNumber: updateData.tableNumber || currentOrder.tableNumber || '',
+        floorName: updateData.floorName || currentOrder.floorName || '',
+        orderType: updateData.orderType || currentOrder.orderType || '',
+      }
     });
 
   } catch (error) {
@@ -36460,7 +36468,7 @@ app.post('/api/sync/batch', authenticateToken, async (req, res) => {
               createdAt: new Date(),
               syncSource: 'offline_batch',
             };
-            const wasteRef = await db.collection('wasteEntries').add(wasteData);
+            const wasteRef = await db.collection('waste_entries').add(wasteData);
             result = { wasteEntry: { id: wasteRef.id } };
             break;
           }
