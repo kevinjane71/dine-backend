@@ -395,8 +395,7 @@ DineOpen AI Analytics
       <div style="border-radius: 12px; overflow: hidden; border: 1px solid #e5e7eb;">
         <table width="100%" cellpadding="0" cellspacing="0" style="border-collapse: collapse;">
           ${data.todayReport.tax?.total > 0 ? `<tr style="background: #f9fafb;"><td style="padding: 8px 16px; font-size: 13px; color: #374151; font-weight: 600;" colspan="2">Tax Summary</td></tr>
-          ${data.todayReport.tax.cgst > 0 ? `<tr style="background: #ffffff;"><td style="padding: 8px 16px; font-size: 13px; color: #4b5563; border-top: 1px solid #f3f4f6;">CGST</td><td style="padding: 8px 16px; font-size: 13px; color: #1f2937; font-weight: 600; text-align: right; border-top: 1px solid #f3f4f6;">${data.todayReport.currencySymbol || data.currencySymbol || '₹'}${data.todayReport.tax.cgst.toLocaleString()}</td></tr>` : ''}
-          ${data.todayReport.tax.sgst > 0 ? `<tr style="background: #f9fafb;"><td style="padding: 8px 16px; font-size: 13px; color: #4b5563; border-top: 1px solid #f3f4f6;">SGST</td><td style="padding: 8px 16px; font-size: 13px; color: #1f2937; font-weight: 600; text-align: right; border-top: 1px solid #f3f4f6;">${data.todayReport.currencySymbol || data.currencySymbol || '₹'}${data.todayReport.tax.sgst.toLocaleString()}</td></tr>` : ''}
+          ${(data.todayReport.tax.breakdown || []).filter(t => t.amount > 0).map((t, i) => `<tr style="background: ${i % 2 === 0 ? '#ffffff' : '#f9fafb'};"><td style="padding: 8px 16px; font-size: 13px; color: #4b5563; border-top: 1px solid #f3f4f6;">${t.name}</td><td style="padding: 8px 16px; font-size: 13px; color: #1f2937; font-weight: 600; text-align: right; border-top: 1px solid #f3f4f6;">${data.todayReport.currencySymbol || data.currencySymbol || '₹'}${t.amount.toLocaleString()}</td></tr>`).join('')}
           <tr style="background: #f0fdf4;"><td style="padding: 10px 16px; font-size: 13px; color: #1f2937; font-weight: 600; border-top: 1px solid #e5e7eb;">Total Tax</td><td style="padding: 10px 16px; font-size: 13px; color: #16a34a; font-weight: 700; text-align: right; border-top: 1px solid #e5e7eb;">${data.todayReport.currencySymbol || data.currencySymbol || '₹'}${data.todayReport.tax.total.toLocaleString()}</td></tr>` : ''}
           ${(data.todayReport.discounts?.total || 0) > 0 ? `<tr style="background: #ffffff;"><td style="padding: 8px 16px; font-size: 13px; color: #4b5563; border-top: 1px solid #f3f4f6;">Discounts</td><td style="padding: 8px 16px; font-size: 13px; color: #dc2626; font-weight: 600; text-align: right; border-top: 1px solid #f3f4f6;">-${data.todayReport.currencySymbol || data.currencySymbol || '₹'}${data.todayReport.discounts.total.toLocaleString()}</td></tr>` : ''}
           ${(data.todayReport.cancelled?.count || 0) > 0 ? `<tr style="background: #f9fafb;"><td style="padding: 8px 16px; font-size: 13px; color: #4b5563; border-top: 1px solid #f3f4f6;">Cancelled</td><td style="padding: 8px 16px; font-size: 13px; color: #dc2626; font-weight: 600; text-align: right; border-top: 1px solid #f3f4f6;">${data.todayReport.cancelled.count} orders</td></tr>` : ''}
@@ -950,12 +949,15 @@ DineOpen Analytics Team`,
     }
 
     const template = this.templates.aiInsightsReport;
-    const today = new Date().toLocaleDateString('en-US', {
-      weekday: 'long',
-      year: 'numeric',
-      month: 'long',
-      day: 'numeric'
-    });
+    // Use timezone-aware date from todayReport, falling back to server time
+    const reportTz = reportData.todayReport?.timezone || 'Asia/Kolkata';
+    const today = reportData.todayReport?.reportDate
+      ? new Date(reportData.todayReport.reportDate + 'T12:00:00').toLocaleDateString('en-US', {
+          weekday: 'long', year: 'numeric', month: 'long', day: 'numeric', timeZone: 'UTC'
+        })
+      : new Date().toLocaleDateString('en-US', {
+          weekday: 'long', year: 'numeric', month: 'long', day: 'numeric', timeZone: reportTz
+        });
 
     const data = {
       ...reportData,
@@ -972,7 +974,7 @@ DineOpen Analytics Team`,
 
     const attachments = [];
     if (pdfBuffer) {
-      const dateStr = new Date().toISOString().split('T')[0];
+      const dateStr = reportData.todayReport?.reportDate || new Date().toISOString().split('T')[0];
       attachments.push({
         filename: `DineOpen-Report-${dateStr}.pdf`,
         content: pdfBuffer,

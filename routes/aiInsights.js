@@ -712,7 +712,36 @@ router.get('/email-preferences', authenticateToken, requireOwnerRole, async (req
  * Generate a full AI insights report for an owner (reusable by test + cron)
  * Returns { insights, analytics, restaurantCount } or null if no restaurants
  */
-async function generateReportForOwner(userId) {
+/**
+ * Convert IANA timezone string to tzOffset (minutes from UTC, same as getTimezoneOffset).
+ * E.g. "Asia/Kolkata" → -330, "America/New_York" → 300 (EST) or 240 (EDT)
+ */
+function ianaToTzOffset(tz) {
+  try {
+    const now = new Date();
+    const formatter = new Intl.DateTimeFormat('en-US', {
+      timeZone: tz,
+      year: 'numeric', month: '2-digit', day: '2-digit',
+      hour: '2-digit', minute: '2-digit', second: '2-digit',
+      hour12: false
+    });
+    const parts = formatter.formatToParts(now);
+    const lY = parseInt(parts.find(p => p.type === 'year')?.value);
+    const lM = parseInt(parts.find(p => p.type === 'month')?.value) - 1;
+    const lD = parseInt(parts.find(p => p.type === 'day')?.value);
+    const lH = parseInt(parts.find(p => p.type === 'hour')?.value);
+    const lMin = parseInt(parts.find(p => p.type === 'minute')?.value);
+    const lS = parseInt(parts.find(p => p.type === 'second')?.value);
+    const localAsUTC = Date.UTC(lY, lM, lD, lH === 24 ? 0 : lH, lMin, lS);
+    const utcMs = now.getTime();
+    // tzOffset = UTC - local (in minutes), same as JS getTimezoneOffset()
+    return Math.round((utcMs - localAsUTC) / 60000);
+  } catch (_) {
+    return -330; // fallback to IST
+  }
+}
+
+async function generateReportForOwner(userId, timezone) {
   // --- Find ALL restaurants for this owner ---
   // 1. Direct ownership via ownerId
   const restaurantsSnap = await db.collection(collections.restaurants)
@@ -765,9 +794,24 @@ async function generateReportForOwner(userId) {
   const restaurants = Array.from(restaurantMap.values());
   const restaurantIds = restaurants.map(r => r.id);
 
-  // --- 7-day analytics ---
-  const sevenDaysAgo = new Date();
-  sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 7);
+  // --- Resolve timezone and business day start from settings ---
+  // timezone param comes from ownerPreferences (IANA string) or fallback
+  let ownerTz = timezone;
+  if (!ownerTz) {
+    try {
+      const prefDoc = await db.collection('ownerPreferences').doc(userId).get();
+      if (prefDoc.exists) ownerTz = prefDoc.data().timezone;
+    } catch (_) {}
+  }
+  const tzOffset = ownerTz ? ianaToTzOffset(ownerTz) : -330; // fallback IST
+  const dayStartHour = restaurants[0]?.posSettings?.businessDayStartHour || 0;
+
+  // --- 7-day analytics (timezone-aware) ---
+  const today = todayInTZ(tzOffset, dayStartHour);
+  const sevenDaysAgoStr = dateStrInTZ(
+    new Date(Date.now() - 7 * 24 * 60 * 60 * 1000), tzOffset, dayStartHour
+  );
+  const sevenDaysAgo = dateBoundsInTZ(sevenDaysAgoStr, tzOffset, dayStartHour).start;
 
   let totalRevenue = 0;
   let totalOrders = 0;
@@ -897,16 +941,15 @@ async function generateReportForOwner(userId) {
     outOfStockCount
   });
 
-  // --- Today's detailed EOD-style report across ALL restaurants ---
-  const todayStr = new Date().toISOString().split('T')[0];
-  const startOfDay = new Date(`${todayStr}T00:00:00`);
-  const endOfDay = new Date(`${todayStr}T23:59:59.999`);
+  // --- Today's detailed EOD-style report across ALL restaurants (timezone-aware) ---
+  const startOfDay = today.start;
+  const endOfDay = today.end;
 
   let todayRevenue = 0, todayOrderCount = 0, todayCashCollected = 0;
   let cashSales = 0, cardSales = 0, upiSales = 0, splitSales = 0, otherSales = 0;
   let totalTax = 0, totalDiscount = 0;
   let cancelledCount = 0, refundedCount = 0, refundedAmount = 0;
-  const taxBreakdown = { cgst: 0, sgst: 0, igst: 0 };
+  const taxBreakdown = {}; // dynamic: collects all tax names from orders
   const categoryWise = {};
   const todayItemCounts = {};
   const staffWise = {};
@@ -966,14 +1009,14 @@ async function generateReportForOwner(userId) {
       else if (method === 'card' || method === 'credit_card' || method === 'debit_card') staffWise[staffId].payments.card += amount;
       else if (method === 'upi' || method === 'razorpay' || method === 'phonepe' || method === 'gpay' || method === 'paytm') staffWise[staffId].payments.upi += amount;
 
-      // Tax breakdown
+      // Tax breakdown — dynamically collect all tax names
       totalTax += order.taxAmount || 0;
       if (order.taxBreakdown && Array.isArray(order.taxBreakdown)) {
         order.taxBreakdown.forEach(tax => {
-          const name = (tax.name || '').toLowerCase();
-          if (name.includes('cgst')) taxBreakdown.cgst += tax.amount || 0;
-          else if (name.includes('sgst')) taxBreakdown.sgst += tax.amount || 0;
-          else if (name.includes('igst')) taxBreakdown.igst += tax.amount || 0;
+          const name = (tax.name || 'Tax').toUpperCase().trim();
+          if (name && tax.amount) {
+            taxBreakdown[name] = (taxBreakdown[name] || 0) + (tax.amount || 0);
+          }
         });
       }
 
@@ -1027,10 +1070,18 @@ async function generateReportForOwner(userId) {
     } catch (_) {}
   }
 
-  const currencySymbol = restaurants[0]?.currencySymbol || restaurants[0]?.currencySettings?.symbol || '₹';
+  // Currency: pick most common symbol across restaurants
+  const currencyVotes = {};
+  restaurants.forEach(r => {
+    const sym = r.currencySymbol || r.currencySettings?.symbol || '₹';
+    currencyVotes[sym] = (currencyVotes[sym] || 0) + 1;
+  });
+  const currencySymbol = Object.entries(currencyVotes).sort((a, b) => b[1] - a[1])[0]?.[0] || '₹';
 
   const round = v => Math.round(v * 100) / 100;
   const todayReport = {
+    reportDate: today.dateStr,
+    timezone: ownerTz || 'Asia/Kolkata',
     summary: {
       totalRevenue: round(todayRevenue),
       orderCount: todayOrderCount,
@@ -1046,9 +1097,10 @@ async function generateReportForOwner(userId) {
     },
     tax: {
       total: round(totalTax),
-      cgst: round(taxBreakdown.cgst),
-      sgst: round(taxBreakdown.sgst),
-      igst: round(taxBreakdown.igst),
+      breakdown: Object.entries(taxBreakdown).map(([name, amount]) => ({
+        name,
+        amount: round(amount),
+      })).sort((a, b) => b.amount - a.amount),
     },
     discounts: { total: round(totalDiscount) },
     returns: { count: 0, amount: 0 },
@@ -1081,7 +1133,7 @@ async function generateReportForOwner(userId) {
 router.post('/send-test-report', authenticateToken, requireOwnerRole, async (req, res) => {
   try {
     const userId = req.user.userId || req.user.id;
-    const { email, emails } = req.body;
+    const { email, emails, timezone } = req.body;
 
     // Support both single email (legacy) and array
     const recipients = (emails && emails.length > 0) ? emails : (email ? [email] : []);
@@ -1091,7 +1143,7 @@ router.post('/send-test-report', authenticateToken, requireOwnerRole, async (req
 
     console.log(`🤖 Generating AI insights report for ${recipients.join(', ')}...`);
 
-    const reportData = await generateReportForOwner(userId);
+    const reportData = await generateReportForOwner(userId, timezone);
     if (!reportData) {
       return res.status(400).json({ success: false, error: 'No restaurants found for this owner' });
     }

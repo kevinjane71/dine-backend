@@ -18744,8 +18744,8 @@ app.get('/api/cron/send-daily-reports', async (req, res) => {
         const userDoc = await db.collection('users').doc(userId).get();
         const ownerName = userDoc.exists ? (userDoc.data().name || userDoc.data().displayName || 'Restaurant Owner') : 'Restaurant Owner';
 
-        // Generate report using the exported function
-        const reportData = await aiInsightsRoutes.generateReportForOwner(userId);
+        // Generate report using the exported function (pass owner's timezone)
+        const reportData = await aiInsightsRoutes.generateReportForOwner(userId, prefs.timezone);
         if (!reportData) continue;
 
         // Send to all recipient emails
