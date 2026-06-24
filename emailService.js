@@ -296,7 +296,7 @@ DineOpen AI Analytics
       <table width="100%" cellpadding="0" cellspacing="0" style="border-collapse: separate; border-spacing: 12px 0;">
         <tr>
           <td style="background: linear-gradient(135deg, #10b981, #059669); color: white; padding: 20px; border-radius: 12px; text-align: center; width: 25%;">
-            <div style="font-size: 24px; font-weight: 700; margin-bottom: 4px;">₹${typeof data.analytics.totalRevenue === 'number' ? data.analytics.totalRevenue.toLocaleString() : data.analytics.totalRevenue}</div>
+            <div style="font-size: 24px; font-weight: 700; margin-bottom: 4px;">${data.todayReport?.currencySymbol || data.currencySymbol || '₹'}${typeof data.analytics.totalRevenue === 'number' ? data.analytics.totalRevenue.toLocaleString() : data.analytics.totalRevenue}</div>
             <div style="font-size: 11px; opacity: 0.9; text-transform: uppercase; letter-spacing: 0.5px;">Revenue</div>
           </td>
           <td style="background: linear-gradient(135deg, #3b82f6, #2563eb); color: white; padding: 20px; border-radius: 12px; text-align: center; width: 25%;">
@@ -304,7 +304,7 @@ DineOpen AI Analytics
             <div style="font-size: 11px; opacity: 0.9; text-transform: uppercase; letter-spacing: 0.5px;">Orders</div>
           </td>
           <td style="background: linear-gradient(135deg, #f59e0b, #d97706); color: white; padding: 20px; border-radius: 12px; text-align: center; width: 25%;">
-            <div style="font-size: 24px; font-weight: 700; margin-bottom: 4px;">₹${typeof data.analytics.avgOrderValue === 'number' ? Math.round(data.analytics.avgOrderValue) : data.analytics.avgOrderValue}</div>
+            <div style="font-size: 24px; font-weight: 700; margin-bottom: 4px;">${data.todayReport?.currencySymbol || data.currencySymbol || '₹'}${typeof data.analytics.avgOrderValue === 'number' ? Math.round(data.analytics.avgOrderValue) : data.analytics.avgOrderValue}</div>
             <div style="font-size: 11px; opacity: 0.9; text-transform: uppercase; letter-spacing: 0.5px;">Avg Order</div>
           </td>
           <td style="background: linear-gradient(135deg, #ef4444, #dc2626); color: white; padding: 20px; border-radius: 12px; text-align: center; width: 25%;">
@@ -314,6 +314,98 @@ DineOpen AI Analytics
         </tr>
       </table>
     </div>
+
+    ${data.todayReport ? `
+    <!-- Today's Sales Report -->
+    <div style="padding: 0 30px 10px;">
+      <h3 style="font-size: 14px; font-weight: 700; color: #6b7280; text-transform: uppercase; letter-spacing: 1px; margin: 0 0 12px;">
+        📋 Today's Sales Report
+      </h3>
+    </div>
+
+    <!-- Payment Breakdown -->
+    ${data.todayReport.payments ? `
+    <div style="padding: 0 30px 20px;">
+      <div style="border-radius: 12px; overflow: hidden; border: 1px solid #e5e7eb;">
+        <table width="100%" cellpadding="0" cellspacing="0" style="border-collapse: collapse;">
+          <tr style="background: #f9fafb;">
+            <td style="padding: 10px 16px; font-size: 13px; font-weight: 600; color: #374151;">Payment Method</td>
+            <td style="padding: 10px 16px; font-size: 13px; font-weight: 600; color: #374151; text-align: right;">Amount</td>
+          </tr>
+          ${(data.todayReport.payments.cash || 0) > 0 ? `<tr style="background: #ffffff;"><td style="padding: 10px 16px; font-size: 13px; color: #4b5563; border-top: 1px solid #f3f4f6;">💵 Cash</td><td style="padding: 10px 16px; font-size: 13px; color: #1f2937; font-weight: 600; text-align: right; border-top: 1px solid #f3f4f6;">${data.todayReport.currencySymbol || data.currencySymbol || '₹'}${data.todayReport.payments.cash.toLocaleString()}</td></tr>` : ''}
+          ${(data.todayReport.payments.card || 0) > 0 ? `<tr style="background: #f9fafb;"><td style="padding: 10px 16px; font-size: 13px; color: #4b5563; border-top: 1px solid #f3f4f6;">💳 Card</td><td style="padding: 10px 16px; font-size: 13px; color: #1f2937; font-weight: 600; text-align: right; border-top: 1px solid #f3f4f6;">${data.todayReport.currencySymbol || data.currencySymbol || '₹'}${data.todayReport.payments.card.toLocaleString()}</td></tr>` : ''}
+          ${(data.todayReport.payments.upi || 0) > 0 ? `<tr style="background: #ffffff;"><td style="padding: 10px 16px; font-size: 13px; color: #4b5563; border-top: 1px solid #f3f4f6;">📱 UPI</td><td style="padding: 10px 16px; font-size: 13px; color: #1f2937; font-weight: 600; text-align: right; border-top: 1px solid #f3f4f6;">${data.todayReport.currencySymbol || data.currencySymbol || '₹'}${data.todayReport.payments.upi.toLocaleString()}</td></tr>` : ''}
+          ${(data.todayReport.payments.split || 0) > 0 ? `<tr style="background: #f9fafb;"><td style="padding: 10px 16px; font-size: 13px; color: #4b5563; border-top: 1px solid #f3f4f6;">🔀 Split</td><td style="padding: 10px 16px; font-size: 13px; color: #1f2937; font-weight: 600; text-align: right; border-top: 1px solid #f3f4f6;">${data.todayReport.currencySymbol || data.currencySymbol || '₹'}${data.todayReport.payments.split.toLocaleString()}</td></tr>` : ''}
+          ${(data.todayReport.payments.other || 0) > 0 ? `<tr style="background: #ffffff;"><td style="padding: 10px 16px; font-size: 13px; color: #4b5563; border-top: 1px solid #f3f4f6;">🏦 Other</td><td style="padding: 10px 16px; font-size: 13px; color: #1f2937; font-weight: 600; text-align: right; border-top: 1px solid #f3f4f6;">${data.todayReport.currencySymbol || data.currencySymbol || '₹'}${data.todayReport.payments.other.toLocaleString()}</td></tr>` : ''}
+        </table>
+      </div>
+    </div>
+    ` : ''}
+
+    <!-- Top Selling Items -->
+    ${data.todayReport.topItems?.length > 0 ? `
+    <div style="padding: 0 30px 20px;">
+      <h3 style="font-size: 14px; font-weight: 700; color: #6b7280; text-transform: uppercase; letter-spacing: 1px; margin: 0 0 12px;">🏆 Top Selling Items</h3>
+      <div style="border-radius: 12px; overflow: hidden; border: 1px solid #e5e7eb;">
+        <table width="100%" cellpadding="0" cellspacing="0" style="border-collapse: collapse;">
+          <tr style="background: #f9fafb;">
+            <td style="padding: 10px 16px; font-size: 13px; font-weight: 600; color: #374151;">Item</td>
+            <td style="padding: 10px 16px; font-size: 13px; font-weight: 600; color: #374151; text-align: center;">Qty</td>
+            <td style="padding: 10px 16px; font-size: 13px; font-weight: 600; color: #374151; text-align: right;">Revenue</td>
+          </tr>
+          ${data.todayReport.topItems.slice(0, 10).map((item, i) => `
+          <tr style="background: ${i % 2 === 0 ? '#ffffff' : '#f9fafb'};">
+            <td style="padding: 10px 16px; font-size: 13px; color: #1f2937; border-top: 1px solid #f3f4f6;">${item.name}</td>
+            <td style="padding: 10px 16px; font-size: 13px; color: #4b5563; text-align: center; border-top: 1px solid #f3f4f6;">${item.qty || item.quantity || 0}</td>
+            <td style="padding: 10px 16px; font-size: 13px; color: #1f2937; font-weight: 600; text-align: right; border-top: 1px solid #f3f4f6;">${data.todayReport.currencySymbol || data.currencySymbol || '₹'}${(item.revenue || 0).toLocaleString()}</td>
+          </tr>`).join('')}
+        </table>
+      </div>
+    </div>
+    ` : ''}
+
+    <!-- Staff Performance -->
+    ${data.todayReport.staffBreakdown?.length > 0 ? `
+    <div style="padding: 0 30px 20px;">
+      <h3 style="font-size: 14px; font-weight: 700; color: #6b7280; text-transform: uppercase; letter-spacing: 1px; margin: 0 0 12px;">👥 Staff Performance</h3>
+      <div style="border-radius: 12px; overflow: hidden; border: 1px solid #e5e7eb;">
+        <table width="100%" cellpadding="0" cellspacing="0" style="border-collapse: collapse;">
+          <tr style="background: #f9fafb;">
+            <td style="padding: 10px 16px; font-size: 13px; font-weight: 600; color: #374151;">Staff</td>
+            <td style="padding: 10px 16px; font-size: 13px; font-weight: 600; color: #374151;">Role</td>
+            <td style="padding: 10px 16px; font-size: 13px; font-weight: 600; color: #374151; text-align: center;">Orders</td>
+            <td style="padding: 10px 16px; font-size: 13px; font-weight: 600; color: #374151; text-align: right;">Sales</td>
+          </tr>
+          ${data.todayReport.staffBreakdown.map((staff, i) => `
+          <tr style="background: ${i % 2 === 0 ? '#ffffff' : '#f9fafb'};">
+            <td style="padding: 10px 16px; font-size: 13px; color: #1f2937; font-weight: 500; border-top: 1px solid #f3f4f6;">${staff.staffName || staff.name || '-'}</td>
+            <td style="padding: 10px 16px; font-size: 13px; color: #4b5563; border-top: 1px solid #f3f4f6;">${staff.role || '-'}</td>
+            <td style="padding: 10px 16px; font-size: 13px; color: #4b5563; text-align: center; border-top: 1px solid #f3f4f6;">${staff.orderCount || staff.orders || 0}</td>
+            <td style="padding: 10px 16px; font-size: 13px; color: #1f2937; font-weight: 600; text-align: right; border-top: 1px solid #f3f4f6;">${data.todayReport.currencySymbol || data.currencySymbol || '₹'}${(staff.totalSales || staff.sales || 0).toLocaleString()}</td>
+          </tr>`).join('')}
+        </table>
+      </div>
+    </div>
+    ` : ''}
+
+    <!-- Tax & Adjustments -->
+    ${(data.todayReport.tax || data.todayReport.discounts || data.todayReport.cancelled) ? `
+    <div style="padding: 0 30px 20px;">
+      <h3 style="font-size: 14px; font-weight: 700; color: #6b7280; text-transform: uppercase; letter-spacing: 1px; margin: 0 0 12px;">🧾 Tax & Adjustments</h3>
+      <div style="border-radius: 12px; overflow: hidden; border: 1px solid #e5e7eb;">
+        <table width="100%" cellpadding="0" cellspacing="0" style="border-collapse: collapse;">
+          ${data.todayReport.tax?.total > 0 ? `<tr style="background: #f9fafb;"><td style="padding: 8px 16px; font-size: 13px; color: #374151; font-weight: 600;" colspan="2">Tax Summary</td></tr>
+          ${data.todayReport.tax.cgst > 0 ? `<tr style="background: #ffffff;"><td style="padding: 8px 16px; font-size: 13px; color: #4b5563; border-top: 1px solid #f3f4f6;">CGST</td><td style="padding: 8px 16px; font-size: 13px; color: #1f2937; font-weight: 600; text-align: right; border-top: 1px solid #f3f4f6;">${data.todayReport.currencySymbol || data.currencySymbol || '₹'}${data.todayReport.tax.cgst.toLocaleString()}</td></tr>` : ''}
+          ${data.todayReport.tax.sgst > 0 ? `<tr style="background: #f9fafb;"><td style="padding: 8px 16px; font-size: 13px; color: #4b5563; border-top: 1px solid #f3f4f6;">SGST</td><td style="padding: 8px 16px; font-size: 13px; color: #1f2937; font-weight: 600; text-align: right; border-top: 1px solid #f3f4f6;">${data.todayReport.currencySymbol || data.currencySymbol || '₹'}${data.todayReport.tax.sgst.toLocaleString()}</td></tr>` : ''}
+          <tr style="background: #f0fdf4;"><td style="padding: 10px 16px; font-size: 13px; color: #1f2937; font-weight: 600; border-top: 1px solid #e5e7eb;">Total Tax</td><td style="padding: 10px 16px; font-size: 13px; color: #16a34a; font-weight: 700; text-align: right; border-top: 1px solid #e5e7eb;">${data.todayReport.currencySymbol || data.currencySymbol || '₹'}${data.todayReport.tax.total.toLocaleString()}</td></tr>` : ''}
+          ${(data.todayReport.discounts?.total || 0) > 0 ? `<tr style="background: #ffffff;"><td style="padding: 8px 16px; font-size: 13px; color: #4b5563; border-top: 1px solid #f3f4f6;">Discounts</td><td style="padding: 8px 16px; font-size: 13px; color: #dc2626; font-weight: 600; text-align: right; border-top: 1px solid #f3f4f6;">-${data.todayReport.currencySymbol || data.currencySymbol || '₹'}${data.todayReport.discounts.total.toLocaleString()}</td></tr>` : ''}
+          ${(data.todayReport.cancelled?.count || 0) > 0 ? `<tr style="background: #f9fafb;"><td style="padding: 8px 16px; font-size: 13px; color: #4b5563; border-top: 1px solid #f3f4f6;">Cancelled</td><td style="padding: 8px 16px; font-size: 13px; color: #dc2626; font-weight: 600; text-align: right; border-top: 1px solid #f3f4f6;">${data.todayReport.cancelled.count} orders</td></tr>` : ''}
+          ${(data.todayReport.refunded?.count || 0) > 0 ? `<tr style="background: #ffffff;"><td style="padding: 8px 16px; font-size: 13px; color: #4b5563; border-top: 1px solid #f3f4f6;">Refunded (${data.todayReport.refunded.count})</td><td style="padding: 8px 16px; font-size: 13px; color: #dc2626; font-weight: 600; text-align: right; border-top: 1px solid #f3f4f6;">-${data.todayReport.currencySymbol || data.currencySymbol || '₹'}${data.todayReport.refunded.amount.toLocaleString()}</td></tr>` : ''}
+        </table>
+      </div>
+    </div>
+    ` : ''}
+    ` : ''}
 
     ${data.insights.alerts?.length > 0 ? `
     <!-- Alerts Section -->

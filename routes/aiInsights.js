@@ -713,19 +713,59 @@ router.get('/email-preferences', authenticateToken, requireOwnerRole, async (req
  * Returns { insights, analytics, restaurantCount } or null if no restaurants
  */
 async function generateReportForOwner(userId) {
+  // --- Find ALL restaurants for this owner ---
+  // 1. Direct ownership via ownerId
   const restaurantsSnap = await db.collection(collections.restaurants)
     .where('ownerId', '==', userId)
     .get();
 
-  if (restaurantsSnap.empty) return null;
-
-  const restaurants = [];
-  const restaurantIds = [];
+  const restaurantMap = new Map();
   restaurantsSnap.docs.forEach(doc => {
-    restaurantIds.push(doc.id);
-    restaurants.push({ id: doc.id, ...doc.data() });
+    restaurantMap.set(doc.id, { id: doc.id, ...doc.data() });
   });
 
+  // 2. Also check userRestaurants collection for additional access
+  try {
+    const urSnap = await db.collection(collections.userRestaurants)
+      .where('userId', '==', userId)
+      .get();
+    const extraIds = urSnap.docs
+      .map(d => d.data().restaurantId)
+      .filter(rid => rid && !restaurantMap.has(rid));
+    if (extraIds.length > 0) {
+      const extraDocs = await Promise.all(
+        extraIds.map(rid => db.collection(collections.restaurants).doc(rid).get())
+      );
+      extraDocs.forEach(doc => {
+        if (doc.exists) restaurantMap.set(doc.id, { id: doc.id, ...doc.data() });
+      });
+    }
+  } catch (_) {}
+
+  // 3. Check if any found restaurant has an organizationId — if so, include all org restaurants
+  const orgIds = new Set();
+  for (const r of restaurantMap.values()) {
+    if (r.organizationId) orgIds.add(r.organizationId);
+  }
+  for (const orgId of orgIds) {
+    try {
+      const orgSnap = await db.collection(collections.restaurants)
+        .where('organizationId', '==', orgId)
+        .get();
+      orgSnap.docs.forEach(doc => {
+        if (!restaurantMap.has(doc.id)) {
+          restaurantMap.set(doc.id, { id: doc.id, ...doc.data() });
+        }
+      });
+    } catch (_) {}
+  }
+
+  if (restaurantMap.size === 0) return null;
+
+  const restaurants = Array.from(restaurantMap.values());
+  const restaurantIds = restaurants.map(r => r.id);
+
+  // --- 7-day analytics ---
   const sevenDaysAgo = new Date();
   sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 7);
 
@@ -763,7 +803,6 @@ async function generateReportForOwner(userId) {
         .get()
     ]);
 
-    // Process orders
     const restaurant = restaurants.find(r => r.id === restaurantId);
     let restaurantRevenue = 0;
     let restaurantOrders = 0;
@@ -807,14 +846,12 @@ async function generateReportForOwner(userId) {
       restaurant.orders = restaurantOrders;
     }
 
-    // Process staff
     staffNewSnap.docs.forEach(() => staffCount++);
     staffLegacySnap.docs.forEach(doc => {
       const role = (doc.data().role || '').toLowerCase();
       if (role !== 'owner' && role !== 'customer') staffCount++;
     });
 
-    // Process inventory
     invSnap.docs.forEach(doc => {
       const data = doc.data();
       const currentStock = data.currentStock || 0;
@@ -860,7 +897,181 @@ async function generateReportForOwner(userId) {
     outOfStockCount
   });
 
-  return { insights, analytics, restaurantCount: restaurants.length };
+  // --- Today's detailed EOD-style report across ALL restaurants ---
+  const todayStr = new Date().toISOString().split('T')[0];
+  const startOfDay = new Date(`${todayStr}T00:00:00`);
+  const endOfDay = new Date(`${todayStr}T23:59:59.999`);
+
+  let todayRevenue = 0, todayOrderCount = 0, todayCashCollected = 0;
+  let cashSales = 0, cardSales = 0, upiSales = 0, splitSales = 0, otherSales = 0;
+  let totalTax = 0, totalDiscount = 0;
+  let cancelledCount = 0, refundedCount = 0, refundedAmount = 0;
+  const taxBreakdown = { cgst: 0, sgst: 0, igst: 0 };
+  const categoryWise = {};
+  const todayItemCounts = {};
+  const staffWise = {};
+
+  for (const restaurantId of restaurantIds) {
+    const todayOrdersSnap = await db.collection(collections.orders)
+      .where('restaurantId', '==', restaurantId)
+      .where('createdAt', '>=', startOfDay)
+      .where('createdAt', '<=', endOfDay)
+      .get();
+
+    todayOrdersSnap.forEach(doc => {
+      const order = doc.data();
+
+      if (order.status === 'cancelled' || order.status === 'deleted') {
+        cancelledCount++;
+        return;
+      }
+      if (order.status === 'refunded') {
+        refundedCount++;
+        refundedAmount += order.finalAmount || order.totalAmount || 0;
+        return;
+      }
+
+      const amount = order.finalAmount || order.totalAmount || 0;
+      todayRevenue += amount;
+      todayOrderCount++;
+
+      // Payment method breakdown
+      const method = (order.paymentMethod || 'cash').toLowerCase();
+      if (method === 'cash') { cashSales += amount; todayCashCollected += amount; }
+      else if (method === 'card' || method === 'credit_card' || method === 'debit_card') cardSales += amount;
+      else if (method === 'upi' || method === 'razorpay' || method === 'phonepe' || method === 'gpay' || method === 'paytm') upiSales += amount;
+      else if (method === 'split') {
+        splitSales += amount;
+        if (order.splitPayments) {
+          order.splitPayments.forEach(sp => {
+            if ((sp.method || 'cash').toLowerCase() === 'cash') {
+              todayCashCollected += sp.amount || 0;
+            }
+          });
+        }
+      } else {
+        otherSales += amount;
+      }
+
+      // Staff-wise tracking
+      const staffId = order.staffInfo?.userId || order.staffInfo?.waiterId || order.waiterId || 'unknown';
+      const staffName = order.staffInfo?.waiterName || order.staffInfo?.name || order.waiterName || 'Owner';
+      const staffRole = order.staffInfo?.role || '';
+      if (!staffWise[staffId]) {
+        staffWise[staffId] = { staffName, role: staffRole, orderCount: 0, totalSales: 0, payments: { cash: 0, card: 0, upi: 0 } };
+      }
+      staffWise[staffId].orderCount += 1;
+      staffWise[staffId].totalSales += amount;
+      if (method === 'cash') staffWise[staffId].payments.cash += amount;
+      else if (method === 'card' || method === 'credit_card' || method === 'debit_card') staffWise[staffId].payments.card += amount;
+      else if (method === 'upi' || method === 'razorpay' || method === 'phonepe' || method === 'gpay' || method === 'paytm') staffWise[staffId].payments.upi += amount;
+
+      // Tax breakdown
+      totalTax += order.taxAmount || 0;
+      if (order.taxBreakdown && Array.isArray(order.taxBreakdown)) {
+        order.taxBreakdown.forEach(tax => {
+          const name = (tax.name || '').toLowerCase();
+          if (name.includes('cgst')) taxBreakdown.cgst += tax.amount || 0;
+          else if (name.includes('sgst')) taxBreakdown.sgst += tax.amount || 0;
+          else if (name.includes('igst')) taxBreakdown.igst += tax.amount || 0;
+        });
+      }
+
+      // Discount tracking
+      totalDiscount += (order.discountAmount || 0) + (order.manualDiscount || 0) + (order.loyaltyDiscount || 0);
+
+      // Item-level and category tracking
+      if (order.items && Array.isArray(order.items)) {
+        order.items.forEach(item => {
+          const itemKey = item.name || 'Unknown';
+          if (!todayItemCounts[itemKey]) {
+            todayItemCounts[itemKey] = { name: itemKey, qty: 0, revenue: 0 };
+          }
+          todayItemCounts[itemKey].qty += item.quantity || 1;
+          todayItemCounts[itemKey].revenue += (item.price || 0) * (item.quantity || 1);
+
+          const cat = item.category || 'Uncategorized';
+          if (!categoryWise[cat]) categoryWise[cat] = { name: cat, revenue: 0 };
+          categoryWise[cat].revenue += (item.price || 0) * (item.quantity || 1);
+        });
+      }
+    });
+  }
+
+  const topItems = Object.values(todayItemCounts).sort((a, b) => b.qty - a.qty).slice(0, 15);
+  const categorySales = Object.values(categoryWise).sort((a, b) => b.revenue - a.revenue);
+
+  // Shifts for today
+  const allShifts = [];
+  for (const restaurantId of restaurantIds) {
+    const restaurant = restaurants.find(r => r.id === restaurantId);
+    const storeName = restaurant?.name || restaurantId;
+    try {
+      const shiftsSnap = await db.collection(collections.shifts || 'shifts')
+        .where('restaurantId', '==', restaurantId)
+        .where('openedAt', '>=', startOfDay)
+        .where('openedAt', '<=', endOfDay)
+        .get();
+      shiftsSnap.forEach(doc => {
+        const s = doc.data();
+        allShifts.push({
+          storeName,
+          openedBy: s.openedBy || s.staffName || '',
+          openedAt: s.openedAt?.toDate ? s.openedAt.toDate().toISOString() : s.openedAt,
+          closedAt: s.closedAt?.toDate ? s.closedAt.toDate().toISOString() : s.closedAt,
+          status: s.status,
+          totalSales: s.totalSales || 0,
+          orderCount: s.orderCount || 0,
+        });
+      });
+    } catch (_) {}
+  }
+
+  const currencySymbol = restaurants[0]?.currencySymbol || restaurants[0]?.currencySettings?.symbol || '₹';
+
+  const round = v => Math.round(v * 100) / 100;
+  const todayReport = {
+    summary: {
+      totalRevenue: round(todayRevenue),
+      orderCount: todayOrderCount,
+      avgOrderValue: todayOrderCount > 0 ? round(todayRevenue / todayOrderCount) : 0,
+      cashCollected: round(todayCashCollected),
+    },
+    payments: {
+      cash: round(cashSales),
+      card: round(cardSales),
+      upi: round(upiSales),
+      split: round(splitSales),
+      other: round(otherSales),
+    },
+    tax: {
+      total: round(totalTax),
+      cgst: round(taxBreakdown.cgst),
+      sgst: round(taxBreakdown.sgst),
+      igst: round(taxBreakdown.igst),
+    },
+    discounts: { total: round(totalDiscount) },
+    returns: { count: 0, amount: 0 },
+    cancelled: { count: cancelledCount },
+    refunded: { count: refundedCount, amount: round(refundedAmount) },
+    topItems,
+    categorySales,
+    shifts: allShifts,
+    staffBreakdown: Object.values(staffWise).map(s => ({
+      staffName: s.staffName,
+      role: s.role,
+      orderCount: s.orderCount,
+      totalSales: round(s.totalSales),
+      payments: {
+        cash: round(s.payments.cash),
+        card: round(s.payments.card),
+        upi: round(s.payments.upi),
+      }
+    })).sort((a, b) => b.totalSales - a.totalSales),
+    currencySymbol,
+  };
+
+  return { insights, analytics, restaurantCount: restaurants.length, todayReport, currencySymbol };
 }
 
 /**
@@ -894,7 +1105,9 @@ router.post('/send-test-report', authenticateToken, requireOwnerRole, async (req
         ownerName,
         insights: reportData.insights,
         analytics: reportData.analytics,
-        restaurantCount: reportData.restaurantCount
+        restaurantCount: reportData.restaurantCount,
+        todayReport: reportData.todayReport,
+        currencySymbol: reportData.currencySymbol
       });
     }
 

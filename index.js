@@ -18755,7 +18755,9 @@ app.get('/api/cron/send-daily-reports', async (req, res) => {
             ownerName,
             insights: reportData.insights,
             analytics: reportData.analytics,
-            restaurantCount: reportData.restaurantCount
+            restaurantCount: reportData.restaurantCount,
+            todayReport: reportData.todayReport,
+            currencySymbol: reportData.currencySymbol
           });
         }
 
