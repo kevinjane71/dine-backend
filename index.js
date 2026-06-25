@@ -9765,6 +9765,10 @@ app.post('/api/orders', async (req, res) => {
     if (tipAmt < 0) tipAmt = 0;
     if (tipAmt > subtotalForDiscount) tipAmt = subtotalForDiscount;
     const roAmt = roundOffAmount ? Number(roundOffAmount) : 0;
+    // Validate round-off: max ±5 (roundOffTo can be 1, 5, or 10 — half of 10 = 5)
+    if (roAmt < -5 || roAmt > 5) {
+      return res.status(400).json({ error: 'Round-off amount must be between -5 and +5' });
+    }
     finalAmount = Math.max(0, finalAmount + scAmt + tipAmt + roAmt);
 
     // Generate order number and daily/sequential order ID (based on restaurant orderSettings.sequentialOrderIdEnabled)
@@ -9804,8 +9808,9 @@ app.post('/api/orders', async (req, res) => {
         return res.status(400).json({ error: 'Split bill must have at least 2 guest splits' });
       }
       const sbTotal = splitBill.splits.reduce((sum, s) => sum + (parseFloat(s.totalAmount) || 0), 0);
-      if (Math.abs(sbTotal - finalAmount) > 1) {
-        console.warn(`⚠️ Split bill total (₹${sbTotal}) differs from finalAmount (₹${finalAmount}) by ₹${Math.abs(sbTotal - finalAmount)}`);
+      const sbDiff = Math.abs(sbTotal - finalAmount);
+      if (sbDiff > 0.50) {
+        console.warn(`⚠️ Split bill total (₹${sbTotal}) differs from finalAmount (₹${finalAmount}) by ₹${sbDiff}`);
       }
     }
 
@@ -11369,6 +11374,7 @@ function aggregateDailyStats(dailyDocs, dateStrings) {
   const hourCounts = {};
   const revenueByDay = {};
   const paymentBreakdown = {};
+  const categoryBreakdown = {};
   const dayNames = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
 
   for (const doc of dailyDocs) {
@@ -11417,6 +11423,15 @@ function aggregateDailyStats(dailyDocs, dateStrings) {
       }
     }
 
+    // Category breakdown
+    if (doc.categoryBreakdown && typeof doc.categoryBreakdown === 'object') {
+      for (const [cat, val] of Object.entries(doc.categoryBreakdown)) {
+        if (!categoryBreakdown[cat]) categoryBreakdown[cat] = { itemsSold: 0, revenue: 0 };
+        categoryBreakdown[cat].itemsSold += (val.itemsSold || 0);
+        categoryBreakdown[cat].revenue += (val.revenue || 0);
+      }
+    }
+
     // Revenue by day-of-week
     if (doc.date) {
       const d = new Date(doc.date + 'T12:00:00'); // noon to avoid timezone edge
@@ -11456,7 +11471,12 @@ function aggregateDailyStats(dailyDocs, dateStrings) {
     popularItems, revenueData,
     ordersByType: ordersByTypeArray,
     busyHours,
-    paymentBreakdown
+    paymentBreakdown,
+    categoryBreakdown: Object.entries(categoryBreakdown).map(([name, val]) => ({
+      category: name,
+      itemsSold: val.itemsSold,
+      revenue: Math.round(val.revenue * 100) / 100
+    })).sort((a, b) => b.revenue - a.revenue)
   };
 }
 
@@ -11549,16 +11569,33 @@ function calculateAnalytics(orders, period) {
     .sort((a, b) => b.orders - a.orders)
     .slice(0, 6);
 
-  // Payment method breakdown (exclude due orders; partial orders use paidAmount)
+  // Payment method breakdown (exclude due orders; handle split payments)
   const paymentBreakdown = {};
   orders.forEach(order => {
     if (order.paymentStatus === 'due') return; // Skip fully unpaid orders
-    const method = (order.paymentMethod || 'cash').toLowerCase();
     const refundAdj = order.refundAmount || 0;
     const eff = getEffectiveOrderRevenue(order);
-    if (!paymentBreakdown[method]) paymentBreakdown[method] = { count: 0, total: 0 };
-    paymentBreakdown[method].count += 1;
-    paymentBreakdown[method].total += eff.amountWithTax - refundAdj;
+    const orderRevenue = eff.amountWithTax - refundAdj;
+
+    // Handle split payments: distribute revenue across individual payment methods
+    if (order.splitPayments && Array.isArray(order.splitPayments) && order.splitPayments.length > 1) {
+      const splitTotal = order.splitPayments.reduce((s, sp) => s + (sp.amount || 0), 0);
+      order.splitPayments.forEach(sp => {
+        const pm = (sp.method || sp.paymentMethod || 'cash').toLowerCase();
+        if (!paymentBreakdown[pm]) paymentBreakdown[pm] = { count: 0, total: 0 };
+        // Proportionally distribute refund-adjusted revenue across splits
+        const proportion = splitTotal > 0 ? (sp.amount || 0) / splitTotal : 0;
+        paymentBreakdown[pm].total += orderRevenue * proportion;
+      });
+      // Count the order once under 'split' for order count tracking
+      if (!paymentBreakdown['split']) paymentBreakdown['split'] = { count: 0, total: 0 };
+      paymentBreakdown['split'].count += 1;
+    } else {
+      const method = (order.paymentMethod || 'cash').toLowerCase();
+      if (!paymentBreakdown[method]) paymentBreakdown[method] = { count: 0, total: 0 };
+      paymentBreakdown[method].count += 1;
+      paymentBreakdown[method].total += orderRevenue;
+    }
   });
   // Round totals
   Object.keys(paymentBreakdown).forEach(method => {
@@ -13107,7 +13144,13 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
         return res.status(400).json({ error: 'Split bill and split payments cannot be used together' });
       }
     }
-    if (req.body.roundOffAmount !== undefined) updateData.roundOffAmount = req.body.roundOffAmount;
+    if (req.body.roundOffAmount !== undefined) {
+      const roVal = Number(req.body.roundOffAmount) || 0;
+      if (roVal < -5 || roVal > 5) {
+        return res.status(400).json({ error: 'Round-off amount must be between -5 and +5' });
+      }
+      updateData.roundOffAmount = req.body.roundOffAmount;
+    }
     if (req.body.paidAmount !== undefined) updateData.paidAmount = req.body.paidAmount;
     if (req.body.outstandingAmount !== undefined) updateData.outstandingAmount = req.body.outstandingAmount;
     if (req.body.paymentStatus !== undefined) updateData.paymentStatus = req.body.paymentStatus;
@@ -13524,6 +13567,21 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
           itemPriceDiscrepancies,
         };
         console.warn('⚠️ PATCH billing discrepancy detected:', JSON.stringify(updateData.billingAudit));
+      }
+    }
+
+    // Recalculate outstanding amount when finalAmount changes and there's existing partial/due payment
+    // This prevents the race condition where items change but outstanding stays stale
+    if (updateData.finalAmount != null && req.body.partialPayAmount == null && !req.body.paidAmount) {
+      const existingPaid = currentOrder.paidAmount;
+      const existingStatus = updateData.paymentStatus || currentOrder.paymentStatus;
+      if (typeof existingPaid === 'number' && (existingStatus === 'partial' || existingStatus === 'due')) {
+        const newOutstanding = Math.max(0, Math.round((updateData.finalAmount - existingPaid) * 100) / 100);
+        if (newOutstanding !== (currentOrder.outstandingAmount || 0)) {
+          updateData.outstandingAmount = newOutstanding;
+          updateData.paymentStatus = existingPaid <= 0 ? 'due' : (existingPaid >= updateData.finalAmount ? 'paid' : 'partial');
+          console.log(`💰 PATCH: Recalculated outstanding after finalAmount change: paid=₹${existingPaid}, final=₹${updateData.finalAmount}, outstanding=₹${newOutstanding}`);
+        }
       }
     }
 
@@ -14151,7 +14209,8 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
 
     res.json({
       message: 'Order updated successfully',
-      data: { orderId }
+      data: { orderId },
+      order: { id: orderId, dailyOrderId: currentOrder.dailyOrderId, orderNumber: currentOrder.orderNumber }
     });
 
   } catch (error) {
@@ -28023,17 +28082,18 @@ app.get('/api/books/:restaurantId/revenue', authenticateToken, async (req, res) 
     }
     const { restaurantId } = req.params;
     const { period = 'this_month', startDate, endDate, subRestaurantId } = req.query;
+    const tzOffset = parseTZ(req);
     const { start, end } = getDateRange(period, startDate, endDate);
     const prev = getPreviousRange(start, end);
 
-    // Build date string arrays for current and previous periods
+    // Build date string arrays for current and previous periods (timezone-aware)
     const curDateStrings = [];
     for (let d = new Date(start); d <= end; d.setDate(d.getDate() + 1)) {
-      curDateStrings.push(d.toISOString().split('T')[0]);
+      curDateStrings.push(dateStrInTZ(d, tzOffset));
     }
     const prevDateStrings = [];
     for (let d = new Date(prev.start); d <= prev.end; d.setDate(d.getDate() + 1)) {
-      prevDateStrings.push(d.toISOString().split('T')[0]);
+      prevDateStrings.push(dateStrInTZ(d, tzOffset));
     }
 
     // Sub-restaurant filter: if specified, use sub-restaurant dailyStats doc IDs
@@ -28053,7 +28113,7 @@ app.get('/api/books/:restaurantId/revenue', authenticateToken, async (req, res) 
     // Check if we got any dailyStats data
     const hasDailyStats = curDocs.some(doc => doc.exists);
 
-    let totalRevenue = 0, totalTax = 0, totalDiscounts = 0, refunds = 0, orderCount = 0;
+    let totalRevenue = 0, totalTax = 0, totalDiscounts = 0, refunds = 0, orderCount = 0, totalDueAmount = 0;
     const byPaymentMethod = {};
     const byOrderType = {};
     const dailyMap = {};
@@ -28065,12 +28125,14 @@ app.get('/api/books/:restaurantId/revenue', authenticateToken, async (req, res) 
       curDocs.forEach((doc, i) => {
         if (!doc.exists) return;
         const data = doc.data();
-        // totalRevenueWithTax + totalDueAmount = full revenue (same as finalAmount || totalAmount for non-cancelled)
-        const docRevenue = (data.totalRevenueWithTax || 0) + (data.totalDueAmount || 0);
+        // Revenue = collected amounts minus refunds; due tracked separately
+        const docRefunds = data.totalRefunds || 0;
+        const docRevenue = (data.totalRevenueWithTax || 0) - docRefunds;
         totalRevenue += docRevenue;
+        totalDueAmount += data.totalDueAmount || 0;
         totalTax += data.totalTax || 0;
         totalDiscounts += data.totalDiscounts || 0;
-        refunds += data.totalRefunds || 0;
+        refunds += docRefunds;
         orderCount += data.totalOrders || 0;
 
         // Payment method breakdown from paymentMethod_* fields
@@ -28097,12 +28159,12 @@ app.get('/api/books/:restaurantId/revenue', authenticateToken, async (req, res) 
         dailyMap[dateKey].tax += data.totalTax || 0;
       });
 
-      // Previous period revenue from dailyStats
+      // Previous period revenue from dailyStats (collected minus refunds, consistent with current period)
       let prevRevenue = 0;
       prevDocs.forEach(doc => {
         if (!doc.exists) return;
         const data = doc.data();
-        prevRevenue += (data.totalRevenueWithTax || 0) + (data.totalDueAmount || 0);
+        prevRevenue += (data.totalRevenueWithTax || 0) - (data.totalRefunds || 0);
       });
 
       // Sub-restaurant breakdown: if no subRestaurantId filter, try to read sub-restaurant stats
@@ -28114,6 +28176,7 @@ app.get('/api/books/:restaurantId/revenue', authenticateToken, async (req, res) 
 
       const responseData = {
         totalRevenue, totalTax, totalDiscounts, refunds, orderCount,
+        totalDueAmount: Math.round(totalDueAmount * 100) / 100,
         avgOrderValue: orderCount > 0 ? totalRevenue / orderCount : 0,
         byPaymentMethod, byOrderType, dailyBreakdown,
         previousRevenue: prevRevenue, changePercent: Math.round(changePercent * 10) / 10
@@ -28142,22 +28205,27 @@ app.get('/api/books/:restaurantId/revenue', authenticateToken, async (req, res) 
       const o = doc.data();
       if (o.status === 'cancelled' || o.status === 'deleted') return;
       const amount = o.finalAmount || o.totalAmount || 0;
-      totalRevenue += amount;
+      const refundAdj = o.refundAmount || 0;
       totalTax += o.taxAmount || 0;
       totalDiscounts += o.discountAmount || 0;
-      if (o.refundAmount) refunds += o.refundAmount;
+      if (refundAdj > 0) refunds += refundAdj;
       orderCount++;
 
+      // Revenue calculation: only collected amounts, subtract refunds (consistent with analytics)
       const ps = (o.paymentStatus || '').toLowerCase();
       if (ps === 'due') {
+        totalDueAmount += amount;
         byPaymentMethod['due'] = (byPaymentMethod['due'] || 0) + amount;
       } else if (ps === 'partial' && o.paidAmount != null) {
         const paidAmt = Math.min(Number(o.paidAmount) || 0, amount);
         const dueAmt = Math.max(0, amount - paidAmt);
+        totalRevenue += paidAmt - refundAdj;
+        totalDueAmount += dueAmt;
         const pm = (o.paymentMethod || 'cash').toLowerCase();
         if (paidAmt > 0) byPaymentMethod[pm] = (byPaymentMethod[pm] || 0) + paidAmt;
         if (dueAmt > 0) byPaymentMethod['due'] = (byPaymentMethod['due'] || 0) + dueAmt;
       } else {
+        totalRevenue += amount - refundAdj;
         const pm = (o.paymentMethod || 'cash').toLowerCase();
         byPaymentMethod[pm] = (byPaymentMethod[pm] || 0) + amount;
       }
@@ -28184,7 +28252,16 @@ app.get('/api/books/:restaurantId/revenue', authenticateToken, async (req, res) 
     let prevRevenue = 0;
     prevSnap.forEach(doc => {
       const o = doc.data();
-      if (o.status !== 'cancelled' && o.status !== 'deleted') prevRevenue += o.finalAmount || o.totalAmount || 0;
+      if (o.status === 'cancelled' || o.status === 'deleted') return;
+      const ps = (o.paymentStatus || '').toLowerCase();
+      if (ps === 'due') return; // Exclude due from previous revenue
+      const amt = o.finalAmount || o.totalAmount || 0;
+      const ref = o.refundAmount || 0;
+      if (ps === 'partial' && o.paidAmount != null) {
+        prevRevenue += Math.min(Number(o.paidAmount) || 0, amt) - ref;
+      } else {
+        prevRevenue += amt - ref;
+      }
     });
 
     const dailyBreakdown = Object.values(dailyMap).sort((a, b) => a.date.localeCompare(b.date));
@@ -28192,6 +28269,7 @@ app.get('/api/books/:restaurantId/revenue', authenticateToken, async (req, res) 
 
     const responseData = {
       totalRevenue, totalTax, totalDiscounts, refunds, orderCount,
+      totalDueAmount: Math.round(totalDueAmount * 100) / 100,
       avgOrderValue: orderCount > 0 ? totalRevenue / orderCount : 0,
       byPaymentMethod, byOrderType, dailyBreakdown,
       previousRevenue: prevRevenue, changePercent: Math.round(changePercent * 10) / 10
@@ -28517,17 +28595,18 @@ app.get('/api/books/:restaurantId/pnl', authenticateToken, async (req, res) => {
     }
     const { restaurantId } = req.params;
     const { period = 'this_month', startDate, endDate } = req.query;
+    const tzOffset = parseTZ(req);
     const { start, end } = getDateRange(period, startDate, endDate);
     const prev = getPreviousRange(start, end);
 
-    // Build date strings for dailyStats batch reads (revenue only)
+    // Build date strings for dailyStats batch reads (timezone-aware)
     const curDateStrings = [];
     for (let d = new Date(start); d <= end; d.setDate(d.getDate() + 1)) {
-      curDateStrings.push(d.toISOString().split('T')[0]);
+      curDateStrings.push(dateStrInTZ(d, tzOffset));
     }
     const prevDateStrings = [];
     for (let d = new Date(prev.start); d <= prev.end; d.setDate(d.getDate() + 1)) {
-      prevDateStrings.push(d.toISOString().split('T')[0]);
+      prevDateStrings.push(dateStrInTZ(d, tzOffset));
     }
     const curStatsRefs = curDateStrings.map(ds => db.collection('dailyStats').doc(`${restaurantId}_${ds}`));
     const prevStatsRefs = prevDateStrings.map(ds => db.collection('dailyStats').doc(`${restaurantId}_${ds}`));
@@ -28555,12 +28634,12 @@ app.get('/api/books/:restaurantId/pnl', authenticateToken, async (req, res) => {
       curStatsDocs.forEach(doc => {
         if (!doc.exists) return;
         const data = doc.data();
-        revenue += (data.totalRevenueWithTax || 0) + (data.totalDueAmount || 0);
+        revenue += (data.totalRevenueWithTax || 0) - (data.totalRefunds || 0);
       });
       prevStatsDocs.forEach(doc => {
         if (!doc.exists) return;
         const data = doc.data();
-        prevRevenue += (data.totalRevenueWithTax || 0) + (data.totalDueAmount || 0);
+        prevRevenue += (data.totalRevenueWithTax || 0) - (data.totalRefunds || 0);
       });
     } else {
       // Fallback: raw order scan (for restaurants with no dailyStats yet)
@@ -28573,12 +28652,16 @@ app.get('/api/books/:restaurantId/pnl', authenticateToken, async (req, res) => {
       orderSnap.forEach(doc => {
         const o = doc.data();
         if (o.status === 'cancelled' || o.status === 'deleted') return;
-        revenue += o.finalAmount || o.totalAmount || 0;
+        const amt = o.finalAmount || o.totalAmount || 0;
+        const refund = (o.refundAmount || 0) + (o.autoRefundAmount || 0);
+        revenue += amt - refund;
       });
       prevOrderSnap.forEach(doc => {
         const o = doc.data();
         if (o.status === 'cancelled' || o.status === 'deleted') return;
-        prevRevenue += o.finalAmount || o.totalAmount || 0;
+        const amt = o.finalAmount || o.totalAmount || 0;
+        const refund = (o.refundAmount || 0) + (o.autoRefundAmount || 0);
+        prevRevenue += amt - refund;
       });
     }
 
@@ -28649,17 +28732,18 @@ app.get('/api/books/:restaurantId/overview', authenticateToken, async (req, res)
     }
     const { restaurantId } = req.params;
     const { period = 'this_month', startDate, endDate } = req.query;
+    const tzOffset = parseTZ(req);
     const { start, end } = getDateRange(period, startDate, endDate);
     const prev = getPreviousRange(start, end);
 
-    // Build date strings for dailyStats batch reads (revenue + dailyCashFlow)
+    // Build date strings for dailyStats batch reads (timezone-aware)
     const curDateStrings = [];
     for (let d = new Date(start); d <= end; d.setDate(d.getDate() + 1)) {
-      curDateStrings.push(d.toISOString().split('T')[0]);
+      curDateStrings.push(dateStrInTZ(d, tzOffset));
     }
     const prevDateStrings = [];
     for (let d = new Date(prev.start); d <= prev.end; d.setDate(d.getDate() + 1)) {
-      prevDateStrings.push(d.toISOString().split('T')[0]);
+      prevDateStrings.push(dateStrInTZ(d, tzOffset));
     }
     const curStatsRefs = curDateStrings.map(ds => db.collection('dailyStats').doc(`${restaurantId}_${ds}`));
     const prevStatsRefs = prevDateStrings.map(ds => db.collection('dailyStats').doc(`${restaurantId}_${ds}`));
@@ -28687,7 +28771,8 @@ app.get('/api/books/:restaurantId/overview', authenticateToken, async (req, res)
       curStatsDocs.forEach((doc, i) => {
         if (!doc.exists) return;
         const data = doc.data();
-        const amt = (data.totalRevenueWithTax || 0) + (data.totalDueAmount || 0);
+        // Revenue = collected minus refunds (consistent with Books revenue endpoint)
+        const amt = (data.totalRevenueWithTax || 0) - (data.totalRefunds || 0);
         revenue += amt;
         activeOrderCount += data.totalOrders || 0;
         const dk = curDateStrings[i];
@@ -28697,7 +28782,7 @@ app.get('/api/books/:restaurantId/overview', authenticateToken, async (req, res)
       prevStatsDocs.forEach(doc => {
         if (!doc.exists) return;
         const data = doc.data();
-        prevRevenue += (data.totalRevenueWithTax || 0) + (data.totalDueAmount || 0);
+        prevRevenue += (data.totalRevenueWithTax || 0) - (data.totalRefunds || 0);
       });
     } else {
       // Fallback: raw order scan (for restaurants with no dailyStats yet)
@@ -31935,17 +32020,18 @@ app.post('/api/orders/:orderId/refund', authenticateToken, async (req, res) => {
       return res.status(400).json({ error: 'Refund amount cannot exceed order total' });
     }
 
-    // Validate refund doesn't exceed what was actually paid
+    // Validate refund doesn't exceed what was actually paid (use rounding to avoid float drift)
     const paidAmount = typeof orderData.paidAmount === 'number' ? orderData.paidAmount : finalAmount;
     const alreadyRefunded = typeof orderData.refundAmount === 'number' ? orderData.refundAmount : 0;
-    const refundableAmount = paidAmount - alreadyRefunded;
-    if (refundAmount > refundableAmount + 0.01) {
-      return res.status(400).json({ error: `Refund amount (₹${refundAmount}) exceeds refundable amount (₹${Math.round(refundableAmount * 100) / 100}). Only ₹${Math.round(refundableAmount * 100) / 100} has been paid.` });
+    const refundableAmount = Math.round((paidAmount - alreadyRefunded) * 100) / 100;
+    const roundedRefundAmount = Math.round(refundAmount * 100) / 100;
+    if (roundedRefundAmount > refundableAmount + 0.02) {
+      return res.status(400).json({ error: `Refund amount (₹${roundedRefundAmount}) exceeds refundable amount (₹${refundableAmount}). Only ₹${refundableAmount} has been paid.` });
     }
 
-    const isFullRefund = refundAmount >= finalAmount;
+    const isFullRefund = roundedRefundAmount >= finalAmount;
     const updateFields = {
-      refundAmount: Number(refundAmount),
+      refundAmount: roundedRefundAmount,
       refundReason: refundReason || null,
       refundType: refundType || (isFullRefund ? 'full' : 'partial'),
       refundedAt: new Date().toISOString(),
