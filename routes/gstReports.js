@@ -43,20 +43,25 @@ router.get('/:restaurantId/gstr1', async (req, res) => {
 
     orderSnap.docs.forEach(doc => {
       const order = doc.data();
-      if (order.status === 'cancelled' || order.status === 'deleted') return;
+      if (order.status === 'cancelled' || order.status === 'deleted' || order.status === 'refunded') return;
       if (order.paymentStatus === 'due') return; // Exclude unpaid orders from GSTR-1
 
+      const orderTotal = order.finalAmount || order.totalAmount || 0;
       const taxAmount = order.taxAmount || 0;
-      const refund = order.autoRefundAmount || 0;
-      const taxableValue = (order.finalAmount || order.totalAmount || 0) - taxAmount - refund;
+      // Account for all refunds (manual + auto), proportionally reduce tax
+      const totalRefund = (order.refundAmount || 0) + (order.autoRefundAmount || 0);
+      const refundRatio = orderTotal > 0 ? Math.min(1, totalRefund / orderTotal) : 0;
+      const effectiveTax = Math.round(taxAmount * (1 - refundRatio) * 100) / 100;
+      const effectiveTotal = Math.round((orderTotal - totalRefund) * 100) / 100;
+      const taxableValue = effectiveTotal - effectiveTax;
       const gstRate = order.taxBreakdown?.[0]?.rate || order.taxRate || 5;
-      const gst = splitGST(taxAmount, gstRate);
+      const gst = splitGST(effectiveTax, gstRate);
 
       totalTaxableValue += taxableValue;
       totalCGST += gst.cgst;
       totalSGST += gst.sgst;
       totalIGST += gst.igst;
-      totalInvoiceValue += (order.finalAmount || order.totalAmount || 0) - refund;
+      totalInvoiceValue += effectiveTotal;
 
       invoices.push({
         orderId: doc.id,
@@ -70,7 +75,8 @@ router.get('/:restaurantId/gstr1', async (req, res) => {
         cgst: Math.round(gst.cgst * 100) / 100,
         sgst: Math.round(gst.sgst * 100) / 100,
         igst: Math.round(gst.igst * 100) / 100,
-        totalValue: Math.round((order.finalAmount || order.totalAmount || 0) * 100) / 100,
+        totalValue: Math.round(effectiveTotal * 100) / 100,
+        refundAmount: totalRefund > 0 ? Math.round(totalRefund * 100) / 100 : undefined,
         paymentMethod: order.paymentMethod || 'cash',
         taxInclusiveMode: order.taxInclusiveMode || 'exclusive',
       });
@@ -116,12 +122,17 @@ router.get('/:restaurantId/gstr3b', async (req, res) => {
     let outwardTaxable = 0, outwardTax = 0;
     orderSnap.docs.forEach(doc => {
       const o = doc.data();
-      if (o.status === 'cancelled' || o.status === 'deleted') return;
+      if (o.status === 'cancelled' || o.status === 'deleted' || o.status === 'refunded') return;
       if (o.paymentStatus === 'due') return;
+      const orderTotal = o.finalAmount || o.totalAmount || 0;
       const tax = o.taxAmount || 0;
-      const refund = o.autoRefundAmount || 0;
-      outwardTaxable += (o.finalAmount || o.totalAmount || 0) - tax - refund;
-      outwardTax += tax;
+      // Account for all refunds, proportionally reduce tax
+      const totalRefund = (o.refundAmount || 0) + (o.autoRefundAmount || 0);
+      const refundRatio = orderTotal > 0 ? Math.min(1, totalRefund / orderTotal) : 0;
+      const effectiveTax = tax * (1 - refundRatio);
+      const effectiveTotal = orderTotal - totalRefund;
+      outwardTaxable += effectiveTotal - effectiveTax;
+      outwardTax += effectiveTax;
     });
 
     // Inward supplies (from supplier invoices)

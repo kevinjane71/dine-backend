@@ -88,19 +88,26 @@ function calculatePerItemTax(orderItems, taxSettings, categories, totalDiscount,
   let inclusiveTaxAmount = 0;
   let exclusiveTaxAmount = 0;
 
-  for (const item of orderItems) {
+  // Pre-compute per-item taxable amounts (after discount distribution)
+  const itemTaxables = orderItems.map(item => {
     const itemTotal = item.total || item.price * item.quantity;
     const isDiscountable = item.discountApplicable !== false;
-    const isInclusive = isItemTaxInclusive(item, taxSettings);
-
     const itemDiscShare = (isDiscountable && discountableSubtotal > 0)
       ? (itemTotal / discountableSubtotal) * totalDiscount
       : 0;
-    const itemTaxable = Math.max(0, itemTotal - itemDiscShare);
+    return Math.max(0, itemTotal - itemDiscShare);
+  });
+  const actualPostDiscountTotal = itemTaxables.reduce((s, v) => s + v, 0);
 
-    const postDiscountSubtotal = Math.max(0, subtotal - totalDiscount);
-    const itemSCShare = postDiscountSubtotal > 0
-      ? (itemTaxable / postDiscountSubtotal) * (serviceChargeAmount || 0)
+  for (let idx = 0; idx < orderItems.length; idx++) {
+    const item = orderItems[idx];
+    const itemTotal = item.total || item.price * item.quantity;
+    const isInclusive = isItemTaxInclusive(item, taxSettings);
+    const itemTaxable = itemTaxables[idx];
+
+    // Distribute service charge proportionally to each item's post-discount value
+    const itemSCShare = actualPostDiscountTotal > 0
+      ? (itemTaxable / actualPostDiscountTotal) * (serviceChargeAmount || 0)
       : (subtotal > 0 ? (itemTotal / subtotal) * (serviceChargeAmount || 0) : 0);
     const itemTaxableWithSC = itemTaxable + itemSCShare;
 
