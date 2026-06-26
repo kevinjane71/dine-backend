@@ -21105,6 +21105,10 @@ app.get('/api/kot/render/:restaurantId/:orderId', async (req, res) => {
           if (station.isDefault && !allAssignedCatIds.has(catId)) return true;
           return false;
         });
+        // No items for this station — return empty response
+        if (items.length === 0) {
+          return res.json({ success: true, empty: true, reason: 'no_items_for_station', stationId, stationName: station.name });
+        }
       }
     }
 
