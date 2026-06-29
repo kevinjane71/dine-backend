@@ -130,56 +130,87 @@ const performanceOptimizer = require('./middleware/performanceOptimizer');
 const firestoreOptimizer = require('./utils/firestoreOptimizer');
 const { kvGet, kvSet, kvDel, getCachedRestaurant, invalidateRestaurantCache, invalidateUserCache } = require('./utils/kvCache');
 
-// ── Order rate limiter ──
+// ── Rate Limiters ──
 // Uses a SEPARATE Upstash Redis database (RATELIMIT_REDIS_URL) so it doesn't eat
 // into the main cache quota. Falls back to in-memory if not configured.
 // Env vars needed: RATELIMIT_REDIS_URL + RATELIMIT_REDIS_TOKEN (from a second free Upstash DB)
 let orderRateLimiter = null;
-const orderRateMapFallback = new Map(); // in-memory fallback
-const ORDER_RATE_LIMIT = 30;
-const ORDER_RATE_WINDOW = 60000; // 60s
+let globalRateLimiter = null;
+let rateLimitRedis = null;
 
 try {
   if (process.env.RATELIMIT_REDIS_URL && process.env.RATELIMIT_REDIS_TOKEN) {
     const { Ratelimit } = require('@upstash/ratelimit');
     const { Redis } = require('@upstash/redis');
+    rateLimitRedis = new Redis({ url: process.env.RATELIMIT_REDIS_URL, token: process.env.RATELIMIT_REDIS_TOKEN });
+
+    // Order creation: 30 per minute per restaurant
     orderRateLimiter = new Ratelimit({
-      redis: new Redis({ url: process.env.RATELIMIT_REDIS_URL, token: process.env.RATELIMIT_REDIS_TOKEN }),
-      limiter: Ratelimit.slidingWindow(ORDER_RATE_LIMIT, '60 s'),
-      ephemeralCache: new Map(), // blocked requests use 0 Redis calls
+      redis: rateLimitRedis,
+      limiter: Ratelimit.slidingWindow(30, '60 s'),
+      ephemeralCache: new Map(),
       prefix: 'rl:orders',
     });
-    console.log('Order rate limiter: Upstash (separate DB, sliding window 30/min)');
+
+    // Global API: 200 per minute per IP (covers all endpoints)
+    globalRateLimiter = new Ratelimit({
+      redis: rateLimitRedis,
+      limiter: Ratelimit.slidingWindow(200, '60 s'),
+      ephemeralCache: new Map(),
+      prefix: 'rl:global',
+    });
+
+    console.log('Rate limiters: Upstash (orders: 30/min, global: 200/min)');
   } else {
-    console.log('Order rate limiter: In-memory fallback (set RATELIMIT_REDIS_URL for cross-instance)');
+    console.log('Rate limiters: In-memory fallback (set RATELIMIT_REDIS_URL for cross-instance)');
   }
 } catch (err) {
-  console.warn('Order rate limiter: Init failed —', err.message);
+  console.warn('Rate limiters: Init failed —', err.message);
 }
 
-// Cleanup in-memory fallback every 5 min
+// In-memory fallback maps
+const orderRateMapFallback = new Map();
+const globalRateMapFallback = new Map();
+const ORDER_RATE_LIMIT = 30;
+const GLOBAL_RATE_LIMIT = 200;
+const RATE_WINDOW = 60000; // 60s
+
+// Cleanup stale entries every 5 min
 setInterval(() => {
   const now = Date.now();
   for (const [key, val] of orderRateMapFallback) {
-    if (now - val.windowStart > ORDER_RATE_WINDOW * 2) orderRateMapFallback.delete(key);
+    if (now - val.windowStart > RATE_WINDOW * 2) orderRateMapFallback.delete(key);
+  }
+  for (const [key, val] of globalRateMapFallback) {
+    if (now - val.windowStart > RATE_WINDOW * 2) globalRateMapFallback.delete(key);
   }
 }, 5 * 60 * 1000);
 
+function inMemoryRateCheck(map, key, limit) {
+  const now = Date.now();
+  let entry = map.get(key);
+  if (!entry || now - entry.windowStart > RATE_WINDOW) {
+    entry = { count: 0, windowStart: now };
+    map.set(key, entry);
+  }
+  entry.count++;
+  return entry.count <= limit;
+}
+
 async function checkOrderRateLimit(restaurantId) {
-  // Prefer Upstash rate limiter if configured
   if (orderRateLimiter) {
     const { success } = await orderRateLimiter.limit(restaurantId);
     return success;
   }
-  // Fallback: in-memory (works per warm instance)
-  const now = Date.now();
-  let entry = orderRateMapFallback.get(restaurantId);
-  if (!entry || now - entry.windowStart > ORDER_RATE_WINDOW) {
-    entry = { count: 0, windowStart: now };
-    orderRateMapFallback.set(restaurantId, entry);
+  return inMemoryRateCheck(orderRateMapFallback, restaurantId, ORDER_RATE_LIMIT);
+}
+
+async function checkGlobalRateLimit(ip) {
+  if (globalRateLimiter) {
+    const { success } = await globalRateLimiter.limit(ip);
+    return success;
   }
-  entry.count++;
-  return entry.count <= ORDER_RATE_LIMIT;
+  return inMemoryRateCheck(globalRateMapFallback, ip, GLOBAL_RATE_LIMIT);
 }
 
 // Firestore daily counter — counts total reads/writes per day (2 Redis calls per request)
@@ -1527,6 +1558,19 @@ app.use((req, res, next) => {
   res.setHeader('X-Request-ID', req.id);
   next();
 });
+
+// Global rate limiter ready but disabled — enable after testing order rate limit
+// app.use('/api', async (req, res, next) => {
+//   try {
+//     const ip = (req.headers['x-forwarded-for'] || '').split(',')[0].trim() || req.socket?.remoteAddress || 'unknown';
+//     const allowed = await checkGlobalRateLimit(ip);
+//     if (!allowed) {
+//       console.warn(`🚫 Global rate limit hit: IP ${ip} — ${req.method} ${req.path}`);
+//       return res.status(429).json({ error: 'Too many requests. Please slow down.' });
+//     }
+//   } catch (err) {}
+//   next();
+// });
 
 // Firestore daily counter — flush counts at end of each request
 try {
