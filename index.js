@@ -14721,7 +14721,11 @@ app.use('/api/sadad', sadadRoutes);
 
 // Print installer (KOT Printer exe/dmg) – use same bucket as image/menu uploads
 app.set('printInstallerBucket', bucket);
+app.set('bucket', bucket);
 app.use('/api/print-installer', printInstallerRoutes);
+
+// Bulk menu upload (signed URL + async extraction)
+app.use('/api/menus', require('./routes/bulkMenuUpload'));
 
 // Public AI tools (no auth, IP rate-limited)
 app.use('/api/public/tools', vercelSecurityMiddleware.publicAPI, publicToolsRoutes);
