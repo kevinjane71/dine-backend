@@ -1240,6 +1240,7 @@ router.get('/restaurants', authenticateSuperAdmin, requireSuperAdmin, async (req
         adminNote: d.adminNote || '',
         allowOrderDelete: d.orderSettings?.allowOrderDelete || false,
         notificationOrderTypes: d.orderSettings?.notificationOrderTypes || ['online'],
+        pgBackendUrl: d.pgBackendUrl || null,
       };
     });
 
@@ -1850,6 +1851,79 @@ router.patch('/restaurants/:restaurantId/settings', authenticateSuperAdmin, requ
   } catch (error) {
     console.error('Super admin update restaurant settings error:', error);
     res.status(500).json({ success: false, error: 'Failed to update restaurant settings' });
+  }
+});
+
+// ─── Backend Routing (Migration Control) ─────────────────────────────
+// Set or clear pgBackendUrl on a restaurant to route its frontend traffic
+// to GCP Cloud Run (PG) or back to Vercel (Firestore).
+router.patch('/restaurants/:restaurantId/backend', authenticateSuperAdmin, requireSuperAdmin, async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+    const { pgBackendUrl } = req.body || {};
+
+    if (!restaurantId) {
+      return res.status(400).json({ success: false, error: 'restaurantId is required' });
+    }
+
+    const restaurantRef = db.collection(collections.restaurants).doc(restaurantId);
+    const restaurant = await restaurantRef.get();
+    if (!restaurant.exists) {
+      return res.status(404).json({ success: false, error: 'Restaurant not found' });
+    }
+
+    const updateData = { updatedAt: new Date() };
+    if (pgBackendUrl && typeof pgBackendUrl === 'string' && pgBackendUrl.startsWith('https://')) {
+      updateData.pgBackendUrl = pgBackendUrl;
+    } else {
+      updateData.pgBackendUrl = null;
+    }
+
+    await restaurantRef.update(updateData);
+
+    console.log(`Backend routing updated: ${restaurantId} → ${updateData.pgBackendUrl || 'Vercel (default)'}`);
+    res.json({ success: true, pgBackendUrl: updateData.pgBackendUrl });
+  } catch (error) {
+    console.error('Super admin update backend routing error:', error);
+    res.status(500).json({ success: false, error: 'Failed to update backend routing' });
+  }
+});
+
+// Bulk update backend routing for multiple restaurants
+router.patch('/restaurants/bulk-backend', authenticateSuperAdmin, requireSuperAdmin, async (req, res) => {
+  try {
+    const { restaurantIds, pgBackendUrl } = req.body || {};
+
+    if (!Array.isArray(restaurantIds) || restaurantIds.length === 0) {
+      return res.status(400).json({ success: false, error: 'restaurantIds array is required' });
+    }
+
+    if (restaurantIds.length > 200) {
+      return res.status(400).json({ success: false, error: 'Maximum 200 restaurants per batch' });
+    }
+
+    const urlValue = (pgBackendUrl && typeof pgBackendUrl === 'string' && pgBackendUrl.startsWith('https://'))
+      ? pgBackendUrl
+      : null;
+
+    const BATCH_LIMIT = 500;
+    let updated = 0;
+    for (let i = 0; i < restaurantIds.length; i += BATCH_LIMIT) {
+      const chunk = restaurantIds.slice(i, i + BATCH_LIMIT);
+      const batch = db.batch();
+      for (const id of chunk) {
+        const ref = db.collection(collections.restaurants).doc(id);
+        batch.update(ref, { pgBackendUrl: urlValue, updatedAt: new Date() });
+      }
+      await batch.commit();
+      updated += chunk.length;
+    }
+
+    console.log(`Bulk backend routing: ${updated} restaurants → ${urlValue || 'Vercel (default)'}`);
+    res.json({ success: true, updated, pgBackendUrl: urlValue });
+  } catch (error) {
+    console.error('Super admin bulk backend routing error:', error);
+    res.status(500).json({ success: false, error: 'Failed to bulk update backend routing' });
   }
 });
 
