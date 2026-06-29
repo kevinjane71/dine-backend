@@ -130,6 +130,58 @@ const performanceOptimizer = require('./middleware/performanceOptimizer');
 const firestoreOptimizer = require('./utils/firestoreOptimizer');
 const { kvGet, kvSet, kvDel, getCachedRestaurant, invalidateRestaurantCache, invalidateUserCache } = require('./utils/kvCache');
 
+// ── Order rate limiter ──
+// Uses a SEPARATE Upstash Redis database (RATELIMIT_REDIS_URL) so it doesn't eat
+// into the main cache quota. Falls back to in-memory if not configured.
+// Env vars needed: RATELIMIT_REDIS_URL + RATELIMIT_REDIS_TOKEN (from a second free Upstash DB)
+let orderRateLimiter = null;
+const orderRateMapFallback = new Map(); // in-memory fallback
+const ORDER_RATE_LIMIT = 30;
+const ORDER_RATE_WINDOW = 60000; // 60s
+
+try {
+  if (process.env.RATELIMIT_REDIS_URL && process.env.RATELIMIT_REDIS_TOKEN) {
+    const { Ratelimit } = require('@upstash/ratelimit');
+    const { Redis } = require('@upstash/redis');
+    orderRateLimiter = new Ratelimit({
+      redis: new Redis({ url: process.env.RATELIMIT_REDIS_URL, token: process.env.RATELIMIT_REDIS_TOKEN }),
+      limiter: Ratelimit.slidingWindow(ORDER_RATE_LIMIT, '60 s'),
+      ephemeralCache: new Map(), // blocked requests use 0 Redis calls
+      prefix: 'rl:orders',
+    });
+    console.log('Order rate limiter: Upstash (separate DB, sliding window 30/min)');
+  } else {
+    console.log('Order rate limiter: In-memory fallback (set RATELIMIT_REDIS_URL for cross-instance)');
+  }
+} catch (err) {
+  console.warn('Order rate limiter: Init failed —', err.message);
+}
+
+// Cleanup in-memory fallback every 5 min
+setInterval(() => {
+  const now = Date.now();
+  for (const [key, val] of orderRateMapFallback) {
+    if (now - val.windowStart > ORDER_RATE_WINDOW * 2) orderRateMapFallback.delete(key);
+  }
+}, 5 * 60 * 1000);
+
+async function checkOrderRateLimit(restaurantId) {
+  // Prefer Upstash rate limiter if configured
+  if (orderRateLimiter) {
+    const { success } = await orderRateLimiter.limit(restaurantId);
+    return success;
+  }
+  // Fallback: in-memory (works per warm instance)
+  const now = Date.now();
+  let entry = orderRateMapFallback.get(restaurantId);
+  if (!entry || now - entry.windowStart > ORDER_RATE_WINDOW) {
+    entry = { count: 0, windowStart: now };
+    orderRateMapFallback.set(restaurantId, entry);
+  }
+  entry.count++;
+  return entry.count <= ORDER_RATE_LIMIT;
+}
+
 // Firestore daily counter — counts total reads/writes per day (2 Redis calls per request)
 try {
   const { enableProfiler } = require('./utils/firestoreProfiler');
@@ -8986,8 +9038,25 @@ app.post('/api/public/orders/:restaurantId', vercelSecurityMiddleware.publicAPI,
   }
 });
 
+// Order validation limits — prevents quantity/price manipulation exploits
+const ORDER_MAX_QUANTITY = 10000;
+const ORDER_MAX_UNIT_PRICE = 1000000; // ₹10 lakh per unit
+
 app.post('/api/orders', async (req, res) => {
   try {
+    // ── Rate limit: prevent order spam (e.g. 2000+ orders in 1 minute) ──
+    if (req.body.restaurantId) {
+      try {
+        const allowed = await checkOrderRateLimit(req.body.restaurantId);
+        if (!allowed) {
+          console.warn(`🚫 Order rate limit hit: restaurant ${req.body.restaurantId}`);
+          return res.status(429).json({ error: 'Too many orders. Please wait before placing more orders (limit: 30/min).' });
+        }
+      } catch (rlErr) {
+        console.error('Rate limit check failed (non-blocking):', rlErr.message);
+      }
+    }
+
     console.log('🛒 Order Creation Request:', {
       restaurantId: req.body.restaurantId,
       tableNumber: req.body.tableNumber,
@@ -9329,12 +9398,15 @@ app.post('/api/orders', async (req, res) => {
       if (isCustomItem) {
         // Custom item — no menu lookup needed, use FE-provided name/price directly
         const fePrice = typeof item.price === 'number' ? item.price : (typeof item.basePrice === 'number' ? item.basePrice : 0);
-        if (fePrice < 0) {
-          return res.status(400).json({ error: `Invalid price for custom item "${item.name}": price cannot be negative (₹${fePrice})` });
+        if (fePrice < 0 || fePrice > ORDER_MAX_UNIT_PRICE) {
+          return res.status(400).json({ error: `Invalid price for custom item "${item.name}": price must be between ₹0 and ₹${ORDER_MAX_UNIT_PRICE}` });
         }
         const parsedQty = parseInt(item.quantity, 10);
         if (parsedQty != null && parsedQty <= 0) {
           return res.status(400).json({ error: `Invalid quantity for custom item "${item.name}": quantity must be positive` });
+        }
+        if (parsedQty > ORDER_MAX_QUANTITY) {
+          return res.status(400).json({ error: `Invalid quantity for custom item "${item.name}": quantity cannot exceed ${ORDER_MAX_QUANTITY}` });
         }
         const itemQuantity = Math.max(1, parsedQty || 1);
         const itemTotal = fePrice * itemQuantity;
@@ -9444,14 +9516,17 @@ app.post('/api/orders', async (req, res) => {
       // Expected unit price = expected base + customizations (for price edit comparison)
       const expectedUnitPrice = (expectedMenuPrice || 0) + (customizationPrice || 0);
 
-      // Validate price is non-negative
-      if (unitPrice < 0) {
-        return res.status(400).json({ error: `Invalid price for item "${menuItem.name}": price cannot be negative (₹${unitPrice})` });
+      // Validate price bounds
+      if (unitPrice < 0 || unitPrice > ORDER_MAX_UNIT_PRICE) {
+        return res.status(400).json({ error: `Invalid price for item "${menuItem.name}": price must be between ₹0 and ₹${ORDER_MAX_UNIT_PRICE}` });
       }
 
       const parsedQty = parseInt(item.quantity, 10);
       if (parsedQty != null && parsedQty <= 0) {
         return res.status(400).json({ error: `Invalid quantity for item "${menuItem.name}": quantity must be positive` });
+      }
+      if (parsedQty > ORDER_MAX_QUANTITY) {
+        return res.status(400).json({ error: `Invalid quantity for item "${menuItem.name}": quantity cannot exceed ${ORDER_MAX_QUANTITY}` });
       }
       const itemQuantity = Math.max(1, parsedQty || 1);
 
@@ -12997,9 +13072,9 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
         const resolvedUnitPrice = (resolvedBasePrice || 0) + (customizationPrice || 0);
         const expectedUnitPricePatch = (expectedMenuPricePatch || 0) + (customizationPrice || 0);
 
-        // Validate price is non-negative
-        if (resolvedUnitPrice < 0) {
-          throw new Error(`Invalid price for item "${cleanItem.name || menuItem?.name}": price cannot be negative (₹${resolvedUnitPrice})`);
+        // Validate price bounds
+        if (resolvedUnitPrice < 0 || resolvedUnitPrice > ORDER_MAX_UNIT_PRICE) {
+          throw new Error(`Invalid price for item "${cleanItem.name || menuItem?.name}": price must be between ₹0 and ₹${ORDER_MAX_UNIT_PRICE}`);
         }
 
         // Log if FE-sent price differs from BE-resolved price
@@ -13010,6 +13085,9 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
         const parsedQtyPatch = parseInt(cleanItem.quantity, 10);
         if (parsedQtyPatch != null && parsedQtyPatch <= 0) {
           throw new Error(`Invalid quantity for item "${cleanItem.name || menuItem?.name}": quantity must be positive`);
+        }
+        if (parsedQtyPatch > ORDER_MAX_QUANTITY) {
+          throw new Error(`Invalid quantity for item "${cleanItem.name || menuItem?.name}": quantity cannot exceed ${ORDER_MAX_QUANTITY}`);
         }
         const itemQuantity = Math.max(1, parsedQtyPatch || 1);
 
@@ -32540,10 +32618,18 @@ app.patch('/api/orders/:orderId/edit-completed-items', authenticateToken, async 
       const customizationPrice = customizations.reduce((sum, c) => sum + (typeof c.price === 'number' ? c.price : 0), 0);
       const resolvedUnitPrice = (resolvedBasePrice || 0) + customizationPrice;
 
-      // Validate quantity — reject zero/negative (consistent with PATCH handler)
+      // Validate price bounds
+      if (resolvedUnitPrice < 0 || resolvedUnitPrice > ORDER_MAX_UNIT_PRICE) {
+        throw new Error(`Invalid price for item "${cleanItem.name || menuItem?.name}": price must be between ₹0 and ₹${ORDER_MAX_UNIT_PRICE}`);
+      }
+
+      // Validate quantity bounds
       const parsedQtyEdit = parseInt(cleanItem.quantity, 10);
       if (parsedQtyEdit != null && parsedQtyEdit <= 0) {
         throw new Error(`Invalid quantity for item "${cleanItem.name || menuItem?.name}": quantity must be positive`);
+      }
+      if (parsedQtyEdit > ORDER_MAX_QUANTITY) {
+        throw new Error(`Invalid quantity for item "${cleanItem.name || menuItem?.name}": quantity cannot exceed ${ORDER_MAX_QUANTITY}`);
       }
       const itemQuantity = Math.max(1, parsedQtyEdit || 1);
 
