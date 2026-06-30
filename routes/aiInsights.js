@@ -943,13 +943,26 @@ async function generateReportForOwner(userId, timezone) {
     ordersByType: ordersByTypeArray
   };
 
-  // Currency: pick most common symbol across restaurants
-  const currencyVotes = {};
-  restaurants.forEach(r => {
-    const sym = r.currencySettings?.currencySymbol || r.currencySymbol || '₹';
-    currencyVotes[sym] = (currencyVotes[sym] || 0) + 1;
-  });
-  const currencySymbol = Object.entries(currencyVotes).sort((a, b) => b[1] - a[1])[0]?.[0] || '₹';
+  // Currency: prefer most recently configured currencySettings, else vote
+  let currencySymbol = '₹';
+  const withSettings = restaurants.filter(r => r.currencySettings?.currencySymbol);
+  if (withSettings.length > 0) {
+    // Pick the most recently updated currencySettings
+    const sorted = [...withSettings].sort((a, b) => {
+      const aTime = a.currencySettings?.updatedAt?.toDate?.() || a.currencySettings?.updatedAt || 0;
+      const bTime = b.currencySettings?.updatedAt?.toDate?.() || b.currencySettings?.updatedAt || 0;
+      return (bTime > aTime ? 1 : bTime < aTime ? -1 : 0);
+    });
+    currencySymbol = sorted[0].currencySettings.currencySymbol;
+  } else {
+    // Fallback: vote from old currencySymbol field
+    const currencyVotes = {};
+    restaurants.forEach(r => {
+      const sym = r.currencySymbol || '₹';
+      currencyVotes[sym] = (currencyVotes[sym] || 0) + 1;
+    });
+    currencySymbol = Object.entries(currencyVotes).sort((a, b) => b[1] - a[1])[0]?.[0] || '₹';
+  }
 
   const insights = generateAIInsights({
     restaurants,
@@ -1128,7 +1141,7 @@ async function generateReportForOwner(userId, timezone) {
 router.post('/send-test-report', authenticateToken, requireOwnerRole, async (req, res) => {
   try {
     const userId = req.user.userId || req.user.id;
-    const { email, emails, timezone } = req.body;
+    const { email, emails, timezone, currencySymbol: clientCurrency } = req.body;
 
     // Support both single email (legacy) and array
     const recipients = (emails && emails.length > 0) ? emails : (email ? [email] : []);
@@ -1143,6 +1156,15 @@ router.post('/send-test-report', authenticateToken, requireOwnerRole, async (req
       return res.status(400).json({ success: false, error: 'No restaurants found for this owner' });
     }
 
+    // Use client-provided currency (from CurrencyContext) if available, else use report's resolved currency
+    const resolvedCurrency = clientCurrency || reportData.currencySymbol;
+
+    // If currency was overridden, fix the pre-generated AI summary text
+    const insights = { ...reportData.insights };
+    if (resolvedCurrency && resolvedCurrency !== reportData.currencySymbol && insights.summary) {
+      insights.summary = insights.summary.replace(new RegExp(reportData.currencySymbol.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g'), resolvedCurrency);
+    }
+
     const ownerName = req.user.name || req.user.displayName || 'Restaurant Owner';
 
     // Send to all recipients
@@ -1150,11 +1172,11 @@ router.post('/send-test-report', authenticateToken, requireOwnerRole, async (req
       await emailService.sendAIInsightsReport({
         ownerEmail: recipientEmail,
         ownerName,
-        insights: reportData.insights,
+        insights,
         analytics: reportData.analytics,
         restaurantCount: reportData.restaurantCount,
-        todayReport: reportData.todayReport,
-        currencySymbol: reportData.currencySymbol
+        todayReport: { ...reportData.todayReport, currencySymbol: resolvedCurrency },
+        currencySymbol: resolvedCurrency
       });
     }
 
