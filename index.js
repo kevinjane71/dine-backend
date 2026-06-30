@@ -26270,12 +26270,13 @@ app.post('/api/purchase-orders/:restaurantId/:orderId/email', authenticateToken,
       restaurantName: restaurantData.name || 'Restaurant',
       orderNumber: orderId.slice(-8),
       orderData,
-      invoiceHtml
+      invoiceHtml,
+      currencySymbol: restaurantData.currencySymbol || restaurantData.currencySettings?.symbol || '₹',
     });
 
     if (emailResult.success) {
-      res.json({ 
-        success: true, 
+      res.json({
+        success: true,
         message: 'Purchase order sent successfully',
         emailId: emailResult.emailId 
       });
@@ -34353,7 +34354,8 @@ app.post('/api/email/weekly-analytics', authenticateToken, async (req, res) => {
       customerGrowth: Math.round(customerGrowth * 100) / 100,
       topItems: topItems,
       busiestHours: busiestHours,
-      dailyBreakdown: dailyBreakdown
+      dailyBreakdown: dailyBreakdown,
+      currencySymbol: restaurant.currencySymbol || restaurant.currencySettings?.symbol || '₹',
     };
 
     const result = await emailService.sendWeeklyAnalyticsReport(analyticsData);
