@@ -26271,7 +26271,7 @@ app.post('/api/purchase-orders/:restaurantId/:orderId/email', authenticateToken,
       orderNumber: orderId.slice(-8),
       orderData,
       invoiceHtml,
-      currencySymbol: restaurantData.currencySymbol || restaurantData.currencySettings?.symbol || '₹',
+      currencySymbol: restaurantData.currencySettings?.currencySymbol || restaurantData.currencySymbol || '₹',
     });
 
     if (emailResult.success) {
@@ -34355,7 +34355,7 @@ app.post('/api/email/weekly-analytics', authenticateToken, async (req, res) => {
       topItems: topItems,
       busiestHours: busiestHours,
       dailyBreakdown: dailyBreakdown,
-      currencySymbol: restaurant.currencySymbol || restaurant.currencySettings?.symbol || '₹',
+      currencySymbol: restaurant.currencySettings?.currencySymbol || restaurant.currencySymbol || '₹',
     };
 
     const result = await emailService.sendWeeklyAnalyticsReport(analyticsData);

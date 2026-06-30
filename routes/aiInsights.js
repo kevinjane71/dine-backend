@@ -564,7 +564,7 @@ router.get('/insights', authenticateToken, requireOwnerRole, async (req, res) =>
     const filteredRestaurants = restaurants.filter(r => restaurantIds.includes(r.id));
     const csVotes = {};
     filteredRestaurants.forEach(r => {
-      const sym = r.currencySymbol || r.currencySettings?.symbol || '₹';
+      const sym = r.currencySettings?.currencySymbol || r.currencySymbol || '₹';
       csVotes[sym] = (csVotes[sym] || 0) + 1;
     });
     const resolvedCurrency = Object.entries(csVotes).sort((a, b) => b[1] - a[1])[0]?.[0] || '₹';
@@ -946,7 +946,7 @@ async function generateReportForOwner(userId, timezone) {
   // Currency: pick most common symbol across restaurants
   const currencyVotes = {};
   restaurants.forEach(r => {
-    const sym = r.currencySymbol || r.currencySettings?.symbol || '₹';
+    const sym = r.currencySettings?.currencySymbol || r.currencySymbol || '₹';
     currencyVotes[sym] = (currencyVotes[sym] || 0) + 1;
   });
   const currencySymbol = Object.entries(currencyVotes).sort((a, b) => b[1] - a[1])[0]?.[0] || '₹';

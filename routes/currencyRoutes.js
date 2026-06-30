@@ -215,7 +215,8 @@ router.put('/admin/currency/:restaurantId', authenticateToken, async (req, res) 
     };
 
     await restaurantRef.update({
-      currencySettings: settingsToSave
+      currencySettings: settingsToSave,
+      currencySymbol: settingsToSave.currencySymbol,
     });
 
     res.json({
