@@ -10716,10 +10716,16 @@ app.get('/api/orders/single/:orderId', authenticateToken, async (req, res) => {
 
     const { orderId } = req.params;
 
-    let orderData, ordId;
+    const orderRef = db.collection(collections.orders).doc(orderId);
+    const orderDoc = await orderRef.get();
 
+    if (!orderDoc.exists) {
+      return res.json({ orders: [], pagination: { currentPage: 1, totalPages: 0, totalOrders: 0, limit: 1, hasNextPage: false, hasPrevPage: false } });
+    }
+
+    const orderData = orderDoc.data();
     const order = {
-      id: ordId,
+      id: orderDoc.id,
       ...orderData,
       createdAt: orderData.createdAt,
       updatedAt: orderData.updatedAt,
