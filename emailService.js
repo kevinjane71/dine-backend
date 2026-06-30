@@ -218,12 +218,12 @@ https://www.dineopen.com`,
 
       // Daily AI Insights Report
       aiInsightsReport: {
-        getSubject: (ownerName, date) => `Daily Insights Report - ${date}`,
+        getSubject: (ownerName, date, reportType) => `${reportType === 'weekly' ? 'Weekly' : 'Daily'} Insights Report - ${date}`,
 
         text: (data) => `
 Dear ${data.ownerName},
 
-Here's your AI-powered daily insights report for ${data.date}:
+Here's your AI-powered ${data.reportType === 'weekly' ? 'weekly' : 'daily'} insights report for ${data.date}:
 
 SUMMARY
 ${data.insights.summary}
@@ -268,7 +268,7 @@ DineOpen AI Analytics
         <div style="width: 60px; height: 60px; background: rgba(255,255,255,0.2); border-radius: 16px; margin: 0 auto 16px; display: flex; align-items: center; justify-content: center;">
           <span style="font-size: 28px;">🤖</span>
         </div>
-        <h1 style="color: #ffffff; margin: 0; font-size: 24px; font-weight: 700;">Daily Insights Report</h1>
+        <h1 style="color: #ffffff; margin: 0; font-size: 24px; font-weight: 700;">${data.reportType === 'weekly' ? 'Weekly' : 'Daily'} Insights Report</h1>
         <p style="color: rgba(255,255,255,0.85); margin: 8px 0 0; font-size: 14px;">
           ${data.date}
         </p>
@@ -814,7 +814,8 @@ DineOpen Analytics Team`;
       // HEADER
       // ========================
       doc.rect(0, 0, doc.page.width, 90).fill(brandColor);
-      doc.fontSize(22).font('Helvetica-Bold').fillColor('#ffffff').text('Daily Sales Report', 50, 30);
+      const pdfTitle = data.reportType === 'weekly' ? 'Weekly Sales Report' : 'Daily Sales Report';
+      doc.fontSize(22).font('Helvetica-Bold').fillColor('#ffffff').text(pdfTitle, 50, 30);
       doc.fontSize(11).font('Helvetica').fillColor('rgba(255,255,255,0.85)').text(data.date || new Date().toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' }), 50, 58);
       doc.fontSize(10).font('Helvetica-Bold').text('DineOpen', doc.page.width - 130, 35, { width: 80, align: 'right' });
 
@@ -1000,7 +1001,7 @@ DineOpen Analytics Team`;
 
     return this.sendEmail({
       to: reportData.ownerEmail,
-      subject: template.getSubject(reportData.ownerName, today),
+      subject: template.getSubject(reportData.ownerName, today, reportData.reportType),
       text: template.text(data),
       html: template.html(data),
       attachments

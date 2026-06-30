@@ -18921,28 +18921,50 @@ app.get('/api/cron/send-daily-reports', async (req, res) => {
         const recipients = prefs.reportEmails || (prefs.reportEmail ? [prefs.reportEmail] : []);
         if (recipients.length === 0) continue;
 
+        const frequency = prefs.reportFrequency || 'daily';
+
+        // Determine which reports to send based on frequency and day of week
+        const reportsToSend = [];
+        // Check if today is Sunday in the owner's timezone
+        const ownerNow = new Date().toLocaleString('en-US', { timeZone: prefs.timezone || 'Asia/Kolkata', weekday: 'long' });
+        const isSunday = ownerNow.startsWith('Sunday');
+
+        if (frequency === 'daily') {
+          reportsToSend.push('daily');
+        } else if (frequency === 'weekly') {
+          if (isSunday) reportsToSend.push('weekly');
+        } else if (frequency === 'both') {
+          reportsToSend.push('daily');
+          if (isSunday) reportsToSend.push('weekly');
+        }
+
+        if (reportsToSend.length === 0) continue;
+
         // Get owner's name
         const userDoc = await db.collection('users').doc(userId).get();
         const ownerName = userDoc.exists ? (userDoc.data().name || userDoc.data().displayName || 'Restaurant Owner') : 'Restaurant Owner';
 
-        // Generate report using the exported function (pass owner's timezone)
-        const reportData = await aiInsightsRoutes.generateReportForOwner(userId, prefs.timezone);
-        if (!reportData) continue;
+        for (const reportFreq of reportsToSend) {
+          // Generate report using the exported function (pass owner's timezone + frequency)
+          const reportData = await aiInsightsRoutes.generateReportForOwner(userId, prefs.timezone, reportFreq);
+          if (!reportData) continue;
 
-        // Send to all recipient emails
-        for (const email of recipients) {
-          await emailService.sendAIInsightsReport({
-            ownerEmail: email,
-            ownerName,
-            insights: reportData.insights,
-            analytics: reportData.analytics,
-            restaurantCount: reportData.restaurantCount,
-            todayReport: reportData.todayReport,
-            currencySymbol: reportData.currencySymbol
-          });
+          // Send to all recipient emails
+          for (const email of recipients) {
+            await emailService.sendAIInsightsReport({
+              ownerEmail: email,
+              ownerName,
+              insights: reportData.insights,
+              analytics: reportData.analytics,
+              restaurantCount: reportData.restaurantCount,
+              todayReport: reportData.todayReport,
+              currencySymbol: reportData.currencySymbol,
+              reportType: reportData.reportType || reportFreq
+            });
+          }
+
+          console.log(`✅ Cron: sent ${reportFreq} report to ${recipients.join(', ')} for user ${userId}`);
         }
-
-        console.log(`✅ Cron: sent daily report to ${recipients.join(', ')} for user ${userId}`);
         sent++;
       } catch (err) {
         console.error(`❌ Cron email error for user ${prefDoc.id}:`, err.message);

@@ -69,7 +69,7 @@ const generateAIInsights = (data) => {
   const avgOrderValue = totalOrders > 0 ? totalRevenue / totalOrders : 0;
 
   // ==================== SUMMARY ====================
-  const periodLabel = period === 'today' ? 'today' :
+  const periodLabel = period === 'today' || period === '1d' ? 'today' :
                      period === '7d' ? 'this week' :
                      period === '30d' ? 'this month' : 'this period';
 
@@ -647,7 +647,7 @@ router.get('/usage', authenticateToken, requireOwnerRole, async (req, res) => {
 router.post('/email-preferences', authenticateToken, requireOwnerRole, async (req, res) => {
   try {
     const userId = req.user.userId || req.user.id;
-    const { emailEnabled, email, reportEmails, timezone = 'Asia/Kolkata', reportTime = '08:00' } = req.body;
+    const { emailEnabled, email, reportEmails, timezone = 'Asia/Kolkata', reportTime = '08:00', reportFrequency = 'daily' } = req.body;
 
     // Normalize: support both old single email and new array (max 5)
     const emails = (reportEmails && reportEmails.length > 0)
@@ -657,6 +657,10 @@ router.post('/email-preferences', authenticateToken, requireOwnerRole, async (re
     // Pre-compute UTC hour for cron job matching
     const reportTimeUTC = convertToUTCHour(reportTime, timezone);
 
+    // Validate frequency
+    const validFrequencies = ['daily', 'weekly', 'both'];
+    const freq = validFrequencies.includes(reportFrequency) ? reportFrequency : 'daily';
+
     await db.collection('ownerPreferences').doc(userId).set({
       emailEnabled: !!emailEnabled,
       reportEmails: emails,
@@ -664,6 +668,7 @@ router.post('/email-preferences', authenticateToken, requireOwnerRole, async (re
       timezone,
       reportTime,
       reportTimeUTC,
+      reportFrequency: freq,
       updatedAt: new Date()
     }, { merge: true });
 
@@ -700,7 +705,8 @@ router.get('/email-preferences', authenticateToken, requireOwnerRole, async (req
           reportEmails: req.user.email ? [req.user.email] : [],
           reportEmail: req.user.email || '',
           timezone: 'Asia/Kolkata',
-          reportTime: '08:00'
+          reportTime: '08:00',
+          reportFrequency: 'daily'
         }
       });
     }
@@ -753,7 +759,7 @@ function ianaToTzOffset(tz) {
   }
 }
 
-async function generateReportForOwner(userId, timezone) {
+async function generateReportForOwner(userId, timezone, frequency = 'daily') {
   // --- Find ALL restaurants for this owner ---
   // 1. Direct ownership via ownerId
   const restaurantsSnap = await db.collection(collections.restaurants)
@@ -818,12 +824,18 @@ async function generateReportForOwner(userId, timezone) {
   const tzOffset = ownerTz ? ianaToTzOffset(ownerTz) : -330; // fallback IST
   const dayStartHour = restaurants[0]?.posSettings?.businessDayStartHour || 0;
 
-  // --- 7-day analytics (timezone-aware) ---
+  // --- Analytics period (timezone-aware) ---
   const today = todayInTZ(tzOffset, dayStartHour);
-  const sevenDaysAgoStr = dateStrInTZ(
-    new Date(Date.now() - 7 * 24 * 60 * 60 * 1000), tzOffset, dayStartHour
-  );
-  const sevenDaysAgo = dateBoundsInTZ(sevenDaysAgoStr, tzOffset, dayStartHour).start;
+  let analyticsStart;
+  if (frequency === 'weekly') {
+    const sevenDaysAgoStr = dateStrInTZ(
+      new Date(Date.now() - 7 * 24 * 60 * 60 * 1000), tzOffset, dayStartHour
+    );
+    analyticsStart = dateBoundsInTZ(sevenDaysAgoStr, tzOffset, dayStartHour).start;
+  } else {
+    // daily — use today's start only
+    analyticsStart = today.start;
+  }
 
   let totalRevenue = 0;
   let totalOrders = 0;
@@ -841,7 +853,7 @@ async function generateReportForOwner(userId, timezone) {
     const [ordersSnap, staffNewSnap, staffLegacySnap, invSnap] = await Promise.all([
       db.collection(collections.orders)
         .where('restaurantId', '==', restaurantId)
-        .where('createdAt', '>=', sevenDaysAgo)
+        .where('createdAt', '>=', analyticsStart)
         .get(),
       db.collection(collections.staffUsers)
         .where('restaurantId', '==', restaurantId)
@@ -968,7 +980,7 @@ async function generateReportForOwner(userId, timezone) {
     restaurants,
     orders: allOrders,
     analytics,
-    period: '7d',
+    period: frequency === 'weekly' ? '7d' : '1d',
     staffCount,
     lowStockCount,
     outOfStockCount,
@@ -1131,7 +1143,7 @@ async function generateReportForOwner(userId, timezone) {
     currencySymbol,
   };
 
-  return { insights, analytics, restaurantCount: restaurants.length, todayReport, currencySymbol };
+  return { insights, analytics, restaurantCount: restaurants.length, todayReport, currencySymbol, reportType: frequency };
 }
 
 /**
@@ -1141,7 +1153,7 @@ async function generateReportForOwner(userId, timezone) {
 router.post('/send-test-report', authenticateToken, requireOwnerRole, async (req, res) => {
   try {
     const userId = req.user.userId || req.user.id;
-    const { email, emails, timezone, currencySymbol: clientCurrency } = req.body;
+    const { email, emails, timezone, currencySymbol: clientCurrency, reportFrequency } = req.body;
 
     // Support both single email (legacy) and array
     const recipients = (emails && emails.length > 0) ? emails : (email ? [email] : []);
@@ -1151,7 +1163,7 @@ router.post('/send-test-report', authenticateToken, requireOwnerRole, async (req
 
     console.log(`🤖 Generating AI insights report for ${recipients.join(', ')}...`);
 
-    const reportData = await generateReportForOwner(userId, timezone);
+    const reportData = await generateReportForOwner(userId, timezone, reportFrequency || 'daily');
     if (!reportData) {
       return res.status(400).json({ success: false, error: 'No restaurants found for this owner' });
     }
@@ -1176,7 +1188,8 @@ router.post('/send-test-report', authenticateToken, requireOwnerRole, async (req
         analytics: reportData.analytics,
         restaurantCount: reportData.restaurantCount,
         todayReport: { ...reportData.todayReport, currencySymbol: resolvedCurrency },
-        currencySymbol: resolvedCurrency
+        currencySymbol: resolvedCurrency,
+        reportType: reportData.reportType || 'daily'
       });
     }
 
