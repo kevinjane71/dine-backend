@@ -296,7 +296,7 @@ DineOpen AI Analytics
       <table width="100%" cellpadding="0" cellspacing="0" style="border-collapse: separate; border-spacing: 12px 0;">
         <tr>
           <td style="background: linear-gradient(135deg, #10b981, #059669); color: white; padding: 20px; border-radius: 12px; text-align: center; width: 25%;">
-            <div style="font-size: 24px; font-weight: 700; margin-bottom: 4px;">${data.todayReport?.currencySymbol || data.currencySymbol || '₹'}${typeof data.analytics.totalRevenue === 'number' ? data.analytics.totalRevenue.toLocaleString() : data.analytics.totalRevenue}</div>
+            <div style="font-size: 24px; font-weight: 700; margin-bottom: 4px;">${data.todayReport?.currencySymbol || data.currencySymbol || '₹'}&#x200E;${typeof data.analytics.totalRevenue === 'number' ? data.analytics.totalRevenue.toLocaleString() : data.analytics.totalRevenue}</div>
             <div style="font-size: 11px; opacity: 0.9; text-transform: uppercase; letter-spacing: 0.5px;">Revenue</div>
           </td>
           <td style="background: linear-gradient(135deg, #3b82f6, #2563eb); color: white; padding: 20px; border-radius: 12px; text-align: center; width: 25%;">
@@ -304,14 +304,14 @@ DineOpen AI Analytics
             <div style="font-size: 11px; opacity: 0.9; text-transform: uppercase; letter-spacing: 0.5px;">Orders</div>
           </td>
           <td style="background: linear-gradient(135deg, #f59e0b, #d97706); color: white; padding: 20px; border-radius: 12px; text-align: center; width: 25%;">
-            <div style="font-size: 24px; font-weight: 700; margin-bottom: 4px;">${data.todayReport?.currencySymbol || data.currencySymbol || '₹'}${typeof data.analytics.avgOrderValue === 'number' ? Math.round(data.analytics.avgOrderValue) : data.analytics.avgOrderValue}</div>
+            <div style="font-size: 24px; font-weight: 700; margin-bottom: 4px;">${data.todayReport?.currencySymbol || data.currencySymbol || '₹'}&#x200E;${typeof data.analytics.avgOrderValue === 'number' ? Math.round(data.analytics.avgOrderValue) : data.analytics.avgOrderValue}</div>
             <div style="font-size: 11px; opacity: 0.9; text-transform: uppercase; letter-spacing: 0.5px;">Avg Order</div>
           </td>
           ${data.restaurantCount > 1 ? `<td style="background: linear-gradient(135deg, #ef4444, #dc2626); color: white; padding: 20px; border-radius: 12px; text-align: center; width: 25%;">
             <div style="font-size: 24px; font-weight: 700; margin-bottom: 4px;">${data.restaurantCount}</div>
             <div style="font-size: 11px; opacity: 0.9; text-transform: uppercase; letter-spacing: 0.5px;">Locations</div>
           </td>` : `<td style="background: linear-gradient(135deg, #ef4444, #dc2626); color: white; padding: 20px; border-radius: 12px; text-align: center; width: 25%;">
-            <div style="font-size: 24px; font-weight: 700; margin-bottom: 4px;">${data.todayReport?.currencySymbol || data.currencySymbol || '₹'}${typeof data.todayReport?.summary?.cashCollected === 'number' ? data.todayReport.summary.cashCollected.toLocaleString() : '0'}</div>
+            <div style="font-size: 24px; font-weight: 700; margin-bottom: 4px;">${data.todayReport?.currencySymbol || data.currencySymbol || '₹'}&#x200E;${typeof data.todayReport?.summary?.cashCollected === 'number' ? data.todayReport.summary.cashCollected.toLocaleString() : '0'}</div>
             <div style="font-size: 11px; opacity: 0.9; text-transform: uppercase; letter-spacing: 0.5px;">Cash Collected</div>
           </td>`}
         </tr>
@@ -336,7 +336,7 @@ DineOpen AI Analytics
             <td style="padding: 10px 16px; font-size: 13px; font-weight: 600; color: #374151; text-align: right;">Amount</td>
           </tr>
           ${Object.entries(data.todayReport.payments).filter(([, v]) => v > 0).map(([method, amount], i) => {
-            const pcs = data.todayReport.currencySymbol || data.currencySymbol || '₹';
+            const pcs = (data.todayReport.currencySymbol || data.currencySymbol || '₹') + '&#x200E;';
             const icons = { cash: '💵', card: '💳', upi: '📱', split: '🔀', credit_card: '💳', debit_card: '💳', razorpay: '📱', phonepe: '📱', gpay: '📱', paytm: '📱', bank_transfer: '🏦' };
             const icon = icons[method] || '💰';
             const label = method.charAt(0).toUpperCase() + method.slice(1).replace(/_/g, ' ');
@@ -362,7 +362,7 @@ DineOpen AI Analytics
           <tr style="background: ${i % 2 === 0 ? '#ffffff' : '#f9fafb'};">
             <td style="padding: 10px 16px; font-size: 13px; color: #1f2937; border-top: 1px solid #f3f4f6;">${item.name}</td>
             <td style="padding: 10px 16px; font-size: 13px; color: #4b5563; text-align: center; border-top: 1px solid #f3f4f6;">${item.qty || item.quantity || 0}</td>
-            <td style="padding: 10px 16px; font-size: 13px; color: #1f2937; font-weight: 600; text-align: right; border-top: 1px solid #f3f4f6;">${data.todayReport.currencySymbol || data.currencySymbol || '₹'}${(item.revenue || 0).toLocaleString()}</td>
+            <td style="padding: 10px 16px; font-size: 13px; color: #1f2937; font-weight: 600; text-align: right; border-top: 1px solid #f3f4f6;">${data.todayReport.currencySymbol || data.currencySymbol || '₹'}&#x200E;${(item.revenue || 0).toLocaleString()}</td>
           </tr>`).join('')}
         </table>
       </div>
@@ -371,7 +371,7 @@ DineOpen AI Analytics
 
     <!-- Staff Performance -->
     ${data.todayReport.staffBreakdown?.length > 0 ? (() => {
-      const scs = data.todayReport.currencySymbol || data.currencySymbol || '₹';
+      const scs = (data.todayReport.currencySymbol || data.currencySymbol || '₹') + '&#x200E;';
       const allMethods = [...new Set(data.todayReport.staffBreakdown.flatMap(s => Object.keys(s.payments || {})))];
       return `
     <div style="padding: 0 30px 20px;">
@@ -405,11 +405,11 @@ DineOpen AI Analytics
       <div style="border-radius: 12px; overflow: hidden; border: 1px solid #e5e7eb;">
         <table width="100%" cellpadding="0" cellspacing="0" style="border-collapse: collapse;">
           ${data.todayReport.tax?.total > 0 ? `<tr style="background: #f9fafb;"><td style="padding: 8px 16px; font-size: 13px; color: #374151; font-weight: 600;" colspan="2">Tax Summary</td></tr>
-          ${(data.todayReport.tax.breakdown || []).filter(t => t.amount > 0).map((t, i) => `<tr style="background: ${i % 2 === 0 ? '#ffffff' : '#f9fafb'};"><td style="padding: 8px 16px; font-size: 13px; color: #4b5563; border-top: 1px solid #f3f4f6;">${t.name}</td><td style="padding: 8px 16px; font-size: 13px; color: #1f2937; font-weight: 600; text-align: right; border-top: 1px solid #f3f4f6;">${data.todayReport.currencySymbol || data.currencySymbol || '₹'}${t.amount.toLocaleString()}</td></tr>`).join('')}
-          <tr style="background: #f0fdf4;"><td style="padding: 10px 16px; font-size: 13px; color: #1f2937; font-weight: 600; border-top: 1px solid #e5e7eb;">Total Tax</td><td style="padding: 10px 16px; font-size: 13px; color: #16a34a; font-weight: 700; text-align: right; border-top: 1px solid #e5e7eb;">${data.todayReport.currencySymbol || data.currencySymbol || '₹'}${data.todayReport.tax.total.toLocaleString()}</td></tr>` : ''}
-          ${(data.todayReport.discounts?.total || 0) > 0 ? `<tr style="background: #ffffff;"><td style="padding: 8px 16px; font-size: 13px; color: #4b5563; border-top: 1px solid #f3f4f6;">Discounts</td><td style="padding: 8px 16px; font-size: 13px; color: #dc2626; font-weight: 600; text-align: right; border-top: 1px solid #f3f4f6;">-${data.todayReport.currencySymbol || data.currencySymbol || '₹'}${data.todayReport.discounts.total.toLocaleString()}</td></tr>` : ''}
+          ${(data.todayReport.tax.breakdown || []).filter(t => t.amount > 0).map((t, i) => `<tr style="background: ${i % 2 === 0 ? '#ffffff' : '#f9fafb'};"><td style="padding: 8px 16px; font-size: 13px; color: #4b5563; border-top: 1px solid #f3f4f6;">${t.name}</td><td style="padding: 8px 16px; font-size: 13px; color: #1f2937; font-weight: 600; text-align: right; border-top: 1px solid #f3f4f6;">${data.todayReport.currencySymbol || data.currencySymbol || '₹'}&#x200E;${t.amount.toLocaleString()}</td></tr>`).join('')}
+          <tr style="background: #f0fdf4;"><td style="padding: 10px 16px; font-size: 13px; color: #1f2937; font-weight: 600; border-top: 1px solid #e5e7eb;">Total Tax</td><td style="padding: 10px 16px; font-size: 13px; color: #16a34a; font-weight: 700; text-align: right; border-top: 1px solid #e5e7eb;">${data.todayReport.currencySymbol || data.currencySymbol || '₹'}&#x200E;${data.todayReport.tax.total.toLocaleString()}</td></tr>` : ''}
+          ${(data.todayReport.discounts?.total || 0) > 0 ? `<tr style="background: #ffffff;"><td style="padding: 8px 16px; font-size: 13px; color: #4b5563; border-top: 1px solid #f3f4f6;">Discounts</td><td style="padding: 8px 16px; font-size: 13px; color: #dc2626; font-weight: 600; text-align: right; border-top: 1px solid #f3f4f6;">-${data.todayReport.currencySymbol || data.currencySymbol || '₹'}&#x200E;${data.todayReport.discounts.total.toLocaleString()}</td></tr>` : ''}
           ${(data.todayReport.cancelled?.count || 0) > 0 ? `<tr style="background: #f9fafb;"><td style="padding: 8px 16px; font-size: 13px; color: #4b5563; border-top: 1px solid #f3f4f6;">Cancelled</td><td style="padding: 8px 16px; font-size: 13px; color: #dc2626; font-weight: 600; text-align: right; border-top: 1px solid #f3f4f6;">${data.todayReport.cancelled.count} orders</td></tr>` : ''}
-          ${(data.todayReport.refunded?.count || 0) > 0 ? `<tr style="background: #ffffff;"><td style="padding: 8px 16px; font-size: 13px; color: #4b5563; border-top: 1px solid #f3f4f6;">Refunded (${data.todayReport.refunded.count})</td><td style="padding: 8px 16px; font-size: 13px; color: #dc2626; font-weight: 600; text-align: right; border-top: 1px solid #f3f4f6;">-${data.todayReport.currencySymbol || data.currencySymbol || '₹'}${data.todayReport.refunded.amount.toLocaleString()}</td></tr>` : ''}
+          ${(data.todayReport.refunded?.count || 0) > 0 ? `<tr style="background: #ffffff;"><td style="padding: 8px 16px; font-size: 13px; color: #4b5563; border-top: 1px solid #f3f4f6;">Refunded (${data.todayReport.refunded.count})</td><td style="padding: 8px 16px; font-size: 13px; color: #dc2626; font-weight: 600; text-align: right; border-top: 1px solid #f3f4f6;">-${data.todayReport.currencySymbol || data.currencySymbol || '₹'}&#x200E;${data.todayReport.refunded.amount.toLocaleString()}</td></tr>` : ''}
         </table>
       </div>
     </div>
@@ -551,7 +551,7 @@ DineOpen AI Analytics
         getSubject: (restaurantName, weekRange) => `Weekly Analytics Report - ${restaurantName} (${weekRange})`,
         
         text: (analyticsData) => {
-        const cs = analyticsData.currencySymbol || '₹';
+        const cs = (analyticsData.currencySymbol || '₹') + '\u200E';
         return `
 Dear ${analyticsData.ownerName},
 
@@ -583,7 +583,7 @@ DineOpen Analytics Team`;
         },
 
         html: (analyticsData) => {
-        const cs = analyticsData.currencySymbol || '₹';
+        const cs = (analyticsData.currencySymbol || '₹') + '&#x200E;';
         return `
 <!DOCTYPE html>
 <html>
@@ -774,7 +774,15 @@ DineOpen Analytics Team`;
       doc.on('end', () => resolve(Buffer.concat(chunks)));
       doc.on('error', reject);
 
-      const currency = data.currencySymbol || '\u20B9';
+      // Register Unicode-capable fonts (DejaVu Sans supports Latin, Arabic, Cyrillic, Currency symbols, etc.)
+      const path = require('path');
+      const fontDir = path.join(__dirname, 'fonts');
+      doc.registerFont('DejaVuSans', path.join(fontDir, 'DejaVuSans.ttf'));
+      doc.registerFont('DejaVuSans-Bold', path.join(fontDir, 'DejaVuSans-Bold.ttf'));
+
+      const rawCurrency = data.currencySymbol || '\u20B9';
+      // Add LTR mark after currency symbol to prevent RTL scripts (Arabic, Hebrew) from reversing digit order
+      const currency = rawCurrency + '\u200E';
       const pageWidth = doc.page.width - 100; // 50px margin each side
       const brandColor = '#dc2626';
       const headerBg = '#f9fafb';
@@ -782,7 +790,7 @@ DineOpen Analytics Team`;
 
       // --- Helper: draw a section header with colored underline ---
       const drawSectionHeader = (title, y) => {
-        doc.fontSize(14).font('Helvetica-Bold').fillColor('#1f2937').text(title, 50, y);
+        doc.fontSize(14).font('DejaVuSans-Bold').fillColor('#1f2937').text(title, 50, y);
         const textWidth = doc.widthOfString(title);
         doc.moveTo(50, y + 18).lineTo(50 + textWidth + 10, y + 18).lineWidth(2).strokeColor(brandColor).stroke();
         return y + 30;
@@ -802,7 +810,7 @@ DineOpen Analytics Team`;
         }
         let x = 50;
         columns.forEach((col, i) => {
-          doc.fontSize(fs || 10).font(bold || options.headerRow ? 'Helvetica-Bold' : 'Helvetica')
+          doc.fontSize(fs || 10).font(bold || options.headerRow ? 'DejaVuSans-Bold' : 'DejaVuSans')
             .text(String(col), x + 4, y + 2, { width: widths[i] - 8, align: i === 0 ? 'left' : 'right' });
           x += widths[i];
         });
@@ -815,9 +823,9 @@ DineOpen Analytics Team`;
       // ========================
       doc.rect(0, 0, doc.page.width, 90).fill(brandColor);
       const pdfTitle = data.reportType === 'weekly' ? 'Weekly Sales Report' : 'Daily Sales Report';
-      doc.fontSize(22).font('Helvetica-Bold').fillColor('#ffffff').text(pdfTitle, 50, 30);
-      doc.fontSize(11).font('Helvetica').fillColor('rgba(255,255,255,0.85)').text(data.date || new Date().toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' }), 50, 58);
-      doc.fontSize(10).font('Helvetica-Bold').text('DineOpen', doc.page.width - 130, 35, { width: 80, align: 'right' });
+      doc.fontSize(22).font('DejaVuSans-Bold').fillColor('#ffffff').text(pdfTitle, 50, 30);
+      doc.fontSize(11).font('DejaVuSans').fillColor('rgba(255,255,255,0.85)').text(data.date || new Date().toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' }), 50, 58);
+      doc.fontSize(10).font('DejaVuSans-Bold').text('DineOpen', doc.page.width - 130, 35, { width: 80, align: 'right' });
 
       let y = 110;
 
@@ -840,8 +848,8 @@ DineOpen Analytics Team`;
       doc.rect(50, y, pageWidth, 50).fill(headerBg);
       stats.forEach((stat, i) => {
         const x = 50 + i * statBoxWidth;
-        doc.fontSize(14).font('Helvetica-Bold').fillColor('#1f2937').text(String(stat.value), x + 6, y + 8, { width: statBoxWidth - 12, align: 'center' });
-        doc.fontSize(8).font('Helvetica').fillColor('#6b7280').text(stat.label, x + 6, y + 28, { width: statBoxWidth - 12, align: 'center' });
+        doc.fontSize(14).font('DejaVuSans-Bold').fillColor('#1f2937').text(String(stat.value), x + 6, y + 8, { width: statBoxWidth - 12, align: 'center' });
+        doc.fontSize(8).font('DejaVuSans').fillColor('#6b7280').text(stat.label, x + 6, y + 28, { width: statBoxWidth - 12, align: 'center' });
       });
 
       y += 65;
@@ -851,7 +859,7 @@ DineOpen Analytics Team`;
       // ========================
       if (data.insights && data.insights.summary) {
         y = drawSectionHeader('AI Summary', y);
-        doc.fontSize(10).font('Helvetica').fillColor('#374151');
+        doc.fontSize(10).font('DejaVuSans').fillColor('#374151');
         doc.text(data.insights.summary, 50, y, { width: pageWidth, lineGap: 3 });
         y = doc.y + 20;
       }
@@ -950,7 +958,7 @@ DineOpen Analytics Team`;
       if (y > 750) { doc.addPage(); y = 50; }
       doc.moveTo(50, y).lineTo(50 + pageWidth, y).lineWidth(0.5).strokeColor('#d1d5db').stroke();
       y += 10;
-      doc.fontSize(8).font('Helvetica').fillColor('#9ca3af')
+      doc.fontSize(8).font('DejaVuSans').fillColor('#9ca3af')
         .text(`Generated by DineOpen on ${new Date().toLocaleString()} | www.dineopen.com`, 50, y, { width: pageWidth, align: 'center' });
 
       doc.end();

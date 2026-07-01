@@ -468,7 +468,7 @@ router.get('/insights', authenticateToken, requireOwnerRole, async (req, res) =>
 
       snapshot.docs.forEach(doc => {
         const order = doc.data();
-        const amount = order.totalAmount || order.finalAmount || 0;
+        const amount = order.finalAmount || order.totalAmount || 0;
         totalRevenue += amount;
         totalOrders++;
         restaurantRevenue += amount;
@@ -877,7 +877,7 @@ async function generateReportForOwner(userId, timezone, frequency = 'daily') {
 
     ordersSnap.docs.forEach(doc => {
       const order = doc.data();
-      const amount = order.totalAmount || order.finalAmount || 0;
+      const amount = order.finalAmount || order.totalAmount || 0;
       totalRevenue += amount;
       totalOrders++;
       restaurantRevenue += amount;
@@ -1248,7 +1248,7 @@ async function generateDailyReport(userId, period = 'today') {
 
     ordersSnap.docs.forEach(doc => {
       const order = doc.data();
-      totalRevenue += order.totalAmount || order.finalAmount || 0;
+      totalRevenue += order.finalAmount || order.totalAmount || 0;
       totalOrders++;
     });
   }
