@@ -1853,8 +1853,6 @@ router.patch('/restaurants/:restaurantId/settings', authenticateSuperAdmin, requ
 // ─── Backend Routing (Migration Control) ─────────────────────────────
 // Set or clear pgBackendUrl on a restaurant to route its frontend traffic
 // to GCP Cloud Run (PG) or back to Vercel (Firestore).
-// PATCH /api/super-admin/restaurants/:restaurantId/backend
-// Body: { pgBackendUrl: "https://..." | null }
 router.patch('/restaurants/:restaurantId/backend', authenticateSuperAdmin, requireSuperAdmin, async (req, res) => {
   try {
     const { restaurantId } = req.params;
@@ -1874,13 +1872,13 @@ router.patch('/restaurants/:restaurantId/backend', authenticateSuperAdmin, requi
     if (pgBackendUrl && typeof pgBackendUrl === 'string' && pgBackendUrl.startsWith('https://')) {
       updateData.pgBackendUrl = pgBackendUrl;
     } else {
-      // Clear the field — revert to default (Vercel)
       updateData.pgBackendUrl = null;
     }
 
     await restaurantRef.update(updateData);
 
-    console.log(`🔀 Backend routing updated: ${restaurantId} → ${updateData.pgBackendUrl || 'Vercel (default)'}`);
+    console.log(`Backend routing updated: ${restaurantId} → ${updateData.pgBackendUrl || 'Vercel (default)'}`);
+
     res.json({ success: true, pgBackendUrl: updateData.pgBackendUrl });
   } catch (error) {
     console.error('Super admin update backend routing error:', error);
@@ -1889,8 +1887,6 @@ router.patch('/restaurants/:restaurantId/backend', authenticateSuperAdmin, requi
 });
 
 // Bulk update backend routing for multiple restaurants
-// PATCH /api/super-admin/restaurants/bulk-backend
-// Body: { restaurantIds: [...], pgBackendUrl: "https://..." | null }
 router.patch('/restaurants/bulk-backend', authenticateSuperAdmin, requireSuperAdmin, async (req, res) => {
   try {
     const { restaurantIds, pgBackendUrl } = req.body || {};
@@ -1907,7 +1903,6 @@ router.patch('/restaurants/bulk-backend', authenticateSuperAdmin, requireSuperAd
       ? pgBackendUrl
       : null;
 
-    // Batch write in groups of 500 (Firestore batch limit)
     const BATCH_LIMIT = 500;
     let updated = 0;
     for (let i = 0; i < restaurantIds.length; i += BATCH_LIMIT) {
@@ -1921,7 +1916,8 @@ router.patch('/restaurants/bulk-backend', authenticateSuperAdmin, requireSuperAd
       updated += chunk.length;
     }
 
-    console.log(`🔀 Bulk backend routing: ${updated} restaurants → ${urlValue || 'Vercel (default)'}`);
+    console.log(`Bulk backend routing: ${updated} restaurants → ${urlValue || 'Vercel (default)'}`);
+
     res.json({ success: true, updated, pgBackendUrl: urlValue });
   } catch (error) {
     console.error('Super admin bulk backend routing error:', error);

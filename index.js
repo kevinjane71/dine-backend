@@ -133,6 +133,89 @@ const counterRepo = require('./repos/counterRepo');
 const firestoreOptimizer = require('./utils/firestoreOptimizer');
 const { kvGet, kvSet, kvDel, getCachedRestaurant, invalidateRestaurantCache, invalidateUserCache } = require('./utils/kvCache');
 
+// ── Rate Limiters ──
+// Uses a SEPARATE Upstash Redis database (RATELIMIT_REDIS_URL) so it doesn't eat
+// into the main cache quota. Falls back to in-memory if not configured.
+// Env vars needed: RATELIMIT_REDIS_URL + RATELIMIT_REDIS_TOKEN (from a second free Upstash DB)
+let orderRateLimiter = null;
+let globalRateLimiter = null;
+let rateLimitRedis = null;
+
+try {
+  if (process.env.RATELIMIT_REDIS_URL && process.env.RATELIMIT_REDIS_TOKEN) {
+    const { Ratelimit } = require('@upstash/ratelimit');
+    const { Redis } = require('@upstash/redis');
+    rateLimitRedis = new Redis({ url: process.env.RATELIMIT_REDIS_URL, token: process.env.RATELIMIT_REDIS_TOKEN });
+
+    // Order creation: 30 per minute per restaurant
+    orderRateLimiter = new Ratelimit({
+      redis: rateLimitRedis,
+      limiter: Ratelimit.slidingWindow(30, '60 s'),
+      ephemeralCache: new Map(),
+      prefix: 'rl:orders',
+    });
+
+    // Global API: 200 per minute per IP (covers all endpoints)
+    globalRateLimiter = new Ratelimit({
+      redis: rateLimitRedis,
+      limiter: Ratelimit.slidingWindow(200, '60 s'),
+      ephemeralCache: new Map(),
+      prefix: 'rl:global',
+    });
+
+    console.log('Rate limiters: Upstash (orders: 30/min, global: 200/min)');
+  } else {
+    console.log('Rate limiters: In-memory fallback (set RATELIMIT_REDIS_URL for cross-instance)');
+  }
+} catch (err) {
+  console.warn('Rate limiters: Init failed —', err.message);
+}
+
+// In-memory fallback maps
+const orderRateMapFallback = new Map();
+const globalRateMapFallback = new Map();
+const ORDER_RATE_LIMIT = 30;
+const GLOBAL_RATE_LIMIT = 200;
+const RATE_WINDOW = 60000; // 60s
+
+// Cleanup stale entries every 5 min
+setInterval(() => {
+  const now = Date.now();
+  for (const [key, val] of orderRateMapFallback) {
+    if (now - val.windowStart > RATE_WINDOW * 2) orderRateMapFallback.delete(key);
+  }
+  for (const [key, val] of globalRateMapFallback) {
+    if (now - val.windowStart > RATE_WINDOW * 2) globalRateMapFallback.delete(key);
+  }
+}, 5 * 60 * 1000);
+
+function inMemoryRateCheck(map, key, limit) {
+  const now = Date.now();
+  let entry = map.get(key);
+  if (!entry || now - entry.windowStart > RATE_WINDOW) {
+    entry = { count: 0, windowStart: now };
+    map.set(key, entry);
+  }
+  entry.count++;
+  return entry.count <= limit;
+}
+
+async function checkOrderRateLimit(restaurantId) {
+  if (orderRateLimiter) {
+    const { success } = await orderRateLimiter.limit(restaurantId);
+    return success;
+  }
+  return inMemoryRateCheck(orderRateMapFallback, restaurantId, ORDER_RATE_LIMIT);
+}
+
+async function checkGlobalRateLimit(ip) {
+  if (globalRateLimiter) {
+    const { success } = await globalRateLimiter.limit(ip);
+    return success;
+  }
+  return inMemoryRateCheck(globalRateMapFallback, ip, GLOBAL_RATE_LIMIT);
+}
+
 // Firestore daily counter — counts total reads/writes per day (2 Redis calls per request)
 try {
   const { enableProfiler } = require('./utils/firestoreProfiler');
@@ -1423,6 +1506,19 @@ app.use((req, res, next) => {
   res.setHeader('X-Request-ID', req.id);
   next();
 });
+
+// Global rate limiter ready but disabled — enable after testing order rate limit
+// app.use('/api', async (req, res, next) => {
+//   try {
+//     const ip = (req.headers['x-forwarded-for'] || '').split(',')[0].trim() || req.socket?.remoteAddress || 'unknown';
+//     const allowed = await checkGlobalRateLimit(ip);
+//     if (!allowed) {
+//       console.warn(`🚫 Global rate limit hit: IP ${ip} — ${req.method} ${req.path}`);
+//       return res.status(429).json({ error: 'Too many requests. Please slow down.' });
+//     }
+//   } catch (err) {}
+//   next();
+// });
 
 // Firestore daily counter — flush counts at end of each request
 try {
@@ -8943,8 +9039,25 @@ app.post('/api/public/orders/:restaurantId', vercelSecurityMiddleware.publicAPI,
   }
 });
 
+// Order validation limits — prevents quantity/price manipulation exploits
+const ORDER_MAX_QUANTITY = 10000;
+const ORDER_MAX_UNIT_PRICE = 1000000; // ₹10 lakh per unit
+
 app.post('/api/orders', async (req, res) => {
   try {
+    // ── Rate limit: prevent order spam (e.g. 2000+ orders in 1 minute) ──
+    if (req.body.restaurantId) {
+      try {
+        const allowed = await checkOrderRateLimit(req.body.restaurantId);
+        if (!allowed) {
+          console.warn(`🚫 Order rate limit hit: restaurant ${req.body.restaurantId}`);
+          return res.status(429).json({ error: 'Too many orders. Please wait before placing more orders (limit: 30/min).' });
+        }
+      } catch (rlErr) {
+        console.error('Rate limit check failed (non-blocking):', rlErr.message);
+      }
+    }
+
     console.log('🛒 Order Creation Request:', {
       restaurantId: req.body.restaurantId,
       tableNumber: req.body.tableNumber,
@@ -9279,12 +9392,15 @@ app.post('/api/orders', async (req, res) => {
       if (isCustomItem) {
         // Custom item — no menu lookup needed, use FE-provided name/price directly
         const fePrice = typeof item.price === 'number' ? item.price : (typeof item.basePrice === 'number' ? item.basePrice : 0);
-        if (fePrice < 0) {
-          return res.status(400).json({ error: `Invalid price for custom item "${item.name}": price cannot be negative (₹${fePrice})` });
+        if (fePrice < 0 || fePrice > ORDER_MAX_UNIT_PRICE) {
+          return res.status(400).json({ error: `Invalid price for custom item "${item.name}": price must be between ₹0 and ₹${ORDER_MAX_UNIT_PRICE}` });
         }
         const parsedQty = parseInt(item.quantity, 10);
         if (parsedQty != null && parsedQty <= 0) {
           return res.status(400).json({ error: `Invalid quantity for custom item "${item.name}": quantity must be positive` });
+        }
+        if (parsedQty > ORDER_MAX_QUANTITY) {
+          return res.status(400).json({ error: `Invalid quantity for custom item "${item.name}": quantity cannot exceed ${ORDER_MAX_QUANTITY}` });
         }
         const itemQuantity = Math.max(1, parsedQty || 1);
         const itemTotal = fePrice * itemQuantity;
@@ -9394,14 +9510,17 @@ app.post('/api/orders', async (req, res) => {
       // Expected unit price = expected base + customizations (for price edit comparison)
       const expectedUnitPrice = (expectedMenuPrice || 0) + (customizationPrice || 0);
 
-      // Validate price is non-negative
-      if (unitPrice < 0) {
-        return res.status(400).json({ error: `Invalid price for item "${menuItem.name}": price cannot be negative (₹${unitPrice})` });
+      // Validate price bounds
+      if (unitPrice < 0 || unitPrice > ORDER_MAX_UNIT_PRICE) {
+        return res.status(400).json({ error: `Invalid price for item "${menuItem.name}": price must be between ₹0 and ₹${ORDER_MAX_UNIT_PRICE}` });
       }
 
       const parsedQty = parseInt(item.quantity, 10);
       if (parsedQty != null && parsedQty <= 0) {
         return res.status(400).json({ error: `Invalid quantity for item "${menuItem.name}": quantity must be positive` });
+      }
+      if (parsedQty > ORDER_MAX_QUANTITY) {
+        return res.status(400).json({ error: `Invalid quantity for item "${menuItem.name}": quantity cannot exceed ${ORDER_MAX_QUANTITY}` });
       }
       const itemQuantity = Math.max(1, parsedQty || 1);
 
@@ -10784,7 +10903,8 @@ app.get('/api/orders/:restaurantId', authenticateToken, async (req, res) => {
       todayOnly,
       paymentMethod,
       paymentStatus,
-      myOrdersOnly
+      myOrdersOnly,
+      floorIds
     } = req.query;
 
     console.log(`🔍 Orders API - Restaurant: ${restaurantId}, Page: ${page}, Limit: ${limit}, Status: ${status || 'all'}, Search: ${search || 'none'}, Waiter: ${waiterId || 'all'}, TodayOnly: ${todayOnly}, PaymentMethod: ${paymentMethod || 'all'}`);
@@ -10912,6 +11032,14 @@ app.get('/api/orders/:restaurantId', authenticateToken, async (req, res) => {
       // "Mine" filter — show only orders created by this user
       if (myOrdersOnly) {
         fastQuery = fastQuery.where('staffInfo.userId', '==', myOrdersOnly);
+      }
+
+      // Floor filter — used by captain to see only their assigned floors
+      if (floorIds) {
+        const floorIdArr = Array.isArray(floorIds) ? floorIds : floorIds.split(',').map(f => f.trim()).filter(Boolean);
+        if (floorIdArr.length > 0 && floorIdArr.length <= 30) {
+          fastQuery = fastQuery.where('floorId', 'in', floorIdArr);
+        }
       }
 
       if (todayOnly === 'true') {
@@ -12944,9 +13072,9 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
         const resolvedUnitPrice = (resolvedBasePrice || 0) + (customizationPrice || 0);
         const expectedUnitPricePatch = (expectedMenuPricePatch || 0) + (customizationPrice || 0);
 
-        // Validate price is non-negative
-        if (resolvedUnitPrice < 0) {
-          throw new Error(`Invalid price for item "${cleanItem.name || menuItem?.name}": price cannot be negative (₹${resolvedUnitPrice})`);
+        // Validate price bounds
+        if (resolvedUnitPrice < 0 || resolvedUnitPrice > ORDER_MAX_UNIT_PRICE) {
+          throw new Error(`Invalid price for item "${cleanItem.name || menuItem?.name}": price must be between ₹0 and ₹${ORDER_MAX_UNIT_PRICE}`);
         }
 
         // Log if FE-sent price differs from BE-resolved price
@@ -12957,6 +13085,9 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
         const parsedQtyPatch = parseInt(cleanItem.quantity, 10);
         if (parsedQtyPatch != null && parsedQtyPatch <= 0) {
           throw new Error(`Invalid quantity for item "${cleanItem.name || menuItem?.name}": quantity must be positive`);
+        }
+        if (parsedQtyPatch > ORDER_MAX_QUANTITY) {
+          throw new Error(`Invalid quantity for item "${cleanItem.name || menuItem?.name}": quantity cannot exceed ${ORDER_MAX_QUANTITY}`);
         }
         const itemQuantity = Math.max(1, parsedQtyPatch || 1);
 
@@ -17266,6 +17397,127 @@ app.get('/api/analytics/:restaurantId', authenticateToken, async (req, res) => {
   }
 });
 
+// ── Captain Dashboard API ──────────────────────────────────────────────
+app.get('/api/captain/dashboard/:restaurantId', authenticateToken, async (req, res) => {
+  try {
+    const role = req.user.role;
+    if (!['owner', 'admin', 'manager', 'captain'].includes(role)) {
+      return res.status(403).json({ error: 'Access denied' });
+    }
+
+    const { restaurantId } = req.params;
+    const userId = req.user.userId || req.user.id;
+
+    // 1. Get captain's staff doc for assigned floors/waiters
+    let staffDoc = await db.collection(collections.staffUsers).doc(userId).get();
+    if (!staffDoc.exists) staffDoc = await db.collection(collections.users).doc(userId).get();
+    const staffData = staffDoc.exists ? staffDoc.data() : {};
+    const assignedFloorIds = staffData.assignedFloorIds || [];
+    const assignedWaiterIds = staffData.assignedWaiterIds || [];
+
+    // 2. Fetch floors + tables
+    const floorsSnap = await db.collection('restaurants').doc(restaurantId).collection('floors').get();
+    const floors = [];
+    for (const floorDoc of floorsSnap.docs) {
+      // If captain has assigned floors, filter to only those
+      if (assignedFloorIds.length > 0 && !assignedFloorIds.includes(floorDoc.id)) continue;
+      const floorData = floorDoc.data();
+      const tablesSnap = await db.collection('restaurants').doc(restaurantId)
+        .collection('floors').doc(floorDoc.id).collection('tables').get();
+      const tables = tablesSnap.docs.map(t => ({ id: t.id, name: t.data().name || t.id, status: t.data().status || 'available', currentOrderId: t.data().currentOrderId || null, capacity: t.data().capacity || 0 }));
+      floors.push({ id: floorDoc.id, name: floorData.name || floorDoc.id, tables });
+    }
+
+    // 3. Fetch active orders for captain's floors
+    const floorIdsToQuery = floors.map(f => f.id);
+    let activeOrders = [];
+    if (floorIdsToQuery.length > 0) {
+      const ordersSnap = await db.collection(collections.orders)
+        .where('restaurantId', '==', restaurantId)
+        .where('status', 'in', ['pending', 'confirmed', 'preparing', 'ready'])
+        .orderBy('createdAt', 'desc')
+        .limit(200)
+        .get();
+
+      const now = Date.now();
+      ordersSnap.forEach(doc => {
+        const o = doc.data();
+        // Filter to captain's floors (in-memory since floorId may not be indexed with status)
+        if (floorIdsToQuery.length > 0 && o.floorId && !floorIdsToQuery.includes(o.floorId)) return;
+        const createdAt = o.createdAt?.toDate ? o.createdAt.toDate() : new Date(o.createdAt);
+        const waitMinutes = Math.floor((now - createdAt.getTime()) / 60000);
+        activeOrders.push({
+          id: doc.id,
+          dailyOrderId: o.dailyOrderId,
+          tableNumber: o.tableNumber || '',
+          floorId: o.floorId || '',
+          floorName: o.floorName || '',
+          status: o.status,
+          itemCount: (o.items || []).length,
+          total: o.grandTotal || o.total || 0,
+          waiterName: o.staffInfo?.name || 'Unknown',
+          waiterId: o.staffInfo?.userId || '',
+          createdAt: createdAt.toISOString(),
+          waitMinutes,
+        });
+      });
+    }
+
+    // 4. Fetch waiter details
+    const waiters = [];
+    if (assignedWaiterIds.length > 0) {
+      // Firestore 'in' supports up to 30 elements
+      const waiterSnap = await db.collection(collections.staffUsers)
+        .where('__name__', 'in', assignedWaiterIds.slice(0, 30))
+        .get();
+      waiterSnap.forEach(doc => {
+        const w = doc.data();
+        const waiterOrders = activeOrders.filter(o => o.waiterId === doc.id);
+        const waiterTables = new Set(waiterOrders.map(o => o.tableNumber).filter(Boolean));
+        waiters.push({
+          id: doc.id,
+          name: w.name || 'Staff',
+          role: w.role || 'waiter',
+          activeOrderCount: waiterOrders.length,
+          activeTableCount: waiterTables.size,
+          currentTables: [...waiterTables],
+        });
+      });
+    }
+
+    // 5. Build alerts (orders waiting > 15 min)
+    const alerts = activeOrders
+      .filter(o => o.waitMinutes > 15 && ['pending', 'confirmed', 'preparing'].includes(o.status))
+      .map(o => ({ orderId: o.id, type: 'long_wait', waitMinutes: o.waitMinutes, tableNumber: o.tableNumber, waiterName: o.waiterName }));
+
+    // 6. Compute stats
+    const allTables = floors.flatMap(f => f.tables);
+    const tablesOccupied = allTables.filter(t => t.status === 'occupied').length;
+    const tablesAvailable = allTables.filter(t => t.status === 'available').length;
+    const avgWaitTime = activeOrders.length > 0
+      ? Math.round(activeOrders.reduce((sum, o) => sum + o.waitMinutes, 0) / activeOrders.length)
+      : 0;
+
+    res.json({
+      floors,
+      activeOrders,
+      waiters,
+      alerts,
+      stats: {
+        totalActiveOrders: activeOrders.length,
+        tablesOccupied,
+        tablesAvailable,
+        totalTables: allTables.length,
+        avgWaitTime,
+        alertCount: alerts.length,
+      },
+    });
+  } catch (error) {
+    console.error('Captain dashboard error:', error);
+    res.status(500).json({ error: 'Failed to load captain dashboard' });
+  }
+});
+
 // Staff Management APIs
 const requireOwnerRole = (req, res, next) => {
   if (req.user.role !== 'owner' && req.user.role !== 'admin') {
@@ -17500,9 +17752,10 @@ app.delete('/api/staff/:staffId', authenticateToken, requireOwnerRole, async (re
 const ROLE_DEFAULT_PAGE_ACCESS = {
   admin:    { dashboard:true, history:true, tables:true, menu:true, analytics:true, inventory:true, kot:true, admin:{ settings:true, tax:true, pricing:true, payments:true, billingSettings:true, currency:true, print:true, features:true, restaurants:true, staff:true, orderManagement:true, offers:true, loyalty:true, googleReviews:true, whatsapp:true }, completeBill:true, invoice:true, customers:true, offers:true, printer:true },
   manager:  { dashboard:true, history:true, tables:true, menu:true, analytics:true, inventory:{ read:true, add:true, update:true, delete:false }, kot:true, admin:false, completeBill:true, invoice:true, customers:true, offers:true, printer:true },
-  waiter:   { dashboard:true, history:true, tables:true, menu:true, analytics:false, inventory:false, kot:false, admin:false, completeBill:false, invoice:false, customers:false, offers:false, printer:true, orders:{ read:true, update:true, cancel:true, refund:false, completeBill:false } },
+  captain:  { dashboard:true, history:true, tables:{ read:true, add:false, update:true, delete:false, reset:true }, menu:true, analytics:false, inventory:false, kot:true, admin:false, completeBill:true, invoice:false, customers:false, offers:false, printer:true, orders:{ read:true, update:true, cancel:true, refund:true, completeBill:true } },
+  waiter:   { dashboard:true, history:true, tables:{ read:true, add:false, update:true, delete:false, reset:false }, menu:true, analytics:false, inventory:false, kot:false, admin:false, completeBill:false, invoice:false, customers:false, offers:false, printer:true, orders:{ read:true, update:true, cancel:true, refund:false, completeBill:false } },
   cashier:  { dashboard:true, history:true, tables:false, menu:true, analytics:false, inventory:false, kot:false, admin:false, completeBill:true, invoice:true, customers:false, offers:false, printer:true },
-  employee: { dashboard:true, history:true, tables:true, menu:true, analytics:false, inventory:false, kot:false, admin:false, completeBill:false, invoice:false, customers:false, offers:false, printer:true },
+  employee: { dashboard:true, history:true, tables:{ read:true, add:false, update:false, delete:false, reset:false }, menu:true, analytics:false, inventory:false, kot:false, admin:false, completeBill:false, invoice:false, customers:false, offers:false, printer:true },
   sales:    { dashboard:true, history:true, tables:false, menu:true, analytics:false, inventory:false, kot:false, admin:false, completeBill:false, invoice:false, customers:true, offers:true, printer:true },
 };
 
@@ -17593,7 +17846,12 @@ app.post('/api/staff/:restaurantId', authenticateToken, requireOwnerRole, async 
       pageAccess: requestedPageAccess || ROLE_DEFAULT_PAGE_ACCESS[role] || {
         dashboard: true, history: true, tables: true, menu: true,
         analytics: false, inventory: false, kot: false, admin: false, completeBill: false
-      }
+      },
+      // Captain-specific fields
+      ...(role === 'captain' && {
+        assignedFloorIds: req.body.assignedFloorIds || [],
+        assignedWaiterIds: req.body.assignedWaiterIds || [],
+      }),
     };
 
     const staffRef = await db.collection(collections.staffUsers).add(staffData);
@@ -17681,6 +17939,8 @@ app.patch('/api/staff/:staffId', authenticateToken, requireOwnerRole, async (req
     if (role) updateData.role = role;
     if (status) updateData.status = status;
     if (pageAccess !== undefined) updateData.pageAccess = pageAccess;
+    if (req.body.assignedFloorIds !== undefined) updateData.assignedFloorIds = req.body.assignedFloorIds;
+    if (req.body.assignedWaiterIds !== undefined) updateData.assignedWaiterIds = req.body.assignedWaiterIds;
 
     const collName = staffColl === 'staffUsers' ? collections.staffUsers : collections.users;
     await db.collection(collName).doc(staffId).update(updateData);
@@ -17909,8 +18169,8 @@ app.get('/api/user/check-access/:route', authenticateToken, async (req, res) => 
     const { role } = req.user;
     const route = req.params.route;
 
-    // Owner, admin, waiter bypass all access checks
-    if (['owner', 'admin', 'waiter'].includes(role)) {
+    // Owner, admin, captain, waiter bypass all access checks
+    if (['owner', 'admin', 'captain', 'waiter'].includes(role)) {
       return res.json({ allowed: true });
     }
 
@@ -18254,7 +18514,11 @@ app.post('/api/auth/staff/login', async (req, res) => {
         phone: staffData.phone,
         pageAccess: staffData.pageAccess,
         loginId: staffData.loginId,
-        username: staffData.username || null
+        username: staffData.username || null,
+        ...(staffData.role === 'captain' && {
+          assignedFloorIds: staffData.assignedFloorIds || [],
+          assignedWaiterIds: staffData.assignedWaiterIds || [],
+        }),
       },
       restaurant: restaurantData ? {
         id: staffData.restaurantId, // Use the restaurantId from staff data
@@ -18723,28 +18987,50 @@ app.get('/api/cron/send-daily-reports', async (req, res) => {
         const recipients = prefs.reportEmails || (prefs.reportEmail ? [prefs.reportEmail] : []);
         if (recipients.length === 0) continue;
 
+        const frequency = prefs.reportFrequency || 'daily';
+
+        // Determine which reports to send based on frequency and day of week
+        const reportsToSend = [];
+        // Check if today is Sunday in the owner's timezone
+        const ownerNow = new Date().toLocaleString('en-US', { timeZone: prefs.timezone || 'Asia/Kolkata', weekday: 'long' });
+        const isSunday = ownerNow.startsWith('Sunday');
+
+        if (frequency === 'daily') {
+          reportsToSend.push('daily');
+        } else if (frequency === 'weekly') {
+          if (isSunday) reportsToSend.push('weekly');
+        } else if (frequency === 'both') {
+          reportsToSend.push('daily');
+          if (isSunday) reportsToSend.push('weekly');
+        }
+
+        if (reportsToSend.length === 0) continue;
+
         // Get owner's name
         const userDoc = await db.collection('users').doc(userId).get();
         const ownerName = userDoc.exists ? (userDoc.data().name || userDoc.data().displayName || 'Restaurant Owner') : 'Restaurant Owner';
 
-        // Generate report using the exported function (pass owner's timezone)
-        const reportData = await aiInsightsRoutes.generateReportForOwner(userId, prefs.timezone);
-        if (!reportData) continue;
+        for (const reportFreq of reportsToSend) {
+          // Generate report using the exported function (pass owner's timezone + frequency)
+          const reportData = await aiInsightsRoutes.generateReportForOwner(userId, prefs.timezone, reportFreq);
+          if (!reportData) continue;
 
-        // Send to all recipient emails
-        for (const email of recipients) {
-          await emailService.sendAIInsightsReport({
-            ownerEmail: email,
-            ownerName,
-            insights: reportData.insights,
-            analytics: reportData.analytics,
-            restaurantCount: reportData.restaurantCount,
-            todayReport: reportData.todayReport,
-            currencySymbol: reportData.currencySymbol
-          });
+          // Send to all recipient emails
+          for (const email of recipients) {
+            await emailService.sendAIInsightsReport({
+              ownerEmail: email,
+              ownerName,
+              insights: reportData.insights,
+              analytics: reportData.analytics,
+              restaurantCount: reportData.restaurantCount,
+              todayReport: reportData.todayReport,
+              currencySymbol: reportData.currencySymbol,
+              reportType: reportData.reportType || reportFreq
+            });
+          }
+
+          console.log(`✅ Cron: sent ${reportFreq} report to ${recipients.join(', ')} for user ${userId}`);
         }
-
-        console.log(`✅ Cron: sent daily report to ${recipients.join(', ')} for user ${userId}`);
         sent++;
       } catch (err) {
         console.error(`❌ Cron email error for user ${prefDoc.id}:`, err.message);
@@ -22401,7 +22687,10 @@ async function checkFeaturePermission(req, feature, operation) {
     // Fallback: waiters/staff with history or tables access can update/cancel orders
     // (core order-taking workflow — placing orders, sending to kitchen, adding items)
     if (feature === 'orders' && (operation === 'update' || operation === 'cancel')) {
-      if (pageAccess?.history === true || pageAccess?.tables === true) return true;
+      if (pageAccess?.history === true) return true;
+      // tables access (boolean true or object with read/update) implies order-taking permission
+      const tablesVal = pageAccess?.tables;
+      if (tablesVal === true || (typeof tablesVal === 'object' && tablesVal !== null && (tablesVal.read || tablesVal.update))) return true;
       const historyPerms = resolveFeaturePerms(pageAccess, 'history');
       if (historyPerms.read || historyPerms.update) return true;
     }
@@ -26051,12 +26340,13 @@ app.post('/api/purchase-orders/:restaurantId/:orderId/email', authenticateToken,
       restaurantName: restaurantData.name || 'Restaurant',
       orderNumber: orderId.slice(-8),
       orderData,
-      invoiceHtml
+      invoiceHtml,
+      currencySymbol: restaurantData.currencySettings?.currencySymbol || restaurantData.currencySymbol || '₹',
     });
 
     if (emailResult.success) {
-      res.json({ 
-        success: true, 
+      res.json({
+        success: true,
         message: 'Purchase order sent successfully',
         emailId: emailResult.emailId 
       });
@@ -28912,8 +29202,15 @@ app.get('/api/admin/settings/:restaurantId', authenticateToken, async (req, res)
               requireApproval: false,
               approvalMethod: 'pin',          // 'pin' or 'otp'
               otpChannel: 'whatsapp',          // 'whatsapp', 'email', or 'both'
-              approverRole: 'manager',         // whose PIN/OTP is needed
+              approverRole: 'captain',         // captain approves waiter discounts
               maxDiscountWithoutApproval: 0    // 0 = always require approval when enabled
+            },
+            captain: {
+              requireApproval: false,
+              approvalMethod: 'pin',
+              otpChannel: 'whatsapp',
+              approverRole: 'manager',
+              maxDiscountWithoutApproval: 0
             },
             cashier: {
               requireApproval: false,
@@ -32423,10 +32720,18 @@ app.patch('/api/orders/:orderId/edit-completed-items', authenticateToken, async 
       const customizationPrice = customizations.reduce((sum, c) => sum + (typeof c.price === 'number' ? c.price : 0), 0);
       const resolvedUnitPrice = (resolvedBasePrice || 0) + customizationPrice;
 
-      // Validate quantity — reject zero/negative (consistent with PATCH handler)
+      // Validate price bounds
+      if (resolvedUnitPrice < 0 || resolvedUnitPrice > ORDER_MAX_UNIT_PRICE) {
+        throw new Error(`Invalid price for item "${cleanItem.name || menuItem?.name}": price must be between ₹0 and ₹${ORDER_MAX_UNIT_PRICE}`);
+      }
+
+      // Validate quantity bounds
       const parsedQtyEdit = parseInt(cleanItem.quantity, 10);
       if (parsedQtyEdit != null && parsedQtyEdit <= 0) {
         throw new Error(`Invalid quantity for item "${cleanItem.name || menuItem?.name}": quantity must be positive`);
+      }
+      if (parsedQtyEdit > ORDER_MAX_QUANTITY) {
+        throw new Error(`Invalid quantity for item "${cleanItem.name || menuItem?.name}": quantity cannot exceed ${ORDER_MAX_QUANTITY}`);
       }
       const itemQuantity = Math.max(1, parsedQtyEdit || 1);
 
@@ -34098,7 +34403,8 @@ app.post('/api/email/weekly-analytics', authenticateToken, async (req, res) => {
       customerGrowth: Math.round(customerGrowth * 100) / 100,
       topItems: topItems,
       busiestHours: busiestHours,
-      dailyBreakdown: dailyBreakdown
+      dailyBreakdown: dailyBreakdown,
+      currencySymbol: restaurant.currencySettings?.currencySymbol || restaurant.currencySymbol || '₹',
     };
 
     const result = await emailService.sendWeeklyAnalyticsReport(analyticsData);

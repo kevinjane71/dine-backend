@@ -859,7 +859,7 @@ router.get('/:orgId/sales-summary', ...reportMiddleware, async (req, res) => {
     const { startDate, endDate } = parseDateRange(req.query);
     const outlets = filterOutlets(await getOrgOutlets(orgId), parseRestaurantIds(req));
 
-    const paymentBuckets = { cash: { count: 0, amount: 0 }, card: { count: 0, amount: 0 }, upi: { count: 0, amount: 0 }, aggregator: { count: 0, amount: 0 }, other: { count: 0, amount: 0 } };
+    const paymentBuckets = {};
     const serviceBuckets = { dine_in: { count: 0, amount: 0 }, takeaway: { count: 0, amount: 0 }, delivery: { count: 0, amount: 0 }, aggregator: { count: 0, amount: 0 } };
     const dailyMap = {};
     const hourMap = {};
@@ -887,11 +887,13 @@ router.get('/:orgId/sales-summary', ...reportMiddleware, async (req, res) => {
         } else if (order.splitPayments && Array.isArray(order.splitPayments) && order.splitPayments.length > 0) {
           order.splitPayments.forEach(sp => {
             const bucket = normalizePaymentMethod(sp.method || sp.paymentMethod, order);
+            if (!paymentBuckets[bucket]) paymentBuckets[bucket] = { count: 0, amount: 0 };
             paymentBuckets[bucket].count++;
             paymentBuckets[bucket].amount += Number(sp.amount) || 0;
           });
         } else {
           const bucket = normalizePaymentMethod(order.paymentMethod, order);
+          if (!paymentBuckets[bucket]) paymentBuckets[bucket] = { count: 0, amount: 0 };
           paymentBuckets[bucket].count++;
           paymentBuckets[bucket].amount += revenue;
         }
@@ -1635,24 +1637,30 @@ router.get('/:orgId/export/:reportType', ...reportMiddleware, async (req, res) =
 
       case 'sales-summary': {
         filename = `sales-summary-${orgId}.csv`;
-        csvContent += 'Outlet Name,Revenue,Orders,Avg Ticket,Cash,Card,UPI,Aggregator,Other\n';
         const ssPromises = outlets.map(async (outlet) => {
           const orders = await getOutletOrders(outlet.id, startDate, endDate);
           const rev = orders.reduce((s, o) => s + getOrderRevenue(o), 0);
-          const pm = { cash: 0, card: 0, upi: 0, aggregator: 0, other: 0 };
+          const pm = {};
           orders.forEach(o => {
             const amount = getOrderRevenue(o);
             if (o.splitPayments && Array.isArray(o.splitPayments) && o.splitPayments.length > 0) {
-              o.splitPayments.forEach(sp => { pm[normalizePaymentMethod(sp.method || sp.paymentMethod, o)] += Number(sp.amount) || 0; });
+              o.splitPayments.forEach(sp => {
+                const bucket = normalizePaymentMethod(sp.method || sp.paymentMethod, o);
+                pm[bucket] = (pm[bucket] || 0) + (Number(sp.amount) || 0);
+              });
             } else {
-              pm[normalizePaymentMethod(o.paymentMethod, o)] += amount;
+              const bucket = normalizePaymentMethod(o.paymentMethod, o);
+              pm[bucket] = (pm[bucket] || 0) + amount;
             }
           });
-          return { name: outlet.name, rev: Math.round(rev * 100) / 100, orders: orders.length, avg: orders.length > 0 ? Math.round((rev / orders.length) * 100) / 100 : 0, ...Object.fromEntries(Object.entries(pm).map(([k, v]) => [k, Math.round(v * 100) / 100])) };
+          return { name: outlet.name, rev: Math.round(rev * 100) / 100, orders: orders.length, avg: orders.length > 0 ? Math.round((rev / orders.length) * 100) / 100 : 0, pm: Object.fromEntries(Object.entries(pm).map(([k, v]) => [k, Math.round(v * 100) / 100])) };
         });
         const ssResults = await Promise.all(ssPromises);
         ssResults.sort((a, b) => b.rev - a.rev);
-        ssResults.forEach(r => { csvContent += `${escapeCsvField(r.name)},${r.rev},${r.orders},${r.avg},${r.cash},${r.card},${r.upi},${r.aggregator},${r.other}\n`; });
+        // Collect all unique payment methods across all outlets
+        const allPmMethods = [...new Set(ssResults.flatMap(r => Object.keys(r.pm)))];
+        csvContent += `Outlet Name,Revenue,Orders,Avg Ticket,${allPmMethods.map(m => escapeCsvField(m.charAt(0).toUpperCase() + m.slice(1))).join(',')}\n`;
+        ssResults.forEach(r => { csvContent += `${escapeCsvField(r.name)},${r.rev},${r.orders},${r.avg},${allPmMethods.map(m => r.pm[m] || 0).join(',')}\n`; });
         break;
       }
 

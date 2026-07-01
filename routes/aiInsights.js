@@ -63,19 +63,21 @@ const generateAIInsights = (data) => {
     inventoryInsights: []
   };
 
-  const { restaurants, orders, analytics, period } = data;
+  const { restaurants, orders, analytics, period, currencySymbol: cs = '₹' } = data;
   const totalRestaurants = restaurants?.length || 0;
   const totalRevenue = analytics?.totalRevenue || 0;
   const totalOrders = analytics?.totalOrders || 0;
   const avgOrderValue = totalOrders > 0 ? totalRevenue / totalOrders : 0;
 
   // ==================== SUMMARY ====================
-  const periodLabel = period === 'today' ? 'today' :
+  const periodLabel = period === 'today' || period === '1d' ? 'today' :
                      period === '7d' ? 'this week' :
                      period === '30d' ? 'this month' : 'this period';
 
   if (totalRevenue > 0) {
-    insights.summary = `Your ${totalRestaurants} restaurant${totalRestaurants > 1 ? 's' : ''} generated ₹${totalRevenue.toLocaleString()} in revenue from ${totalOrders} orders ${periodLabel}. Average order value is ₹${avgOrderValue.toFixed(0)}.`;
+    insights.summary = totalRestaurants > 1
+      ? `Your ${totalRestaurants} restaurants generated ${cs}${totalRevenue.toLocaleString()} in revenue from ${totalOrders} orders ${periodLabel}. Average order value is ${cs}${avgOrderValue.toFixed(0)}.`
+      : `You generated ${cs}${totalRevenue.toLocaleString()} in revenue from ${totalOrders} orders ${periodLabel}. Average order value is ${cs}${avgOrderValue.toFixed(0)}.`;
   } else {
     insights.summary = `No orders recorded ${periodLabel}. Consider running promotions to drive traffic.`;
   }
@@ -93,7 +95,7 @@ const generateAIInsights = (data) => {
         type: 'top_performer',
         icon: '🏆',
         title: 'Top Performer',
-        message: `${topPerformer.name} is leading with ₹${topRevenue.toLocaleString()} in revenue`,
+        message: `${topPerformer.name} is leading with ${cs}${topRevenue.toLocaleString()} in revenue`,
         restaurant: topPerformer.name
       });
     }
@@ -129,14 +131,14 @@ const generateAIInsights = (data) => {
       insights.pricingInsights.push({
         icon: '💰',
         title: 'Low Average Order Value',
-        message: `Your average order is ₹${avgOrderValue.toFixed(0)}. Consider upselling combos or premium items to increase this.`,
+        message: `Your average order is ${cs}${avgOrderValue.toFixed(0)}. Consider upselling combos or premium items to increase this.`,
         action: 'Create combo deals or suggest add-ons at checkout'
       });
     } else if (avgOrderValue > 500) {
       insights.pricingInsights.push({
         icon: '✨',
         title: 'Strong Average Order Value',
-        message: `Excellent! Your average order of ₹${avgOrderValue.toFixed(0)} indicates good upselling or premium positioning.`,
+        message: `Excellent! Your average order of ${cs}${avgOrderValue.toFixed(0)} indicates good upselling or premium positioning.`,
         action: 'Maintain current pricing strategy'
       });
     }
@@ -470,7 +472,7 @@ router.get('/insights', authenticateToken, requireOwnerRole, async (req, res) =>
 
       snapshot.docs.forEach(doc => {
         const order = doc.data();
-        const amount = order.totalAmount || order.finalAmount || 0;
+        const amount = order.finalAmount || order.totalAmount || 0;
         totalRevenue += amount;
         totalOrders++;
         restaurantRevenue += amount;
@@ -562,15 +564,25 @@ router.get('/insights', authenticateToken, requireOwnerRole, async (req, res) =>
       ordersByType: ordersByTypeArray
     };
 
+    // Resolve currency symbol from restaurant settings
+    const filteredRestaurants = restaurants.filter(r => restaurantIds.includes(r.id));
+    const csVotes = {};
+    filteredRestaurants.forEach(r => {
+      const sym = r.currencySettings?.currencySymbol || r.currencySymbol || '₹';
+      csVotes[sym] = (csVotes[sym] || 0) + 1;
+    });
+    const resolvedCurrency = Object.entries(csVotes).sort((a, b) => b[1] - a[1])[0]?.[0] || '₹';
+
     // Generate AI insights
     const insights = generateAIInsights({
-      restaurants: restaurants.filter(r => restaurantIds.includes(r.id)),
+      restaurants: filteredRestaurants,
       orders: allOrders,
       analytics,
       period,
       staffCount,
       lowStockCount,
-      outOfStockCount
+      outOfStockCount,
+      currencySymbol: resolvedCurrency
     });
 
     res.json({
@@ -639,7 +651,7 @@ router.get('/usage', authenticateToken, requireOwnerRole, async (req, res) => {
 router.post('/email-preferences', authenticateToken, requireOwnerRole, async (req, res) => {
   try {
     const userId = req.user.userId || req.user.id;
-    const { emailEnabled, email, reportEmails, timezone = 'Asia/Kolkata', reportTime = '08:00' } = req.body;
+    const { emailEnabled, email, reportEmails, timezone = 'Asia/Kolkata', reportTime = '08:00', reportFrequency = 'daily' } = req.body;
 
     // Normalize: support both old single email and new array (max 5)
     const emails = (reportEmails && reportEmails.length > 0)
@@ -649,16 +661,20 @@ router.post('/email-preferences', authenticateToken, requireOwnerRole, async (re
     // Pre-compute UTC hour for cron job matching
     const reportTimeUTC = convertToUTCHour(reportTime, timezone);
 
-    const ownerPrefData = {
+    // Validate frequency
+    const validFrequencies = ['daily', 'weekly', 'both'];
+    const freq = validFrequencies.includes(reportFrequency) ? reportFrequency : 'daily';
+
+    await db.collection('ownerPreferences').doc(userId).set({
       emailEnabled: !!emailEnabled,
       reportEmails: emails,
       reportEmail: emails[0] || req.user.email || '', // Legacy compat
       timezone,
       reportTime,
       reportTimeUTC,
+      reportFrequency: freq,
       updatedAt: new Date()
-    };
-    await db.collection('ownerPreferences').doc(userId).set(ownerPrefData, { merge: true });
+    }, { merge: true });
 
     res.json({
       success: true,
@@ -693,7 +709,8 @@ router.get('/email-preferences', authenticateToken, requireOwnerRole, async (req
           reportEmails: req.user.email ? [req.user.email] : [],
           reportEmail: req.user.email || '',
           timezone: 'Asia/Kolkata',
-          reportTime: '08:00'
+          reportTime: '08:00',
+          reportFrequency: 'daily'
         }
       });
     }
@@ -746,7 +763,7 @@ function ianaToTzOffset(tz) {
   }
 }
 
-async function generateReportForOwner(userId, timezone) {
+async function generateReportForOwner(userId, timezone, frequency = 'daily') {
   // --- Find ALL restaurants for this owner ---
   // 1. Direct ownership via ownerId
   const restaurantsSnap = await db.collection(collections.restaurants)
@@ -811,12 +828,18 @@ async function generateReportForOwner(userId, timezone) {
   const tzOffset = ownerTz ? ianaToTzOffset(ownerTz) : -330; // fallback IST
   const dayStartHour = restaurants[0]?.posSettings?.businessDayStartHour || 0;
 
-  // --- 7-day analytics (timezone-aware) ---
+  // --- Analytics period (timezone-aware) ---
   const today = todayInTZ(tzOffset, dayStartHour);
-  const sevenDaysAgoStr = dateStrInTZ(
-    new Date(Date.now() - 7 * 24 * 60 * 60 * 1000), tzOffset, dayStartHour
-  );
-  const sevenDaysAgo = dateBoundsInTZ(sevenDaysAgoStr, tzOffset, dayStartHour).start;
+  let analyticsStart;
+  if (frequency === 'weekly') {
+    const sevenDaysAgoStr = dateStrInTZ(
+      new Date(Date.now() - 7 * 24 * 60 * 60 * 1000), tzOffset, dayStartHour
+    );
+    analyticsStart = dateBoundsInTZ(sevenDaysAgoStr, tzOffset, dayStartHour).start;
+  } else {
+    // daily — use today's start only
+    analyticsStart = today.start;
+  }
 
   let totalRevenue = 0;
   let totalOrders = 0;
@@ -834,7 +857,7 @@ async function generateReportForOwner(userId, timezone) {
     const [ordersSnap, staffNewSnap, staffLegacySnap, invSnap] = await Promise.all([
       db.collection(collections.orders)
         .where('restaurantId', '==', restaurantId)
-        .where('createdAt', '>=', sevenDaysAgo)
+        .where('createdAt', '>=', analyticsStart)
         .get(),
       db.collection(collections.staffUsers)
         .where('restaurantId', '==', restaurantId)
@@ -858,7 +881,7 @@ async function generateReportForOwner(userId, timezone) {
 
     ordersSnap.docs.forEach(doc => {
       const order = doc.data();
-      const amount = order.totalAmount || order.finalAmount || 0;
+      const amount = order.finalAmount || order.totalAmount || 0;
       totalRevenue += amount;
       totalOrders++;
       restaurantRevenue += amount;
@@ -936,14 +959,36 @@ async function generateReportForOwner(userId, timezone) {
     ordersByType: ordersByTypeArray
   };
 
+  // Currency: prefer most recently configured currencySettings, else vote
+  let currencySymbol = '₹';
+  const withSettings = restaurants.filter(r => r.currencySettings?.currencySymbol);
+  if (withSettings.length > 0) {
+    // Pick the most recently updated currencySettings
+    const sorted = [...withSettings].sort((a, b) => {
+      const aTime = a.currencySettings?.updatedAt?.toDate?.() || a.currencySettings?.updatedAt || 0;
+      const bTime = b.currencySettings?.updatedAt?.toDate?.() || b.currencySettings?.updatedAt || 0;
+      return (bTime > aTime ? 1 : bTime < aTime ? -1 : 0);
+    });
+    currencySymbol = sorted[0].currencySettings.currencySymbol;
+  } else {
+    // Fallback: vote from old currencySymbol field
+    const currencyVotes = {};
+    restaurants.forEach(r => {
+      const sym = r.currencySymbol || '₹';
+      currencyVotes[sym] = (currencyVotes[sym] || 0) + 1;
+    });
+    currencySymbol = Object.entries(currencyVotes).sort((a, b) => b[1] - a[1])[0]?.[0] || '₹';
+  }
+
   const insights = generateAIInsights({
     restaurants,
     orders: allOrders,
     analytics,
-    period: '7d',
+    period: frequency === 'weekly' ? '7d' : '1d',
     staffCount,
     lowStockCount,
-    outOfStockCount
+    outOfStockCount,
+    currencySymbol
   });
 
   // --- Today's detailed EOD-style report across ALL restaurants (timezone-aware) ---
@@ -951,7 +996,7 @@ async function generateReportForOwner(userId, timezone) {
   const endOfDay = today.end;
 
   let todayRevenue = 0, todayOrderCount = 0, todayCashCollected = 0;
-  let cashSales = 0, cardSales = 0, upiSales = 0, splitSales = 0, otherSales = 0;
+  const paymentBreakdown = {}; // dynamic: collects all payment methods from orders
   let totalTax = 0, totalDiscount = 0;
   let cancelledCount = 0, refundedCount = 0, refundedAmount = 0;
   const taxBreakdown = {}; // dynamic: collects all tax names from orders
@@ -983,36 +1028,28 @@ async function generateReportForOwner(userId, timezone) {
       todayRevenue += amount;
       todayOrderCount++;
 
-      // Payment method breakdown
+      // Payment method breakdown — dynamic, tracks all methods
       const method = (order.paymentMethod || 'cash').toLowerCase();
-      if (method === 'cash') { cashSales += amount; todayCashCollected += amount; }
-      else if (method === 'card' || method === 'credit_card' || method === 'debit_card') cardSales += amount;
-      else if (method === 'upi' || method === 'razorpay' || method === 'phonepe' || method === 'gpay' || method === 'paytm') upiSales += amount;
-      else if (method === 'split') {
-        splitSales += amount;
-        if (order.splitPayments) {
-          order.splitPayments.forEach(sp => {
-            if ((sp.method || 'cash').toLowerCase() === 'cash') {
-              todayCashCollected += sp.amount || 0;
-            }
-          });
-        }
-      } else {
-        otherSales += amount;
+      paymentBreakdown[method] = (paymentBreakdown[method] || 0) + amount;
+      if (method === 'cash') {
+        todayCashCollected += amount;
+      } else if (method === 'split' && order.splitPayments) {
+        order.splitPayments.forEach(sp => {
+          const spMethod = (sp.method || 'cash').toLowerCase();
+          if (spMethod === 'cash') todayCashCollected += sp.amount || 0;
+        });
       }
 
-      // Staff-wise tracking
+      // Staff-wise tracking — dynamic payment methods per staff
       const staffId = order.staffInfo?.userId || order.staffInfo?.waiterId || order.waiterId || 'unknown';
       const staffName = order.staffInfo?.waiterName || order.staffInfo?.name || order.waiterName || 'Owner';
       const staffRole = order.staffInfo?.role || '';
       if (!staffWise[staffId]) {
-        staffWise[staffId] = { staffName, role: staffRole, orderCount: 0, totalSales: 0, payments: { cash: 0, card: 0, upi: 0 } };
+        staffWise[staffId] = { staffName, role: staffRole, orderCount: 0, totalSales: 0, payments: {} };
       }
       staffWise[staffId].orderCount += 1;
       staffWise[staffId].totalSales += amount;
-      if (method === 'cash') staffWise[staffId].payments.cash += amount;
-      else if (method === 'card' || method === 'credit_card' || method === 'debit_card') staffWise[staffId].payments.card += amount;
-      else if (method === 'upi' || method === 'razorpay' || method === 'phonepe' || method === 'gpay' || method === 'paytm') staffWise[staffId].payments.upi += amount;
+      staffWise[staffId].payments[method] = (staffWise[staffId].payments[method] || 0) + amount;
 
       // Tax breakdown — dynamically collect all tax names
       totalTax += order.taxAmount || 0;
@@ -1075,14 +1112,6 @@ async function generateReportForOwner(userId, timezone) {
     } catch (_) {}
   }
 
-  // Currency: pick most common symbol across restaurants
-  const currencyVotes = {};
-  restaurants.forEach(r => {
-    const sym = r.currencySymbol || r.currencySettings?.symbol || '₹';
-    currencyVotes[sym] = (currencyVotes[sym] || 0) + 1;
-  });
-  const currencySymbol = Object.entries(currencyVotes).sort((a, b) => b[1] - a[1])[0]?.[0] || '₹';
-
   const round = v => Math.round(v * 100) / 100;
   const todayReport = {
     reportDate: today.dateStr,
@@ -1093,13 +1122,7 @@ async function generateReportForOwner(userId, timezone) {
       avgOrderValue: todayOrderCount > 0 ? round(todayRevenue / todayOrderCount) : 0,
       cashCollected: round(todayCashCollected),
     },
-    payments: {
-      cash: round(cashSales),
-      card: round(cardSales),
-      upi: round(upiSales),
-      split: round(splitSales),
-      other: round(otherSales),
-    },
+    payments: Object.fromEntries(Object.entries(paymentBreakdown).map(([k, v]) => [k, round(v)])),
     tax: {
       total: round(totalTax),
       breakdown: Object.entries(taxBreakdown).map(([name, amount]) => ({
@@ -1119,16 +1142,12 @@ async function generateReportForOwner(userId, timezone) {
       role: s.role,
       orderCount: s.orderCount,
       totalSales: round(s.totalSales),
-      payments: {
-        cash: round(s.payments.cash),
-        card: round(s.payments.card),
-        upi: round(s.payments.upi),
-      }
+      payments: Object.fromEntries(Object.entries(s.payments).map(([k, v]) => [k, round(v)])),
     })).sort((a, b) => b.totalSales - a.totalSales),
     currencySymbol,
   };
 
-  return { insights, analytics, restaurantCount: restaurants.length, todayReport, currencySymbol };
+  return { insights, analytics, restaurantCount: restaurants.length, todayReport, currencySymbol, reportType: frequency };
 }
 
 /**
@@ -1138,7 +1157,7 @@ async function generateReportForOwner(userId, timezone) {
 router.post('/send-test-report', authenticateToken, requireOwnerRole, async (req, res) => {
   try {
     const userId = req.user.userId || req.user.id;
-    const { email, emails, timezone } = req.body;
+    const { email, emails, timezone, currencySymbol: clientCurrency, reportFrequency } = req.body;
 
     // Support both single email (legacy) and array
     const recipients = (emails && emails.length > 0) ? emails : (email ? [email] : []);
@@ -1148,9 +1167,18 @@ router.post('/send-test-report', authenticateToken, requireOwnerRole, async (req
 
     console.log(`🤖 Generating AI insights report for ${recipients.join(', ')}...`);
 
-    const reportData = await generateReportForOwner(userId, timezone);
+    const reportData = await generateReportForOwner(userId, timezone, reportFrequency || 'daily');
     if (!reportData) {
       return res.status(400).json({ success: false, error: 'No restaurants found for this owner' });
+    }
+
+    // Use client-provided currency (from CurrencyContext) if available, else use report's resolved currency
+    const resolvedCurrency = clientCurrency || reportData.currencySymbol;
+
+    // If currency was overridden, fix the pre-generated AI summary text
+    const insights = { ...reportData.insights };
+    if (resolvedCurrency && resolvedCurrency !== reportData.currencySymbol && insights.summary) {
+      insights.summary = insights.summary.replace(new RegExp(reportData.currencySymbol.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g'), resolvedCurrency);
     }
 
     const ownerName = req.user.name || req.user.displayName || 'Restaurant Owner';
@@ -1160,11 +1188,12 @@ router.post('/send-test-report', authenticateToken, requireOwnerRole, async (req
       await emailService.sendAIInsightsReport({
         ownerEmail: recipientEmail,
         ownerName,
-        insights: reportData.insights,
+        insights,
         analytics: reportData.analytics,
         restaurantCount: reportData.restaurantCount,
-        todayReport: reportData.todayReport,
-        currencySymbol: reportData.currencySymbol
+        todayReport: { ...reportData.todayReport, currencySymbol: resolvedCurrency },
+        currencySymbol: resolvedCurrency,
+        reportType: reportData.reportType || 'daily'
       });
     }
 
@@ -1223,7 +1252,7 @@ async function generateDailyReport(userId, period = 'today') {
 
     ordersSnap.docs.forEach(doc => {
       const order = doc.data();
-      totalRevenue += order.totalAmount || order.finalAmount || 0;
+      totalRevenue += order.finalAmount || order.totalAmount || 0;
       totalOrders++;
     });
   }
