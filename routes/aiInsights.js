@@ -4,7 +4,7 @@ const { db, collections } = require('../firebase');
 
 const { authenticateToken, requireOwnerRole } = require('../middleware/auth');
 const emailService = require('../emailService');
-const { parseTZ, parseDayStart, todayInTZ, dateStrInTZ, dateBoundsInTZ } = require('../utils/timezone');
+const { parseTZ, parseDayStart, todayInTZ, dateStrInTZ, dateBoundsInTZ, ianaToTzOffset } = require('../utils/timezone');
 
 // ============================================
 // AI INSIGHTS & DAILY REPORTS
@@ -734,35 +734,6 @@ router.get('/email-preferences', authenticateToken, requireOwnerRole, async (req
  * Generate a full AI insights report for an owner (reusable by test + cron)
  * Returns { insights, analytics, restaurantCount } or null if no restaurants
  */
-/**
- * Convert IANA timezone string to tzOffset (minutes from UTC, same as getTimezoneOffset).
- * E.g. "Asia/Kolkata" → -330, "America/New_York" → 300 (EST) or 240 (EDT)
- */
-function ianaToTzOffset(tz) {
-  try {
-    const now = new Date();
-    const formatter = new Intl.DateTimeFormat('en-US', {
-      timeZone: tz,
-      year: 'numeric', month: '2-digit', day: '2-digit',
-      hour: '2-digit', minute: '2-digit', second: '2-digit',
-      hour12: false
-    });
-    const parts = formatter.formatToParts(now);
-    const lY = parseInt(parts.find(p => p.type === 'year')?.value);
-    const lM = parseInt(parts.find(p => p.type === 'month')?.value) - 1;
-    const lD = parseInt(parts.find(p => p.type === 'day')?.value);
-    const lH = parseInt(parts.find(p => p.type === 'hour')?.value);
-    const lMin = parseInt(parts.find(p => p.type === 'minute')?.value);
-    const lS = parseInt(parts.find(p => p.type === 'second')?.value);
-    const localAsUTC = Date.UTC(lY, lM, lD, lH === 24 ? 0 : lH, lMin, lS);
-    const utcMs = now.getTime();
-    // tzOffset = UTC - local (in minutes), same as JS getTimezoneOffset()
-    return Math.round((utcMs - localAsUTC) / 60000);
-  } catch (_) {
-    return -330; // fallback to IST
-  }
-}
-
 async function generateReportForOwner(userId, timezone, frequency = 'daily') {
   // --- Find ALL restaurants for this owner ---
   // 1. Direct ownership via ownerId
@@ -825,7 +796,8 @@ async function generateReportForOwner(userId, timezone, frequency = 'daily') {
       if (prefDoc.exists) ownerTz = prefDoc.data().timezone;
     } catch (_) {}
   }
-  const tzOffset = ownerTz ? ianaToTzOffset(ownerTz) : -330; // fallback IST
+  const restaurantTz = restaurants[0]?.posSettings?.timezone || 'Asia/Kolkata';
+  const tzOffset = ownerTz ? ianaToTzOffset(ownerTz) : ianaToTzOffset(restaurantTz);
   const dayStartHour = restaurants[0]?.posSettings?.businessDayStartHour || 0;
 
   // --- Analytics period (timezone-aware) ---
@@ -1233,21 +1205,23 @@ async function generateDailyReport(userId, period = 'today') {
     restaurants.push({ id: doc.id, ...doc.data() });
   });
 
-  // Get today's data — use IST (UTC+5:30) as default for automated reports
-  // TODO: Should use store-specific timezone from restaurant settings
-  const IST_OFFSET = -330; // IST getTimezoneOffset() value
-  const todayBounds = todayInTZ(IST_OFFSET);
-  const today = todayBounds.start;
-  const tomorrow = new Date(todayBounds.end.getTime() + 1);
-
+  // Use per-restaurant timezone for correct day boundaries
   let totalRevenue = 0;
   let totalOrders = 0;
+  let summaryDate = '';
 
-  for (const restaurantId of restaurantIds) {
+  for (let i = 0; i < restaurantIds.length; i++) {
+    const restaurantId = restaurantIds[i];
+    const rTz = restaurants[i]?.posSettings?.timezone || 'Asia/Kolkata';
+    const rDsh = restaurants[i]?.posSettings?.businessDayStartHour || 0;
+    const rTzOffset = ianaToTzOffset(rTz);
+    const todayBounds = todayInTZ(rTzOffset, rDsh);
+    if (i === 0) summaryDate = todayBounds.dateStr;
+
     const ordersSnap = await db.collection(collections.orders)
       .where('restaurantId', '==', restaurantId)
-      .where('createdAt', '>=', today)
-      .where('createdAt', '<', tomorrow)
+      .where('createdAt', '>=', todayBounds.start)
+      .where('createdAt', '<', new Date(todayBounds.end.getTime() + 1))
       .get();
 
     ordersSnap.docs.forEach(doc => {
@@ -1258,7 +1232,7 @@ async function generateDailyReport(userId, period = 'today') {
   }
 
   return {
-    date: today.toISOString().split('T')[0],
+    date: summaryDate,
     totalRestaurants: restaurants.length,
     totalRevenue: Math.round(totalRevenue * 100) / 100,
     totalOrders,

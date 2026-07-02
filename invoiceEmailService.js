@@ -17,13 +17,13 @@ const toIsoOrNull = (v) => {
   return null;
 };
 
-const formatIST = (iso) => {
+const formatInTZ = (iso, timezone = 'Asia/Kolkata') => {
   const d = iso ? new Date(iso) : new Date();
   const formattedTime = d.toLocaleTimeString('en-IN', {
-    hour: '2-digit', minute: '2-digit', hour12: true, timeZone: 'Asia/Kolkata'
+    hour: '2-digit', minute: '2-digit', hour12: true, timeZone: timezone
   });
   const formattedDate = d.toLocaleDateString('en-IN', {
-    day: '2-digit', month: 'short', year: 'numeric', timeZone: 'Asia/Kolkata'
+    day: '2-digit', month: 'short', year: 'numeric', timeZone: timezone
   });
   return { formattedDate, formattedTime };
 };
@@ -80,7 +80,7 @@ function buildInvoiceData(orderId, order, restaurant, restaurantId) {
 
   const createdAtIso = toIsoOrNull(order.createdAt);
   const completedAtIso = toIsoOrNull(order.completedAt);
-  const { formattedDate, formattedTime } = formatIST(completedAtIso || createdAtIso);
+  const { formattedDate, formattedTime } = formatInTZ(completedAtIso || createdAtIso, restaurant.posSettings?.timezone);
 
   const currencySymbol = restaurant.currencySymbol || (restaurant.currency === 'USD' ? '$' : '₹');
 

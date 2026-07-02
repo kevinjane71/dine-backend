@@ -12,7 +12,7 @@
 const express = require('express');
 const router = express.Router();
 const { db, collections } = require('../firebase');
-const { todayInTZ } = require('../utils/timezone');
+const { todayInTZ, getRestaurantTzOffset } = require('../utils/timezone');
 const { authenticateToken } = require('../middleware/auth');
 const talabatService = require('../services/talabatService');
 
@@ -206,9 +206,9 @@ async function handleNewTalabatOrder(restaurantId, restaurantData, talabatConfig
     return;
   }
 
-  // Generate daily order ID (use IST as default for aggregator webhooks)
-  const IST_OFFSET = -330;
-  const todayBounds = todayInTZ(IST_OFFSET);
+  // Generate daily order ID using restaurant's configured timezone
+  const { tzOffset, dayStartHour } = await getRestaurantTzOffset(db, restaurantId);
+  const todayBounds = todayInTZ(tzOffset, dayStartHour);
   const dailyOrdersSnap = await db.collection(collections.orders)
     .where('restaurantId', '==', restaurantId)
     .where('createdAt', '>=', todayBounds.start)
