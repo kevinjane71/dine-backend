@@ -108,4 +108,40 @@ function buildDateRange(period, startDate, endDate, tzOffset, dayStartHour) {
   return { start: rangeStart, end: rangeEnd, todayStr };
 }
 
-module.exports = { dateStrInTZ, dateBoundsInTZ, todayInTZ, parseTZ, parseDayStart, buildDateRange };
+// Convert IANA timezone string to getTimezoneOffset()-compatible value (minutes from UTC).
+// E.g. "Asia/Kolkata" → -330, "Asia/Qatar" → -180, "America/New_York" → 300 (EST) or 240 (EDT)
+function ianaToTzOffset(tz) {
+  try {
+    const now = new Date();
+    const formatter = new Intl.DateTimeFormat('en-US', {
+      timeZone: tz,
+      year: 'numeric', month: '2-digit', day: '2-digit',
+      hour: '2-digit', minute: '2-digit', second: '2-digit',
+      hour12: false
+    });
+    const parts = formatter.formatToParts(now);
+    const lY = parseInt(parts.find(p => p.type === 'year')?.value);
+    const lM = parseInt(parts.find(p => p.type === 'month')?.value) - 1;
+    const lD = parseInt(parts.find(p => p.type === 'day')?.value);
+    const lH = parseInt(parts.find(p => p.type === 'hour')?.value);
+    const lMin = parseInt(parts.find(p => p.type === 'minute')?.value);
+    const lS = parseInt(parts.find(p => p.type === 'second')?.value);
+    const localAsUTC = Date.UTC(lY, lM, lD, lH === 24 ? 0 : lH, lMin, lS);
+    const utcMs = now.getTime();
+    return Math.round((utcMs - localAsUTC) / 60000);
+  } catch (_) {
+    return -330; // fallback to IST
+  }
+}
+
+// Get timezone offset for a restaurant from cached doc. Zero extra Firestore reads.
+// Returns { tzOffset, dayStartHour, ianaTimezone }
+async function getRestaurantTzOffset(db, restaurantId) {
+  const { getCachedRestaurant } = require('./kvCache');
+  const { data } = await getCachedRestaurant(db, 'restaurants', restaurantId);
+  const tz = data?.posSettings?.timezone || 'Asia/Kolkata';
+  const dsh = data?.posSettings?.businessDayStartHour || 0;
+  return { tzOffset: ianaToTzOffset(tz), dayStartHour: dsh, ianaTimezone: tz };
+}
+
+module.exports = { dateStrInTZ, dateBoundsInTZ, todayInTZ, parseTZ, parseDayStart, buildDateRange, ianaToTzOffset, getRestaurantTzOffset };

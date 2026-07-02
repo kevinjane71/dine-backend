@@ -12639,8 +12639,9 @@ app.patch('/api/orders/:orderId/status', authenticateToken, async (req, res) => 
           const currencySymbol = restDoc.data().currencySymbol || '₹';
           const orderNum = orderData.dailyOrderId || orderData.orderNumber || (orderId || '').slice(-6);
           const completedAt = new Date();
-          const dateStr = completedAt.toLocaleDateString('en-IN', { day: '2-digit', month: '2-digit', year: 'numeric', timeZone: 'Asia/Kolkata' });
-          const timeStr = completedAt.toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', hour12: true, timeZone: 'Asia/Kolkata' });
+          const restTz = restDoc.data().posSettings?.timezone || 'Asia/Kolkata';
+          const dateStr = completedAt.toLocaleDateString('en-IN', { day: '2-digit', month: '2-digit', year: 'numeric', timeZone: restTz });
+          const timeStr = completedAt.toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', hour12: true, timeZone: restTz });
 
           const shareToken = orderUpdateData.shareToken || orderData.shareToken;
           const baseUrl = process.env.FRONTEND_URL || 'https://www.dineopen.com';
@@ -19480,6 +19481,10 @@ app.get('/api/admin/print-settings/:restaurantId', authenticateToken, async (req
     };
 
     const printSettings = { ...defaultSettings, ...(restaurantData.printSettings || {}) };
+    // Include showPriceOnKot from posSettings so KOT templates can use it
+    if (restaurantData.posSettings?.showPriceOnKot) {
+      printSettings.showPriceOnKot = true;
+    }
 
     res.json({
       success: true,
@@ -21113,13 +21118,13 @@ const toIsoOrNull = (v) => {
   return null;
 };
 
-const formatIST = (iso) => {
+const formatInTZ = (iso, timezone = 'Asia/Kolkata') => {
   const d = iso ? new Date(iso) : new Date();
   const formattedTime = d.toLocaleTimeString('en-IN', {
-    hour: '2-digit', minute: '2-digit', hour12: true, timeZone: 'Asia/Kolkata'
+    hour: '2-digit', minute: '2-digit', hour12: true, timeZone: timezone
   });
   const formattedDate = d.toLocaleDateString('en-IN', {
-    day: '2-digit', month: 'short', year: 'numeric', timeZone: 'Asia/Kolkata'
+    day: '2-digit', month: 'short', year: 'numeric', timeZone: timezone
   });
   return { formattedDate, formattedTime };
 };
@@ -21204,7 +21209,7 @@ const assembleBillRenderPayload = (orderId, orderData, restaurantId, restaurantD
 
   const createdAtIso   = toIsoOrNull(orderData.createdAt);
   const completedAtIso = toIsoOrNull(orderData.completedAt);
-  const { formattedDate, formattedTime } = formatIST(completedAtIso || createdAtIso);
+  const { formattedDate, formattedTime } = formatInTZ(completedAtIso || createdAtIso, restaurantData.posSettings?.timezone);
 
   const printSettings = { ...DEFAULT_PRINT_SETTINGS, ...(restaurantData.printSettings || {}) };
   const businessType = restaurantData.businessType || 'restaurant';
@@ -21346,8 +21351,12 @@ app.get('/api/kot/render/:restaurantId/:orderId', async (req, res) => {
 
     const restaurantData = restaurantDoc.data();
     const createdAtIso = toIsoOrNull(orderData.createdAt);
-    const { formattedDate, formattedTime } = formatIST(createdAtIso);
+    const { formattedDate, formattedTime } = formatInTZ(createdAtIso, restaurantData.posSettings?.timezone);
     const printSettings = { ...DEFAULT_PRINT_SETTINGS, ...(restaurantData.printSettings || {}) };
+    // Pass showPriceOnKot from posSettings into printSettings so KOT templates can use it
+    if (restaurantData.posSettings?.showPriceOnKot) {
+      printSettings.showPriceOnKot = true;
+    }
     const businessType = restaurantData.businessType || 'restaurant';
     const labels = KOT_LABELS[businessType] || KOT_LABELS.restaurant;
     const restaurant = buildRestaurantBlock(restaurantId, restaurantData);
@@ -21423,7 +21432,8 @@ app.get('/api/kot/render/:restaurantId/:orderId', async (req, res) => {
         isReprint: orderData.kotPrinted === true,
         isIncremental: newOnly === 'true',
         printStationId: stationId || null,
-        printStationName
+        printStationName,
+        currencySymbol: restaurantData.currencySymbol || restaurantData.currency || '',
       }
     });
   } catch (error) {
@@ -33716,6 +33726,109 @@ app.get('/api/public/restaurant/code/:code', vercelSecurityMiddleware.publicAPI,
   } catch (error) {
     console.error('Get restaurant by code error:', error);
     res.status(500).json({ error: 'Failed to fetch restaurant' });
+  }
+});
+
+// ─── Token Display System (Public) ───
+
+// Validate PIN for token display
+app.post('/api/public/token-display/:restaurantId/validate', vercelSecurityMiddleware.publicAPI, async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+    const { pin } = req.body;
+
+    const restDoc = await getCachedRestDoc(restaurantId);
+    if (!restDoc.exists) return res.status(404).json({ error: 'Restaurant not found' });
+
+    const data = restDoc.data();
+    const ps = data.posSettings || {};
+
+    if (!ps.tokenDisplayEnabled) return res.status(403).json({ error: 'Token display is not enabled' });
+
+    if (ps.tokenDisplayPin) {
+      if (!pin || pin !== ps.tokenDisplayPin) {
+        return res.status(401).json({ error: 'Invalid PIN' });
+      }
+    }
+
+    res.json({
+      restaurant: { name: data.name, logo: data.logoUrl || '', businessType: data.businessType || 'restaurant' },
+      settings: {
+        autoClearSeconds: ps.tokenDisplayAutoClearSeconds || 60,
+        showCustomerName: ps.tokenDisplayShowName !== false,
+        showOrderType: ps.tokenDisplayShowOrderType !== false,
+      }
+    });
+  } catch (error) {
+    console.error('Token display validate error:', error);
+    res.status(500).json({ error: 'Failed to validate' });
+  }
+});
+
+// Get active orders for token display
+app.get('/api/public/token-display/:restaurantId', vercelSecurityMiddleware.publicAPI, async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+    const { pin } = req.query;
+
+    const restDoc = await getCachedRestDoc(restaurantId);
+    if (!restDoc.exists) return res.status(404).json({ error: 'Restaurant not found' });
+
+    const data = restDoc.data();
+    const ps = data.posSettings || {};
+
+    if (!ps.tokenDisplayEnabled) return res.status(403).json({ error: 'Token display is not enabled' });
+
+    if (ps.tokenDisplayPin) {
+      if (!pin || pin !== ps.tokenDisplayPin) {
+        return res.status(401).json({ error: 'Invalid PIN' });
+      }
+    }
+
+    // Get today's boundaries using restaurant timezone
+    const tz = ps.timezone || 'Asia/Kolkata';
+    const { ianaToTzOffset } = require('./utils/timezone');
+    const tzOffset = ianaToTzOffset(tz);
+    const dayStartHour = ps.businessDayStartHour || 0;
+    const today = todayInTZ(tzOffset, dayStartHour);
+
+    // Query today's active orders
+    const ordersSnapshot = await db.collection(collections.orders)
+      .where('restaurantId', '==', restaurantId)
+      .where('createdAt', '>=', today.start)
+      .where('createdAt', '<=', today.end)
+      .where('status', 'in', ['pending', 'confirmed', 'preparing', 'ready'])
+      .orderBy('createdAt', 'desc')
+      .limit(50)
+      .get();
+
+    const orders = ordersSnapshot.docs.map(doc => {
+      const o = doc.data();
+      const customerName = o.customerName || o.customer?.name || '';
+      return {
+        id: doc.id,
+        dailyOrderId: o.dailyOrderId,
+        status: o.status,
+        orderType: o.orderType || 'dine-in',
+        customerName: ps.tokenDisplayShowName !== false ? (customerName.split(' ')[0] || '') : '',
+        createdAt: o.createdAt?.toDate ? o.createdAt.toDate().toISOString() : o.createdAt,
+        updatedAt: o.updatedAt?.toDate ? o.updatedAt.toDate().toISOString() : o.updatedAt,
+      };
+    });
+
+    res.set('Cache-Control', 'public, s-maxage=5, stale-while-revalidate=5');
+    res.json({
+      restaurant: { name: data.name, logo: data.logoUrl || '', businessType: data.businessType || 'restaurant' },
+      orders,
+      settings: {
+        autoClearSeconds: ps.tokenDisplayAutoClearSeconds || 60,
+        showCustomerName: ps.tokenDisplayShowName !== false,
+        showOrderType: ps.tokenDisplayShowOrderType !== false,
+      }
+    });
+  } catch (error) {
+    console.error('Token display error:', error);
+    res.status(500).json({ error: 'Failed to fetch token display data' });
   }
 });
 
