@@ -1007,6 +1007,43 @@ function resolveItemPriceForRule(menuItem, ruleId, rules) {
   return null; // no adjustment — use base price
 }
 
+// Flatten modifierGroups into a backward-compatible flat customizations array.
+// Used when saving menu items to auto-generate the legacy flat array.
+function flattenModifierGroups(groups) {
+  if (!Array.isArray(groups) || !groups.length) return [];
+  const flat = [];
+  for (const g of groups) {
+    for (const item of (g.items || [])) {
+      if (!item.name) continue;
+      flat.push({
+        id: item.id || `cust_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+        name: item.name,
+        price: typeof item.price === 'number' ? item.price : parseFloat(item.price) || 0,
+        description: item.description || ''
+      });
+    }
+  }
+  return flat;
+}
+
+// Validate and normalize a modifierGroups array from request body.
+function normalizeModifierGroups(groups) {
+  if (!Array.isArray(groups) || !groups.length) return [];
+  return groups.map(g => ({
+    id: g.id || `grp_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+    name: g.name || '',
+    required: g.required === true,
+    min: typeof g.min === 'number' ? g.min : parseInt(g.min) || 0,
+    max: typeof g.max === 'number' ? g.max : parseInt(g.max) || 1,
+    items: Array.isArray(g.items) ? g.items.map(item => ({
+      id: item.id || `cust_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+      name: item.name || '',
+      price: typeof item.price === 'number' ? item.price : parseFloat(item.price) || 0,
+      description: item.description || ''
+    })) : []
+  }));
+}
+
 // Generate a composite key for an order item that uniquely identifies it.
 // Used everywhere items are matched, deduped, or compared for KOT diffs.
 // Key format: "menuItemId|variantName|custId1,custId2" (sorted customizations)
@@ -7610,14 +7647,21 @@ app.post('/api/menus/:restaurantId', authenticateToken, async (req, res) => {
             description: v.description || ''
           }))
         : [],
-      customizations: customizations && Array.isArray(customizations) && customizations.length > 0
-        ? customizations.map(c => ({
-            id: c.id || `cust_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
-            name: c.name,
-            price: typeof c.price === 'number' ? c.price : parseFloat(c.price) || 0,
-            description: c.description || ''
-          }))
-        : [],
+      modifierGroups: normalizeModifierGroups(req.body.modifierGroups),
+      customizations: (() => {
+        const groups = req.body.modifierGroups;
+        if (Array.isArray(groups) && groups.length > 0) {
+          return flattenModifierGroups(normalizeModifierGroups(groups));
+        }
+        return customizations && Array.isArray(customizations) && customizations.length > 0
+          ? customizations.map(c => ({
+              id: c.id || `cust_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+              name: c.name,
+              price: typeof c.price === 'number' ? c.price : parseFloat(c.price) || 0,
+              description: c.description || ''
+            }))
+          : [];
+      })(),
       // Bar-specific fields
       spiritCategory: req.body.spiritCategory || null,
       ingredients: req.body.ingredients || null,
@@ -7763,7 +7807,7 @@ app.patch('/api/menus/item/:id', authenticateToken, async (req, res) => {
       'name', 'description', 'price', 'category', 'isVeg', 'spiceLevel',
       'allergens', 'image', 'shortCode', 'status', 'order',
       'isAvailable', 'stockQuantity', 'lowStockThreshold', 'isStockManaged', 'deductionQuantity',
-      'availableFrom', 'availableUntil', 'variants', 'customizations',
+      'availableFrom', 'availableUntil', 'variants', 'customizations', 'modifierGroups',
       'spiritCategory', 'ingredients', 'abv', 'servingUnit', 'bottleSize',
       'unit', 'weight', 'shelfLife', 'mfgDate', 'expiryDate',
       'servingSize', 'scoopOptions', 'pricingRules', 'taxGroupId',
@@ -7784,6 +7828,13 @@ app.patch('/api/menus/item/:id', authenticateToken, async (req, res) => {
                 description: v.description || ''
               }))
             : [];
+        } else if (field === 'modifierGroups') {
+          const normalized = normalizeModifierGroups(req.body[field]);
+          updateData.modifierGroups = normalized;
+          // Auto-regenerate flat customizations from groups for backward compat
+          if (normalized.length > 0) {
+            updateData.customizations = flattenModifierGroups(normalized);
+          }
         } else if (field === 'customizations') {
           // Ensure customizations are arrays with parsed prices
           updateData[field] = Array.isArray(req.body[field])
@@ -8812,6 +8863,18 @@ app.post('/api/public/orders/:restaurantId', vercelSecurityMiddleware.publicAPI,
       }
     }
 
+    // Apply tier multiplier if customer has a loyalty tier
+    if (loyaltyPointsEarned > 0 && customerData) {
+      const customerTier = customerData.loyaltyTier || 'bronze';
+      const tierMultipliers = { bronze: 1, silver: 1.25, gold: 1.5, platinum: 2 };
+      const multiplier = tierMultipliers[customerTier] || 1;
+      if (multiplier > 1) {
+        const basePoints = loyaltyPointsEarned;
+        loyaltyPointsEarned = Math.floor(loyaltyPointsEarned * multiplier);
+        console.log(`💎 Tier multiplier (${customerTier} ${multiplier}x): ${basePoints} → ${loyaltyPointsEarned} points`);
+      }
+    }
+
     // Razorpay payment verification (if paymentMethod is 'razorpay')
     if (paymentMethod === 'razorpay') {
       if (!razorpayPaymentId || !razorpayOrderId || !razorpaySignature) {
@@ -8861,6 +8924,8 @@ app.post('/api/public/orders/:restaurantId', vercelSecurityMiddleware.publicAPI,
       appliedOffers: appliedOffers,
       loyaltyPointsRedeemed: loyaltyPointsRedeemed,
       loyaltyPointsEarned: loyaltyPointsEarned,
+      tierAtTime: customerData?.loyaltyTier || 'bronze',
+      tierMultiplier: (() => { const t = customerData?.loyaltyTier || 'bronze'; return { bronze: 1, silver: 1.25, gold: 1.5, platinum: 2 }[t] || 1; })(),
       customerInfo: {
         phone: customerPhone,
         name: customerName || 'Customer',
@@ -9796,6 +9861,29 @@ app.post('/api/orders', async (req, res) => {
       }
     }
 
+    // Apply tier multiplier for POS orders
+    let posCustomerTier = 'bronze';
+    if (posLoyaltySettings.enabled && resolvedCustomerPhone && loyaltyPointsEarned > 0) {
+      try {
+        const custSnap = await db.collection('customers')
+          .where('restaurantId', '==', restaurantId)
+          .where('phone', '==', resolvedCustomerPhone)
+          .limit(1).get();
+        if (!custSnap.empty) {
+          posCustomerTier = custSnap.docs[0].data().loyaltyTier || 'bronze';
+          const tierMultipliers = { bronze: 1, silver: 1.25, gold: 1.5, platinum: 2 };
+          const multiplier = tierMultipliers[posCustomerTier] || 1;
+          if (multiplier > 1) {
+            const basePoints = loyaltyPointsEarned;
+            loyaltyPointsEarned = Math.floor(loyaltyPointsEarned * multiplier);
+            console.log(`💎 POS Tier multiplier (${posCustomerTier} ${multiplier}x): ${basePoints} → ${loyaltyPointsEarned} points`);
+          }
+        }
+      } catch (tierErr) {
+        console.error('⚠️ Tier multiplier lookup error:', tierErr.message);
+      }
+    }
+
     console.log(`💰 POS Order pricing: Subtotal ₹${subtotalForDiscount}, Offers -₹${discountAmount}, Manual -₹${manualDiscountAmount}, Loyalty -₹${loyaltyDiscount}, PreTax ₹${preTaxTotal}`);
 
     // Calculate tax using per-item tax resolution (supports tax groups)
@@ -9924,6 +10012,7 @@ app.post('/api/orders', async (req, res) => {
       manualDiscount: Math.round(manualDiscountAmount * 100) / 100,
       manualDiscountType: req.body.manualDiscountType || null,
       manualDiscountValue: req.body.manualDiscountValue != null ? parseFloat(req.body.manualDiscountValue) : null,
+      discountReason: req.body.discountReason || null,
       loyaltyDiscount: Math.round(loyaltyDiscount * 100) / 100,
       totalDiscountAmount: Math.round(totalDiscountAmount * 100) / 100,
       selectedOfferName: req.body.selectedOfferName || (appliedOffer ? appliedOffer.name : null),
@@ -9932,6 +10021,8 @@ app.post('/api/orders', async (req, res) => {
       loyaltyPointsRedeemed: loyaltyPointsRedeemed,
       redeemLoyaltyPoints: redeemLoyaltyPoints || 0,
       loyaltyPointsEarned: loyaltyPointsEarned,
+      tierAtTime: posCustomerTier,
+      tierMultiplier: { bronze: 1, silver: 1.25, gold: 1.5, platinum: 2 }[posCustomerTier] || 1,
       taxAmount: Math.round(taxAmount * 100) / 100,
       taxBreakdown: taxBreakdown, // Save individual tax lines for historical accuracy
       taxInclusiveMode: (inclusiveTaxAmount > 0 && exclusiveTaxAmount > 0) ? 'mixed' : inclusiveTaxAmount > 0 ? 'inclusive' : 'exclusive',
@@ -13284,6 +13375,7 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
     if (req.body.manualDiscount !== undefined) updateData.manualDiscount = Math.min(manualDiscountVal, Math.max(0, orderSubtotal - priorOfferDiscount));
     if (req.body.manualDiscountType !== undefined) updateData.manualDiscountType = req.body.manualDiscountType;
     if (req.body.manualDiscountValue !== undefined) updateData.manualDiscountValue = req.body.manualDiscountValue != null ? parseFloat(req.body.manualDiscountValue) : null;
+    if (req.body.discountReason !== undefined) updateData.discountReason = req.body.discountReason || null;
     if (req.body.selectedOfferName !== undefined) updateData.selectedOfferName = req.body.selectedOfferName;
     if (req.body.appliedOffer !== undefined) updateData.appliedOffer = req.body.appliedOffer;
     if (req.body.appliedOffers !== undefined) updateData.appliedOffers = req.body.appliedOffers;

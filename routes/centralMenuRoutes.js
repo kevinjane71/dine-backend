@@ -220,7 +220,7 @@ router.post('/:orgId/templates/:templateId/items', async (req, res) => {
     const { orgId, templateId } = req.params;
     const {
       name, description, category, basePrice, variants, image, images, isVeg, tags,
-      isLocked, lockFields, sortOrder, shortCode, customizations,
+      isLocked, lockFields, sortOrder, shortCode, customizations, modifierGroups,
       dineInPrice, takeawayPrice, deliveryPrice, allergens,
       spiritCategory, ingredients, abv, servingUnit, bottleSize,
       unit, weight, shelfLife, mfgDate, expiryDate, servingSize, scoopOptions,
@@ -272,7 +272,15 @@ router.post('/:orgId/templates/:templateId/items', async (req, res) => {
       lockFields: lockFields || [],
       sortOrder: sortOrder !== undefined ? sortOrder : 0,
       shortCode: shortCode || '',
-      customizations: customizations || [],
+      modifierGroups: modifierGroups || [],
+      customizations: modifierGroups && modifierGroups.length > 0
+        ? modifierGroups.flatMap(g => (g.items || []).map(o => ({
+            id: o.id || `cust_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+            name: o.name,
+            price: o.price || 0,
+            description: o.description || ''
+          })))
+        : (customizations || []),
       dineInPrice: dineInPrice != null ? Number(dineInPrice) : null,
       takeawayPrice: takeawayPrice != null ? Number(takeawayPrice) : null,
       deliveryPrice: deliveryPrice != null ? Number(deliveryPrice) : null,
@@ -329,7 +337,7 @@ router.patch('/:orgId/templates/:templateId/items/:itemId', async (req, res) => 
     const allowedFields = [
       'name', 'description', 'category', 'basePrice', 'variants', 'image', 'images',
       'isVeg', 'tags', 'isLocked', 'lockFields', 'sortOrder',
-      'shortCode', 'customizations', 'dineInPrice', 'takeawayPrice', 'deliveryPrice',
+      'shortCode', 'customizations', 'modifierGroups', 'dineInPrice', 'takeawayPrice', 'deliveryPrice',
       'allergens', 'spiritCategory', 'ingredients', 'abv', 'servingUnit', 'bottleSize',
       'unit', 'weight', 'shelfLife', 'mfgDate', 'expiryDate', 'servingSize', 'scoopOptions',
       'isStockManaged', 'stockQuantity', 'lowStockThreshold',
@@ -463,6 +471,7 @@ async function pushTemplateToOutlets(templateId, outletIds, overwriteExisting = 
           tags: masterItem.tags,
           shortCode: masterItem.shortCode || existingItem.shortCode || '',
           customizations: masterItem.customizations || [],
+          modifierGroups: masterItem.modifierGroups || [],
           dineInPrice: masterItem.dineInPrice ?? existingItem.dineInPrice ?? null,
           takeawayPrice: masterItem.takeawayPrice ?? existingItem.takeawayPrice ?? null,
           deliveryPrice: masterItem.deliveryPrice ?? existingItem.deliveryPrice ?? null,
@@ -502,6 +511,7 @@ async function pushTemplateToOutlets(templateId, outletIds, overwriteExisting = 
           tags: masterItem.tags,
           shortCode: masterItem.shortCode || '',
           customizations: masterItem.customizations || [],
+          modifierGroups: masterItem.modifierGroups || [],
           dineInPrice: masterItem.dineInPrice ?? null,
           takeawayPrice: masterItem.takeawayPrice ?? null,
           deliveryPrice: masterItem.deliveryPrice ?? null,
@@ -688,6 +698,7 @@ router.post('/:orgId/templates/:templateId/sync', async (req, res) => {
             tags: masterItem.tags,
             shortCode: masterItem.shortCode || existingItem.shortCode || '',
             customizations: masterItem.customizations || [],
+            modifierGroups: masterItem.modifierGroups || [],
             dineInPrice: masterItem.dineInPrice ?? existingItem.dineInPrice ?? null,
             takeawayPrice: masterItem.takeawayPrice ?? existingItem.takeawayPrice ?? null,
             deliveryPrice: masterItem.deliveryPrice ?? existingItem.deliveryPrice ?? null,
@@ -954,6 +965,7 @@ router.post('/:orgId/import-from-outlet/:restaurantId', async (req, res) => {
         tags: menuItem.tags || [],
         shortCode: menuItem.shortCode || '',
         customizations: menuItem.customizations || [],
+        modifierGroups: menuItem.modifierGroups || [],
         dineInPrice: menuItem.dineInPrice ?? null,
         takeawayPrice: menuItem.takeawayPrice ?? null,
         deliveryPrice: menuItem.deliveryPrice ?? null,
