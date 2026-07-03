@@ -20627,6 +20627,23 @@ app.patch('/api/kot/:orderId/status', async (req, res) => {
 
     await db.collection(collections.orders).doc(orderId).update(updateData);
 
+    // Push RTDB event so token display + other views get real-time updates
+    try {
+      const od = (await db.collection(collections.orders).doc(orderId).get()).data();
+      if (od) {
+        await pusherService.notifyOrderStatusUpdated(od.restaurantId, orderId, status, {
+          orderNumber: od.orderNumber,
+          dailyOrderId: od.dailyOrderId,
+          totalAmount: od.totalAmount,
+          tableNumber: od.tableNumber,
+          tableId: od.tableId || null,
+          floorId: od.floorId || null,
+        });
+      }
+    } catch (rtdbErr) {
+      console.error('KOT RTDB notification error (non-blocking):', rtdbErr);
+    }
+
     res.json({
       message: 'KOT status updated successfully',
       status,
