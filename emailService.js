@@ -218,12 +218,17 @@ https://www.dineopen.com`,
 
       // Daily AI Insights Report
       aiInsightsReport: {
-        getSubject: (ownerName, date, reportType) => `${reportType === 'weekly' ? 'Weekly' : 'Daily'} Insights Report - ${date}`,
+        getSubject: (ownerName, date, reportType) => {
+          if (reportType === 'morning') return `Morning Summary - ${date}`;
+          if (reportType === 'closing') return `Day Closing Report - ${date}`;
+          if (reportType === 'weekly') return `Weekly Insights Report - ${date}`;
+          return `Daily Insights Report - ${date}`;
+        },
 
         text: (data) => `
 Dear ${data.ownerName},
 
-Here's your AI-powered ${data.reportType === 'weekly' ? 'weekly' : 'daily'} insights report for ${data.date}:
+Here's your ${data.reportType === 'morning' ? 'morning summary' : data.reportType === 'closing' ? 'day closing report' : data.reportType === 'weekly' ? 'weekly insights report' : 'daily insights report'} for ${data.date}:
 
 SUMMARY
 ${data.insights.summary}
@@ -282,7 +287,7 @@ DineOpen AI Analytics
     <!-- Greeting -->
     <div style="padding: 30px 30px 0;">
       <p style="font-size: 18px; color: #1f2937; margin: 0;">
-        Good morning, <strong>${data.ownerName}</strong>! 👋
+        ${data.reportType === 'closing' ? 'Good evening' : 'Good morning'}, <strong>${data.ownerName}</strong>! 👋
       </p>
     </div>
 

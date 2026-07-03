@@ -651,30 +651,56 @@ router.get('/usage', authenticateToken, requireOwnerRole, async (req, res) => {
 router.post('/email-preferences', authenticateToken, requireOwnerRole, async (req, res) => {
   try {
     const userId = req.user.userId || req.user.id;
-    const { emailEnabled, email, reportEmails, timezone = 'Asia/Kolkata', reportTime = '08:00', reportFrequency = 'daily' } = req.body;
+    const { emailEnabled, email, reportEmails, timezone = 'Asia/Kolkata', reportTime = '08:00', reportFrequency = 'daily', morningSummary, dayClosing } = req.body;
 
     // Normalize: support both old single email and new array (max 5)
     const emails = (reportEmails && reportEmails.length > 0)
       ? reportEmails.slice(0, 5)
       : (email ? [email] : []);
 
-    // Pre-compute UTC hour for cron job matching
-    const reportTimeUTC = convertToUTCHour(reportTime, timezone);
-
     // Validate frequency
     const validFrequencies = ['daily', 'weekly', 'both'];
     const freq = validFrequencies.includes(reportFrequency) ? reportFrequency : 'daily';
 
-    await db.collection('ownerPreferences').doc(userId).set({
+    // Build report schedule config
+    const morningConfig = morningSummary ? {
+      enabled: !!morningSummary.enabled,
+      time: morningSummary.time || '08:00',
+      timeUTC: convertToUTCHour(morningSummary.time || '08:00', timezone)
+    } : null;
+
+    const closingConfig = dayClosing ? {
+      enabled: !!dayClosing.enabled,
+      time: dayClosing.time || '23:00',
+      timeUTC: convertToUTCHour(dayClosing.time || '23:00', timezone)
+    } : null;
+
+    // Build activeReportHoursUTC array for efficient cron querying
+    const activeHours = [];
+    if (morningConfig?.enabled) activeHours.push(morningConfig.timeUTC);
+    if (closingConfig?.enabled) activeHours.push(closingConfig.timeUTC);
+
+    // Determine primary reportTime for backward compat (morning takes precedence)
+    const primaryTime = morningConfig?.enabled ? morningConfig.time : (closingConfig?.enabled ? closingConfig.time : reportTime);
+    const reportTimeUTC = convertToUTCHour(primaryTime, timezone);
+
+    const updateData = {
       emailEnabled: !!emailEnabled,
       reportEmails: emails,
       reportEmail: emails[0] || req.user.email || '', // Legacy compat
       timezone,
-      reportTime,
+      reportTime: primaryTime,
       reportTimeUTC,
       reportFrequency: freq,
       updatedAt: new Date()
-    }, { merge: true });
+    };
+
+    // Add new fields if provided
+    if (morningConfig) updateData.morningSummary = morningConfig;
+    if (closingConfig) updateData.dayClosing = closingConfig;
+    if (activeHours.length > 0) updateData.activeReportHoursUTC = activeHours;
+
+    await db.collection('ownerPreferences').doc(userId).set(updateData, { merge: true });
 
     res.json({
       success: true,
@@ -710,7 +736,9 @@ router.get('/email-preferences', authenticateToken, requireOwnerRole, async (req
           reportEmail: req.user.email || '',
           timezone: 'Asia/Kolkata',
           reportTime: '08:00',
-          reportFrequency: 'daily'
+          reportFrequency: 'daily',
+          morningSummary: { enabled: true, time: '08:00' },
+          dayClosing: { enabled: false, time: '23:00' }
         }
       });
     }
@@ -734,7 +762,7 @@ router.get('/email-preferences', authenticateToken, requireOwnerRole, async (req
  * Generate a full AI insights report for an owner (reusable by test + cron)
  * Returns { insights, analytics, restaurantCount } or null if no restaurants
  */
-async function generateReportForOwner(userId, timezone, frequency = 'daily') {
+async function generateReportForOwner(userId, timezone, frequency = 'daily', reportType = 'closing') {
   // --- Find ALL restaurants for this owner ---
   // 1. Direct ownership via ownerId
   const restaurantsSnap = await db.collection(collections.restaurants)
@@ -802,6 +830,17 @@ async function generateReportForOwner(userId, timezone, frequency = 'daily') {
 
   // --- Analytics period (timezone-aware) ---
   const today = todayInTZ(tzOffset, dayStartHour);
+
+  // For morning reports, use yesterday's date for the EOD section
+  let reportDay;
+  if (reportType === 'morning') {
+    const yesterdayStr = dateStrInTZ(new Date(Date.now() - 86400000), tzOffset, dayStartHour);
+    const yesterdayBounds = dateBoundsInTZ(yesterdayStr, tzOffset, dayStartHour);
+    reportDay = { dateStr: yesterdayStr, start: yesterdayBounds.start, end: yesterdayBounds.end };
+  } else {
+    reportDay = today;
+  }
+
   let analyticsStart;
   if (frequency === 'weekly') {
     const sevenDaysAgoStr = dateStrInTZ(
@@ -809,8 +848,7 @@ async function generateReportForOwner(userId, timezone, frequency = 'daily') {
     );
     analyticsStart = dateBoundsInTZ(sevenDaysAgoStr, tzOffset, dayStartHour).start;
   } else {
-    // daily — use today's start only
-    analyticsStart = today.start;
+    analyticsStart = reportDay.start;
   }
 
   let totalRevenue = 0;
@@ -963,9 +1001,10 @@ async function generateReportForOwner(userId, timezone, frequency = 'daily') {
     currencySymbol
   });
 
-  // --- Today's detailed EOD-style report across ALL restaurants (timezone-aware) ---
-  const startOfDay = today.start;
-  const endOfDay = today.end;
+  // --- Detailed EOD-style report across ALL restaurants (timezone-aware) ---
+  // For morning reports: yesterday's full day. For closing: today.
+  const startOfDay = reportDay.start;
+  const endOfDay = reportDay.end;
 
   let todayRevenue = 0, todayOrderCount = 0, todayCashCollected = 0;
   const paymentBreakdown = {}; // dynamic: collects all payment methods from orders
@@ -1086,7 +1125,8 @@ async function generateReportForOwner(userId, timezone, frequency = 'daily') {
 
   const round = v => Math.round(v * 100) / 100;
   const todayReport = {
-    reportDate: today.dateStr,
+    reportDate: reportDay.dateStr,
+    reportType: reportType,
     timezone: ownerTz || 'Asia/Kolkata',
     summary: {
       totalRevenue: round(todayRevenue),
@@ -1119,7 +1159,7 @@ async function generateReportForOwner(userId, timezone, frequency = 'daily') {
     currencySymbol,
   };
 
-  return { insights, analytics, restaurantCount: restaurants.length, todayReport, currencySymbol, reportType: frequency };
+  return { insights, analytics, restaurantCount: restaurants.length, todayReport, currencySymbol, reportType: reportType, frequency };
 }
 
 /**
@@ -1129,7 +1169,7 @@ async function generateReportForOwner(userId, timezone, frequency = 'daily') {
 router.post('/send-test-report', authenticateToken, requireOwnerRole, async (req, res) => {
   try {
     const userId = req.user.userId || req.user.id;
-    const { email, emails, timezone, currencySymbol: clientCurrency, reportFrequency } = req.body;
+    const { email, emails, timezone, currencySymbol: clientCurrency, reportFrequency, reportType: reqReportType } = req.body;
 
     // Support both single email (legacy) and array
     const recipients = (emails && emails.length > 0) ? emails : (email ? [email] : []);
@@ -1139,7 +1179,7 @@ router.post('/send-test-report', authenticateToken, requireOwnerRole, async (req
 
     console.log(`🤖 Generating AI insights report for ${recipients.join(', ')}...`);
 
-    const reportData = await generateReportForOwner(userId, timezone, reportFrequency || 'daily');
+    const reportData = await generateReportForOwner(userId, timezone, reportFrequency || 'daily', reqReportType || 'closing');
     if (!reportData) {
       return res.status(400).json({ success: false, error: 'No restaurants found for this owner' });
     }

@@ -274,11 +274,13 @@ router.post('/:orgId/templates/:templateId/items', async (req, res) => {
       shortCode: shortCode || '',
       modifierGroups: modifierGroups || [],
       customizations: modifierGroups && modifierGroups.length > 0
-        ? modifierGroups.flatMap(g => (g.items || []).map(o => ({
-            id: o.id || `cust_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+        ? modifierGroups.flatMap(g => (g.options || []).map(o => ({
             name: o.name,
             price: o.price || 0,
-            description: o.description || ''
+            isDefault: o.isDefault || false,
+            groupName: g.name,
+            min: g.min,
+            max: g.max,
           })))
         : (customizations || []),
       dineInPrice: dineInPrice != null ? Number(dineInPrice) : null,

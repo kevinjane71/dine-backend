@@ -7640,14 +7640,16 @@ app.post('/api/menus/:restaurantId', authenticateToken, async (req, res) => {
       availableFrom: req.body.availableFrom || null,
       availableUntil: req.body.availableUntil || null,
       // Variants and customizations (ensure prices are numbers)
-      variants: variants && Array.isArray(variants) && variants.length > 0 
+      variants: variants && Array.isArray(variants) && variants.length > 0
         ? variants.map(v => ({
             name: v.name,
             price: typeof v.price === 'number' ? v.price : parseFloat(v.price) || 0,
             description: v.description || ''
           }))
         : [],
+      // Modifier groups: structured groups with min/max selection rules
       modifierGroups: normalizeModifierGroups(req.body.modifierGroups),
+      // Customizations: flat array for backward compat — auto-generated from groups when present
       customizations: (() => {
         const groups = req.body.modifierGroups;
         if (Array.isArray(groups) && groups.length > 0) {
@@ -7836,15 +7838,26 @@ app.patch('/api/menus/item/:id', authenticateToken, async (req, res) => {
             updateData.customizations = flattenModifierGroups(normalized);
           }
         } else if (field === 'customizations') {
-          // Ensure customizations are arrays with parsed prices
-          updateData[field] = Array.isArray(req.body[field])
-            ? req.body[field].map(c => ({
-                id: c.id || `cust_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
-                name: c.name,
-                price: typeof c.price === 'number' ? c.price : parseFloat(c.price) || 0,
-                description: c.description || ''
-              }))
-            : [];
+          // Skip if modifierGroups is also being updated (groups auto-generate customizations)
+          if (req.body.modifierGroups && Array.isArray(req.body.modifierGroups) && req.body.modifierGroups.length > 0) {
+            // customizations will be set by the modifierGroups handler below
+          } else {
+            updateData[field] = Array.isArray(req.body[field])
+              ? req.body[field].map(c => ({
+                  id: c.id || `cust_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+                  name: c.name,
+                  price: typeof c.price === 'number' ? c.price : parseFloat(c.price) || 0,
+                  description: c.description || ''
+                }))
+              : [];
+          }
+        } else if (field === 'modifierGroups') {
+          const normalized = normalizeModifierGroups(req.body[field]);
+          updateData.modifierGroups = normalized;
+          // Auto-regenerate flat customizations from groups for backward compat
+          if (normalized.length > 0) {
+            updateData.customizations = flattenModifierGroups(normalized);
+          }
         } else if (field === 'abv') {
           updateData[field] = req.body[field] ? parseFloat(req.body[field]) : null;
         } else if (field === 'deductionQuantity') {
@@ -8354,7 +8367,7 @@ app.get('/api/public/bill/:token', vercelSecurityMiddleware.publicAPI, async (re
           name: item.name,
           quantity: item.quantity || 1,
           price: item.price || 0,
-          variant: item.variant || null,
+          variant: item.selectedVariant?.name || item.variant || null,
           customizations: item.customizations || null,
         })),
         subtotal: order.subtotal || order.totalAmount || 0,
@@ -8860,6 +8873,18 @@ app.post('/api/public/orders/:restaurantId', vercelSecurityMiddleware.publicAPI,
         // No redemption - earn points normally on final total
         loyaltyPointsEarned = Math.floor(finalTotal / earnPerAmount) * pointsEarned;
         console.log(`💎 Loyalty points calculation: ₹${finalTotal} / ₹${earnPerAmount} * ${pointsEarned} = ${loyaltyPointsEarned} points`);
+      }
+
+      // Apply tier multiplier if customer has a loyalty tier
+      if (loyaltyPointsEarned > 0 && customerData) {
+        const customerTier = customerData.loyaltyTier || 'bronze';
+        const tierMultipliers = { bronze: 1, silver: 1.25, gold: 1.5, platinum: 2 };
+        const multiplier = tierMultipliers[customerTier] || 1;
+        if (multiplier > 1) {
+          const basePoints = loyaltyPointsEarned;
+          loyaltyPointsEarned = Math.floor(loyaltyPointsEarned * multiplier);
+          console.log(`💎 Tier multiplier (${customerTier} ${multiplier}x): ${basePoints} → ${loyaltyPointsEarned} points`);
+        }
       }
     }
 
@@ -9846,6 +9871,7 @@ app.post('/api/orders', async (req, res) => {
     const preTaxTotal = Math.max(0, totalAmount - totalDiscountAmount);
 
     // Calculate loyalty points earned (stored in order, awarded on completion)
+    let posCustomerTier = 'bronze';
     if (posLoyaltySettings.enabled && resolvedCustomerPhone) {
       const earnPerAmount = Number(posLoyaltySettings.earnPerAmount) || 100;
       const pointsEarnedRate = Number(posLoyaltySettings.pointsEarned) || 4;
@@ -9858,6 +9884,28 @@ app.post('/api/orders', async (req, res) => {
       } else {
         // Default: earn on preTaxTotal (after all discounts including coupon)
         loyaltyPointsEarned = Math.floor(preTaxTotal / earnPerAmount) * pointsEarnedRate;
+      }
+
+      // Apply tier multiplier
+      if (loyaltyPointsEarned > 0) {
+        try {
+          const custSnap = await db.collection('customers')
+            .where('restaurantId', '==', restaurantId)
+            .where('phone', '==', resolvedCustomerPhone)
+            .limit(1).get();
+          if (!custSnap.empty) {
+            posCustomerTier = custSnap.docs[0].data().loyaltyTier || 'bronze';
+            const tierMultipliers = { bronze: 1, silver: 1.25, gold: 1.5, platinum: 2 };
+            const multiplier = tierMultipliers[posCustomerTier] || 1;
+            if (multiplier > 1) {
+              const basePoints = loyaltyPointsEarned;
+              loyaltyPointsEarned = Math.floor(loyaltyPointsEarned * multiplier);
+              console.log(`💎 POS Tier multiplier (${posCustomerTier} ${multiplier}x): ${basePoints} → ${loyaltyPointsEarned} points`);
+            }
+          }
+        } catch (tierErr) {
+          console.error('⚠️ Tier multiplier lookup error:', tierErr.message);
+        }
       }
     }
 
@@ -19060,55 +19108,77 @@ app.get('/api/cron/send-daily-reports', async (req, res) => {
     const currentUTCHour = new Date().getUTCHours();
     console.log(`⏰ Cron: checking daily reports for UTC hour ${currentUTCHour}`);
 
-    // Query all owners who want reports at this UTC hour
-    const prefsSnap = await db.collection('ownerPreferences')
-      .where('emailEnabled', '==', true)
-      .where('reportTimeUTC', '==', currentUTCHour)
-      .get();
+    // Query owners using both new (activeReportHoursUTC) and legacy (reportTimeUTC) fields
+    const [newPrefsSnap, legacyPrefsSnap] = await Promise.all([
+      db.collection('ownerPreferences')
+        .where('emailEnabled', '==', true)
+        .where('activeReportHoursUTC', 'array-contains', currentUTCHour)
+        .get(),
+      db.collection('ownerPreferences')
+        .where('emailEnabled', '==', true)
+        .where('reportTimeUTC', '==', currentUTCHour)
+        .get()
+    ]);
 
-    if (prefsSnap.empty) {
+    // Dedupe by userId — new format takes precedence
+    const prefMap = new Map();
+    newPrefsSnap.docs.forEach(doc => prefMap.set(doc.id, { doc, isNew: true }));
+    legacyPrefsSnap.docs.forEach(doc => {
+      if (!prefMap.has(doc.id)) prefMap.set(doc.id, { doc, isNew: false });
+    });
+
+    if (prefMap.size === 0) {
       return res.json({ success: true, message: 'No reports to send this hour', sent: 0 });
     }
 
     let sent = 0;
     let errors = 0;
 
-    for (const prefDoc of prefsSnap.docs) {
+    for (const [userId, { doc: prefDoc, isNew }] of prefMap) {
       try {
         const prefs = prefDoc.data();
-        const userId = prefDoc.id;
         const recipients = prefs.reportEmails || (prefs.reportEmail ? [prefs.reportEmail] : []);
         if (recipients.length === 0) continue;
 
         const frequency = prefs.reportFrequency || 'daily';
 
-        // Determine which reports to send based on frequency and day of week
-        const reportsToSend = [];
-        // Check if today is Sunday in the owner's timezone
+        // Check if today is Sunday in the owner's timezone (for weekly reports)
         const ownerNow = new Date().toLocaleString('en-US', { timeZone: prefs.timezone || 'Asia/Kolkata', weekday: 'long' });
         const isSunday = ownerNow.startsWith('Sunday');
 
-        if (frequency === 'daily') {
-          reportsToSend.push('daily');
-        } else if (frequency === 'weekly') {
-          if (isSunday) reportsToSend.push('weekly');
-        } else if (frequency === 'both') {
-          reportsToSend.push('daily');
-          if (isSunday) reportsToSend.push('weekly');
+        // Determine which report types to generate this hour
+        const reportsToGenerate = []; // { reportType: 'morning'|'closing', frequency: 'daily'|'weekly' }
+
+        if (isNew && prefs.morningSummary) {
+          // New format — check each report schedule
+          if (prefs.morningSummary?.enabled && prefs.morningSummary?.timeUTC === currentUTCHour) {
+            if (frequency === 'daily' || frequency === 'both') reportsToGenerate.push({ reportType: 'morning', frequency: 'daily' });
+            if ((frequency === 'weekly' || frequency === 'both') && isSunday) reportsToGenerate.push({ reportType: 'morning', frequency: 'weekly' });
+          }
+          if (prefs.dayClosing?.enabled && prefs.dayClosing?.timeUTC === currentUTCHour) {
+            if (frequency === 'daily' || frequency === 'both') reportsToGenerate.push({ reportType: 'closing', frequency: 'daily' });
+            if ((frequency === 'weekly' || frequency === 'both') && isSunday) reportsToGenerate.push({ reportType: 'closing', frequency: 'weekly' });
+          }
+        } else {
+          // Legacy format — treat as closing report (today's data, same as before)
+          if (frequency === 'daily') reportsToGenerate.push({ reportType: 'closing', frequency: 'daily' });
+          else if (frequency === 'weekly' && isSunday) reportsToGenerate.push({ reportType: 'closing', frequency: 'weekly' });
+          else if (frequency === 'both') {
+            reportsToGenerate.push({ reportType: 'closing', frequency: 'daily' });
+            if (isSunday) reportsToGenerate.push({ reportType: 'closing', frequency: 'weekly' });
+          }
         }
 
-        if (reportsToSend.length === 0) continue;
+        if (reportsToGenerate.length === 0) continue;
 
         // Get owner's name
         const userDoc = await db.collection('users').doc(userId).get();
         const ownerName = userDoc.exists ? (userDoc.data().name || userDoc.data().displayName || 'Restaurant Owner') : 'Restaurant Owner';
 
-        for (const reportFreq of reportsToSend) {
-          // Generate report using the exported function (pass owner's timezone + frequency)
-          const reportData = await aiInsightsRoutes.generateReportForOwner(userId, prefs.timezone, reportFreq);
+        for (const { reportType, frequency: reportFreq } of reportsToGenerate) {
+          const reportData = await aiInsightsRoutes.generateReportForOwner(userId, prefs.timezone, reportFreq, reportType);
           if (!reportData) continue;
 
-          // Send to all recipient emails
           for (const email of recipients) {
             await emailService.sendAIInsightsReport({
               ownerEmail: email,
@@ -19118,21 +19188,21 @@ app.get('/api/cron/send-daily-reports', async (req, res) => {
               restaurantCount: reportData.restaurantCount,
               todayReport: reportData.todayReport,
               currencySymbol: reportData.currencySymbol,
-              reportType: reportData.reportType || reportFreq
+              reportType: reportType
             });
           }
 
-          console.log(`✅ Cron: sent ${reportFreq} report to ${recipients.join(', ')} for user ${userId}`);
+          console.log(`✅ Cron: sent ${reportType} ${reportFreq} report to ${recipients.join(', ')} for user ${userId}`);
         }
         sent++;
       } catch (err) {
-        console.error(`❌ Cron email error for user ${prefDoc.id}:`, err.message);
+        console.error(`❌ Cron email error for user ${userId}:`, err.message);
         errors++;
       }
     }
 
-    console.log(`⏰ Cron complete: sent=${sent}, errors=${errors}, checked=${prefsSnap.size}`);
-    res.json({ success: true, sent, errors, checked: prefsSnap.size });
+    console.log(`⏰ Cron complete: sent=${sent}, errors=${errors}, checked=${prefMap.size}`);
+    res.json({ success: true, sent, errors, checked: prefMap.size });
   } catch (error) {
     console.error('Cron send-daily-reports error:', error);
     res.status(500).json({ success: false, error: error.message });
