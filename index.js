@@ -19142,55 +19142,77 @@ app.get('/api/cron/send-daily-reports', async (req, res) => {
     const currentUTCHour = new Date().getUTCHours();
     console.log(`⏰ Cron: checking daily reports for UTC hour ${currentUTCHour}`);
 
-    // Query all owners who want reports at this UTC hour
-    const prefsSnap = await db.collection('ownerPreferences')
-      .where('emailEnabled', '==', true)
-      .where('reportTimeUTC', '==', currentUTCHour)
-      .get();
+    // Query owners using both new (activeReportHoursUTC) and legacy (reportTimeUTC) fields
+    const [newPrefsSnap, legacyPrefsSnap] = await Promise.all([
+      db.collection('ownerPreferences')
+        .where('emailEnabled', '==', true)
+        .where('activeReportHoursUTC', 'array-contains', currentUTCHour)
+        .get(),
+      db.collection('ownerPreferences')
+        .where('emailEnabled', '==', true)
+        .where('reportTimeUTC', '==', currentUTCHour)
+        .get()
+    ]);
 
-    if (prefsSnap.empty) {
+    // Dedupe by userId — new format takes precedence
+    const prefMap = new Map();
+    newPrefsSnap.docs.forEach(doc => prefMap.set(doc.id, { doc, isNew: true }));
+    legacyPrefsSnap.docs.forEach(doc => {
+      if (!prefMap.has(doc.id)) prefMap.set(doc.id, { doc, isNew: false });
+    });
+
+    if (prefMap.size === 0) {
       return res.json({ success: true, message: 'No reports to send this hour', sent: 0 });
     }
 
     let sent = 0;
     let errors = 0;
 
-    for (const prefDoc of prefsSnap.docs) {
+    for (const [userId, { doc: prefDoc, isNew }] of prefMap) {
       try {
         const prefs = prefDoc.data();
-        const userId = prefDoc.id;
         const recipients = prefs.reportEmails || (prefs.reportEmail ? [prefs.reportEmail] : []);
         if (recipients.length === 0) continue;
 
         const frequency = prefs.reportFrequency || 'daily';
 
-        // Determine which reports to send based on frequency and day of week
-        const reportsToSend = [];
-        // Check if today is Sunday in the owner's timezone
+        // Check if today is Sunday in the owner's timezone (for weekly reports)
         const ownerNow = new Date().toLocaleString('en-US', { timeZone: prefs.timezone || 'Asia/Kolkata', weekday: 'long' });
         const isSunday = ownerNow.startsWith('Sunday');
 
-        if (frequency === 'daily') {
-          reportsToSend.push('daily');
-        } else if (frequency === 'weekly') {
-          if (isSunday) reportsToSend.push('weekly');
-        } else if (frequency === 'both') {
-          reportsToSend.push('daily');
-          if (isSunday) reportsToSend.push('weekly');
+        // Determine which report types to generate this hour
+        const reportsToGenerate = []; // { reportType: 'morning'|'closing', frequency: 'daily'|'weekly' }
+
+        if (isNew && prefs.morningSummary) {
+          // New format — check each report schedule
+          if (prefs.morningSummary?.enabled && prefs.morningSummary?.timeUTC === currentUTCHour) {
+            if (frequency === 'daily' || frequency === 'both') reportsToGenerate.push({ reportType: 'morning', frequency: 'daily' });
+            if ((frequency === 'weekly' || frequency === 'both') && isSunday) reportsToGenerate.push({ reportType: 'morning', frequency: 'weekly' });
+          }
+          if (prefs.dayClosing?.enabled && prefs.dayClosing?.timeUTC === currentUTCHour) {
+            if (frequency === 'daily' || frequency === 'both') reportsToGenerate.push({ reportType: 'closing', frequency: 'daily' });
+            if ((frequency === 'weekly' || frequency === 'both') && isSunday) reportsToGenerate.push({ reportType: 'closing', frequency: 'weekly' });
+          }
+        } else {
+          // Legacy format — treat as closing report (today's data, same as before)
+          if (frequency === 'daily') reportsToGenerate.push({ reportType: 'closing', frequency: 'daily' });
+          else if (frequency === 'weekly' && isSunday) reportsToGenerate.push({ reportType: 'closing', frequency: 'weekly' });
+          else if (frequency === 'both') {
+            reportsToGenerate.push({ reportType: 'closing', frequency: 'daily' });
+            if (isSunday) reportsToGenerate.push({ reportType: 'closing', frequency: 'weekly' });
+          }
         }
 
-        if (reportsToSend.length === 0) continue;
+        if (reportsToGenerate.length === 0) continue;
 
         // Get owner's name
         const userDoc = await db.collection('users').doc(userId).get();
         const ownerName = userDoc.exists ? (userDoc.data().name || userDoc.data().displayName || 'Restaurant Owner') : 'Restaurant Owner';
 
-        for (const reportFreq of reportsToSend) {
-          // Generate report using the exported function (pass owner's timezone + frequency)
-          const reportData = await aiInsightsRoutes.generateReportForOwner(userId, prefs.timezone, reportFreq);
+        for (const { reportType, frequency: reportFreq } of reportsToGenerate) {
+          const reportData = await aiInsightsRoutes.generateReportForOwner(userId, prefs.timezone, reportFreq, reportType);
           if (!reportData) continue;
 
-          // Send to all recipient emails
           for (const email of recipients) {
             await emailService.sendAIInsightsReport({
               ownerEmail: email,
@@ -19200,21 +19222,21 @@ app.get('/api/cron/send-daily-reports', async (req, res) => {
               restaurantCount: reportData.restaurantCount,
               todayReport: reportData.todayReport,
               currencySymbol: reportData.currencySymbol,
-              reportType: reportData.reportType || reportFreq
+              reportType: reportType
             });
           }
 
-          console.log(`✅ Cron: sent ${reportFreq} report to ${recipients.join(', ')} for user ${userId}`);
+          console.log(`✅ Cron: sent ${reportType} ${reportFreq} report to ${recipients.join(', ')} for user ${userId}`);
         }
         sent++;
       } catch (err) {
-        console.error(`❌ Cron email error for user ${prefDoc.id}:`, err.message);
+        console.error(`❌ Cron email error for user ${userId}:`, err.message);
         errors++;
       }
     }
 
-    console.log(`⏰ Cron complete: sent=${sent}, errors=${errors}, checked=${prefsSnap.size}`);
-    res.json({ success: true, sent, errors, checked: prefsSnap.size });
+    console.log(`⏰ Cron complete: sent=${sent}, errors=${errors}, checked=${prefMap.size}`);
+    res.json({ success: true, sent, errors, checked: prefMap.size });
   } catch (error) {
     console.error('Cron send-daily-reports error:', error);
     res.status(500).json({ success: false, error: error.message });

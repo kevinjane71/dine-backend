@@ -449,22 +449,36 @@ router.get('/:restaurantId/history', async (req, res) => {
     const userId = req.user.userId || req.user.id;
     const isAdmin = ['owner', 'admin'].includes(role);
 
-    const snap = await db.collection(collections.shifts)
-      .where('restaurantId', '==', restaurantId)
-      .orderBy('openedAt', 'desc')
-      .limit(limit)
-      .get();
+    let snap;
+    try {
+      snap = await db.collection(collections.shifts)
+        .where('restaurantId', '==', restaurantId)
+        .orderBy('openedAt', 'desc')
+        .limit(limit)
+        .get();
+    } catch (indexErr) {
+      // Fallback if composite index is missing — fetch without orderBy, sort in memory
+      console.warn('Shift history: composite index may be missing, using fallback query', indexErr.code || indexErr.message);
+      snap = await db.collection(collections.shifts)
+        .where('restaurantId', '==', restaurantId)
+        .limit(limit)
+        .get();
+    }
 
     let shifts = snap.docs.map(doc => {
       const d = doc.data();
+      const openedAt = d.openedAt?.toDate ? d.openedAt.toDate().toISOString() : d.openedAt;
       return {
         id: doc.id,
         ...d,
         openedBy: normalizeOpenedBy(d.openedBy),
-        openedAt: d.openedAt?.toDate ? d.openedAt.toDate().toISOString() : d.openedAt,
+        openedAt,
         closedAt: d.closedAt?.toDate ? d.closedAt.toDate().toISOString() : d.closedAt,
       };
     });
+
+    // Sort by openedAt descending (needed for fallback path, harmless for indexed path)
+    shifts.sort((a, b) => new Date(b.openedAt || 0) - new Date(a.openedAt || 0));
 
     // Non-admin staff only see their own shifts
     if (!isAdmin) {
@@ -494,13 +508,22 @@ router.get('/:restaurantId/report', async (req, res) => {
     }
 
     // Build query
-    let query = db.collection(collections.shifts)
-      .where('restaurantId', '==', restaurantId)
-      .where('status', '==', 'closed')
-      .orderBy('openedAt', 'desc')
-      .limit(500);
-
-    const snap = await query.get();
+    let snap;
+    try {
+      snap = await db.collection(collections.shifts)
+        .where('restaurantId', '==', restaurantId)
+        .where('status', '==', 'closed')
+        .orderBy('openedAt', 'desc')
+        .limit(500)
+        .get();
+    } catch (indexErr) {
+      console.warn('Shift report: composite index may be missing, using fallback query', indexErr.code || indexErr.message);
+      snap = await db.collection(collections.shifts)
+        .where('restaurantId', '==', restaurantId)
+        .where('status', '==', 'closed')
+        .limit(500)
+        .get();
+    }
 
     let shifts = snap.docs.map(doc => {
       const d = doc.data();
@@ -512,6 +535,9 @@ router.get('/:restaurantId/report', async (req, res) => {
         closedAt: d.closedAt?.toDate ? d.closedAt.toDate().toISOString() : d.closedAt,
       };
     });
+
+    // Sort by openedAt descending (needed for fallback path)
+    shifts.sort((a, b) => new Date(b.openedAt || 0) - new Date(a.openedAt || 0));
 
     // Date filter in-memory
     if (startDate) {
