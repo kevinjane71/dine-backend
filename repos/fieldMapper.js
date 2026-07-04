@@ -141,10 +141,20 @@ const FIELD_MAP = {
   editReason: 'edit_reason',
   preEditSnapshot: 'pre_edit_snapshot',
 
+  // Cover count
+  covers: 'covers',
+
   // Cancellation
   cancelledAt: 'cancelled_at',
   cancelledBy: 'cancelled_by',
   cancellationReason: 'cancellation_reason',
+
+  // Restoration (recall cancelled order)
+  restoredAt: 'restored_at',
+  restoredBy: 'restored_by',
+  restoredByName: 'restored_by_name',
+  restoreReason: 'restore_reason',
+  restorationHistory: 'restoration_history',
 
   // Refund
   refundedAt: 'refunded_at',
@@ -191,7 +201,7 @@ const JSONB_COLUMNS = new Set([
   'tax_breakdown', 'split_payments', 'split_bill',
   'kot_printed_stations', 'delivery_info', 'delivery_address',
   'pre_edit_snapshot', 'void_items', 'removed_items',
-  'price_discrepancies', 'extra_data',
+  'price_discrepancies', 'restoration_history', 'extra_data',
 ]);
 
 /**

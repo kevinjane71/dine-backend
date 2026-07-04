@@ -7574,7 +7574,8 @@ app.post('/api/menus/:restaurantId', authenticateToken, async (req, res) => {
       image,
       shortCode,
       variants,
-      customizations
+      customizations,
+      subCategory
     } = req.body;
 
     if (!name || !price || !category) {
@@ -7624,6 +7625,7 @@ app.post('/api/menus/:restaurantId', authenticateToken, async (req, res) => {
       description: description || '',
       price: parseFloat(price),
       category,
+      subCategory: subCategory || null,
       isVeg: isVeg || false,
       spiceLevel: spiceLevel || 'medium',
       allergens: allergens || [],
@@ -7806,7 +7808,7 @@ app.patch('/api/menus/item/:id', authenticateToken, async (req, res) => {
     
     // Update allowed fields
     const allowedFields = [
-      'name', 'description', 'price', 'category', 'isVeg', 'spiceLevel',
+      'name', 'description', 'price', 'category', 'subCategory', 'isVeg', 'spiceLevel',
       'allergens', 'image', 'shortCode', 'status', 'order',
       'isAvailable', 'stockQuantity', 'lowStockThreshold', 'isStockManaged', 'deductionQuantity',
       'availableFrom', 'availableUntil', 'variants', 'customizations', 'modifierGroups',
@@ -9190,6 +9192,7 @@ app.post('/api/orders', async (req, res) => {
     const splitPayments = req.body.splitPayments || null;
     const splitBill = req.body.splitBill || null;
     const roundOffAmount = req.body.roundOffAmount || null;
+    const covers = Number(req.body.covers) || 1;
 
     // Extract offline/sync fields
     const idempotencyKey = req.body.idempotencyKey || null;
@@ -9909,29 +9912,6 @@ app.post('/api/orders', async (req, res) => {
       }
     }
 
-    // Apply tier multiplier for POS orders
-    let posCustomerTier = 'bronze';
-    if (posLoyaltySettings.enabled && resolvedCustomerPhone && loyaltyPointsEarned > 0) {
-      try {
-        const custSnap = await db.collection('customers')
-          .where('restaurantId', '==', restaurantId)
-          .where('phone', '==', resolvedCustomerPhone)
-          .limit(1).get();
-        if (!custSnap.empty) {
-          posCustomerTier = custSnap.docs[0].data().loyaltyTier || 'bronze';
-          const tierMultipliers = { bronze: 1, silver: 1.25, gold: 1.5, platinum: 2 };
-          const multiplier = tierMultipliers[posCustomerTier] || 1;
-          if (multiplier > 1) {
-            const basePoints = loyaltyPointsEarned;
-            loyaltyPointsEarned = Math.floor(loyaltyPointsEarned * multiplier);
-            console.log(`💎 POS Tier multiplier (${posCustomerTier} ${multiplier}x): ${basePoints} → ${loyaltyPointsEarned} points`);
-          }
-        }
-      } catch (tierErr) {
-        console.error('⚠️ Tier multiplier lookup error:', tierErr.message);
-      }
-    }
-
     console.log(`💰 POS Order pricing: Subtotal ₹${subtotalForDiscount}, Offers -₹${discountAmount}, Manual -₹${manualDiscountAmount}, Loyalty -₹${loyaltyDiscount}, PreTax ₹${preTaxTotal}`);
 
     // Calculate tax using per-item tax resolution (supports tax groups)
@@ -10130,6 +10110,8 @@ app.post('/api/orders', async (req, res) => {
       // Delivery fields
       deliveryInfo: req.body.deliveryInfo || null,
       deliveryAddress: req.body.deliveryAddress || null,
+      // Cover count (pax/guests at table)
+      covers: covers,
       // Sub-restaurant fields
       subRestaurantId: req.body.subRestaurantId || null,
       subRestaurantName: req.body.subRestaurantName || null,
@@ -12687,6 +12669,24 @@ app.patch('/api/orders/:orderId/status', authenticateToken, async (req, res) => 
       const invoiceEmailService = require('./invoiceEmailService');
       invoiceEmailService.sendInvoiceEmail({ orderId, restaurantId: orderData.restaurantId })
         .catch(err => console.error('Invoice email error (non-blocking):', err.message));
+    }
+
+    // Fire-and-forget: increment shift cashSales for cash payments
+    if (status === 'completed' && (orderData.paymentMethod === 'cash' || orderData.paymentMethod === 'Cash')) {
+      const staffId = orderData.staffId || orderData.createdBy || req.user?.userId;
+      if (staffId) {
+        db.collection(collections.shifts || 'shifts')
+          .where('restaurantId', '==', orderData.restaurantId)
+          .where('staffId', '==', staffId)
+          .where('status', '==', 'open')
+          .limit(1).get().then(snap => {
+            if (!snap.empty) {
+              snap.docs[0].ref.update({
+                cashSales: FieldValue.increment(orderData.finalAmount || orderData.totalAmount || 0)
+              });
+            }
+          }).catch(() => {});
+      }
     }
 
     // Fire-and-forget: send bill on WhatsApp if enabled
@@ -21927,6 +21927,227 @@ app.patch('/api/orders/:orderId/cancel', authenticateToken, async (req, res) => 
   }
 });
 
+// Restore Order — reapply side effects (inverse of reverseOrderSideEffects)
+async function reapplyOrderSideEffects(orderId, orderData) {
+  const restaurantId = orderData.restaurantId;
+  const results = { inventory: false, customer: false, loyalty: false, offers: false };
+
+  console.log(`🔁 Reapplying side effects for restored Order ${orderId}`);
+
+  // 1. Re-deduct inventory
+  try {
+    const orderItems = orderData.items || [];
+    if (orderItems.length > 0) {
+      await adjustDirectMenuItemStock(restaurantId, orderItems, 'deduct');
+      await inventoryService.deductInventoryForOrder(restaurantId, orderId, orderItems);
+      await syncInventoryStockToMenuItems(restaurantId);
+      results.inventory = true;
+      console.log(`📦 Inventory re-deducted for restored Order ${orderId}`);
+    }
+  } catch (err) {
+    console.error(`⚠️ Inventory re-deduction failed for Order ${orderId}:`, err.message);
+  }
+
+  // 2. Re-add customer stats + loyalty points
+  const customerId = orderData.customerId;
+  if (customerId) {
+    try {
+      const custRef = db.collection(collections.customers).doc(customerId);
+      const custDoc = await custRef.get();
+      if (custDoc.exists) {
+        const custData = custDoc.data();
+        const orderHistory = custData.orderHistory || [];
+
+        // Re-add this order to history (if not already there)
+        if (!orderHistory.some(h => h.orderId === orderId)) {
+          orderHistory.push({
+            orderId,
+            date: orderData.createdAt || new Date(),
+            totalAmount: orderData.finalAmount || orderData.totalAmount || 0,
+            paidAmount: orderData.paidAmount || orderData.finalAmount || orderData.totalAmount || 0,
+            items: (orderData.items || []).length,
+            orderType: orderData.orderType || 'dine_in'
+          });
+        }
+
+        const newTotalOrders = orderHistory.length;
+        const newTotalSpent = orderHistory.reduce((sum, o) => sum + (o.paidAmount != null ? o.paidAmount : (o.finalAmount || o.totalAmount || 0)), 0);
+
+        const custUpdate = {
+          orderHistory,
+          totalOrders: newTotalOrders,
+          totalSpent: Math.round(newTotalSpent * 100) / 100,
+          updatedAt: new Date()
+        };
+
+        // Re-apply loyalty points: add earned back, deduct redeemed again
+        const pointsEarned = orderData.loyaltyPointsEarned || 0;
+        const pointsRedeemed = orderData.loyaltyPointsRedeemed || 0;
+        const netReapply = pointsEarned - pointsRedeemed;
+        if (netReapply !== 0) {
+          custUpdate.loyaltyPoints = FieldValue.increment(netReapply);
+          results.loyalty = true;
+        }
+
+        // Re-apply outstanding balance if applicable
+        if (orderData.outstandingAmount && orderData.outstandingAmount > 0) {
+          const creditHistory = custData.creditHistory || [];
+          creditHistory.push({
+            orderId,
+            outstandingAmount: orderData.outstandingAmount,
+            date: new Date(),
+            type: 'restored'
+          });
+          custUpdate.creditHistory = creditHistory;
+          custUpdate.outstandingBalance = FieldValue.increment(orderData.outstandingAmount);
+        }
+
+        await custRef.update(custUpdate);
+        results.customer = true;
+      }
+    } catch (err) {
+      console.error(`⚠️ Customer stats reapply failed for Order ${orderId}:`, err.message);
+    }
+  }
+
+  // 3. Re-apply offer/promo usage
+  const appliedOffers = orderData.appliedOffers && orderData.appliedOffers.length > 0
+    ? orderData.appliedOffers
+    : (orderData.appliedOffer && orderData.appliedOffer.id ? [orderData.appliedOffer] : []);
+
+  if (appliedOffers.length > 0) {
+    try {
+      const customerPhone = orderData.customerPhone || orderData.customer?.phone || '';
+      const offerCustomerKey = offerEngine.buildCustomerKey(customerId, customerPhone);
+      for (const offer of appliedOffers) {
+        if (offer && offer.id) {
+          await offerEngine.incrementUsage(db, offer.id, offerCustomerKey);
+        }
+      }
+      results.offers = true;
+    } catch (err) {
+      console.error(`⚠️ Offer usage reapply failed for Order ${orderId}:`, err.message);
+    }
+  }
+
+  console.log(`✅ Side effect reapply complete for Order ${orderId}:`, results);
+  return results;
+}
+
+// Restore Cancelled Order API
+app.patch('/api/orders/:orderId/restore', authenticateToken, async (req, res) => {
+  try {
+    // Permission check: orders.restore
+    if (!(await checkFeaturePermission(req, 'orders', 'restore'))) {
+      return res.status(403).json({ error: 'Access denied. Orders restore permission required.' });
+    }
+    const { orderId } = req.params;
+    const { reason } = req.body;
+
+    console.log(`🔁 Restore Order API - Order: ${orderId}, Reason: ${reason || 'No reason'}`);
+
+    const orderDoc = await db.collection(collections.orders).doc(orderId).get();
+    if (!orderDoc.exists) {
+      return res.status(404).json({ error: 'Order not found' });
+    }
+
+    const orderData = orderDoc.data();
+
+    // Only cancelled orders can be restored
+    if (orderData.status !== 'cancelled') {
+      return res.status(400).json({ error: 'Only cancelled orders can be restored' });
+    }
+
+    // Check time window
+    const restDoc = await getCachedRestDoc(orderData.restaurantId);
+    const restData = restDoc.exists ? restDoc.data() : {};
+    const restoreWindowHours = restData.posSettings?.orderRestoreWindowHours || 24;
+    const cancelledAt = orderData.cancelledAt?.toDate ? orderData.cancelledAt.toDate() : new Date(orderData.cancelledAt);
+    const hoursSinceCancellation = (Date.now() - cancelledAt.getTime()) / (1000 * 60 * 60);
+    if (hoursSinceCancellation > restoreWindowHours) {
+      return res.status(400).json({
+        error: `Cannot restore order — cancellation was more than ${restoreWindowHours} hours ago`
+      });
+    }
+
+    // Check if original table is still available
+    let tableWarning = null;
+    if (orderData.tableNumber && orderData.tableNumber.trim()) {
+      try {
+        if (orderData.floorId && orderData.tableId) {
+          const tableRef = db.collection('restaurants').doc(orderData.restaurantId)
+            .collection('floors').doc(orderData.floorId)
+            .collection('tables').doc(orderData.tableId);
+          const tableDoc = await tableRef.get();
+          if (tableDoc.exists) {
+            const tableData = tableDoc.data();
+            if (tableData.status === 'occupied' && tableData.currentOrderId && tableData.currentOrderId !== orderId) {
+              tableWarning = `Table ${orderData.tableNumber} is now occupied by another order. Order restored without table assignment.`;
+            } else {
+              // Re-occupy the table
+              await tableRef.update({ status: 'occupied', currentOrderId: orderId, updatedAt: new Date() });
+              pusherService.triggerTableStatusUpdated(orderData.restaurantId, {
+                tableId: orderData.tableId, status: 'occupied', orderId, tableNumber: orderData.tableNumber,
+              }).catch(() => {});
+            }
+          }
+        }
+      } catch (err) {
+        console.error('Table check on restore failed:', err.message);
+      }
+    }
+
+    // Restore the order
+    const restoreStatus = orderData.lastStatus || 'pending';
+    const updateData = {
+      status: restoreStatus,
+      restoredAt: new Date(),
+      restoredBy: req.user.userId,
+      restoredByName: req.user.name || req.user.email || 'Staff',
+      restoreReason: reason || '',
+      updatedAt: new Date()
+    };
+
+    // Track restoration history
+    const restorationHistory = orderData.restorationHistory || [];
+    restorationHistory.push({
+      restoredAt: new Date(),
+      restoredBy: req.user.userId,
+      restoredByName: updateData.restoredByName,
+      reason: reason || '',
+      previousStatus: 'cancelled',
+      restoredTo: restoreStatus
+    });
+    updateData.restorationHistory = restorationHistory;
+
+    await db.collection(collections.orders).doc(orderId).update(updateData);
+
+    // Reapply all side effects
+    const reapplyResults = await reapplyOrderSideEffects(orderId, orderData);
+
+    // Re-add to daily stats
+    if (!['saved', 'cancelled', 'deleted'].includes(restoreStatus)) {
+      updateDailyStats(orderData.restaurantId, orderData, 'add', parseTZ(req), parseDayStart(req));
+    }
+
+    console.log(`✅ Order ${orderId} restored successfully to status: ${restoreStatus}`);
+
+    res.json({
+      success: true,
+      message: 'Order restored successfully',
+      orderId,
+      restoredTo: restoreStatus,
+      restoredAt: updateData.restoredAt,
+      tableWarning,
+      reapplyResults
+    });
+
+  } catch (error) {
+    console.error('Restore order error:', error);
+    res.status(500).json({ error: 'Failed to restore order' });
+  }
+});
+
 // ========================================
 // FCM (Firebase Cloud Messaging) — Printer device token registration
 // ========================================
@@ -30099,6 +30320,89 @@ app.get('/api/customers/reports', authenticateToken, async (req, res) => {
   }
 });
 
+// Lookup customer by wallet card number/barcode — MUST be before /:restaurantId to avoid param collision
+app.get('/api/customers/lookup-card/:cardNumber', authenticateToken, async (req, res) => {
+  try {
+    const { cardNumber } = req.params;
+    const { restaurantId } = req.query;
+    if (!cardNumber || !restaurantId) {
+      return res.status(400).json({ error: 'Card number and restaurantId are required' });
+    }
+
+    // Search by walletCardNumber first, then walletCardBarcode
+    let custDoc = null;
+    const byNumber = await db.collection('customers')
+      .where('restaurantId', '==', restaurantId)
+      .where('walletCardNumber', '==', cardNumber.trim())
+      .limit(1).get();
+
+    if (!byNumber.empty) {
+      custDoc = byNumber.docs[0];
+    } else {
+      const byBarcode = await db.collection('customers')
+        .where('restaurantId', '==', restaurantId)
+        .where('walletCardBarcode', '==', cardNumber.trim())
+        .limit(1).get();
+      if (!byBarcode.empty) {
+        custDoc = byBarcode.docs[0];
+      }
+    }
+
+    if (!custDoc) {
+      return res.status(404).json({ error: 'No customer found with this card number' });
+    }
+
+    const data = custDoc.data();
+    res.json({
+      customerId: custDoc.id,
+      customerName: data.name || '',
+      phone: data.phone || '',
+      walletBalance: data.walletBalance || 0,
+      walletCardNumber: data.walletCardNumber || '',
+      loyaltyPoints: data.loyaltyPoints || 0,
+      outstandingBalance: data.outstandingBalance || 0
+    });
+  } catch (error) {
+    console.error('Lookup card error:', error);
+    res.status(500).json({ error: 'Failed to lookup card' });
+  }
+});
+
+// Link physical card to customer
+app.post('/api/customers/:customerId/link-card', authenticateToken, async (req, res) => {
+  try {
+    const { customerId } = req.params;
+    const { walletCardNumber, walletCardBarcode, restaurantId } = req.body;
+
+    if (!walletCardNumber && !walletCardBarcode) {
+      return res.status(400).json({ error: 'Card number or barcode is required' });
+    }
+
+    // Uniqueness check
+    const cardValue = (walletCardNumber || walletCardBarcode).trim();
+    const field = walletCardNumber ? 'walletCardNumber' : 'walletCardBarcode';
+    const existing = await db.collection('customers')
+      .where('restaurantId', '==', restaurantId)
+      .where(field, '==', cardValue)
+      .limit(1).get();
+
+    if (!existing.empty && existing.docs[0].id !== customerId) {
+      return res.status(400).json({ error: 'This card is already linked to another customer' });
+    }
+
+    const updateData = { updatedAt: new Date() };
+    if (walletCardNumber) updateData.walletCardNumber = walletCardNumber.trim();
+    if (walletCardBarcode) updateData.walletCardBarcode = walletCardBarcode.trim();
+
+    await db.collection('customers').doc(customerId).update(updateData);
+
+    res.json({ success: true, message: 'Card linked successfully' });
+  } catch (error) {
+    console.error('Link card error:', error);
+    res.status(500).json({ error: 'Failed to link card' });
+  }
+});
+
 app.get('/api/customers/:restaurantId', authenticateToken, async (req, res) => {
   try {
     if (!(await checkFeaturePermission(req, 'customers', 'read'))) {
@@ -34083,7 +34387,7 @@ app.post('/api/categories/:restaurantId', authenticateToken, async (req, res) =>
     }
 
     const { restaurantId } = req.params;
-    const { name, emoji = '🍽️', description = '' } = req.body;
+    const { name, emoji = '🍽️', description = '', parentId = null } = req.body;
 
     if (!name) {
       return res.status(400).json({ error: 'Category name is required' });
@@ -34097,6 +34401,11 @@ app.post('/api/categories/:restaurantId', authenticateToken, async (req, res) =>
 
     const restaurantData = restaurantDoc.data();
     const existingCategories = restaurantData.categories || [];
+
+    // Validate parentId if provided
+    if (parentId && !existingCategories.find(cat => cat.id === parentId)) {
+      return res.status(400).json({ error: 'Parent category not found' });
+    }
 
     // Check if category already exists (use same ID generation as bulk-save)
     const categoryId = categoryNameToId(name);
@@ -34112,6 +34421,7 @@ app.post('/api/categories/:restaurantId', authenticateToken, async (req, res) =>
       name: name.trim(),
       emoji: emoji.trim(),
       description: description.trim(),
+      parentId: parentId || null,
       createdAt: new Date(),
       updatedAt: new Date()
     };
@@ -34143,7 +34453,7 @@ app.patch('/api/categories/:restaurantId/:categoryId', authenticateToken, async 
     }
 
     const { restaurantId, categoryId } = req.params;
-    const { name, emoji, description, taxGroupId } = req.body;
+    const { name, emoji, description, taxGroupId, parentId } = req.body;
 
     // Get restaurant document
     const restaurantDoc = await getCachedRestDoc(restaurantId);
@@ -34160,6 +34470,11 @@ app.patch('/api/categories/:restaurantId/:categoryId', authenticateToken, async 
       return res.status(404).json({ error: 'Category not found' });
     }
 
+    // Validate parentId if provided
+    if (parentId !== undefined && parentId !== null && !categories.find(cat => cat.id === parentId)) {
+      return res.status(400).json({ error: 'Parent category not found' });
+    }
+
     // Update category
     const updatedCategory = {
       ...categories[categoryIndex],
@@ -34167,6 +34482,7 @@ app.patch('/api/categories/:restaurantId/:categoryId', authenticateToken, async 
       ...(emoji && { emoji: emoji.trim() }),
       ...(description !== undefined && { description: description.trim() }),
       ...(taxGroupId !== undefined && { taxGroupId: taxGroupId || null }),
+      ...(parentId !== undefined && { parentId: parentId || null }),
       updatedAt: new Date()
     };
 
@@ -34214,13 +34530,21 @@ app.delete('/api/categories/:restaurantId/:categoryId', authenticateToken, async
       return res.status(404).json({ error: 'Category not found' });
     }
 
-    // Check if any menu items use this category
+    // Check if any child categories reference this as parent
+    const childCategories = categories.filter(cat => cat.parentId === categoryId);
+    if (childCategories.length > 0) {
+      return res.status(400).json({
+        error: `Cannot delete category. ${childCategories.length} sub-categories are under this category. Please delete or reassign them first.`
+      });
+    }
+
+    // Check if any menu items use this category or sub-category
     const menuItems = restaurantData.menu?.items || [];
-    const itemsUsingCategory = menuItems.filter(item => item.category === categoryId);
-    
+    const itemsUsingCategory = menuItems.filter(item => item.category === categoryId || item.subCategory === categoryId);
+
     if (itemsUsingCategory.length > 0) {
-      return res.status(400).json({ 
-        error: `Cannot delete category. ${itemsUsingCategory.length} menu items are using this category. Please reassign or delete those items first.` 
+      return res.status(400).json({
+        error: `Cannot delete category. ${itemsUsingCategory.length} menu items are using this category. Please reassign or delete those items first.`
       });
     }
 

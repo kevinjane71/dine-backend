@@ -50,6 +50,8 @@ const FIELD_MAP = {
   // Wallet
   walletBalance:          'wallet_balance',
   walletHistory:          'wallet_history',
+  walletCardNumber:       'wallet_card_number',
+  walletCardBarcode:      'wallet_card_barcode',
 
   // Tips
   tipEarnings:            'tip_earnings',
