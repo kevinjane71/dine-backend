@@ -1254,6 +1254,30 @@ const WHATSAPP_ORDER_LOG_JSONB_COLUMNS = new Set(['parsed_order', 'extra_data'])
 const whatsappOrderLogToPgRow = makeToPgRow(WHATSAPP_ORDER_LOG_FIELD_MAP, WHATSAPP_ORDER_LOG_JSONB_COLUMNS);
 const whatsappOrderLogToFirestoreObj = makeToFirestoreObj(buildReverseMap(WHATSAPP_ORDER_LOG_FIELD_MAP));
 
+// ── d365SyncLog ──────────────────────────────────────────────────────────────
+
+const D365_SYNC_LOG_FIELD_MAP = {
+  id: 'id',
+  restaurantId: 'restaurant_id',
+  type: 'type',
+  date: 'date',
+  status: 'status',
+  orderId: 'order_id',
+  journalLinesPosted: 'journal_lines_posted',
+  totalAmount: 'total_amount',
+  bcDocumentNumber: 'bc_document_number',
+  itemsSynced: 'items_synced',
+  customersSynced: 'customers_synced',
+  error: 'error',
+  details: 'details',
+  syncedBy: 'synced_by',
+  syncedAt: 'synced_at',
+};
+
+const D365_SYNC_LOG_JSONB_COLUMNS = new Set(['details', 'extra_data']);
+const d365SyncLogToPgRow = makeToPgRow(D365_SYNC_LOG_FIELD_MAP, D365_SYNC_LOG_JSONB_COLUMNS);
+const d365SyncLogToFirestoreObj = makeToFirestoreObj(buildReverseMap(D365_SYNC_LOG_FIELD_MAP));
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // Exports
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -1350,4 +1374,7 @@ module.exports = {
   menuBulkDeleteLogToPgRow, menuBulkDeleteLogToFirestoreObj, MENU_BULK_DELETE_LOG_JSONB_COLUMNS,
   aggregatorWebhookLogToPgRow, aggregatorWebhookLogToFirestoreObj, AGGREGATOR_WEBHOOK_LOG_JSONB_COLUMNS,
   whatsappOrderLogToPgRow, whatsappOrderLogToFirestoreObj, WHATSAPP_ORDER_LOG_JSONB_COLUMNS,
+
+  // GROUP O: D365 Integration
+  d365SyncLogToPgRow, d365SyncLogToFirestoreObj, D365_SYNC_LOG_JSONB_COLUMNS,
 };

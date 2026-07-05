@@ -70,11 +70,16 @@ const MENU_ITEM_FIELD_MAP = {
   deliveryPrice: 'delivery_price',
   allergens: 'allergens',
   status: 'status',
+  outletPrices: 'outlet_prices',
+  barcode: 'barcode',
+  barcodeFormat: 'barcode_format',
+  subCategory: 'sub_category',
+  modifierGroups: 'modifier_groups',
   createdAt: 'created_at',
   updatedAt: 'updated_at',
 };
 
-const MENU_ITEM_JSONB_COLUMNS = new Set(['variants', 'images', 'tags', 'lock_fields', 'customizations', 'allergens', 'extra_data']);
+const MENU_ITEM_JSONB_COLUMNS = new Set(['variants', 'images', 'tags', 'lock_fields', 'customizations', 'allergens', 'outlet_prices', 'modifier_groups', 'extra_data']);
 const menuItemToPgRow = makeToPgRow(MENU_ITEM_FIELD_MAP, MENU_ITEM_JSONB_COLUMNS);
 const menuItemToFirestoreObj = makeToFirestoreObj(buildReverseMap(MENU_ITEM_FIELD_MAP));
 

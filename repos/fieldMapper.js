@@ -171,6 +171,10 @@ const FIELD_MAP = {
   // Item count
   itemCount: 'item_count',
 
+  // Reprint tracking
+  billReprintCount: 'bill_reprint_count',
+  billReprintHistory: 'bill_reprint_history',
+
   // Misc
   shareToken: 'share_token',
   billPrinted: 'bill_printed',
@@ -201,7 +205,7 @@ const JSONB_COLUMNS = new Set([
   'tax_breakdown', 'split_payments', 'split_bill',
   'kot_printed_stations', 'delivery_info', 'delivery_address',
   'pre_edit_snapshot', 'void_items', 'removed_items',
-  'price_discrepancies', 'restoration_history', 'extra_data',
+  'price_discrepancies', 'restoration_history', 'bill_reprint_history', 'extra_data',
 ]);
 
 /**

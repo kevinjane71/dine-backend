@@ -326,6 +326,7 @@ const {
   menuBulkDeleteLogToPgRow, menuBulkDeleteLogToFirestoreObj, MENU_BULK_DELETE_LOG_JSONB_COLUMNS,
   aggregatorWebhookLogToPgRow, aggregatorWebhookLogToFirestoreObj, AGGREGATOR_WEBHOOK_LOG_JSONB_COLUMNS,
   whatsappOrderLogToPgRow, whatsappOrderLogToFirestoreObj, WHATSAPP_ORDER_LOG_JSONB_COLUMNS,
+  d365SyncLogToPgRow, d365SyncLogToFirestoreObj, D365_SYNC_LOG_JSONB_COLUMNS,
 } = require('./systemMiscFieldMapper');
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -557,6 +558,7 @@ const REGISTRY = {
   'whatsappOrderLogs':     { table: 'whatsapp_order_logs',     fieldMap: {}, toPgRow: whatsappOrderLogToPgRow,      toFirestoreObj: whatsappOrderLogToFirestoreObj,      jsonbCols: WHATSAPP_ORDER_LOG_JSONB_COLUMNS },
   'stockAudits':           { table: 'stock_audits',            fieldMap: {}, toPgRow: stockAuditToPgRow,            toFirestoreObj: stockAuditToFirestoreObj,            jsonbCols: STOCK_AUDIT_JSONB_COLUMNS },
   'productionEntries':     { table: 'production_entries',      fieldMap: {}, toPgRow: productionEntryToPgRow,       toFirestoreObj: productionEntryToFirestoreObj,       jsonbCols: PRODUCTION_ENTRY_JSONB_COLUMNS },
+  'd365SyncLog':           { table: 'd365_sync_log',           fieldMap: {}, toPgRow: d365SyncLogToPgRow,           toFirestoreObj: d365SyncLogToFirestoreObj,           jsonbCols: D365_SYNC_LOG_JSONB_COLUMNS },
 
   // ── auth & menu ─────────────────────────────────────────────────────────
   'menus':             { table: 'menus',              fieldMap: MENU_FIELD_MAP,             toPgRow: menuToPgRow,             toFirestoreObj: menuToFirestoreObj,             jsonbCols: MENU_JSONB_COLUMNS, cacheTTL: 120 },

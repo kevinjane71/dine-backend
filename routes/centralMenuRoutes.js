@@ -225,6 +225,7 @@ router.post('/:orgId/templates/:templateId/items', async (req, res) => {
       spiritCategory, ingredients, abv, servingUnit, bottleSize,
       unit, weight, shelfLife, mfgDate, expiryDate, servingSize, scoopOptions,
       isStockManaged, stockQuantity, lowStockThreshold,
+      outletPrices, barcode, barcodeFormat,
     } = req.body;
 
     // Validate template exists and belongs to org
@@ -302,6 +303,9 @@ router.post('/:orgId/templates/:templateId/items', async (req, res) => {
       isStockManaged: isStockManaged || false,
       stockQuantity: stockQuantity != null ? Number(stockQuantity) : null,
       lowStockThreshold: lowStockThreshold != null ? Number(lowStockThreshold) : 5,
+      outletPrices: outletPrices || {},
+      barcode: barcode || '',
+      barcodeFormat: barcodeFormat || '',
       status: 'active',
       createdAt: now,
       updatedAt: now,
@@ -343,6 +347,7 @@ router.patch('/:orgId/templates/:templateId/items/:itemId', async (req, res) => 
       'allergens', 'spiritCategory', 'ingredients', 'abv', 'servingUnit', 'bottleSize',
       'unit', 'weight', 'shelfLife', 'mfgDate', 'expiryDate', 'servingSize', 'scoopOptions',
       'isStockManaged', 'stockQuantity', 'lowStockThreshold',
+      'outletPrices', 'barcode', 'barcodeFormat', 'subCategory',
     ];
     const updates = { updatedAt: new Date().toISOString() };
 
@@ -409,6 +414,60 @@ router.delete('/:orgId/templates/:templateId/items/:itemId', async (req, res) =>
 });
 
 // ============================================================
+// 8b. PATCH /:orgId/templates/:templateId/items/:itemId/outlet-prices — Update outlet-specific prices
+// ============================================================
+router.patch('/:orgId/templates/:templateId/items/:itemId/outlet-prices', async (req, res) => {
+  try {
+    const { orgId, templateId, itemId } = req.params;
+    const { outletPrices } = req.body;
+
+    if (!outletPrices || typeof outletPrices !== 'object') {
+      return res.status(400).json({ success: false, error: 'outletPrices object is required' });
+    }
+
+    const itemRef = db.collection(collections.orgMenuItems).doc(itemId);
+    const itemDoc = await itemRef.get();
+
+    if (!itemDoc.exists) {
+      return res.status(404).json({ success: false, error: 'Item not found' });
+    }
+
+    const item = itemDoc.data();
+
+    if (item.organizationId !== orgId || item.templateId !== templateId) {
+      return res.status(403).json({ success: false, error: 'Item does not belong to this template or organization' });
+    }
+
+    // Merge new outlet prices with existing ones (allows partial updates)
+    const existingPrices = item.outletPrices || {};
+    const mergedPrices = { ...existingPrices };
+
+    for (const [outletId, price] of Object.entries(outletPrices)) {
+      if (price === null || price === '') {
+        // Remove override for this outlet
+        delete mergedPrices[outletId];
+      } else {
+        const numPrice = Number(price);
+        if (isNaN(numPrice) || numPrice < 0) {
+          return res.status(400).json({ success: false, error: `Invalid price for outlet ${outletId}` });
+        }
+        mergedPrices[outletId] = numPrice;
+      }
+    }
+
+    await itemRef.update({
+      outletPrices: mergedPrices,
+      updatedAt: new Date().toISOString(),
+    });
+
+    return res.json({ success: true, outletPrices: mergedPrices });
+  } catch (error) {
+    console.error('Error updating outlet prices:', error);
+    return res.status(500).json({ success: false, error: 'Failed to update outlet prices' });
+  }
+});
+
+// ============================================================
 // Reusable helper: push template items to outlets
 // ============================================================
 async function pushTemplateToOutlets(templateId, outletIds, overwriteExisting = false) {
@@ -465,7 +524,7 @@ async function pushTemplateToOutlets(templateId, outletIds, overwriteExisting = 
           name: masterItem.name,
           description: masterItem.description,
           category: masterItem.category,
-          price: existingItem.isLocalOverride ? existingItem.price : masterItem.basePrice,
+          price: existingItem.isLocalOverride ? existingItem.price : (masterItem.outletPrices?.[outletId] ?? masterItem.basePrice),
           variants: masterItem.variants,
           image: masterItem.image,
           images: masterItem.images || [],
@@ -505,7 +564,7 @@ async function pushTemplateToOutlets(templateId, outletIds, overwriteExisting = 
           name: masterItem.name,
           description: masterItem.description,
           category: masterItem.category,
-          price: masterItem.basePrice,
+          price: masterItem.outletPrices?.[outletId] ?? masterItem.basePrice,
           variants: masterItem.variants,
           image: masterItem.image,
           images: masterItem.images || [],

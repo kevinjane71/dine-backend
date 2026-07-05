@@ -79,9 +79,13 @@ const MENU_ITEM_FIELD_MAP = {
   updatedAt: 'updated_at',
   deletedAt: 'deleted_at',
   syncedAt: 'synced_at',
+  barcode: 'barcode',
+  barcodeFormat: 'barcode_format',
+  subCategory: 'sub_category',
+  modifierGroups: 'modifier_groups',
 };
 
-const MENU_ITEM_JSONB_COLUMNS = new Set(['variants', 'customizations', 'images', 'allergens', 'tags', 'pricing_rules', 'extra_data']);
+const MENU_ITEM_JSONB_COLUMNS = new Set(['variants', 'customizations', 'images', 'allergens', 'tags', 'pricing_rules', 'modifier_groups', 'extra_data']);
 const menuItemToPgRow = makeToPgRow(MENU_ITEM_FIELD_MAP, MENU_ITEM_JSONB_COLUMNS);
 const menuItemToFirestoreObj = makeToFirestoreObj(buildReverseMap(MENU_ITEM_FIELD_MAP));
 

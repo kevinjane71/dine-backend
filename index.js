@@ -1302,6 +1302,7 @@ const ownerDashboardRoutes = require('./routes/ownerDashboard');
 
 // Aggregator integration routes (Talabat, Deliveroo, etc.)
 const aggregatorRoutes = require('./routes/aggregatorRoutes');
+const dynamics365Routes = require('./routes/dynamics365Routes');
 const customerGroupsRoutes = require('./routes/customerGroups');
 const aiInsightsRoutes = require('./routes/aiInsights');
 const superAdminRoutes = require('./routes/superAdmin');
@@ -7695,6 +7696,9 @@ app.post('/api/menus/:restaurantId', authenticateToken, async (req, res) => {
       pluCode: req.body.pluCode || null, // 4-digit PLU code for label-printing scale barcode lookup
       // Discount applicability (default true — item participates in discount distribution)
       discountApplicable: req.body.discountApplicable !== undefined ? req.body.discountApplicable : true,
+      // Barcode fields
+      barcode: req.body.barcode || '',
+      barcodeFormat: req.body.barcodeFormat || '',
       createdAt: new Date(),
       updatedAt: new Date()
     };
@@ -7816,7 +7820,7 @@ app.patch('/api/menus/item/:id', authenticateToken, async (req, res) => {
       'unit', 'weight', 'shelfLife', 'mfgDate', 'expiryDate',
       'servingSize', 'scoopOptions', 'pricingRules', 'taxGroupId',
       'discountApplicable', 'taxInclusive', 'soldByWeight', 'priceUnit', 'pluCode',
-      'hideImage'
+      'hideImage', 'barcode', 'barcodeFormat'
     ];
     
     allowedFields.forEach(field => {
@@ -12311,6 +12315,702 @@ app.get('/api/analytics/:restaurantId/daily-summary', authenticateToken, async (
   } catch (error) {
     console.error('Daily summary error:', error);
     res.status(500).json({ error: 'Failed to fetch daily summary' });
+  }
+});
+
+// ========== Hourly Item Sales Report ==========
+app.get('/api/analytics/:restaurantId/hourly-sales', authenticateToken, async (req, res) => {
+  try {
+    if (!(await checkFeaturePermission(req, 'analytics', 'read'))) {
+      return res.status(403).json({ error: 'Access denied.' });
+    }
+    const { restaurantId } = req.params;
+    const { startDate, endDate, subRestaurantId } = req.query;
+    const tzOffset = parseTZ(req);
+
+    // Determine date range
+    const today = tzOffset !== undefined ? dateStrInTZ(new Date(), tzOffset) : new Date().toISOString().split('T')[0];
+    const dateStart = startDate || today;
+    const dateEnd = endDate || today;
+
+    let rangeStart, rangeEnd;
+    if (tzOffset !== undefined) {
+      rangeStart = dateBoundsInTZ(dateStart, tzOffset).start;
+      rangeEnd = dateBoundsInTZ(dateEnd, tzOffset).end;
+    } else {
+      const [sy, sm, sd] = dateStart.split('-').map(Number);
+      const [ey, em, ed] = dateEnd.split('-').map(Number);
+      rangeStart = new Date(sy, sm - 1, sd, 0, 0, 0, 0);
+      rangeEnd = new Date(ey, em - 1, ed, 23, 59, 59, 999);
+    }
+
+    let query = db.collection(collections.orders)
+      .where('restaurantId', '==', restaurantId)
+      .where('createdAt', '>=', rangeStart)
+      .where('createdAt', '<=', rangeEnd);
+    if (subRestaurantId) query = query.where('subRestaurantId', '==', subRestaurantId);
+    const snap = await query.get();
+
+    // Build hourly buckets (0-23)
+    const hours = {};
+    for (let h = 0; h < 24; h++) {
+      hours[h] = { hour: h, orders: 0, revenue: 0, items: {} };
+    }
+
+    let totalOrders = 0, totalRevenue = 0;
+    const globalItemMap = {};
+
+    snap.docs.forEach(doc => {
+      const order = doc.data();
+      if (['cancelled', 'deleted', 'saved', 'refunded'].includes(order.status)) return;
+
+      const createdAt = order.createdAt?.toDate ? order.createdAt.toDate() : new Date(order.createdAt);
+      // Apply timezone offset to get local hour
+      let localDate = createdAt;
+      if (tzOffset !== undefined) {
+        localDate = new Date(createdAt.getTime() + tzOffset * 60000);
+      }
+      const hour = localDate.getUTCHours !== undefined && tzOffset !== undefined
+        ? localDate.getUTCHours()
+        : createdAt.getHours();
+
+      const refundAdj = (order.refundAmount && order.status !== 'refunded') ? order.refundAmount : 0;
+      const orderRevenue = (order.finalAmount || order.totalAmount || 0) - refundAdj;
+
+      hours[hour].orders++;
+      hours[hour].revenue += orderRevenue;
+      totalOrders++;
+      totalRevenue += orderRevenue;
+
+      // Item breakdown per hour
+      if (order.items && Array.isArray(order.items)) {
+        order.items.forEach(item => {
+          const name = item.name || item.itemName || 'Unknown';
+          const qty = item.quantity || 1;
+          const itemRev = (item.price || 0) * qty;
+
+          if (!hours[hour].items[name]) hours[hour].items[name] = { qty: 0, revenue: 0 };
+          hours[hour].items[name].qty += qty;
+          hours[hour].items[name].revenue += itemRev;
+
+          if (!globalItemMap[name]) globalItemMap[name] = { qty: 0, revenue: 0 };
+          globalItemMap[name].qty += qty;
+          globalItemMap[name].revenue += itemRev;
+        });
+      }
+    });
+
+    // Format response
+    const hoursArray = Object.values(hours).map(h => ({
+      hour: h.hour,
+      label: `${String(h.hour).padStart(2, '0')}:00`,
+      orders: h.orders,
+      revenue: Math.round(h.revenue * 100) / 100,
+      topItems: Object.entries(h.items)
+        .map(([name, d]) => ({ name, qty: d.qty, revenue: Math.round(d.revenue * 100) / 100 }))
+        .sort((a, b) => b.qty - a.qty)
+        .slice(0, 5)
+    }));
+
+    const topItems = Object.entries(globalItemMap)
+      .map(([name, d]) => ({ name, qty: d.qty, revenue: Math.round(d.revenue * 100) / 100 }))
+      .sort((a, b) => b.qty - a.qty)
+      .slice(0, 20);
+
+    // Identify peak hours
+    const activeHours = hoursArray.filter(h => h.orders > 0);
+    const peakHour = activeHours.length > 0
+      ? activeHours.reduce((max, h) => h.orders > max.orders ? h : max, activeHours[0])
+      : null;
+
+    res.json({
+      success: true,
+      data: {
+        dateRange: { start: dateStart, end: dateEnd },
+        totalOrders,
+        totalRevenue: Math.round(totalRevenue * 100) / 100,
+        avgOrderValue: totalOrders > 0 ? Math.round((totalRevenue / totalOrders) * 100) / 100 : 0,
+        peakHour: peakHour ? { hour: peakHour.hour, label: peakHour.label, orders: peakHour.orders, revenue: peakHour.revenue } : null,
+        hours: hoursArray,
+        topItems
+      }
+    });
+  } catch (error) {
+    console.error('Hourly sales error:', error);
+    res.status(500).json({ error: 'Failed to fetch hourly sales data' });
+  }
+});
+
+// ============================================================
+// POST /api/orders/:orderId/reprint-log — Log a bill reprint
+// ============================================================
+app.post('/api/orders/:orderId/reprint-log', authenticateToken, async (req, res) => {
+  try {
+    const { orderId } = req.params;
+    const orderRef = db.collection(collections.orders).doc(orderId);
+    const orderDoc = await orderRef.get();
+    if (!orderDoc.exists) return res.status(404).json({ error: 'Order not found' });
+
+    const entry = {
+      reprintedAt: new Date().toISOString(),
+      reprintedBy: req.user?.userId || req.user?.uid || 'unknown',
+      reprintedByName: req.user?.name || req.user?.displayName || 'Unknown',
+    };
+
+    await orderRef.update({
+      billReprintCount: FieldValue.increment(1),
+      billReprintHistory: FieldValue.arrayUnion(entry),
+      updatedAt: new Date(),
+    });
+
+    res.json({ success: true, entry });
+  } catch (error) {
+    console.error('Reprint log error:', error);
+    res.status(500).json({ error: 'Failed to log reprint' });
+  }
+});
+
+// ============================================================
+// GET /api/analytics/:restaurantId/menu-engineering — Menu engineering BCG matrix
+// ============================================================
+app.get('/api/analytics/:restaurantId/menu-engineering', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+    const { startDate, endDate, subRestaurantId } = req.query;
+    const tzOffset = parseTZ(req);
+
+    const today = tzOffset !== undefined ? dateStrInTZ(new Date(), tzOffset) : new Date().toISOString().split('T')[0];
+    const dateStart = startDate || today;
+    const dateEnd = endDate || today;
+    let rangeStart, rangeEnd;
+    if (tzOffset !== undefined) {
+      rangeStart = dateBoundsInTZ(dateStart, tzOffset).start;
+      rangeEnd = dateBoundsInTZ(dateEnd, tzOffset).end;
+    } else {
+      const [sy, sm, sd] = dateStart.split('-').map(Number);
+      const [ey, em, ed] = dateEnd.split('-').map(Number);
+      rangeStart = new Date(sy, sm - 1, sd, 0, 0, 0, 0);
+      rangeEnd = new Date(ey, em - 1, ed, 23, 59, 59, 999);
+    }
+
+    let query = db.collection(collections.orders)
+      .where('restaurantId', '==', restaurantId)
+      .where('createdAt', '>=', rangeStart)
+      .where('createdAt', '<=', rangeEnd);
+    if (subRestaurantId) query = query.where('subRestaurantId', '==', subRestaurantId);
+    const snap = await query.get();
+
+    // Aggregate item sales
+    const itemMap = {};
+    const excludeStatuses = new Set(['cancelled', 'deleted', 'saved', 'refunded']);
+    snap.forEach(doc => {
+      const o = doc.data();
+      if (excludeStatuses.has(o.status)) return;
+      (o.items || []).forEach(item => {
+        const name = item.itemName || item.name || 'Unknown';
+        const qty = item.quantity || item.qty || 1;
+        const price = item.itemPrice || item.price || 0;
+        const revenue = price * qty;
+        if (!itemMap[name]) itemMap[name] = { name, category: item.category || 'Uncategorized', qtySold: 0, revenue: 0, menuItemId: item.menuItemId || item.id || '' };
+        itemMap[name].qtySold += qty;
+        itemMap[name].revenue += revenue;
+      });
+    });
+
+    // Get cost data from inventory
+    const invSnap = await db.collection(collections.inventory)
+      .where('restaurantId', '==', restaurantId).get();
+    const costMap = {};
+    invSnap.forEach(doc => {
+      const inv = doc.data();
+      const costPerUnit = inv.costPerUnit || 0;
+      if (inv.linkedMenuItemId) costMap[inv.linkedMenuItemId] = costPerUnit;
+      if (inv.name) costMap[inv.name.toLowerCase()] = costPerUnit;
+    });
+
+    // Calculate margins
+    const items = Object.values(itemMap).map(item => {
+      const costPerUnit = costMap[item.menuItemId] || costMap[item.name.toLowerCase()] || 0;
+      const cost = costPerUnit * item.qtySold;
+      const margin = item.revenue - cost;
+      const marginPercent = item.revenue > 0 ? Math.round((margin / item.revenue) * 10000) / 100 : 0;
+      return { ...item, costPerUnit: Math.round(costPerUnit * 100) / 100, cost: Math.round(cost * 100) / 100, margin: Math.round(margin * 100) / 100, marginPercent, revenue: Math.round(item.revenue * 100) / 100 };
+    });
+
+    // BCG classification
+    const totalItems = items.length;
+    if (totalItems > 0) {
+      const avgQty = items.reduce((s, i) => s + i.qtySold, 0) / totalItems;
+      const avgMargin = items.reduce((s, i) => s + i.marginPercent, 0) / totalItems;
+      items.forEach(item => {
+        const highPop = item.qtySold >= avgQty;
+        const highMargin = item.marginPercent >= avgMargin;
+        if (highPop && highMargin) item.classification = 'star';
+        else if (highPop && !highMargin) item.classification = 'plowHorse';
+        else if (!highPop && highMargin) item.classification = 'puzzle';
+        else item.classification = 'dog';
+      });
+      items.sort((a, b) => b.revenue - a.revenue);
+      items.forEach((item, i) => { item.popularityRank = i + 1; });
+
+      // Category summary
+      const catMap = {};
+      items.forEach(item => {
+        if (!catMap[item.category]) catMap[item.category] = { category: item.category, items: 0, revenue: 0, totalMargin: 0 };
+        catMap[item.category].items++;
+        catMap[item.category].revenue += item.revenue;
+        catMap[item.category].totalMargin += item.marginPercent;
+      });
+      const categorySummary = Object.values(catMap).map(c => ({ ...c, avgMargin: Math.round((c.totalMargin / c.items) * 100) / 100, revenue: Math.round(c.revenue * 100) / 100 }));
+
+      const summary = { stars: 0, plowHorses: 0, puzzles: 0, dogs: 0 };
+      items.forEach(i => { if (summary[i.classification + 's'] !== undefined) summary[i.classification + 's']++; else if (i.classification === 'plowHorse') summary.plowHorses++; else if (i.classification === 'star') summary.stars++; });
+      // Recount properly
+      summary.stars = items.filter(i => i.classification === 'star').length;
+      summary.plowHorses = items.filter(i => i.classification === 'plowHorse').length;
+      summary.puzzles = items.filter(i => i.classification === 'puzzle').length;
+      summary.dogs = items.filter(i => i.classification === 'dog').length;
+
+      return res.json({ success: true, data: { dateRange: { start: dateStart, end: dateEnd }, totalItems, avgMarginPercent: Math.round(avgMargin * 100) / 100, avgQuantity: Math.round(avgQty * 100) / 100, summary, categorySummary, items } });
+    }
+
+    res.json({ success: true, data: { dateRange: { start: dateStart, end: dateEnd }, totalItems: 0, avgMarginPercent: 0, avgQuantity: 0, summary: { stars: 0, plowHorses: 0, puzzles: 0, dogs: 0 }, categorySummary: [], items: [] } });
+  } catch (error) {
+    console.error('Menu engineering error:', error);
+    res.status(500).json({ error: 'Failed to fetch menu engineering data' });
+  }
+});
+
+// ============================================================
+// GET /api/analytics/:restaurantId/reprint-log — Reprint check log
+// ============================================================
+app.get('/api/analytics/:restaurantId/reprint-log', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+    const { startDate, endDate, subRestaurantId } = req.query;
+    const tzOffset = parseTZ(req);
+
+    const today = tzOffset !== undefined ? dateStrInTZ(new Date(), tzOffset) : new Date().toISOString().split('T')[0];
+    const dateStart = startDate || today;
+    const dateEnd = endDate || today;
+    let rangeStart, rangeEnd;
+    if (tzOffset !== undefined) { rangeStart = dateBoundsInTZ(dateStart, tzOffset).start; rangeEnd = dateBoundsInTZ(dateEnd, tzOffset).end; }
+    else { const [sy,sm,sd] = dateStart.split('-').map(Number); const [ey,em,ed] = dateEnd.split('-').map(Number); rangeStart = new Date(sy,sm-1,sd,0,0,0,0); rangeEnd = new Date(ey,em-1,ed,23,59,59,999); }
+
+    let query = db.collection(collections.orders).where('restaurantId','==',restaurantId).where('createdAt','>=',rangeStart).where('createdAt','<=',rangeEnd);
+    if (subRestaurantId) query = query.where('subRestaurantId','==',subRestaurantId);
+    const snap = await query.get();
+
+    let totalOrders = 0;
+    const reprintOrders = [];
+    const staffCounts = {};
+
+    snap.forEach(doc => {
+      totalOrders++;
+      const o = doc.data();
+      const count = o.billReprintCount || 0;
+      if (count > 0) {
+        reprintOrders.push({
+          orderId: doc.id,
+          orderNumber: o.orderNumber || o.tokenNumber || '-',
+          date: o.createdAt,
+          reprintCount: count,
+          originalCashier: o.staffInfo?.name || o.waiterName || o.createdByName || 'Unknown',
+          totalAmount: o.finalAmount || o.totalAmount || 0,
+          reprintHistory: o.billReprintHistory || [],
+        });
+        (o.billReprintHistory || []).forEach(h => {
+          const name = h.reprintedByName || 'Unknown';
+          staffCounts[name] = (staffCounts[name] || 0) + 1;
+        });
+      }
+    });
+
+    const totalReprints = reprintOrders.reduce((s, o) => s + o.reprintCount, 0);
+    const topReprinter = Object.entries(staffCounts).sort((a, b) => b[1] - a[1])[0];
+
+    res.json({ success: true, data: { dateRange: { start: dateStart, end: dateEnd }, totalReprints, totalOrders, reprintPercentage: totalOrders > 0 ? Math.round((reprintOrders.length / totalOrders) * 10000) / 100 : 0, topReprinter: topReprinter ? { name: topReprinter[0], count: topReprinter[1] } : null, orders: reprintOrders } });
+  } catch (error) {
+    console.error('Reprint log error:', error);
+    res.status(500).json({ error: 'Failed to fetch reprint log' });
+  }
+});
+
+// ============================================================
+// GET /api/analytics/:restaurantId/staff-sales — Per-staff sales report
+// ============================================================
+app.get('/api/analytics/:restaurantId/staff-sales', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+    const { startDate, endDate, subRestaurantId } = req.query;
+    const tzOffset = parseTZ(req);
+
+    const today = tzOffset !== undefined ? dateStrInTZ(new Date(), tzOffset) : new Date().toISOString().split('T')[0];
+    const dateStart = startDate || today;
+    const dateEnd = endDate || today;
+    let rangeStart, rangeEnd;
+    if (tzOffset !== undefined) { rangeStart = dateBoundsInTZ(dateStart, tzOffset).start; rangeEnd = dateBoundsInTZ(dateEnd, tzOffset).end; }
+    else { const [sy,sm,sd] = dateStart.split('-').map(Number); const [ey,em,ed] = dateEnd.split('-').map(Number); rangeStart = new Date(sy,sm-1,sd,0,0,0,0); rangeEnd = new Date(ey,em-1,ed,23,59,59,999); }
+
+    let query = db.collection(collections.orders).where('restaurantId','==',restaurantId).where('createdAt','>=',rangeStart).where('createdAt','<=',rangeEnd);
+    if (subRestaurantId) query = query.where('subRestaurantId','==',subRestaurantId);
+    const snap = await query.get();
+
+    const excludeStatuses = new Set(['cancelled', 'deleted', 'saved', 'refunded']);
+    const staffMap = {};
+
+    snap.forEach(doc => {
+      const o = doc.data();
+      if (excludeStatuses.has(o.status)) return;
+      const staffId = o.waiterId || o.staffId || o.createdBy || o.staffInfo?.userId || 'unknown';
+      const staffName = o.waiterName || o.staffName || o.createdByName || o.staffInfo?.name || 'Unknown Staff';
+      const role = o.staffInfo?.role || '';
+      if (!staffMap[staffId]) staffMap[staffId] = { staffId, staffName, role, ordersHandled: 0, totalSales: 0, tipsEarned: 0 };
+      staffMap[staffId].ordersHandled++;
+      staffMap[staffId].totalSales += (o.finalAmount || o.totalAmount || 0);
+      staffMap[staffId].tipsEarned += (o.tipAmount || 0);
+    });
+
+    const staff = Object.values(staffMap).map(s => ({
+      ...s,
+      totalSales: Math.round(s.totalSales * 100) / 100,
+      tipsEarned: Math.round(s.tipsEarned * 100) / 100,
+      avgTicket: s.ordersHandled > 0 ? Math.round((s.totalSales / s.ordersHandled) * 100) / 100 : 0,
+    })).sort((a, b) => b.totalSales - a.totalSales);
+
+    const totalRevenue = staff.reduce((s, st) => s + st.totalSales, 0);
+    const totalTips = staff.reduce((s, st) => s + st.tipsEarned, 0);
+
+    res.json({ success: true, data: { dateRange: { start: dateStart, end: dateEnd }, totalStaff: staff.length, totalRevenue: Math.round(totalRevenue * 100) / 100, avgRevenuePerStaff: staff.length > 0 ? Math.round((totalRevenue / staff.length) * 100) / 100 : 0, totalTips: Math.round(totalTips * 100) / 100, staff } });
+  } catch (error) {
+    console.error('Staff sales error:', error);
+    res.status(500).json({ error: 'Failed to fetch staff sales data' });
+  }
+});
+
+// ============================================================
+// GET /api/analytics/:restaurantId/promotion-report — Offer/discount usage
+// ============================================================
+app.get('/api/analytics/:restaurantId/promotion-report', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+    const { startDate, endDate, subRestaurantId } = req.query;
+    const tzOffset = parseTZ(req);
+
+    const today = tzOffset !== undefined ? dateStrInTZ(new Date(), tzOffset) : new Date().toISOString().split('T')[0];
+    const dateStart = startDate || today;
+    const dateEnd = endDate || today;
+    let rangeStart, rangeEnd;
+    if (tzOffset !== undefined) { rangeStart = dateBoundsInTZ(dateStart, tzOffset).start; rangeEnd = dateBoundsInTZ(dateEnd, tzOffset).end; }
+    else { const [sy,sm,sd] = dateStart.split('-').map(Number); const [ey,em,ed] = dateEnd.split('-').map(Number); rangeStart = new Date(sy,sm-1,sd,0,0,0,0); rangeEnd = new Date(ey,em-1,ed,23,59,59,999); }
+
+    let query = db.collection(collections.orders).where('restaurantId','==',restaurantId).where('createdAt','>=',rangeStart).where('createdAt','<=',rangeEnd);
+    if (subRestaurantId) query = query.where('subRestaurantId','==',subRestaurantId);
+    const snap = await query.get();
+
+    const excludeStatuses = new Set(['cancelled', 'deleted', 'saved']);
+    const offerMap = {};
+    let totalOrdersWithDiscount = 0;
+    let totalOrders = 0;
+    let totalRevenue = 0;
+
+    snap.forEach(doc => {
+      const o = doc.data();
+      if (excludeStatuses.has(o.status)) return;
+      totalOrders++;
+      totalRevenue += (o.finalAmount || o.totalAmount || 0);
+
+      let hasDiscount = false;
+
+      // Named offers
+      const offers = o.appliedOffers || (o.appliedOffer ? [o.appliedOffer] : []);
+      offers.forEach(offer => {
+        const name = offer.name || offer.offerName || o.selectedOfferName || 'Unnamed Offer';
+        const disc = offer.discountApplied || offer.discount || 0;
+        if (!offerMap[name]) offerMap[name] = { name, type: 'offer', usageCount: 0, totalDiscount: 0 };
+        offerMap[name].usageCount++;
+        offerMap[name].totalDiscount += disc;
+        hasDiscount = true;
+      });
+
+      // Manual discount
+      if (o.manualDiscount && o.manualDiscount > 0) {
+        const key = '__manual';
+        if (!offerMap[key]) offerMap[key] = { name: 'Manual Discount', type: 'manual', usageCount: 0, totalDiscount: 0 };
+        offerMap[key].usageCount++;
+        offerMap[key].totalDiscount += o.manualDiscount;
+        hasDiscount = true;
+      }
+
+      // Loyalty discount
+      if (o.loyaltyDiscount && o.loyaltyDiscount > 0) {
+        const key = '__loyalty';
+        if (!offerMap[key]) offerMap[key] = { name: 'Loyalty Discount', type: 'loyalty', usageCount: 0, totalDiscount: 0 };
+        offerMap[key].usageCount++;
+        offerMap[key].totalDiscount += o.loyaltyDiscount;
+        hasDiscount = true;
+      }
+
+      // Coupon
+      if (o.couponDiscount && o.couponDiscount > 0) {
+        const key = o.couponCode || '__coupon';
+        if (!offerMap[key]) offerMap[key] = { name: o.couponCode || 'Coupon', type: 'coupon', usageCount: 0, totalDiscount: 0 };
+        offerMap[key].usageCount++;
+        offerMap[key].totalDiscount += o.couponDiscount;
+        hasDiscount = true;
+      }
+
+      if (hasDiscount) totalOrdersWithDiscount++;
+    });
+
+    const offers = Object.values(offerMap).map(o => ({
+      ...o,
+      totalDiscount: Math.round(o.totalDiscount * 100) / 100,
+      avgDiscount: o.usageCount > 0 ? Math.round((o.totalDiscount / o.usageCount) * 100) / 100 : 0,
+    })).sort((a, b) => b.totalDiscount - a.totalDiscount);
+
+    const totalDiscountGiven = offers.reduce((s, o) => s + o.totalDiscount, 0);
+
+    res.json({ success: true, data: { dateRange: { start: dateStart, end: dateEnd }, totalOffersUsed: totalOrdersWithDiscount, totalOrders, totalDiscountGiven: Math.round(totalDiscountGiven * 100) / 100, avgDiscountPerOrder: totalOrdersWithDiscount > 0 ? Math.round((totalDiscountGiven / totalOrdersWithDiscount) * 100) / 100 : 0, discountPercentOfRevenue: totalRevenue > 0 ? Math.round((totalDiscountGiven / totalRevenue) * 10000) / 100 : 0, offers } });
+  } catch (error) {
+    console.error('Promotion report error:', error);
+    res.status(500).json({ error: 'Failed to fetch promotion report' });
+  }
+});
+
+// ============================================================
+// GET /api/analytics/:restaurantId/split-bills — Split bill orders
+// ============================================================
+app.get('/api/analytics/:restaurantId/split-bills', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+    const { startDate, endDate, subRestaurantId } = req.query;
+    const tzOffset = parseTZ(req);
+
+    const today = tzOffset !== undefined ? dateStrInTZ(new Date(), tzOffset) : new Date().toISOString().split('T')[0];
+    const dateStart = startDate || today;
+    const dateEnd = endDate || today;
+    let rangeStart, rangeEnd;
+    if (tzOffset !== undefined) { rangeStart = dateBoundsInTZ(dateStart, tzOffset).start; rangeEnd = dateBoundsInTZ(dateEnd, tzOffset).end; }
+    else { const [sy,sm,sd] = dateStart.split('-').map(Number); const [ey,em,ed] = dateEnd.split('-').map(Number); rangeStart = new Date(sy,sm-1,sd,0,0,0,0); rangeEnd = new Date(ey,em-1,ed,23,59,59,999); }
+
+    let query = db.collection(collections.orders).where('restaurantId','==',restaurantId).where('createdAt','>=',rangeStart).where('createdAt','<=',rangeEnd);
+    if (subRestaurantId) query = query.where('subRestaurantId','==',subRestaurantId);
+    const snap = await query.get();
+
+    let totalOrders = 0;
+    const splitOrders = [];
+    const methodCounts = {};
+
+    snap.forEach(doc => {
+      const o = doc.data();
+      if (o.status === 'cancelled' || o.status === 'deleted') return;
+      totalOrders++;
+
+      const splits = o.splitPayments || [];
+      const splitBill = o.splitBill;
+      const hasSplit = splits.length > 1 || (splitBill && splitBill.splits?.length > 0);
+      if (!hasSplit) return;
+
+      const method = splitBill?.method || (splits.length > 1 ? 'multi-payment' : 'custom');
+      methodCounts[method] = (methodCounts[method] || 0) + 1;
+
+      const splitDetails = splits.length > 1
+        ? splits.map(s => ({ method: s.paymentMethod || s.method || 'cash', amount: s.amount || 0 }))
+        : (splitBill?.splits || []).map(s => ({ method: s.paymentMethod || s.method || 'cash', amount: s.totalAmount || s.amount || 0, name: s.name || '' }));
+
+      splitOrders.push({
+        orderId: doc.id,
+        orderNumber: o.orderNumber || o.tokenNumber || '-',
+        date: o.createdAt,
+        totalAmount: o.finalAmount || o.totalAmount || 0,
+        splitMethod: method,
+        splitCount: splitDetails.length,
+        splits: splitDetails,
+      });
+    });
+
+    const avgSplitCount = splitOrders.length > 0 ? Math.round((splitOrders.reduce((s, o) => s + o.splitCount, 0) / splitOrders.length) * 10) / 10 : 0;
+    const commonMethod = Object.entries(methodCounts).sort((a, b) => b[1] - a[1])[0];
+
+    res.json({ success: true, data: { dateRange: { start: dateStart, end: dateEnd }, totalSplitOrders: splitOrders.length, totalOrders, splitPercentage: totalOrders > 0 ? Math.round((splitOrders.length / totalOrders) * 10000) / 100 : 0, avgSplitCount, commonMethod: commonMethod ? commonMethod[0] : '-', methodBreakdown: methodCounts, orders: splitOrders } });
+  } catch (error) {
+    console.error('Split bills error:', error);
+    res.status(500).json({ error: 'Failed to fetch split bills data' });
+  }
+});
+
+// ============================================================
+// GET /api/analytics/:restaurantId/comp-report — Complimentary orders
+// ============================================================
+app.get('/api/analytics/:restaurantId/comp-report', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+    const { startDate, endDate, subRestaurantId } = req.query;
+    const tzOffset = parseTZ(req);
+
+    const today = tzOffset !== undefined ? dateStrInTZ(new Date(), tzOffset) : new Date().toISOString().split('T')[0];
+    const dateStart = startDate || today;
+    const dateEnd = endDate || today;
+    let rangeStart, rangeEnd;
+    if (tzOffset !== undefined) { rangeStart = dateBoundsInTZ(dateStart, tzOffset).start; rangeEnd = dateBoundsInTZ(dateEnd, tzOffset).end; }
+    else { const [sy,sm,sd] = dateStart.split('-').map(Number); const [ey,em,ed] = dateEnd.split('-').map(Number); rangeStart = new Date(sy,sm-1,sd,0,0,0,0); rangeEnd = new Date(ey,em-1,ed,23,59,59,999); }
+
+    let query = db.collection(collections.orders).where('restaurantId','==',restaurantId).where('createdAt','>=',rangeStart).where('createdAt','<=',rangeEnd);
+    if (subRestaurantId) query = query.where('subRestaurantId','==',subRestaurantId);
+    const snap = await query.get();
+
+    let totalOrders = 0;
+    const compOrders = [];
+
+    snap.forEach(doc => {
+      const o = doc.data();
+      if (o.status === 'cancelled' || o.status === 'deleted') return;
+      totalOrders++;
+
+      const subtotal = o.subtotal || o.totalAmount || 0;
+      const totalDiscount = o.totalDiscountAmount || ((o.discountAmount || 0) + (o.manualDiscount || 0) + (o.loyaltyDiscount || 0) + (o.offerDiscount || 0));
+      const compAmount = o.compAmount || 0;
+      const isComp = compAmount > 0 || (subtotal > 0 && totalDiscount >= subtotal * 0.95);
+
+      if (!isComp) return;
+
+      const items = (o.items || []).map(i => i.itemName || i.name || 'Unknown').slice(0, 5);
+      compOrders.push({
+        orderId: doc.id,
+        orderNumber: o.orderNumber || o.tokenNumber || '-',
+        date: o.createdAt,
+        items,
+        originalTotal: subtotal,
+        discountAmount: Math.round(totalDiscount * 100) / 100,
+        compAmount: Math.round(compAmount * 100) / 100,
+        reason: o.discountReason || o.cancellationReason || o.compReason || '-',
+        approvedBy: o.staffInfo?.name || o.waiterName || o.createdByName || 'Unknown',
+      });
+    });
+
+    const totalValueComped = compOrders.reduce((s, o) => s + (o.compAmount || o.discountAmount || o.originalTotal), 0);
+
+    res.json({ success: true, data: { dateRange: { start: dateStart, end: dateEnd }, totalCompOrders: compOrders.length, totalOrders, totalValueComped: Math.round(totalValueComped * 100) / 100, percentOfOrders: totalOrders > 0 ? Math.round((compOrders.length / totalOrders) * 10000) / 100 : 0, orders: compOrders } });
+  } catch (error) {
+    console.error('Comp report error:', error);
+    res.status(500).json({ error: 'Failed to fetch comp report data' });
+  }
+});
+
+// ============================================================
+// GET /api/analytics/:restaurantId/audit-trail — Order modification log
+// ============================================================
+app.get('/api/analytics/:restaurantId/audit-trail', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+    const { startDate, endDate, subRestaurantId, actionType } = req.query;
+    const tzOffset = parseTZ(req);
+
+    const today = tzOffset !== undefined ? dateStrInTZ(new Date(), tzOffset) : new Date().toISOString().split('T')[0];
+    const dateStart = startDate || today;
+    const dateEnd = endDate || today;
+    let rangeStart, rangeEnd;
+    if (tzOffset !== undefined) { rangeStart = dateBoundsInTZ(dateStart, tzOffset).start; rangeEnd = dateBoundsInTZ(dateEnd, tzOffset).end; }
+    else { const [sy,sm,sd] = dateStart.split('-').map(Number); const [ey,em,ed] = dateEnd.split('-').map(Number); rangeStart = new Date(sy,sm-1,sd,0,0,0,0); rangeEnd = new Date(ey,em-1,ed,23,59,59,999); }
+
+    let query = db.collection(collections.orders).where('restaurantId','==',restaurantId).where('createdAt','>=',rangeStart).where('createdAt','<=',rangeEnd);
+    if (subRestaurantId) query = query.where('subRestaurantId','==',subRestaurantId);
+    const snap = await query.get();
+
+    const events = [];
+
+    snap.forEach(doc => {
+      const o = doc.data();
+      const orderNum = o.orderNumber || o.tokenNumber || '-';
+      const orderId = doc.id;
+
+      // Edited orders
+      if (o.editCount > 0) {
+        events.push({
+          timestamp: o.updatedAt || o.createdAt,
+          action: 'edited',
+          orderId, orderNumber: orderNum,
+          staffName: o.staffInfo?.name || o.createdByName || 'Unknown',
+          details: `Edited ${o.editCount} time(s)${o.editReason ? ': ' + o.editReason : ''}`,
+        });
+      }
+
+      // Cancelled orders
+      if (o.status === 'cancelled') {
+        events.push({
+          timestamp: o.cancelledAt || o.updatedAt || o.createdAt,
+          action: 'cancelled',
+          orderId, orderNumber: orderNum,
+          staffName: o.cancelledBy || o.staffInfo?.name || 'Unknown',
+          details: o.cancellationReason || 'No reason provided',
+        });
+      }
+
+      // Deleted/voided
+      if (o.status === 'deleted') {
+        events.push({
+          timestamp: o.updatedAt || o.createdAt,
+          action: 'voided',
+          orderId, orderNumber: orderNum,
+          staffName: o.staffInfo?.name || 'Unknown',
+          details: o.cancellationReason || 'Order voided',
+        });
+      }
+
+      // Refunded
+      if (o.status === 'refunded' || o.refundAmount > 0) {
+        events.push({
+          timestamp: o.refundedAt || o.updatedAt || o.createdAt,
+          action: 'refunded',
+          orderId, orderNumber: orderNum,
+          staffName: o.refundedBy || o.staffInfo?.name || 'Unknown',
+          details: `Refund: ${o.refundAmount || 0}${o.refundReason ? ' — ' + o.refundReason : ''}`,
+        });
+      }
+
+      // Reprinted
+      if (o.billReprintCount > 0) {
+        (o.billReprintHistory || []).forEach(h => {
+          events.push({
+            timestamp: h.reprintedAt,
+            action: 'reprinted',
+            orderId, orderNumber: orderNum,
+            staffName: h.reprintedByName || 'Unknown',
+            details: 'Bill reprinted',
+          });
+        });
+      }
+
+      // Restored
+      if (o.restoredAt) {
+        events.push({
+          timestamp: o.restoredAt,
+          action: 'restored',
+          orderId, orderNumber: orderNum,
+          staffName: o.restoredByName || 'Unknown',
+          details: o.restoreReason || 'Order restored from cancelled',
+        });
+      }
+    });
+
+    // Sort by timestamp descending
+    events.sort((a, b) => {
+      const ta = a.timestamp instanceof Date ? a.timestamp.getTime() : new Date(a.timestamp).getTime();
+      const tb = b.timestamp instanceof Date ? b.timestamp.getTime() : new Date(b.timestamp).getTime();
+      return tb - ta;
+    });
+
+    // Filter by action type if specified
+    const filtered = actionType ? events.filter(e => e.action === actionType) : events;
+
+    const summary = { edited: 0, cancelled: 0, voided: 0, refunded: 0, reprinted: 0, restored: 0 };
+    events.forEach(e => { if (summary[e.action] !== undefined) summary[e.action]++; });
+
+    res.json({ success: true, data: { dateRange: { start: dateStart, end: dateEnd }, totalEvents: filtered.length, summary, events: filtered.slice(0, 500) } });
+  } catch (error) {
+    console.error('Audit trail error:', error);
+    res.status(500).json({ error: 'Failed to fetch audit trail' });
   }
 });
 
@@ -19237,6 +19937,7 @@ app.use('/api/warehouse', warehouseRoutes);
 app.use('/api/central-kitchen', centralKitchenRoutes);
 app.use('/api/hq-reports', hqReportsRoutes);
 app.use('/api/aggregators', aggregatorRoutes);
+app.use('/api/d365', dynamics365Routes);
 
 // ==================== BUSINESS SETTINGS (for GST invoices) ====================
 
