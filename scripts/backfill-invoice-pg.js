@@ -6,10 +6,15 @@
  *   FIREBASE_PROJECT_ID=... FIREBASE_CLIENT_EMAIL=... FIREBASE_PRIVATE_KEY=... \
  *   node scripts/backfill-invoice-pg.js [--upsert] [--dry-run] [--collection NAME]
  *
+ * Or with dotenv (auto-loads .env.local):
+ *   node scripts/backfill-invoice-pg.js [--upsert]
+ *
  * Collections: inv_organizations, inv_customers, inv_items, inv_invoices,
  *   inv_quotes, inv_challans, inv_payments, inv_expenses, inv_settings,
  *   inv_number_sequences
  */
+
+require('dotenv').config({ path: require('path').join(__dirname, '..', '.env.local') });
 
 const admin = require('firebase-admin');
 

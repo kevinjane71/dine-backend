@@ -7,6 +7,8 @@
  *   node scripts/backfill-enterprise-pg.js [--upsert] [--dry-run] [--collection NAME]
  */
 
+require('dotenv').config({ path: require('path').join(__dirname, '..', '.env.local') });
+
 const admin = require('firebase-admin');
 
 if (!admin.apps.find(a => a && a.name === 'backfill-enterprise')) {
