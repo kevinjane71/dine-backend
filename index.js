@@ -2880,6 +2880,20 @@ const extractMenuFromDocument = async (docUrl, businessType = 'restaurant') => {
     console.log('📥 Downloading file...');
     const buffer = await downloadFileBuffer(docUrl);
     const fileName = docUrl.split('/').pop().split('?')[0];
+
+    // If the .txt file looks like CSV (has comma-separated headers), try structured CSV parsing first
+    const rawText = buffer.toString('utf-8');
+    const firstLine = rawText.split('\n')[0].toLowerCase().trim();
+    if (firstLine.includes('name') && firstLine.includes('price') && firstLine.includes(',')) {
+      console.log('📊 Text file looks like CSV, trying structured parser first...');
+      const structured = tryParseStructuredCSV(buffer, fileName.replace(/\.txt$/, '.csv'));
+      if (structured && structured.menuItems.length > 0) {
+        console.log(`✅ Structured CSV parser extracted ${structured.menuItems.length} items from .txt file (no AI needed)`);
+        return structured;
+      }
+      console.log('⚠️ Structured CSV parse failed, falling back to AI extraction...');
+    }
+
     const textContent = await parseDocumentToText(buffer, fileName);
     console.log(`📄 Parsed document to text (${textContent.length} chars)`);
 
