@@ -2734,6 +2734,12 @@ const tryParseStructuredCSV = (buffer, fileName) => {
     const catKey = catCol ? findOrig(catCol) : null;
     const nameArCol = headers.find(h => /^(name_?ar|arabic_?name|arabic|namear)$/i.test(h));
     const nameArKey = nameArCol ? findOrig(nameArCol) : null;
+    const isVegCol = headers.find(h => /^(is_?veg|veg|vegetarian)$/i.test(h));
+    const isVegKey = isVegCol ? findOrig(isVegCol) : null;
+    const variantsJsonCol = headers.find(h => /^(variants)$/i.test(h));
+    const variantsJsonKey = variantsJsonCol ? findOrig(variantsJsonCol) : null;
+    const descCol = headers.find(h => /^(description|desc)$/i.test(h));
+    const descKey = descCol ? findOrig(descCol) : null;
 
     // Detect variant columns (variant1_name, variant1_price, variant2_name, etc.)
     const variantSets = [];
@@ -2746,7 +2752,7 @@ const tryParseStructuredCSV = (buffer, fileName) => {
     // Detect veg/non-veg heuristic keywords
     const nonVegKeywords = /chicken|mutton|fish|prawn|egg|lamb|pork|beef|meat|keema|gosht|surmai|pomfret|rawas|crab|lobster|shrimp|bacon|sausage|ham|salami|pepperoni/i;
 
-    console.log(`📊 Structured CSV detected: ${rows.length} rows, name="${nameKey}", price="${priceKey}", category="${catKey || 'none'}", nameAr="${nameArKey || 'none'}", variants=${variantSets.length}`);
+    console.log(`📊 Structured CSV detected: ${rows.length} rows, name="${nameKey}", price="${priceKey}", category="${catKey || 'none'}", nameAr="${nameArKey || 'none'}", isVeg="${isVegKey || 'none'}", variantsJson="${variantsJsonKey || 'none'}", variantCols=${variantSets.length}`);
 
     const categoriesMap = new Map();
     const menuItems = [];
@@ -2764,18 +2770,26 @@ const tryParseStructuredCSV = (buffer, fileName) => {
         categoriesMap.set(categoryName, { name: categoryName, order: categoriesMap.size + 1 });
       }
 
-      // Collect variants from variant columns
-      const variants = [];
-      for (const vs of variantSets) {
-        const vName = String(row[vs.nameKey] || '').trim();
-        const vPrice = parseFloat(row[vs.priceKey]);
-        if (vName && !isNaN(vPrice) && vPrice > 0) {
-          variants.push({ name: vName, price: vPrice });
+      // Collect variants from variant columns or JSON variants column
+      let variants = [];
+      if (variantsJsonKey && row[variantsJsonKey]) {
+        try {
+          const parsed = JSON.parse(String(row[variantsJsonKey]));
+          if (Array.isArray(parsed)) variants = parsed.filter(v => v && v.name && v.price != null).map(v => ({ name: String(v.name).trim(), price: parseFloat(v.price) || 0 }));
+        } catch (e) { /* not valid JSON, ignore */ }
+      }
+      if (variants.length === 0) {
+        for (const vs of variantSets) {
+          const vName = String(row[vs.nameKey] || '').trim();
+          const vPrice = parseFloat(row[vs.priceKey]);
+          if (vName && !isNaN(vPrice) && vPrice > 0) {
+            variants.push({ name: vName, price: vPrice });
+          }
         }
       }
 
-      // Determine isVeg
-      const isVeg = !nonVegKeywords.test(name) && !nonVegKeywords.test(categoryName);
+      // Determine isVeg — use explicit column if available, else heuristic
+      const isVeg = isVegKey ? /^(true|1|yes|veg)$/i.test(String(row[isVegKey]).trim()) : (!nonVegKeywords.test(name) && !nonVegKeywords.test(categoryName));
 
       // Generate imageKeyword
       const imageKeyword = name.toLowerCase().replace(/[^a-z0-9\s]/g, '').trim().split(/\s+/).slice(0, 3).join('-');
@@ -2785,7 +2799,7 @@ const tryParseStructuredCSV = (buffer, fileName) => {
       menuItems.push({
         name,
         nameAr: nameAr || null,
-        description: '',
+        description: descKey ? String(row[descKey] || '').trim() : '',
         price,
         category: categoryName,
         isVeg,
@@ -2843,7 +2857,8 @@ shortCode: 1,2,3... If NOT a menu: {"categories":[],"menuItems":[]}`
         }
       ],
       max_tokens: 16000,
-      temperature: 0.1
+      temperature: 0.1,
+      response_format: { type: "json_object" }
     });
     const content = response.choices[0].message.content;
     const jsonMatch = content.match(/\{[\s\S]*\}/);
@@ -2886,8 +2901,9 @@ Return JSON: {"categories":[...],"menuItems":[{"name":"","description":"","price
 shortCode: 1,2,3... If NOT a menu: {"categories":[],"menuItems":[]}`
         }
       ],
-      max_tokens: 8000,
-      temperature: 0.1
+      max_tokens: 16000,
+      temperature: 0.1,
+      response_format: { type: "json_object" }
     });
     const content = response.choices[0].message.content;
     const jsonMatch = content.match(/\{[\s\S]*\}/);
