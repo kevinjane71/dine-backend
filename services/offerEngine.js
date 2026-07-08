@@ -42,10 +42,35 @@ const isItemExcluded = (item, offer) => {
 
 // ---------- schedule & date validation ----------
 
-const isScheduleValid = (offer, now = new Date()) => {
+const isScheduleValid = (offer, now = new Date(), timezone = null) => {
   if (!offer || !offer.schedule || offer.schedule.type !== 'recurring') return true;
-  const currentDay = now.getDay();
-  const currentTime = `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`;
+  // Convert to restaurant's local time if timezone provided (backend runs in UTC)
+  let currentDay, currentHours, currentMins;
+  if (timezone) {
+    try {
+      const parts = new Intl.DateTimeFormat('en-US', {
+        timeZone: timezone,
+        weekday: 'short', hour: 'numeric', minute: 'numeric', hour12: false,
+      }).formatToParts(now);
+      const dayMap = { Sun: 0, Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6 };
+      const weekday = parts.find(p => p.type === 'weekday')?.value || '';
+      currentDay = dayMap[weekday] ?? now.getDay();
+      currentHours = parseInt(parts.find(p => p.type === 'hour')?.value || '0', 10);
+      currentMins = parseInt(parts.find(p => p.type === 'minute')?.value || '0', 10);
+      // Intl hour12:false returns 24 as midnight in some environments
+      if (currentHours === 24) currentHours = 0;
+    } catch (_) {
+      // Invalid timezone — fall back to UTC
+      currentDay = now.getDay();
+      currentHours = now.getHours();
+      currentMins = now.getMinutes();
+    }
+  } else {
+    currentDay = now.getDay();
+    currentHours = now.getHours();
+    currentMins = now.getMinutes();
+  }
+  const currentTime = `${String(currentHours).padStart(2, '0')}:${String(currentMins).padStart(2, '0')}`;
   const scheduleDays = offer.schedule.days || [];
   const startTime = offer.schedule.startTime || '00:00';
   const endTime = offer.schedule.endTime || '23:59';
@@ -288,13 +313,13 @@ const hasScopeMatchingCart = (offer, cart) => {
   return true;
 };
 
-const filterApplicableOffers = (offers, { subtotal, cart, context, now }) => {
+const filterApplicableOffers = (offers, { subtotal, cart, context, now, timezone }) => {
   if (!Array.isArray(offers)) return [];
   const n = now || new Date();
   return offers.filter(offer => {
     if (!offer) return false;
     if (offer.isActive === false) return false;
-    if (!isScheduleValid(offer, n)) return false;
+    if (!isScheduleValid(offer, n, timezone)) return false;
     if (!isDateValid(offer, n)) return false;
     if (offer.minOrderValue && subtotal < offer.minOrderValue) return false;
     // Tiered offers: must meet at least the lowest tier's minSubtotal

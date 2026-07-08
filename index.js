@@ -8791,7 +8791,8 @@ app.post('/api/public/orders/:restaurantId', vercelSecurityMiddleware.publicAPI,
         const isValidDate = (!validFrom || now >= validFrom) && (!validUntil || now <= validUntil);
         const isUnderUsageLimit = !offer.usageLimit || (offer.usageCount || 0) < offer.usageLimit;
         const meetsMinOrder = subtotal >= (offer.minOrderValue || 0);
-        const isValidSchedule = offerEngine.isScheduleValid(offer, now);
+        const restTimezone = restaurantData.posSettings?.timezone || 'Asia/Kolkata';
+        const isValidSchedule = offerEngine.isScheduleValid(offer, now, restTimezone);
         const audienceOk = offerEngine.matchesAudience(offer, offerContext);
 
         // Per-customer usage cap
@@ -9802,8 +9803,9 @@ app.post('/api/orders', async (req, res) => {
           const isUnderUsageLimit = !offer.usageLimit || (offer.usageCount || 0) < offer.usageLimit;
           const meetsMinOrder = subtotalForDiscount >= (offer.minOrderValue || offer.minimumOrder || 0);
 
-          // Check schedule (happy hour / time-based) — use centralized engine for overnight support
-          const isValidSchedule = offerEngine.isScheduleValid(offer, now);
+          // Check schedule (happy hour / time-based) — use restaurant timezone for accuracy
+          const restTimezone = restaurantData.posSettings?.timezone || 'Asia/Kolkata';
+          const isValidSchedule = offerEngine.isScheduleValid(offer, now, restTimezone);
 
           // Check targetRestaurants
           const offerTargetRestaurants = offer.targetRestaurants || 'all';
@@ -13536,8 +13538,9 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
           if (offer.usageLimit && (offer.usageCount || 0) >= offer.usageLimit) continue;
           if (offer.minOrderValue && orderSubtotal < offer.minOrderValue) continue;
 
-          // Use centralized schedule validation (handles overnight ranges)
-          if (!offerEngine.isScheduleValid(offer)) continue;
+          // Use centralized schedule validation (handles overnight ranges + timezone)
+          const patchRestTz = (restDoc.exists ? restDoc.data().posSettings?.timezone : null) || 'Asia/Kolkata';
+          if (!offerEngine.isScheduleValid(offer, new Date(), patchRestTz)) continue;
 
           // Use centralized audience validation
           if (!offerEngine.matchesAudience(offer, {})) continue;
