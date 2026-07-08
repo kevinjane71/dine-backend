@@ -20392,7 +20392,7 @@ app.put('/api/admin/print-settings/:restaurantId', authenticateToken, async (req
     }
     // billLayout: object with boolean flags for bill section visibility
     if (printSettings.billLayout !== undefined && typeof printSettings.billLayout === 'object') {
-      const validBillKeys = ['showAddress','showPhone','showTable','showWaiter','showCustomer','showPayment','showOrderType','showSubtotal','showTaxBreakdown','showFooter','showPoweredBy','showDelivery'];
+      const validBillKeys = ['showAddress','showPhone','showTable','showWaiter','showCustomer','showCustomerPhone','showPayment','showOrderType','showSubtotal','showTaxBreakdown','showFooter','showPoweredBy','showDelivery'];
       const bl = {};
       for (const k of validBillKeys) {
         if (printSettings.billLayout[k] !== undefined) bl[k] = Boolean(printSettings.billLayout[k]);
@@ -21843,6 +21843,7 @@ const DEFAULT_PRINT_SETTINGS = {
     showTable: true,
     showWaiter: true,
     showCustomer: true,
+    showCustomerPhone: false,
     showPayment: true,
     showOrderType: true,
     showSubtotal: true,
