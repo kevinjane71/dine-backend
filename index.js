@@ -18381,7 +18381,17 @@ app.get('/api/user/page-access', authenticateToken, async (req, res) => {
     }
     
     const userData = userDoc.data();
-    
+
+    // Fetch superAdminDisabledPages from restaurant doc (cached, minimal cost)
+    let superAdminDisabledPages = [];
+    const restaurantId = userData.restaurantId || req.user.restaurantId || req.query.restaurantId;
+    if (restaurantId) {
+      try {
+        const restDoc = await getCachedRestDoc(restaurantId);
+        superAdminDisabledPages = restDoc.data()?.superAdminDisabledPages || [];
+      } catch (_) { /* non-fatal */ }
+    }
+
     res.json({
       pageAccess: userData.pageAccess || {
         dashboard: true,
@@ -18395,7 +18405,8 @@ app.get('/api/user/page-access', authenticateToken, async (req, res) => {
       },
       role: userData.role,
       restaurantId: userData.restaurantId,
-      notAllowedPages: userData.notAllowedPages || [] // Array of page IDs to hide (e.g., ['billing', 'inventory'])
+      notAllowedPages: userData.notAllowedPages || [], // Array of page IDs to hide (e.g., ['billing', 'inventory'])
+      superAdminDisabledPages
     });
   } catch (error) {
     console.error('Get page access error:', error);
