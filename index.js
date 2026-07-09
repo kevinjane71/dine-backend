@@ -9591,11 +9591,45 @@ app.post('/api/orders', async (req, res) => {
       const menuItem = menuItems.find(menuItem => menuItem.id === item.menuItemId);
 
       if (!menuItem) {
+        if (isOfflineSync) {
+          // Offline sync: menu item may have been deleted/changed since order was placed locally.
+          // Accept the order using frontend-provided data so the sale is not lost.
+          const fePrice = typeof item.price === 'number' ? item.price : (typeof item.basePrice === 'number' ? item.basePrice : 0);
+          const parsedQty = parseInt(item.quantity, 10);
+          const itemQuantity = Math.max(1, parsedQty || 1);
+          const customizations = Array.isArray(item.selectedCustomizations)
+            ? item.selectedCustomizations
+            : (Array.isArray(item.customizations) ? item.customizations : []);
+          const customizationPrice = customizations.reduce((sum, c) => sum + (typeof c.price === 'number' ? c.price : 0), 0);
+          const unitPrice = (fePrice || 0) + (customizationPrice || 0);
+          const selectedVariant = item.selectedVariant || item.variant || null;
+          const itemTotal = unitPrice * itemQuantity;
+          totalAmount += itemTotal;
+
+          orderItems.push({
+            menuItemId: item.menuItemId,
+            name: typeof item.name === 'string' ? item.name.substring(0, 200) : 'Unknown Item',
+            nameAr: typeof item.nameAr === 'string' ? item.nameAr.substring(0, 200) : null,
+            price: unitPrice,
+            quantity: itemQuantity,
+            total: itemTotal,
+            category: item.category || '',
+            shortCode: item.shortCode || null,
+            notes: typeof item.notes === 'string' ? item.notes.substring(0, 500) : '',
+            selectedVariant: selectedVariant ? { name: selectedVariant.name, price: selectedVariant.price || 0 } : null,
+            selectedCustomizations: customizations.map(c => ({ id: c.id || null, name: c.name || c, price: typeof c.price === 'number' ? c.price : 0 })),
+            menuItemNotFound: true,
+            menuPrice: null,
+            priceEdited: false,
+          });
+          console.log(`🔄 Offline sync: menu item ${item.menuItemId} not found in current menu, using FE data: "${item.name}" ₹${unitPrice} x${itemQuantity}`);
+          continue;
+        }
         return res.status(400).json({ error: `Menu item ${item.menuItemId} not found` });
       }
 
-      // Block out-of-stock items
-      if (menuItem.isAvailable === false) {
+      // Block out-of-stock items — skip for offline sync (order was already placed)
+      if (menuItem.isAvailable === false && !isOfflineSync) {
         return res.status(400).json({ error: `"${menuItem.name}" is currently out of stock` });
       }
 
