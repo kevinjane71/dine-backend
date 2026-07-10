@@ -2435,9 +2435,13 @@ router.get('/whatsapp/conversations', authenticateSuperAdmin, requireSuperAdmin,
 
     const convosMap = {};
     const allDocs = [...incomingSnap.docs, ...repliesSnap.docs];
+    // Deduplicate by messageId (Meta can fire webhooks multiple times)
+    const seenMsgIds = new Set();
 
     allDocs.forEach(doc => {
       const d = doc.data();
+      if (d.messageId && seenMsgIds.has(d.messageId)) return; // Skip duplicate
+      if (d.messageId) seenMsgIds.add(d.messageId);
       const phone = d.phone || d.customerPhone;
       if (!phone) return;
 
@@ -2558,6 +2562,15 @@ router.get('/whatsapp/messages/:phone', authenticateSuperAdmin, requireSuperAdmi
       };
     }).sort((a, b) => (a.timestamp || '').localeCompare(b.timestamp || ''));
 
+    // Deduplicate by messageId (Meta webhooks can fire multiple times for the same message)
+    const seenMessageIds = new Set();
+    const dedupedMessages = messages.filter(m => {
+      if (!m.messageId) return true; // No messageId — keep (legacy entries)
+      if (seenMessageIds.has(m.messageId)) return false; // Duplicate — skip
+      seenMessageIds.add(m.messageId);
+      return true;
+    });
+
     const sessionActive = lastIncomingAt ? (Date.now() - lastIncomingAt.getTime() < 24 * 60 * 60 * 1000) : false;
 
     // Auto mark-read
@@ -2567,7 +2580,7 @@ router.get('/whatsapp/messages/:phone', authenticateSuperAdmin, requireSuperAdmi
       await batch.commit();
     }
 
-    res.json({ success: true, messages, sessionActive });
+    res.json({ success: true, messages: dedupedMessages, sessionActive });
   } catch (error) {
     console.error('WhatsApp messages error:', error);
     res.status(500).json({ success: false, error: 'Failed to fetch messages' });

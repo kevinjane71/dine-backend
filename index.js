@@ -35543,6 +35543,22 @@ app.post('/api/automation/webhook/whatsapp', async (req, res) => {
           // Handle incoming messages from customers
           if (value?.messages && Array.isArray(value.messages)) {
             for (const message of value.messages) {
+              // Dedup: skip if this messageId was already stored (Meta can send duplicate webhooks)
+              if (message.id) {
+                try {
+                  const existingMsg = await db.collection(collections.automationLogs)
+                    .where('messageId', '==', message.id)
+                    .limit(1)
+                    .get();
+                  if (!existingMsg.empty) {
+                    console.log('[WhatsApp] Skipping duplicate message:', message.id);
+                    continue; // Already stored — skip to next message
+                  }
+                } catch (dedupErr) {
+                  console.warn('[WhatsApp] Dedup check failed (proceeding):', dedupErr.message);
+                }
+              }
+
               const processedMessage = whatsappService.handleIncomingMessage({
                 entry: [{
                   changes: [{
