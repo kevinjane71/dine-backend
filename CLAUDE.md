@@ -457,3 +457,11 @@ node scripts/backfill-orders-pg.js --upsert
 **Registry/mappers:** 153/158 entries now carry real fieldMaps (was ~54); booking_venues duplicate key resolved (canonical: booking_venues + hotelBooking mapper); `menu` alias → menu_items (14 AI/RAG legacy subcollection readers now read live PG data); new mapped columns: restaurants.aggregator_config, orders.delivery_status/delivery_assigned_at, feedback_forms.distribution, rest_bookings.venue, owner_preferences.email_enabled/active_report_hours_utc, daily_stats.total_covers, app_users.email_otp/email_otp_expiry, purchase_orders.expected_delivery_date/received_at, menu_items.sub_category.
 
 **⚠️ scripts/add-cutover-columns.sql MUST run on Cloud SQL before deploying this revision** (adds columns + migrates values out of extra_data). Cutover procedure: docs/pg-cutover-runbook.md. Deploy script fixed: switch-backend.sh now uses --update-env-vars (--set-env-vars wiped all 44 env vars).
+
+### 2026-07-12 (later): GCP prepped for parallel run — LIVE
+- add-cutover-columns.sql executed on Cloud SQL (all columns verified; incl. late addition owner_preferences.report_time_utc — legacy cron field, 12 rows migrated from extra_data)
+- DB password ROTATED via gcloud sql users set-password; .env.local updated; old password redacted from PG_MIGRATION_PROGRESS.md. Cloud SQL authorized networks still 0.0.0.0/0 — follow-up: Cloud SQL connector
+- CRON_SECRET generated (in .env.local + Cloud Run env); Cloud Scheduler job `dine-daily-reports` (hourly, asia-south1) → /api/cron/send-daily-reports; live-tested 200
+- Deployed rev dine-backend-00018-fng: min-instances=1, max=3, concurrency=40, timeout=120, full 48-var env via --env-vars-file
+- Live verification: health 200, staff-login PG query round-trip OK, cron 200, no pgAdapter errors in logs
+- **Parallel-run model:** new customers → GCP URL https://dine-backend-1087929121342.asia-south1.run.app ; old customers stay on Vercel/Firestore. PG's copy of OLD customers' data is stale (June) — never route old customers to GCP without the runbook backfill sync. Webhook caveat: add Cloud Run URL as additional webhook in Razorpay/Dodo/WhatsApp/Talabat for GCP-hosted customers.
