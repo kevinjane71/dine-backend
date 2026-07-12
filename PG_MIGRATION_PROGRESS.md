@@ -12,8 +12,8 @@
 | Cloud SQL Public IP | 34.14.155.43 |
 | Database | dine |
 | User | dine_app |
-| Password | DineOrders2026Pg |
-| DATABASE_URL | `postgresql://dine_app:DineOrders2026Pg@34.14.155.43:5432/dine?ssl=true&sslmode=no-verify` |
+| Password | (rotated 2026-07-12 — stored only in .env.local / Cloud Run env, never commit) |
+| DATABASE_URL | `postgresql://dine_app:<password>@34.14.155.43:5432/dine?ssl=true&sslmode=no-verify` (see .env.local) |
 | Cloud Run URL | https://dine-backend-son5lc3cca-el.a.run.app |
 | Vercel URL | https://dine-be2-phi.vercel.app |
 | Authorized Networks | 0.0.0.0/0 (all IPs, needed for Vercel serverless) |
