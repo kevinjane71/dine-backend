@@ -73,6 +73,7 @@ const FIELD_MAP = {
   barInventorySettings:        'bar_inventory_settings',
   discountApprovalSettings:    'discount_approval_settings',
   kotSettings:                 'kot_settings',
+  aggregatorConfig:            'aggregator_config',
 
   // Timestamps
   createdAt:                   'created_at',
@@ -92,7 +93,7 @@ const JSONB_COLUMNS = new Set([
   'currency_settings', 'customer_app_settings', 'billing_settings',
   'billing_audit', 'booking_settings', 'feedback_settings',
   'bar_inventory_settings', 'discount_approval_settings', 'kot_settings',
-  'menu', 'extra_data',
+  'aggregator_config', 'menu', 'extra_data',
 ]);
 
 // Fields to skip entirely (too large / separate concern)

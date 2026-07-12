@@ -393,29 +393,29 @@ const automationLogToFirestoreObj = makeToFirestoreObj(buildReverseMap(AUTOMATIO
 
 module.exports = {
   // Bolna
-  bolnaAgentToPgRow, bolnaAgentToFirestoreObj, BOLNA_AGENT_JSONB_COLUMNS,
-  phoneCallToPgRow, phoneCallToFirestoreObj, PHONE_CALL_JSONB_COLUMNS,
+  bolnaAgentToPgRow, bolnaAgentToFirestoreObj, BOLNA_AGENT_JSONB_COLUMNS, BOLNA_AGENT_FIELD_MAP,
+  phoneCallToPgRow, phoneCallToFirestoreObj, PHONE_CALL_JSONB_COLUMNS, PHONE_CALL_FIELD_MAP,
   // DineAI
-  dineaiSettingsToPgRow, dineaiSettingsToFirestoreObj, DINEAI_SETTINGS_JSONB_COLUMNS,
-  dineaiUsageToPgRow, dineaiUsageToFirestoreObj, DINEAI_USAGE_JSONB_COLUMNS,
-  dineaiKnowledgeToPgRow, dineaiKnowledgeToFirestoreObj, DINEAI_KNOWLEDGE_JSONB_COLUMNS,
-  dineaiRtSessionToPgRow, dineaiRtSessionToFirestoreObj, DINEAI_RT_SESSION_JSONB_COLUMNS,
-  dineaiRtFuncCallToPgRow, dineaiRtFuncCallToFirestoreObj, DINEAI_RT_FUNC_CALL_JSONB_COLUMNS,
-  dineaiCheapSessionToPgRow, dineaiCheapSessionToFirestoreObj, DINEAI_CHEAP_SESSION_JSONB_COLUMNS,
+  dineaiSettingsToPgRow, dineaiSettingsToFirestoreObj, DINEAI_SETTINGS_JSONB_COLUMNS, DINEAI_SETTINGS_FIELD_MAP,
+  dineaiUsageToPgRow, dineaiUsageToFirestoreObj, DINEAI_USAGE_JSONB_COLUMNS, DINEAI_USAGE_FIELD_MAP,
+  dineaiKnowledgeToPgRow, dineaiKnowledgeToFirestoreObj, DINEAI_KNOWLEDGE_JSONB_COLUMNS, DINEAI_KNOWLEDGE_FIELD_MAP,
+  dineaiRtSessionToPgRow, dineaiRtSessionToFirestoreObj, DINEAI_RT_SESSION_JSONB_COLUMNS, DINEAI_RT_SESSION_FIELD_MAP,
+  dineaiRtFuncCallToPgRow, dineaiRtFuncCallToFirestoreObj, DINEAI_RT_FUNC_CALL_JSONB_COLUMNS, DINEAI_RT_FUNC_CALL_FIELD_MAP,
+  dineaiCheapSessionToPgRow, dineaiCheapSessionToFirestoreObj, DINEAI_CHEAP_SESSION_JSONB_COLUMNS, DINEAI_CHEAP_SESSION_FIELD_MAP,
   // AI Usage
-  chatgptUsageToPgRow, chatgptUsageToFirestoreObj, CHATGPT_USAGE_JSONB_COLUMNS,
-  aiUsageToPgRow, aiUsageToFirestoreObj, AI_USAGE_JSONB_COLUMNS,
-  aiInsightsUsageToPgRow, aiInsightsUsageToFirestoreObj, AI_INSIGHTS_USAGE_JSONB_COLUMNS,
+  chatgptUsageToPgRow, chatgptUsageToFirestoreObj, CHATGPT_USAGE_JSONB_COLUMNS, CHATGPT_USAGE_FIELD_MAP,
+  aiUsageToPgRow, aiUsageToFirestoreObj, AI_USAGE_JSONB_COLUMNS, AI_USAGE_FIELD_MAP,
+  aiInsightsUsageToPgRow, aiInsightsUsageToFirestoreObj, AI_INSIGHTS_USAGE_JSONB_COLUMNS, AI_INSIGHTS_USAGE_FIELD_MAP,
   // Google Reviews
-  googleReviewSettingsToPgRow, googleReviewSettingsToFirestoreObj, GOOGLE_REVIEW_SETTINGS_JSONB_COLUMNS,
-  googleReviewsCacheToPgRow, googleReviewsCacheToFirestoreObj, GOOGLE_REVIEWS_CACHE_JSONB_COLUMNS,
-  googleBizTokensToPgRow, googleBizTokensToFirestoreObj, GOOGLE_BIZ_TOKENS_JSONB_COLUMNS,
+  googleReviewSettingsToPgRow, googleReviewSettingsToFirestoreObj, GOOGLE_REVIEW_SETTINGS_JSONB_COLUMNS, GOOGLE_REVIEW_SETTINGS_FIELD_MAP,
+  googleReviewsCacheToPgRow, googleReviewsCacheToFirestoreObj, GOOGLE_REVIEWS_CACHE_JSONB_COLUMNS, GOOGLE_REVIEWS_CACHE_FIELD_MAP,
+  googleBizTokensToPgRow, googleBizTokensToFirestoreObj, GOOGLE_BIZ_TOKENS_JSONB_COLUMNS, GOOGLE_BIZ_TOKENS_FIELD_MAP,
   // WhatsApp
-  whatsappConfigToPgRow, whatsappConfigToFirestoreObj, WHATSAPP_CONFIG_JSONB_COLUMNS,
-  whatsappLogToPgRow, whatsappLogToFirestoreObj, WHATSAPP_LOG_JSONB_COLUMNS,
+  whatsappConfigToPgRow, whatsappConfigToFirestoreObj, WHATSAPP_CONFIG_JSONB_COLUMNS, WHATSAPP_CONFIG_FIELD_MAP,
+  whatsappLogToPgRow, whatsappLogToFirestoreObj, WHATSAPP_LOG_JSONB_COLUMNS, WHATSAPP_LOG_FIELD_MAP,
   // Automations
-  automationToPgRow, automationToFirestoreObj, AUTOMATION_JSONB_COLUMNS,
-  automationTemplateToPgRow, automationTemplateToFirestoreObj, AUTOMATION_TEMPLATE_JSONB_COLUMNS,
-  automationSettingsToPgRow, automationSettingsToFirestoreObj, AUTOMATION_SETTINGS_JSONB_COLUMNS,
-  automationLogToPgRow, automationLogToFirestoreObj, AUTOMATION_LOG_JSONB_COLUMNS,
+  automationToPgRow, automationToFirestoreObj, AUTOMATION_JSONB_COLUMNS, AUTOMATION_FIELD_MAP,
+  automationTemplateToPgRow, automationTemplateToFirestoreObj, AUTOMATION_TEMPLATE_JSONB_COLUMNS, AUTOMATION_TEMPLATE_FIELD_MAP,
+  automationSettingsToPgRow, automationSettingsToFirestoreObj, AUTOMATION_SETTINGS_JSONB_COLUMNS, AUTOMATION_SETTINGS_FIELD_MAP,
+  automationLogToPgRow, automationLogToFirestoreObj, AUTOMATION_LOG_JSONB_COLUMNS, AUTOMATION_LOG_FIELD_MAP,
 };

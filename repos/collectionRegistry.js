@@ -40,6 +40,7 @@ const {
   toPgRow: dsToPgRow,
   toFirestoreObj: dsToFirestoreObj,
   JSONB_COLUMNS: DS_JSONB_COLUMNS,
+  resolveKeyPath: dsResolveKeyPath,
 } = require('./dailyStatsFieldMapper');
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -194,139 +195,138 @@ const {
 } = require('./hotelBookingFieldMapper');
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Imports — invoice (no FIELD_MAP exports)
+// Imports — invoice
 // ═══════════════════════════════════════════════════════════════════════════
 const {
-  orgToPgRow: invOrgToPgRow, orgToFirestoreObj: invOrgToFirestoreObj, ORG_JSONB_COLUMNS: INV_ORG_JSONB_COLUMNS,
-  customerToPgRow: invCustToPgRow, customerToFirestoreObj: invCustToFirestoreObj, CUSTOMER_JSONB_COLUMNS: INV_CUST_JSONB_COLUMNS,
-  itemToPgRow: invItemToPgRow, itemToFirestoreObj: invItemToFirestoreObj, ITEM_JSONB_COLUMNS: INV_ITEM_JSONB_COLUMNS,
-  invoiceToPgRow: invInvoiceToPgRow, invoiceToFirestoreObj: invInvoiceToFirestoreObj, INVOICE_JSONB_COLUMNS: INV_INVOICE_JSONB_COLUMNS,
-  quoteToPgRow, quoteToFirestoreObj, QUOTE_JSONB_COLUMNS,
-  challanToPgRow, challanToFirestoreObj, CHALLAN_JSONB_COLUMNS,
-  paymentToPgRow: invPaymentToPgRow, paymentToFirestoreObj: invPaymentToFirestoreObj, PAYMENT_JSONB_COLUMNS: INV_PAYMENT_JSONB_COLUMNS,
-  expenseToPgRow: invExpenseToPgRow, expenseToFirestoreObj: invExpenseToFirestoreObj, EXPENSE_JSONB_COLUMNS: INV_EXPENSE_JSONB_COLUMNS,
-  settingsToPgRow, settingsToFirestoreObj, SETTINGS_JSONB_COLUMNS,
-  numberSeqToPgRow, numberSeqToFirestoreObj, NUMBER_SEQ_JSONB_COLUMNS,
+  orgToPgRow: invOrgToPgRow, orgToFirestoreObj: invOrgToFirestoreObj, ORG_JSONB_COLUMNS: INV_ORG_JSONB_COLUMNS, ORG_FIELD_MAP: INV_ORG_FIELD_MAP,
+  customerToPgRow: invCustToPgRow, customerToFirestoreObj: invCustToFirestoreObj, CUSTOMER_JSONB_COLUMNS: INV_CUST_JSONB_COLUMNS, CUSTOMER_FIELD_MAP: INV_CUST_FIELD_MAP,
+  itemToPgRow: invItemToPgRow, itemToFirestoreObj: invItemToFirestoreObj, ITEM_JSONB_COLUMNS: INV_ITEM_JSONB_COLUMNS, ITEM_FIELD_MAP: INV_ITEM_FIELD_MAP,
+  invoiceToPgRow: invInvoiceToPgRow, invoiceToFirestoreObj: invInvoiceToFirestoreObj, INVOICE_JSONB_COLUMNS: INV_INVOICE_JSONB_COLUMNS, INVOICE_FIELD_MAP: INV_INVOICE_FIELD_MAP,
+  quoteToPgRow, quoteToFirestoreObj, QUOTE_JSONB_COLUMNS, QUOTE_FIELD_MAP,
+  challanToPgRow, challanToFirestoreObj, CHALLAN_JSONB_COLUMNS, CHALLAN_FIELD_MAP,
+  paymentToPgRow: invPaymentToPgRow, paymentToFirestoreObj: invPaymentToFirestoreObj, PAYMENT_JSONB_COLUMNS: INV_PAYMENT_JSONB_COLUMNS, PAYMENT_FIELD_MAP: INV_PAYMENT_FIELD_MAP,
+  expenseToPgRow: invExpenseToPgRow, expenseToFirestoreObj: invExpenseToFirestoreObj, EXPENSE_JSONB_COLUMNS: INV_EXPENSE_JSONB_COLUMNS, EXPENSE_FIELD_MAP: INV_EXPENSE_FIELD_MAP,
+  settingsToPgRow, settingsToFirestoreObj, SETTINGS_JSONB_COLUMNS, SETTINGS_FIELD_MAP,
+  numberSeqToPgRow, numberSeqToFirestoreObj, NUMBER_SEQ_JSONB_COLUMNS, NUMBER_SEQ_FIELD_MAP,
 } = require('./invoiceFieldMapper');
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Imports — enterprise (no FIELD_MAP exports)
+// Imports — enterprise
 // ═══════════════════════════════════════════════════════════════════════════
 const {
-  orgToPgRow: entOrgToPgRow, orgToFirestoreObj: entOrgToFirestoreObj, ORG_JSONB_COLUMNS: ENT_ORG_JSONB_COLUMNS,
-  menuTemplateToPgRow, menuTemplateToFirestoreObj, MENU_TEMPLATE_JSONB_COLUMNS,
-  menuItemToPgRow: entMenuItemToPgRow, menuItemToFirestoreObj: entMenuItemToFirestoreObj, MENU_ITEM_JSONB_COLUMNS: ENT_MENU_ITEM_JSONB_COLUMNS,
-  indentToPgRow, indentToFirestoreObj, INDENT_JSONB_COLUMNS,
-  productionOrderToPgRow, productionOrderToFirestoreObj, PRODUCTION_ORDER_JSONB_COLUMNS,
-  distributionPlanToPgRow, distributionPlanToFirestoreObj, DISTRIBUTION_PLAN_JSONB_COLUMNS,
-  orgSettingsToPgRow, orgSettingsToFirestoreObj, ORG_SETTINGS_JSONB_COLUMNS,
-  auditLogToPgRow, auditLogToFirestoreObj, AUDIT_LOG_JSONB_COLUMNS,
+  orgToPgRow: entOrgToPgRow, orgToFirestoreObj: entOrgToFirestoreObj, ORG_JSONB_COLUMNS: ENT_ORG_JSONB_COLUMNS, ORG_FIELD_MAP: ENT_ORG_FIELD_MAP,
+  menuTemplateToPgRow, menuTemplateToFirestoreObj, MENU_TEMPLATE_JSONB_COLUMNS, MENU_TEMPLATE_FIELD_MAP,
+  menuItemToPgRow: entMenuItemToPgRow, menuItemToFirestoreObj: entMenuItemToFirestoreObj, MENU_ITEM_JSONB_COLUMNS: ENT_MENU_ITEM_JSONB_COLUMNS, MENU_ITEM_FIELD_MAP: ENT_MENU_ITEM_FIELD_MAP,
+  indentToPgRow, indentToFirestoreObj, INDENT_JSONB_COLUMNS, INDENT_FIELD_MAP,
+  productionOrderToPgRow, productionOrderToFirestoreObj, PRODUCTION_ORDER_JSONB_COLUMNS, PRODUCTION_ORDER_FIELD_MAP,
+  distributionPlanToPgRow, distributionPlanToFirestoreObj, DISTRIBUTION_PLAN_JSONB_COLUMNS, DISTRIBUTION_PLAN_FIELD_MAP,
+  orgSettingsToPgRow, orgSettingsToFirestoreObj, ORG_SETTINGS_JSONB_COLUMNS, ORG_SETTINGS_FIELD_MAP,
+  auditLogToPgRow, auditLogToFirestoreObj, AUDIT_LOG_JSONB_COLUMNS, AUDIT_LOG_FIELD_MAP,
 } = require('./enterpriseFieldMapper');
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Imports — AI & automation (no FIELD_MAP exports)
+// Imports — AI & automation
 // ═══════════════════════════════════════════════════════════════════════════
 const {
-  bolnaAgentToPgRow, bolnaAgentToFirestoreObj, BOLNA_AGENT_JSONB_COLUMNS,
-  phoneCallToPgRow, phoneCallToFirestoreObj, PHONE_CALL_JSONB_COLUMNS,
-  dineaiSettingsToPgRow, dineaiSettingsToFirestoreObj, DINEAI_SETTINGS_JSONB_COLUMNS,
-  dineaiUsageToPgRow, dineaiUsageToFirestoreObj, DINEAI_USAGE_JSONB_COLUMNS,
-  dineaiKnowledgeToPgRow, dineaiKnowledgeToFirestoreObj, DINEAI_KNOWLEDGE_JSONB_COLUMNS,
-  dineaiRtSessionToPgRow, dineaiRtSessionToFirestoreObj, DINEAI_RT_SESSION_JSONB_COLUMNS,
-  dineaiCheapSessionToPgRow, dineaiCheapSessionToFirestoreObj, DINEAI_CHEAP_SESSION_JSONB_COLUMNS,
-  chatgptUsageToPgRow, chatgptUsageToFirestoreObj, CHATGPT_USAGE_JSONB_COLUMNS,
-  aiUsageToPgRow, aiUsageToFirestoreObj, AI_USAGE_JSONB_COLUMNS,
-  aiInsightsUsageToPgRow, aiInsightsUsageToFirestoreObj, AI_INSIGHTS_USAGE_JSONB_COLUMNS,
-  googleReviewSettingsToPgRow, googleReviewSettingsToFirestoreObj, GOOGLE_REVIEW_SETTINGS_JSONB_COLUMNS,
-  googleReviewsCacheToPgRow, googleReviewsCacheToFirestoreObj, GOOGLE_REVIEWS_CACHE_JSONB_COLUMNS,
-  googleBizTokensToPgRow, googleBizTokensToFirestoreObj, GOOGLE_BIZ_TOKENS_JSONB_COLUMNS,
-  whatsappConfigToPgRow, whatsappConfigToFirestoreObj, WHATSAPP_CONFIG_JSONB_COLUMNS,
-  whatsappLogToPgRow, whatsappLogToFirestoreObj, WHATSAPP_LOG_JSONB_COLUMNS,
-  automationToPgRow, automationToFirestoreObj, AUTOMATION_JSONB_COLUMNS,
-  automationTemplateToPgRow, automationTemplateToFirestoreObj, AUTOMATION_TEMPLATE_JSONB_COLUMNS,
-  automationSettingsToPgRow, automationSettingsToFirestoreObj, AUTOMATION_SETTINGS_JSONB_COLUMNS,
-  automationLogToPgRow, automationLogToFirestoreObj, AUTOMATION_LOG_JSONB_COLUMNS,
+  bolnaAgentToPgRow, bolnaAgentToFirestoreObj, BOLNA_AGENT_JSONB_COLUMNS, BOLNA_AGENT_FIELD_MAP,
+  phoneCallToPgRow, phoneCallToFirestoreObj, PHONE_CALL_JSONB_COLUMNS, PHONE_CALL_FIELD_MAP,
+  dineaiSettingsToPgRow, dineaiSettingsToFirestoreObj, DINEAI_SETTINGS_JSONB_COLUMNS, DINEAI_SETTINGS_FIELD_MAP,
+  dineaiUsageToPgRow, dineaiUsageToFirestoreObj, DINEAI_USAGE_JSONB_COLUMNS, DINEAI_USAGE_FIELD_MAP,
+  dineaiKnowledgeToPgRow, dineaiKnowledgeToFirestoreObj, DINEAI_KNOWLEDGE_JSONB_COLUMNS, DINEAI_KNOWLEDGE_FIELD_MAP,
+  dineaiRtSessionToPgRow, dineaiRtSessionToFirestoreObj, DINEAI_RT_SESSION_JSONB_COLUMNS, DINEAI_RT_SESSION_FIELD_MAP,
+  dineaiCheapSessionToPgRow, dineaiCheapSessionToFirestoreObj, DINEAI_CHEAP_SESSION_JSONB_COLUMNS, DINEAI_CHEAP_SESSION_FIELD_MAP,
+  chatgptUsageToPgRow, chatgptUsageToFirestoreObj, CHATGPT_USAGE_JSONB_COLUMNS, CHATGPT_USAGE_FIELD_MAP,
+  aiUsageToPgRow, aiUsageToFirestoreObj, AI_USAGE_JSONB_COLUMNS, AI_USAGE_FIELD_MAP,
+  aiInsightsUsageToPgRow, aiInsightsUsageToFirestoreObj, AI_INSIGHTS_USAGE_JSONB_COLUMNS, AI_INSIGHTS_USAGE_FIELD_MAP,
+  googleReviewSettingsToPgRow, googleReviewSettingsToFirestoreObj, GOOGLE_REVIEW_SETTINGS_JSONB_COLUMNS, GOOGLE_REVIEW_SETTINGS_FIELD_MAP,
+  googleReviewsCacheToPgRow, googleReviewsCacheToFirestoreObj, GOOGLE_REVIEWS_CACHE_JSONB_COLUMNS, GOOGLE_REVIEWS_CACHE_FIELD_MAP,
+  googleBizTokensToPgRow, googleBizTokensToFirestoreObj, GOOGLE_BIZ_TOKENS_JSONB_COLUMNS, GOOGLE_BIZ_TOKENS_FIELD_MAP,
+  whatsappConfigToPgRow, whatsappConfigToFirestoreObj, WHATSAPP_CONFIG_JSONB_COLUMNS, WHATSAPP_CONFIG_FIELD_MAP,
+  whatsappLogToPgRow, whatsappLogToFirestoreObj, WHATSAPP_LOG_JSONB_COLUMNS, WHATSAPP_LOG_FIELD_MAP,
+  automationToPgRow, automationToFirestoreObj, AUTOMATION_JSONB_COLUMNS, AUTOMATION_FIELD_MAP,
+  automationTemplateToPgRow, automationTemplateToFirestoreObj, AUTOMATION_TEMPLATE_JSONB_COLUMNS, AUTOMATION_TEMPLATE_FIELD_MAP,
+  automationSettingsToPgRow, automationSettingsToFirestoreObj, AUTOMATION_SETTINGS_JSONB_COLUMNS, AUTOMATION_SETTINGS_FIELD_MAP,
+  automationLogToPgRow, automationLogToFirestoreObj, AUTOMATION_LOG_JSONB_COLUMNS, AUTOMATION_LOG_FIELD_MAP,
 } = require('./aiAutomationFieldMapper');
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Imports — system & misc (no FIELD_MAP exports)
+// Imports — system & misc
 // ═══════════════════════════════════════════════════════════════════════════
 const {
   // GROUP A: Supply Chain
-  supplierToPgRow, supplierToFirestoreObj, SUPPLIER_JSONB_COLUMNS,
-  poToPgRow, poToFirestoreObj, PO_JSONB_COLUMNS,
-  requisitionToPgRow, requisitionToFirestoreObj, REQUISITION_JSONB_COLUMNS,
-  grnToPgRow, grnToFirestoreObj, GRN_JSONB_COLUMNS,
-  supplierReturnToPgRow, supplierReturnToFirestoreObj, SUPPLIER_RETURN_JSONB_COLUMNS,
-  stockTransferToPgRow, stockTransferToFirestoreObj, STOCK_TRANSFER_JSONB_COLUMNS,
-  supplierPerfToPgRow, supplierPerfToFirestoreObj, SUPPLIER_PERF_JSONB_COLUMNS,
-  supplierInvoiceToPgRow, supplierInvoiceToFirestoreObj, SUPPLIER_INVOICE_JSONB_COLUMNS,
+  supplierToPgRow, supplierToFirestoreObj, SUPPLIER_JSONB_COLUMNS, SUPPLIER_FIELD_MAP,
+  poToPgRow, poToFirestoreObj, PO_JSONB_COLUMNS, PO_FIELD_MAP,
+  requisitionToPgRow, requisitionToFirestoreObj, REQUISITION_JSONB_COLUMNS, REQUISITION_FIELD_MAP,
+  grnToPgRow, grnToFirestoreObj, GRN_JSONB_COLUMNS, GRN_FIELD_MAP,
+  supplierReturnToPgRow, supplierReturnToFirestoreObj, SUPPLIER_RETURN_JSONB_COLUMNS, SUPPLIER_RETURN_FIELD_MAP,
+  stockTransferToPgRow, stockTransferToFirestoreObj, STOCK_TRANSFER_JSONB_COLUMNS, STOCK_TRANSFER_FIELD_MAP,
+  supplierPerfToPgRow, supplierPerfToFirestoreObj, SUPPLIER_PERF_JSONB_COLUMNS, SUPPLIER_PERF_FIELD_MAP,
+  supplierInvoiceToPgRow, supplierInvoiceToFirestoreObj, SUPPLIER_INVOICE_JSONB_COLUMNS, SUPPLIER_INVOICE_FIELD_MAP,
   // GROUP B: Inventory & Production (systemMisc versions — used as fallback only)
-  stockAuditToPgRow, stockAuditToFirestoreObj, STOCK_AUDIT_JSONB_COLUMNS,
-  productionEntryToPgRow, productionEntryToFirestoreObj, PRODUCTION_ENTRY_JSONB_COLUMNS,
+  stockAuditToPgRow, stockAuditToFirestoreObj, STOCK_AUDIT_JSONB_COLUMNS, STOCK_AUDIT_FIELD_MAP,
+  productionEntryToPgRow, productionEntryToFirestoreObj, PRODUCTION_ENTRY_JSONB_COLUMNS, PRODUCTION_ENTRY_FIELD_MAP,
   // GROUP C: Feedback & Customer
-  feedbackFormToPgRow, feedbackFormToFirestoreObj, FEEDBACK_FORM_JSONB_COLUMNS,
-  feedbackResponseToPgRow, feedbackResponseToFirestoreObj, FEEDBACK_RESPONSE_JSONB_COLUMNS,
-  customerGroupToPgRow, customerGroupToFirestoreObj, CUSTOMER_GROUP_JSONB_COLUMNS,
+  feedbackFormToPgRow, feedbackFormToFirestoreObj, FEEDBACK_FORM_JSONB_COLUMNS, FEEDBACK_FORM_FIELD_MAP,
+  feedbackResponseToPgRow, feedbackResponseToFirestoreObj, FEEDBACK_RESPONSE_JSONB_COLUMNS, FEEDBACK_RESPONSE_FIELD_MAP,
+  customerGroupToPgRow, customerGroupToFirestoreObj, CUSTOMER_GROUP_JSONB_COLUMNS, CUSTOMER_GROUP_FIELD_MAP,
   // GROUP D: Booking & Space
-  bookingToPgRow, bookingToFirestoreObj, BOOKING_JSONB_COLUMNS,
-  bookingVenueToPgRow: smBookingVenueToPgRow, bookingVenueToFirestoreObj: smBookingVenueToFirestoreObj, BOOKING_VENUE_JSONB_COLUMNS: SM_BOOKING_VENUE_JSONB_COLUMNS,
-  spaceBookingToPgRow, spaceBookingToFirestoreObj, SPACE_BOOKING_JSONB_COLUMNS,
+  bookingToPgRow, bookingToFirestoreObj, BOOKING_JSONB_COLUMNS, BOOKING_FIELD_MAP,
+  spaceBookingToPgRow, spaceBookingToFirestoreObj, SPACE_BOOKING_JSONB_COLUMNS, SPACE_BOOKING_FIELD_MAP,
   // GROUP E: Parking
-  parkingConfigToPgRow, parkingConfigToFirestoreObj, PARKING_CONFIG_JSONB_COLUMNS,
-  parkingZoneToPgRow, parkingZoneToFirestoreObj, PARKING_ZONE_JSONB_COLUMNS,
-  parkingSlotToPgRow, parkingSlotToFirestoreObj, PARKING_SLOT_JSONB_COLUMNS,
-  parkingTicketToPgRow, parkingTicketToFirestoreObj, PARKING_TICKET_JSONB_COLUMNS,
-  parkingRateToPgRow, parkingRateToFirestoreObj, PARKING_RATE_JSONB_COLUMNS,
+  parkingConfigToPgRow, parkingConfigToFirestoreObj, PARKING_CONFIG_JSONB_COLUMNS, PARKING_CONFIG_FIELD_MAP,
+  parkingZoneToPgRow, parkingZoneToFirestoreObj, PARKING_ZONE_JSONB_COLUMNS, PARKING_ZONE_FIELD_MAP,
+  parkingSlotToPgRow, parkingSlotToFirestoreObj, PARKING_SLOT_JSONB_COLUMNS, PARKING_SLOT_FIELD_MAP,
+  parkingTicketToPgRow, parkingTicketToFirestoreObj, PARKING_TICKET_JSONB_COLUMNS, PARKING_TICKET_FIELD_MAP,
+  parkingRateToPgRow, parkingRateToFirestoreObj, PARKING_RATE_JSONB_COLUMNS, PARKING_RATE_FIELD_MAP,
   // GROUP F: Settings
-  restaurantSettingsToPgRow, restaurantSettingsToFirestoreObj, RESTAURANT_SETTINGS_JSONB_COLUMNS,
-  discountSettingsToPgRow, discountSettingsToFirestoreObj, DISCOUNT_SETTINGS_JSONB_COLUMNS,
+  restaurantSettingsToPgRow, restaurantSettingsToFirestoreObj, RESTAURANT_SETTINGS_JSONB_COLUMNS, RESTAURANT_SETTINGS_FIELD_MAP,
+  discountSettingsToPgRow, discountSettingsToFirestoreObj, DISCOUNT_SETTINGS_JSONB_COLUMNS, DISCOUNT_SETTINGS_FIELD_MAP,
   // GROUP G: Payment & Billing
-  paymentToPgRow: smPaymentToPgRow, paymentToFirestoreObj: smPaymentToFirestoreObj, PAYMENT_JSONB_COLUMNS: SM_PAYMENT_JSONB_COLUMNS,
-  razorpayTokenToPgRow, razorpayTokenToFirestoreObj, RAZORPAY_TOKEN_JSONB_COLUMNS,
-  dodoOrderToPgRow, dodoOrderToFirestoreObj, DODO_ORDER_JSONB_COLUMNS,
-  dodoBillingToPgRow, dodoBillingToFirestoreObj, DODO_BILLING_JSONB_COLUMNS,
-  dodoRefundToPgRow, dodoRefundToFirestoreObj, DODO_REFUND_JSONB_COLUMNS,
-  dodoDisputeToPgRow, dodoDisputeToFirestoreObj, DODO_DISPUTE_JSONB_COLUMNS,
-  dodoWebhookToPgRow, dodoWebhookToFirestoreObj, DODO_WEBHOOK_JSONB_COLUMNS,
-  dineWebhookToPgRow, dineWebhookToFirestoreObj, DINE_WEBHOOK_JSONB_COLUMNS,
+  paymentToPgRow: smPaymentToPgRow, paymentToFirestoreObj: smPaymentToFirestoreObj, PAYMENT_JSONB_COLUMNS: SM_PAYMENT_JSONB_COLUMNS, PAYMENT_FIELD_MAP: SM_PAYMENT_FIELD_MAP,
+  razorpayTokenToPgRow, razorpayTokenToFirestoreObj, RAZORPAY_TOKEN_JSONB_COLUMNS, RAZORPAY_TOKEN_FIELD_MAP,
+  dodoOrderToPgRow, dodoOrderToFirestoreObj, DODO_ORDER_JSONB_COLUMNS, DODO_ORDER_FIELD_MAP,
+  dodoBillingToPgRow, dodoBillingToFirestoreObj, DODO_BILLING_JSONB_COLUMNS, DODO_BILLING_FIELD_MAP,
+  dodoRefundToPgRow, dodoRefundToFirestoreObj, DODO_REFUND_JSONB_COLUMNS, DODO_REFUND_FIELD_MAP,
+  dodoDisputeToPgRow, dodoDisputeToFirestoreObj, DODO_DISPUTE_JSONB_COLUMNS, DODO_DISPUTE_FIELD_MAP,
+  dodoWebhookToPgRow, dodoWebhookToFirestoreObj, DODO_WEBHOOK_JSONB_COLUMNS, DODO_WEBHOOK_FIELD_MAP,
+  dineWebhookToPgRow, dineWebhookToFirestoreObj, DINE_WEBHOOK_JSONB_COLUMNS, DINE_WEBHOOK_FIELD_MAP,
   // GROUP H: Cart & Idempotency
-  savedCartToPgRow, savedCartToFirestoreObj, SAVED_CART_JSONB_COLUMNS,
-  idempotencyKeyToPgRow, idempotencyKeyToFirestoreObj, IDEMPOTENCY_KEY_JSONB_COLUMNS,
+  savedCartToPgRow, savedCartToFirestoreObj, SAVED_CART_JSONB_COLUMNS, SAVED_CART_FIELD_MAP,
+  idempotencyKeyToPgRow, idempotencyKeyToFirestoreObj, IDEMPOTENCY_KEY_JSONB_COLUMNS, IDEMPOTENCY_KEY_FIELD_MAP,
   // GROUP I: Security
-  blockedIpToPgRow, blockedIpToFirestoreObj, BLOCKED_IP_JSONB_COLUMNS,
-  securityLogToPgRow, securityLogToFirestoreObj, SECURITY_LOG_JSONB_COLUMNS,
-  rateLimitToPgRow, rateLimitToFirestoreObj, RATE_LIMIT_JSONB_COLUMNS,
-  publicToolUsageToPgRow, publicToolUsageToFirestoreObj, PUBLIC_TOOL_USAGE_JSONB_COLUMNS,
-  systemConfigToPgRow, systemConfigToFirestoreObj, SYSTEM_CONFIG_JSONB_COLUMNS,
+  blockedIpToPgRow, blockedIpToFirestoreObj, BLOCKED_IP_JSONB_COLUMNS, BLOCKED_IP_FIELD_MAP,
+  securityLogToPgRow, securityLogToFirestoreObj, SECURITY_LOG_JSONB_COLUMNS, SECURITY_LOG_FIELD_MAP,
+  rateLimitToPgRow, rateLimitToFirestoreObj, RATE_LIMIT_JSONB_COLUMNS, RATE_LIMIT_FIELD_MAP,
+  publicToolUsageToPgRow, publicToolUsageToFirestoreObj, PUBLIC_TOOL_USAGE_JSONB_COLUMNS, PUBLIC_TOOL_USAGE_FIELD_MAP,
+  systemConfigToPgRow, systemConfigToFirestoreObj, SYSTEM_CONFIG_JSONB_COLUMNS, SYSTEM_CONFIG_FIELD_MAP,
   // GROUP J: Auth & OTP
-  emailOtpToPgRow, emailOtpToFirestoreObj, EMAIL_OTP_JSONB_COLUMNS,
-  otpVerificationToPgRow, otpVerificationToFirestoreObj, OTP_VERIFICATION_JSONB_COLUMNS,
-  demoRequestToPgRow, demoRequestToFirestoreObj, DEMO_REQUEST_JSONB_COLUMNS,
+  emailOtpToPgRow, emailOtpToFirestoreObj, EMAIL_OTP_JSONB_COLUMNS, EMAIL_OTP_FIELD_MAP,
+  otpVerificationToPgRow, otpVerificationToFirestoreObj, OTP_VERIFICATION_JSONB_COLUMNS, OTP_VERIFICATION_FIELD_MAP,
+  demoRequestToPgRow, demoRequestToFirestoreObj, DEMO_REQUEST_JSONB_COLUMNS, DEMO_REQUEST_FIELD_MAP,
   // GROUP K: AI & Chatbot
-  chatbotConvToPgRow, chatbotConvToFirestoreObj, CHATBOT_CONV_JSONB_COLUMNS,
-  conversationToPgRow, conversationToFirestoreObj, CONVERSATION_JSONB_COLUMNS,
-  ragKnowledgeToPgRow, ragKnowledgeToFirestoreObj, RAG_KNOWLEDGE_JSONB_COLUMNS,
-  tokenUsageToPgRow, tokenUsageToFirestoreObj, TOKEN_USAGE_JSONB_COLUMNS,
-  queryCacheToPgRow, queryCacheToFirestoreObj, QUERY_CACHE_JSONB_COLUMNS,
+  chatbotConvToPgRow, chatbotConvToFirestoreObj, CHATBOT_CONV_JSONB_COLUMNS, CHATBOT_CONV_FIELD_MAP,
+  conversationToPgRow, conversationToFirestoreObj, CONVERSATION_JSONB_COLUMNS, CONVERSATION_FIELD_MAP,
+  ragKnowledgeToPgRow, ragKnowledgeToFirestoreObj, RAG_KNOWLEDGE_JSONB_COLUMNS, RAG_KNOWLEDGE_FIELD_MAP,
+  tokenUsageToPgRow, tokenUsageToFirestoreObj, TOKEN_USAGE_JSONB_COLUMNS, TOKEN_USAGE_FIELD_MAP,
+  queryCacheToPgRow, queryCacheToFirestoreObj, QUERY_CACHE_JSONB_COLUMNS, QUERY_CACHE_FIELD_MAP,
   // GROUP L: Bar Inventory (systemMisc versions — inventory versions preferred)
   barBottleToPgRow, barBottleToFirestoreObj, BAR_BOTTLE_JSONB_COLUMNS,
   barReconciliationToPgRow, barReconciliationToFirestoreObj, BAR_RECONCILIATION_JSONB_COLUMNS,
   // GROUP M: Staff & Scheduling (systemMisc versions — register version preferred)
   staffAvailabilityToPgRow, staffAvailabilityToFirestoreObj, STAFF_AVAILABILITY_JSONB_COLUMNS,
-  staffLocationToPgRow, staffLocationToFirestoreObj, STAFF_LOCATION_JSONB_COLUMNS,
-  staffLocationLatestToPgRow, staffLocationLatestToFirestoreObj, STAFF_LOCATION_LATEST_JSONB_COLUMNS,
+  staffLocationToPgRow, staffLocationToFirestoreObj, STAFF_LOCATION_JSONB_COLUMNS, STAFF_LOCATION_FIELD_MAP,
+  staffLocationLatestToPgRow, staffLocationLatestToFirestoreObj, STAFF_LOCATION_LATEST_JSONB_COLUMNS, STAFF_LOCATION_LATEST_FIELD_MAP,
   // GROUP N: Miscellaneous
-  invoiceToPgRow: smInvoiceToPgRow, invoiceToFirestoreObj: smInvoiceToFirestoreObj, INVOICE_JSONB_COLUMNS: SM_INVOICE_JSONB_COLUMNS,
-  discountApprovalToPgRow, discountApprovalToFirestoreObj, DISCOUNT_APPROVAL_JSONB_COLUMNS,
-  ownerPrefToPgRow, ownerPrefToFirestoreObj, OWNER_PREF_JSONB_COLUMNS,
-  taxSettingsToPgRow, taxSettingsToFirestoreObj, TAX_SETTINGS_JSONB_COLUMNS,
-  staffToPgRow: smStaffToPgRow, staffToFirestoreObj: smStaffToFirestoreObj, STAFF_JSONB_COLUMNS: SM_STAFF_JSONB_COLUMNS,
-  couponToPgRow, couponToFirestoreObj, COUPON_JSONB_COLUMNS,
-  menuBulkDeleteLogToPgRow, menuBulkDeleteLogToFirestoreObj, MENU_BULK_DELETE_LOG_JSONB_COLUMNS,
-  aggregatorWebhookLogToPgRow, aggregatorWebhookLogToFirestoreObj, AGGREGATOR_WEBHOOK_LOG_JSONB_COLUMNS,
-  whatsappOrderLogToPgRow, whatsappOrderLogToFirestoreObj, WHATSAPP_ORDER_LOG_JSONB_COLUMNS,
-  d365SyncLogToPgRow, d365SyncLogToFirestoreObj, D365_SYNC_LOG_JSONB_COLUMNS,
+  invoiceToPgRow: smInvoiceToPgRow, invoiceToFirestoreObj: smInvoiceToFirestoreObj, INVOICE_JSONB_COLUMNS: SM_INVOICE_JSONB_COLUMNS, INVOICE_FIELD_MAP: SM_INVOICE_FIELD_MAP,
+  discountApprovalToPgRow, discountApprovalToFirestoreObj, DISCOUNT_APPROVAL_JSONB_COLUMNS, DISCOUNT_APPROVAL_FIELD_MAP,
+  ownerPrefToPgRow, ownerPrefToFirestoreObj, OWNER_PREF_JSONB_COLUMNS, OWNER_PREF_FIELD_MAP,
+  taxSettingsToPgRow, taxSettingsToFirestoreObj, TAX_SETTINGS_JSONB_COLUMNS, TAX_SETTINGS_FIELD_MAP,
+  staffToPgRow: smStaffToPgRow, staffToFirestoreObj: smStaffToFirestoreObj, STAFF_JSONB_COLUMNS: SM_STAFF_JSONB_COLUMNS, STAFF_FIELD_MAP: SM_STAFF_FIELD_MAP,
+  couponToPgRow, couponToFirestoreObj, COUPON_JSONB_COLUMNS, COUPON_FIELD_MAP,
+  menuBulkDeleteLogToPgRow, menuBulkDeleteLogToFirestoreObj, MENU_BULK_DELETE_LOG_JSONB_COLUMNS, MENU_BULK_DELETE_LOG_FIELD_MAP,
+  aggregatorWebhookLogToPgRow, aggregatorWebhookLogToFirestoreObj, AGGREGATOR_WEBHOOK_LOG_JSONB_COLUMNS, AGGREGATOR_WEBHOOK_LOG_FIELD_MAP,
+  whatsappOrderLogToPgRow, whatsappOrderLogToFirestoreObj, WHATSAPP_ORDER_LOG_JSONB_COLUMNS, WHATSAPP_ORDER_LOG_FIELD_MAP,
+  d365SyncLogToPgRow, d365SyncLogToFirestoreObj, D365_SYNC_LOG_JSONB_COLUMNS, D365_SYNC_LOG_FIELD_MAP,
 } = require('./systemMiscFieldMapper');
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -345,7 +345,7 @@ const {
 // Counter identity helpers (counters use counterRepo atomic ops)
 // ═══════════════════════════════════════════════════════════════════════════
 const counterIdentity = (obj) => obj;
-const COUNTER_JSONB = new Set();
+const COUNTER_JSONB = new Set(['extra_data']);
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Generic identity + JSONB set (for simple collections with no field mapper)
@@ -374,7 +374,7 @@ const REGISTRY = {
   'barReconciliation':      { table: 'bar_reconciliation',     fieldMap: invFM.barReconciliation.FIELD_MAP,     toPgRow: invFM.barReconciliation.toPgRow,     toFirestoreObj: invFM.barReconciliation.toFirestoreObj,     jsonbCols: invFM.barReconciliation.JSONB_COLUMNS },
 
   // ── dailyStats ──────────────────────────────────────────────────────────
-  'dailyStats': { table: 'daily_stats', fieldMap: DS_FIELD_MAP, toPgRow: dsToPgRow, toFirestoreObj: dsToFirestoreObj, jsonbCols: DS_JSONB_COLUMNS },
+  'dailyStats': { table: 'daily_stats', fieldMap: DS_FIELD_MAP, toPgRow: dsToPgRow, toFirestoreObj: dsToFirestoreObj, jsonbCols: DS_JSONB_COLUMNS, resolveKeyPath: dsResolveKeyPath },
 
   // ── floors & tables ─────────────────────────────────────────────────────
   'floors': { table: 'floors', fieldMap: FLOOR_FIELD_MAP, toPgRow: floorToPgRow, toFirestoreObj: floorToFirestoreObj, jsonbCols: FT_JSONB_COLUMNS, cacheTTL: 60 },
@@ -431,138 +431,144 @@ const REGISTRY = {
   'booking_venues':               { table: 'booking_venues',              fieldMap: BOOKING_VENUE_FIELD_MAP,   toPgRow: bookingVenueToPgRow,     toFirestoreObj: bookingVenueToFirestoreObj,     jsonbCols: BOOKING_VENUE_JSONB_COLUMNS },
   'booking-venues':               { table: 'booking_venues',              fieldMap: BOOKING_VENUE_FIELD_MAP,   toPgRow: bookingVenueToPgRow,     toFirestoreObj: bookingVenueToFirestoreObj,     jsonbCols: BOOKING_VENUE_JSONB_COLUMNS },
 
-  // ── invoice module (no FIELD_MAP — use {}) ──────────────────────────────
-  'inv_organizations':    { table: 'inv_organizations',    fieldMap: {}, toPgRow: invOrgToPgRow,      toFirestoreObj: invOrgToFirestoreObj,      jsonbCols: INV_ORG_JSONB_COLUMNS },
-  'inv_customers':        { table: 'inv_customers',        fieldMap: {}, toPgRow: invCustToPgRow,     toFirestoreObj: invCustToFirestoreObj,     jsonbCols: INV_CUST_JSONB_COLUMNS },
-  'inv_items':            { table: 'inv_items',            fieldMap: {}, toPgRow: invItemToPgRow,     toFirestoreObj: invItemToFirestoreObj,     jsonbCols: INV_ITEM_JSONB_COLUMNS },
-  'inv_invoices':         { table: 'inv_invoices',         fieldMap: {}, toPgRow: invInvoiceToPgRow,  toFirestoreObj: invInvoiceToFirestoreObj,  jsonbCols: INV_INVOICE_JSONB_COLUMNS },
-  'inv_quotes':           { table: 'inv_quotes',           fieldMap: {}, toPgRow: quoteToPgRow,       toFirestoreObj: quoteToFirestoreObj,       jsonbCols: QUOTE_JSONB_COLUMNS },
-  'inv_challans':         { table: 'inv_challans',         fieldMap: {}, toPgRow: challanToPgRow,     toFirestoreObj: challanToFirestoreObj,     jsonbCols: CHALLAN_JSONB_COLUMNS },
-  'inv_payments':         { table: 'inv_payments',         fieldMap: {}, toPgRow: invPaymentToPgRow,  toFirestoreObj: invPaymentToFirestoreObj,  jsonbCols: INV_PAYMENT_JSONB_COLUMNS },
-  'inv_expenses':         { table: 'inv_expenses',         fieldMap: {}, toPgRow: invExpenseToPgRow,  toFirestoreObj: invExpenseToFirestoreObj,  jsonbCols: INV_EXPENSE_JSONB_COLUMNS },
-  'inv_settings':         { table: 'inv_settings',         fieldMap: {}, toPgRow: settingsToPgRow,    toFirestoreObj: settingsToFirestoreObj,    jsonbCols: SETTINGS_JSONB_COLUMNS },
-  'inv_number_sequences': { table: 'inv_number_sequences', fieldMap: {}, toPgRow: numberSeqToPgRow,   toFirestoreObj: numberSeqToFirestoreObj,   jsonbCols: NUMBER_SEQ_JSONB_COLUMNS },
+  // ── invoice module ──────────────────────────────────────────────────────
+  'inv_organizations':    { table: 'inv_organizations',    fieldMap: INV_ORG_FIELD_MAP,     toPgRow: invOrgToPgRow,      toFirestoreObj: invOrgToFirestoreObj,      jsonbCols: INV_ORG_JSONB_COLUMNS },
+  'inv_customers':        { table: 'inv_customers',        fieldMap: INV_CUST_FIELD_MAP,    toPgRow: invCustToPgRow,     toFirestoreObj: invCustToFirestoreObj,     jsonbCols: INV_CUST_JSONB_COLUMNS },
+  'inv_items':            { table: 'inv_items',            fieldMap: INV_ITEM_FIELD_MAP,    toPgRow: invItemToPgRow,     toFirestoreObj: invItemToFirestoreObj,     jsonbCols: INV_ITEM_JSONB_COLUMNS },
+  'inv_invoices':         { table: 'inv_invoices',         fieldMap: INV_INVOICE_FIELD_MAP, toPgRow: invInvoiceToPgRow,  toFirestoreObj: invInvoiceToFirestoreObj,  jsonbCols: INV_INVOICE_JSONB_COLUMNS },
+  'inv_quotes':           { table: 'inv_quotes',           fieldMap: QUOTE_FIELD_MAP,       toPgRow: quoteToPgRow,       toFirestoreObj: quoteToFirestoreObj,       jsonbCols: QUOTE_JSONB_COLUMNS },
+  'inv_challans':         { table: 'inv_challans',         fieldMap: CHALLAN_FIELD_MAP,     toPgRow: challanToPgRow,     toFirestoreObj: challanToFirestoreObj,     jsonbCols: CHALLAN_JSONB_COLUMNS },
+  'inv_payments':         { table: 'inv_payments',         fieldMap: INV_PAYMENT_FIELD_MAP, toPgRow: invPaymentToPgRow,  toFirestoreObj: invPaymentToFirestoreObj,  jsonbCols: INV_PAYMENT_JSONB_COLUMNS },
+  'inv_expenses':         { table: 'inv_expenses',         fieldMap: INV_EXPENSE_FIELD_MAP, toPgRow: invExpenseToPgRow,  toFirestoreObj: invExpenseToFirestoreObj,  jsonbCols: INV_EXPENSE_JSONB_COLUMNS },
+  'inv_settings':         { table: 'inv_settings',         fieldMap: SETTINGS_FIELD_MAP,    toPgRow: settingsToPgRow,    toFirestoreObj: settingsToFirestoreObj,    jsonbCols: SETTINGS_JSONB_COLUMNS },
+  'inv_number_sequences': { table: 'inv_number_sequences', fieldMap: NUMBER_SEQ_FIELD_MAP,  toPgRow: numberSeqToPgRow,   toFirestoreObj: numberSeqToFirestoreObj,   jsonbCols: NUMBER_SEQ_JSONB_COLUMNS },
 
-  // ── enterprise (no FIELD_MAP — use {}) ──────────────────────────────────
-  'organizations':     { table: 'ent_organizations',  fieldMap: {}, toPgRow: entOrgToPgRow,           toFirestoreObj: entOrgToFirestoreObj,           jsonbCols: ENT_ORG_JSONB_COLUMNS },
-  'orgMenuTemplates':  { table: 'org_menu_templates', fieldMap: {}, toPgRow: menuTemplateToPgRow,     toFirestoreObj: menuTemplateToFirestoreObj,     jsonbCols: MENU_TEMPLATE_JSONB_COLUMNS },
-  'orgMenuItems':      { table: 'org_menu_items',     fieldMap: {}, toPgRow: entMenuItemToPgRow,      toFirestoreObj: entMenuItemToFirestoreObj,      jsonbCols: ENT_MENU_ITEM_JSONB_COLUMNS },
-  'indentRequests':    { table: 'indent_requests',    fieldMap: {}, toPgRow: indentToPgRow,           toFirestoreObj: indentToFirestoreObj,           jsonbCols: INDENT_JSONB_COLUMNS },
-  'productionOrders':  { table: 'production_orders',  fieldMap: {}, toPgRow: productionOrderToPgRow,  toFirestoreObj: productionOrderToFirestoreObj,  jsonbCols: PRODUCTION_ORDER_JSONB_COLUMNS },
-  'distributionPlans': { table: 'distribution_plans', fieldMap: {}, toPgRow: distributionPlanToPgRow, toFirestoreObj: distributionPlanToFirestoreObj, jsonbCols: DISTRIBUTION_PLAN_JSONB_COLUMNS },
-  'orgSettings':       { table: 'org_settings',       fieldMap: {}, toPgRow: orgSettingsToPgRow,      toFirestoreObj: orgSettingsToFirestoreObj,      jsonbCols: ORG_SETTINGS_JSONB_COLUMNS },
-  'orgAuditLog':       { table: 'org_audit_log',      fieldMap: {}, toPgRow: auditLogToPgRow,         toFirestoreObj: auditLogToFirestoreObj,         jsonbCols: AUDIT_LOG_JSONB_COLUMNS },
+  // ── enterprise ──────────────────────────────────────────────────────────
+  'organizations':     { table: 'ent_organizations',  fieldMap: ENT_ORG_FIELD_MAP,           toPgRow: entOrgToPgRow,           toFirestoreObj: entOrgToFirestoreObj,           jsonbCols: ENT_ORG_JSONB_COLUMNS },
+  'orgMenuTemplates':  { table: 'org_menu_templates', fieldMap: MENU_TEMPLATE_FIELD_MAP,     toPgRow: menuTemplateToPgRow,     toFirestoreObj: menuTemplateToFirestoreObj,     jsonbCols: MENU_TEMPLATE_JSONB_COLUMNS },
+  'orgMenuItems':      { table: 'org_menu_items',     fieldMap: ENT_MENU_ITEM_FIELD_MAP,     toPgRow: entMenuItemToPgRow,      toFirestoreObj: entMenuItemToFirestoreObj,      jsonbCols: ENT_MENU_ITEM_JSONB_COLUMNS },
+  'indentRequests':    { table: 'indent_requests',    fieldMap: INDENT_FIELD_MAP,            toPgRow: indentToPgRow,           toFirestoreObj: indentToFirestoreObj,           jsonbCols: INDENT_JSONB_COLUMNS },
+  'productionOrders':  { table: 'production_orders',  fieldMap: PRODUCTION_ORDER_FIELD_MAP,  toPgRow: productionOrderToPgRow,  toFirestoreObj: productionOrderToFirestoreObj,  jsonbCols: PRODUCTION_ORDER_JSONB_COLUMNS },
+  'distributionPlans': { table: 'distribution_plans', fieldMap: DISTRIBUTION_PLAN_FIELD_MAP, toPgRow: distributionPlanToPgRow, toFirestoreObj: distributionPlanToFirestoreObj, jsonbCols: DISTRIBUTION_PLAN_JSONB_COLUMNS },
+  'orgSettings':       { table: 'org_settings',       fieldMap: ORG_SETTINGS_FIELD_MAP,      toPgRow: orgSettingsToPgRow,      toFirestoreObj: orgSettingsToFirestoreObj,      jsonbCols: ORG_SETTINGS_JSONB_COLUMNS },
+  'orgAuditLog':       { table: 'org_audit_log',      fieldMap: AUDIT_LOG_FIELD_MAP,         toPgRow: auditLogToPgRow,         toFirestoreObj: auditLogToFirestoreObj,         jsonbCols: AUDIT_LOG_JSONB_COLUMNS },
 
-  // ── AI & automation (no FIELD_MAP — use {}) ─────────────────────────────
-  'bolnaAgents':                { table: 'bolna_agents',              fieldMap: {}, toPgRow: bolnaAgentToPgRow,           toFirestoreObj: bolnaAgentToFirestoreObj,           jsonbCols: BOLNA_AGENT_JSONB_COLUMNS },
-  'phoneCalls':                 { table: 'phone_calls',              fieldMap: {}, toPgRow: phoneCallToPgRow,            toFirestoreObj: phoneCallToFirestoreObj,            jsonbCols: PHONE_CALL_JSONB_COLUMNS },
-  'dineai_settings':            { table: 'dineai_settings',          fieldMap: {}, toPgRow: dineaiSettingsToPgRow,       toFirestoreObj: dineaiSettingsToFirestoreObj,       jsonbCols: DINEAI_SETTINGS_JSONB_COLUMNS },
-  'dineai_usage':               { table: 'dineai_usage',            fieldMap: {}, toPgRow: dineaiUsageToPgRow,          toFirestoreObj: dineaiUsageToFirestoreObj,          jsonbCols: DINEAI_USAGE_JSONB_COLUMNS },
-  'dineai_knowledge':           { table: 'dineai_knowledge',        fieldMap: {}, toPgRow: dineaiKnowledgeToPgRow,      toFirestoreObj: dineaiKnowledgeToFirestoreObj,      jsonbCols: DINEAI_KNOWLEDGE_JSONB_COLUMNS },
-  'dineai_realtime_sessions':   { table: 'dineai_realtime_sessions', fieldMap: {}, toPgRow: dineaiRtSessionToPgRow,     toFirestoreObj: dineaiRtSessionToFirestoreObj,     jsonbCols: DINEAI_RT_SESSION_JSONB_COLUMNS },
-  'dineai_cheap_sessions':      { table: 'dineai_cheap_sessions',   fieldMap: {}, toPgRow: dineaiCheapSessionToPgRow,   toFirestoreObj: dineaiCheapSessionToFirestoreObj,   jsonbCols: DINEAI_CHEAP_SESSION_JSONB_COLUMNS },
-  'chatgptUsage':               { table: 'chatgpt_usage',           fieldMap: {}, toPgRow: chatgptUsageToPgRow,         toFirestoreObj: chatgptUsageToFirestoreObj,         jsonbCols: CHATGPT_USAGE_JSONB_COLUMNS },
-  'aiUsage':                    { table: 'ai_usage',                fieldMap: {}, toPgRow: aiUsageToPgRow,              toFirestoreObj: aiUsageToFirestoreObj,              jsonbCols: AI_USAGE_JSONB_COLUMNS },
-  'aiInsightsUsage':            { table: 'ai_insights_usage',       fieldMap: {}, toPgRow: aiInsightsUsageToPgRow,      toFirestoreObj: aiInsightsUsageToFirestoreObj,      jsonbCols: AI_INSIGHTS_USAGE_JSONB_COLUMNS },
-  'googleReviewSettings':       { table: 'google_review_settings',  fieldMap: {}, toPgRow: googleReviewSettingsToPgRow, toFirestoreObj: googleReviewSettingsToFirestoreObj, jsonbCols: GOOGLE_REVIEW_SETTINGS_JSONB_COLUMNS },
-  'googleReviewsCache':         { table: 'google_reviews_cache',    fieldMap: {}, toPgRow: googleReviewsCacheToPgRow,   toFirestoreObj: googleReviewsCacheToFirestoreObj,   jsonbCols: GOOGLE_REVIEWS_CACHE_JSONB_COLUMNS },
-  'googleBusinessTokens':       { table: 'google_business_tokens',  fieldMap: {}, toPgRow: googleBizTokensToPgRow,      toFirestoreObj: googleBizTokensToFirestoreObj,      jsonbCols: GOOGLE_BIZ_TOKENS_JSONB_COLUMNS },
-  'whatsappOrderingConfig':     { table: 'whatsapp_ordering_config', fieldMap: {}, toPgRow: whatsappConfigToPgRow,      toFirestoreObj: whatsappConfigToFirestoreObj,      jsonbCols: WHATSAPP_CONFIG_JSONB_COLUMNS },
-  'whatsappConversationLogs':   { table: 'whatsapp_conversation_logs', fieldMap: {}, toPgRow: whatsappLogToPgRow,       toFirestoreObj: whatsappLogToFirestoreObj,         jsonbCols: WHATSAPP_LOG_JSONB_COLUMNS },
-  'automations':                { table: 'automations',             fieldMap: {}, toPgRow: automationToPgRow,           toFirestoreObj: automationToFirestoreObj,           jsonbCols: AUTOMATION_JSONB_COLUMNS },
-  'automation-templates':       { table: 'automation_templates',    fieldMap: {}, toPgRow: automationTemplateToPgRow,   toFirestoreObj: automationTemplateToFirestoreObj,   jsonbCols: AUTOMATION_TEMPLATE_JSONB_COLUMNS },
-  'automationTemplates':        { table: 'automation_templates',    fieldMap: {}, toPgRow: automationTemplateToPgRow,   toFirestoreObj: automationTemplateToFirestoreObj,   jsonbCols: AUTOMATION_TEMPLATE_JSONB_COLUMNS },
-  'automation-settings':        { table: 'automation_settings',     fieldMap: {}, toPgRow: automationSettingsToPgRow,   toFirestoreObj: automationSettingsToFirestoreObj,   jsonbCols: AUTOMATION_SETTINGS_JSONB_COLUMNS },
-  'automation-logs':            { table: 'automation_logs',         fieldMap: {}, toPgRow: automationLogToPgRow,        toFirestoreObj: automationLogToFirestoreObj,        jsonbCols: AUTOMATION_LOG_JSONB_COLUMNS },
+  // ── AI & automation ─────────────────────────────────────────────────────
+  'bolnaAgents':                { table: 'bolna_agents',              fieldMap: BOLNA_AGENT_FIELD_MAP, toPgRow: bolnaAgentToPgRow,           toFirestoreObj: bolnaAgentToFirestoreObj,           jsonbCols: BOLNA_AGENT_JSONB_COLUMNS },
+  'phoneCalls':                 { table: 'phone_calls',              fieldMap: PHONE_CALL_FIELD_MAP, toPgRow: phoneCallToPgRow,            toFirestoreObj: phoneCallToFirestoreObj,            jsonbCols: PHONE_CALL_JSONB_COLUMNS },
+  'dineai_settings':            { table: 'dineai_settings',          fieldMap: DINEAI_SETTINGS_FIELD_MAP, toPgRow: dineaiSettingsToPgRow,       toFirestoreObj: dineaiSettingsToFirestoreObj,       jsonbCols: DINEAI_SETTINGS_JSONB_COLUMNS },
+  'dineai_usage':               { table: 'dineai_usage',            fieldMap: DINEAI_USAGE_FIELD_MAP, toPgRow: dineaiUsageToPgRow,          toFirestoreObj: dineaiUsageToFirestoreObj,          jsonbCols: DINEAI_USAGE_JSONB_COLUMNS },
+  'dineai_knowledge':           { table: 'dineai_knowledge',        fieldMap: DINEAI_KNOWLEDGE_FIELD_MAP, toPgRow: dineaiKnowledgeToPgRow,      toFirestoreObj: dineaiKnowledgeToFirestoreObj,      jsonbCols: DINEAI_KNOWLEDGE_JSONB_COLUMNS },
+  'dineai_realtime_sessions':   { table: 'dineai_realtime_sessions', fieldMap: DINEAI_RT_SESSION_FIELD_MAP, toPgRow: dineaiRtSessionToPgRow,     toFirestoreObj: dineaiRtSessionToFirestoreObj,     jsonbCols: DINEAI_RT_SESSION_JSONB_COLUMNS },
+  'dineai_cheap_sessions':      { table: 'dineai_cheap_sessions',   fieldMap: DINEAI_CHEAP_SESSION_FIELD_MAP, toPgRow: dineaiCheapSessionToPgRow,   toFirestoreObj: dineaiCheapSessionToFirestoreObj,   jsonbCols: DINEAI_CHEAP_SESSION_JSONB_COLUMNS },
+  'chatgptUsage':               { table: 'chatgpt_usage',           fieldMap: CHATGPT_USAGE_FIELD_MAP, toPgRow: chatgptUsageToPgRow,         toFirestoreObj: chatgptUsageToFirestoreObj,         jsonbCols: CHATGPT_USAGE_JSONB_COLUMNS },
+  'aiUsage':                    { table: 'ai_usage',                fieldMap: AI_USAGE_FIELD_MAP, toPgRow: aiUsageToPgRow,              toFirestoreObj: aiUsageToFirestoreObj,              jsonbCols: AI_USAGE_JSONB_COLUMNS },
+  'aiInsightsUsage':            { table: 'ai_insights_usage',       fieldMap: AI_INSIGHTS_USAGE_FIELD_MAP, toPgRow: aiInsightsUsageToPgRow,      toFirestoreObj: aiInsightsUsageToFirestoreObj,      jsonbCols: AI_INSIGHTS_USAGE_JSONB_COLUMNS },
+  'googleReviewSettings':       { table: 'google_review_settings',  fieldMap: GOOGLE_REVIEW_SETTINGS_FIELD_MAP, toPgRow: googleReviewSettingsToPgRow, toFirestoreObj: googleReviewSettingsToFirestoreObj, jsonbCols: GOOGLE_REVIEW_SETTINGS_JSONB_COLUMNS },
+  'googleReviewsCache':         { table: 'google_reviews_cache',    fieldMap: GOOGLE_REVIEWS_CACHE_FIELD_MAP, toPgRow: googleReviewsCacheToPgRow,   toFirestoreObj: googleReviewsCacheToFirestoreObj,   jsonbCols: GOOGLE_REVIEWS_CACHE_JSONB_COLUMNS },
+  'googleBusinessTokens':       { table: 'google_business_tokens',  fieldMap: GOOGLE_BIZ_TOKENS_FIELD_MAP, toPgRow: googleBizTokensToPgRow,      toFirestoreObj: googleBizTokensToFirestoreObj,      jsonbCols: GOOGLE_BIZ_TOKENS_JSONB_COLUMNS },
+  'whatsappOrderingConfig':     { table: 'whatsapp_ordering_config', fieldMap: WHATSAPP_CONFIG_FIELD_MAP, toPgRow: whatsappConfigToPgRow,      toFirestoreObj: whatsappConfigToFirestoreObj,      jsonbCols: WHATSAPP_CONFIG_JSONB_COLUMNS },
+  'whatsappConversationLogs':   { table: 'whatsapp_conversation_logs', fieldMap: WHATSAPP_LOG_FIELD_MAP, toPgRow: whatsappLogToPgRow,       toFirestoreObj: whatsappLogToFirestoreObj,         jsonbCols: WHATSAPP_LOG_JSONB_COLUMNS },
+  'automations':                { table: 'automations',             fieldMap: AUTOMATION_FIELD_MAP, toPgRow: automationToPgRow,           toFirestoreObj: automationToFirestoreObj,           jsonbCols: AUTOMATION_JSONB_COLUMNS },
+  'automation-templates':       { table: 'automation_templates',    fieldMap: AUTOMATION_TEMPLATE_FIELD_MAP, toPgRow: automationTemplateToPgRow,   toFirestoreObj: automationTemplateToFirestoreObj,   jsonbCols: AUTOMATION_TEMPLATE_JSONB_COLUMNS },
+  'automationTemplates':        { table: 'automation_templates',    fieldMap: AUTOMATION_TEMPLATE_FIELD_MAP, toPgRow: automationTemplateToPgRow,   toFirestoreObj: automationTemplateToFirestoreObj,   jsonbCols: AUTOMATION_TEMPLATE_JSONB_COLUMNS },
+  'automation-settings':        { table: 'automation_settings',     fieldMap: AUTOMATION_SETTINGS_FIELD_MAP, toPgRow: automationSettingsToPgRow,   toFirestoreObj: automationSettingsToFirestoreObj,   jsonbCols: AUTOMATION_SETTINGS_JSONB_COLUMNS },
+  'automation-logs':            { table: 'automation_logs',         fieldMap: AUTOMATION_LOG_FIELD_MAP, toPgRow: automationLogToPgRow,        toFirestoreObj: automationLogToFirestoreObj,        jsonbCols: AUTOMATION_LOG_JSONB_COLUMNS },
 
-  // ── system & misc (no FIELD_MAP — use {}) ───────────────────────────────
+  // ── system & misc ───────────────────────────────────────────────────────
   // Supply Chain
-  'suppliers':              { table: 'suppliers',             fieldMap: {}, toPgRow: supplierToPgRow,        toFirestoreObj: supplierToFirestoreObj,        jsonbCols: SUPPLIER_JSONB_COLUMNS },
-  'purchaseOrders':         { table: 'purchase_orders',       fieldMap: {}, toPgRow: poToPgRow,              toFirestoreObj: poToFirestoreObj,              jsonbCols: PO_JSONB_COLUMNS },
-  'purchase-requisitions':  { table: 'purchase_requisitions', fieldMap: {}, toPgRow: requisitionToPgRow,     toFirestoreObj: requisitionToFirestoreObj,     jsonbCols: REQUISITION_JSONB_COLUMNS },
-  'goods-receipt-notes':    { table: 'goods_receipt_notes',   fieldMap: {}, toPgRow: grnToPgRow,             toFirestoreObj: grnToFirestoreObj,             jsonbCols: GRN_JSONB_COLUMNS },
-  'supplier-returns':       { table: 'supplier_returns',      fieldMap: {}, toPgRow: supplierReturnToPgRow,  toFirestoreObj: supplierReturnToFirestoreObj,  jsonbCols: SUPPLIER_RETURN_JSONB_COLUMNS },
-  'stock-transfers':        { table: 'stock_transfers',       fieldMap: {}, toPgRow: stockTransferToPgRow,   toFirestoreObj: stockTransferToFirestoreObj,   jsonbCols: STOCK_TRANSFER_JSONB_COLUMNS },
-  'supplier-performance':   { table: 'supplier_performance',  fieldMap: {}, toPgRow: supplierPerfToPgRow,    toFirestoreObj: supplierPerfToFirestoreObj,    jsonbCols: SUPPLIER_PERF_JSONB_COLUMNS },
-  'supplier-invoices':      { table: 'supplier_invoices',     fieldMap: {}, toPgRow: supplierInvoiceToPgRow, toFirestoreObj: supplierInvoiceToFirestoreObj, jsonbCols: SUPPLIER_INVOICE_JSONB_COLUMNS },
+  'suppliers':              { table: 'suppliers',             fieldMap: SUPPLIER_FIELD_MAP,         toPgRow: supplierToPgRow,        toFirestoreObj: supplierToFirestoreObj,        jsonbCols: SUPPLIER_JSONB_COLUMNS },
+  'purchaseOrders':         { table: 'purchase_orders',       fieldMap: PO_FIELD_MAP,               toPgRow: poToPgRow,              toFirestoreObj: poToFirestoreObj,              jsonbCols: PO_JSONB_COLUMNS },
+  'purchase-requisitions':  { table: 'purchase_requisitions', fieldMap: REQUISITION_FIELD_MAP,      toPgRow: requisitionToPgRow,     toFirestoreObj: requisitionToFirestoreObj,     jsonbCols: REQUISITION_JSONB_COLUMNS },
+  'goods-receipt-notes':    { table: 'goods_receipt_notes',   fieldMap: GRN_FIELD_MAP,              toPgRow: grnToPgRow,             toFirestoreObj: grnToFirestoreObj,             jsonbCols: GRN_JSONB_COLUMNS },
+  'supplier-returns':       { table: 'supplier_returns',      fieldMap: SUPPLIER_RETURN_FIELD_MAP,  toPgRow: supplierReturnToPgRow,  toFirestoreObj: supplierReturnToFirestoreObj,  jsonbCols: SUPPLIER_RETURN_JSONB_COLUMNS },
+  'stock-transfers':        { table: 'stock_transfers',       fieldMap: STOCK_TRANSFER_FIELD_MAP,   toPgRow: stockTransferToPgRow,   toFirestoreObj: stockTransferToFirestoreObj,   jsonbCols: STOCK_TRANSFER_JSONB_COLUMNS },
+  'supplier-performance':   { table: 'supplier_performance',  fieldMap: SUPPLIER_PERF_FIELD_MAP,    toPgRow: supplierPerfToPgRow,    toFirestoreObj: supplierPerfToFirestoreObj,    jsonbCols: SUPPLIER_PERF_JSONB_COLUMNS },
+  'supplier-invoices':      { table: 'supplier_invoices',     fieldMap: SUPPLIER_INVOICE_FIELD_MAP, toPgRow: supplierInvoiceToPgRow, toFirestoreObj: supplierInvoiceToFirestoreObj, jsonbCols: SUPPLIER_INVOICE_JSONB_COLUMNS },
 
   // Feedback & Customer
-  'feedbackForms':     { table: 'feedback_forms',     fieldMap: {}, toPgRow: feedbackFormToPgRow,     toFirestoreObj: feedbackFormToFirestoreObj,     jsonbCols: FEEDBACK_FORM_JSONB_COLUMNS },
-  'feedbackResponses': { table: 'feedback_responses', fieldMap: {}, toPgRow: feedbackResponseToPgRow, toFirestoreObj: feedbackResponseToFirestoreObj, jsonbCols: FEEDBACK_RESPONSE_JSONB_COLUMNS },
-  'customerGroups':    { table: 'customer_groups',    fieldMap: {}, toPgRow: customerGroupToPgRow,    toFirestoreObj: customerGroupToFirestoreObj,    jsonbCols: CUSTOMER_GROUP_JSONB_COLUMNS },
-  'customer-segments': { table: 'customer_groups',    fieldMap: {}, toPgRow: customerGroupToPgRow,    toFirestoreObj: customerGroupToFirestoreObj,    jsonbCols: CUSTOMER_GROUP_JSONB_COLUMNS },
-  'customerSegments':  { table: 'customer_groups',    fieldMap: {}, toPgRow: customerGroupToPgRow,    toFirestoreObj: customerGroupToFirestoreObj,    jsonbCols: CUSTOMER_GROUP_JSONB_COLUMNS },
+  'feedbackForms':     { table: 'feedback_forms',     fieldMap: FEEDBACK_FORM_FIELD_MAP,     toPgRow: feedbackFormToPgRow,     toFirestoreObj: feedbackFormToFirestoreObj,     jsonbCols: FEEDBACK_FORM_JSONB_COLUMNS },
+  'feedbackResponses': { table: 'feedback_responses', fieldMap: FEEDBACK_RESPONSE_FIELD_MAP, toPgRow: feedbackResponseToPgRow, toFirestoreObj: feedbackResponseToFirestoreObj, jsonbCols: FEEDBACK_RESPONSE_JSONB_COLUMNS },
+  'customerGroups':    { table: 'customer_groups',    fieldMap: CUSTOMER_GROUP_FIELD_MAP,    toPgRow: customerGroupToPgRow,    toFirestoreObj: customerGroupToFirestoreObj,    jsonbCols: CUSTOMER_GROUP_JSONB_COLUMNS },
+  'customer-segments': { table: 'customer_groups',    fieldMap: CUSTOMER_GROUP_FIELD_MAP,    toPgRow: customerGroupToPgRow,    toFirestoreObj: customerGroupToFirestoreObj,    jsonbCols: CUSTOMER_GROUP_JSONB_COLUMNS },
+  'customerSegments':  { table: 'customer_groups',    fieldMap: CUSTOMER_GROUP_FIELD_MAP,    toPgRow: customerGroupToPgRow,    toFirestoreObj: customerGroupToFirestoreObj,    jsonbCols: CUSTOMER_GROUP_JSONB_COLUMNS },
 
   // Booking & Space (systemMisc versions)
-  'bookings':       { table: 'rest_bookings',        fieldMap: {}, toPgRow: bookingToPgRow,        toFirestoreObj: bookingToFirestoreObj,        jsonbCols: BOOKING_JSONB_COLUMNS },
-  'booking_venues': { table: 'rest_booking_venues',  fieldMap: {}, toPgRow: smBookingVenueToPgRow, toFirestoreObj: smBookingVenueToFirestoreObj, jsonbCols: SM_BOOKING_VENUE_JSONB_COLUMNS },
-  'spaceBookings':  { table: 'space_bookings',       fieldMap: {}, toPgRow: spaceBookingToPgRow,   toFirestoreObj: spaceBookingToFirestoreObj,   jsonbCols: SPACE_BOOKING_JSONB_COLUMNS },
+  // NOTE: the 'booking_venues' / 'bookingVenues' / 'booking-venues' aliases all live in
+  // the hotel & bookings section above and point to the `booking_venues` table.
+  // The old duplicate here (→ rest_booking_venues) was removed — it silently shadowed
+  // the hotel-booking config and split venue data across two tables.
+  'bookings':       { table: 'rest_bookings',        fieldMap: BOOKING_FIELD_MAP,       toPgRow: bookingToPgRow,        toFirestoreObj: bookingToFirestoreObj,        jsonbCols: BOOKING_JSONB_COLUMNS },
+  'spaceBookings':  { table: 'space_bookings',       fieldMap: SPACE_BOOKING_FIELD_MAP, toPgRow: spaceBookingToPgRow,   toFirestoreObj: spaceBookingToFirestoreObj,   jsonbCols: SPACE_BOOKING_JSONB_COLUMNS },
 
   // Parking
-  'parkingConfigs':  { table: 'parking_configs',  fieldMap: {}, toPgRow: parkingConfigToPgRow, toFirestoreObj: parkingConfigToFirestoreObj, jsonbCols: PARKING_CONFIG_JSONB_COLUMNS },
-  'parkingZones':    { table: 'parking_zones',    fieldMap: {}, toPgRow: parkingZoneToPgRow,   toFirestoreObj: parkingZoneToFirestoreObj,   jsonbCols: PARKING_ZONE_JSONB_COLUMNS },
-  'parkingSlots':    { table: 'parking_slots',    fieldMap: {}, toPgRow: parkingSlotToPgRow,   toFirestoreObj: parkingSlotToFirestoreObj,   jsonbCols: PARKING_SLOT_JSONB_COLUMNS },
-  'parkingTickets':  { table: 'parking_tickets',  fieldMap: {}, toPgRow: parkingTicketToPgRow, toFirestoreObj: parkingTicketToFirestoreObj, jsonbCols: PARKING_TICKET_JSONB_COLUMNS },
-  'parkingRates':    { table: 'parking_rates',    fieldMap: {}, toPgRow: parkingRateToPgRow,   toFirestoreObj: parkingRateToFirestoreObj,   jsonbCols: PARKING_RATE_JSONB_COLUMNS },
+  'parkingConfigs':  { table: 'parking_configs',  fieldMap: PARKING_CONFIG_FIELD_MAP, toPgRow: parkingConfigToPgRow, toFirestoreObj: parkingConfigToFirestoreObj, jsonbCols: PARKING_CONFIG_JSONB_COLUMNS },
+  'parkingZones':    { table: 'parking_zones',    fieldMap: PARKING_ZONE_FIELD_MAP,   toPgRow: parkingZoneToPgRow,   toFirestoreObj: parkingZoneToFirestoreObj,   jsonbCols: PARKING_ZONE_JSONB_COLUMNS },
+  'parkingSlots':    { table: 'parking_slots',    fieldMap: PARKING_SLOT_FIELD_MAP,   toPgRow: parkingSlotToPgRow,   toFirestoreObj: parkingSlotToFirestoreObj,   jsonbCols: PARKING_SLOT_JSONB_COLUMNS },
+  'parkingTickets':  { table: 'parking_tickets',  fieldMap: PARKING_TICKET_FIELD_MAP, toPgRow: parkingTicketToPgRow, toFirestoreObj: parkingTicketToFirestoreObj, jsonbCols: PARKING_TICKET_JSONB_COLUMNS },
+  'parkingRates':    { table: 'parking_rates',    fieldMap: PARKING_RATE_FIELD_MAP,   toPgRow: parkingRateToPgRow,   toFirestoreObj: parkingRateToFirestoreObj,   jsonbCols: PARKING_RATE_JSONB_COLUMNS },
 
   // Settings
-  'restaurantSettings': { table: 'restaurant_settings', fieldMap: {}, toPgRow: restaurantSettingsToPgRow, toFirestoreObj: restaurantSettingsToFirestoreObj, jsonbCols: RESTAURANT_SETTINGS_JSONB_COLUMNS },
-  'discountSettings':   { table: 'discount_settings',   fieldMap: {}, toPgRow: discountSettingsToPgRow,   toFirestoreObj: discountSettingsToFirestoreObj,   jsonbCols: DISCOUNT_SETTINGS_JSONB_COLUMNS },
+  'restaurantSettings': { table: 'restaurant_settings', fieldMap: RESTAURANT_SETTINGS_FIELD_MAP, toPgRow: restaurantSettingsToPgRow, toFirestoreObj: restaurantSettingsToFirestoreObj, jsonbCols: RESTAURANT_SETTINGS_JSONB_COLUMNS },
+  'discountSettings':   { table: 'discount_settings',   fieldMap: DISCOUNT_SETTINGS_FIELD_MAP,   toPgRow: discountSettingsToPgRow,   toFirestoreObj: discountSettingsToFirestoreObj,   jsonbCols: DISCOUNT_SETTINGS_JSONB_COLUMNS },
 
   // Payment & Billing (generic POS payments, dodo, etc.)
-  'payments':                  { table: 'pos_payments',            fieldMap: {}, toPgRow: smPaymentToPgRow,      toFirestoreObj: smPaymentToFirestoreObj,      jsonbCols: SM_PAYMENT_JSONB_COLUMNS },
-  'razorpay_tokens':           { table: 'razorpay_tokens',         fieldMap: {}, toPgRow: razorpayTokenToPgRow,   toFirestoreObj: razorpayTokenToFirestoreObj,   jsonbCols: RAZORPAY_TOKEN_JSONB_COLUMNS },
-  'dine_dodo_orders':          { table: 'dine_dodo_orders',        fieldMap: {}, toPgRow: dodoOrderToPgRow,       toFirestoreObj: dodoOrderToFirestoreObj,       jsonbCols: DODO_ORDER_JSONB_COLUMNS },
-  'dine_dodo_billing':         { table: 'dine_dodo_billing',       fieldMap: {}, toPgRow: dodoBillingToPgRow,     toFirestoreObj: dodoBillingToFirestoreObj,     jsonbCols: DODO_BILLING_JSONB_COLUMNS },
-  'dine_dodo_refunds':         { table: 'dine_dodo_refunds',       fieldMap: {}, toPgRow: dodoRefundToPgRow,      toFirestoreObj: dodoRefundToFirestoreObj,      jsonbCols: DODO_REFUND_JSONB_COLUMNS },
-  'dine_dodo_disputes':        { table: 'dine_dodo_disputes',      fieldMap: {}, toPgRow: dodoDisputeToPgRow,     toFirestoreObj: dodoDisputeToFirestoreObj,     jsonbCols: DODO_DISPUTE_JSONB_COLUMNS },
-  'dine_dodo_webhook_events':  { table: 'dine_dodo_webhook_events', fieldMap: {}, toPgRow: dodoWebhookToPgRow,   toFirestoreObj: dodoWebhookToFirestoreObj,   jsonbCols: DODO_WEBHOOK_JSONB_COLUMNS },
-  'dine_webhook_events':       { table: 'dine_webhook_events',     fieldMap: {}, toPgRow: dineWebhookToPgRow,     toFirestoreObj: dineWebhookToFirestoreObj,     jsonbCols: DINE_WEBHOOK_JSONB_COLUMNS },
+  'payments':                  { table: 'pos_payments',            fieldMap: SM_PAYMENT_FIELD_MAP,     toPgRow: smPaymentToPgRow,      toFirestoreObj: smPaymentToFirestoreObj,      jsonbCols: SM_PAYMENT_JSONB_COLUMNS },
+  'razorpay_tokens':           { table: 'razorpay_tokens',         fieldMap: RAZORPAY_TOKEN_FIELD_MAP, toPgRow: razorpayTokenToPgRow,   toFirestoreObj: razorpayTokenToFirestoreObj,   jsonbCols: RAZORPAY_TOKEN_JSONB_COLUMNS },
+  'dine_dodo_orders':          { table: 'dine_dodo_orders',        fieldMap: DODO_ORDER_FIELD_MAP,     toPgRow: dodoOrderToPgRow,       toFirestoreObj: dodoOrderToFirestoreObj,       jsonbCols: DODO_ORDER_JSONB_COLUMNS },
+  'dine_dodo_billing':         { table: 'dine_dodo_billing',       fieldMap: DODO_BILLING_FIELD_MAP,   toPgRow: dodoBillingToPgRow,     toFirestoreObj: dodoBillingToFirestoreObj,     jsonbCols: DODO_BILLING_JSONB_COLUMNS },
+  'dine_dodo_refunds':         { table: 'dine_dodo_refunds',       fieldMap: DODO_REFUND_FIELD_MAP,    toPgRow: dodoRefundToPgRow,      toFirestoreObj: dodoRefundToFirestoreObj,      jsonbCols: DODO_REFUND_JSONB_COLUMNS },
+  'dine_dodo_disputes':        { table: 'dine_dodo_disputes',      fieldMap: DODO_DISPUTE_FIELD_MAP,   toPgRow: dodoDisputeToPgRow,     toFirestoreObj: dodoDisputeToFirestoreObj,     jsonbCols: DODO_DISPUTE_JSONB_COLUMNS },
+  'dine_dodo_webhook_events':  { table: 'dine_dodo_webhook_events', fieldMap: DODO_WEBHOOK_FIELD_MAP,  toPgRow: dodoWebhookToPgRow,   toFirestoreObj: dodoWebhookToFirestoreObj,   jsonbCols: DODO_WEBHOOK_JSONB_COLUMNS },
+  'dine_webhook_events':       { table: 'dine_webhook_events',     fieldMap: DINE_WEBHOOK_FIELD_MAP,   toPgRow: dineWebhookToPgRow,     toFirestoreObj: dineWebhookToFirestoreObj,     jsonbCols: DINE_WEBHOOK_JSONB_COLUMNS },
 
   // Cart & Idempotency
-  'saved_carts':       { table: 'saved_carts',       fieldMap: {}, toPgRow: savedCartToPgRow,       toFirestoreObj: savedCartToFirestoreObj,       jsonbCols: SAVED_CART_JSONB_COLUMNS },
-  'idempotency_keys':  { table: 'idempotency_keys',  fieldMap: {}, toPgRow: idempotencyKeyToPgRow,  toFirestoreObj: idempotencyKeyToFirestoreObj,  jsonbCols: IDEMPOTENCY_KEY_JSONB_COLUMNS },
+  'saved_carts':       { table: 'saved_carts',       fieldMap: SAVED_CART_FIELD_MAP,      toPgRow: savedCartToPgRow,       toFirestoreObj: savedCartToFirestoreObj,       jsonbCols: SAVED_CART_JSONB_COLUMNS },
+  'idempotency_keys':  { table: 'idempotency_keys',  fieldMap: IDEMPOTENCY_KEY_FIELD_MAP, toPgRow: idempotencyKeyToPgRow,  toFirestoreObj: idempotencyKeyToFirestoreObj,  jsonbCols: IDEMPOTENCY_KEY_JSONB_COLUMNS },
 
   // Security
-  'blockedIPs':       { table: 'blocked_ips',       fieldMap: {}, toPgRow: blockedIpToPgRow,       toFirestoreObj: blockedIpToFirestoreObj,       jsonbCols: BLOCKED_IP_JSONB_COLUMNS },
-  'securityLogs':     { table: 'security_logs',     fieldMap: {}, toPgRow: securityLogToPgRow,     toFirestoreObj: securityLogToFirestoreObj,     jsonbCols: SECURITY_LOG_JSONB_COLUMNS },
-  'rateLimits':       { table: 'rate_limits',       fieldMap: {}, toPgRow: rateLimitToPgRow,       toFirestoreObj: rateLimitToFirestoreObj,       jsonbCols: RATE_LIMIT_JSONB_COLUMNS },
-  'publicToolUsage':  { table: 'public_tool_usage', fieldMap: {}, toPgRow: publicToolUsageToPgRow, toFirestoreObj: publicToolUsageToFirestoreObj, jsonbCols: PUBLIC_TOOL_USAGE_JSONB_COLUMNS },
-  'systemConfig':     { table: 'system_config',     fieldMap: {}, toPgRow: systemConfigToPgRow,    toFirestoreObj: systemConfigToFirestoreObj,    jsonbCols: SYSTEM_CONFIG_JSONB_COLUMNS },
+  'blockedIPs':       { table: 'blocked_ips',       fieldMap: BLOCKED_IP_FIELD_MAP,        toPgRow: blockedIpToPgRow,       toFirestoreObj: blockedIpToFirestoreObj,       jsonbCols: BLOCKED_IP_JSONB_COLUMNS },
+  'securityLogs':     { table: 'security_logs',     fieldMap: SECURITY_LOG_FIELD_MAP,      toPgRow: securityLogToPgRow,     toFirestoreObj: securityLogToFirestoreObj,     jsonbCols: SECURITY_LOG_JSONB_COLUMNS },
+  'rateLimits':       { table: 'rate_limits',       fieldMap: RATE_LIMIT_FIELD_MAP,        toPgRow: rateLimitToPgRow,       toFirestoreObj: rateLimitToFirestoreObj,       jsonbCols: RATE_LIMIT_JSONB_COLUMNS },
+  'publicToolUsage':  { table: 'public_tool_usage', fieldMap: PUBLIC_TOOL_USAGE_FIELD_MAP, toPgRow: publicToolUsageToPgRow, toFirestoreObj: publicToolUsageToFirestoreObj, jsonbCols: PUBLIC_TOOL_USAGE_JSONB_COLUMNS },
+  'systemConfig':     { table: 'system_config',     fieldMap: SYSTEM_CONFIG_FIELD_MAP,     toPgRow: systemConfigToPgRow,    toFirestoreObj: systemConfigToFirestoreObj,    jsonbCols: SYSTEM_CONFIG_JSONB_COLUMNS },
 
   // Auth & OTP
-  'email_otp_temp':    { table: 'email_otp_temp',    fieldMap: {}, toPgRow: emailOtpToPgRow,          toFirestoreObj: emailOtpToFirestoreObj,          jsonbCols: EMAIL_OTP_JSONB_COLUMNS },
-  'otp_verification':  { table: 'otp_verification',  fieldMap: {}, toPgRow: otpVerificationToPgRow,   toFirestoreObj: otpVerificationToFirestoreObj,   jsonbCols: OTP_VERIFICATION_JSONB_COLUMNS },
-  'demoRequests':      { table: 'demo_requests',     fieldMap: {}, toPgRow: demoRequestToPgRow,       toFirestoreObj: demoRequestToFirestoreObj,       jsonbCols: DEMO_REQUEST_JSONB_COLUMNS },
+  'email_otp_temp':    { table: 'email_otp_temp',    fieldMap: EMAIL_OTP_FIELD_MAP,        toPgRow: emailOtpToPgRow,          toFirestoreObj: emailOtpToFirestoreObj,          jsonbCols: EMAIL_OTP_JSONB_COLUMNS },
+  'otp_verification':  { table: 'otp_verification',  fieldMap: OTP_VERIFICATION_FIELD_MAP, toPgRow: otpVerificationToPgRow,   toFirestoreObj: otpVerificationToFirestoreObj,   jsonbCols: OTP_VERIFICATION_JSONB_COLUMNS },
+  'demoRequests':      { table: 'demo_requests',     fieldMap: DEMO_REQUEST_FIELD_MAP,     toPgRow: demoRequestToPgRow,       toFirestoreObj: demoRequestToFirestoreObj,       jsonbCols: DEMO_REQUEST_JSONB_COLUMNS },
 
   // AI & Chatbot (systemMisc)
-  'chatbot_conversations': { table: 'chatbot_conversations', fieldMap: {}, toPgRow: chatbotConvToPgRow,    toFirestoreObj: chatbotConvToFirestoreObj,    jsonbCols: CHATBOT_CONV_JSONB_COLUMNS },
-  'conversations':         { table: 'ai_conversations',      fieldMap: {}, toPgRow: conversationToPgRow,   toFirestoreObj: conversationToFirestoreObj,   jsonbCols: CONVERSATION_JSONB_COLUMNS },
-  'rag_knowledge':         { table: 'rag_knowledge',         fieldMap: {}, toPgRow: ragKnowledgeToPgRow,   toFirestoreObj: ragKnowledgeToFirestoreObj,   jsonbCols: RAG_KNOWLEDGE_JSONB_COLUMNS },
-  'token_usage':           { table: 'token_usage',           fieldMap: {}, toPgRow: tokenUsageToPgRow,     toFirestoreObj: tokenUsageToFirestoreObj,     jsonbCols: TOKEN_USAGE_JSONB_COLUMNS },
-  'query_cache':           { table: 'query_cache',           fieldMap: {}, toPgRow: queryCacheToPgRow,     toFirestoreObj: queryCacheToFirestoreObj,     jsonbCols: QUERY_CACHE_JSONB_COLUMNS },
+  'chatbot_conversations': { table: 'chatbot_conversations', fieldMap: CHATBOT_CONV_FIELD_MAP,  toPgRow: chatbotConvToPgRow,    toFirestoreObj: chatbotConvToFirestoreObj,    jsonbCols: CHATBOT_CONV_JSONB_COLUMNS },
+  'conversations':         { table: 'ai_conversations',      fieldMap: CONVERSATION_FIELD_MAP,  toPgRow: conversationToPgRow,   toFirestoreObj: conversationToFirestoreObj,   jsonbCols: CONVERSATION_JSONB_COLUMNS },
+  'rag_knowledge':         { table: 'rag_knowledge',         fieldMap: RAG_KNOWLEDGE_FIELD_MAP, toPgRow: ragKnowledgeToPgRow,   toFirestoreObj: ragKnowledgeToFirestoreObj,   jsonbCols: RAG_KNOWLEDGE_JSONB_COLUMNS },
+  'token_usage':           { table: 'token_usage',           fieldMap: TOKEN_USAGE_FIELD_MAP,   toPgRow: tokenUsageToPgRow,     toFirestoreObj: tokenUsageToFirestoreObj,     jsonbCols: TOKEN_USAGE_JSONB_COLUMNS },
+  'query_cache':           { table: 'query_cache',           fieldMap: QUERY_CACHE_FIELD_MAP,   toPgRow: queryCacheToPgRow,     toFirestoreObj: queryCacheToFirestoreObj,     jsonbCols: QUERY_CACHE_JSONB_COLUMNS },
 
   // Staff & Scheduling (systemMisc)
-  'staffLocations':        { table: 'staff_locations',        fieldMap: {}, toPgRow: staffLocationToPgRow,       toFirestoreObj: staffLocationToFirestoreObj,       jsonbCols: STAFF_LOCATION_JSONB_COLUMNS },
-  'staffLocations_latest': { table: 'staff_locations_latest', fieldMap: {}, toPgRow: staffLocationLatestToPgRow, toFirestoreObj: staffLocationLatestToFirestoreObj, jsonbCols: STAFF_LOCATION_LATEST_JSONB_COLUMNS },
+  'staffLocations':        { table: 'staff_locations',        fieldMap: STAFF_LOCATION_FIELD_MAP,        toPgRow: staffLocationToPgRow,       toFirestoreObj: staffLocationToFirestoreObj,       jsonbCols: STAFF_LOCATION_JSONB_COLUMNS },
+  'staffLocations_latest': { table: 'staff_locations_latest', fieldMap: STAFF_LOCATION_LATEST_FIELD_MAP, toPgRow: staffLocationLatestToPgRow, toFirestoreObj: staffLocationLatestToFirestoreObj, jsonbCols: STAFF_LOCATION_LATEST_JSONB_COLUMNS },
 
   // Miscellaneous
-  'invoices':              { table: 'pos_invoices',            fieldMap: {}, toPgRow: smInvoiceToPgRow,            toFirestoreObj: smInvoiceToFirestoreObj,            jsonbCols: SM_INVOICE_JSONB_COLUMNS },
-  'discountApprovals':     { table: 'discount_approvals',      fieldMap: {}, toPgRow: discountApprovalToPgRow,     toFirestoreObj: discountApprovalToFirestoreObj,     jsonbCols: DISCOUNT_APPROVAL_JSONB_COLUMNS },
-  'ownerPreferences':      { table: 'owner_preferences',       fieldMap: {}, toPgRow: ownerPrefToPgRow,            toFirestoreObj: ownerPrefToFirestoreObj,            jsonbCols: OWNER_PREF_JSONB_COLUMNS },
-  'taxSettings':           { table: 'tax_settings',            fieldMap: {}, toPgRow: taxSettingsToPgRow,           toFirestoreObj: taxSettingsToFirestoreObj,           jsonbCols: TAX_SETTINGS_JSONB_COLUMNS },
-  'staff':                 { table: 'legacy_staff',            fieldMap: {}, toPgRow: smStaffToPgRow,               toFirestoreObj: smStaffToFirestoreObj,               jsonbCols: SM_STAFF_JSONB_COLUMNS },
-  'coupons':               { table: 'coupons',                 fieldMap: {}, toPgRow: couponToPgRow,                toFirestoreObj: couponToFirestoreObj,                jsonbCols: COUPON_JSONB_COLUMNS },
-  'menuBulkDeleteLogs':    { table: 'menu_bulk_delete_logs',   fieldMap: {}, toPgRow: menuBulkDeleteLogToPgRow,     toFirestoreObj: menuBulkDeleteLogToFirestoreObj,     jsonbCols: MENU_BULK_DELETE_LOG_JSONB_COLUMNS },
-  'aggregatorWebhookLogs': { table: 'aggregator_webhook_logs', fieldMap: {}, toPgRow: aggregatorWebhookLogToPgRow,  toFirestoreObj: aggregatorWebhookLogToFirestoreObj,  jsonbCols: AGGREGATOR_WEBHOOK_LOG_JSONB_COLUMNS },
-  'whatsappOrderLogs':     { table: 'whatsapp_order_logs',     fieldMap: {}, toPgRow: whatsappOrderLogToPgRow,      toFirestoreObj: whatsappOrderLogToFirestoreObj,      jsonbCols: WHATSAPP_ORDER_LOG_JSONB_COLUMNS },
-  'stockAudits':           { table: 'stock_audits',            fieldMap: {}, toPgRow: stockAuditToPgRow,            toFirestoreObj: stockAuditToFirestoreObj,            jsonbCols: STOCK_AUDIT_JSONB_COLUMNS },
-  'productionEntries':     { table: 'production_entries',      fieldMap: {}, toPgRow: productionEntryToPgRow,       toFirestoreObj: productionEntryToFirestoreObj,       jsonbCols: PRODUCTION_ENTRY_JSONB_COLUMNS },
-  'd365SyncLog':           { table: 'd365_sync_log',           fieldMap: {}, toPgRow: d365SyncLogToPgRow,           toFirestoreObj: d365SyncLogToFirestoreObj,           jsonbCols: D365_SYNC_LOG_JSONB_COLUMNS },
+  'invoices':              { table: 'pos_invoices',            fieldMap: SM_INVOICE_FIELD_MAP,            toPgRow: smInvoiceToPgRow,            toFirestoreObj: smInvoiceToFirestoreObj,            jsonbCols: SM_INVOICE_JSONB_COLUMNS },
+  'discountApprovals':     { table: 'discount_approvals',      fieldMap: DISCOUNT_APPROVAL_FIELD_MAP,     toPgRow: discountApprovalToPgRow,     toFirestoreObj: discountApprovalToFirestoreObj,     jsonbCols: DISCOUNT_APPROVAL_JSONB_COLUMNS },
+  'ownerPreferences':      { table: 'owner_preferences',       fieldMap: OWNER_PREF_FIELD_MAP,            toPgRow: ownerPrefToPgRow,            toFirestoreObj: ownerPrefToFirestoreObj,            jsonbCols: OWNER_PREF_JSONB_COLUMNS },
+  'taxSettings':           { table: 'tax_settings',            fieldMap: TAX_SETTINGS_FIELD_MAP,          toPgRow: taxSettingsToPgRow,           toFirestoreObj: taxSettingsToFirestoreObj,           jsonbCols: TAX_SETTINGS_JSONB_COLUMNS },
+  'staff':                 { table: 'legacy_staff',            fieldMap: SM_STAFF_FIELD_MAP,              toPgRow: smStaffToPgRow,               toFirestoreObj: smStaffToFirestoreObj,               jsonbCols: SM_STAFF_JSONB_COLUMNS },
+  'coupons':               { table: 'coupons',                 fieldMap: COUPON_FIELD_MAP,                toPgRow: couponToPgRow,                toFirestoreObj: couponToFirestoreObj,                jsonbCols: COUPON_JSONB_COLUMNS },
+  'menuBulkDeleteLogs':    { table: 'menu_bulk_delete_logs',   fieldMap: MENU_BULK_DELETE_LOG_FIELD_MAP,  toPgRow: menuBulkDeleteLogToPgRow,     toFirestoreObj: menuBulkDeleteLogToFirestoreObj,     jsonbCols: MENU_BULK_DELETE_LOG_JSONB_COLUMNS },
+  'aggregatorWebhookLogs': { table: 'aggregator_webhook_logs', fieldMap: AGGREGATOR_WEBHOOK_LOG_FIELD_MAP, toPgRow: aggregatorWebhookLogToPgRow, toFirestoreObj: aggregatorWebhookLogToFirestoreObj,  jsonbCols: AGGREGATOR_WEBHOOK_LOG_JSONB_COLUMNS },
+  'whatsappOrderLogs':     { table: 'whatsapp_order_logs',     fieldMap: WHATSAPP_ORDER_LOG_FIELD_MAP,    toPgRow: whatsappOrderLogToPgRow,      toFirestoreObj: whatsappOrderLogToFirestoreObj,      jsonbCols: WHATSAPP_ORDER_LOG_JSONB_COLUMNS },
+  'stockAudits':           { table: 'stock_audits',            fieldMap: STOCK_AUDIT_FIELD_MAP,           toPgRow: stockAuditToPgRow,            toFirestoreObj: stockAuditToFirestoreObj,            jsonbCols: STOCK_AUDIT_JSONB_COLUMNS },
+  'productionEntries':     { table: 'production_entries',      fieldMap: PRODUCTION_ENTRY_FIELD_MAP,      toPgRow: productionEntryToPgRow,       toFirestoreObj: productionEntryToFirestoreObj,       jsonbCols: PRODUCTION_ENTRY_JSONB_COLUMNS },
+  'd365SyncLog':           { table: 'd365_sync_log',           fieldMap: D365_SYNC_LOG_FIELD_MAP,         toPgRow: d365SyncLogToPgRow,           toFirestoreObj: d365SyncLogToFirestoreObj,           jsonbCols: D365_SYNC_LOG_JSONB_COLUMNS },
 
   // ── auth & menu ─────────────────────────────────────────────────────────
   'menus':             { table: 'menus',              fieldMap: MENU_FIELD_MAP,             toPgRow: menuToPgRow,             toFirestoreObj: menuToFirestoreObj,             jsonbCols: MENU_JSONB_COLUMNS, cacheTTL: 120 },
   'menuItems':         { table: 'menu_items',         fieldMap: MENU_ITEM_FIELD_MAP,        toPgRow: menuItemToPgRow,         toFirestoreObj: menuItemToFirestoreObj,         jsonbCols: MENU_ITEM_JSONB_COLUMNS, cacheTTL: 120 },
+  // Legacy subcollection alias: restaurants/{id}/menu → menu_items (scoped by restaurant_id).
+  // 14 AI/RAG read sites use db.collection('restaurants').doc(id).collection('menu').
+  'menu':              { table: 'menu_items',         fieldMap: MENU_ITEM_FIELD_MAP,        toPgRow: menuItemToPgRow,         toFirestoreObj: menuItemToFirestoreObj,         jsonbCols: MENU_ITEM_JSONB_COLUMNS, cacheTTL: 120 },
   'users':             { table: 'app_users',          fieldMap: APP_USER_FIELD_MAP,         toPgRow: appUserToPgRow,          toFirestoreObj: appUserToFirestoreObj,          jsonbCols: APP_USER_JSONB_COLUMNS },
   'userRestaurants':   { table: 'user_restaurants',   fieldMap: USER_RESTAURANT_FIELD_MAP,  toPgRow: userRestaurantToPgRow,   toFirestoreObj: userRestaurantToFirestoreObj,   jsonbCols: USER_RESTAURANT_JSONB_COLUMNS },
   'staffCredentials':  { table: 'staff_credentials',  fieldMap: STAFF_CREDENTIAL_FIELD_MAP, toPgRow: staffCredentialToPgRow,  toFirestoreObj: staffCredentialToFirestoreObj,  jsonbCols: STAFF_CREDENTIAL_JSONB_COLUMNS },

@@ -9,7 +9,8 @@
 PROJECT_ID="ascendant-idea-443107-f8"
 REGION="asia-south1"
 SERVICE_NAME="dine-backend"
-CLOUD_RUN_URL="https://dine-backend-son5lc3cca-el.a.run.app"
+# NOTE: resolved dynamically via get_cloud_run_url; this is only a fallback
+CLOUD_RUN_URL="https://dine-backend-1087929121342.asia-south1.run.app"
 VERCEL_URL="https://dine-backend-lake.vercel.app"
 FRONTEND_DIR="$(dirname "$0")/../dine-frontend"
 
@@ -93,8 +94,13 @@ deploy() {
     --cpu=1 \
     --timeout=60 \
     --allow-unauthenticated \
-    --set-env-vars="NODE_ENV=production" \
+    --update-env-vars="NODE_ENV=production" \
     --port=3003
+  # IMPORTANT: --update-env-vars MERGES with existing env vars.
+  # NEVER use --set-env-vars here — it REPLACES the whole env, wiping
+  # DATABASE_URL + 40 other vars and silently reverting the service to
+  # Firestore mode. Full env refresh: gcloud run services update $SERVICE_NAME \
+  #   --env-vars-file=.env.yaml (44 vars from .env.local)
 
   if [ $? -eq 0 ]; then
     CLOUD_RUN_URL=$(get_cloud_run_url)

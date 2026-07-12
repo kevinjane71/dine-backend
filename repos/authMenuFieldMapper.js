@@ -100,6 +100,8 @@ const APP_USER_FIELD_MAP = {
   role: 'role',
   emailVerified: 'email_verified',
   phoneVerified: 'phone_verified',
+  emailOTP: 'email_otp',
+  emailOTPExpiry: 'email_otp_expiry',
   provider: 'provider',
   setupComplete: 'setup_complete',
   googleUid: 'google_uid',

@@ -22,6 +22,7 @@ const FIELD_MAP = {
   totalTax: 'total_tax',
   totalDiscounts: 'total_discounts',
   totalRefunds: 'total_refunds',
+  totalCovers: 'total_covers',
   createdAt: 'created_at',
   updatedAt: 'updated_at',
 };
@@ -217,6 +218,28 @@ function toFirestoreObj(pgRow) {
 }
 
 /**
+ * Resolve dynamic Firestore keys to their real JSONB column + path so the
+ * pgAdapter's update()/set() transforms (FieldValue.increment etc.) land in
+ * the same place toPgRow/toFirestoreObj use. Returns { col, path } or null
+ * for keys the generic fieldMap/camelToSnake resolution already handles.
+ *
+ *   paymentMethod_cash.transactions → { col: 'payment_methods', path: ['cash','transactions'] }
+ *   ordersByType_dine_in            → { col: 'order_types',     path: ['dine_in','count'] }
+ *   orderTypeRevenue_dine_in        → { col: 'order_types',     path: ['dine_in','revenue'] }
+ */
+function resolveKeyPath(key) {
+  const parts = key.split('.');
+  const top = parts[0];
+  let m = top.match(/^paymentMethod_(.+)$/);
+  if (m) return { col: 'payment_methods', path: [m[1], ...parts.slice(1)] };
+  m = top.match(/^ordersByType_(.+)$/);
+  if (m) return { col: 'order_types', path: [m[1], 'count', ...parts.slice(1)] };
+  m = top.match(/^orderTypeRevenue_(.+)$/);
+  if (m) return { col: 'order_types', path: [m[1], 'revenue', ...parts.slice(1)] };
+  return null;
+}
+
+/**
  * Serialize a value for JSONB column.
  */
 function toJsonbValue(val) {
@@ -286,6 +309,7 @@ module.exports = {
   JSONB_COLUMNS,
   toPgRow,
   toFirestoreObj,
+  resolveKeyPath,
   buildInsert,
   buildUpdate,
   convertTimestamp,

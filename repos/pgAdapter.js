@@ -86,9 +86,23 @@ function camelToSnake(str) {
   return str.replace(/[A-Z]/g, (letter) => '_' + letter.toLowerCase());
 }
 
+// Only plain identifiers may be interpolated into SQL as column names
+const SAFE_IDENT_RE = /^[a-zA-Z_][a-zA-Z0-9_]*$/;
+
 function resolveField(fieldMap, field) {
+  // Support FieldPath objects (e.g. FieldPath.documentId() → '__name__')
+  if (typeof field !== 'string') {
+    const segments = field && field.segments;
+    const s = Array.isArray(segments) ? segments.join('.') : String(field);
+    if (s === '__name__') return 'id';
+    field = s;
+  }
   if (field === '__name__') return 'id';
-  return fieldMap[field] || camelToSnake(field);
+  const col = fieldMap[field] || camelToSnake(field);
+  if (!SAFE_IDENT_RE.test(col)) {
+    throw new Error(`[pgAdapter] Unsafe column name derived from field "${field}"`);
+  }
+  return col;
 }
 
 function generateId() {
@@ -128,7 +142,9 @@ function getFieldValueType(val) {
  * Extract the numeric operand from a FieldValue.increment() sentinel.
  */
 function getIncrementOperand(val) {
-  return val._operand || val.operand || 1;
+  const op = val._operand !== undefined ? val._operand : val.operand;
+  const n = Number(op);
+  return Number.isFinite(n) ? n : 1;
 }
 
 /**
@@ -136,6 +152,118 @@ function getIncrementOperand(val) {
  */
 function getArrayElements(val) {
   return val._elements || val.elements || [];
+}
+
+// ---------------------------------------------------------------------------
+// Timestamp revival — Firestore returns Timestamp objects (.toDate()/.seconds);
+// PG returns raw JS Dates (timestamptz columns) and {_seconds,_nanoseconds}
+// blobs inside JSONB (from backfilled Firestore Timestamps). App code written
+// for Firestore calls .toDate() everywhere, so wrap both shapes on every read.
+// ---------------------------------------------------------------------------
+
+let TimestampClass = null;
+try {
+  TimestampClass = require('firebase-admin/firestore').Timestamp;
+} catch (_) { /* firebase-admin not available — use shim */ }
+
+function toTimestamp(date) {
+  if (TimestampClass) return TimestampClass.fromDate(date);
+  const ms = date.getTime();
+  const seconds = Math.floor(ms / 1000);
+  const nanoseconds = (ms - seconds * 1000) * 1e6;
+  return {
+    seconds,
+    nanoseconds,
+    _seconds: seconds,
+    _nanoseconds: nanoseconds,
+    toDate: () => new Date(ms),
+    toMillis: () => ms,
+    isEqual: (o) => !!o && typeof o.toMillis === 'function' && o.toMillis() === ms,
+    toJSON: () => ({ _seconds: seconds, _nanoseconds: nanoseconds }),
+  };
+}
+
+/**
+ * Recursively wrap date-like values as Firestore Timestamps (mutates in place
+ * for objects/arrays). Converts: JS Date, {_seconds,_nanoseconds}.
+ * Leaves plain ISO strings alone — those were strings on Firestore too.
+ */
+function reviveTimestamps(val, depth = 0) {
+  if (val == null || depth > 12) return val;
+  if (val instanceof Date) return toTimestamp(val);
+  if (typeof val !== 'object') return val;
+  if (typeof val.toDate === 'function') return val; // already a Timestamp
+  if (Array.isArray(val)) {
+    for (let i = 0; i < val.length; i++) val[i] = reviveTimestamps(val[i], depth + 1);
+    return val;
+  }
+  if (
+    val._seconds !== undefined &&
+    val._nanoseconds !== undefined &&
+    Object.keys(val).length <= 2
+  ) {
+    return toTimestamp(new Date(val._seconds * 1000 + val._nanoseconds / 1e6));
+  }
+  for (const k of Object.keys(val)) val[k] = reviveTimestamps(val[k], depth + 1);
+  return val;
+}
+
+// ---------------------------------------------------------------------------
+// Sentinel resolution for INSERT paths — set()/add() can carry FieldValue
+// sentinels and dotted keys; resolve them to concrete values for a fresh row.
+// ---------------------------------------------------------------------------
+
+function setNestedValue(target, dottedKey, value) {
+  const parts = dottedKey.split('.');
+  let node = target;
+  for (let i = 0; i < parts.length - 1; i++) {
+    const p = parts[i];
+    if (typeof node[p] !== 'object' || node[p] === null || Array.isArray(node[p])) {
+      node[p] = {};
+    }
+    node = node[p];
+  }
+  node[parts[parts.length - 1]] = value;
+}
+
+function hasSentinelOrDottedKey(data) {
+  for (const [key, val] of Object.entries(data)) {
+    if (key.includes('.')) return true;
+    if (isFieldValueSentinel(val)) return true;
+  }
+  return false;
+}
+
+function resolveSentinelsToValues(data) {
+  const out = {};
+  for (const [key, val] of Object.entries(data)) {
+    if (val === undefined) continue;
+    let resolved = val;
+    if (isFieldValueSentinel(val)) {
+      switch (getFieldValueType(val)) {
+        case 'increment':
+          resolved = getIncrementOperand(val);
+          break;
+        case 'serverTimestamp':
+          resolved = new Date();
+          break;
+        case 'arrayUnion':
+          resolved = getArrayElements(val);
+          break;
+        case 'arrayRemove':
+          resolved = [];
+          break;
+        case 'delete':
+          continue;
+        default:
+          console.warn(`[pgAdapter] Dropping unknown sentinel for field "${key}" in set()/add()`);
+          continue;
+      }
+    }
+    if (key.includes('.')) setNestedValue(out, key, resolved);
+    else out[key] = resolved;
+  }
+  return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -186,7 +314,17 @@ class PgDocRef {
   }
 
   get parent() {
-    return { id: this._collectionName };
+    // Firestore: docRef.parent = collection ref; docRef.parent.parent = parent DOC ref.
+    // For scoped subcollection docs (restaurants/X/floors/Y/tables/Z) expose the
+    // nearest ancestor doc id so patterns like ref.parent.parent.id work.
+    const chain = this._scopeChain;
+    return {
+      id: this._collectionName,
+      parent:
+        chain && chain.length
+          ? { id: chain[chain.length - 1].value }
+          : null,
+    };
   }
 
   /**
@@ -216,13 +354,15 @@ class PgDocRef {
             if (cached === '__null__') {
               return makeDocumentSnapshot(this.id, null, this);
             }
-            return makeDocumentSnapshot(this.id, cached, this);
+            return makeDocumentSnapshot(this.id, reviveTimestamps(cached), this);
           }
         } catch (_) { /* cache miss — fall through to PG */ }
       }
 
+      // Inside a transaction, lock the row (Firestore transactions are
+      // read-modify-write safe; plain READ COMMITTED SELECTs are not)
       const result = await this._exec(
-        `SELECT * FROM ${table} WHERE id = $1`,
+        `SELECT * FROM ${table} WHERE id = $1${this._client ? ' FOR UPDATE' : ''}`,
         [this.id]
       );
       if (result.rows.length === 0) {
@@ -233,7 +373,7 @@ class PgDocRef {
         }
         return makeDocumentSnapshot(this.id, null, this);
       }
-      const data = this._config.toFirestoreObj(result.rows[0]);
+      const data = reviveTimestamps(this._config.toFirestoreObj(result.rows[0]));
 
       // Cache the result
       if (cacheTTL && !this._client) {
@@ -250,16 +390,59 @@ class PgDocRef {
 
   /**
    * SET — UPSERT a document.
+   *
+   * Firestore semantics supported:
+   *  - set(data) — replace-style upsert (mapped columns overwritten)
+   *  - set(data, { merge: true }) — partial upsert; JSONB object values are
+   *    shallow-merged into existing JSONB columns instead of replacing them
+   *  - FieldValue sentinels (increment/serverTimestamp/arrayUnion/...) and
+   *    dotted keys work in both modes: on an existing row they are applied as
+   *    transforms (via update()); on a missing row they are resolved to
+   *    initial values and inserted. This is what updateDailyStats() relies on.
+   *
    * @param {Object} data
    * @param {Object} [options] - { merge: true } for partial upsert
    */
   async set(data, options) {
     try {
       const { table, jsonbCols } = this._config;
-      const pgRow = this._config.toPgRow({ id: this.id, ...data });
+      const merge = !!(
+        options &&
+        (options.merge || (options.mergeFields && options.mergeFields.length))
+      );
+
+      // Inject subcollection scope fields (restaurantId/floorId/...) so docs
+      // created via scopedRef.doc(id).set() are visible to scoped queries
+      let payload = data;
+      if (this._scopeChain && this._scopeChain.length) {
+        payload = { ...data };
+        for (const scope of this._scopeChain) {
+          if (payload[scope.field] === undefined) payload[scope.field] = scope.value;
+        }
+      }
+
+      if (merge && hasSentinelOrDottedKey(payload)) {
+        // Transform-style merge upsert: UPDATE first (sentinel machinery lives
+        // there), INSERT a resolved initial row when the doc doesn't exist yet.
+        const updated = await this.update(payload, { allowMissing: true });
+        if (!updated) {
+          const inserted = await this._insertResolved(payload);
+          if (!inserted) {
+            // Concurrent writer inserted first — apply our transforms on top
+            await this.update(payload, { allowMissing: true });
+          }
+        }
+        if (this._config.cacheTTL) bumpTableVersion(table).catch(() => {});
+        return;
+      }
+
+      const rowData = hasSentinelOrDottedKey(payload)
+        ? resolveSentinelsToValues(payload)
+        : payload;
+      const pgRow = this._config.toPgRow({ id: this.id, ...rowData });
       if (!pgRow.id) pgRow.id = this.id;
 
-      const upsert = buildUpsert(table, pgRow, jsonbCols);
+      const upsert = buildUpsert(table, pgRow, jsonbCols, ['id'], { mergeJsonb: merge });
       try {
         await this._exec(upsert.text, upsert.values);
       } catch (innerErr) {
@@ -272,7 +455,7 @@ class PgDocRef {
           if (overflow !== undefined) {
             pgRow.extra_data = { ...(pgRow.extra_data || {}), [badCol]: overflow };
           }
-          const retry = buildUpsert(table, pgRow, jsonbCols);
+          const retry = buildUpsert(table, pgRow, jsonbCols, ['id'], { mergeJsonb: merge });
           await this._exec(retry.text, retry.values);
         } else {
           throw innerErr;
@@ -287,59 +470,154 @@ class PgDocRef {
   }
 
   /**
-   * UPDATE — partial update with FieldValue sentinel support.
-   * @param {Object} data
+   * INSERT a row with sentinels/dotted keys resolved to concrete values.
+   * ON CONFLICT DO NOTHING — returns true if the row was inserted, false if a
+   * concurrent writer beat us to it. Retries missing columns into extra_data.
    */
-  async update(data) {
+  async _insertResolved(payload) {
+    const { table, jsonbCols } = this._config;
+    const resolved = resolveSentinelsToValues(payload);
+    let pgRow = this._config.toPgRow({ id: this.id, ...resolved });
+    if (!pgRow.id) pgRow.id = this.id;
+
+    for (let attempt = 0; attempt < 4; attempt++) {
+      const ins = buildInsert(table, pgRow, jsonbCols);
+      const text = ins.text.replace(/ RETURNING \*$/, ' ON CONFLICT (id) DO NOTHING');
+      try {
+        const res = await this._exec(text, ins.values);
+        return res.rowCount > 0;
+      } catch (innerErr) {
+        const colMatch = innerErr.message.match(/column "([^"]+)" of relation/);
+        if (!colMatch) throw innerErr;
+        const badCol = colMatch[1];
+        console.warn(`[pgAdapter] Column "${badCol}" missing on ${table} during insert, moving to extra_data`);
+        const overflow = pgRow[badCol];
+        delete pgRow[badCol];
+        if (overflow !== undefined) {
+          pgRow.extra_data = { ...(pgRow.extra_data || {}), [badCol]: overflow };
+        }
+      }
+    }
+    throw new Error(`[pgAdapter] Insert retry limit exceeded for ${this.path}`);
+  }
+
+  /**
+   * UPDATE — partial update with FieldValue sentinel support.
+   *
+   * Matches Firestore semantics:
+   *  - dot-notation paths write into JSONB columns (creating intermediate
+   *    objects), with full sentinel support at the leaf
+   *  - throws NOT_FOUND (err.code = 5) when the document doesn't exist
+   *  - arrayUnion dedupes (Firestore set semantics)
+   *  - unknown columns overflow into extra_data via a merging JSONB write
+   *
+   * @param {Object} data
+   * @param {Object} [_opts] - internal: { allowMissing, _retryDepth, _skipAutoUpdatedAt }
+   * @returns {boolean} true if a row was updated (false only with allowMissing)
+   */
+  async update(data, _opts = {}) {
+    const { allowMissing = false, _retryDepth = 0, _skipAutoUpdatedAt = false } = _opts;
     try {
       const { table, fieldMap, jsonbCols } = this._config;
       const setClauses = [];
       const values = [];
-      let paramIdx = 1;
+      const addValue = (v) => {
+        values.push(v);
+        return values.length;
+      };
 
       for (const [key, val] of Object.entries(data)) {
         if (val === undefined) continue;
 
-        // Handle dot-notation (e.g. 'subscription.status')
-        const dotParts = key.split('.');
-        const topLevelKey = dotParts[0];
-        const pgCol = resolveField(fieldMap, topLevelKey);
+        // Resolve the target column + JSONB path. Collections with dynamic
+        // key packing (e.g. dailyStats paymentMethod_cash → payment_methods
+        // JSONB) expose resolveKeyPath in their registry config; everything
+        // else uses dot-notation + fieldMap.
+        let pgCol;
+        let jsonPath;
+        const hook = this._config.resolveKeyPath ? this._config.resolveKeyPath(key) : null;
+        if (hook && hook.col) {
+          pgCol = hook.col;
+          jsonPath = hook.path || [];
+        } else {
+          const dotParts = key.split('.');
+          pgCol = resolveField(fieldMap, dotParts[0]);
+          jsonPath = dotParts.slice(1);
+        }
 
-        if (dotParts.length > 1 && jsonbCols.has(pgCol)) {
-          // Nested update into a JSONB column
-          const jsonPath = dotParts.slice(1);
-          const pathLiteral = '{' + jsonPath.join(',') + '}';
-          const jsonVal = JSON.stringify(val);
-          setClauses.push(
-            `${pgCol} = jsonb_set(COALESCE(${pgCol}, '{}'), '${pathLiteral}', $${paramIdx}::jsonb)`
-          );
-          values.push(jsonVal);
-          paramIdx++;
+        if (jsonPath.length > 0 && jsonbCols.has(pgCol)) {
+          // Nested update into a JSONB column. jsonb_set only creates the leaf
+          // key, so chain jsonb_set calls to create intermediate objects first.
+          let baseExpr = `COALESCE(${pgCol}, '{}'::jsonb)`;
+          for (let d = 1; d < jsonPath.length; d++) {
+            const prefixIdx = addValue(jsonPath.slice(0, d));
+            baseExpr = `jsonb_set(${baseExpr}, $${prefixIdx}::text[], COALESCE(${pgCol}#>$${prefixIdx}::text[], '{}'::jsonb), true)`;
+          }
+          const pathIdx = addValue(jsonPath);
+          const pathParam = `$${pathIdx}::text[]`;
+
+          if (isFieldValueSentinel(val)) {
+            switch (getFieldValueType(val)) {
+              case 'increment': {
+                const operand = getIncrementOperand(val);
+                setClauses.push(
+                  `${pgCol} = jsonb_set(${baseExpr}, ${pathParam}, to_jsonb(COALESCE((${pgCol}#>>${pathParam})::numeric, 0) + ${operand}), true)`
+                );
+                break;
+              }
+              case 'serverTimestamp': {
+                setClauses.push(
+                  `${pgCol} = jsonb_set(${baseExpr}, ${pathParam}, to_jsonb(NOW()), true)`
+                );
+                break;
+              }
+              case 'arrayUnion': {
+                const elemsIdx = addValue(JSON.stringify(getArrayElements(val)));
+                setClauses.push(
+                  `${pgCol} = jsonb_set(${baseExpr}, ${pathParam}, COALESCE(${pgCol}#>${pathParam}, '[]'::jsonb) || (SELECT COALESCE(jsonb_agg(n), '[]'::jsonb) FROM jsonb_array_elements($${elemsIdx}::jsonb) AS n WHERE NOT (COALESCE(${pgCol}#>${pathParam}, '[]'::jsonb) @> jsonb_build_array(n))), true)`
+                );
+                break;
+              }
+              case 'arrayRemove': {
+                const remIdx = addValue(JSON.stringify(getArrayElements(val)));
+                setClauses.push(
+                  `${pgCol} = jsonb_set(${baseExpr}, ${pathParam}, (SELECT COALESCE(jsonb_agg(e), '[]'::jsonb) FROM jsonb_array_elements(COALESCE(${pgCol}#>${pathParam}, '[]'::jsonb)) AS e WHERE NOT ($${remIdx}::jsonb @> jsonb_build_array(e))), true)`
+                );
+                break;
+              }
+              case 'delete': {
+                setClauses.push(`${pgCol} = COALESCE(${pgCol}, '{}'::jsonb) #- ${pathParam}`);
+                break;
+              }
+              default: {
+                console.warn(`[pgAdapter] Unknown sentinel at "${key}" — skipping`);
+                break;
+              }
+            }
+          } else {
+            const valIdx = addValue(toJsonbValue(convertTimestamp(val)));
+            setClauses.push(
+              `${pgCol} = jsonb_set(${baseExpr}, ${pathParam}, $${valIdx}::jsonb, true)`
+            );
+          }
           continue;
         }
 
-        if (dotParts.length > 1) {
-          // Dot-notation on a non-JSONB column — update the top-level column
-          // and ignore the nested path (no structured sub-fields in regular cols)
-          if (isFieldValueSentinel(val)) {
-            // still handle sentinel below using pgCol
-          } else {
-            setClauses.push(`${pgCol} = $${paramIdx}`);
-            values.push(val instanceof Date ? val : convertTimestamp(val));
-            paramIdx++;
-            continue;
-          }
+        if (jsonPath.length > 0 && !isFieldValueSentinel(val)) {
+          // Dot-notation on a non-JSONB column — write the leaf value to the
+          // top-level column (no structured sub-fields in regular cols)
+          const leafIdx = addValue(convertTimestamp(val));
+          setClauses.push(`${pgCol} = $${leafIdx}`);
+          continue;
         }
 
-        // FieldValue sentinels
+        // FieldValue sentinels on top-level columns
         if (isFieldValueSentinel(val)) {
           const fvType = getFieldValueType(val);
           switch (fvType) {
             case 'increment': {
               const operand = getIncrementOperand(val);
-              setClauses.push(
-                `${pgCol} = COALESCE(${pgCol}, 0) + ${Number(operand)}`
-              );
+              setClauses.push(`${pgCol} = COALESCE(${pgCol}, 0) + ${operand}`);
               break;
             }
             case 'serverTimestamp': {
@@ -347,24 +625,19 @@ class PgDocRef {
               break;
             }
             case 'arrayUnion': {
-              const elements = getArrayElements(val);
+              // Firestore arrayUnion has set semantics — only append elements
+              // not already present
+              const elemsIdx = addValue(JSON.stringify(getArrayElements(val)));
               setClauses.push(
-                `${pgCol} = COALESCE(${pgCol}, '[]'::jsonb) || $${paramIdx}::jsonb`
+                `${pgCol} = COALESCE(${pgCol}, '[]'::jsonb) || (SELECT COALESCE(jsonb_agg(n), '[]'::jsonb) FROM jsonb_array_elements($${elemsIdx}::jsonb) AS n WHERE NOT (COALESCE(${pgCol}, '[]'::jsonb) @> jsonb_build_array(n)))`
               );
-              values.push(JSON.stringify(elements));
-              paramIdx++;
               break;
             }
             case 'arrayRemove': {
-              const removeElements = getArrayElements(val);
-              // Remove each element from the jsonb array
-              let expr = `COALESCE(${pgCol}, '[]'::jsonb)`;
-              for (const elem of removeElements) {
-                expr = `(SELECT COALESCE(jsonb_agg(e), '[]'::jsonb) FROM jsonb_array_elements(${expr}) AS e WHERE e != $${paramIdx}::jsonb)`;
-                values.push(JSON.stringify(elem));
-                paramIdx++;
-              }
-              setClauses.push(`${pgCol} = ${expr}`);
+              const remIdx = addValue(JSON.stringify(getArrayElements(val)));
+              setClauses.push(
+                `${pgCol} = (SELECT COALESCE(jsonb_agg(e), '[]'::jsonb) FROM jsonb_array_elements(COALESCE(${pgCol}, '[]'::jsonb)) AS e WHERE NOT ($${remIdx}::jsonb @> jsonb_build_array(e)))`
+              );
               break;
             }
             case 'delete': {
@@ -372,13 +645,7 @@ class PgDocRef {
               break;
             }
             default: {
-              // Unknown sentinel — treat as regular value
-              console.warn(
-                `[pgAdapter] Unknown FieldValue sentinel type for field "${key}"`
-              );
-              setClauses.push(`${pgCol} = $${paramIdx}`);
-              values.push(val);
-              paramIdx++;
+              console.warn(`[pgAdapter] Unknown FieldValue sentinel type for field "${key}" — skipping`);
               break;
             }
           }
@@ -388,60 +655,74 @@ class PgDocRef {
         // Regular field
         const cleanVal = convertTimestamp(val);
         if (jsonbCols.has(pgCol)) {
-          setClauses.push(`${pgCol} = $${paramIdx}::jsonb`);
-          values.push(toJsonbValue(cleanVal));
+          const jIdx = addValue(toJsonbValue(cleanVal));
+          if (pgCol === 'extra_data') {
+            // Merge — replacing would wipe every other unmapped field
+            setClauses.push(`${pgCol} = COALESCE(${pgCol}, '{}'::jsonb) || $${jIdx}::jsonb`);
+          } else {
+            setClauses.push(`${pgCol} = $${jIdx}::jsonb`);
+          }
         } else {
-          setClauses.push(`${pgCol} = $${paramIdx}`);
-          values.push(cleanVal);
+          const rIdx = addValue(cleanVal);
+          setClauses.push(`${pgCol} = $${rIdx}`);
         }
-        paramIdx++;
       }
 
-      if (setClauses.length === 0) return;
+      if (setClauses.length === 0) return true;
 
       // Bump updated_at unless already set in this update
       const alreadySetsUpdatedAt = setClauses.some(c => c.startsWith('updated_at'));
-      if (!alreadySetsUpdatedAt) {
+      if (!alreadySetsUpdatedAt && !_skipAutoUpdatedAt) {
         setClauses.push('updated_at = NOW()');
       }
 
-      values.push(this.id);
-      const sql = `UPDATE ${table} SET ${setClauses.join(', ')} WHERE id = $${paramIdx}`;
+      const idIdx = addValue(this.id);
+      const sql = `UPDATE ${table} SET ${setClauses.join(', ')} WHERE id = $${idIdx}`;
+      let result;
       try {
-        await this._exec(sql, values);
+        result = await this._exec(sql, values);
       } catch (innerErr) {
-        // If a column doesn't exist, retry without that column
+        // If a column doesn't exist, retry with the offending fields routed
+        // into extra_data (as JSONB path writes — preserves sentinel semantics)
         const colMatch = innerErr.message.match(/column "([^"]+)" of relation/);
-        if (colMatch) {
+        if (colMatch && _retryDepth < 3) {
           const badCol = colMatch[1];
-          console.warn(`[pgAdapter] Column "${badCol}" missing on ${table}, storing in extra_data`);
-          // Rebuild without the bad column — collect overflow into extra_data
-          const overflow = {};
-          const retryClauses = [];
-          const retryValues = [];
-          let retryIdx = 1;
+          if (badCol === 'updated_at' && !_skipAutoUpdatedAt) {
+            return this.update(data, { ..._opts, _retryDepth: _retryDepth + 1, _skipAutoUpdatedAt: true });
+          }
+          const filteredData = {};
+          let moved = 0;
           for (const [key, val] of Object.entries(data)) {
             if (val === undefined) continue;
-            const topKey = key.split('.')[0];
-            const pgCol = resolveField(fieldMap, topKey);
-            if (pgCol === badCol) {
-              overflow[key] = val instanceof Date ? val.toISOString() : val;
-              continue;
+            const h = this._config.resolveKeyPath ? this._config.resolveKeyPath(key) : null;
+            const col = h && h.col ? h.col : resolveField(fieldMap, key.split('.')[0]);
+            if (col === badCol) {
+              filteredData[`extra_data.${key}`] = val;
+              moved++;
+            } else {
+              filteredData[key] = val;
             }
           }
-          // Re-run the whole update excluding bad keys
-          const filteredData = { ...data };
-          for (const k of Object.keys(overflow)) delete filteredData[k];
-          if (Object.keys(overflow).length > 0 && jsonbCols.has('extra_data')) {
-            filteredData['extra_data'] = { ...overflow };
+          if (moved > 0 && jsonbCols.has('extra_data')) {
+            console.warn(`[pgAdapter] Column "${badCol}" missing on ${table}, storing ${moved} field(s) in extra_data`);
+            return this.update(filteredData, { ..._opts, _retryDepth: _retryDepth + 1 });
           }
-          // Recursive call with filtered data
-          return this.update(filteredData);
         }
         throw innerErr;
       }
+
+      if (result.rowCount === 0) {
+        if (allowMissing) return false;
+        // Firestore update() rejects with NOT_FOUND — app code relies on this
+        // for update-or-create fallbacks
+        const nf = new Error(`NOT_FOUND: no document to update: ${this.path}`);
+        nf.code = 5;
+        throw nf;
+      }
+
       // Invalidate cache
       if (this._config.cacheTTL) bumpTableVersion(table).catch(() => {});
+      return true;
     } catch (err) {
       console.error(
         `[pgAdapter] DocRef.update() error (${this.path}):`,
@@ -522,6 +803,8 @@ class PgQuery {
     this._orderBys = [];
     this._limitVal = null;
     this._startAfterSnap = null;
+    this._startAfterValues = null;
+    this._client = null; // set when running inside a PG transaction
   }
 
   /**
@@ -538,6 +821,8 @@ class PgQuery {
     q._limitVal = this._limitVal;
     q._offsetVal = this._offsetVal;
     q._startAfterSnap = this._startAfterSnap;
+    q._startAfterValues = this._startAfterValues;
+    q._client = this._client;
     return q;
   }
 
@@ -559,9 +844,19 @@ class PgQuery {
     return q;
   }
 
-  startAfter(docSnapshot) {
+  /**
+   * startAfter — accepts a DocumentSnapshot (Firestore style) OR raw field
+   * values matching the orderBy clauses (also Firestore style).
+   */
+  startAfter(...args) {
     const q = this._clone();
-    q._startAfterSnap = docSnapshot;
+    if (args.length === 1 && args[0] && typeof args[0].data === 'function') {
+      q._startAfterSnap = args[0];
+      q._startAfterValues = null;
+    } else if (args.length > 0 && args[0] !== undefined) {
+      q._startAfterSnap = null;
+      q._startAfterValues = args;
+    }
     return q;
   }
 
@@ -572,58 +867,120 @@ class PgQuery {
   }
 
   /**
+   * Build WHERE conditions for this query's filters. Pushes parameters onto
+   * `values` and returns { conditions, emptyResult }. Shared by get()/count().
+   */
+  _buildConditions(values) {
+    const { fieldMap, jsonbCols } = this._config;
+    const conditions = [];
+
+    for (const w of this._wheres) {
+      const mappedOp = OP_MAP[w.op];
+      if (!mappedOp) {
+        throw new Error(`[pgAdapter] Unsupported operator: "${w.op}"`);
+      }
+      const dotParts = typeof w.field === 'string' ? w.field.split('.') : [w.field];
+      const topField = dotParts[0];
+      const pgCol = resolveField(fieldMap, topField);
+      const cleanValue = convertTimestamp(w.value);
+      const addValue = (v) => {
+        values.push(v);
+        return values.length;
+      };
+
+      // Dot-notation into a JSONB column (e.g. 'staffInfo.userId')
+      if (dotParts.length > 1 && jsonbCols && jsonbCols.has(pgCol)) {
+        const pathIdx = addValue(dotParts.slice(1));
+        const pathParam = `$${pathIdx}::text[]`;
+        const textExpr = `${pgCol}#>>${pathParam}`;
+
+        if (w.op === 'array-contains') {
+          const vIdx = addValue(JSON.stringify([cleanValue]));
+          conditions.push(`COALESCE(${pgCol}#>${pathParam}, '[]'::jsonb) @> $${vIdx}::jsonb`);
+        } else if (cleanValue === null && (w.op === '==' || w.op === '!=')) {
+          conditions.push(w.op === '==' ? `${textExpr} IS NULL` : `${textExpr} IS NOT NULL`);
+        } else if (w.op === 'in') {
+          if (!Array.isArray(cleanValue) || cleanValue.length === 0) {
+            return { conditions, emptyResult: true };
+          }
+          const vIdx = addValue(cleanValue.map((v) => (typeof v === 'string' ? v : String(v))));
+          conditions.push(`${textExpr} = ANY($${vIdx})`);
+        } else if (w.op === 'not-in') {
+          if (!Array.isArray(cleanValue) || cleanValue.length === 0) continue;
+          const vIdx = addValue(cleanValue.map((v) => (typeof v === 'string' ? v : String(v))));
+          conditions.push(`${textExpr} != ALL($${vIdx})`);
+        } else if (typeof cleanValue === 'number') {
+          // ->> returns text — cast so numeric comparisons aren't lexicographic
+          const vIdx = addValue(cleanValue);
+          conditions.push(`(${textExpr})::numeric ${mappedOp} $${vIdx}`);
+        } else if (cleanValue instanceof Date) {
+          const vIdx = addValue(cleanValue);
+          conditions.push(`(${textExpr})::timestamptz ${mappedOp} $${vIdx}`);
+        } else if (typeof cleanValue === 'boolean') {
+          const vIdx = addValue(String(cleanValue));
+          conditions.push(`${textExpr} ${mappedOp} $${vIdx}`);
+        } else {
+          const vIdx = addValue(cleanValue);
+          conditions.push(`${textExpr} ${mappedOp} $${vIdx}`);
+        }
+        continue;
+      }
+
+      // NULL equality — SQL 'col != NULL' matches nothing; Firestore semantics
+      // are IS NULL / IS NOT NULL
+      if (cleanValue === null && (w.op === '==' || w.op === '!=')) {
+        conditions.push(w.op === '==' ? `${pgCol} IS NULL` : `${pgCol} IS NOT NULL`);
+        continue;
+      }
+
+      if (w.op === 'in') {
+        if (!Array.isArray(cleanValue) || cleanValue.length === 0) {
+          return { conditions, emptyResult: true };
+        }
+        const vIdx = addValue(cleanValue);
+        conditions.push(`${pgCol} = ANY($${vIdx})`);
+      } else if (w.op === 'not-in') {
+        if (!Array.isArray(cleanValue) || cleanValue.length === 0) continue;
+        const vIdx = addValue(cleanValue);
+        conditions.push(`${pgCol} != ALL($${vIdx})`);
+      } else if (w.op === 'array-contains') {
+        const vIdx = addValue(JSON.stringify([cleanValue]));
+        conditions.push(`COALESCE(${pgCol}, '[]'::jsonb) @> $${vIdx}::jsonb`);
+      } else {
+        const vIdx = addValue(cleanValue);
+        conditions.push(`${pgCol} ${mappedOp} $${vIdx}`);
+      }
+    }
+
+    return { conditions, emptyResult: false };
+  }
+
+  /**
    * count() — Returns a query whose get() returns { data() { return { count } } }
+   * Errors propagate (Firestore throws too) — a silent 0 hides real failures.
    */
   count() {
     const self = this;
     return {
       async get() {
         try {
-          const { table, fieldMap } = self._config;
-          const conditions = [];
+          const { table } = self._config;
           const values = [];
-          let paramIdx = 1;
-
-          for (const w of self._wheres) {
-            const pgCol = resolveField(fieldMap, w.field);
-            const mappedOp = OP_MAP[w.op];
-            if (!mappedOp) throw new Error(`[pgAdapter] Unsupported operator: "${w.op}"`);
-            const cleanValue = convertTimestamp(w.value);
-
-            if (w.op === 'in') {
-              if (!Array.isArray(cleanValue) || cleanValue.length === 0) {
-                return { data: () => ({ count: 0 }) };
-              }
-              conditions.push(`${pgCol} = ANY($${paramIdx})`);
-              values.push(cleanValue);
-              paramIdx++;
-            } else if (w.op === 'not-in') {
-              if (!Array.isArray(cleanValue) || cleanValue.length === 0) continue;
-              conditions.push(`${pgCol} != ALL($${paramIdx})`);
-              values.push(cleanValue);
-              paramIdx++;
-            } else if (w.op === 'array-contains') {
-              conditions.push(`${pgCol} @> $${paramIdx}::jsonb`);
-              values.push(JSON.stringify([cleanValue]));
-              paramIdx++;
-            } else {
-              conditions.push(`${pgCol} ${mappedOp} $${paramIdx}`);
-              values.push(cleanValue);
-              paramIdx++;
-            }
-          }
+          const { conditions, emptyResult } = self._buildConditions(values);
+          if (emptyResult) return { data: () => ({ count: 0 }) };
 
           let sql = `SELECT COUNT(*) AS cnt FROM ${table}`;
           if (conditions.length > 0) {
             sql += ' WHERE ' + conditions.join(' AND ');
           }
 
-          const result = await pgQuery(sql, values);
+          const exec = self._client ? self._client.query.bind(self._client) : pgQuery;
+          const result = await exec(sql, values);
           const cnt = parseInt(result.rows[0].cnt, 10);
           return { data: () => ({ count: cnt }) };
         } catch (err) {
           console.error(`[pgAdapter] count() error (${self._collectionName}):`, err.message);
-          return { data: () => ({ count: 0 }) };
+          throw err;
         }
       }
     };
@@ -642,15 +999,17 @@ class PgQuery {
    */
   async get() {
     try {
-      const { table, fieldMap, jsonbCols, toFirestoreObj, cacheTTL } = this._config;
+      const { table, fieldMap, toFirestoreObj, cacheTTL } = this._config;
+      const usingCursor = !!(this._startAfterSnap || this._startAfterValues);
 
-      // Redis query cache check — only for cacheable collections without cursor pagination
+      // Redis query cache check — only for cacheable, non-transactional,
+      // non-cursor reads
       let qCacheKey = null;
-      if (cacheTTL && !this._startAfterSnap) {
+      if (cacheTTL && !usingCursor && !this._client) {
         try {
           const ver = await getTableVersion(table);
           const queryDesc = {
-            w: this._wheres.map(w => ({ f: w.field, o: w.op, v: w.value instanceof Date ? w.value.toISOString() : w.value })),
+            w: this._wheres.map(w => ({ f: typeof w.field === 'string' ? w.field : String(w.field), o: w.op, v: w.value instanceof Date ? w.value.toISOString() : w.value })),
             ob: this._orderBys,
             l: this._limitVal,
             off: this._offsetVal,
@@ -661,71 +1020,84 @@ class PgQuery {
             // Reconstruct DocumentSnapshots from cached data
             const docs = cached.map(item => {
               const ref = new PgDocRef(this._collectionName, item.id, this._config, this._firestoreDb);
-              return makeDocumentSnapshot(item.id, item.data, ref);
+              return makeDocumentSnapshot(item.id, reviveTimestamps(item.data), ref);
             });
             return makeQuerySnapshot(docs);
           }
         } catch (_) { /* cache miss — fall through to PG */ }
       }
 
-      const conditions = [];
       const values = [];
-      let paramIdx = 1;
+      const { conditions, emptyResult } = this._buildConditions(values);
+      if (emptyResult) return makeQuerySnapshot([]);
 
-      // WHERE clauses
-      for (const w of this._wheres) {
-        // Handle dot-notation for JSONB fields (e.g. 'staffInfo.userId')
-        const dotParts = w.field.split('.');
-        const topField = dotParts[0];
-        const pgCol = resolveField(fieldMap, topField);
-        const mappedOp = OP_MAP[w.op];
+      // ORDER BY — Firestore excludes documents that lack the orderBy field,
+      // so filter NULLs (also fixes NULLS-first-on-DESC surprises)
+      const orderParts = [];
+      for (const o of this._orderBys) {
+        const col = resolveField(fieldMap, o.field);
+        const dir = o.direction === 'desc' ? 'DESC' : 'ASC';
+        orderParts.push(`${col} ${dir}`);
+        conditions.push(`${col} IS NOT NULL`);
+      }
 
-        if (dotParts.length > 1 && jsonbCols && jsonbCols.has(pgCol)) {
-          // JSONB path query: staff_info->>'userId' = $1
-          const jsonPath = dotParts.slice(1);
-          let jsonExpr = pgCol;
-          for (let i = 0; i < jsonPath.length - 1; i++) {
-            jsonExpr = `${jsonExpr}->'${jsonPath[i]}'`;
+      // startAfter — cursor pagination
+      if (this._orderBys.length > 0 && usingCursor) {
+        let cursorVals = null;
+        let cursorId = null;
+
+        if (this._startAfterSnap) {
+          const snapData = this._startAfterSnap.data
+            ? this._startAfterSnap.data()
+            : null;
+          if (snapData) {
+            cursorVals = this._orderBys.map((o) => {
+              let v = snapData[o.field];
+              if (v === undefined && typeof o.field === 'string' && o.field.includes('.')) {
+                v = o.field.split('.').reduce((acc, k) => (acc == null ? acc : acc[k]), snapData);
+              }
+              if (v === undefined) v = snapData[camelToSnake(String(o.field))];
+              return convertTimestamp(v);
+            });
+            cursorId = this._startAfterSnap.id || null;
           }
-          jsonExpr = `${jsonExpr}->>'${jsonPath[jsonPath.length - 1]}'`;
-          const cleanValue = convertTimestamp(w.value);
-          conditions.push(`${jsonExpr} ${mappedOp} $${paramIdx}`);
-          values.push(typeof cleanValue === 'number' ? String(cleanValue) : cleanValue);
-          paramIdx++;
-          continue;
+        } else if (this._startAfterValues) {
+          cursorVals = this._startAfterValues
+            .slice(0, this._orderBys.length)
+            .map(convertTimestamp);
         }
 
-        if (!mappedOp) {
-          throw new Error(`[pgAdapter] Unsupported operator: "${w.op}"`);
-        }
+        if (cursorVals && cursorVals.length > 0) {
+          const dirs = this._orderBys.map((o) => (o.direction === 'desc' ? 'desc' : 'asc'));
+          const uniform = dirs.every((d) => d === dirs[0]);
+          const allPresent = cursorVals.every((v) => v !== undefined && v !== null);
 
-        const cleanValue = convertTimestamp(w.value);
-
-        if (w.op === 'in') {
-          if (!Array.isArray(cleanValue) || cleanValue.length === 0) {
-            // Empty 'in' array — return empty result
-            return makeQuerySnapshot([]);
+          if (uniform && allPresent) {
+            // Row-value comparison with doc-id tiebreak — Firestore appends
+            // __name__ implicitly, preventing skips/dupes on equal sort keys
+            const cols = this._orderBys.map((o) => resolveField(fieldMap, o.field));
+            const placeholders = cursorVals.map((v) => {
+              values.push(v);
+              return `$${values.length}`;
+            });
+            if (cursorId) {
+              cols.push('id');
+              values.push(cursorId);
+              placeholders.push(`$${values.length}`);
+            }
+            const cmp = dirs[0] === 'desc' ? '<' : '>';
+            conditions.push(`(${cols.join(', ')}) ${cmp} (${placeholders.join(', ')})`);
+          } else {
+            // Mixed directions or missing cursor values — per-field fallback
+            for (let i = 0; i < this._orderBys.length; i++) {
+              const v = cursorVals[i];
+              if (v === undefined || v === null) continue;
+              const col = resolveField(fieldMap, this._orderBys[i].field);
+              const cmpOp = dirs[i] === 'desc' ? '<' : '>';
+              values.push(v);
+              conditions.push(`${col} ${cmpOp} $${values.length}`);
+            }
           }
-          conditions.push(`${pgCol} = ANY($${paramIdx})`);
-          values.push(cleanValue);
-          paramIdx++;
-        } else if (w.op === 'not-in') {
-          if (!Array.isArray(cleanValue) || cleanValue.length === 0) {
-            // Empty 'not-in' — no filter needed
-            continue;
-          }
-          conditions.push(`${pgCol} != ALL($${paramIdx})`);
-          values.push(cleanValue);
-          paramIdx++;
-        } else if (w.op === 'array-contains') {
-          // JSONB contains: col @> '["value"]'::jsonb
-          conditions.push(`${pgCol} @> $${paramIdx}::jsonb`);
-          values.push(JSON.stringify([cleanValue]));
-          paramIdx++;
-        } else {
-          conditions.push(`${pgCol} ${mappedOp} $${paramIdx}`);
-          values.push(cleanValue);
-          paramIdx++;
         }
       }
 
@@ -734,47 +1106,11 @@ class PgQuery {
       if (conditions.length > 0) {
         sql += ' WHERE ' + conditions.join(' AND ');
       }
-
-      // ORDER BY
-      if (this._orderBys.length > 0) {
-        const orderParts = this._orderBys.map((o) => {
-          const col = resolveField(fieldMap, o.field);
-          const dir = o.direction === 'desc' ? 'DESC' : 'ASC';
-          return `${col} ${dir}`;
-        });
-        sql += ' ORDER BY ' + orderParts.join(', ');
-      }
-
-      // startAfter — cursor pagination using the ordered fields
-      if (this._startAfterSnap && this._orderBys.length > 0) {
-        const snapData = this._startAfterSnap.data
-          ? this._startAfterSnap.data()
-          : null;
-        if (snapData) {
-          const cursorConditions = [];
-          for (const o of this._orderBys) {
-            const col = resolveField(fieldMap, o.field);
-            const snapVal =
-              snapData[o.field] !== undefined
-                ? snapData[o.field]
-                : snapData[camelToSnake(o.field)];
-            if (snapVal !== undefined && snapVal !== null) {
-              const cmpOp = o.direction === 'desc' ? '<' : '>';
-              cursorConditions.push(`${col} ${cmpOp} $${paramIdx}`);
-              values.push(convertTimestamp(snapVal));
-              paramIdx++;
-            }
-          }
-          if (cursorConditions.length > 0) {
-            // Wrap cursor conditions: they should be ANDed together and ANDed with existing WHERE
-            const cursorSql = cursorConditions.join(' AND ');
-            if (conditions.length > 0) {
-              sql += ` AND (${cursorSql})`;
-            } else {
-              sql += ` WHERE ${cursorSql}`;
-            }
-          }
-        }
+      if (orderParts.length > 0) {
+        // Doc-id tiebreak mirrors Firestore's implicit __name__ ordering
+        const lastDir =
+          this._orderBys[this._orderBys.length - 1].direction === 'desc' ? 'DESC' : 'ASC';
+        sql += ' ORDER BY ' + orderParts.join(', ') + `, id ${lastDir}`;
       }
 
       // LIMIT
@@ -787,10 +1123,11 @@ class PgQuery {
         sql += ` OFFSET ${parseInt(this._offsetVal, 10)}`;
       }
 
-      const result = await pgQuery(sql, values);
+      const exec = this._client ? this._client.query.bind(this._client) : pgQuery;
+      const result = await exec(sql, values);
 
       const docs = result.rows.map((row) => {
-        const data = toFirestoreObj(row);
+        const data = reviveTimestamps(toFirestoreObj(row));
         const id = row.id;
         const ref = new PgDocRef(
           this._collectionName,
@@ -835,9 +1172,10 @@ class PgCollectionRef {
   }
 
   doc(id) {
+    // Firestore collection.doc() with no args mints a random ID
     return new PgDocRef(
       this._collectionName,
-      id,
+      id || generateId(),
       this._config,
       this._firestoreDb
     );
@@ -870,13 +1208,13 @@ class PgCollectionRef {
     return q.limit(n);
   }
 
-  startAfter(docSnapshot) {
+  startAfter(...args) {
     const q = new PgQuery(
       this._config,
       this._collectionName,
       this._firestoreDb
     );
-    return q.startAfter(docSnapshot);
+    return q.startAfter(...args);
   }
 
   select(...fields) {
@@ -920,21 +1258,41 @@ class PgCollectionRef {
 
   /**
    * ADD — insert a new document with an auto-generated ID.
+   * Resolves FieldValue sentinels (serverTimestamp etc.) to concrete values
+   * and retries missing columns into extra_data.
    * @param {Object} data
-   * @returns {{ id: string }}
+   * @returns {PgDocRef} document reference (has .id, .get(), .update(), ...)
    */
   async add(data) {
     try {
       const { table, jsonbCols } = this._config;
       const id = generateId();
-      const pgRow = this._config.toPgRow({ id, ...data });
+      const rowData = hasSentinelOrDottedKey(data)
+        ? resolveSentinelsToValues(data)
+        : data;
+      let pgRow = this._config.toPgRow({ id, ...rowData });
       if (!pgRow.id) pgRow.id = id;
 
-      const { text, values } = buildInsert(table, pgRow, jsonbCols);
-      await pgQuery(text, values);
+      for (let attempt = 0; attempt < 4; attempt++) {
+        const { text, values } = buildInsert(table, pgRow, jsonbCols);
+        try {
+          await pgQuery(text, values);
+          break;
+        } catch (innerErr) {
+          const colMatch = innerErr.message.match(/column "([^"]+)" of relation/);
+          if (!colMatch || attempt === 3) throw innerErr;
+          const badCol = colMatch[1];
+          console.warn(`[pgAdapter] Column "${badCol}" missing on ${table} during add(), moving to extra_data`);
+          const overflow = pgRow[badCol];
+          delete pgRow[badCol];
+          if (overflow !== undefined) {
+            pgRow.extra_data = { ...(pgRow.extra_data || {}), [badCol]: overflow };
+          }
+        }
+      }
       // Invalidate cache
       if (this._config.cacheTTL) bumpTableVersion(table).catch(() => {});
-      return { id };
+      return new PgDocRef(this._collectionName, id, this._config, this._firestoreDb);
     } catch (err) {
       console.error(
         `[pgAdapter] CollectionRef.add() error (${this._collectionName}):`,
@@ -977,51 +1335,57 @@ class PgScopedCollectionRef extends PgCollectionRef {
     this._ancestorScopes = ancestorScopes || [];
   }
 
-  _addScope(q) {
-    // Add ancestor scopes first (e.g. restaurantId from grandparent)
-    for (const scope of this._ancestorScopes) {
-      q._wheres.unshift({ field: scope.field, op: '==', value: scope.value });
-    }
-    // Add the immediate parent scope filter
-    q._wheres.unshift({ field: this._scopeField, op: '==', value: this._parentDocId });
-    // Deduplicate
-    const seen = new Set();
-    q._wheres = q._wheres.filter(w => {
-      const key = `${w.field}|${w.op}|${w.value}`;
-      if (seen.has(key)) return false;
-      seen.add(key);
-      return true;
-    });
-    return q;
-  }
-
-  where(field, op, value) {
-    return this._addScope(super.where(field, op, value));
-  }
-
-  orderBy(field, direction) {
-    return this._addScope(super.orderBy(field, direction));
-  }
-
-  limit(n) {
-    return this._addScope(super.limit(n));
-  }
-
-  async get() {
+  /**
+   * Base query with all scope filters applied. EVERY query entry point must
+   * come through here, otherwise a chained call (count/offset/select/...)
+   * would silently query across ALL parents (cross-tenant leak).
+   */
+  _scopedQuery() {
     const q = new PgQuery(this._config, this._collectionName, this._firestoreDb);
-    // Add ancestor scopes
     for (const scope of this._ancestorScopes) {
       q._wheres.push({ field: scope.field, op: '==', value: scope.value });
     }
     q._wheres.push({ field: this._scopeField, op: '==', value: this._parentDocId });
-    return q.get();
+    return q;
+  }
+
+  where(field, op, value) {
+    return this._scopedQuery().where(field, op, value);
+  }
+
+  orderBy(field, direction) {
+    return this._scopedQuery().orderBy(field, direction);
+  }
+
+  limit(n) {
+    return this._scopedQuery().limit(n);
+  }
+
+  offset(n) {
+    return this._scopedQuery().offset(n);
+  }
+
+  select(...fields) {
+    return this._scopedQuery().select(...fields);
+  }
+
+  startAfter(...args) {
+    return this._scopedQuery().startAfter(...args);
+  }
+
+  count() {
+    return this._scopedQuery().count();
+  }
+
+  async get() {
+    return this._scopedQuery().get();
   }
 
   doc(id) {
     // Return a PgDocRef that carries our full scope chain for child subcollections
     const ref = new PgDocRef(
       this._collectionName,
-      id,
+      id || generateId(),
       this._config,
       this._firestoreDb
     );
@@ -1078,6 +1442,7 @@ class PgBatch {
     if (this._ops.length === 0) return;
 
     const client = await getClient();
+    let poisoned = null;
     try {
       await client.query('BEGIN');
 
@@ -1124,11 +1489,16 @@ class PgBatch {
 
       await client.query('COMMIT');
     } catch (err) {
-      await client.query('ROLLBACK');
+      try {
+        await client.query('ROLLBACK');
+      } catch (rbErr) {
+        // Connection is unusable — make sure the pool destroys it
+        poisoned = rbErr;
+      }
       console.error('[pgAdapter] Batch.commit() error:', err.message);
       throw err;
     } finally {
-      client.release();
+      client.release(poisoned || undefined);
     }
   }
 }
@@ -1150,22 +1520,29 @@ class PgTransaction {
   }
 
   /**
-   * GET a document within the transaction.
-   * @param {PgDocRef} docRef
+   * GET a document or query within the transaction.
+   * Doc reads take a row lock (SELECT ... FOR UPDATE); queries run on the
+   * transaction's connection so they see uncommitted writes.
+   * @param {PgDocRef|PgQuery} docRefOrQuery
    */
-  async get(docRef) {
-    if (docRef instanceof PgDocRef) {
+  async get(docRefOrQuery) {
+    if (docRefOrQuery instanceof PgDocRef) {
       const txRef = new PgDocRef(
-        docRef._collectionName,
-        docRef.id,
-        docRef._config,
-        docRef._firestoreDb,
+        docRefOrQuery._collectionName,
+        docRefOrQuery.id,
+        docRefOrQuery._config,
+        docRefOrQuery._firestoreDb,
         this._client
       );
       return txRef.get();
     }
+    if (docRefOrQuery instanceof PgQuery) {
+      const q = docRefOrQuery._clone();
+      q._client = this._client;
+      return q.get();
+    }
     // Firestore ref — read outside transaction
-    return docRef.get();
+    return docRefOrQuery.get();
   }
 
   /**
@@ -1277,27 +1654,40 @@ function createPgDb(registry, firestoreDb) {
      * @param {Function} updateFn - async (transaction) => result
      */
     /**
+     * Query a collection across all parents (Firestore collectionGroup).
+     * PG subcollections are flattened into single tables, so an unscoped
+     * query over the mapped table IS the collection-group query.
+     */
+    collectionGroup(name) {
+      if (registry[name]) {
+        return new PgQuery(registry[name], name, firestoreDb);
+      }
+      if (firestoreDb) {
+        console.warn(
+          `[pgAdapter] No PG mapping for collectionGroup "${name}", falling back to Firestore`
+        );
+        return firestoreDb.collectionGroup(name);
+      }
+      throw new Error(
+        `[pgAdapter] No PG mapping for collectionGroup "${name}" and no Firestore fallback`
+      );
+    },
+
+    /**
      * Batch-fetch multiple documents by their refs.
      * Equivalent to Firestore's db.getAll(...docRefs).
+     * Errors propagate — Firestore's getAll rejects too; swallowing them made
+     * failing reads look like missing documents.
      * @param {...PgDocRef} docRefs
      * @returns {Array} Array of DocumentSnapshots
      */
     async getAll(...docRefs) {
-      const results = [];
-      for (const ref of docRefs) {
-        try {
-          const snap = await ref.get();
-          results.push(snap);
-        } catch (err) {
-          // Return a non-existent snapshot on error (matches Firestore behavior)
-          results.push(makeDocumentSnapshot(ref.id, null, ref));
-        }
-      }
-      return results;
+      return Promise.all(docRefs.map((ref) => ref.get()));
     },
 
     async runTransaction(updateFn) {
       const client = await getClient();
+      let poisoned = null;
       try {
         await client.query('BEGIN');
         const transaction = new PgTransaction(client, registry, firestoreDb);
@@ -1305,11 +1695,15 @@ function createPgDb(registry, firestoreDb) {
         await client.query('COMMIT');
         return result;
       } catch (err) {
-        await client.query('ROLLBACK');
+        try {
+          await client.query('ROLLBACK');
+        } catch (rbErr) {
+          poisoned = rbErr;
+        }
         console.error('[pgAdapter] runTransaction() error:', err.message);
         throw err;
       } finally {
-        client.release();
+        client.release(poisoned || undefined);
       }
     },
   };

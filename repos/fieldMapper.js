@@ -126,6 +126,8 @@ const FIELD_MAP = {
   deliveryInfo: 'delivery_info',
   deliveryAddress: 'delivery_address',
   deliveryPartnerId: 'delivery_partner_id',
+  deliveryStatus: 'delivery_status',
+  deliveryAssignedAt: 'delivery_assigned_at',
 
   // Multi-location
   subRestaurantId: 'sub_restaurant_id',

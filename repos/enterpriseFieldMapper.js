@@ -197,12 +197,12 @@ const auditLogToFirestoreObj = makeToFirestoreObj(buildReverseMap(AUDIT_LOG_FIEL
 // ── Exports ──────────────────────────────────────────────────────────────────
 
 module.exports = {
-  orgToPgRow, orgToFirestoreObj, ORG_JSONB_COLUMNS,
-  menuTemplateToPgRow, menuTemplateToFirestoreObj, MENU_TEMPLATE_JSONB_COLUMNS,
-  menuItemToPgRow, menuItemToFirestoreObj, MENU_ITEM_JSONB_COLUMNS,
-  indentToPgRow, indentToFirestoreObj, INDENT_JSONB_COLUMNS,
-  productionOrderToPgRow, productionOrderToFirestoreObj, PRODUCTION_ORDER_JSONB_COLUMNS,
-  distributionPlanToPgRow, distributionPlanToFirestoreObj, DISTRIBUTION_PLAN_JSONB_COLUMNS,
-  orgSettingsToPgRow, orgSettingsToFirestoreObj, ORG_SETTINGS_JSONB_COLUMNS,
-  auditLogToPgRow, auditLogToFirestoreObj, AUDIT_LOG_JSONB_COLUMNS,
+  orgToPgRow, orgToFirestoreObj, ORG_JSONB_COLUMNS, ORG_FIELD_MAP,
+  menuTemplateToPgRow, menuTemplateToFirestoreObj, MENU_TEMPLATE_JSONB_COLUMNS, MENU_TEMPLATE_FIELD_MAP,
+  menuItemToPgRow, menuItemToFirestoreObj, MENU_ITEM_JSONB_COLUMNS, MENU_ITEM_FIELD_MAP,
+  indentToPgRow, indentToFirestoreObj, INDENT_JSONB_COLUMNS, INDENT_FIELD_MAP,
+  productionOrderToPgRow, productionOrderToFirestoreObj, PRODUCTION_ORDER_JSONB_COLUMNS, PRODUCTION_ORDER_FIELD_MAP,
+  distributionPlanToPgRow, distributionPlanToFirestoreObj, DISTRIBUTION_PLAN_JSONB_COLUMNS, DISTRIBUTION_PLAN_FIELD_MAP,
+  orgSettingsToPgRow, orgSettingsToFirestoreObj, ORG_SETTINGS_JSONB_COLUMNS, ORG_SETTINGS_FIELD_MAP,
+  auditLogToPgRow, auditLogToFirestoreObj, AUDIT_LOG_JSONB_COLUMNS, AUDIT_LOG_FIELD_MAP,
 };

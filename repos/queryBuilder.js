@@ -6,12 +6,31 @@
  */
 
 /**
+ * JSON.stringify replacer that normalizes all date-like values to ISO strings:
+ *  - Firestore Timestamp ({ toDate() })  → ISO string
+ *  - Serialized Timestamp ({ _seconds, _nanoseconds }) → ISO string
+ *  - Date already serializes to ISO via its own toJSON
+ * Ensures nested dates inside JSONB columns are stored consistently.
+ */
+function dateNormalizingReplacer(key, value) {
+  const orig = this[key];
+  if (orig && typeof orig === 'object') {
+    if (typeof orig.toDate === 'function') {
+      try { return orig.toDate().toISOString(); } catch (_) { return value; }
+    }
+    if (orig._seconds !== undefined && orig._nanoseconds !== undefined) {
+      return new Date(orig._seconds * 1000 + orig._nanoseconds / 1e6).toISOString();
+    }
+  }
+  return value;
+}
+
+/**
  * Convert a value to a valid JSONB string for PostgreSQL.
  */
 function toJsonbValue(val) {
   if (val === null || val === undefined) return null;
-  if (typeof val === 'object') return JSON.stringify(val);
-  return JSON.stringify(val);
+  return JSON.stringify(val, dateNormalizingReplacer);
 }
 
 /**
@@ -30,9 +49,17 @@ function convertTimestamp(val) {
 
 /**
  * Check if a value is a Firestore FieldValue sentinel (delete, serverTimestamp, etc.)
+ * NOTE: Firestore Timestamp objects also have isEqual() — they are data, not
+ * sentinels, so exclude anything date-like (toDate / _seconds).
  */
 function isFieldValueSentinel(val) {
-  return val !== null && typeof val === 'object' && typeof val.isEqual === 'function';
+  return (
+    val !== null &&
+    typeof val === 'object' &&
+    typeof val.isEqual === 'function' &&
+    typeof val.toDate !== 'function' &&
+    val._seconds === undefined
+  );
 }
 
 /**
@@ -114,7 +141,7 @@ function buildUpdate(tableName, id, pgRow, jsonbColumns) {
  * @param {string[]} conflictCols - Columns for ON CONFLICT clause (default: ['id'])
  * @returns {{ text: string, values: any[] }}
  */
-function buildUpsert(tableName, pgRow, jsonbColumns, conflictCols = ['id']) {
+function buildUpsert(tableName, pgRow, jsonbColumns, conflictCols = ['id'], opts = {}) {
   const cols = [];
   const placeholders = [];
   const values = [];
@@ -132,9 +159,20 @@ function buildUpsert(tableName, pgRow, jsonbColumns, conflictCols = ['id']) {
     i++;
   }
 
+  // For merge-style set(), JSONB columns holding plain objects are shallow-
+  // merged into the existing value (Firestore merge keeps sibling keys);
+  // arrays and scalars still replace.
+  const isMergeableObject = (col) => {
+    const v = pgRow[col];
+    return v !== null && typeof v === 'object' && !Array.isArray(v) && !(v instanceof Date);
+  };
+
   const updateCols = cols.filter(c => !conflictCols.includes(c));
   const updateClauses = updateCols.map(c => {
     if (c === 'extra_data') {
+      return `${c} = COALESCE(${tableName}.${c}, '{}'::jsonb) || EXCLUDED.${c}`;
+    }
+    if (opts.mergeJsonb && jsonbColumns.has(c) && isMergeableObject(c)) {
       return `${c} = COALESCE(${tableName}.${c}, '{}'::jsonb) || EXCLUDED.${c}`;
     }
     return `${c} = EXCLUDED.${c}`;

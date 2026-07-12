@@ -434,3 +434,26 @@ node scripts/backfill-orders-pg.js --upsert
 - NUMERIC/BIGINT type parsers (prevent string concatenation bugs)
 - JSONB dot-notation in WHERE clauses (`staffInfo.userId` → `staff_info->>'userId'`)
 - Subcollection routing via PgScopedCollectionRef with ancestor scope propagation
+
+### 2026-07-12: Pre-cutover audit + full adapter/registry fix (merged main)
+
+**Merged main → pg-full-migration** (9 commits): covers/totalCovers daily stats, timezone-aware offer schedules, WhatsApp webhook dedup by messageId, chatgptUsageLimiter FieldValue fix, KOT status RTDB notify, CSV parser upgrades (isVeg/variants-JSON/description + .txt pre-parse), superAdminDisabledPages, super-admin WhatsApp dedup, offline-sync fallback for deleted menu items.
+
+**pgAdapter core fixes (repos/pgAdapter.js, queryBuilder.js, pgClient.js):**
+- `set()`/`add()` now translate FieldValue sentinels (increment/serverTimestamp/arrayUnion/arrayRemove/delete) — previously silently dropped, which zeroed ALL dailyStats accumulation. Merge-set with sentinels = UPDATE-first, INSERT-resolved-row on miss (race-safe via ON CONFLICT DO NOTHING)
+- Timestamp revival on every read: timestamptz Dates and JSONB `{_seconds,_nanoseconds}` blobs → real Firestore Timestamps (`.toDate()` works again; OTP login, KOT, shift close-out fixed). Plain ISO strings intentionally NOT converted
+- `where(f,'!=',null)` → `IS NOT NULL` (was `!= NULL` = always empty); same for `'=='`
+- `doc()` with no args auto-generates an ID (10+ create flows crashed with NULL id)
+- `db.collectionGroup(name)` implemented (mapped → flat-table query; unmapped → Firestore fallback) — fixes SADAD webhook TypeError
+- `update()`: throws NOT_FOUND (code 5) on missing doc like Firestore; dot-path JSONB writes create intermediate objects, support sentinels at the leaf, and paths are parameterized (`$n::text[]`); extra_data updates MERGE (`||`) instead of replacing; missing-column retry routes fields into extra_data as JSONB-path writes (sentinel semantics preserved), capped depth, no infinite recursion
+- arrayUnion dedupes (Firestore set semantics); arrayRemove single-pass
+- Cursors: `startAfter(rawValue...)` supported; snapshot cursors use row-value tuple comparison with doc-id tiebreak; orderBy adds `IS NOT NULL` (Firestore excludes docs missing the field) + `id` tiebreak in ORDER BY
+- Transactions: `SELECT ... FOR UPDATE` row locking; `tx.get(query)` runs on the tx connection; ROLLBACK failures poison-release the client
+- count() propagates errors (was silently returning 0); getAll() rejects on error; scoped subcollections no longer leak scope on count/offset/select/startAfter
+- JSONB dot-path WHERE: numeric/date casts, `in`/`not-in`, booleans, null — no more lexicographic text compares
+- Per-collection `resolveKeyPath` hook (dailyStats): dynamic keys like `paymentMethod_cash.transactions` land in packed `payment_methods` JSONB
+- pgClient: statement_timeout (30s default), connect timeout 10s, env knobs PG_STATEMENT_TIMEOUT_MS/PG_CONNECT_TIMEOUT_MS
+
+**Registry/mappers:** 153/158 entries now carry real fieldMaps (was ~54); booking_venues duplicate key resolved (canonical: booking_venues + hotelBooking mapper); `menu` alias → menu_items (14 AI/RAG legacy subcollection readers now read live PG data); new mapped columns: restaurants.aggregator_config, orders.delivery_status/delivery_assigned_at, feedback_forms.distribution, rest_bookings.venue, owner_preferences.email_enabled/active_report_hours_utc, daily_stats.total_covers, app_users.email_otp/email_otp_expiry, purchase_orders.expected_delivery_date/received_at, menu_items.sub_category.
+
+**⚠️ scripts/add-cutover-columns.sql MUST run on Cloud SQL before deploying this revision** (adds columns + migrates values out of extra_data). Cutover procedure: docs/pg-cutover-runbook.md. Deploy script fixed: switch-backend.sh now uses --update-env-vars (--set-env-vars wiped all 44 env vars).

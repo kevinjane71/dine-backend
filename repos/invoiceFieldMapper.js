@@ -275,23 +275,23 @@ const numberSeqToFirestoreObj = makeToFirestoreObj(buildReverseMap(NUMBER_SEQ_FI
 
 module.exports = {
   // Organizations
-  orgToPgRow, orgToFirestoreObj, ORG_JSONB_COLUMNS,
+  orgToPgRow, orgToFirestoreObj, ORG_JSONB_COLUMNS, ORG_FIELD_MAP,
   // Customers
-  customerToPgRow, customerToFirestoreObj, CUSTOMER_JSONB_COLUMNS,
+  customerToPgRow, customerToFirestoreObj, CUSTOMER_JSONB_COLUMNS, CUSTOMER_FIELD_MAP,
   // Items
-  itemToPgRow, itemToFirestoreObj, ITEM_JSONB_COLUMNS,
+  itemToPgRow, itemToFirestoreObj, ITEM_JSONB_COLUMNS, ITEM_FIELD_MAP,
   // Invoices
-  invoiceToPgRow, invoiceToFirestoreObj, INVOICE_JSONB_COLUMNS,
+  invoiceToPgRow, invoiceToFirestoreObj, INVOICE_JSONB_COLUMNS, INVOICE_FIELD_MAP,
   // Quotes
-  quoteToPgRow, quoteToFirestoreObj, QUOTE_JSONB_COLUMNS,
+  quoteToPgRow, quoteToFirestoreObj, QUOTE_JSONB_COLUMNS, QUOTE_FIELD_MAP,
   // Challans
-  challanToPgRow, challanToFirestoreObj, CHALLAN_JSONB_COLUMNS,
+  challanToPgRow, challanToFirestoreObj, CHALLAN_JSONB_COLUMNS, CHALLAN_FIELD_MAP,
   // Payments
-  paymentToPgRow, paymentToFirestoreObj, PAYMENT_JSONB_COLUMNS,
+  paymentToPgRow, paymentToFirestoreObj, PAYMENT_JSONB_COLUMNS, PAYMENT_FIELD_MAP,
   // Expenses
-  expenseToPgRow, expenseToFirestoreObj, EXPENSE_JSONB_COLUMNS,
+  expenseToPgRow, expenseToFirestoreObj, EXPENSE_JSONB_COLUMNS, EXPENSE_FIELD_MAP,
   // Settings
-  settingsToPgRow, settingsToFirestoreObj, SETTINGS_JSONB_COLUMNS,
+  settingsToPgRow, settingsToFirestoreObj, SETTINGS_JSONB_COLUMNS, SETTINGS_FIELD_MAP,
   // Number sequences
-  numberSeqToPgRow, numberSeqToFirestoreObj, NUMBER_SEQ_JSONB_COLUMNS,
+  numberSeqToPgRow, numberSeqToFirestoreObj, NUMBER_SEQ_JSONB_COLUMNS, NUMBER_SEQ_FIELD_MAP,
 };

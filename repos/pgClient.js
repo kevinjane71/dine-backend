@@ -10,7 +10,9 @@ function getPool() {
     max: parseInt(process.env.PG_POOL_MAX) || 10,
     min: parseInt(process.env.PG_POOL_MIN) || 2,
     idleTimeoutMillis: 30000,
-    connectionTimeoutMillis: 5000,
+    connectionTimeoutMillis: parseInt(process.env.PG_CONNECT_TIMEOUT_MS) || 10000,
+    // Kill runaway queries server-side so a bad plan can't hold a connection forever
+    statement_timeout: parseInt(process.env.PG_STATEMENT_TIMEOUT_MS) || 30000,
   });
 
   pool.on('error', (err) => {

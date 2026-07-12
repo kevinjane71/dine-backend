@@ -1268,7 +1268,7 @@ class FunctionCallingAgent {
       table: {
         id: targetTable.id,
         name: tableData.name,
-        floor: targetTable.ref.parent.parent.id
+        floor: targetFloorId || tableData.floorId || targetTable.ref.parent?.parent?.id || null
       }
     };
   }
