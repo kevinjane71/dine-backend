@@ -335,6 +335,12 @@ function updateDailyStats(restaurantId, order, operation, tzOffset, dayStartHour
       updatedAt: FieldValue.serverTimestamp()
     };
 
+    // Cover count for dine-in orders
+    const ot = (order.orderType || 'dine_in').toLowerCase().replace(/[\s-]+/g, '_');
+    if (ot === 'dine_in') {
+      update.totalCovers = FieldValue.increment((order.covers || 1) * sign);
+    }
+
     // Track due amounts separately
     if (effective.dueAmount > 0) {
       update.totalDueAmount = FieldValue.increment(effective.dueAmount * sign);
@@ -2677,6 +2683,12 @@ const tryParseStructuredCSV = (buffer, fileName) => {
     const catKey = catCol ? findOrig(catCol) : null;
     const nameArCol = headers.find(h => /^(name_?ar|arabic_?name|arabic|namear)$/i.test(h));
     const nameArKey = nameArCol ? findOrig(nameArCol) : null;
+    const isVegCol = headers.find(h => /^(is_?veg|veg|vegetarian)$/i.test(h));
+    const isVegKey = isVegCol ? findOrig(isVegCol) : null;
+    const variantsJsonCol = headers.find(h => /^(variants)$/i.test(h));
+    const variantsJsonKey = variantsJsonCol ? findOrig(variantsJsonCol) : null;
+    const descCol = headers.find(h => /^(description|desc)$/i.test(h));
+    const descKey = descCol ? findOrig(descCol) : null;
 
     // Detect variant columns (variant1_name, variant1_price, variant2_name, etc.)
     const variantSets = [];
@@ -2689,7 +2701,7 @@ const tryParseStructuredCSV = (buffer, fileName) => {
     // Detect veg/non-veg heuristic keywords
     const nonVegKeywords = /chicken|mutton|fish|prawn|egg|lamb|pork|beef|meat|keema|gosht|surmai|pomfret|rawas|crab|lobster|shrimp|bacon|sausage|ham|salami|pepperoni/i;
 
-    console.log(`📊 Structured CSV detected: ${rows.length} rows, name="${nameKey}", price="${priceKey}", category="${catKey || 'none'}", nameAr="${nameArKey || 'none'}", variants=${variantSets.length}`);
+    console.log(`📊 Structured CSV detected: ${rows.length} rows, name="${nameKey}", price="${priceKey}", category="${catKey || 'none'}", nameAr="${nameArKey || 'none'}", isVeg="${isVegKey || 'none'}", variantsJson="${variantsJsonKey || 'none'}", variantCols=${variantSets.length}`);
 
     const categoriesMap = new Map();
     const menuItems = [];
@@ -2707,18 +2719,26 @@ const tryParseStructuredCSV = (buffer, fileName) => {
         categoriesMap.set(categoryName, { name: categoryName, order: categoriesMap.size + 1 });
       }
 
-      // Collect variants from variant columns
-      const variants = [];
-      for (const vs of variantSets) {
-        const vName = String(row[vs.nameKey] || '').trim();
-        const vPrice = parseFloat(row[vs.priceKey]);
-        if (vName && !isNaN(vPrice) && vPrice > 0) {
-          variants.push({ name: vName, price: vPrice });
+      // Collect variants from variant columns or JSON variants column
+      let variants = [];
+      if (variantsJsonKey && row[variantsJsonKey]) {
+        try {
+          const parsed = JSON.parse(String(row[variantsJsonKey]));
+          if (Array.isArray(parsed)) variants = parsed.filter(v => v && v.name && v.price != null).map(v => ({ name: String(v.name).trim(), price: parseFloat(v.price) || 0 }));
+        } catch (e) { /* not valid JSON, ignore */ }
+      }
+      if (variants.length === 0) {
+        for (const vs of variantSets) {
+          const vName = String(row[vs.nameKey] || '').trim();
+          const vPrice = parseFloat(row[vs.priceKey]);
+          if (vName && !isNaN(vPrice) && vPrice > 0) {
+            variants.push({ name: vName, price: vPrice });
+          }
         }
       }
 
-      // Determine isVeg
-      const isVeg = !nonVegKeywords.test(name) && !nonVegKeywords.test(categoryName);
+      // Determine isVeg — use explicit column if available, else heuristic
+      const isVeg = isVegKey ? /^(true|1|yes|veg)$/i.test(String(row[isVegKey]).trim()) : (!nonVegKeywords.test(name) && !nonVegKeywords.test(categoryName));
 
       // Generate imageKeyword
       const imageKeyword = name.toLowerCase().replace(/[^a-z0-9\s]/g, '').trim().split(/\s+/).slice(0, 3).join('-');
@@ -2728,7 +2748,7 @@ const tryParseStructuredCSV = (buffer, fileName) => {
       menuItems.push({
         name,
         nameAr: nameAr || null,
-        description: '',
+        description: descKey ? String(row[descKey] || '').trim() : '',
         price,
         category: categoryName,
         isVeg,
@@ -2786,7 +2806,8 @@ shortCode: 1,2,3... If NOT a menu: {"categories":[],"menuItems":[]}`
         }
       ],
       max_tokens: 16000,
-      temperature: 0.1
+      temperature: 0.1,
+      response_format: { type: "json_object" }
     });
     const content = response.choices[0].message.content;
     const jsonMatch = content.match(/\{[\s\S]*\}/);
@@ -2808,6 +2829,20 @@ const extractMenuFromDocument = async (docUrl, businessType = 'restaurant') => {
     console.log('📥 Downloading file...');
     const buffer = await downloadFileBuffer(docUrl);
     const fileName = docUrl.split('/').pop().split('?')[0];
+
+    // If the .txt file looks like CSV (has comma-separated headers), try structured CSV parsing first
+    const rawText = buffer.toString('utf-8');
+    const firstLine = rawText.split('\n')[0].toLowerCase().trim();
+    if (firstLine.includes('name') && firstLine.includes('price') && firstLine.includes(',')) {
+      console.log('📊 Text file looks like CSV, trying structured parser first...');
+      const structured = tryParseStructuredCSV(buffer, fileName.replace(/\.txt$/, '.csv'));
+      if (structured && structured.menuItems.length > 0) {
+        console.log(`✅ Structured CSV parser extracted ${structured.menuItems.length} items from .txt file (no AI needed)`);
+        return structured;
+      }
+      console.log('⚠️ Structured CSV parse failed, falling back to AI extraction...');
+    }
+
     const textContent = await parseDocumentToText(buffer, fileName);
     console.log(`📄 Parsed document to text (${textContent.length} chars)`);
 
@@ -2829,8 +2864,9 @@ Return JSON: {"categories":[...],"menuItems":[{"name":"","description":"","price
 shortCode: 1,2,3... If NOT a menu: {"categories":[],"menuItems":[]}`
         }
       ],
-      max_tokens: 8000,
-      temperature: 0.1
+      max_tokens: 16000,
+      temperature: 0.1,
+      response_format: { type: "json_object" }
     });
     const content = response.choices[0].message.content;
     const jsonMatch = content.match(/\{[\s\S]*\}/);
@@ -8723,7 +8759,8 @@ app.post('/api/public/orders/:restaurantId', vercelSecurityMiddleware.publicAPI,
         const isValidDate = (!validFrom || now >= validFrom) && (!validUntil || now <= validUntil);
         const isUnderUsageLimit = !offer.usageLimit || (offer.usageCount || 0) < offer.usageLimit;
         const meetsMinOrder = subtotal >= (offer.minOrderValue || 0);
-        const isValidSchedule = offerEngine.isScheduleValid(offer, now);
+        const restTimezone = restaurantData.posSettings?.timezone || 'Asia/Kolkata';
+        const isValidSchedule = offerEngine.isScheduleValid(offer, now, restTimezone);
         const audienceOk = offerEngine.matchesAudience(offer, offerContext);
 
         // Per-customer usage cap
@@ -9527,11 +9564,45 @@ app.post('/api/orders', async (req, res) => {
       const menuItem = menuItems.find(menuItem => menuItem.id === item.menuItemId);
 
       if (!menuItem) {
+        if (isOfflineSync) {
+          // Offline sync: menu item may have been deleted/changed since order was placed locally.
+          // Accept the order using frontend-provided data so the sale is not lost.
+          const fePrice = typeof item.price === 'number' ? item.price : (typeof item.basePrice === 'number' ? item.basePrice : 0);
+          const parsedQty = parseInt(item.quantity, 10);
+          const itemQuantity = Math.max(1, parsedQty || 1);
+          const customizations = Array.isArray(item.selectedCustomizations)
+            ? item.selectedCustomizations
+            : (Array.isArray(item.customizations) ? item.customizations : []);
+          const customizationPrice = customizations.reduce((sum, c) => sum + (typeof c.price === 'number' ? c.price : 0), 0);
+          const unitPrice = (fePrice || 0) + (customizationPrice || 0);
+          const selectedVariant = item.selectedVariant || item.variant || null;
+          const itemTotal = unitPrice * itemQuantity;
+          totalAmount += itemTotal;
+
+          orderItems.push({
+            menuItemId: item.menuItemId,
+            name: typeof item.name === 'string' ? item.name.substring(0, 200) : 'Unknown Item',
+            nameAr: typeof item.nameAr === 'string' ? item.nameAr.substring(0, 200) : null,
+            price: unitPrice,
+            quantity: itemQuantity,
+            total: itemTotal,
+            category: item.category || '',
+            shortCode: item.shortCode || null,
+            notes: typeof item.notes === 'string' ? item.notes.substring(0, 500) : '',
+            selectedVariant: selectedVariant ? { name: selectedVariant.name, price: selectedVariant.price || 0 } : null,
+            selectedCustomizations: customizations.map(c => ({ id: c.id || null, name: c.name || c, price: typeof c.price === 'number' ? c.price : 0 })),
+            menuItemNotFound: true,
+            menuPrice: null,
+            priceEdited: false,
+          });
+          console.log(`🔄 Offline sync: menu item ${item.menuItemId} not found in current menu, using FE data: "${item.name}" ₹${unitPrice} x${itemQuantity}`);
+          continue;
+        }
         return res.status(400).json({ error: `Menu item ${item.menuItemId} not found` });
       }
 
-      // Block out-of-stock items
-      if (menuItem.isAvailable === false) {
+      // Block out-of-stock items — skip for offline sync (order was already placed)
+      if (menuItem.isAvailable === false && !isOfflineSync) {
         return res.status(400).json({ error: `"${menuItem.name}" is currently out of stock` });
       }
 
@@ -9739,8 +9810,9 @@ app.post('/api/orders', async (req, res) => {
           const isUnderUsageLimit = !offer.usageLimit || (offer.usageCount || 0) < offer.usageLimit;
           const meetsMinOrder = subtotalForDiscount >= (offer.minOrderValue || offer.minimumOrder || 0);
 
-          // Check schedule (happy hour / time-based) — use centralized engine for overnight support
-          const isValidSchedule = offerEngine.isScheduleValid(offer, now);
+          // Check schedule (happy hour / time-based) — use restaurant timezone for accuracy
+          const restTimezone = restaurantData.posSettings?.timezone || 'Asia/Kolkata';
+          const isValidSchedule = offerEngine.isScheduleValid(offer, now, restTimezone);
 
           // Check targetRestaurants
           const offerTargetRestaurants = offer.targetRestaurants || 'all';
@@ -14166,8 +14238,9 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
           if (offer.usageLimit && (offer.usageCount || 0) >= offer.usageLimit) continue;
           if (offer.minOrderValue && orderSubtotal < offer.minOrderValue) continue;
 
-          // Use centralized schedule validation (handles overnight ranges)
-          if (!offerEngine.isScheduleValid(offer)) continue;
+          // Use centralized schedule validation (handles overnight ranges + timezone)
+          const patchRestTz = (restDoc.exists ? restDoc.data().posSettings?.timezone : null) || 'Asia/Kolkata';
+          if (!offerEngine.isScheduleValid(offer, new Date(), patchRestTz)) continue;
 
           // Use centralized audience validation
           if (!offerEngine.matchesAudience(offer, {})) continue;
@@ -18951,7 +19024,17 @@ app.get('/api/user/page-access', authenticateToken, async (req, res) => {
     }
     
     const userData = userDoc.data();
-    
+
+    // Fetch superAdminDisabledPages from restaurant doc (cached, minimal cost)
+    let superAdminDisabledPages = [];
+    const restaurantId = userData.restaurantId || req.user.restaurantId || req.query.restaurantId;
+    if (restaurantId) {
+      try {
+        const restDoc = await getCachedRestDoc(restaurantId);
+        superAdminDisabledPages = restDoc.data()?.superAdminDisabledPages || [];
+      } catch (_) { /* non-fatal */ }
+    }
+
     res.json({
       pageAccess: userData.pageAccess || {
         dashboard: true,
@@ -18965,7 +19048,8 @@ app.get('/api/user/page-access', authenticateToken, async (req, res) => {
       },
       role: userData.role,
       restaurantId: userData.restaurantId,
-      notAllowedPages: userData.notAllowedPages || [] // Array of page IDs to hide (e.g., ['billing', 'inventory'])
+      notAllowedPages: userData.notAllowedPages || [], // Array of page IDs to hide (e.g., ['billing', 'inventory'])
+      superAdminDisabledPages
     });
   } catch (error) {
     console.error('Get page access error:', error);
@@ -21284,6 +21368,23 @@ app.patch('/api/kot/:orderId/status', async (req, res) => {
     }
 
     await db.collection(collections.orders).doc(orderId).update(updateData);
+
+    // Push RTDB event so token display + other views get real-time updates
+    try {
+      const od = (await db.collection(collections.orders).doc(orderId).get()).data();
+      if (od) {
+        await pusherService.notifyOrderStatusUpdated(od.restaurantId, orderId, status, {
+          orderNumber: od.orderNumber,
+          dailyOrderId: od.dailyOrderId,
+          totalAmount: od.totalAmount,
+          tableNumber: od.tableNumber,
+          tableId: od.tableId || null,
+          floorId: od.floorId || null,
+        });
+      }
+    } catch (rtdbErr) {
+      console.error('KOT RTDB notification error (non-blocking):', rtdbErr);
+    }
 
     res.json({
       message: 'KOT status updated successfully',
@@ -36037,6 +36138,22 @@ app.post('/api/automation/webhook/whatsapp', async (req, res) => {
           // Handle incoming messages from customers
           if (value?.messages && Array.isArray(value.messages)) {
             for (const message of value.messages) {
+              // Dedup: skip if this messageId was already stored (Meta can send duplicate webhooks)
+              if (message.id) {
+                try {
+                  const existingMsg = await db.collection(collections.automationLogs)
+                    .where('messageId', '==', message.id)
+                    .limit(1)
+                    .get();
+                  if (!existingMsg.empty) {
+                    console.log('[WhatsApp] Skipping duplicate message:', message.id);
+                    continue; // Already stored — skip to next message
+                  }
+                } catch (dedupErr) {
+                  console.warn('[WhatsApp] Dedup check failed (proceeding):', dedupErr.message);
+                }
+              }
+
               const processedMessage = whatsappService.handleIncomingMessage({
                 entry: [{
                   changes: [{

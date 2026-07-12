@@ -69,6 +69,17 @@ router.post('/webhook', async (req, res) => {
     // Always log incoming message to automationLogs for super-admin inbox visibility
     try {
       const db = getDb();
+      // Dedup: skip if this messageId was already stored (Meta can send duplicate webhooks)
+      if (message.id) {
+        const existing = await db.collection(collections.automationLogs)
+          .where('messageId', '==', message.id)
+          .limit(1)
+          .get();
+        if (!existing.empty) {
+          console.log('[WhatsApp] Skipping duplicate message:', message.id);
+          return; // Already stored — skip entire handler
+        }
+      }
       const logEntry = {
         type: 'incoming',
         direction: 'incoming',

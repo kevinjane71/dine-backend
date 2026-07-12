@@ -1,4 +1,5 @@
 const { db, collections } = require('../firebase');
+const { FieldValue } = require('firebase-admin/firestore');
 
 // ChatGPT API Usage Limiter
 const chatgptUsageLimiter = {
@@ -122,8 +123,8 @@ const chatgptUsageLimiter = {
 
       // Increment call count
       await userUsageRef.update({
-        callCount: db.FieldValue.increment(1),
-        totalTokensUsed: db.FieldValue.increment(tokensUsed),
+        callCount: FieldValue.increment(1),
+        totalTokensUsed: FieldValue.increment(tokensUsed),
         lastCallAt: now
       });
 
@@ -142,8 +143,8 @@ const chatgptUsageLimiter = {
 
       // Increment IP call count
       await ipUsageRef.update({
-        callCount: db.FieldValue.increment(1),
-        totalTokensUsed: db.FieldValue.increment(tokensUsed),
+        callCount: FieldValue.increment(1),
+        totalTokensUsed: FieldValue.increment(tokensUsed),
         lastCallAt: now
       });
 

@@ -7,7 +7,7 @@ const { authenticateSuperAdmin, requireSuperAdmin } = require('../middleware/sup
 const { checkPermission } = require('../middleware/checkPermission');
 const { parseTZ, todayInTZ, dateStrInTZ, dateBoundsInTZ } = require('../utils/timezone');
 const subAdminRoutes = require('./subAdmin');
-const { getCachedRestDoc } = require('../utils/kvCache');
+const { getCachedRestDoc, invalidateRestaurantCache } = require('../utils/kvCache');
 
 
 // ─── Constants ───────────────────────────────────────────────────────
@@ -1810,7 +1810,7 @@ router.get('/restaurants/:restaurantId/settings', authenticateSuperAdmin, requir
       return res.status(404).json({ success: false, error: 'Restaurant not found' });
     }
     const data = restaurant.data();
-    res.json({ success: true, name: data.name || '', orderSettings: data.orderSettings || {} });
+    res.json({ success: true, name: data.name || '', orderSettings: data.orderSettings || {}, superAdminDisabledPages: data.superAdminDisabledPages || [] });
   } catch (err) {
     console.error('Error fetching restaurant settings:', err);
     res.status(500).json({ success: false, error: err.message });
@@ -1822,7 +1822,7 @@ router.get('/restaurants/:restaurantId/settings', authenticateSuperAdmin, requir
 router.patch('/restaurants/:restaurantId/settings', authenticateSuperAdmin, requireSuperAdmin, async (req, res) => {
   try {
     const { restaurantId } = req.params;
-    const { orderSettings } = req.body || {};
+    const { orderSettings, superAdminDisabledPages } = req.body || {};
 
     if (!restaurantId) {
       return res.status(400).json({ success: false, error: 'restaurantId is required' });
@@ -1841,9 +1841,18 @@ router.patch('/restaurants/:restaurantId/settings', authenticateSuperAdmin, requ
       updateData.orderSettings = { ...existing, ...orderSettings };
     }
 
-    await restaurantRef.update(updateData);
+    if (Array.isArray(superAdminDisabledPages)) {
+      updateData.superAdminDisabledPages = superAdminDisabledPages;
+    }
 
-    res.json({ success: true, orderSettings: updateData.orderSettings || restaurant.data().orderSettings || {} });
+    await restaurantRef.update(updateData);
+    invalidateRestaurantCache(restaurantId);
+
+    res.json({
+      success: true,
+      orderSettings: updateData.orderSettings || restaurant.data().orderSettings || {},
+      superAdminDisabledPages: updateData.superAdminDisabledPages ?? restaurant.data().superAdminDisabledPages ?? []
+    });
   } catch (error) {
     console.error('Super admin update restaurant settings error:', error);
     res.status(500).json({ success: false, error: 'Failed to update restaurant settings' });
@@ -2424,9 +2433,13 @@ router.get('/whatsapp/conversations', authenticateSuperAdmin, requireSuperAdmin,
 
     const convosMap = {};
     const allDocs = [...incomingSnap.docs, ...repliesSnap.docs];
+    // Deduplicate by messageId (Meta can fire webhooks multiple times)
+    const seenMsgIds = new Set();
 
     allDocs.forEach(doc => {
       const d = doc.data();
+      if (d.messageId && seenMsgIds.has(d.messageId)) return; // Skip duplicate
+      if (d.messageId) seenMsgIds.add(d.messageId);
       const phone = d.phone || d.customerPhone;
       if (!phone) return;
 
@@ -2547,6 +2560,15 @@ router.get('/whatsapp/messages/:phone', authenticateSuperAdmin, requireSuperAdmi
       };
     }).sort((a, b) => (a.timestamp || '').localeCompare(b.timestamp || ''));
 
+    // Deduplicate by messageId (Meta webhooks can fire multiple times for the same message)
+    const seenMessageIds = new Set();
+    const dedupedMessages = messages.filter(m => {
+      if (!m.messageId) return true; // No messageId — keep (legacy entries)
+      if (seenMessageIds.has(m.messageId)) return false; // Duplicate — skip
+      seenMessageIds.add(m.messageId);
+      return true;
+    });
+
     const sessionActive = lastIncomingAt ? (Date.now() - lastIncomingAt.getTime() < 24 * 60 * 60 * 1000) : false;
 
     // Auto mark-read
@@ -2556,7 +2578,7 @@ router.get('/whatsapp/messages/:phone', authenticateSuperAdmin, requireSuperAdmi
       await batch.commit();
     }
 
-    res.json({ success: true, messages, sessionActive });
+    res.json({ success: true, messages: dedupedMessages, sessionActive });
   } catch (error) {
     console.error('WhatsApp messages error:', error);
     res.status(500).json({ success: false, error: 'Failed to fetch messages' });
