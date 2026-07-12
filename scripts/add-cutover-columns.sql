@@ -291,3 +291,20 @@ COMMIT;
 --   SELECT count(*) FROM app_users WHERE extra_data ? 'emailOTPExpiry';
 -- All should be 0 (or only rows whose values could not be parsed).
 -- ============================================================================
+
+-- ────────────────────────────────────────────────────────────────────────────
+-- 12. owner_preferences.report_time_utc (INTEGER) — legacy hourly-report field
+--     queried by /api/cron/send-daily-reports (index.js ~19903)
+--     (added 2026-07-12 after live cron test)
+-- ────────────────────────────────────────────────────────────────────────────
+BEGIN;
+ALTER TABLE owner_preferences ADD COLUMN IF NOT EXISTS report_time_utc INTEGER;
+
+UPDATE owner_preferences
+   SET report_time_utc = NULLIF(extra_data->>'reportTimeUTC','')::numeric::integer
+ WHERE report_time_utc IS NULL AND extra_data ? 'reportTimeUTC';
+
+UPDATE owner_preferences
+   SET extra_data = extra_data - 'reportTimeUTC'
+ WHERE report_time_utc IS NOT NULL AND extra_data ? 'reportTimeUTC';
+COMMIT;

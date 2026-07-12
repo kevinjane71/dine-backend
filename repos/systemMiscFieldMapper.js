@@ -1144,6 +1144,7 @@ const OWNER_PREF_FIELD_MAP = {
   dashboardLayout: 'dashboard_layout',
   emailEnabled: 'email_enabled',
   activeReportHoursUTC: 'active_report_hours_utc',
+  reportTimeUTC: 'report_time_utc',
   updatedAt: 'updated_at',
 };
 
