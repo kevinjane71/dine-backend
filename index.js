@@ -23003,6 +23003,68 @@ app.post('/api/web/register-fcm-token', async (req, res) => {
 });
 
 // ========================================
+// PRINT DIAGNOSTICS TELEMETRY
+// ========================================
+// Desktop (Electron) terminals POST print outcomes here — primarily FAILURES —
+// so we can diagnose printer issues remotely by restaurantId without a site
+// visit or asking a non-technical customer to send a log file.
+//
+// Design notes (this must never disrupt the POS):
+//  - Fire-and-forget from the client; the print itself never waits on or fails
+//    because of this call.
+//  - Unauthenticated + restaurantId-keyed, mirroring the /api/printer/*-fcm-token
+//    endpoints, so it works even when a terminal's auth token is stale.
+//  - Payload is strictly capped/sanitized so telemetry can't store huge blobs.
+//  - Writes via db.collection() so it works on BOTH the Firestore branch (main)
+//    and the PostgreSQL branch (pg-full-migration, routed via pgAdapter).
+//  - Any server-side write failure is swallowed (logged only) and still returns
+//    200, so a telemetry hiccup can never bubble back into the print flow.
+app.post('/api/print-diagnostics', async (req, res) => {
+  try {
+    const { restaurantId, terminalId, event } = req.body || {};
+    if (!restaurantId || !event || typeof event !== 'object' || Array.isArray(event)) {
+      return res.status(400).json({ success: false, error: 'restaurantId and event object are required' });
+    }
+
+    // Sanitize + cap the event object (defense against oversized/abusive payloads).
+    const safeEvent = {};
+    for (const [k, v] of Object.entries(event)) {
+      if (v === null || v === undefined) continue;
+      if (typeof v === 'string') safeEvent[k] = v.slice(0, 500);
+      else if (typeof v === 'number' || typeof v === 'boolean') safeEvent[k] = v;
+      else if (Array.isArray(v)) safeEvent[k] = v.slice(0, 40).map((x) => String(x).slice(0, 160));
+      else safeEvent[k] = String(v).slice(0, 500);
+    }
+
+    // Flatten the fields we want to query/filter on into top-level columns; keep
+    // the full detail in `event` for completeness.
+    const record = {
+      restaurantId: String(restaurantId).slice(0, 128),
+      terminalId: terminalId ? String(terminalId).slice(0, 128) : null,
+      type: safeEvent.type || null,
+      method: safeEvent.method || null,
+      success: typeof safeEvent.success === 'boolean' ? safeEvent.success : null,
+      deviceName: safeEvent.configuredDeviceName || safeEvent.deviceName || null,
+      deviceMatched: typeof safeEvent.deviceMatched === 'boolean' ? safeEvent.deviceMatched : null,
+      failureReason: safeEvent.failureReason || null,
+      hint: safeEvent.hint || null,
+      os: safeEvent.os || null,
+      appVersion: safeEvent.appVersion || null,
+      electronVersion: safeEvent.electron || safeEvent.electronVersion || null,
+      event: safeEvent,
+      createdAt: new Date(),
+    };
+
+    await db.collection(collections.printDiagnostics).add(record);
+    res.json({ success: true });
+  } catch (error) {
+    // Telemetry must never surface as a client-facing error.
+    console.error('[PrintDiagnostics] write failed:', error.message);
+    res.status(200).json({ success: false, error: 'logged-server-side' });
+  }
+});
+
+// ========================================
 // VOICE ASSISTANT API
 // ========================================
 

@@ -342,6 +342,16 @@ const {
 } = require('./authMenuFieldMapper');
 
 // ═══════════════════════════════════════════════════════════════════════════
+// Imports — print diagnostics telemetry
+// ═══════════════════════════════════════════════════════════════════════════
+const {
+  PRINT_DIAG_FIELD_MAP,
+  PRINT_DIAG_JSONB_COLUMNS,
+  printDiagToPgRow,
+  printDiagToFirestoreObj,
+} = require('./printDiagnosticsFieldMapper');
+
+// ═══════════════════════════════════════════════════════════════════════════
 // Counter identity helpers (counters use counterRepo atomic ops)
 // ═══════════════════════════════════════════════════════════════════════════
 const counterIdentity = (obj) => obj;
@@ -578,6 +588,12 @@ const REGISTRY = {
   'daily_order_counters': { table: 'order_counters', fieldMap: {}, toPgRow: counterIdentity, toFirestoreObj: counterIdentity, jsonbCols: COUNTER_JSONB },
   'order_id_counters':    { table: 'order_counters', fieldMap: {}, toPgRow: counterIdentity, toFirestoreObj: counterIdentity, jsonbCols: COUNTER_JSONB },
   'tab_counters':         { table: 'order_counters', fieldMap: {}, toPgRow: counterIdentity, toFirestoreObj: counterIdentity, jsonbCols: COUNTER_JSONB },
+
+  // ── print diagnostics telemetry ─────────────────────────────────────────
+  // Requires the print_diagnostics table (scripts/create-print-diagnostics-table.sql)
+  // to exist on Cloud SQL before this branch deploys; until then the endpoint
+  // still works on Firestore. Writes are fire-and-forget + server-side try/caught.
+  'printDiagnostics':     { table: 'print_diagnostics', fieldMap: PRINT_DIAG_FIELD_MAP, toPgRow: printDiagToPgRow, toFirestoreObj: printDiagToFirestoreObj, jsonbCols: PRINT_DIAG_JSONB_COLUMNS },
 };
 
 module.exports = REGISTRY;
