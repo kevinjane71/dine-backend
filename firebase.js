@@ -170,7 +170,9 @@ const collections = {
   parkingRates: 'parkingRates',
   // Bookings & Catering
   bookings: 'bookings',
-  bookingVenues: 'bookingVenues'
+  bookingVenues: 'bookingVenues',
+  // Print diagnostics telemetry (desktop app printer troubleshooting)
+  printDiagnostics: 'printDiagnostics'
 };
 
 const admin = null; // We don't need the legacy admin object anymore
