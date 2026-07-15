@@ -1045,16 +1045,28 @@ function normalizeModifierGroups(groups) {
   }));
 }
 
+// Sanitize a per-item seat number (seat-level ordering / pivot seating).
+// Valid: integer 1..65 (industry cap, per Oracle Simphony). Anything else → null (= shared/table).
+function sanitizeSeat(seat) {
+  const n = typeof seat === 'string' && seat.trim() !== '' ? Number(seat) : seat;
+  return Number.isInteger(n) && n >= 1 && n <= 65 ? n : null;
+}
+
 // Generate a composite key for an order item that uniquely identifies it.
 // Used everywhere items are matched, deduped, or compared for KOT diffs.
 // Key format: "menuItemId|variantName|custId1,custId2" (sorted customizations)
+// When the item has a seat assigned (seat-level ordering), the seat joins the
+// key so identical items on different seats stay separate lines. Items with
+// no seat produce the exact same key as before — zero behavior change for
+// existing orders and restaurants with the feature off.
 function getOrderItemKey(item) {
   const id = item.menuItemId || item.id || '';
   const variant = item.selectedVariant?.name || '';
   const custs = Array.isArray(item.selectedCustomizations) && item.selectedCustomizations.length > 0
     ? [...item.selectedCustomizations].map(c => c.id || c.name || '').sort().join(',')
     : '';
-  return `${id}|${variant}|${custs}`;
+  const seat = sanitizeSeat(item.seat);
+  return seat === null ? `${id}|${variant}|${custs}` : `${id}|${variant}|${custs}|s${seat}`;
 }
 
 // Server-side deduplication: merge items with the same composite key (menuItemId + variant + customizations).
@@ -8696,6 +8708,7 @@ app.post('/api/public/orders/:restaurantId', vercelSecurityMiddleware.publicAPI,
         menuItemId: item.menuItemId,
         name: menuItem.name,
         price: menuItem.price,
+        seat: sanitizeSeat(item.seat),
         quantity: item.quantity,
         total: itemTotal,
         category: menuItem.category || '',
@@ -9570,6 +9583,7 @@ app.post('/api/orders', async (req, res) => {
         orderItems.push({
           menuItemId: item.menuItemId,
           name: typeof item.name === 'string' ? item.name.substring(0, 200) : 'Custom Item',
+          seat: sanitizeSeat(item.seat),
           nameAr: typeof item.nameAr === 'string' ? item.nameAr.substring(0, 200) : null,
           price: fePrice,
           quantity: itemQuantity,
@@ -9609,6 +9623,7 @@ app.post('/api/orders', async (req, res) => {
           orderItems.push({
             menuItemId: item.menuItemId,
             name: typeof item.name === 'string' ? item.name.substring(0, 200) : 'Unknown Item',
+            seat: sanitizeSeat(item.seat),
             nameAr: typeof item.nameAr === 'string' ? item.nameAr.substring(0, 200) : null,
             price: unitPrice,
             quantity: itemQuantity,
@@ -9737,6 +9752,7 @@ app.post('/api/orders', async (req, res) => {
         menuItemId: item.menuItemId,
         name: menuItem.name,
         nameAr: menuItem.nameAr || null,
+        seat: sanitizeSeat(item.seat),
         price: unitPrice,
         quantity: itemQuantity,
         total: itemTotal,
@@ -13245,12 +13261,16 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
       const allowPriceEditPatch = restaurantData?.posSettings?.allowPriceEdit === true;
       const processedItems = items.map(newItem => {
         // Match by menuItemId + variant name so items with different variants
-        // (e.g., Half vs Full) are correctly treated as separate line items
+        // (e.g., Half vs Full) are correctly treated as separate line items.
+        // Seat-level ordering: same item on different seats must stay separate
+        // lines too (both null when feature off → identical to old behavior).
         const newVariantName = newItem.selectedVariant?.name || null;
+        const newSeat = sanitizeSeat(newItem.seat);
         const existingItem = existingItems.find(existing => {
           if (existing.menuItemId !== newItem.menuItemId) return false;
           const existingVariantName = existing.selectedVariant?.name || null;
-          return existingVariantName === newVariantName;
+          if (existingVariantName !== newVariantName) return false;
+          return sanitizeSeat(existing.seat) === newSeat;
         });
 
         // Clear any previous KOT diff flags to avoid stale flags from prior updates
@@ -13386,11 +13406,12 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
       });
 
       // Detect removed items — items that existed before but are NOT in the new items list
-      // Match by menuItemId + variant name (consistent with existingItem matching above)
+      // Match by menuItemId + variant name + seat (consistent with existingItem matching above)
       const removedItems = existingItems
         .filter(existing => !items.find(newItem => {
           if (newItem.menuItemId !== existing.menuItemId) return false;
-          return (newItem.selectedVariant?.name || null) === (existing.selectedVariant?.name || null);
+          if ((newItem.selectedVariant?.name || null) !== (existing.selectedVariant?.name || null)) return false;
+          return sanitizeSeat(newItem.seat) === sanitizeSeat(existing.seat);
         }))
         .map(removedItem => ({
           ...removedItem,
@@ -13406,8 +13427,37 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
         console.warn(`⚠️ PATCH /api/orders: Deduped ${processedItems.length} → ${dedupedPatchItems.length} items`);
       }
 
+      // Seat-move reconciliation: moving an item between seats must NOT re-fire
+      // the kitchen. The seat-aware matching above marks a moved line as
+      // removed(old seat)+new(new seat) — but if the BASE quantity (ignoring
+      // seat) is unchanged, it's a pure seat move: strip the KOT diff flags.
+      // No-op when no seats are in play (base key === seat key for all items).
+      const baseKey = (it) => getOrderItemKey({ ...it, seat: null });
+      const sumByBaseKey = (arr) => {
+        const m = new Map();
+        for (const it of arr) m.set(baseKey(it), (m.get(baseKey(it)) || 0) + (it.quantity || 0));
+        return m;
+      };
+      const oldBaseQty = sumByBaseKey(existingItems);
+      const newBaseQty = sumByBaseKey(dedupedPatchItems);
+      const seatMoveKeys = new Set();
+      for (const [k, oldQ] of oldBaseQty) {
+        if ((newBaseQty.get(k) || 0) === oldQ) seatMoveKeys.add(k);
+      }
+      const reconciledRemovedItems = removedItems.filter(it => !seatMoveKeys.has(baseKey(it)));
+      for (const it of dedupedPatchItems) {
+        if ((it.isNew || it.isUpdated) && seatMoveKeys.has(baseKey(it))) {
+          delete it.isNew;
+          delete it.isUpdated;
+          delete it.addedAt;
+          delete it.updatedAt;
+          delete it.previousQuantity;
+          delete it.quantityDelta;
+        }
+      }
+
       // Store removed items separately so they don't affect totals but are available for KOT display
-      updateData.removedItems = removedItems;
+      updateData.removedItems = reconciledRemovedItems;
       updateData.items = dedupedPatchItems;
       updateData.itemCount = dedupedPatchItems.reduce((sum, item) => sum + item.quantity, 0);
       let itemsSubtotal = await calculateOrderTotal(dedupedPatchItems);
@@ -33490,6 +33540,7 @@ app.patch('/api/orders/:orderId/edit-completed-items', authenticateToken, async 
         price: resolvedUnitPrice,
         total: itemTotal,
         quantity: itemQuantity,
+        seat: sanitizeSeat(cleanItem.seat),
         selectedVariant: selectedVariant ? { name: selectedVariant.name, price: selectedVariant.price || 0 } : null,
         selectedCustomizations: customizations.map(c => ({ id: c.id || null, name: c.name || c, price: typeof c.price === 'number' ? c.price : 0 })),
         isStockManaged: menuItem?.isStockManaged || cleanItem.isStockManaged || false,
