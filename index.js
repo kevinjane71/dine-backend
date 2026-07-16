@@ -1052,6 +1052,15 @@ function sanitizeSeat(seat) {
   return Number.isInteger(n) && n >= 1 && n <= 65 ? n : null;
 }
 
+// Resolve a seat for storage, enforcing the restaurant's feature flag
+// server-side: when posSettings.seatOrdering is off/absent, seats are nulled
+// regardless of what the client sent (stale apps, replayed/crafted payloads).
+function resolveSeat(seat, restaurantData) {
+  const mode = restaurantData?.posSettings?.seatOrdering;
+  if (mode !== 'optional' && mode !== 'required') return null;
+  return sanitizeSeat(seat);
+}
+
 // Generate a composite key for an order item that uniquely identifies it.
 // Used everywhere items are matched, deduped, or compared for KOT diffs.
 // Key format: "menuItemId|variantName|custId1,custId2" (sorted customizations)
@@ -8708,7 +8717,7 @@ app.post('/api/public/orders/:restaurantId', vercelSecurityMiddleware.publicAPI,
         menuItemId: item.menuItemId,
         name: menuItem.name,
         price: menuItem.price,
-        seat: sanitizeSeat(item.seat),
+        seat: resolveSeat(item.seat, restaurantData),
         quantity: item.quantity,
         total: itemTotal,
         category: menuItem.category || '',
@@ -9583,7 +9592,7 @@ app.post('/api/orders', async (req, res) => {
         orderItems.push({
           menuItemId: item.menuItemId,
           name: typeof item.name === 'string' ? item.name.substring(0, 200) : 'Custom Item',
-          seat: sanitizeSeat(item.seat),
+          seat: resolveSeat(item.seat, restaurantData),
           nameAr: typeof item.nameAr === 'string' ? item.nameAr.substring(0, 200) : null,
           price: fePrice,
           quantity: itemQuantity,
@@ -9623,7 +9632,7 @@ app.post('/api/orders', async (req, res) => {
           orderItems.push({
             menuItemId: item.menuItemId,
             name: typeof item.name === 'string' ? item.name.substring(0, 200) : 'Unknown Item',
-            seat: sanitizeSeat(item.seat),
+            seat: resolveSeat(item.seat, restaurantData),
             nameAr: typeof item.nameAr === 'string' ? item.nameAr.substring(0, 200) : null,
             price: unitPrice,
             quantity: itemQuantity,
@@ -9752,7 +9761,7 @@ app.post('/api/orders', async (req, res) => {
         menuItemId: item.menuItemId,
         name: menuItem.name,
         nameAr: menuItem.nameAr || null,
-        seat: sanitizeSeat(item.seat),
+        seat: resolveSeat(item.seat, restaurantData),
         price: unitPrice,
         quantity: itemQuantity,
         total: itemTotal,
@@ -12496,6 +12505,16 @@ app.patch('/api/orders/:orderId/status', authenticateToken, async (req, res) => 
       return res.status(403).json({ error: 'Access denied: Order does not belong to your restaurant' });
     }
 
+    // Configurable role gate for kitchen-progression statuses (preparing/ready/served)
+    if (!(await canAdvanceOrderStatus(req, orderData.restaurantId, status))) {
+      return res.status(403).json({ error: 'Access denied. Your role is not permitted to update order status.' });
+    }
+
+    // Fire the customer "order ready" alert when this endpoint bumps to ready.
+    if (status === 'ready' && orderData.status !== 'ready') {
+      maybeNotifyCustomerOrderReady({ id: orderId, ...orderData }).catch(() => {});
+    }
+
     // NEW: Handle deferred loyalty/stats updates on completion
     if (status === 'completed' && orderData.status !== 'completed') {
       console.log(`✅ Order ${orderId} marked as completed. Processing deferred updates...`);
@@ -13074,6 +13093,9 @@ app.patch('/api/orders/:orderId/status', authenticateToken, async (req, res) => 
 app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
   try {
     const { orderId } = req.params;
+    // Seat-level ordering: set true when this PATCH only moves items between
+    // seats (no quantity change) — suppresses the KOT reprint below
+    let isSeatOnlyItemsPatch = false;
     const {
       items,
       tableNumber,
@@ -13258,19 +13280,30 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
 
       // Compare with existing items to mark new/updated items
       const existingItems = currentOrder.items || [];
+      // (assigned after reconciliation below; read by the KOT reprint block)
       const allowPriceEditPatch = restaurantData?.posSettings?.allowPriceEdit === true;
+      // Base-key (menuItemId + variant, no seat) quantity sums — used to
+      // recognize pure seat moves before per-line processing
+      const patchBaseKey = (it) => `${it.menuItemId}|${it.selectedVariant?.name || ''}`;
+      const preOldBaseQty = new Map();
+      existingItems.forEach(it => preOldBaseQty.set(patchBaseKey(it), (preOldBaseQty.get(patchBaseKey(it)) || 0) + (it.quantity || 0)));
+      const preNewBaseQty = new Map();
+      items.forEach(it => preNewBaseQty.set(patchBaseKey(it), (preNewBaseQty.get(patchBaseKey(it)) || 0) + (it.quantity || 0)));
       const processedItems = items.map(newItem => {
         // Match by menuItemId + variant name so items with different variants
         // (e.g., Half vs Full) are correctly treated as separate line items.
         // Seat-level ordering: same item on different seats must stay separate
         // lines too (both null when feature off → identical to old behavior).
         const newVariantName = newItem.selectedVariant?.name || null;
-        const newSeat = sanitizeSeat(newItem.seat);
+        // resolveSeat (not sanitizeSeat): when the flag is off, both sides
+        // resolve to null → matching is byte-identical to pre-seat behavior
+        // even against clients that send seats anyway
+        const newSeat = resolveSeat(newItem.seat, restaurantData);
         const existingItem = existingItems.find(existing => {
           if (existing.menuItemId !== newItem.menuItemId) return false;
           const existingVariantName = existing.selectedVariant?.name || null;
           if (existingVariantName !== newVariantName) return false;
-          return sanitizeSeat(existing.seat) === newSeat;
+          return resolveSeat(existing.seat, restaurantData) === newSeat;
         });
 
         // Clear any previous KOT diff flags to avoid stale flags from prior updates
@@ -13282,10 +13315,18 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
         // Server-side price resolution (mirrors POST handler logic)
         const menuItem = isCustomItemPatch ? null : menuItems.find(m => m.id === cleanItem.menuItemId);
 
-        // Check availability for NEW items being added to the order
+        // Check availability for NEW items being added to the order.
+        // A line that is "new" only because its seat changed (base quantity
+        // for this item+variant is unchanged and existed before) is NOT a
+        // genuine addition — moving an 86'd item between seats must not fail.
         const isNewItem = !existingItem;
         if (isNewItem && menuItem && menuItem.isAvailable === false) {
-          throw new Error(`Item "${menuItem.name}" is currently unavailable and cannot be added to the order`);
+          const bk = patchBaseKey(newItem);
+          const priorQty = preOldBaseQty.get(bk) || 0;
+          const isSeatMoveOnly = priorQty > 0 && (preNewBaseQty.get(bk) || 0) <= priorQty;
+          if (!isSeatMoveOnly) {
+            throw new Error(`Item "${menuItem.name}" is currently unavailable and cannot be added to the order`);
+          }
         }
 
         const selectedVariant = cleanItem.selectedVariant || null;
@@ -13372,6 +13413,7 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
           ...cleanItem,
           price: resolvedUnitPrice,
           total: patchItemTotal,
+          seat: resolveSeat(cleanItem.seat, restaurantData),
           selectedVariant: selectedVariant ? { name: selectedVariant.name, price: selectedVariant.price || 0 } : null,
           selectedCustomizations: customizations.map(c => ({ id: c.id || null, name: c.name || c, price: typeof c.price === 'number' ? c.price : 0 })),
           // Per-item price edit tracking — only flag genuine manual edits, not variant/rule price differences
@@ -13411,7 +13453,7 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
         .filter(existing => !items.find(newItem => {
           if (newItem.menuItemId !== existing.menuItemId) return false;
           if ((newItem.selectedVariant?.name || null) !== (existing.selectedVariant?.name || null)) return false;
-          return sanitizeSeat(newItem.seat) === sanitizeSeat(existing.seat);
+          return resolveSeat(newItem.seat, restaurantData) === resolveSeat(existing.seat, restaurantData);
         }))
         .map(removedItem => ({
           ...removedItem,
@@ -13432,7 +13474,11 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
       // removed(old seat)+new(new seat) — but if the BASE quantity (ignoring
       // seat) is unchanged, it's a pure seat move: strip the KOT diff flags.
       // No-op when no seats are in play (base key === seat key for all items).
-      const baseKey = (it) => getOrderItemKey({ ...it, seat: null });
+      // Base key mirrors the line-match signature above (menuItemId + variant,
+      // WITHOUT seat) — using the customization-aware composite key here would
+      // strip legitimate KOT flags in no-seat orders that carry two
+      // customization variants of the same item.
+      const baseKey = (it) => `${it.menuItemId}|${it.selectedVariant?.name || ''}`;
       const sumByBaseKey = (arr) => {
         const m = new Map();
         for (const it of arr) m.set(baseKey(it), (m.get(baseKey(it)) || 0) + (it.quantity || 0));
@@ -13454,6 +13500,16 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
           delete it.previousQuantity;
           delete it.quantityDelta;
         }
+      }
+
+      // Pure seat move (some seat-aware key changed, no base quantity changed,
+      // nothing removed): kitchen must not be re-notified — even for clients
+      // that don't send skipKOT
+      {
+        const oldSeatKeys = new Set(existingItems.map(i => getOrderItemKey(i)));
+        const seatKeysChanged = dedupedPatchItems.some(i => !oldSeatKeys.has(getOrderItemKey(i)));
+        const noFlagsLeft = dedupedPatchItems.every(i => !i.isNew && !i.isUpdated);
+        isSeatOnlyItemsPatch = seatKeysChanged && noFlagsLeft && reconciledRemovedItems.length === 0;
       }
 
       // Store removed items separately so they don't affect totals but are available for KOT display
@@ -14007,15 +14063,19 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
         const newItems = updateData.items || [];
 
         // Build maps using composite key (menuItemId + variant + customizations)
-        // so variant items are tracked separately for inventory
+        // so variant items are tracked separately for inventory.
+        // Seat is deliberately EXCLUDED: moving an item between seats is not a
+        // stock change — seat-aware keys here caused phantom deduct/restore
+        // churn (and stock inflation when deduct clamped at 0 but restore didn't).
+        const invKey = (i) => getOrderItemKey({ ...i, seat: null });
         const oldQtyMap = {};
         oldItems.forEach(i => {
-          const key = getOrderItemKey(i);
+          const key = invKey(i);
           oldQtyMap[key] = (oldQtyMap[key] || 0) + (i.quantity || 1);
         });
         const newQtyMap = {};
         newItems.forEach(i => {
-          const key = getOrderItemKey(i);
+          const key = invKey(i);
           newQtyMap[key] = (newQtyMap[key] || 0) + (i.quantity || 1);
         });
 
@@ -14031,13 +14091,13 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
 
           if (delta > 0) {
             // More of this item — need to deduct additional inventory
-            const itemData = newItems.find(i => getOrderItemKey(i) === key);
+            const itemData = newItems.find(i => invKey(i) === key);
             if (itemData) {
               addedItems.push({ ...itemData, quantity: delta });
             }
           } else if (delta < 0) {
             // Less of this item — need to restore inventory
-            const itemData = oldItems.find(i => getOrderItemKey(i) === key);
+            const itemData = oldItems.find(i => invKey(i) === key);
             if (itemData) {
               removedItems.push({ ...itemData, quantity: Math.abs(delta) });
             }
@@ -14451,7 +14511,7 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
     // If items were updated and order is NOT completed/cancelled/deleted/saved, trigger KOT reprint
     const orderStatus = status || currentOrder.status;
     const nonKitchenStatuses = ['completed', 'cancelled', 'deleted', 'saved'];
-    if (items && items.length > 0 && !nonKitchenStatuses.includes(orderStatus) && !skipKOT) {
+    if (items && items.length > 0 && !nonKitchenStatuses.includes(orderStatus) && !skipKOT && !isSeatOnlyItemsPatch) {
       try {
         // Reset kotPrinted so pending-print API returns this order (polling mode)
         await db.collection(collections.orders).doc(orderId).update({
@@ -19754,7 +19814,8 @@ app.get('/api/admin/print-settings/:restaurantId', authenticateToken, async (req
       autoPrintOnCompleteBilling: false,   // Native: silent print bill on Complete Billing
       autoPrintOnBillAndPrint: true,       // Native: silent print bill on Bill & Print
       kotTemplate: 'classic',              // KOT print template: classic, compact, bold, grouped, numbered
-      billTemplate: 'classic'              // Bill print template: classic, compact, detailed, elegant, minimal
+      billTemplate: 'classic',             // Bill print template: classic, compact, detailed, elegant, minimal
+      showOrderStatusQR: false             // Print a "track your order" QR on the bill (links to /order-status/<id>)
     };
 
     const printSettings = { ...defaultSettings, ...(restaurantData.printSettings || {}) };
@@ -19809,7 +19870,8 @@ app.put('/api/admin/print-settings/:restaurantId', authenticateToken, async (req
       'autoPrintOnPlaceOrder',
       'autoPrintOnKOTAndPrint',
       'autoPrintOnCompleteBilling',
-      'autoPrintOnBillAndPrint'
+      'autoPrintOnBillAndPrint',
+      'showOrderStatusQR'
     ];
 
     // Numeric fields
@@ -20733,7 +20795,78 @@ app.get('/api/kot/:restaurantId', async (req, res) => {
 });
 
 // Update KOT cooking status and timer
-app.patch('/api/kot/:orderId/status', async (req, res) => {
+// Which roles may ADVANCE an order's kitchen/service status (preparing/ready/served).
+// owner/admin are always allowed. `billingSettings.orderStatusRoles` lets each store
+// widen this beyond the kitchen (e.g. waiter, cashier, manager). An empty/unset list
+// means "any authenticated staff" so existing setups keep working. Statuses outside
+// the kitchen-progression set are gated by their own checks (cancel/completeBill).
+const KITCHEN_PROGRESSION_STATUSES = ['preparing', 'ready', 'served'];
+async function canAdvanceOrderStatus(req, restaurantId, targetStatus) {
+  if (!KITCHEN_PROGRESSION_STATUSES.includes(targetStatus)) return true;
+  const role = (req.user?.role || '').toLowerCase();
+  if (role === 'owner' || role === 'admin') return true;
+  if (!restaurantId) return true;
+  try {
+    const restDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
+    const roles = restDoc.exists ? restDoc.data()?.billingSettings?.orderStatusRoles : null;
+    if (Array.isArray(roles) && roles.length > 0) return roles.includes(role);
+    return true; // not configured → allow any authenticated staff (kitchen included)
+  } catch (e) {
+    console.error('canAdvanceOrderStatus check error (allowing):', e.message);
+    return true;
+  }
+}
+
+// Sends the customer an "order ready" alert (WhatsApp/SMS) when their order is
+// bumped to ready. Fully implemented below (P2); safe no-op guard here so the
+// call sites never throw. Fire-and-forget — never blocks a status update.
+async function maybeNotifyCustomerOrderReady(order) {
+  try {
+    return await sendCustomerOrderReadyAlert(order);
+  } catch (e) {
+    console.error('maybeNotifyCustomerOrderReady error (non-blocking):', e.message);
+  }
+}
+
+// Sends the customer a WhatsApp "your order is ready" message when an order is
+// bumped to ready. Opt-in per store (posSettings.orderReadyAlertEnabled) and only
+// when WhatsApp is connected — so it's silent/cost-free unless enabled. Includes a
+// link to the customer's own live status page.
+async function sendCustomerOrderReadyAlert(order) {
+  const phone = order?.customerInfo?.phone || order?.customerPhone;
+  if (!phone || phone === 'null' || String(phone).trim() === '') return;
+  const restaurantId = order.restaurantId;
+  if (!restaurantId) return;
+
+  const restDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
+  if (!restDoc.exists) return;
+  const rest = restDoc.data();
+  if (!rest?.posSettings?.orderReadyAlertEnabled) return; // off by default (opt-in)
+  const restaurantName = rest.name || rest.restaurantName || 'your order';
+
+  // WhatsApp credentials — same resolution as the messaging endpoints.
+  const snapshot = await db.collection(collections.automationSettings)
+    .where('restaurantId', '==', restaurantId)
+    .where('type', '==', 'whatsapp')
+    .limit(1)
+    .get();
+  if (snapshot.empty || !snapshot.docs[0].data().connected) return;
+  const wa = snapshot.docs[0].data();
+  const credentials = wa.mode === 'dineopen'
+    ? { accessToken: process.env.DINEOPEN_WHATSAPP_ACCESS_TOKEN, phoneNumberId: wa.phoneNumberId || process.env.DINEOPEN_WHATSAPP_PHONE_NUMBER_ID, businessAccountId: process.env.DINEOPEN_WHATSAPP_BUSINESS_ACCOUNT_ID }
+    : { accessToken: wa.accessToken, phoneNumberId: wa.phoneNumberId || process.env.DINEOPEN_WHATSAPP_PHONE_NUMBER_ID, businessAccountId: wa.businessAccountId };
+  if (!credentials.accessToken) return;
+
+  const token = order.dailyOrderId || order.orderNumber || (order.id ? String(order.id).slice(-6) : '');
+  const baseUrl = process.env.FRONTEND_URL || 'https://www.dineopen.com';
+  const link = order.id ? `${baseUrl}/order-status/${order.id}` : '';
+  const name = order?.customerInfo?.name ? ` ${order.customerInfo.name}` : '';
+  const message = `Hi${name}! 🎉 Your order${token ? ` #${token}` : ''} at ${restaurantName} is READY.${link ? `\n\nTrack it live: ${link}` : ''}`;
+
+  await whatsappService.sendTextMessage(phone, message, credentials);
+}
+
+app.patch('/api/kot/:orderId/status', authenticateToken, async (req, res) => {
   try {
     const { orderId } = req.params;
     const { status, cookingStartTime, cookingEndTime, notes } = req.body;
@@ -20741,6 +20874,28 @@ app.patch('/api/kot/:orderId/status', async (req, res) => {
     const validStatuses = ['pending', 'confirmed', 'preparing', 'ready', 'served', 'completed', 'cancelled'];
     if (!validStatuses.includes(status)) {
       return res.status(400).json({ error: 'Invalid status' });
+    }
+
+    // Load the order once — used for auth scoping, timing calc and the RTDB payload.
+    const orderRef = db.collection(collections.orders).doc(orderId);
+    const orderSnap = await orderRef.get();
+    if (!orderSnap.exists) {
+      return res.status(404).json({ error: 'Order not found' });
+    }
+    const existingOrder = orderSnap.data();
+
+    // Restaurant-scope check: staff are limited to their store; owner/admin to the
+    // selected store (falls back to the order's store).
+    const role = (req.user?.role || '').toLowerCase();
+    const userRestaurantId = req.user?.restaurantId
+      || ((role === 'owner' || role === 'admin') ? (req.body.restaurantId || existingOrder.restaurantId) : null);
+    if (userRestaurantId && existingOrder.restaurantId !== userRestaurantId) {
+      return res.status(403).json({ error: 'Access denied: Order does not belong to your restaurant' });
+    }
+
+    // Role gate — who is allowed to move an order to preparing/ready/served.
+    if (!(await canAdvanceOrderStatus(req, existingOrder.restaurantId, status))) {
+      return res.status(403).json({ error: 'Access denied. Your role is not permitted to update order status.' });
     }
 
     const updateData = {
@@ -20756,17 +20911,13 @@ app.patch('/api/kot/:orderId/status', async (req, res) => {
 
     if (status === 'ready') {
       updateData.cookingEndTime = new Date();
-      
-      // Calculate actual cooking time if we have start time
-      const orderDoc = await db.collection(collections.orders).doc(orderId).get();
-      if (orderDoc.exists) {
-        const orderData = orderDoc.data();
-        if (orderData.cookingStartTime) {
-          const startTime = orderData.cookingStartTime.toDate();
-          const endTime = new Date();
-          const cookingDuration = Math.floor((endTime - startTime) / (1000 * 60)); // in minutes
-          updateData.actualCookingTime = cookingDuration;
-        }
+      // Calculate actual cooking time if we have a start time (reuse loaded order)
+      if (existingOrder.cookingStartTime) {
+        const startTime = existingOrder.cookingStartTime.toDate
+          ? existingOrder.cookingStartTime.toDate()
+          : new Date(existingOrder.cookingStartTime);
+        const cookingDuration = Math.floor((new Date() - startTime) / (1000 * 60)); // minutes
+        updateData.actualCookingTime = cookingDuration;
       }
     }
 
@@ -20782,23 +20933,25 @@ app.patch('/api/kot/:orderId/status', async (req, res) => {
       updateData.kitchenNotes = notes;
     }
 
-    await db.collection(collections.orders).doc(orderId).update(updateData);
+    await orderRef.update(updateData);
 
     // Push RTDB event so token display + other views get real-time updates
     try {
-      const od = (await db.collection(collections.orders).doc(orderId).get()).data();
-      if (od) {
-        await pusherService.notifyOrderStatusUpdated(od.restaurantId, orderId, status, {
-          orderNumber: od.orderNumber,
-          dailyOrderId: od.dailyOrderId,
-          totalAmount: od.totalAmount,
-          tableNumber: od.tableNumber,
-          tableId: od.tableId || null,
-          floorId: od.floorId || null,
-        });
-      }
+      await pusherService.notifyOrderStatusUpdated(existingOrder.restaurantId, orderId, status, {
+        orderNumber: existingOrder.orderNumber,
+        dailyOrderId: existingOrder.dailyOrderId,
+        totalAmount: existingOrder.totalAmount,
+        tableNumber: existingOrder.tableNumber,
+        tableId: existingOrder.tableId || null,
+        floorId: existingOrder.floorId || null,
+      });
     } catch (rtdbErr) {
       console.error('KOT RTDB notification error (non-blocking):', rtdbErr);
+    }
+
+    // Customer "order ready" alert (WhatsApp/SMS) — fire-and-forget (P2 hook).
+    if (status === 'ready' && existingOrder.status !== 'ready') {
+      maybeNotifyCustomerOrderReady({ id: orderId, ...existingOrder }).catch(() => {});
     }
 
     res.json({
@@ -32786,6 +32939,8 @@ app.get('/api/restaurants/:restaurantId/billing-settings', authenticateToken, as
       completeBillingRoles: Array.isArray(existing.completeBillingRoles) ? existing.completeBillingRoles : [],
       billAndPrintRoles: Array.isArray(existing.billAndPrintRoles) ? existing.billAndPrintRoles : [],
       paymentMethodRoles: Array.isArray(existing.paymentMethodRoles) ? existing.paymentMethodRoles : [],
+      // Who can advance order status (preparing/ready/served). Empty = any staff.
+      orderStatusRoles: Array.isArray(existing.orderStatusRoles) ? existing.orderStatusRoles : [],
       // Split Bill (divide order among guests)
       splitBillEnabled: existing.splitBillEnabled ?? false,
       splitBillDefaultMethod: ['equal','by-item','by-amount'].includes(existing.splitBillDefaultMethod) ? existing.splitBillDefaultMethod : 'equal',
@@ -32885,6 +33040,10 @@ app.put('/api/restaurants/:restaurantId/billing-settings', authenticateToken, as
         : [],
       paymentMethodRoles: Array.isArray(settings.paymentMethodRoles)
         ? settings.paymentMethodRoles.filter(r => typeof r === 'string' && r.length > 0 && r.length <= 50)
+        : [],
+      // Who can advance order status (preparing/ready/served). Empty = any staff.
+      orderStatusRoles: Array.isArray(settings.orderStatusRoles)
+        ? settings.orderStatusRoles.filter(r => typeof r === 'string' && r.length > 0 && r.length <= 50)
         : [],
       // Split Bill (divide order among guests)
       splitBillEnabled: settings.splitBillEnabled ?? false,
@@ -33540,7 +33699,7 @@ app.patch('/api/orders/:orderId/edit-completed-items', authenticateToken, async 
         price: resolvedUnitPrice,
         total: itemTotal,
         quantity: itemQuantity,
-        seat: sanitizeSeat(cleanItem.seat),
+        seat: resolveSeat(cleanItem.seat, restaurantData),
         selectedVariant: selectedVariant ? { name: selectedVariant.name, price: selectedVariant.price || 0 } : null,
         selectedCustomizations: customizations.map(c => ({ id: c.id || null, name: c.name || c, price: typeof c.price === 'number' ? c.price : 0 })),
         isStockManaged: menuItem?.isStockManaged || cleanItem.isStockManaged || false,
@@ -34491,6 +34650,54 @@ app.get('/api/public/token-display/:restaurantId', vercelSecurityMiddleware.publ
   } catch (error) {
     console.error('Token display error:', error);
     res.status(500).json({ error: 'Failed to fetch token display data' });
+  }
+});
+
+// Customer's own live order status ("track my order"). Public — the unguessable
+// orderId is the access token. Returns only non-sensitive fields (status, token,
+// timeline, item count, total) so a guest can watch their order go ready on their
+// phone. Frontend page: /order-status/<orderId>.
+app.get('/api/public/order-status/:orderId', vercelSecurityMiddleware.publicAPI, async (req, res) => {
+  try {
+    const { orderId } = req.params;
+    const orderDoc = await db.collection(collections.orders).doc(orderId).get();
+    if (!orderDoc.exists) return res.status(404).json({ error: 'Order not found' });
+    const o = orderDoc.data();
+
+    let restaurantName = '';
+    let logo = '';
+    if (o.restaurantId) {
+      const restDoc = await getCachedRestDoc(o.restaurantId);
+      if (restDoc.exists) {
+        const rd = restDoc.data();
+        restaurantName = rd.name || rd.restaurantName || '';
+        logo = rd.logoUrl || '';
+      }
+    }
+
+    const toIso = (t) => (t?.toDate ? t.toDate().toISOString() : (t || null));
+    const items = Array.isArray(o.items) ? o.items : (Array.isArray(o.orderItems) ? o.orderItems : []);
+
+    res.set('Cache-Control', 'public, s-maxage=3, stale-while-revalidate=5');
+    res.json({
+      id: orderId,
+      status: o.status,                       // pending|confirmed|preparing|ready|served|completed|cancelled
+      token: o.dailyOrderId || o.orderNumber || String(orderId).slice(-6),
+      orderType: o.orderType || 'dine-in',
+      customerName: (o.customerInfo?.name || o.customerName || '').split(' ')[0] || '',
+      itemCount: items.reduce((n, it) => n + (Number(it.quantity) || 1), 0),
+      total: o.finalAmount || o.grandTotal || o.totalAmount || 0,
+      restaurant: { name: restaurantName, logo },
+      timeline: {
+        placedAt: toIso(o.createdAt),
+        preparingAt: toIso(o.cookingStartTime || o.kotTime),
+        readyAt: toIso(o.cookingEndTime),
+        updatedAt: toIso(o.updatedAt),
+      },
+    });
+  } catch (error) {
+    console.error('Public order-status error:', error);
+    res.status(500).json({ error: 'Failed to fetch order status' });
   }
 });
 
