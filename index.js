@@ -9218,7 +9218,21 @@ app.post('/api/public/orders/:restaurantId', vercelSecurityMiddleware.publicAPI,
 const ORDER_MAX_QUANTITY = 10000;
 const ORDER_MAX_UNIT_PRICE = 1000000; // ₹10 lakh per unit
 
-app.post('/api/orders', async (req, res) => {
+// POST /api/orders authentication: all staff clients (web POS, dine-app,
+// local-login offline devices) carry a JWT — require it. The single carve-out
+// is the legacy customer self-order QR flow (orderType 'customer_self_order'),
+// which has no staff token; for that flow the FE billing override below is
+// also disabled so billing stays fully server-computed. Verified senders:
+// crave → /api/customer/orders, public QR → /api/public/orders (both separate).
+function authenticateOrderCreate(req, res, next) {
+  if (req.body && req.body.orderType === 'customer_self_order') {
+    req.user = null;
+    return next();
+  }
+  return authenticateToken(req, res, next);
+}
+
+app.post('/api/orders', authenticateOrderCreate, async (req, res) => {
   try {
     // ── Rate limit: prevent order spam (e.g. 2000+ orders in 1 minute) ──
     if (req.body.restaurantId) {
@@ -10286,6 +10300,38 @@ app.post('/api/orders', async (req, res) => {
       const feTotalDisc = parseFloat(req.body.totalDiscountAmount) || (feDiscount + feManual + feLoyalty);
       const feSubtotal = parseFloat(req.body.totalAmount) || subtotalForDiscount;
       const feTaxAmt = req.body.taxBreakdown.reduce((s, t) => s + (t.amount || 0), 0);
+
+      // ── Sanity clamp: the override may only refine, never rewrite, billing ──
+      // Server-priced subtotal is authoritative (items were re-priced above).
+      // Reject the override entirely (keep server-computed orderData) when the
+      // client's numbers are impossible: negative discounts, discounts
+      // exceeding the subtotal, subtotal far from server pricing, or a final
+      // amount below what the discounts can explain. Self-order (no auth) never
+      // gets the override at all.
+      const feCouponPre = parseFloat(req.body.couponDiscount) || 0;
+      const claimedDiscTotal = Math.max(feTotalDisc, feDiscount + feManual + feLoyalty) + feCouponPre;
+      const serverSubtotal = Math.round(subtotalForDiscount * 100) / 100;
+      const subtotalTolerance = Math.max(2, serverSubtotal * 0.01);
+      const feFinalPre = parseFloat(req.body.finalAmount) || 0;
+      // Final-amount floor = (subtotal − discounts) minus whatever round-off the
+      // FE applied (tax/service-charge/tip only push finalAmount UP, so they are
+      // not credited — the floor stays conservative). This accommodates
+      // round-to-nearest-₹10/₹50 and inclusive-tax bills without false rejects.
+      const feRoundOff = Math.abs(parseFloat(req.body.roundOffAmount) || 0);
+      const finalFloor = (serverSubtotal - claimedDiscTotal) - feRoundOff - subtotalTolerance;
+      const overrideInvalid =
+        req.user === null ||
+        feDiscount < 0 || feManual < 0 || feLoyalty < 0 || feCouponPre < 0 || feTaxAmt < 0 ||
+        claimedDiscTotal > serverSubtotal + subtotalTolerance ||
+        Math.abs(feSubtotal - serverSubtotal) > subtotalTolerance ||
+        feFinalPre < 0 ||
+        feFinalPre < finalFloor;
+      if (overrideInvalid) {
+        orderData.billingClamped = true;
+        console.warn(`🚫 POS override REJECTED (server values kept) — restaurant ${restaurantId}: ` +
+          `feSubtotal=₹${feSubtotal} vs server=₹${serverSubtotal}, claimedDisc=₹${claimedDiscTotal}, feFinal=₹${feFinalPre}, auth=${!!req.user}`);
+      }
+      if (!overrideInvalid) {
       orderData.subtotal = Math.round(feSubtotal * 100) / 100;
       orderData.discountAmount = Math.round(feDiscount * 100) / 100;
       orderData.offerDiscount = Math.round(feDiscount * 100) / 100;
@@ -10309,6 +10355,7 @@ app.post('/api/orders', async (req, res) => {
       }
       orderData.finalAmount = Math.max(0, orderData.finalAmount);
       console.log(`📊 POS override: Using frontend billing values (Subtotal: ₹${orderData.subtotal}, Disc: ₹${orderData.totalDiscountAmount}, Tax: ₹${orderData.taxAmount}, Final: ₹${orderData.finalAmount})`);
+      }
     }
 
     // Billing audit: compare FE-sent values vs BE-resolved values
