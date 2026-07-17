@@ -10534,7 +10534,11 @@ app.post('/api/orders', authenticateOrderCreate, async (req, res) => {
         loyaltyPointsEarned: loyaltyPointsEarned,
         loyaltyPointsRedeemed: loyaltyPointsRedeemed,
         outstandingAmount: req.body.partialPayAmount != null ? Math.round((finalAmount - Number(req.body.partialPayAmount)) * 100) / 100 : 0,
-        paidAmount: req.body.partialPayAmount != null ? Math.round(Number(req.body.partialPayAmount) * 100) / 100 : 0,
+        // paidAmount = amount actually collected. Fully-paid orders (no
+        // partialPayAmount) must record finalAmount, NOT 0 — the totalSpent
+        // recompute reads paidAmount directly (0 != null, so 0 would count the
+        // order as ₹0 spent). Due/partial record the partial amount.
+        paidAmount: req.body.partialPayAmount != null ? Math.round(Number(req.body.partialPayAmount) * 100) / 100 : Math.round(finalAmount * 100) / 100,
         paymentStatus: req.body.partialPayAmount != null ? (Number(req.body.partialPayAmount) === 0 ? 'due' : 'partial') : 'paid',
         orderDate: new Date(),
         tableNumber: tableNumber || seatNumber || null,
@@ -12588,6 +12592,13 @@ app.patch('/api/orders/:orderId/status', authenticateToken, async (req, res) => 
             orderDate: new Date(),
             tableNumber: orderData.tableNumber || null,
             orderType: orderData.orderType,
+            // paidAmount = amount actually collected, so the totalSpent recompute
+            // doesn't over-count a due order linked to a customer at completion.
+            paymentStatus: orderData.paymentStatus || 'paid',
+            paidAmount: (orderData.paymentStatus === 'due' || orderData.paymentStatus === 'partial')
+              ? Math.round(Number(orderData.paidAmount || 0) * 100) / 100
+              : Math.round(orderFinalAmount * 100) / 100,
+            outstandingAmount: Math.round(Number(orderData.outstandingAmount || 0) * 100) / 100,
           };
           // Normalize phone helper
           const normPhone = (p) => {
@@ -14228,7 +14239,14 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
                 loyaltyPointsEarned: pointsEarned,
                 loyaltyPointsRedeemed: pointsRedeemed,
                 paymentStatus: updateData.paymentStatus || 'paid',
-                paidAmount: updateData.paidAmount || null,
+                // paidAmount = amount actually collected. `updateData.paidAmount || null`
+                // wrongly turned a full-due ₹0 into null → the totalSpent recompute
+                // then counted the FULL finalAmount as spent (and settle-credit later
+                // added it again → double-count). Record the true collected amount:
+                // 0 for due, the partial for partial, finalAmount for paid.
+                paidAmount: (updateData.paymentStatus === 'due' || updateData.paymentStatus === 'partial')
+                  ? Math.round(Number(updateData.paidAmount || 0) * 100) / 100
+                  : Math.round(orderFinalAmount * 100) / 100,
                 outstandingAmount: updateData.outstandingAmount || 0,
               };
               const newHistory = [...existingHistory, histEntry];
