@@ -10793,6 +10793,9 @@ app.post('/api/orders', async (req, res) => {
       const shareToken = crypto.randomBytes(16).toString('hex');
       orderRef.update({ shareToken }).catch(err => console.error('ShareToken update error:', err));
 
+      // Fire-and-forget: cashback wallet credit (offer promotionType 'cashback')
+      processCashbackForOrder(orderRef.id, { ...orderData, restaurantId }).catch(() => {});
+
       // Fire-and-forget: send bill_notification template on WhatsApp
       (async () => {
         try {
@@ -13496,6 +13499,11 @@ app.patch('/api/orders/:orderId/status', authenticateToken, async (req, res) => 
       }
     }
 
+    // Fire-and-forget: cashback wallet credit (offer promotionType 'cashback')
+    if (status === 'completed') {
+      processCashbackForOrder(orderId, orderData).catch(() => {});
+    }
+
     // Fire-and-forget: send bill on WhatsApp if enabled
     if (status === 'completed') {
       (async () => {
@@ -15215,6 +15223,11 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
       } catch (kotError) {
         console.error('KOT reprint error (non-blocking):', kotError);
       }
+    }
+
+    // Fire-and-forget: cashback wallet credit (offer promotionType 'cashback')
+    if (status === 'completed' && currentOrder.status !== 'completed') {
+      processCashbackForOrder(orderId, currentOrder).catch(() => {});
     }
 
     // If status changed to completed, trigger billing print
@@ -22311,6 +22324,8 @@ const assembleBillRenderPayload = (orderId, orderData, restaurantId, restaurantD
     restaurantLegalName: restaurant.legalBusinessName || '',
     restaurantAddress: printSettings.receiptAddress || restaurant.address,
     restaurantPhone: printSettings.receiptPhone || restaurant.phone,
+    cashbackEarned: orderData.cashbackEarned || 0,
+    cashbackOfferName: orderData.cashbackOfferName || null,
     restaurantEmail: restaurant.email,
     gstin: restaurant.gstin || '',
     fssai: restaurant.fssai || '',
@@ -22932,6 +22947,96 @@ app.patch('/api/orders/:orderId/cancel', authenticateToken, async (req, res) => 
     res.status(500).json({ error: 'Failed to cancel order' });
   }
 });
+
+// ========================================
+// Cashback — automatic post-payment wallet credit (offer promotionType 'cashback')
+// Evaluated at order completion from the paid amount; credits the customer's
+// wallet for use on the NEXT order. Fire-and-forget; never blocks completion.
+// ========================================
+async function processCashbackForOrder(orderId, orderData) {
+  try {
+    const restaurantId = orderData.restaurantId;
+    if (!restaurantId) return;
+
+    // Double-credit guard: re-read the order; skip if already processed
+    const freshDoc = await db.collection(collections.orders).doc(orderId).get();
+    if (!freshDoc.exists) return;
+    const fresh = freshDoc.data();
+    if (fresh.cashbackEarned != null) return;
+    if ((fresh.outstandingAmount || 0) > 0) return; // khata/partial: no cashback until fully paid
+
+    const paidAmount = Number(fresh.finalAmount != null ? fresh.finalAmount : fresh.totalAmount) || 0;
+    if (paidAmount <= 0) return;
+
+    // Active cashback offers for this restaurant (filtered in code — small set)
+    const offersSnap = await db.collection('offers')
+      .where('restaurantId', '==', restaurantId)
+      .where('isActive', '==', true)
+      .get();
+    if (offersSnap.empty) return;
+
+    const restDoc = await getCachedRestDoc(restaurantId);
+    const restTimezone = (restDoc.exists ? restDoc.data().posSettings?.timezone : null) || 'Asia/Kolkata';
+    const now = new Date();
+
+    let best = null;
+    offersSnap.docs.forEach(doc => {
+      const offer = { id: doc.id, ...doc.data() };
+      if (offer.promotionType !== 'cashback') return;
+      if (!offerEngine.isDateValid(offer, now)) return;
+      if (!offerEngine.isScheduleValid(offer, now, restTimezone)) return;
+      if (offer.usageLimit && (offer.usageCount || 0) >= offer.usageLimit) return;
+      const amount = offerEngine.resolveCashbackAmount(offer, paidAmount);
+      if (amount > 0 && (!best || amount > best.amount)) best = { offer, amount };
+    });
+    if (!best) return;
+
+    // Resolve the customer — cashback needs a wallet to land in
+    let customerId = fresh.customerId || null;
+    const customerPhone = fresh.customerInfo?.phone || fresh.customerPhone || null;
+    if (!customerId && customerPhone) {
+      const custSnap = await db.collection('customers')
+        .where('restaurantId', '==', restaurantId)
+        .where('phone', '==', customerPhone)
+        .limit(1).get();
+      if (!custSnap.empty) customerId = custSnap.docs[0].id;
+    }
+    if (!customerId) {
+      console.log(`💸 Cashback: order ${orderId} qualifies for ₹${best.amount} but has no customer attached — skipped`);
+      return;
+    }
+
+    // Mark the order first (idempotency anchor), then credit the wallet
+    await db.collection(collections.orders).doc(orderId).update({
+      cashbackEarned: best.amount,
+      cashbackOfferId: best.offer.id,
+      cashbackOfferName: best.offer.name || 'Cashback',
+    });
+
+    const txn = {
+      id: `txn_${Date.now()}_${Math.random().toString(36).substr(2, 6)}`,
+      type: 'credit',
+      amount: best.amount,
+      reason: 'cashback',
+      notes: `Cashback on order ${fresh.dailyOrderId || orderId} (${best.offer.name || 'Cashback offer'})`,
+      orderId,
+      offerId: best.offer.id,
+      balanceAfter: null, // computed client-side from running balance; increments are atomic
+      createdAt: new Date().toISOString(),
+    };
+    await db.collection('customers').doc(customerId).update({
+      walletBalance: FieldValue.increment(best.amount),
+      walletHistory: FieldValue.arrayUnion(txn),
+      updatedAt: new Date().toISOString(),
+    });
+
+    const customerKey = offerEngine.buildCustomerKey(customerId, customerPhone || '');
+    offerEngine.incrementUsage(db, best.offer.id, customerKey).catch(() => {});
+    console.log(`💸 Cashback: ₹${best.amount} credited to customer ${customerId} for order ${orderId} (paid ₹${paidAmount})`);
+  } catch (err) {
+    console.error('Cashback processing error (non-blocking):', err.message);
+  }
+}
 
 // Restore Order — reapply side effects (inverse of reverseOrderSideEffects)
 async function reapplyOrderSideEffects(orderId, orderData) {
