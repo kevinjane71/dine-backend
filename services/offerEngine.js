@@ -219,6 +219,11 @@ const calculateCrossItemBogo = (offer, cart) => {
 // ---------- core discount calculation ----------
 
 const calculateDiscountForOffer = (offer, subtotal, cart = [], context = {}) => {
+  // Cashback offers credit the customer's wallet AFTER payment — they never
+  // reduce the current bill
+  if (offer && offer.promotionType === 'cashback') {
+    return { discount: 0, freeItems: [], appliedTier: null };
+  }
   if (!offer || subtotal <= 0) return { discount: 0, freeItems: [], appliedTier: null };
 
   const offerScope = offer.scope || 'order';
@@ -319,6 +324,8 @@ const filterApplicableOffers = (offers, { subtotal, cart, context, now, timezone
   return offers.filter(offer => {
     if (!offer) return false;
     if (offer.isActive === false) return false;
+    // Cashback offers are automatic post-payment credits, not selectable discounts
+    if (offer.promotionType === 'cashback') return false;
     if (!isScheduleValid(offer, n, timezone)) return false;
     if (!isDateValid(offer, n)) return false;
     if (offer.minOrderValue && subtotal < offer.minOrderValue) return false;
@@ -359,6 +366,29 @@ const pickBestOffer = (applicableOffers, subtotal, cart, context = {}) => {
 };
 
 // ---------- per-customer usage helpers ----------
+
+// ---------- cashback ----------
+
+// Resolve the cashback amount an order earns from a cashback offer.
+// Tiered: highest tier whose minSubtotal <= paid amount wins
+//   tiers: [{ minSubtotal: 249, cashbackAmount: 49 }, ...]
+//   (cashbackAmount preferred; falls back to discountValue so the existing
+//    tier editor UI can be reused as-is)
+// Flat: offer.cashbackAmount with optional offer.minOrderValue gate.
+const resolveCashbackAmount = (offer, paidAmount) => {
+  if (!offer || offer.promotionType !== 'cashback') return 0;
+  const amount = Number(paidAmount) || 0;
+  if (amount <= 0) return 0;
+  if (Array.isArray(offer.tiers) && offer.tiers.length > 0) {
+    const tier = resolveTier(offer, amount);
+    if (!tier) return 0;
+    const cb = Number(tier.cashbackAmount != null ? tier.cashbackAmount : tier.discountValue) || 0;
+    return cb > 0 ? Math.round(cb * 100) / 100 : 0;
+  }
+  if (offer.minOrderValue && amount < offer.minOrderValue) return 0;
+  const cb = Number(offer.cashbackAmount) || 0;
+  return cb > 0 ? Math.round(cb * 100) / 100 : 0;
+};
 
 const buildCustomerKey = (customerId, phone) => {
   if (customerId) return customerId;
@@ -449,6 +479,7 @@ module.exports = {
   matchesAudience,
   calculateDiscountForOffer,
   filterApplicableOffers,
+  resolveCashbackAmount,
   pickBestOffer,
   buildCustomerKey,
   getCustomerUsageMap,
