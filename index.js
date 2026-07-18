@@ -33166,8 +33166,15 @@ app.get('/api/public/offers/:restaurantId', vercelSecurityMiddleware.publicAPI, 
       kvSet(offersCacheKey, allOffers, 180).catch(() => {});
     }
 
-    // Filter cached offers by date, usage, and first-order eligibility
+    // Filter cached offers by date, usage, and first-order eligibility.
+    // Cashback offers are automatic post-payment wallet credits, NOT selectable
+    // bill discounts — exclude them here so the public ordering page (which has
+    // its own offer math and would otherwise render them as "₹X off" and
+    // underpay via Razorpay) never treats them as discounts. Filtered on every
+    // response so a stale cache can't leak them either. Cashback still credits:
+    // processCashbackForOrder reads Firestore directly at completion.
     const offers = allOffers.filter(offer => {
+      if (offer.promotionType === 'cashback') return false;
       const validFrom = offer.validFrom ? new Date(offer.validFrom) : null;
       const validUntil = offer.validUntil ? new Date(offer.validUntil) : null;
       const isValidDate = (!validFrom || now >= validFrom) && (!validUntil || now <= validUntil);
