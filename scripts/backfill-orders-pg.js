@@ -32,6 +32,7 @@ const DRY_RUN = args.includes('--dry-run');
 const BATCH_SIZE = parseInt(args.find(a => a.startsWith('--batch='))?.split('=')[1]) || 500;
 const RESTAURANT_FILTER = args.find(a => a.startsWith('--restaurant='))?.split('=')[1] || null;
 const SINCE_DATE = args.find(a => a.startsWith('--since='))?.split('=')[1] || null;
+const UNTIL_DATE = args.find(a => a.startsWith('--until='))?.split('=')[1] || null; // createdAt < this (chunking)
 const UPSERT = args.includes('--upsert'); // Update existing rows instead of skipping
 
 // Stats
@@ -54,6 +55,7 @@ async function main() {
   console.log(`Batch size:     ${BATCH_SIZE}`);
   console.log(`Restaurant:     ${RESTAURANT_FILTER || 'ALL'}`);
   console.log(`Since:          ${SINCE_DATE || 'ALL TIME'}`);
+  console.log(`Until:          ${UNTIL_DATE || 'NOW'}`);
   console.log(`Database URL:   ${process.env.DATABASE_URL ? '✓ set' : '✗ MISSING'}`);
   console.log('');
 
@@ -64,6 +66,10 @@ async function main() {
 
   // Test PG connection
   const pool = getPool();
+  // Cloud SQL over the public IP occasionally resets idle pooled clients. Without
+  // an 'error' listener, that emits an unhandled 'error' on the Client and crashes
+  // the whole process mid-run. Swallow it — the per-batch pool.connect() reconnects.
+  pool.on('error', (err) => console.error(`⚠️  pool client error (recovering): ${err.message}`));
   try {
     const pgTest = await pool.query('SELECT NOW() as time, COUNT(*) as existing_orders FROM orders');
     console.log(`PG connected:   ${pgTest.rows[0].time}`);
@@ -82,6 +88,9 @@ async function main() {
   }
   if (SINCE_DATE) {
     countQuery = countQuery.where('createdAt', '>=', new Date(SINCE_DATE));
+  }
+  if (UNTIL_DATE) {
+    countQuery = countQuery.where('createdAt', '<', new Date(UNTIL_DATE));
   }
   const countSnapshot = await countQuery.count().get();
   const totalExpected = countSnapshot.data().count;
@@ -118,6 +127,9 @@ async function main() {
     }
     if (SINCE_DATE) {
       batchQuery = batchQuery.where('createdAt', '>=', new Date(SINCE_DATE));
+    }
+    if (UNTIL_DATE) {
+      batchQuery = batchQuery.where('createdAt', '<', new Date(UNTIL_DATE));
     }
     batchQuery = batchQuery.orderBy('createdAt', 'asc');
     if (lastDoc) {
