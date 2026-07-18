@@ -92,7 +92,12 @@ function computeShiftSales(ordersSnap, shiftOpenDate, shiftUserId, isShiftOwnerA
       });
     } else {
       const method = (order.paymentMethod || 'cash').toLowerCase();
-      categorizePayment(method, collected, order, buckets);
+      // The wallet-redeemed portion was paid from the customer's wallet, not
+      // this method and not the cash drawer — exclude it from the method bucket
+      // (else a wallet-paid cash order over-states cash → phantom shortage).
+      const walletPaid = parseFloat(order.walletRedeemAmount || 0);
+      const methodAmount = Math.max(0, collected - walletPaid);
+      if (methodAmount > 0) categorizePayment(method, methodAmount, order, buckets);
     }
   });
 
