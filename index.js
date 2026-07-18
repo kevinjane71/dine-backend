@@ -10243,6 +10243,7 @@ app.post('/api/orders', authenticateOrderCreate, async (req, res) => {
       syncSource: syncSource, // 'online' | 'offline' — tracks how order was placed
       ...(idempotencyKey ? { idempotencyKey } : {}),
       walletRedeemAmount: req.body.walletRedeemAmount ? Math.round(Number(req.body.walletRedeemAmount) * 100) / 100 : null,
+      walletCustomerId: req.body.walletCustomerId || null,
       // Coupon fields
       couponCode: req.body.couponCode || null,
       couponId: req.body.couponId || null,
@@ -10871,6 +10872,7 @@ app.post('/api/orders', authenticateOrderCreate, async (req, res) => {
 
       // Fire-and-forget: cashback wallet credit (offer promotionType 'cashback')
       processCashbackForOrder(orderRef.id, { ...orderData, restaurantId }).catch(() => {});
+      processWalletRedemptionForOrder(orderRef.id).catch(() => {});
 
       // Fire-and-forget: send bill_notification template on WhatsApp
       (async () => {
@@ -12897,6 +12899,7 @@ app.patch('/api/orders/:orderId/status', authenticateToken, async (req, res) => 
     // Fire-and-forget: cashback wallet credit (offer promotionType 'cashback')
     if (status === 'completed') {
       processCashbackForOrder(orderId, orderData).catch(() => {});
+      processWalletRedemptionForOrder(orderId).catch(() => {});
     }
 
     // Fire-and-forget: send bill on WhatsApp if enabled
@@ -14631,6 +14634,7 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
     // Fire-and-forget: cashback wallet credit (offer promotionType 'cashback')
     if (status === 'completed' && currentOrder.status !== 'completed') {
       processCashbackForOrder(orderId, currentOrder).catch(() => {});
+      processWalletRedemptionForOrder(orderId).catch(() => {});
     }
 
     // If status changed to completed, trigger billing print
@@ -22376,6 +22380,90 @@ app.patch('/api/orders/:orderId/cancel', authenticateToken, async (req, res) => 
     res.status(500).json({ error: 'Failed to cancel order' });
   }
 });
+
+// ========================================
+// Wallet debit — atomic + idempotent per order.
+// Idempotency key: a 'redeem' walletHistory entry carrying this orderId. Safe to
+// call from BOTH the /wallet/redeem endpoint and the completion hook below — the
+// wallet is only ever debited once per order regardless of who triggers it or of
+// races (the transaction serializes concurrent calls). This is what lets the
+// server-side completion hook coexist with the pre-existing client-side debit
+// without ever double-charging.
+// ========================================
+async function debitWalletForOrder({ customerId, orderId, amount, staffId = null, staffName = 'System', notes = '' }) {
+  const amt = Math.round(Number(amount) * 100) / 100;
+  if (!customerId || !amt || amt <= 0) return { success: false, reason: 'invalid_args' };
+  const customerRef = db.collection('customers').doc(customerId);
+  try {
+    return await db.runTransaction(async (tx) => {
+      const doc = await tx.get(customerRef);
+      if (!doc.exists) return { success: false, reason: 'customer_not_found' };
+      const data = doc.data();
+      const history = Array.isArray(data.walletHistory) ? data.walletHistory : [];
+      // Idempotency: already debited for this order?
+      if (orderId && history.some(h => h && h.type === 'redeem' && h.orderId === orderId)) {
+        return { success: true, alreadyDone: true, walletBalance: data.walletBalance || 0 };
+      }
+      const currentBalance = data.walletBalance || 0;
+      if (currentBalance < amt) return { success: false, reason: 'insufficient_balance', walletBalance: currentBalance };
+      const newBalance = Math.round((currentBalance - amt) * 100) / 100;
+      const txn = {
+        id: `txn_${Date.now()}_${Math.random().toString(36).substr(2, 6)}`,
+        type: 'redeem',
+        amount: amt,
+        reason: 'redemption',
+        notes: notes || (orderId ? `Redeemed for order ${orderId}` : ''),
+        orderId: orderId || null,
+        staffId,
+        staffName,
+        balanceAfter: newBalance,
+        createdAt: new Date().toISOString(),
+      };
+      tx.update(customerRef, {
+        walletBalance: newBalance,
+        walletHistory: [...history, txn],
+        updatedAt: new Date().toISOString(),
+      });
+      return { success: true, walletBalance: newBalance, transaction: txn };
+    });
+  } catch (err) {
+    console.error(`Wallet debit error (order ${orderId}, customer ${customerId}):`, err.message);
+    return { success: false, reason: 'error', error: err.message };
+  }
+}
+
+// Fire-and-forget wallet debit at order completion. Ensures wallet-paid orders
+// are debited server-side even when the client never calls (table billing) or
+// can't (offline sync) — the previous client-only debit silently missed both.
+// Re-reads the persisted order (like the cashback processor) so it always sees
+// the merged walletRedeemAmount/walletCustomerId regardless of the caller.
+async function processWalletRedemptionForOrder(orderId) {
+  try {
+    const freshDoc = await db.collection(collections.orders).doc(orderId).get();
+    if (!freshDoc.exists) return;
+    const fresh = freshDoc.data();
+    const amt = Math.round(Number(fresh.walletRedeemAmount || 0) * 100) / 100;
+    if (!amt || amt <= 0) return;
+    const customerId = fresh.walletCustomerId || fresh.customerId;
+    if (!customerId) {
+      console.warn(`⚠️ Wallet redemption ₹${amt} on order ${orderId} has no customer — skipped`);
+      return;
+    }
+    const result = await debitWalletForOrder({
+      customerId,
+      orderId,
+      amount: amt,
+      notes: `Wallet payment for order ${fresh.dailyOrderId || orderId}`,
+    });
+    if (result.success && !result.alreadyDone) {
+      console.log(`💰 Wallet debited ₹${amt} for order ${orderId} (customer ${customerId})`);
+    } else if (!result.success) {
+      console.warn(`⚠️ Wallet debit not applied for order ${orderId}: ${result.reason}`);
+    }
+  } catch (err) {
+    console.error('processWalletRedemptionForOrder error (non-blocking):', err.message);
+  }
+}
 
 // ========================================
 // Cashback — automatic post-payment wallet credit (offer promotionType 'cashback')
@@ -34495,40 +34583,47 @@ app.post('/api/customers/:customerId/wallet/credit', authenticateToken, async (r
     }
 
     const customerRef = db.collection('customers').doc(customerId);
-    const customerDoc = await customerRef.get();
-    if (!customerDoc.exists) {
+    const parsedAmt = Math.round(parseFloat(amount) * 100) / 100;
+    const staffId = req.user?.userId || req.user?.id || null;
+    const staffName = req.user?.name || 'Staff';
+
+    // Atomic read-modify-write so a concurrent wallet debit (order billing)
+    // can't clobber this top-up (or vice-versa). Preserves the exact stored
+    // shape (balanceAfter is the true post-credit balance).
+    const txResult = await db.runTransaction(async (tx) => {
+      const doc = await tx.get(customerRef);
+      if (!doc.exists) return { notFound: true };
+      const data = doc.data();
+      const currentBalance = data.walletBalance || 0;
+      const newBalance = Math.round((currentBalance + parsedAmt) * 100) / 100;
+      const history = Array.isArray(data.walletHistory) ? data.walletHistory : [];
+      const transaction = {
+        id: `txn_${Date.now()}_${Math.random().toString(36).substr(2, 6)}`,
+        type: 'credit',
+        amount: parsedAmt,
+        reason: reason || 'advance_payment',
+        notes: notes || '',
+        staffId,
+        staffName,
+        balanceAfter: newBalance,
+        createdAt: new Date().toISOString(),
+      };
+      tx.update(customerRef, {
+        walletBalance: newBalance,
+        walletHistory: [...history, transaction],
+        updatedAt: new Date().toISOString(),
+      });
+      return { newBalance, transaction };
+    });
+
+    if (txResult.notFound) {
       return res.status(404).json({ error: 'Customer not found' });
     }
 
-    const customer = customerDoc.data();
-    const currentBalance = customer.walletBalance || 0;
-    const newBalance = currentBalance + parseFloat(amount);
-
-    const transaction = {
-      id: `txn_${Date.now()}_${Math.random().toString(36).substr(2, 6)}`,
-      type: 'credit',
-      amount: parseFloat(amount),
-      reason: reason || 'advance_payment',
-      notes: notes || '',
-      staffId: req.user?.userId || req.user?.id || null,
-      staffName: req.user?.name || 'Staff',
-      balanceAfter: newBalance,
-      createdAt: new Date().toISOString()
-    };
-
-    const walletHistory = customer.walletHistory || [];
-    walletHistory.push(transaction);
-
-    await customerRef.update({
-      walletBalance: newBalance,
-      walletHistory: walletHistory,
-      updatedAt: new Date().toISOString()
-    });
-
     res.json({
       success: true,
-      walletBalance: newBalance,
-      transaction
+      walletBalance: txResult.newBalance,
+      transaction: txResult.transaction
     });
   } catch (error) {
     console.error('Error adding wallet credit:', error);
@@ -34552,41 +34647,32 @@ app.post('/api/customers/:customerId/wallet/redeem', authenticateToken, async (r
       return res.status(404).json({ error: 'Customer not found' });
     }
 
-    const customer = customerDoc.data();
-    const currentBalance = customer.walletBalance || 0;
-
-    if (currentBalance < parseFloat(amount)) {
-      return res.status(400).json({ error: 'Insufficient wallet balance' });
-    }
-
-    const newBalance = currentBalance - parseFloat(amount);
-
-    const transaction = {
-      id: `txn_${Date.now()}_${Math.random().toString(36).substr(2, 6)}`,
-      type: 'redeem',
-      amount: parseFloat(amount),
-      reason: 'redemption',
-      notes: notes || '',
+    // Atomic + idempotent-per-order debit (shared with the completion hook, so
+    // a client call and the server-side hook can never double-charge one order).
+    const result = await debitWalletForOrder({
+      customerId,
       orderId: orderId || null,
+      amount: parseFloat(amount),
       staffId: req.user?.userId || req.user?.id || null,
       staffName: req.user?.name || 'Staff',
-      balanceAfter: newBalance,
-      createdAt: new Date().toISOString()
-    };
-
-    const walletHistory = customer.walletHistory || [];
-    walletHistory.push(transaction);
-
-    await customerRef.update({
-      walletBalance: newBalance,
-      walletHistory: walletHistory,
-      updatedAt: new Date().toISOString()
+      notes: notes || '',
     });
+
+    if (!result.success) {
+      if (result.reason === 'insufficient_balance') {
+        return res.status(400).json({ error: 'Insufficient wallet balance' });
+      }
+      if (result.reason === 'customer_not_found') {
+        return res.status(404).json({ error: 'Customer not found' });
+      }
+      return res.status(500).json({ error: 'Failed to redeem from wallet' });
+    }
 
     res.json({
       success: true,
-      walletBalance: newBalance,
-      transaction
+      walletBalance: result.walletBalance,
+      transaction: result.transaction || null,
+      alreadyRedeemed: result.alreadyDone === true,
     });
   } catch (error) {
     console.error('Error redeeming wallet:', error);
