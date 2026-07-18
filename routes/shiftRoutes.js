@@ -55,12 +55,36 @@ function computeShiftSales(ordersSnap, shiftOpenDate, shiftUserId, isShiftOwnerA
       if (orderStaffId && orderStaffId !== shiftUserId) return;
     }
 
-    const amount = parseFloat(order.finalAmount || order.totalAmount || 0);
-    buckets.totalSales += amount;
-    buckets.orderCount++;
-    buckets.serviceChargeCollected += parseFloat(order.serviceChargeAmount || 0);
+    // Only completed/billed orders are sales. Open (pending/confirmed) and
+    // saved orders have collected nothing — counting them inflated expectedCash
+    // and produced phantom drawer shortages at close.
+    const ps = (order.paymentStatus || '').toLowerCase();
+    const isBilled = order.status === 'completed' || ['paid', 'partial', 'due'].includes(ps);
+    if (!isBilled) return;
 
-    if (order.splitPayments && Array.isArray(order.splitPayments) && order.splitPayments.length > 0) {
+    // Count only the amount actually COLLECTED: due → 0 (customer owes), partial
+    // → paidAmount, otherwise → full final. Full finalAmount for a due/partial
+    // order is not cash in the drawer.
+    const fullAmount = parseFloat(order.finalAmount || order.totalAmount || 0);
+    let collected;
+    if (ps === 'due') collected = 0;
+    else if (ps === 'partial') collected = parseFloat(order.paidAmount || 0);
+    else collected = fullAmount;
+
+    buckets.orderCount++;
+    buckets.totalSales += collected;
+    if (collected <= 0) return; // due / zero-collected: no cash, no method bucket, no SC
+
+    // Service charge is only "collected" on a fully-paid order (partial SC
+    // allocation is ambiguous — omit rather than over-count).
+    if (collected >= fullAmount) {
+      buckets.serviceChargeCollected += parseFloat(order.serviceChargeAmount || 0);
+    }
+
+    // Use the split breakdown only when the order was FULLY paid (splitPayments
+    // describe the full split; for a partial payment they don't reflect what was
+    // actually collected, so bucket the collected amount under the order method).
+    if (collected >= fullAmount && order.splitPayments && Array.isArray(order.splitPayments) && order.splitPayments.length > 0) {
       order.splitPayments.forEach(sp => {
         const method = (sp.method || sp.paymentMethod || 'cash').toLowerCase();
         const spAmount = parseFloat(sp.amount || 0);
@@ -68,7 +92,7 @@ function computeShiftSales(ordersSnap, shiftOpenDate, shiftUserId, isShiftOwnerA
       });
     } else {
       const method = (order.paymentMethod || 'cash').toLowerCase();
-      categorizePayment(method, amount, order, buckets);
+      categorizePayment(method, collected, order, buckets);
     }
   });
 
