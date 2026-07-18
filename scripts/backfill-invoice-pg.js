@@ -17,6 +17,7 @@
 require('dotenv').config({ path: require('path').join(__dirname, '..', '.env.local') });
 
 const admin = require('firebase-admin');
+const { getFirestore } = require('firebase-admin/firestore');
 
 // Initialize Firebase with env-based credentials (unique app name)
 if (!admin.apps.find(a => a && a.name === 'backfill-invoice')) {
@@ -32,7 +33,7 @@ if (!admin.apps.find(a => a && a.name === 'backfill-invoice')) {
 }
 
 const app = admin.app('backfill-invoice');
-const db = app.firestore();
+const db = getFirestore(app, 'dine'); // named 'dine' DB, not (default)
 db.settings({ databaseId: 'dine', ignoreUndefinedProperties: true });
 
 const { query, getPool } = require('../repos/pgClient');

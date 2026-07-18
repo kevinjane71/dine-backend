@@ -21,7 +21,8 @@
 
 require('dotenv').config({ path: require('path').join(__dirname, '..', '.env.local') });
 
-const { db, collections } = require('../firebase');
+const { getFirestoreDb, collections } = require('../firebase');
+const db = getFirestoreDb(); // raw Firestore ('dine'), bypasses pgAdapter — source of truth for backfill
 const { getPool } = require('../repos/pgClient');
 const { toPgRow, JSONB_COLUMNS, toJsonbValue } = require('../repos/fieldMapper');
 
