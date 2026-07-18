@@ -215,16 +215,31 @@ router.post('/:registerId/close', async (req, res) => {
       const openedTime = new Date(registerData.openedAt);
       if (orderTime < openedTime) return;
 
-      const amount = parseFloat(order.finalAmount || order.totalAmount || 0);
-      buckets.totalSales += amount;
+      // Only completed/billed orders are sales; count only the amount actually
+      // COLLECTED (due → 0, partial → paidAmount, else full). Counting open or
+      // unpaid orders as cash inflated expectedCash → phantom drawer shortages.
+      const ps = (order.paymentStatus || '').toLowerCase();
+      const isBilled = order.status === 'completed' || ['paid', 'partial', 'due'].includes(ps);
+      if (!isBilled) return;
+
+      const fullAmount = parseFloat(order.finalAmount || order.totalAmount || 0);
+      let collected;
+      if (ps === 'due') collected = 0;
+      else if (ps === 'partial') collected = parseFloat(order.paidAmount || 0);
+      else collected = fullAmount;
+
       buckets.orderCount++;
+      buckets.totalSales += collected;
+      if (collected <= 0) return;
 
-      // Tips and service charge
-      const orderTip = parseFloat(order.tipAmount || 0);
-      buckets.serviceChargeCollected += parseFloat(order.serviceChargeAmount || 0);
+      // Service charge counted only on a fully-paid order (partial SC ambiguous).
+      if (collected >= fullAmount) {
+        buckets.serviceChargeCollected += parseFloat(order.serviceChargeAmount || 0);
+      }
 
-      // Handle split payments
-      if (order.splitPayments && Array.isArray(order.splitPayments) && order.splitPayments.length > 0) {
+      // Split breakdown only for fully-paid orders (for a partial, splitPayments
+      // describe the intended full split, not what was collected).
+      if (collected >= fullAmount && order.splitPayments && Array.isArray(order.splitPayments) && order.splitPayments.length > 0) {
         order.splitPayments.forEach(sp => {
           const method = (sp.method || sp.paymentMethod || 'cash').toLowerCase();
           const spAmount = parseFloat(sp.amount || 0);
@@ -232,21 +247,7 @@ router.post('/:registerId/close', async (req, res) => {
         });
       } else {
         const method = (order.paymentMethod || 'cash').toLowerCase();
-        const isAggregator = ['zomato', 'swiggy', 'aggregator', 'online', 'talabat', 'deliveroo', 'noon_food', 'careem'].includes(method) || ['online_order', 'talabat', 'deliveroo', 'noon_food', 'careem'].includes(order.orderSource);
-
-        if (isAggregator) {
-          buckets.aggregatorSales += amount;
-        } else if (method === 'cash') {
-          buckets.cashSales += amount;
-        } else if (method === 'card' || method === 'credit_card' || method === 'debit_card') {
-          buckets.cardSales += amount;
-          buckets.cardTips += orderTip;
-        } else if (method === 'upi' || method === 'razorpay') {
-          buckets.upiSales += amount;
-          buckets.cardTips += orderTip;
-        } else {
-          buckets.otherSales += amount;
-        }
+        categorizePayment(method, collected, order, buckets);
       }
     });
 
@@ -364,13 +365,28 @@ router.get('/:registerId/x-report', async (req, res) => {
       const openedTime = new Date(registerData.openedAt);
       if (orderTime < openedTime) return;
 
-      const amount = parseFloat(order.finalAmount || order.totalAmount || 0);
-      buckets.totalSales += amount;
+      // Only completed/billed orders; count only the amount actually COLLECTED
+      // (due → 0, partial → paidAmount, else full). Prevents phantom shortages
+      // from open/unpaid orders being counted as cash.
+      const ps = (order.paymentStatus || '').toLowerCase();
+      const isBilled = order.status === 'completed' || ['paid', 'partial', 'due'].includes(ps);
+      if (!isBilled) return;
+
+      const fullAmount = parseFloat(order.finalAmount || order.totalAmount || 0);
+      let collected;
+      if (ps === 'due') collected = 0;
+      else if (ps === 'partial') collected = parseFloat(order.paidAmount || 0);
+      else collected = fullAmount;
+
       buckets.orderCount++;
+      buckets.totalSales += collected;
+      if (collected <= 0) return;
 
-      buckets.serviceChargeCollected += parseFloat(order.serviceChargeAmount || 0);
+      if (collected >= fullAmount) {
+        buckets.serviceChargeCollected += parseFloat(order.serviceChargeAmount || 0);
+      }
 
-      if (order.splitPayments && Array.isArray(order.splitPayments) && order.splitPayments.length > 0) {
+      if (collected >= fullAmount && order.splitPayments && Array.isArray(order.splitPayments) && order.splitPayments.length > 0) {
         order.splitPayments.forEach(sp => {
           const method = (sp.method || sp.paymentMethod || 'cash').toLowerCase();
           const spAmount = parseFloat(sp.amount || 0);
@@ -378,22 +394,7 @@ router.get('/:registerId/x-report', async (req, res) => {
         });
       } else {
         const method = (order.paymentMethod || 'cash').toLowerCase();
-        const orderTip = parseFloat(order.tipAmount || 0);
-        const isAggregator = ['zomato', 'swiggy', 'aggregator', 'online', 'talabat', 'deliveroo', 'noon_food', 'careem'].includes(method) || ['online_order', 'talabat', 'deliveroo', 'noon_food', 'careem'].includes(order.orderSource);
-
-        if (isAggregator) {
-          buckets.aggregatorSales += amount;
-        } else if (method === 'cash') {
-          buckets.cashSales += amount;
-        } else if (method === 'card' || method === 'credit_card' || method === 'debit_card') {
-          buckets.cardSales += amount;
-          buckets.cardTips += orderTip;
-        } else if (method === 'upi' || method === 'razorpay') {
-          buckets.upiSales += amount;
-          buckets.cardTips += orderTip;
-        } else {
-          buckets.otherSales += amount;
-        }
+        categorizePayment(method, collected, order, buckets);
       }
     });
 
