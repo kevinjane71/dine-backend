@@ -79,7 +79,15 @@ router.get('/:restaurantId', authenticateToken, async (req, res) => {
       .get();
     const groups = [];
     snap.forEach(doc => groups.push({ id: doc.id, ...doc.data() }));
-    groups.sort((a, b) => (b.updatedAt || '').localeCompare(a.updatedAt || ''));
+    // updatedAt may be a string (Firestore ISO), Date (PG adapter), or Timestamp —
+    // localeCompare on a non-string threw and 500'd the whole list
+    const ts = (v) => {
+      if (!v) return 0;
+      if (typeof v.toDate === 'function') v = v.toDate();
+      const ms = new Date(v).getTime();
+      return isNaN(ms) ? 0 : ms;
+    };
+    groups.sort((a, b) => ts(b.updatedAt) - ts(a.updatedAt));
     res.json({ success: true, groups });
   } catch (err) {
     console.error('[customerGroups] list error', err);
