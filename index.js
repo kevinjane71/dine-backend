@@ -14226,6 +14226,41 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
     // Track how many times this order has been updated after initial placement
     updateData.updateCount = (currentOrder.updateCount || 0) + 1;
 
+    // Clean edit-history + auto-refund for editing an ALREADY-completed bill.
+    // The Order History "Edit Items" flow re-bills a completed order through this
+    // endpoint (status stays 'completed'); record who/when/why, the item diff and
+    // old/new totals, and flag an auto-refund when the new total is lower — parity
+    // with the dedicated edit-completed-items endpoint so a completed-bill edit is
+    // always auditable.
+    const patchEditReason = typeof req.body.editReason === 'string' ? req.body.editReason.trim() : '';
+    if (currentOrder.status === 'completed' && status === 'completed' && (items || patchEditReason)) {
+      const oldItems = currentOrder.items || [];
+      const newItems = updateData.items || items || [];
+      const oldMap = {}; oldItems.forEach(i => { oldMap[getOrderItemKey(i)] = i; });
+      const newMap = {}; newItems.forEach(i => { newMap[getOrderItemKey(i)] = i; });
+      const itemsAdded = newItems.filter(i => !oldMap[getOrderItemKey(i)]).map(i => ({ name: i.name, variant: i.selectedVariant?.name || null, quantity: i.quantity }));
+      const itemsRemoved = oldItems.filter(i => !newMap[getOrderItemKey(i)]).map(i => ({ name: i.name, variant: i.selectedVariant?.name || null, quantity: i.quantity }));
+      const itemsModified = newItems.filter(i => oldMap[getOrderItemKey(i)] && oldMap[getOrderItemKey(i)].quantity !== i.quantity).map(i => ({ name: i.name, variant: i.selectedVariant?.name || null, from: oldMap[getOrderItemKey(i)].quantity, to: i.quantity }));
+      const oldTotal = currentOrder.finalAmount || currentOrder.totalAmount || 0;
+      const newTotal = updateData.finalAmount != null ? updateData.finalAmount : oldTotal;
+      const editEntry = {
+        editedAt: new Date().toISOString(),
+        editedBy: lastUpdatedBy || { name: 'Staff', id: req.user?.userId || 'unknown', role: req.user?.role || 'unknown' },
+        type: 'billing',
+        editReason: patchEditReason || 'Edited after completion',
+        changes: { itemsAdded, itemsRemoved, itemsModified, oldTotal, newTotal },
+      };
+      updateData.editHistory = [...(currentOrder.editHistory || []), editEntry];
+      updateData.editCount = (currentOrder.editCount || 0) + 1;
+      const amountDiff = Math.round((newTotal - oldTotal) * 100) / 100;
+      if (amountDiff < 0) {
+        updateData.autoRefundAmount = Math.abs(amountDiff);
+        updateData.autoRefundReason = `Bill edited after completion: ${editEntry.editReason}`;
+        updateData.autoRefundAt = new Date().toISOString();
+        updateData.autoRefundBy = req.user?.userId || null;
+      }
+    }
+
     console.log('🔄 Backend - Updating order:', orderId, 'with data:', updateData);
     await db.collection(collections.orders).doc(orderId).update(updateData);
 
