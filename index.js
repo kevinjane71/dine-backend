@@ -487,6 +487,46 @@ function updateDailyStatsRevenueDiff(restaurantId, order, oldAmount, newAmount, 
   }
 }
 
+// Reconcile dailyStats when a due (khata) amount is settled later. The
+// collected money becomes revenue, the outstanding-due total and the 'due'
+// payment bucket shrink, and the settlement method's bucket grows. Uses the
+// ORDER's date (same convention as the revenue-diff it replaces), so the
+// buckets it decrements are the ones the order originally recorded. Amounts
+// only — transaction counts are a secondary metric and reconciling them per
+// partial/full settlement risks double-counting, so they are left as-is.
+function updateDailyStatsOnDueSettlement(restaurantId, order, settleAmount, settlementMethod, tzOffset, dayStartHour) {
+  try {
+    const amt = Math.round((Number(settleAmount) || 0) * 100) / 100;
+    if (amt <= 0) return;
+    const orderDate = order.createdAt?.toDate ? order.createdAt.toDate()
+      : (order.createdAt instanceof Date ? order.createdAt : new Date(order.createdAt || Date.now()));
+    const dateStr = dateStrInTZ(orderDate, tzOffset, dayStartHour);
+    const docId = `${restaurantId}_${dateStr}`;
+    const statsRef = db.collection('dailyStats').doc(docId);
+    const method = (settlementMethod || 'cash').toLowerCase();
+    const update = {
+      restaurantId,
+      date: dateStr,
+      updatedAt: FieldValue.serverTimestamp(),
+      totalRevenue: FieldValue.increment(amt),
+      totalRevenueWithTax: FieldValue.increment(amt),
+      totalDueAmount: FieldValue.increment(-amt),
+      'paymentMethod_due.amount': FieldValue.increment(-amt),
+      [`paymentMethod_${method}.amount`]: FieldValue.increment(amt),
+    };
+    statsRef.set(update, { merge: true })
+      .catch(err => console.error('dailyStats settlement error (non-blocking):', err));
+    if (order.subRestaurantId) {
+      const subDocId = `${restaurantId}_sub_${order.subRestaurantId}_${dateStr}`;
+      db.collection('dailyStats').doc(subDocId).set({
+        ...update, subRestaurantId: order.subRestaurantId, subRestaurantName: order.subRestaurantName || null,
+      }, { merge: true }).catch(() => {});
+    }
+  } catch (err) {
+    console.error('dailyStats settlement helper error (non-blocking):', err);
+  }
+}
+
 // Calculate pricing adjustments (zone surcharge, time-based pricing)
 function calculatePricingAdjustments(restaurantData, { tableSection, floorData, orderTime, subtotal }) {
   const result = { zoneSurcharge: 0, appliedRules: [] };
@@ -14394,12 +14434,31 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
         updateDailyStats(currentOrder.restaurantId, currentOrder, 'cancel', parseTZ(req), parseDayStart(req));
       }
     } else if (prevCounted && nowCounted) {
-      // Order stayed counted — check if amount changed (items update, billing fields, or payment status change)
+      // Order stayed counted. Two distinct kinds of change need different handling:
+      //  1. Payment method OR payment status changed (billing a KOT order:
+      //     pending→paid/due, cash→UPI). The payment-method bucket and the
+      //     due/revenue classification were FROZEN at order creation (a KOT
+      //     order is added to dailyStats as pending/cash at POST). A revenue-diff
+      //     can't move a bucket or reclassify due, so re-bucket the whole order:
+      //     cancel(old) + add(new) — the same proven pattern the /status and
+      //     edit-completed paths use. Fixes payment breakdown (R1) and the khata
+      //     revenue double-count (R2: due orders were kept in revenue, then
+      //     added again on settlement).
+      //  2. Otherwise, a pure amount change (item edit) uses the cheaper
+      //     revenue-diff (unchanged behavior).
       const newTotal = updateData.totalAmount !== undefined ? updateData.totalAmount : currentOrder.totalAmount;
       const newFinal = updateData.finalAmount !== undefined ? updateData.finalAmount : currentOrder.finalAmount;
       const oldTotal = currentOrder.totalAmount || 0;
       const oldFinal = currentOrder.finalAmount || 0;
-      if (newTotal !== oldTotal || newFinal !== oldFinal) {
+      const oldPm = (currentOrder.paymentMethod || 'cash').toLowerCase();
+      const newPm = (updateData.paymentMethod !== undefined ? updateData.paymentMethod : (currentOrder.paymentMethod || 'cash')).toLowerCase();
+      const oldPs = (currentOrder.paymentStatus || '').toLowerCase();
+      const newPs = (updateData.paymentStatus !== undefined ? updateData.paymentStatus : (currentOrder.paymentStatus || '')).toLowerCase();
+      const paymentChanged = oldPm !== newPm || oldPs !== newPs;
+      if (paymentChanged) {
+        updateDailyStats(currentOrder.restaurantId, currentOrder, 'cancel', parseTZ(req), parseDayStart(req));
+        updateDailyStats(currentOrder.restaurantId, { ...currentOrder, ...updateData }, 'add', parseTZ(req), parseDayStart(req));
+      } else if (newTotal !== oldTotal || newFinal !== oldFinal) {
         updateDailyStatsRevenueDiff(currentOrder.restaurantId, currentOrder, oldTotal, newTotal, oldFinal, newFinal, parseTZ(req), parseDayStart(req));
       }
     }
@@ -34487,7 +34546,7 @@ app.post('/api/customers/:customerId/settle-credit', authenticateToken, async (r
 
         // Update daily stats: add settled amount to revenue for the order's original date
         const tzOffset = parseTZ(req);
-        updateDailyStatsRevenueDiff(orderData.restaurantId, orderData, 0, settleAmount, 0, settleAmount, tzOffset, parseDayStart(req));
+        updateDailyStatsOnDueSettlement(orderData.restaurantId, orderData, settleAmount, paymentMethod, tzOffset, parseDayStart(req));
       }
     }
 
@@ -34553,7 +34612,7 @@ app.post('/api/customers/:customerId/bulk-settle-credit', authenticateToken, asy
 
       // Update daily stats: add settled amount to revenue for the order's original date
       const tzOffset = parseTZ(req);
-      updateDailyStatsRevenueDiff(orderData.restaurantId, orderData, 0, outstanding, 0, outstanding, tzOffset, parseDayStart(req));
+      updateDailyStatsOnDueSettlement(orderData.restaurantId, orderData, outstanding, paymentMethod, tzOffset, parseDayStart(req));
     }
 
     // Update customer: decrement balance, mark credit history entries as settled
