@@ -142,6 +142,17 @@ const FIELD_MAP = {
   editCount: 'edit_count',
   editReason: 'edit_reason',
   preEditSnapshot: 'pre_edit_snapshot',
+  editHistory: 'edit_history',
+  autoRefundAmount: 'auto_refund_amount',
+  autoRefundReason: 'auto_refund_reason',
+  autoRefundAt: 'auto_refund_at',
+  autoRefundBy: 'auto_refund_by',
+  // Cashback (offer promotionType 'cashback') + wallet + billing-clamp flags
+  cashbackEarned: 'cashback_earned',
+  cashbackOfferId: 'cashback_offer_id',
+  cashbackOfferName: 'cashback_offer_name',
+  walletCustomerId: 'wallet_customer_id',
+  billingClamped: 'billing_clamped',
 
   // Cover count
   covers: 'covers',
@@ -206,7 +217,7 @@ const JSONB_COLUMNS = new Set([
   'applied_offer', 'applied_offers', 'applied_pricing_rules',
   'tax_breakdown', 'split_payments', 'split_bill',
   'kot_printed_stations', 'delivery_info', 'delivery_address',
-  'pre_edit_snapshot', 'void_items', 'removed_items',
+  'pre_edit_snapshot', 'void_items', 'removed_items', 'edit_history',
   'price_discrepancies', 'restoration_history', 'bill_reprint_history', 'extra_data',
 ]);
 

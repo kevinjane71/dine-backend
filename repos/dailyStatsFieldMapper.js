@@ -22,6 +22,7 @@ const FIELD_MAP = {
   totalTax: 'total_tax',
   totalDiscounts: 'total_discounts',
   totalRefunds: 'total_refunds',
+  refundsIssued: 'refunds_issued',
   totalCovers: 'total_covers',
   createdAt: 'created_at',
   updatedAt: 'updated_at',
