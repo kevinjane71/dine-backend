@@ -527,6 +527,38 @@ function updateDailyStatsOnDueSettlement(restaurantId, order, settleAmount, sett
   }
 }
 
+// Track the amount refunded on a day for the "Refunds" report tile. Deliberately
+// a SEPARATE field from totalRefunds (which stays 0): revenue is already reported
+// NET of refunds (the refund handler reduces it via cancel/revenue-diff), and
+// every report computes revenue as `totalRevenueWithTax - totalRefunds`. Keeping
+// totalRefunds at 0 means that formula stays `- 0` everywhere and revenue can
+// never be double-subtracted; refundsIssued is display-only.
+function updateDailyStatsRefundsIssued(restaurantId, order, amount, tzOffset, dayStartHour) {
+  try {
+    const amt = Math.round((Number(amount) || 0) * 100) / 100;
+    if (amt <= 0) return;
+    const orderDate = order.createdAt?.toDate ? order.createdAt.toDate()
+      : (order.createdAt instanceof Date ? order.createdAt : new Date(order.createdAt || Date.now()));
+    const dateStr = dateStrInTZ(orderDate, tzOffset, dayStartHour);
+    const docId = `${restaurantId}_${dateStr}`;
+    const update = {
+      restaurantId, date: dateStr,
+      updatedAt: FieldValue.serverTimestamp(),
+      refundsIssued: FieldValue.increment(amt),
+    };
+    db.collection('dailyStats').doc(docId).set(update, { merge: true })
+      .catch(err => console.error('dailyStats refundsIssued error (non-blocking):', err));
+    if (order.subRestaurantId) {
+      const subDocId = `${restaurantId}_sub_${order.subRestaurantId}_${dateStr}`;
+      db.collection('dailyStats').doc(subDocId).set({
+        ...update, subRestaurantId: order.subRestaurantId, subRestaurantName: order.subRestaurantName || null,
+      }, { merge: true }).catch(() => {});
+    }
+  } catch (err) {
+    console.error('dailyStats refundsIssued helper error (non-blocking):', err);
+  }
+}
+
 // Calculate pricing adjustments (zone surcharge, time-based pricing)
 function calculatePricingAdjustments(restaurantData, { tableSection, floorData, orderTime, subtotal }) {
   const result = { zoneSurcharge: 0, appliedRules: [] };
@@ -22179,7 +22211,7 @@ app.get('/api/token/render/:restaurantId/:orderId', async (req, res) => {
 // ========================================
 async function reverseOrderSideEffects(orderId, orderData) {
   const restaurantId = orderData.restaurantId;
-  const results = { inventory: false, customer: false, loyalty: false, offers: false, credit: false };
+  const results = { inventory: false, customer: false, loyalty: false, offers: false, credit: false, wallet: false };
 
   console.log(`🔄 Reversing side effects for Order ${orderId} (was: ${orderData.status})`);
 
@@ -22254,6 +22286,18 @@ async function reverseOrderSideEffects(orderId, orderData) {
         await custRef.update(custUpdate);
         results.customer = true;
         console.log(`👤 Customer ${customerId} stats reversed: orders ${custData.totalOrders} → ${newTotalOrders}, spent ₹${custData.totalSpent} → ₹${Math.round(newTotalSpent * 100) / 100}`);
+
+        // Reverse wallet effects (only for orders that actually completed —
+        // pre-completion cancels never debited wallet or credited cashback).
+        // Credits back the wallet payment and claws back the cashback, reading
+        // the wallet history so only real effects are reversed; idempotent.
+        if (wasCompleted) {
+          const walletRev = await reverseWalletForRefundedOrder(customerId, orderId, orderData);
+          if (walletRev.reversed) {
+            results.wallet = true;
+            console.log(`💸 Wallet reversed for refunded order ${orderId}: +₹${walletRev.walletRefunded} payment, -₹${walletRev.cashbackClawedBack} cashback (net ${walletRev.net >= 0 ? '+' : ''}₹${walletRev.net})`);
+          }
+        }
       }
     } catch (err) {
       console.error(`⚠️ Customer stats reversal failed for Order ${orderId}:`, err.message);
@@ -22560,6 +22604,57 @@ async function processWalletRedemptionForOrder(orderId) {
     }
   } catch (err) {
     console.error('processWalletRedemptionForOrder error (non-blocking):', err.message);
+  }
+}
+
+// Reverse an order's wallet effects when it is fully refunded / cancelled /
+// deleted after completion: credit back what the customer actually paid from
+// their wallet (the completion debit) and claw back the cashback that was
+// actually credited. Reads the wallet HISTORY (not the order's claimed amounts)
+// so it only reverses effects that truly happened — the completion debit/credit
+// can fail. Idempotent per order via a 'refund_reversal' history entry; atomic.
+async function reverseWalletForRefundedOrder(customerId, orderId, orderData) {
+  if (!customerId) return { reversed: false };
+  const customerRef = db.collection('customers').doc(customerId);
+  try {
+    return await db.runTransaction(async (tx) => {
+      const doc = await tx.get(customerRef);
+      if (!doc.exists) return { reversed: false };
+      const data = doc.data();
+      const history = Array.isArray(data.walletHistory) ? data.walletHistory : [];
+      if (history.some(h => h && h.type === 'refund_reversal' && h.orderId === orderId)) {
+        return { reversed: false, alreadyDone: true };
+      }
+      const redeemEntry = history.find(h => h && h.type === 'redeem' && h.orderId === orderId);
+      const cashbackEntry = history.find(h => h && h.type === 'credit' && h.reason === 'cashback' && h.orderId === orderId);
+      const walletRefunded = redeemEntry ? Math.round((Number(redeemEntry.amount) || 0) * 100) / 100 : 0;      // give back
+      const cashbackClawedBack = cashbackEntry ? Math.round((Number(cashbackEntry.amount) || 0) * 100) / 100 : 0; // take back
+      const net = Math.round((walletRefunded - cashbackClawedBack) * 100) / 100;
+      if (net === 0) return { reversed: false };
+      const currentBalance = data.walletBalance || 0;
+      const newBalance = Math.round((currentBalance + net) * 100) / 100; // may go negative if cashback was already spent
+      const txn = {
+        id: `txn_${Date.now()}_${Math.random().toString(36).substr(2, 6)}`,
+        type: 'refund_reversal',
+        amount: net,
+        reason: 'order_refunded',
+        notes: `Order ${orderData.dailyOrderId || orderId} refunded — wallet payment +${walletRefunded}, cashback -${cashbackClawedBack}`,
+        orderId,
+        walletRefunded,
+        cashbackClawedBack,
+        balanceAfter: newBalance,
+        createdAt: new Date().toISOString(),
+      };
+      tx.update(customerRef, {
+        walletBalance: newBalance,
+        walletHistory: [...history, txn],
+        updatedAt: new Date().toISOString(),
+      });
+      return { reversed: true, net, walletRefunded, cashbackClawedBack };
+    });
+  } catch (err) {
+    console.error(`reverseWalletForRefundedOrder error (order ${orderId}):`, err.message);
+    return { reversed: false, error: err.message };
   }
 }
 
@@ -29524,14 +29619,16 @@ app.get('/api/books/:restaurantId/revenue', authenticateToken, async (req, res) 
       curDocs.forEach((doc, i) => {
         if (!doc.exists) return;
         const data = doc.data();
-        // Revenue = collected amounts minus refunds; due tracked separately
+        // Revenue is already NET of refunds (the refund handler reduces
+        // totalRevenueWithTax). totalRefunds stays 0, so this keeps revenue net.
+        // The Refunds tile reads refundsIssued (display-only, never subtracted).
         const docRefunds = data.totalRefunds || 0;
         const docRevenue = (data.totalRevenueWithTax || 0) - docRefunds;
         totalRevenue += docRevenue;
         totalDueAmount += data.totalDueAmount || 0;
         totalTax += data.totalTax || 0;
         totalDiscounts += data.totalDiscounts || 0;
-        refunds += docRefunds;
+        refunds += (data.refundsIssued || 0);
         orderCount += data.totalOrders || 0;
 
         // Payment method breakdown from paymentMethod_* fields
@@ -33556,6 +33653,7 @@ app.post('/api/orders/:orderId/refund', authenticateToken, async (req, res) => {
       // Update daily stats — full refund effectively removes from revenue
       if (!['saved', 'cancelled', 'deleted'].includes(orderData.status)) {
         updateDailyStats(orderData.restaurantId, orderData, 'cancel', parseTZ(req), parseDayStart(req));
+        updateDailyStatsRefundsIssued(orderData.restaurantId, orderData, roundedRefundAmount, parseTZ(req), parseDayStart(req));
       }
     } else {
       // Partial refund — subtract refund amount from daily stats revenue (order still counts)
@@ -33563,6 +33661,7 @@ app.post('/api/orders/:orderId/refund', authenticateToken, async (req, res) => {
         const oldFinal = orderData.finalAmount || orderData.totalAmount || 0;
         const oldBase = orderData.totalAmount || 0;
         updateDailyStatsRevenueDiff(orderData.restaurantId, orderData, oldBase, oldBase - refundAmount, oldFinal, oldFinal - refundAmount, parseTZ(req), parseDayStart(req));
+        updateDailyStatsRefundsIssued(orderData.restaurantId, orderData, roundedRefundAmount, parseTZ(req), parseDayStart(req));
       }
     }
 
