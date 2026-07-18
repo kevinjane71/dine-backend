@@ -8500,6 +8500,12 @@ app.post('/api/public/orders/:restaurantId', vercelSecurityMiddleware.publicAPI,
       razorpayPaymentId,
       razorpayOrderId,
       razorpaySignature,
+      // Tip + service charge the customer was actually charged (Razorpay charges
+      // the FE total including these). Recorded so the stored order and reports
+      // match the charge — the server total is a RECORD only, it does not drive
+      // the charge, so trusting these (clamped) is safe.
+      tipAmount: reqTipAmount,
+      serviceCharge: reqServiceCharge,
     } = req.body;
 
     if (!restaurantId || !items || items.length === 0) {
@@ -8678,7 +8684,23 @@ app.post('/api/public/orders/:restaurantId', vercelSecurityMiddleware.publicAPI,
         return res.status(400).json({ error: `Menu item ${item.menuItemId} not found` });
       }
 
-      const itemTotal = menuItem.price * item.quantity;
+      // Validate quantity (mirror the authenticated POS path) — a public client
+      // could otherwise send a negative/invalid quantity to deflate the subtotal.
+      const parsedQty = parseInt(item.quantity, 10);
+      if (!Number.isFinite(parsedQty) || parsedQty <= 0) {
+        return res.status(400).json({ error: `Invalid quantity for item "${menuItem.name}"` });
+      }
+      if (parsedQty > ORDER_MAX_QUANTITY) {
+        return res.status(400).json({ error: `Quantity for "${menuItem.name}" cannot exceed ${ORDER_MAX_QUANTITY}` });
+      }
+      const itemQuantity = parsedQty;
+
+      // Block out-of-stock items (mirror the POS path)
+      if (menuItem.isAvailable === false) {
+        return res.status(400).json({ error: `"${menuItem.name}" is currently out of stock` });
+      }
+
+      const itemTotal = menuItem.price * itemQuantity;
       subtotal += itemTotal;
 
       orderItems.push({
@@ -8686,7 +8708,7 @@ app.post('/api/public/orders/:restaurantId', vercelSecurityMiddleware.publicAPI,
         name: menuItem.name,
         price: menuItem.price,
         seat: resolveSeat(item.seat, restaurantData),
-        quantity: item.quantity,
+        quantity: itemQuantity,
         total: itemTotal,
         category: menuItem.category || '',
         categoryId: menuItem.categoryId || menuItem.category || '',
@@ -8898,8 +8920,18 @@ app.post('/api/public/orders/:restaurantId', vercelSecurityMiddleware.publicAPI,
       orderItems, taxSettings, categories, totalDiscount, 0 // no service charge for public orders
     );
 
-    // Only add exclusive tax (inclusive tax already embedded in prices)
-    const finalTotal = preTaxTotal + exclusiveTaxAmount;
+    // Tip + service charge (what the customer was charged via Razorpay). Clamp
+    // to non-negative; no upper cap so the record matches the charge exactly.
+    const publicTipAmount = Math.max(0, Math.round((Number(reqTipAmount) || 0) * 100) / 100);
+    const publicServiceChargeAmount = Math.max(0, Math.round((Number(reqServiceCharge?.amount) || 0) * 100) / 100);
+    const publicServiceChargeRate = Math.max(0, Number(reqServiceCharge?.rate) || 0);
+
+    // Only add exclusive tax (inclusive tax already embedded in prices), then
+    // the service charge and tip the customer actually paid.
+    // loyaltyEarnBase excludes tip/SC so loyalty is earned exactly as before
+    // (points on food + tax, never on a tip).
+    const loyaltyEarnBase = preTaxTotal + exclusiveTaxAmount;
+    const finalTotal = loyaltyEarnBase + publicServiceChargeAmount + publicTipAmount;
 
     // Calculate loyalty points earned
     let loyaltyPointsEarned = 0;
@@ -8931,13 +8963,13 @@ app.post('/api/public/orders/:restaurantId', vercelSecurityMiddleware.publicAPI,
           console.log(`💎 Loyalty points (on full ₹${amountBeforeRedemption}): ${loyaltyPointsEarned} points`);
         } else {
           // Default: Earn points only on the remaining amount after redemption
-          loyaltyPointsEarned = Math.floor(finalTotal / earnPerAmount) * pointsEarned;
-          console.log(`💎 Loyalty points (on remaining ₹${finalTotal}): ${loyaltyPointsEarned} points`);
+          loyaltyPointsEarned = Math.floor(loyaltyEarnBase / earnPerAmount) * pointsEarned;
+          console.log(`💎 Loyalty points (on remaining ₹${loyaltyEarnBase}): ${loyaltyPointsEarned} points`);
         }
       } else {
-        // No redemption - earn points normally on final total
-        loyaltyPointsEarned = Math.floor(finalTotal / earnPerAmount) * pointsEarned;
-        console.log(`💎 Loyalty points calculation: ₹${finalTotal} / ₹${earnPerAmount} * ${pointsEarned} = ${loyaltyPointsEarned} points`);
+        // No redemption - earn points normally on the food+tax total (excl. tip/SC)
+        loyaltyPointsEarned = Math.floor(loyaltyEarnBase / earnPerAmount) * pointsEarned;
+        console.log(`💎 Loyalty points calculation: ₹${loyaltyEarnBase} / ₹${earnPerAmount} * ${pointsEarned} = ${loyaltyPointsEarned} points`);
       }
 
       // Apply tier multiplier if customer has a loyalty tier
@@ -9061,9 +9093,9 @@ app.post('/api/public/orders/:restaurantId', vercelSecurityMiddleware.publicAPI,
       finalAmount: Math.round(finalTotal * 100) / 100,
       taxAmount: Math.round((taxAmount || 0) * 100) / 100,
       taxBreakdown: taxBreakdown || [],
-      serviceChargeAmount: 0,
-      serviceChargeRate: 0,
-      tipAmount: 0,
+      serviceChargeAmount: publicServiceChargeAmount,
+      serviceChargeRate: publicServiceChargeRate,
+      tipAmount: publicTipAmount,
       roundOffAmount: 0,
       discountAmount: Math.round((discountAmount || 0) * 100) / 100,
       manualDiscount: 0,
