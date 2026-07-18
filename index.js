@@ -14177,6 +14177,14 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
           const fePricePatch = typeof cleanItem.basePrice === 'number' ? cleanItem.basePrice
             : (typeof cleanItem.price === 'number' ? cleanItem.price : null);
 
+          // Editing a SETTLED bill: keep the base price this existing line was
+          // originally billed at (from the order's own stored basePrice — server-
+          // authoritative, not FE-claimed), so a menu price change since the bill
+          // was placed can't silently alter a completed total or revert a manual
+          // price edit. Only for lines already on the completed order; genuinely
+          // new lines added during the edit still price at the current menu.
+          const isSettledExistingLine = currentOrder.status === 'completed' && existingItem && typeof existingItem.basePrice === 'number';
+
           if (selectedVariant && typeof selectedVariant.price === 'number') {
             // Variant selected — validate against menu
             // Prefer name match; only fall back to price match when name is absent
@@ -14185,6 +14193,9 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
             );
             resolvedBasePrice = matchedVariant ? matchedVariant.price : selectedVariant.price;
             expectedMenuPricePatch = resolvedBasePrice; // variant price is the expected price
+          } else if (isSettledExistingLine) {
+            resolvedBasePrice = existingItem.basePrice;
+            expectedMenuPricePatch = existingItem.basePrice;
           } else if (allowPriceEditPatch && fePricePatch !== null) {
             // Price edit enabled — trust FE price
             resolvedBasePrice = fePricePatch;
@@ -14196,9 +14207,10 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
             }
           }
 
-          // Multi-tier pricing: override base price for non-variant items
-          // Skip if staff explicitly edited the price
-          const wasManuallyEditedPatch = cleanItem.priceEdited === true || (allowPriceEditPatch && fePricePatch !== null && fePricePatch !== menuItem.price);
+          // Multi-tier pricing: override base price for non-variant items.
+          // Skip if staff explicitly edited the price OR this is a preserved
+          // settled-bill line (must not be re-priced by a current pricing rule).
+          const wasManuallyEditedPatch = cleanItem.priceEdited === true || isSettledExistingLine || (allowPriceEditPatch && fePricePatch !== null && fePricePatch !== menuItem.price);
           if (multiPricing?.enabled && activePricingRuleId && !selectedVariant && !wasManuallyEditedPatch) {
             const rulePrice = resolveItemPriceForRule(menuItem, activePricingRuleId, multiPricing.rules);
             if (rulePrice !== null) {
