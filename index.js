@@ -22131,9 +22131,16 @@ async function reverseOrderSideEffects(orderId, orderData) {
           updatedAt: new Date()
         };
 
-        // Reverse loyalty points: undo earned, restore redeemed
-        const pointsEarned = orderData.loyaltyPointsEarned || 0;
-        const pointsRedeemed = orderData.loyaltyPointsRedeemed || 0;
+        // Reverse loyalty points ONLY if the order was actually completed —
+        // loyalty is awarded/deducted at completion, so a pre-completion cancel
+        // never touched points and must not reverse them (that wrongly dropped
+        // the customer's balance for an order they never paid). orderData holds
+        // the pre-mutation status at every caller: cancel → never 'completed'
+        // (cancel is blocked for completed orders); refund/delete → 'completed'
+        // when the order was billed.
+        const wasCompleted = orderData.status === 'completed';
+        const pointsEarned = wasCompleted ? (orderData.loyaltyPointsEarned || 0) : 0;
+        const pointsRedeemed = wasCompleted ? (orderData.loyaltyPointsRedeemed || 0) : 0;
         const netReverse = -pointsEarned + pointsRedeemed; // subtract earned, add back redeemed
         if (netReverse !== 0) {
           custUpdate.loyaltyPoints = FieldValue.increment(netReverse);
@@ -22586,8 +22593,16 @@ async function reapplyOrderSideEffects(orderId, orderData) {
         const custData = custDoc.data();
         const orderHistory = custData.orderHistory || [];
 
-        // Re-add this order to history (if not already there)
-        if (!orderHistory.some(h => h.orderId === orderId)) {
+        // Only re-add to history / re-apply loyalty if the order was completed
+        // before cancellation (mirror of the reverse guard). Cancel is blocked
+        // for completed orders, so a restored order is always pre-completion —
+        // its history entry and loyalty are applied when it is genuinely
+        // completed later, NOT on restore (else totalOrders/totalSpent inflate
+        // and points are granted for an unpaid order).
+        const wasCompleted = orderData.lastStatus === 'completed';
+
+        // Re-add this order to history (if completed and not already there)
+        if (wasCompleted && !orderHistory.some(h => h.orderId === orderId)) {
           orderHistory.push({
             orderId,
             date: orderData.createdAt || new Date(),
@@ -22609,8 +22624,8 @@ async function reapplyOrderSideEffects(orderId, orderData) {
         };
 
         // Re-apply loyalty points: add earned back, deduct redeemed again
-        const pointsEarned = orderData.loyaltyPointsEarned || 0;
-        const pointsRedeemed = orderData.loyaltyPointsRedeemed || 0;
+        const pointsEarned = wasCompleted ? (orderData.loyaltyPointsEarned || 0) : 0;
+        const pointsRedeemed = wasCompleted ? (orderData.loyaltyPointsRedeemed || 0) : 0;
         const netReapply = pointsEarned - pointsRedeemed;
         if (netReapply !== 0) {
           custUpdate.loyaltyPoints = FieldValue.increment(netReapply);
