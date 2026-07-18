@@ -247,7 +247,10 @@ router.post('/:registerId/close', async (req, res) => {
         });
       } else {
         const method = (order.paymentMethod || 'cash').toLowerCase();
-        categorizePayment(method, collected, order, buckets);
+        // Wallet-redeemed portion was paid from wallet, not this method / drawer.
+        const walletPaid = parseFloat(order.walletRedeemAmount || 0);
+        const methodAmount = Math.max(0, collected - walletPaid);
+        if (methodAmount > 0) categorizePayment(method, methodAmount, order, buckets);
       }
     });
 
@@ -394,7 +397,10 @@ router.get('/:registerId/x-report', async (req, res) => {
         });
       } else {
         const method = (order.paymentMethod || 'cash').toLowerCase();
-        categorizePayment(method, collected, order, buckets);
+        // Wallet-redeemed portion was paid from wallet, not this method / drawer.
+        const walletPaid = parseFloat(order.walletRedeemAmount || 0);
+        const methodAmount = Math.max(0, collected - walletPaid);
+        if (methodAmount > 0) categorizePayment(method, methodAmount, order, buckets);
       }
     });
 
