@@ -9198,7 +9198,21 @@ app.post('/api/public/orders/:restaurantId', vercelSecurityMiddleware.publicAPI,
 const ORDER_MAX_QUANTITY = 10000;
 const ORDER_MAX_UNIT_PRICE = 1000000; // ₹10 lakh per unit
 
-app.post('/api/orders', async (req, res) => {
+// POST /api/orders authentication: all staff clients (web POS, dine-app,
+// local-login offline devices) carry a JWT — require it. The single carve-out
+// is the legacy customer self-order QR flow (orderType 'customer_self_order'),
+// which has no staff token; for that flow the FE billing override below is
+// also disabled so billing stays fully server-computed. Verified senders:
+// crave → /api/customer/orders, public QR → /api/public/orders (both separate).
+function authenticateOrderCreate(req, res, next) {
+  if (req.body && req.body.orderType === 'customer_self_order') {
+    req.user = null;
+    return next();
+  }
+  return authenticateToken(req, res, next);
+}
+
+app.post('/api/orders', authenticateOrderCreate, async (req, res) => {
   try {
     // ── Rate limit: prevent order spam (e.g. 2000+ orders in 1 minute) ──
     if (req.body.restaurantId) {
@@ -10202,6 +10216,7 @@ app.post('/api/orders', async (req, res) => {
       syncSource: syncSource, // 'online' | 'offline' — tracks how order was placed
       ...(idempotencyKey ? { idempotencyKey } : {}),
       walletRedeemAmount: req.body.walletRedeemAmount ? Math.round(Number(req.body.walletRedeemAmount) * 100) / 100 : null,
+      walletCustomerId: req.body.walletCustomerId || null,
       // Coupon fields
       couponCode: req.body.couponCode || null,
       couponId: req.body.couponId || null,
@@ -10260,6 +10275,38 @@ app.post('/api/orders', async (req, res) => {
       const feTotalDisc = parseFloat(req.body.totalDiscountAmount) || (feDiscount + feManual + feLoyalty);
       const feSubtotal = parseFloat(req.body.totalAmount) || subtotalForDiscount;
       const feTaxAmt = req.body.taxBreakdown.reduce((s, t) => s + (t.amount || 0), 0);
+
+      // ── Sanity clamp: the override may only refine, never rewrite, billing ──
+      // Server-priced subtotal is authoritative (items were re-priced above).
+      // Reject the override entirely (keep server-computed orderData) when the
+      // client's numbers are impossible: negative discounts, discounts
+      // exceeding the subtotal, subtotal far from server pricing, or a final
+      // amount below what the discounts can explain. Self-order (no auth) never
+      // gets the override at all.
+      const feCouponPre = parseFloat(req.body.couponDiscount) || 0;
+      const claimedDiscTotal = Math.max(feTotalDisc, feDiscount + feManual + feLoyalty) + feCouponPre;
+      const serverSubtotal = Math.round(subtotalForDiscount * 100) / 100;
+      const subtotalTolerance = Math.max(2, serverSubtotal * 0.01);
+      const feFinalPre = parseFloat(req.body.finalAmount) || 0;
+      // Final-amount floor = (subtotal − discounts) minus whatever round-off the
+      // FE applied (tax/service-charge/tip only push finalAmount UP, so they are
+      // not credited — the floor stays conservative). This accommodates
+      // round-to-nearest-₹10/₹50 and inclusive-tax bills without false rejects.
+      const feRoundOff = Math.abs(parseFloat(req.body.roundOffAmount) || 0);
+      const finalFloor = (serverSubtotal - claimedDiscTotal) - feRoundOff - subtotalTolerance;
+      const overrideInvalid =
+        req.user === null ||
+        feDiscount < 0 || feManual < 0 || feLoyalty < 0 || feCouponPre < 0 || feTaxAmt < 0 ||
+        claimedDiscTotal > serverSubtotal + subtotalTolerance ||
+        Math.abs(feSubtotal - serverSubtotal) > subtotalTolerance ||
+        feFinalPre < 0 ||
+        feFinalPre < finalFloor;
+      if (overrideInvalid) {
+        orderData.billingClamped = true;
+        console.warn(`🚫 POS override REJECTED (server values kept) — restaurant ${restaurantId}: ` +
+          `feSubtotal=₹${feSubtotal} vs server=₹${serverSubtotal}, claimedDisc=₹${claimedDiscTotal}, feFinal=₹${feFinalPre}, auth=${!!req.user}`);
+      }
+      if (!overrideInvalid) {
       orderData.subtotal = Math.round(feSubtotal * 100) / 100;
       orderData.discountAmount = Math.round(feDiscount * 100) / 100;
       orderData.offerDiscount = Math.round(feDiscount * 100) / 100;
@@ -10283,6 +10330,7 @@ app.post('/api/orders', async (req, res) => {
       }
       orderData.finalAmount = Math.max(0, orderData.finalAmount);
       console.log(`📊 POS override: Using frontend billing values (Subtotal: ₹${orderData.subtotal}, Disc: ₹${orderData.totalDiscountAmount}, Tax: ₹${orderData.taxAmount}, Final: ₹${orderData.finalAmount})`);
+      }
     }
 
     // Billing audit: compare FE-sent values vs BE-resolved values
@@ -10461,7 +10509,11 @@ app.post('/api/orders', async (req, res) => {
         loyaltyPointsEarned: loyaltyPointsEarned,
         loyaltyPointsRedeemed: loyaltyPointsRedeemed,
         outstandingAmount: req.body.partialPayAmount != null ? Math.round((finalAmount - Number(req.body.partialPayAmount)) * 100) / 100 : 0,
-        paidAmount: req.body.partialPayAmount != null ? Math.round(Number(req.body.partialPayAmount) * 100) / 100 : 0,
+        // paidAmount = amount actually collected. Fully-paid orders (no
+        // partialPayAmount) must record finalAmount, NOT 0 — the totalSpent
+        // recompute reads paidAmount directly (0 != null, so 0 would count the
+        // order as ₹0 spent). Due/partial record the partial amount.
+        paidAmount: req.body.partialPayAmount != null ? Math.round(Number(req.body.partialPayAmount) * 100) / 100 : Math.round(finalAmount * 100) / 100,
         paymentStatus: req.body.partialPayAmount != null ? (Number(req.body.partialPayAmount) === 0 ? 'due' : 'partial') : 'paid',
         orderDate: new Date(),
         tableNumber: tableNumber || seatNumber || null,
@@ -10795,6 +10847,7 @@ app.post('/api/orders', async (req, res) => {
 
       // Fire-and-forget: cashback wallet credit (offer promotionType 'cashback')
       processCashbackForOrder(orderRef.id, { ...orderData, restaurantId }).catch(() => {});
+      processWalletRedemptionForOrder(orderRef.id).catch(() => {});
 
       // Fire-and-forget: send bill_notification template on WhatsApp
       (async () => {
@@ -13204,6 +13257,13 @@ app.patch('/api/orders/:orderId/status', authenticateToken, async (req, res) => 
             orderDate: new Date(),
             tableNumber: orderData.tableNumber || null,
             orderType: orderData.orderType,
+            // paidAmount = amount actually collected, so the totalSpent recompute
+            // doesn't over-count a due order linked to a customer at completion.
+            paymentStatus: orderData.paymentStatus || 'paid',
+            paidAmount: (orderData.paymentStatus === 'due' || orderData.paymentStatus === 'partial')
+              ? Math.round(Number(orderData.paidAmount || 0) * 100) / 100
+              : Math.round(orderFinalAmount * 100) / 100,
+            outstandingAmount: Math.round(Number(orderData.outstandingAmount || 0) * 100) / 100,
           };
           // Normalize phone helper
           const normPhone = (p) => {
@@ -13502,6 +13562,7 @@ app.patch('/api/orders/:orderId/status', authenticateToken, async (req, res) => 
     // Fire-and-forget: cashback wallet credit (offer promotionType 'cashback')
     if (status === 'completed') {
       processCashbackForOrder(orderId, orderData).catch(() => {});
+      processWalletRedemptionForOrder(orderId).catch(() => {});
     }
 
     // Fire-and-forget: send bill on WhatsApp if enabled
@@ -14847,7 +14908,14 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
                 loyaltyPointsEarned: pointsEarned,
                 loyaltyPointsRedeemed: pointsRedeemed,
                 paymentStatus: updateData.paymentStatus || 'paid',
-                paidAmount: updateData.paidAmount || null,
+                // paidAmount = amount actually collected. `updateData.paidAmount || null`
+                // wrongly turned a full-due ₹0 into null → the totalSpent recompute
+                // then counted the FULL finalAmount as spent (and settle-credit later
+                // added it again → double-count). Record the true collected amount:
+                // 0 for due, the partial for partial, finalAmount for paid.
+                paidAmount: (updateData.paymentStatus === 'due' || updateData.paymentStatus === 'partial')
+                  ? Math.round(Number(updateData.paidAmount || 0) * 100) / 100
+                  : Math.round(orderFinalAmount * 100) / 100,
                 outstandingAmount: updateData.outstandingAmount || 0,
               };
               const newHistory = [...existingHistory, histEntry];
@@ -15228,6 +15296,7 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
     // Fire-and-forget: cashback wallet credit (offer promotionType 'cashback')
     if (status === 'completed' && currentOrder.status !== 'completed') {
       processCashbackForOrder(orderId, currentOrder).catch(() => {});
+      processWalletRedemptionForOrder(orderId).catch(() => {});
     }
 
     // If status changed to completed, trigger billing print
@@ -22697,9 +22766,16 @@ async function reverseOrderSideEffects(orderId, orderData) {
           updatedAt: new Date()
         };
 
-        // Reverse loyalty points: undo earned, restore redeemed
-        const pointsEarned = orderData.loyaltyPointsEarned || 0;
-        const pointsRedeemed = orderData.loyaltyPointsRedeemed || 0;
+        // Reverse loyalty points ONLY if the order was actually completed —
+        // loyalty is awarded/deducted at completion, so a pre-completion cancel
+        // never touched points and must not reverse them (that wrongly dropped
+        // the customer's balance for an order they never paid). orderData holds
+        // the pre-mutation status at every caller: cancel → never 'completed'
+        // (cancel is blocked for completed orders); refund/delete → 'completed'
+        // when the order was billed.
+        const wasCompleted = orderData.status === 'completed';
+        const pointsEarned = wasCompleted ? (orderData.loyaltyPointsEarned || 0) : 0;
+        const pointsRedeemed = wasCompleted ? (orderData.loyaltyPointsRedeemed || 0) : 0;
         const netReverse = -pointsEarned + pointsRedeemed; // subtract earned, add back redeemed
         if (netReverse !== 0) {
           custUpdate.loyaltyPoints = FieldValue.increment(netReverse);
@@ -22949,6 +23025,90 @@ app.patch('/api/orders/:orderId/cancel', authenticateToken, async (req, res) => 
 });
 
 // ========================================
+// Wallet debit — atomic + idempotent per order.
+// Idempotency key: a 'redeem' walletHistory entry carrying this orderId. Safe to
+// call from BOTH the /wallet/redeem endpoint and the completion hook below — the
+// wallet is only ever debited once per order regardless of who triggers it or of
+// races (the transaction serializes concurrent calls). This is what lets the
+// server-side completion hook coexist with the pre-existing client-side debit
+// without ever double-charging.
+// ========================================
+async function debitWalletForOrder({ customerId, orderId, amount, staffId = null, staffName = 'System', notes = '' }) {
+  const amt = Math.round(Number(amount) * 100) / 100;
+  if (!customerId || !amt || amt <= 0) return { success: false, reason: 'invalid_args' };
+  const customerRef = db.collection('customers').doc(customerId);
+  try {
+    return await db.runTransaction(async (tx) => {
+      const doc = await tx.get(customerRef);
+      if (!doc.exists) return { success: false, reason: 'customer_not_found' };
+      const data = doc.data();
+      const history = Array.isArray(data.walletHistory) ? data.walletHistory : [];
+      // Idempotency: already debited for this order?
+      if (orderId && history.some(h => h && h.type === 'redeem' && h.orderId === orderId)) {
+        return { success: true, alreadyDone: true, walletBalance: data.walletBalance || 0 };
+      }
+      const currentBalance = data.walletBalance || 0;
+      if (currentBalance < amt) return { success: false, reason: 'insufficient_balance', walletBalance: currentBalance };
+      const newBalance = Math.round((currentBalance - amt) * 100) / 100;
+      const txn = {
+        id: `txn_${Date.now()}_${Math.random().toString(36).substr(2, 6)}`,
+        type: 'redeem',
+        amount: amt,
+        reason: 'redemption',
+        notes: notes || (orderId ? `Redeemed for order ${orderId}` : ''),
+        orderId: orderId || null,
+        staffId,
+        staffName,
+        balanceAfter: newBalance,
+        createdAt: new Date().toISOString(),
+      };
+      tx.update(customerRef, {
+        walletBalance: newBalance,
+        walletHistory: [...history, txn],
+        updatedAt: new Date().toISOString(),
+      });
+      return { success: true, walletBalance: newBalance, transaction: txn };
+    });
+  } catch (err) {
+    console.error(`Wallet debit error (order ${orderId}, customer ${customerId}):`, err.message);
+    return { success: false, reason: 'error', error: err.message };
+  }
+}
+
+// Fire-and-forget wallet debit at order completion. Ensures wallet-paid orders
+// are debited server-side even when the client never calls (table billing) or
+// can't (offline sync) — the previous client-only debit silently missed both.
+// Re-reads the persisted order (like the cashback processor) so it always sees
+// the merged walletRedeemAmount/walletCustomerId regardless of the caller.
+async function processWalletRedemptionForOrder(orderId) {
+  try {
+    const freshDoc = await db.collection(collections.orders).doc(orderId).get();
+    if (!freshDoc.exists) return;
+    const fresh = freshDoc.data();
+    const amt = Math.round(Number(fresh.walletRedeemAmount || 0) * 100) / 100;
+    if (!amt || amt <= 0) return;
+    const customerId = fresh.walletCustomerId || fresh.customerId;
+    if (!customerId) {
+      console.warn(`⚠️ Wallet redemption ₹${amt} on order ${orderId} has no customer — skipped`);
+      return;
+    }
+    const result = await debitWalletForOrder({
+      customerId,
+      orderId,
+      amount: amt,
+      notes: `Wallet payment for order ${fresh.dailyOrderId || orderId}`,
+    });
+    if (result.success && !result.alreadyDone) {
+      console.log(`💰 Wallet debited ₹${amt} for order ${orderId} (customer ${customerId})`);
+    } else if (!result.success) {
+      console.warn(`⚠️ Wallet debit not applied for order ${orderId}: ${result.reason}`);
+    }
+  } catch (err) {
+    console.error('processWalletRedemptionForOrder error (non-blocking):', err.message);
+  }
+}
+
+// ========================================
 // Cashback — automatic post-payment wallet credit (offer promotionType 'cashback')
 // Evaluated at order completion from the paid amount; credits the customer's
 // wallet for use on the NEXT order. Fire-and-forget; never blocks completion.
@@ -23069,8 +23229,16 @@ async function reapplyOrderSideEffects(orderId, orderData) {
         const custData = custDoc.data();
         const orderHistory = custData.orderHistory || [];
 
-        // Re-add this order to history (if not already there)
-        if (!orderHistory.some(h => h.orderId === orderId)) {
+        // Only re-add to history / re-apply loyalty if the order was completed
+        // before cancellation (mirror of the reverse guard). Cancel is blocked
+        // for completed orders, so a restored order is always pre-completion —
+        // its history entry and loyalty are applied when it is genuinely
+        // completed later, NOT on restore (else totalOrders/totalSpent inflate
+        // and points are granted for an unpaid order).
+        const wasCompleted = orderData.lastStatus === 'completed';
+
+        // Re-add this order to history (if completed and not already there)
+        if (wasCompleted && !orderHistory.some(h => h.orderId === orderId)) {
           orderHistory.push({
             orderId,
             date: orderData.createdAt || new Date(),
@@ -23092,8 +23260,8 @@ async function reapplyOrderSideEffects(orderId, orderData) {
         };
 
         // Re-apply loyalty points: add earned back, deduct redeemed again
-        const pointsEarned = orderData.loyaltyPointsEarned || 0;
-        const pointsRedeemed = orderData.loyaltyPointsRedeemed || 0;
+        const pointsEarned = wasCompleted ? (orderData.loyaltyPointsEarned || 0) : 0;
+        const pointsRedeemed = wasCompleted ? (orderData.loyaltyPointsRedeemed || 0) : 0;
         const netReapply = pointsEarned - pointsRedeemed;
         if (netReapply !== 0) {
           custUpdate.loyaltyPoints = FieldValue.increment(netReapply);
@@ -35028,39 +35196,47 @@ app.post('/api/customers/:customerId/wallet/credit', authenticateToken, async (r
     }
 
     const customerRef = db.collection('customers').doc(customerId);
-    const customerDoc = await customerRef.get();
-    if (!customerDoc.exists) {
+    const parsedAmt = Math.round(parseFloat(amount) * 100) / 100;
+    const staffId = req.user?.userId || req.user?.id || null;
+    const staffName = req.user?.name || 'Staff';
+
+    // Atomic read-modify-write so a concurrent wallet debit (order billing)
+    // can't clobber this top-up (or vice-versa). Preserves the exact stored
+    // shape (balanceAfter is the true post-credit balance).
+    const txResult = await db.runTransaction(async (tx) => {
+      const doc = await tx.get(customerRef);
+      if (!doc.exists) return { notFound: true };
+      const data = doc.data();
+      const currentBalance = data.walletBalance || 0;
+      const newBalance = Math.round((currentBalance + parsedAmt) * 100) / 100;
+      const history = Array.isArray(data.walletHistory) ? data.walletHistory : [];
+      const transaction = {
+        id: `txn_${Date.now()}_${Math.random().toString(36).substr(2, 6)}`,
+        type: 'credit',
+        amount: parsedAmt,
+        reason: reason || 'advance_payment',
+        notes: notes || '',
+        staffId,
+        staffName,
+        balanceAfter: newBalance,
+        createdAt: new Date().toISOString(),
+      };
+      tx.update(customerRef, {
+        walletBalance: newBalance,
+        walletHistory: [...history, transaction],
+        updatedAt: new Date().toISOString(),
+      });
+      return { newBalance, transaction };
+    });
+
+    if (txResult.notFound) {
       return res.status(404).json({ error: 'Customer not found' });
     }
 
-    const customer = customerDoc.data();
-    const currentBalance = customer.walletBalance || 0;
-    const newBalance = currentBalance + parseFloat(amount);
-
-    const transaction = {
-      id: `txn_${Date.now()}_${Math.random().toString(36).substr(2, 6)}`,
-      type: 'credit',
-      amount: parseFloat(amount),
-      reason: reason || 'advance_payment',
-      notes: notes || '',
-      staffId: req.user?.userId || req.user?.id || null,
-      staffName: req.user?.name || 'Staff',
-      balanceAfter: newBalance,
-      createdAt: new Date().toISOString()
-    };
-
-    const walletHistory = customer.walletHistory || [];
-    walletHistory.push(transaction);
-
-    await customerRef.update({
-      walletBalance: newBalance,
-      walletHistory: walletHistory,
-      updatedAt: new Date().toISOString()
-    });
     res.json({
       success: true,
-      walletBalance: newBalance,
-      transaction
+      walletBalance: txResult.newBalance,
+      transaction: txResult.transaction
     });
   } catch (error) {
     console.error('Error adding wallet credit:', error);
@@ -35084,40 +35260,32 @@ app.post('/api/customers/:customerId/wallet/redeem', authenticateToken, async (r
       return res.status(404).json({ error: 'Customer not found' });
     }
 
-    const customer = customerDoc.data();
-    const currentBalance = customer.walletBalance || 0;
-
-    if (currentBalance < parseFloat(amount)) {
-      return res.status(400).json({ error: 'Insufficient wallet balance' });
-    }
-
-    const newBalance = currentBalance - parseFloat(amount);
-
-    const transaction = {
-      id: `txn_${Date.now()}_${Math.random().toString(36).substr(2, 6)}`,
-      type: 'redeem',
-      amount: parseFloat(amount),
-      reason: 'redemption',
-      notes: notes || '',
+    // Atomic + idempotent-per-order debit (shared with the completion hook, so
+    // a client call and the server-side hook can never double-charge one order).
+    const result = await debitWalletForOrder({
+      customerId,
       orderId: orderId || null,
+      amount: parseFloat(amount),
       staffId: req.user?.userId || req.user?.id || null,
       staffName: req.user?.name || 'Staff',
-      balanceAfter: newBalance,
-      createdAt: new Date().toISOString()
-    };
-
-    const walletHistory = customer.walletHistory || [];
-    walletHistory.push(transaction);
-
-    await customerRef.update({
-      walletBalance: newBalance,
-      walletHistory: walletHistory,
-      updatedAt: new Date().toISOString()
+      notes: notes || '',
     });
+
+    if (!result.success) {
+      if (result.reason === 'insufficient_balance') {
+        return res.status(400).json({ error: 'Insufficient wallet balance' });
+      }
+      if (result.reason === 'customer_not_found') {
+        return res.status(404).json({ error: 'Customer not found' });
+      }
+      return res.status(500).json({ error: 'Failed to redeem from wallet' });
+    }
+
     res.json({
       success: true,
-      walletBalance: newBalance,
-      transaction
+      walletBalance: result.walletBalance,
+      transaction: result.transaction || null,
+      alreadyRedeemed: result.alreadyDone === true,
     });
   } catch (error) {
     console.error('Error redeeming wallet:', error);
