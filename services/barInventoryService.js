@@ -51,6 +51,7 @@ async function registerBottle(restaurantId, data, userId) {
     totalPegsPoured: 0,
     totalMlPoured: 0,       // from weight measurements
     totalMlSold: 0,         // from POS orders
+    remainingMl: Number(data.bottleSize) || 750,  // live depletion source-of-truth (scale-optional)
 
     // Wastage
     wastage: 0,
@@ -102,10 +103,23 @@ async function openBottle(bottleId, openingWeight, userId) {
 async function recordPour(bottleId, mlPoured, orderId) {
   const ref = db.collection('barBottles').doc(bottleId);
 
-  await ref.update({
-    totalMlSold: FieldValue.increment(mlPoured),
-    totalPegsPoured: FieldValue.increment(1),
-    updatedAt: new Date()
+  // Deplete a live remainingMl so stock is a source of truth WITHOUT needing to
+  // weigh the bottle; auto-flip to 'empty' at ≤0. Weight reconciliation stays as
+  // an optional variance layer. Transactional so concurrent pours stay correct.
+  await db.runTransaction(async (tx) => {
+    const snap = await tx.get(ref);
+    if (!snap.exists) return;
+    const b = snap.data();
+    const size = Number(b.bottleSize) || 0;
+    const prevRemaining = (typeof b.remainingMl === 'number') ? b.remainingMl : size;
+    const newRemaining = Math.max(0, prevRemaining - (Number(mlPoured) || 0));
+    tx.update(ref, {
+      totalMlSold: FieldValue.increment(Number(mlPoured) || 0),
+      totalPegsPoured: FieldValue.increment(1),
+      remainingMl: newRemaining,
+      ...(newRemaining <= 0 && b.status !== 'empty' ? { status: 'empty', emptiedAt: new Date() } : {}),
+      updatedAt: new Date()
+    });
   });
 }
 

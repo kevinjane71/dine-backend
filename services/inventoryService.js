@@ -79,25 +79,49 @@ const UNIT_CONVERSIONS = {
   'boxes': { dimension: 'box', toBase: 1 },
   'bunch': { dimension: 'bunch', toBase: 1 },
   'bunches': { dimension: 'bunch', toBase: 1 },
+  // Bar + ice-cream container/serving units (own dimension — cross-unit conversion
+  // for these is handled per-item via conversionFactor, e.g. 1 bottle = 750 ml).
+  'case': { dimension: 'case', toBase: 1 },
+  'cases': { dimension: 'case', toBase: 1 },
+  'keg': { dimension: 'keg', toBase: 1 },
+  'kegs': { dimension: 'keg', toBase: 1 },
+  'scoop': { dimension: 'scoop', toBase: 1 },
+  'scoops': { dimension: 'scoop', toBase: 1 },
+  'tub': { dimension: 'tub', toBase: 1 },
+  'tubs': { dimension: 'tub', toBase: 1 },
+  'peg': { dimension: 'peg', toBase: 1 },
+  'pegs': { dimension: 'peg', toBase: 1 },
+  'shot': { dimension: 'shot', toBase: 1 },
+  'shots': { dimension: 'shot', toBase: 1 },
 };
 
 /**
- * Convert quantity between compatible units.
- * Returns original quantity if units are unknown or incompatible.
+ * Convert quantity between compatible units, reporting whether the conversion was
+ * actually possible. Returns { value, converted, reason }.
+ *  - converted:true  → value is correct (same unit, or a valid conversion)
+ *  - converted:false → units are unknown (typo) or cross-dimension (g↔pcs);
+ *                      value falls back to the raw quantity, and the CALLER must
+ *                      decide (deduction skips + flags rather than deduct raw).
  */
-function convertUnits(quantity, fromUnit, toUnit) {
-  if (!fromUnit || !toUnit) return quantity;
+function convertUnitsSafe(quantity, fromUnit, toUnit) {
+  if (!fromUnit || !toUnit) return { value: quantity, converted: true };
   const from = fromUnit.toLowerCase().trim();
   const to = toUnit.toLowerCase().trim();
-  if (from === to) return quantity;
+  if (from === to) return { value: quantity, converted: true };
 
   const fromConv = UNIT_CONVERSIONS[from];
   const toConv = UNIT_CONVERSIONS[to];
 
-  if (!fromConv || !toConv) return quantity;
-  if (fromConv.dimension !== toConv.dimension) return quantity;
+  if (!fromConv || !toConv) return { value: quantity, converted: false, reason: 'unknown-unit' };
+  if (fromConv.dimension !== toConv.dimension) return { value: quantity, converted: false, reason: 'dimension-mismatch' };
 
-  return (quantity * fromConv.toBase) / toConv.toBase;
+  return { value: (quantity * fromConv.toBase) / toConv.toBase, converted: true };
+}
+
+// Backward-compatible wrapper (returns the number). Prefer convertUnitsSafe in
+// deduction paths so a mismatch can be flagged instead of silently deducting raw.
+function convertUnits(quantity, fromUnit, toUnit) {
+  return convertUnitsSafe(quantity, fromUnit, toUnit).value;
 }
 
 class InventoryService {
@@ -238,22 +262,31 @@ class InventoryService {
    * Deducts inventory based on an order.
    * Triggered asynchronously after order placement.
    */
-  async deductInventoryForOrder(restaurantId, orderId, orderItems) {
-    console.log(`📉 Processing inventory deduction for Order ${orderId}`);
+  async deductInventoryForOrder(restaurantId, orderId, orderItems, options = {}) {
+    // referenceId is the per-deduction-event idempotency key (the base orderId for
+    // the original deduction, or `${orderId}_edit_*` for edit-added items). The
+    // base `orderId` is ALSO stamped on every txn so a cancel can reverse the
+    // original AND all edit deductions together. Callers that pass a composite as
+    // `orderId` should instead pass the base orderId + { referenceId }.
+    const referenceId = options.referenceId || orderId;
+    const baseOrderId = orderId;
+    console.log(`📉 Processing inventory deduction for Order ${baseOrderId} (ref ${referenceId})`);
 
     try {
       if (!orderItems || orderItems.length === 0) return [];
 
-      // Idempotency: check if this order already has deduction transactions
+      // Idempotency: skip only if this exact deduction event already has a
+      // NON-reversed DEDUCTION txn. After a cancel stamps reversedAt on the
+      // originals, an un-cancel (same referenceId) re-deducts correctly.
       const existingTxSnap = await db.collection('inventoryTransactions')
-        .where('referenceId', '==', orderId)
+        .where('referenceId', '==', referenceId)
         .where('type', '==', 'DEDUCTION')
         .where('source', '==', 'ORDER')
-        .limit(1)
         .get();
 
-      if (!existingTxSnap.empty) {
-        console.log(`⚠️ Inventory already deducted for Order ${orderId} — skipping (idempotent)`);
+      const hasActiveDeduction = existingTxSnap.docs.some(d => !d.data().reversedAt);
+      if (hasActiveDeduction) {
+        console.log(`⚠️ Inventory already deducted for ${referenceId} — skipping (idempotent)`);
         return [];
       }
 
@@ -283,11 +316,66 @@ class InventoryService {
         recipesList.push({ id: doc.id, ...data, ref: doc.ref });
       });
 
+      // 1c. Load the restaurant (menu items for variant multipliers + modifier
+      // inventory links; also reused for bar settings below).
+      const restDocLoaded = await db.collection(collections.restaurants).doc(restaurantId).get();
+      const restDataLoaded = restDocLoaded.exists ? restDocLoaded.data() : {};
+      const menuItemsMap = {};
+      for (const m of (restDataLoaded.menu?.items || [])) menuItemsMap[m.id] = m;
+
       const deductions = [];
 
       // 2. Process each ordered item
       for (const item of orderItems) {
         const qtySold = item.quantity;
+        // Variant scaling: a Half/Small portion consumes a fraction of the recipe.
+        // Defaults to 1 (full recipe) so items without a configured multiplier are
+        // unchanged. Applied to every recipe ingredient below.
+        const menuDef = menuItemsMap[item.menuItemId];
+        // Variant scaling from the menu definition (authoritative); falls back to a
+        // value on the order item, else 1 (full recipe — unchanged behaviour).
+        const variantDef = item.selectedVariant?.name ? (menuDef?.variants || []).find(v => v.name === item.selectedVariant.name) : null;
+        const variantMult = (() => {
+          const m = (variantDef && typeof variantDef.recipeMultiplier === 'number') ? variantDef.recipeMultiplier
+                  : (item.selectedVariant && typeof item.selectedVariant.recipeMultiplier === 'number') ? item.selectedVariant.recipeMultiplier
+                  : 1;
+          return (typeof m === 'number' && m > 0) ? m : 1;
+        })();
+
+        // Modifier/add-on deduction: a modifier option (menuDef.modifierGroups[].items[])
+        // can carry an inventory link {inventoryItemId, invQuantity, invUnit}. Deduct
+        // those independently of the main recipe so stock-consuming add-ons (extra
+        // shot, extra cheese) are tracked. Inert until options are linked in the UI.
+        for (const cust of (item.selectedCustomizations || [])) {
+          if (!cust) continue;
+          let link = null;
+          if (cust.inventoryItemId) link = { inventoryItemId: cust.inventoryItemId, quantity: cust.quantity, unit: cust.unit };
+          else if (menuDef) {
+            for (const g of (menuDef.modifierGroups || [])) {
+              const opt = (g.items || []).find(o => (cust.id && o.id === cust.id) || (o.name && o.name === cust.name));
+              if (opt && opt.inventoryItemId) { link = { inventoryItemId: opt.inventoryItemId, quantity: opt.invQuantity, unit: opt.invUnit }; break; }
+            }
+          }
+          if (!link || !link.inventoryItemId) continue;
+          const modQty = (typeof link.quantity === 'number' ? link.quantity : 0) * qtySold;
+          if (modQty <= 0) continue;
+          const modInv = inventoryItems.find(i => i.id === link.inventoryItemId);
+          if (!modInv) continue;
+          const mconv = convertUnitsSafe(modQty, link.unit || modInv.unit, modInv.unit);
+          if (!mconv.converted) { console.warn(`⚠️ Modifier unit mismatch for ${modInv.name} (${link.unit} → ${modInv.unit}) — skipped`); continue; }
+          const modDeduct = mconv.value;
+          batch.update(modInv.ref, { currentStock: FieldValue.increment(-modDeduct), updatedAt: new Date() });
+          const mCost = modInv.costPerUnit || 0;
+          batch.set(db.collection('inventoryTransactions').doc(), {
+            restaurantId, inventoryItemId: modInv.id, inventoryItemName: modInv.name,
+            type: 'DEDUCTION', source: 'ORDER', referenceId, orderId: baseOrderId,
+            quantityChange: -modDeduct, unit: modInv.unit, costPerUnit: mCost, totalCost: modDeduct * mCost,
+            date: new Date(), notes: `Modifier "${cust.name}" on ${qtySold}x ${item.name}`
+          });
+          hasUpdates = true;
+          modInv.currentStock = Math.max(0, (modInv.currentStock || 0) - modDeduct);
+          deductions.push({ inventoryItemId: modInv.id, inventoryItemName: modInv.name, unit: modInv.unit, quantityDeducted: modDeduct, newStock: modInv.currentStock, menuItemName: `${item.name} (${cust.name})`, method: 'modifier' });
+        }
 
         // Find recipe for this menu item — first by menuItemId, then fallback to name match
         let recipe = null;
@@ -326,7 +414,7 @@ class InventoryService {
                 const transactionRef = db.collection('inventoryTransactions').doc();
                 batch.set(transactionRef, {
                   restaurantId, inventoryItemId: directInvItem.id, inventoryItemName: directInvItem.name,
-                  type: 'DEDUCTION', source: 'ORDER', referenceId: orderId,
+                  type: 'DEDUCTION', source: 'ORDER', referenceId, orderId: baseOrderId,
                   quantityChange: -deductQty, unit: directInvItem.unit || 'pcs',
                   costPerUnit: unitCost, totalCost: deductQty * unitCost,
                   date: new Date(), notes: `Direct deduction: ${qtySold}x ${item.name}`
@@ -357,7 +445,7 @@ class InventoryService {
         const flatIngredients = this.flattenIngredients(recipeMap, recipe.ingredients || []);
 
         for (const ingredient of flatIngredients) {
-            const qtyNeeded = ingredient.quantity * qtySold;
+            const qtyNeeded = ingredient.quantity * qtySold * variantMult;
             
             // Try to find matching inventory item
             // First check if linked by ID
@@ -366,19 +454,38 @@ class InventoryService {
                 inventoryItem = inventoryItems.find(i => i.id === ingredient.inventoryItemId);
             }
 
-            // Fallback: Fuzzy name match
-            if (!inventoryItem) {
+            // Fallback: Fuzzy name match (soft link — explicit inventoryItemId is
+            // preferred; name matching can hit the wrong item e.g. "Tea"→"Green Tea").
+            if (!inventoryItem && ingredient.inventoryItemName) {
                 const targetName = ingredient.inventoryItemName.toLowerCase();
-                inventoryItem = inventoryItems.find(i => 
-                    i.name.toLowerCase() === targetName || 
+                inventoryItem = inventoryItems.find(i =>
+                    i.name.toLowerCase() === targetName ||
                     i.name.toLowerCase().includes(targetName) ||
                     targetName.includes(i.name.toLowerCase())
                 );
+                if (inventoryItem) {
+                    console.warn(`⚠️ Ingredient "${ingredient.inventoryItemName}" matched by NAME (no inventoryItemId) → "${inventoryItem.name}". Link it explicitly to avoid mis-deduction.`);
+                }
             }
 
             if (inventoryItem) {
-                // Convert recipe ingredient unit → inventory item unit
-                let deductionAmount = convertUnits(qtyNeeded, ingredient.unit, inventoryItem.unit);
+                // Convert recipe ingredient unit → inventory item unit. If the units
+                // are not convertible (typo or cross-dimension e.g. "g" vs "pcs"),
+                // DO NOT deduct a raw number into a different unit — flag it and skip.
+                const conv = convertUnitsSafe(qtyNeeded, ingredient.unit, inventoryItem.unit);
+                if (!conv.converted) {
+                  console.warn(`⚠️ UNIT MISMATCH: recipe "${ingredient.unit}" → stock "${inventoryItem.unit}" for ${inventoryItem.name} — skipped (${conv.reason})`);
+                  batch.set(db.collection('inventoryTransactions').doc(), {
+                    restaurantId, inventoryItemId: inventoryItem.id, inventoryItemName: inventoryItem.name,
+                    type: 'UNIT_MISMATCH', source: 'ORDER', referenceId, orderId: baseOrderId,
+                    quantityChange: 0, unit: inventoryItem.unit, recipeUnit: ingredient.unit, reason: conv.reason,
+                    date: new Date(), notes: `Skipped: recipe unit "${ingredient.unit}" not convertible to stock unit "${inventoryItem.unit}" for ${item.name}`
+                  });
+                  hasUpdates = true;
+                  continue;
+                }
+                let deductionAmount = conv.value;
+                let expiredWasteQty = 0; // hoisted so the stock write can also subtract auto-wasted expired batches
 
                 // --- FIFO Batch Deduction ---
                 const batchIds = [];
@@ -408,7 +515,7 @@ class InventoryService {
                     });
 
                     const now = new Date();
-                    let expiredWasteQty = 0;
+                    expiredWasteQty = 0; // (declared at ingredient scope above)
 
                     // First pass: skip expired batches and auto-mark them as waste
                     const validBatches = [];
@@ -483,9 +590,11 @@ class InventoryService {
                   newStock = Math.max(0, (inventoryItem.currentStock || 0) - deductionAmount);
                 }
 
-                // Update Inventory (atomic increment for concurrent safety)
+                // Update Inventory (atomic increment for concurrent safety). Also
+                // subtract any expired batch quantity auto-wasted above, so the
+                // aggregate currentStock stays equal to the sum of batch remainingQty.
                 batch.update(inventoryItem.ref, {
-                    currentStock: FieldValue.increment(-deductionAmount),
+                    currentStock: FieldValue.increment(-(deductionAmount + expiredWasteQty)),
                     updatedAt: new Date()
                 });
 
@@ -498,7 +607,8 @@ class InventoryService {
                     inventoryItemName: inventoryItem.name,
                     type: 'DEDUCTION',
                     source: 'ORDER',
-                    referenceId: orderId,
+                    referenceId,
+                    orderId: baseOrderId,
                     quantityChange: -deductionAmount,
                     unit: inventoryItem.unit,
                     costPerUnit: unitCost,
@@ -588,22 +698,37 @@ class InventoryService {
     console.log(`📈 Restoring inventory for cancelled/deleted Order ${orderId}`);
 
     try {
-      // Find all deduction transactions for this order
-      const txSnapshot = await db.collection('inventoryTransactions')
-        .where('referenceId', '==', orderId)
-        .where('type', '==', 'DEDUCTION')
-        .where('source', '==', 'ORDER')
-        .get();
+      // Find all DEDUCTION txns for this order — by the base `orderId` field
+      // (catches the original AND every edit deduction) and by `referenceId`
+      // (backward-compat for txns written before orderId existed). Merge + dedupe,
+      // and keep only ACTIVE (non-reversed) order deductions so a double-cancel
+      // can't double-restore.
+      const [byOrderId, byRef] = await Promise.all([
+        db.collection('inventoryTransactions').where('orderId', '==', orderId).get(),
+        db.collection('inventoryTransactions').where('referenceId', '==', orderId).get(),
+      ]);
+      const seen = new Set();
+      const txDocs = [];
+      for (const snap of [byOrderId, byRef]) {
+        snap.forEach(d => {
+          if (seen.has(d.id)) return;
+          seen.add(d.id);
+          const data = d.data();
+          if (data.type === 'DEDUCTION' && data.source === 'ORDER' && !data.reversedAt) {
+            txDocs.push(d);
+          }
+        });
+      }
 
-      if (txSnapshot.empty) {
-        console.log(`ℹ️ No inventory deductions found for Order ${orderId} — nothing to restore`);
+      if (txDocs.length === 0) {
+        console.log(`ℹ️ No active inventory deductions for Order ${orderId} — nothing to restore`);
         return [];
       }
 
       const batch = db.batch();
       const restorations = [];
 
-      for (const txDoc of txSnapshot.docs) {
+      for (const txDoc of txDocs) {
         const tx = txDoc.data();
         const restoreQty = Math.abs(tx.quantityChange || 0);
         if (restoreQty <= 0) continue;
@@ -635,7 +760,11 @@ class InventoryService {
           }
         }
 
-        // Create reversal transaction record
+        // Mark the original DEDUCTION reversed so an un-cancel re-deducts and a
+        // double-cancel doesn't double-restore.
+        batch.update(txDoc.ref, { reversedAt: new Date() });
+
+        // Create reversal transaction record (audit trail)
         const reversalRef = db.collection('inventoryTransactions').doc();
         batch.set(reversalRef, {
           restaurantId,
@@ -644,6 +773,7 @@ class InventoryService {
           type: 'ADDITION',
           source: 'ORDER_CANCELLED',
           referenceId: orderId,
+          orderId,
           quantityChange: restoreQty,
           unit: tx.unit || '',
           costPerUnit: tx.costPerUnit || 0,
