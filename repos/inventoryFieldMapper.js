@@ -119,6 +119,8 @@ const INV_TX_FIELD_MAP = {
   totalCost:               'total_cost',
   date:                    'date',
   referenceId:             'reference_id',
+  orderId:                 'order_id',      // base order id (restore queries WHERE on this)
+  reversedAt:              'reversed_at',   // set when a deduction is reversed on cancel
   batchIds:                'batch_ids',
   performedBy:             'performed_by',
   notes:                   'notes',
