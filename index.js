@@ -30666,9 +30666,12 @@ app.get('/api/customers/:restaurantId', authenticateToken, async (req, res) => {
       // Firestore doesn't support full-text search; we use a capped scan
       // select() only fields needed for search matching + display (skip orderHistory to reduce data transfer)
       const scanLimit = 5000;
+      // Order by createdAt, NOT lastOrderDate — ordering excludes docs where the
+      // field is null (Firestore semantics, mirrored by the PG adapter), which
+      // hid every imported customer who had never placed an order
       const allSnapshot = await db.collection(collections.customers)
         .where('restaurantId', '==', restaurantId)
-        .orderBy('lastOrderDate', 'desc')
+        .orderBy('createdAt', 'desc')
         .select('name', 'phone', 'email', 'city', 'address', 'totalOrders', 'totalSpent', 'loyaltyPoints', 'lastOrderDate', 'source', 'createdAt', 'dob', 'outstandingBalance', 'restaurantId')
         .limit(scanLimit)
         .get();
@@ -30715,9 +30718,13 @@ app.get('/api/customers/:restaurantId', authenticateToken, async (req, res) => {
     const cursor = req.query.cursor; // last document ID from previous page
     const listFields = ['name', 'phone', 'email', 'city', 'totalOrders', 'totalSpent', 'loyaltyPoints', 'lastOrderDate', 'source', 'createdAt', 'dob', 'outstandingBalance', 'restaurantId'];
 
+    // Order by createdAt, NOT lastOrderDate — ordering excludes docs where the
+    // field is null (Firestore semantics, mirrored by the PG adapter), which
+    // hid every imported customer who had never placed an order. The customers
+    // page re-sorts each loaded page client-side by last order.
     let query = db.collection(collections.customers)
       .where('restaurantId', '==', restaurantId)
-      .orderBy('lastOrderDate', 'desc')
+      .orderBy('createdAt', 'desc')
       .select(...listFields);
 
     if (cursor) {
