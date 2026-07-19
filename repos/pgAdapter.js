@@ -470,6 +470,39 @@ class PgDocRef {
   }
 
   /**
+   * create() — Firestore semantics: INSERT the document, but reject with
+   * ALREADY_EXISTS (err.code = 6) if a document with this id already exists.
+   * Used for atomic key reservation (e.g. order idempotency): concurrent
+   * callers race on INSERT and only one wins. Backed by INSERT ... ON CONFLICT
+   * (id) DO NOTHING (via _insertResolved), so it is race-safe at the DB level.
+   */
+  async create(data) {
+    try {
+      const { table } = this._config;
+      let payload = data || {};
+      // Inject subcollection scope fields like set() does
+      if (this._scopeChain && this._scopeChain.length) {
+        payload = { ...payload };
+        for (const scope of this._scopeChain) {
+          if (payload[scope.field] === undefined) payload[scope.field] = scope.value;
+        }
+      }
+      const inserted = await this._insertResolved(payload);
+      if (!inserted) {
+        const err = new Error(`ALREADY_EXISTS: document already exists: ${this.path}`);
+        err.code = 6; // Firestore ALREADY_EXISTS
+        throw err;
+      }
+      if (this._config.cacheTTL) bumpTableVersion(table).catch(() => {});
+    } catch (err) {
+      if (err.code !== 6) {
+        console.error(`[pgAdapter] DocRef.create() error (${this.path}):`, err.message);
+      }
+      throw err;
+    }
+  }
+
+  /**
    * INSERT a row with sentinels/dotted keys resolved to concrete values.
    * ON CONFLICT DO NOTHING — returns true if the row was inserted, false if a
    * concurrent writer beat us to it. Retries missing columns into extra_data.
