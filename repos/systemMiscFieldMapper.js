@@ -153,6 +153,8 @@ const SUPPLIER_PERF_FIELD_MAP = {
   supplierId: 'supplier_id',
   metrics: 'metrics',
   evaluationDate: 'evaluation_date',
+  // GET /suppliers/:id/performance orders by this — was unmapped → 500
+  overallScore: 'overall_score',
 };
 
 const SUPPLIER_PERF_JSONB_COLUMNS = new Set(['metrics', 'extra_data']);
@@ -165,6 +167,10 @@ const SUPPLIER_INVOICE_FIELD_MAP = {
   id: 'id',
   restaurantId: 'restaurant_id',
   supplierId: 'supplier_id',
+  // generate-invoice-from-PO filters by purchaseOrderId (was unmapped → 500);
+  // list orders by invoiceDate (was unmapped → fell back to JS sort)
+  purchaseOrderId: 'purchase_order_id',
+  invoiceDate: 'invoice_date',
   createdAt: 'created_at',
 };
 

@@ -154,6 +154,25 @@ const FIELD_MAP = {
   walletCustomerId: 'wallet_customer_id',
   billingClamped: 'billing_clamped',
 
+  // Update tracking + billing audit (written on every order PATCH / completion —
+  // these were unmapped, so bill completion overflowed the adapter retry cap)
+  updateHistory: 'update_history',
+  updateCount: 'update_count',
+  offerIds: 'offer_ids',
+  lastUpdatedBy: 'last_updated_by',
+  billingAudit: 'billing_audit',
+  discountReason: 'discount_reason',
+  managerPin: 'manager_pin',
+  splitPaymentsStale: 'split_payments_stale',
+  // Comp/void amounts (voidAmount/adjustedFinalAmount/compItems were unmapped)
+  voidAmount: 'void_amount',
+  adjustedFinalAmount: 'adjusted_final_amount',
+  compItems: 'comp_items',
+
+  // Soft-delete (cancelled-orders "deleted" report filters/orders by this)
+  deletedAt: 'deleted_at',
+  deletedBy: 'deleted_by',
+
   // Cover count
   covers: 'covers',
 
@@ -219,6 +238,7 @@ const JSONB_COLUMNS = new Set([
   'kot_printed_stations', 'delivery_info', 'delivery_address',
   'pre_edit_snapshot', 'void_items', 'removed_items', 'edit_history',
   'price_discrepancies', 'restoration_history', 'bill_reprint_history', 'extra_data',
+  'update_history', 'offer_ids', 'billing_audit', 'comp_items',
 ]);
 
 /**

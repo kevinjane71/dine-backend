@@ -525,6 +525,14 @@ class PgDocRef {
         values.push(v);
         return values.length;
       };
+      // Accumulate all writes targeting the same JSONB column into ONE chained
+      // expression, flushed to a single SET clause after the loop. Postgres
+      // rejects multiple assignments to the same column in one UPDATE, so
+      // writing e.g. two dynamic keys into payment_methods, or overflowing
+      // several unmapped fields into extra_data, must combine — not emit N
+      // clauses. Keyed by column → current RHS SQL expression.
+      const jsonbAccum = {};
+      const jsonbBase = (col) => (jsonbAccum[col] !== undefined ? jsonbAccum[col] : `COALESCE(${col}, '{}'::jsonb)`);
 
       for (const [key, val] of Object.entries(data)) {
         if (val === undefined) continue;
@@ -548,7 +556,9 @@ class PgDocRef {
         if (jsonPath.length > 0 && jsonbCols.has(pgCol)) {
           // Nested update into a JSONB column. jsonb_set only creates the leaf
           // key, so chain jsonb_set calls to create intermediate objects first.
-          let baseExpr = `COALESCE(${pgCol}, '{}'::jsonb)`;
+          // baseExpr chains off any prior write to this same column so multiple
+          // path writes collapse into one SET clause (see jsonbAccum above).
+          let baseExpr = jsonbBase(pgCol);
           for (let d = 1; d < jsonPath.length; d++) {
             const prefixIdx = addValue(jsonPath.slice(0, d));
             baseExpr = `jsonb_set(${baseExpr}, $${prefixIdx}::text[], COALESCE(${pgCol}#>$${prefixIdx}::text[], '{}'::jsonb), true)`;
@@ -560,33 +570,29 @@ class PgDocRef {
             switch (getFieldValueType(val)) {
               case 'increment': {
                 const operand = getIncrementOperand(val);
-                setClauses.push(
-                  `${pgCol} = jsonb_set(${baseExpr}, ${pathParam}, to_jsonb(COALESCE((${pgCol}#>>${pathParam})::numeric, 0) + ${operand}), true)`
-                );
+                jsonbAccum[pgCol] =
+                  `jsonb_set(${baseExpr}, ${pathParam}, to_jsonb(COALESCE((${pgCol}#>>${pathParam})::numeric, 0) + ${operand}), true)`;
                 break;
               }
               case 'serverTimestamp': {
-                setClauses.push(
-                  `${pgCol} = jsonb_set(${baseExpr}, ${pathParam}, to_jsonb(NOW()), true)`
-                );
+                jsonbAccum[pgCol] =
+                  `jsonb_set(${baseExpr}, ${pathParam}, to_jsonb(NOW()), true)`;
                 break;
               }
               case 'arrayUnion': {
                 const elemsIdx = addValue(JSON.stringify(getArrayElements(val)));
-                setClauses.push(
-                  `${pgCol} = jsonb_set(${baseExpr}, ${pathParam}, COALESCE(${pgCol}#>${pathParam}, '[]'::jsonb) || (SELECT COALESCE(jsonb_agg(n), '[]'::jsonb) FROM jsonb_array_elements($${elemsIdx}::jsonb) AS n WHERE NOT (COALESCE(${pgCol}#>${pathParam}, '[]'::jsonb) @> jsonb_build_array(n))), true)`
-                );
+                jsonbAccum[pgCol] =
+                  `jsonb_set(${baseExpr}, ${pathParam}, COALESCE(${pgCol}#>${pathParam}, '[]'::jsonb) || (SELECT COALESCE(jsonb_agg(n), '[]'::jsonb) FROM jsonb_array_elements($${elemsIdx}::jsonb) AS n WHERE NOT (COALESCE(${pgCol}#>${pathParam}, '[]'::jsonb) @> jsonb_build_array(n))), true)`;
                 break;
               }
               case 'arrayRemove': {
                 const remIdx = addValue(JSON.stringify(getArrayElements(val)));
-                setClauses.push(
-                  `${pgCol} = jsonb_set(${baseExpr}, ${pathParam}, (SELECT COALESCE(jsonb_agg(e), '[]'::jsonb) FROM jsonb_array_elements(COALESCE(${pgCol}#>${pathParam}, '[]'::jsonb)) AS e WHERE NOT ($${remIdx}::jsonb @> jsonb_build_array(e))), true)`
-                );
+                jsonbAccum[pgCol] =
+                  `jsonb_set(${baseExpr}, ${pathParam}, (SELECT COALESCE(jsonb_agg(e), '[]'::jsonb) FROM jsonb_array_elements(COALESCE(${pgCol}#>${pathParam}, '[]'::jsonb)) AS e WHERE NOT ($${remIdx}::jsonb @> jsonb_build_array(e))), true)`;
                 break;
               }
               case 'delete': {
-                setClauses.push(`${pgCol} = COALESCE(${pgCol}, '{}'::jsonb) #- ${pathParam}`);
+                jsonbAccum[pgCol] = `${baseExpr} #- ${pathParam}`;
                 break;
               }
               default: {
@@ -596,9 +602,8 @@ class PgDocRef {
             }
           } else {
             const valIdx = addValue(toJsonbValue(convertTimestamp(val)));
-            setClauses.push(
-              `${pgCol} = jsonb_set(${baseExpr}, ${pathParam}, $${valIdx}::jsonb, true)`
-            );
+            jsonbAccum[pgCol] =
+              `jsonb_set(${baseExpr}, ${pathParam}, $${valIdx}::jsonb, true)`;
           }
           continue;
         }
@@ -657,15 +662,22 @@ class PgDocRef {
         if (jsonbCols.has(pgCol)) {
           const jIdx = addValue(toJsonbValue(cleanVal));
           if (pgCol === 'extra_data') {
-            // Merge — replacing would wipe every other unmapped field
-            setClauses.push(`${pgCol} = COALESCE(${pgCol}, '{}'::jsonb) || $${jIdx}::jsonb`);
+            // Merge — replacing would wipe every other unmapped field. Chain off
+            // any prior write to extra_data so it stays a single SET clause.
+            jsonbAccum[pgCol] = `${jsonbBase(pgCol)} || $${jIdx}::jsonb`;
           } else {
-            setClauses.push(`${pgCol} = $${jIdx}::jsonb`);
+            // Full replace of a JSONB column overrides any prior accumulation.
+            jsonbAccum[pgCol] = `$${jIdx}::jsonb`;
           }
         } else {
           const rIdx = addValue(cleanVal);
           setClauses.push(`${pgCol} = $${rIdx}`);
         }
+      }
+
+      // Flush accumulated JSONB-column expressions — one SET clause per column.
+      for (const [col, expr] of Object.entries(jsonbAccum)) {
+        setClauses.push(`${col} = ${expr}`);
       }
 
       if (setClauses.length === 0) return true;
@@ -683,9 +695,16 @@ class PgDocRef {
         result = await this._exec(sql, values);
       } catch (innerErr) {
         // If a column doesn't exist, retry with the offending fields routed
-        // into extra_data (as JSONB path writes — preserves sentinel semantics)
+        // into extra_data (as JSONB path writes — preserves sentinel semantics).
+        // Postgres reports only ONE missing column per error, so each retry
+        // moves one field and re-executes. The cap must therefore be >= the max
+        // number of distinct unmapped columns a single update() can carry, or
+        // the write 500s once it exceeds the cap (this was breaking bill
+        // completion, which writes update_history + update_count + offer_ids +
+        // last_updated_by = 4 unmapped fields). Each retry only continues while
+        // it made progress (moved > 0), so this is bounded, not an infinite loop.
         const colMatch = innerErr.message.match(/column "([^"]+)" of relation/);
-        if (colMatch && _retryDepth < 3) {
+        if (colMatch && _retryDepth < 25) {
           const badCol = colMatch[1];
           if (badCol === 'updated_at' && !_skipAutoUpdatedAt) {
             return this.update(data, { ..._opts, _retryDepth: _retryDepth + 1, _skipAutoUpdatedAt: true });
