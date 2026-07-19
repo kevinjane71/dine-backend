@@ -11788,8 +11788,11 @@ app.get('/api/analytics/:restaurantId', authenticateToken, async (req, res) => {
       dateStrings.push(`${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}-${String(d.getUTCDate()).padStart(2, '0')}`);
     }
 
-    // Fetch dailyStats docs
-    let dailyDocs;
+    // Fetch dailyStats docs (getAll batch read — adapter-supported)
+    const statsRefs = dateStrings.map(ds => db.collection('dailyStats').doc(`${restaurantId}_${ds}`));
+    const statsDocs = await db.getAll(...statsRefs);
+    const dailyDocs = statsDocs.filter(d => d.exists).map(d => d.data());
+
     console.log(`📊 Found ${dailyDocs.length} dailyStats docs for analytics (${period})`);
 
     // Backward compatibility: if no dailyStats docs exist yet, fall back to raw orders
@@ -12279,7 +12282,9 @@ app.get('/api/analytics/:restaurantId/daily-summary', authenticateToken, async (
         ? `${restaurantId}_sub_${subRestaurantId}_${d}`
         : `${restaurantId}_${d}`);
 
-      let dailyDocsData;
+      const dailyRefs = docIds.map(id => db.collection('dailyStats').doc(id));
+      const dailyDocsSnaps = dailyRefs.length > 0 ? await db.getAll(...dailyRefs) : [];
+      const dailyDocsData = dailyDocsSnaps.map(d => d.exists ? d.data() : null);
       console.log(`📊 daily-summary: found ${dailyDocsData.filter(d => d).length}/${dailyDocsData.length} dailyStats docs`);
 
     dailyDocsData.forEach((data, idx) => {
@@ -12518,7 +12523,11 @@ app.get('/api/analytics/:restaurantId/daily-summary', authenticateToken, async (
     if (!subRestaurantId) {
       try {
         const subBreakdownMap = {};
-        let subDocs;
+        const subSnap = await db.collection('dailyStats')
+          .where('restaurantId', '==', restaurantId)
+          .where('subRestaurantId', '!=', null)
+          .get();
+        const subDocs = subSnap.docs.map(doc => doc.data());
         subDocs.forEach(d => {
           if (!dates.includes(d.date)) return;
           const sid = d.subRestaurantId;
@@ -17021,7 +17030,14 @@ app.get('/api/tables/:restaurantId', async (req, res) => {
   try {
     const { restaurantId } = req.params;
 
-    let tables;
+    const snapshot = await db.collection(collections.tables)
+      .where('restaurantId', '==', restaurantId)
+      .get();
+    const tables = [];
+    snapshot.forEach(doc => {
+      tables.push({ id: doc.id, ...doc.data() });
+    });
+
     // Cache at Vercel Edge for 1 min, serve stale for 30s
     res.set('Cache-Control', 'public, s-maxage=60, stale-while-revalidate=30');
     res.json({ tables });
@@ -30266,8 +30282,13 @@ app.get('/api/books/:restaurantId/revenue', authenticateToken, async (req, res) 
       ? `${restaurantId}_sub_${subRestaurantId}_${dateStr}`
       : `${restaurantId}_${dateStr}`;
 
-    // Batch-read dailyStats docs for both periods
-    let curDocs, prevDocs;
+    // Batch-read dailyStats docs for both periods (1 read/day vs scanning orders)
+    const curRefs = curDateStrings.map(ds => db.collection('dailyStats').doc(getDocId(ds)));
+    const prevRefs = prevDateStrings.map(ds => db.collection('dailyStats').doc(getDocId(ds)));
+    const [curDocs, prevDocs] = await Promise.all([
+      curRefs.length > 0 ? db.getAll(...curRefs) : [],
+      prevRefs.length > 0 ? db.getAll(...prevRefs) : []
+    ]);
     // Check if we got any dailyStats data
     const hasDailyStats = curDocs.some(doc => doc.exists);
 
@@ -30773,12 +30794,12 @@ app.get('/api/books/:restaurantId/pnl', authenticateToken, async (req, res) => {
     const expRef = db.collection(collections.expenses);
     const retRef = db.collection(collections.supplierReturns);
 
-    let curStatsDocs, prevStatsDocs;
-    const statsPromise = (async () => {
-    })();
+    const curStatsRefs = curDateStrings.map(ds => db.collection('dailyStats').doc(`${restaurantId}_${ds}`));
+    const prevStatsRefs = prevDateStrings.map(ds => db.collection('dailyStats').doc(`${restaurantId}_${ds}`));
 
-    const [, txSnap, expSnap, prevExpSnap, retSnap] = await Promise.all([
-      statsPromise,
+    const [curStatsDocs, prevStatsDocs, txSnap, expSnap, prevExpSnap, retSnap] = await Promise.all([
+      curStatsRefs.length > 0 ? db.getAll(...curStatsRefs) : [],
+      prevStatsRefs.length > 0 ? db.getAll(...prevStatsRefs) : [],
       txRef.where('restaurantId', '==', restaurantId).where('type', '==', 'DEDUCTION').where('date', '>=', start).where('date', '<=', end).get(),
       expRef.where('restaurantId', '==', restaurantId).where('date', '>=', start).where('date', '<=', end).get(),
       expRef.where('restaurantId', '==', restaurantId).where('date', '>=', prev.start).where('date', '<=', prev.end).get(),
