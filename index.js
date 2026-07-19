@@ -30664,6 +30664,18 @@ app.get('/api/customers/:restaurantId', authenticateToken, async (req, res) => {
     const pageSize = Math.min(100, Math.max(1, parseInt(req.query.pageSize) || 50));
     const search = (req.query.search || '').trim().toLowerCase();
 
+    // createdAt may be a Firestore Timestamp, an ISO string, or null. Sort newest
+    // first; null/unparseable sorts last but is still INCLUDED (never-ordered
+    // customers must appear). Used in place of a Firestore orderBy, which would
+    // need a composite index (restaurantId + createdAt) that isn't provisioned.
+    const createdAtMs = (v) => {
+      if (!v) return 0;
+      if (typeof v.toDate === 'function') return v.toDate().getTime();
+      const t = new Date(v).getTime();
+      return isNaN(t) ? 0 : t;
+    };
+    const byCreatedAtDesc = (a, b) => createdAtMs(b.createdAt) - createdAtMs(a.createdAt);
+
     // Verify user has access to this restaurant
     const restaurant = await getCachedRestDoc(restaurantId);
     if (!restaurant.exists || restaurant.data().ownerId !== userId) {
@@ -30675,12 +30687,11 @@ app.get('/api/customers/:restaurantId', authenticateToken, async (req, res) => {
       // Firestore doesn't support full-text search; we use a capped scan
       // select() only fields needed for search matching + display (skip orderHistory to reduce data transfer)
       const scanLimit = 5000;
-      // Order by createdAt, NOT lastOrderDate — ordering excludes docs where the
-      // field is null (Firestore semantics, mirrored by the PG adapter), which
-      // hid every imported customer who had never placed an order
+      // No Firestore orderBy: where(restaurantId)+orderBy(createdAt) needs a
+      // composite index that isn't provisioned (→ 500), and orderBy would also
+      // drop null-createdAt docs. Fetch by restaurantId (auto-indexed), sort in JS.
       const allSnapshot = await db.collection(collections.customers)
         .where('restaurantId', '==', restaurantId)
-        .orderBy('createdAt', 'desc')
         .select('name', 'phone', 'email', 'city', 'address', 'totalOrders', 'totalSpent', 'loyaltyPoints', 'lastOrderDate', 'source', 'createdAt', 'dob', 'outstandingBalance', 'restaurantId')
         .limit(scanLimit)
         .get();
@@ -30702,6 +30713,7 @@ app.get('/api/customers/:restaurantId', authenticateToken, async (req, res) => {
         }
       });
 
+      allCustomers.sort(byCreatedAtDesc);
       const total = allCustomers.length;
       const skip = (page - 1) * pageSize;
       const customers = allCustomers.slice(skip, skip + pageSize);
@@ -30722,47 +30734,35 @@ app.get('/api/customers/:restaurantId', authenticateToken, async (req, res) => {
       .get();
     const total = countSnapshot.data().count;
 
-    // Fetch paginated customers (select only fields needed for list view, skip orderHistory to reduce transfer)
-    // Supports cursor-based pagination (preferred, avoids reading skipped docs) and offset fallback
-    const cursor = req.query.cursor; // last document ID from previous page
+    // Fetch customers (select only list-view fields). No Firestore orderBy:
+    // where(restaurantId)+orderBy(createdAt) needs an unprovisioned composite
+    // index (→ 500) and would drop null-createdAt docs. Fetch a capped set by
+    // restaurantId (auto-indexed), sort by createdAt desc in JS, paginate by
+    // slice (page-based). Cursor pagination is dropped since it requires an
+    // ordered Firestore query; the frontend re-sorts each page client-side.
     const listFields = ['name', 'phone', 'email', 'city', 'totalOrders', 'totalSpent', 'loyaltyPoints', 'lastOrderDate', 'source', 'createdAt', 'dob', 'outstandingBalance', 'restaurantId'];
+    const scanLimit = 5000;
 
-    // Order by createdAt, NOT lastOrderDate — ordering excludes docs where the
-    // field is null (Firestore semantics, mirrored by the PG adapter), which
-    // hid every imported customer who had never placed an order. The customers
-    // page re-sorts each loaded page client-side by last order.
-    let query = db.collection(collections.customers)
+    const listSnapshot = await db.collection(collections.customers)
       .where('restaurantId', '==', restaurantId)
-      .orderBy('createdAt', 'desc')
-      .select(...listFields);
+      .select(...listFields)
+      .limit(scanLimit)
+      .get();
 
-    if (cursor) {
-      // Cursor-based: start after the last doc from previous page (no wasted reads)
-      const cursorDoc = await db.collection(collections.customers).doc(cursor).get();
-      if (cursorDoc.exists) {
-        query = query.startAfter(cursorDoc);
-      }
-    } else if (page > 1) {
-      // Fallback: offset-based for backward compatibility
-      const skip = (page - 1) * pageSize;
-      query = query.offset(skip);
-    }
-
-    const customersSnapshot = await query.limit(pageSize).get();
-
-    const customers = [];
-    customersSnapshot.forEach(doc => {
+    const allList = [];
+    listSnapshot.forEach(doc => {
       const data = doc.data();
-      customers.push({
+      allList.push({
         id: doc.id,
         ...data,
         totalOrders: data.totalOrders || 0,
         totalSpent: data.totalSpent || 0,
       });
     });
+    allList.sort(byCreatedAtDesc);
 
-    // Include nextCursor for efficient next-page fetching
-    const nextCursor = customers.length === pageSize ? customers[customers.length - 1].id : null;
+    const skip = (page - 1) * pageSize;
+    const customers = allList.slice(skip, skip + pageSize);
 
     res.json({
       customers,
@@ -30770,7 +30770,7 @@ app.get('/api/customers/:restaurantId', authenticateToken, async (req, res) => {
       page,
       pageSize,
       totalPages: Math.ceil(total / pageSize),
-      nextCursor,
+      nextCursor: null, // page-based pagination (cursor needs a Firestore orderBy)
     });
   } catch (error) {
     console.error('Get customers error:', error);
