@@ -340,15 +340,44 @@ class PgDocRef {
   /**
    * GET a single document by ID.
    */
+  /**
+   * Build the subcollection-scope WHERE conditions for this doc (empty for
+   * top-level docs). A scoped doc (e.g. restaurants/{r}/floors/{f}/tables/{t},
+   * or offers/{o}/customerOfferUsage/{c}) must resolve by id AND its ancestor
+   * scope columns — matching by id alone lets a doc from another parent/tenant
+   * leak in when ids collide across scopes. Returns { sql, values }.
+   */
+  _scopeConditions(startIdx) {
+    const chain = this._scopeChain || [];
+    if (!chain.length) return { sql: '', values: [] };
+    const { fieldMap } = this._config;
+    const parts = [];
+    const values = [];
+    let idx = startIdx;
+    for (const s of chain) {
+      parts.push(`${resolveField(fieldMap, s.field)} = $${idx++}`);
+      values.push(s.value);
+    }
+    return { sql: ' AND ' + parts.join(' AND '), values };
+  }
+
+  // Cache-key suffix so scoped docs with colliding ids don't share a cache slot
+  _scopeCacheSuffix() {
+    const chain = this._scopeChain || [];
+    return chain.length ? '|' + chain.map(s => s.value).join('|') : '';
+  }
+
   async get() {
     try {
       const { table, cacheTTL } = this._config;
+      const scope = this._scopeConditions(2);
+      const cacheId = this.id + this._scopeCacheSuffix();
 
       // Redis cache check (only for non-transactional reads on cacheable collections)
       if (cacheTTL && !this._client) {
         try {
           const ver = await getTableVersion(table);
-          const cKey = docCacheKey(table, ver, this.id);
+          const cKey = docCacheKey(table, ver, cacheId);
           const cached = await kvGet(cKey);
           if (cached) {
             if (cached === '__null__') {
@@ -362,14 +391,14 @@ class PgDocRef {
       // Inside a transaction, lock the row (Firestore transactions are
       // read-modify-write safe; plain READ COMMITTED SELECTs are not)
       const result = await this._exec(
-        `SELECT * FROM ${table} WHERE id = $1${this._client ? ' FOR UPDATE' : ''}`,
-        [this.id]
+        `SELECT * FROM ${table} WHERE id = $1${scope.sql}${this._client ? ' FOR UPDATE' : ''}`,
+        [this.id, ...scope.values]
       );
       if (result.rows.length === 0) {
         // Cache the miss briefly to avoid repeated queries for non-existent docs
         if (cacheTTL && !this._client) {
           const ver = await getTableVersion(table).catch(() => 0);
-          kvSet(docCacheKey(table, ver, this.id), '__null__', Math.min(cacheTTL, 30)).catch(() => {});
+          kvSet(docCacheKey(table, ver, cacheId), '__null__', Math.min(cacheTTL, 30)).catch(() => {});
         }
         return makeDocumentSnapshot(this.id, null, this);
       }
@@ -378,7 +407,7 @@ class PgDocRef {
       // Cache the result
       if (cacheTTL && !this._client) {
         const ver = await getTableVersion(table).catch(() => 0);
-        kvSet(docCacheKey(table, ver, this.id), data, cacheTTL).catch(() => {});
+        kvSet(docCacheKey(table, ver, cacheId), data, cacheTTL).catch(() => {});
       }
 
       return makeDocumentSnapshot(this.id, data, this);
@@ -722,7 +751,9 @@ class PgDocRef {
       }
 
       const idIdx = addValue(this.id);
-      const sql = `UPDATE ${table} SET ${setClauses.join(', ')} WHERE id = $${idIdx}`;
+      const scope = this._scopeConditions(idIdx + 1);
+      for (const v of scope.values) values.push(v);
+      const sql = `UPDATE ${table} SET ${setClauses.join(', ')} WHERE id = $${idIdx}${scope.sql}`;
       let result;
       try {
         result = await this._exec(sql, values);
@@ -790,7 +821,8 @@ class PgDocRef {
   async delete() {
     try {
       const { table } = this._config;
-      await this._exec(`DELETE FROM ${table} WHERE id = $1`, [this.id]);
+      const scope = this._scopeConditions(2);
+      await this._exec(`DELETE FROM ${table} WHERE id = $1${scope.sql}`, [this.id, ...scope.values]);
       // Invalidate cache
       if (this._config.cacheTTL) bumpTableVersion(table).catch(() => {});
     } catch (err) {

@@ -400,8 +400,11 @@ const getCustomerUsageMap = async (db, offerIds, customerKey) => {
   const map = {};
   if (!db || !customerKey || !Array.isArray(offerIds) || offerIds.length === 0) return map;
   try {
+    // Doc id is composite (`${offerId}_${customerKey}`) so the flattened PG row
+    // has a globally-unique id — the same customer using two offers no longer
+    // collides on PRIMARY KEY (id).
     const reads = offerIds.map(oid =>
-      db.collection('offers').doc(oid).collection('customerOfferUsage').doc(customerKey).get()
+      db.collection('offers').doc(oid).collection('customerOfferUsage').doc(`${oid}_${customerKey}`).get()
     );
     const snaps = await Promise.all(reads);
     snaps.forEach((snap, i) => {
@@ -416,7 +419,7 @@ const getCustomerUsageMap = async (db, offerIds, customerKey) => {
 const incrementUsage = async (db, offerId, customerKey) => {
   if (!db || !offerId || !customerKey) return;
   try {
-    const ref = db.collection('offers').doc(offerId).collection('customerOfferUsage').doc(customerKey);
+    const ref = db.collection('offers').doc(offerId).collection('customerOfferUsage').doc(`${offerId}_${customerKey}`);
     await db.runTransaction(async (tx) => {
       const snap = await tx.get(ref);
       const nowIso = new Date().toISOString();
@@ -428,6 +431,8 @@ const incrementUsage = async (db, offerId, customerKey) => {
         });
       } else {
         tx.set(ref, {
+          offerId,      // explicit — the transaction set() path doesn't inject subcollection scope
+          customerKey,
           usageCount: 1,
           firstUsedAt: nowIso,
           lastUsedAt: nowIso,
@@ -457,7 +462,7 @@ const decrementUsage = async (db, offerId, customerKey) => {
 
     // Decrement per-customer usage (if customerKey provided)
     if (customerKey) {
-      const ref = db.collection('offers').doc(offerId).collection('customerOfferUsage').doc(customerKey);
+      const ref = db.collection('offers').doc(offerId).collection('customerOfferUsage').doc(`${offerId}_${customerKey}`);
       await db.runTransaction(async (tx) => {
         const snap = await tx.get(ref);
         if (snap.exists) {

@@ -109,6 +109,20 @@ const GRN_JSONB_COLUMNS = new Set(['items', 'extra_data']);
 const grnToPgRow = makeToPgRow(GRN_FIELD_MAP, GRN_JSONB_COLUMNS);
 const grnToFirestoreObj = makeToFirestoreObj(buildReverseMap(GRN_FIELD_MAP));
 
+// Per-customer offer-usage counts — subcollection offers/{offerId}/customerOfferUsage/{docId}.
+// Flattened to customer_offer_usage, scoped by offer_id; doc id is `{offerId}_{customerKey}`.
+const CUSTOMER_OFFER_USAGE_FIELD_MAP = {
+  id: 'id',
+  offerId: 'offer_id',
+  customerKey: 'customer_key',
+  usageCount: 'usage_count',
+  firstUsedAt: 'first_used_at',
+  lastUsedAt: 'last_used_at',
+};
+const CUSTOMER_OFFER_USAGE_JSONB_COLUMNS = new Set(['extra_data']);
+const customerOfferUsageToPgRow = makeToPgRow(CUSTOMER_OFFER_USAGE_FIELD_MAP, CUSTOMER_OFFER_USAGE_JSONB_COLUMNS);
+const customerOfferUsageToFirestoreObj = makeToFirestoreObj(buildReverseMap(CUSTOMER_OFFER_USAGE_FIELD_MAP));
+
 // ── supplierReturns (Firestore: supplier-returns) ───────────────────────────
 
 const SUPPLIER_RETURN_FIELD_MAP = {
@@ -1301,6 +1315,7 @@ module.exports = {
   poToPgRow, poToFirestoreObj, PO_JSONB_COLUMNS, PO_FIELD_MAP,
   requisitionToPgRow, requisitionToFirestoreObj, REQUISITION_JSONB_COLUMNS, REQUISITION_FIELD_MAP,
   grnToPgRow, grnToFirestoreObj, GRN_JSONB_COLUMNS, GRN_FIELD_MAP,
+  customerOfferUsageToPgRow, customerOfferUsageToFirestoreObj, CUSTOMER_OFFER_USAGE_JSONB_COLUMNS, CUSTOMER_OFFER_USAGE_FIELD_MAP,
   supplierReturnToPgRow, supplierReturnToFirestoreObj, SUPPLIER_RETURN_JSONB_COLUMNS, SUPPLIER_RETURN_FIELD_MAP,
   stockTransferToPgRow, stockTransferToFirestoreObj, STOCK_TRANSFER_JSONB_COLUMNS, STOCK_TRANSFER_FIELD_MAP,
   supplierPerfToPgRow, supplierPerfToFirestoreObj, SUPPLIER_PERF_JSONB_COLUMNS, SUPPLIER_PERF_FIELD_MAP,
