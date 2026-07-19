@@ -159,7 +159,7 @@ class InventoryService {
               category: 'Raw Material',
               unit: ing.unit || 'g',
               currentStock: 0,
-              minimumStock: 0,
+              minStock: 0, // must be minStock (maps to min_stock); minimumStock would land in extra_data and low-stock detection would never fire
               costPerUnit: 0,
               isActive: true,
               createdAt: new Date(),

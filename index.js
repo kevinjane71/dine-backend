@@ -17332,7 +17332,7 @@ app.patch('/api/tables/:tableId/status', authenticateToken, async (req, res) => 
         .doc(tableId)
         .get();
 
-      if (tableDoc.exists) {
+      if (tableDoc.exists && tableDoc.data().restaurantId === restaurantId) {
         await db.collection('restaurants')
           .doc(restaurantId)
           .collection('floors')
@@ -17458,7 +17458,7 @@ app.patch('/api/tables/:tableId', authenticateToken, async (req, res) => {
         .doc(tableId)
         .get();
 
-      if (tableDoc.exists) {
+      if (tableDoc.exists && tableDoc.data().restaurantId === restaurantId) {
         await db.collection('restaurants')
           .doc(restaurantId)
           .collection('floors')
@@ -17513,7 +17513,7 @@ app.delete('/api/tables/:tableId', authenticateToken, async (req, res) => {
         .doc(tableId)
         .get();
 
-      if (tableDoc.exists) {
+      if (tableDoc.exists && tableDoc.data().restaurantId === restaurantId) {
         await db.collection('restaurants')
           .doc(restaurantId)
           .collection('floors')
@@ -21643,20 +21643,21 @@ app.get('/api/kot/:restaurantId', async (req, res) => {
       return enriched;
     };
 
-    // Fetch tables from Firestore (tables are NOT migrated to PG)
+    // Fetch tables to enrich KOT with floor/capacity. Tables are keyed by
+    // `name` (there is no `number` field); orders store tableNumber == name.
     const tablesSnapshot = await db.collection(collections.tables)
       .where('restaurantId', '==', restaurantId)
-      .select('number', 'name', 'floor', 'floorId', 'capacity', 'status', 'section')
+      .select('name', 'floor', 'floorId', 'capacity', 'status', 'section')
       .limit(500)
       .get();
 
     const tableMap = {};
     tablesSnapshot.forEach(tableDoc => {
       const tableData = tableDoc.data();
-      if (tableData.number != null) {
-        tableMap[tableData.number] = {
+      if (tableData.name != null) {
+        tableMap[tableData.name] = {
           id: tableDoc.id,
-          number: tableData.number,
+          number: tableData.name,
           floor: tableData.floor,
           capacity: tableData.capacity
         };
@@ -22342,15 +22343,15 @@ app.get('/api/kot/:restaurantId/:orderId', async (req, res) => {
       try {
         const tablesSnapshot = await db.collection(collections.tables)
           .where('restaurantId', '==', restaurantId)
-          .where('number', '==', orderData.tableNumber)
+          .where('name', '==', orderData.tableNumber)
           .limit(1)
           .get();
-        
+
         if (!tablesSnapshot.empty) {
           const tableData = tablesSnapshot.docs[0].data();
           tableInfo = {
             id: tablesSnapshot.docs[0].id,
-            number: tableData.number,
+            number: tableData.name,
             floor: tableData.floor,
             capacity: tableData.capacity
           };
