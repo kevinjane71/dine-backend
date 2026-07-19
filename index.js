@@ -9122,16 +9122,22 @@ app.post('/api/public/orders/:restaurantId', vercelSecurityMiddleware.publicAPI,
     console.log(`🏷️ Order Type: ${orderType}`);
     console.log(`💰 Total: ₹${finalTotal} (Subtotal: ₹${subtotal}, Discount: ₹${discountAmount}, Loyalty: ₹${loyaltyDiscount})`);
 
-    // SMART INVENTORY: Deduct stock (awaited, but non-blocking on failure)
-    try {
-      await inventoryService.deductInventoryForOrder(restaurantId, orderRef.id, orderItems);
-      await syncInventoryStockToMenuItems(restaurantId);
-      await adjustDirectMenuItemStock(restaurantId, orderItems, 'decrement');
-    } catch (invErr) {
-      console.error('⚠️ Inventory Deduction Error (order still created):', invErr);
-      // Record failure in order for later reconciliation
-      orderRef.update({ inventoryDeductionFailed: true, inventoryError: invErr.message }).catch(() => {});
-    }
+    // SMART INVENTORY: deduct stock + sync menu badges in the BACKGROUND (like
+    // updateDailyStats below). These load all inventory/recipes and rewrite the
+    // menu, which for large-menu restaurants blew past the serverless timeout and
+    // left the order stuck on "Processing payment…" with no KOT/bill returned.
+    // Never block the sale on inventory bookkeeping — it reconciles async, and a
+    // failure is flagged on the order (inventoryDeductionFailed) for later fixup.
+    (async () => {
+      try {
+        await inventoryService.deductInventoryForOrder(restaurantId, orderRef.id, orderItems);
+        await syncInventoryStockToMenuItems(restaurantId);
+        await adjustDirectMenuItemStock(restaurantId, orderItems, 'decrement');
+      } catch (invErr) {
+        console.error('⚠️ Background inventory deduction error (order still created):', invErr);
+        orderRef.update({ inventoryDeductionFailed: true, inventoryError: invErr.message }).catch(() => {});
+      }
+    })();
 
     // Update daily analytics stats (fire-and-forget)
     updateDailyStats(restaurantId, orderData, 'add', parseTZ(req), parseDayStart(req));
@@ -10642,20 +10648,21 @@ app.post('/api/orders', async (req, res) => {
     // to minimize total response time (parallel max vs sequential sum).
     const postOrderTasks = [];
 
-    // 1. INVENTORY: Deduct stock then sync to menu items (sequential internally)
-    // Note: syncInventoryStockToMenuItems removed — adjustDirectMenuItemStock already
-    // syncs inventory-linked items AND decrements stock-managed items in one transaction.
-    postOrderTasks.push(
-      (async () => {
-        try {
-          await inventoryService.deductInventoryForOrder(restaurantId, orderRef.id, orderItems);
-          await adjustDirectMenuItemStock(restaurantId, orderItems, 'decrement');
-        } catch (invErr) {
-          console.error('⚠️ Inventory Deduction Error (order still created):', invErr);
-          orderRef.update({ inventoryDeductionFailed: true, inventoryError: invErr.message }).catch(() => {});
-        }
-      })()
-    );
+    // 1. INVENTORY: deduct stock in the BACKGROUND — deliberately NOT added to the
+    // awaited postOrderTasks. deductInventoryForOrder loads all inventory + recipes
+    // (+ the menu), which for large-menu restaurants was the slow task that blew
+    // past the serverless timeout and left the order stuck on "Processing payment…"
+    // with no KOT/bill. The sale must never wait on inventory bookkeeping; it
+    // reconciles async and flags inventoryDeductionFailed on error.
+    (async () => {
+      try {
+        await inventoryService.deductInventoryForOrder(restaurantId, orderRef.id, orderItems);
+        await adjustDirectMenuItemStock(restaurantId, orderItems, 'decrement');
+      } catch (invErr) {
+        console.error('⚠️ Background inventory deduction error (order still created):', invErr);
+        orderRef.update({ inventoryDeductionFailed: true, inventoryError: invErr.message }).catch(() => {});
+      }
+    })();
 
     // 2. TABLE STATUS: Update to "occupied" if table number is provided
     if (tableNumber && tableNumber.trim()) {
