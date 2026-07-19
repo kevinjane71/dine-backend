@@ -213,7 +213,11 @@ router.post('/:registerId/close', async (req, res) => {
         return;
       }
 
-      const openedTime = new Date(registerData.openedAt);
+      // openedAt may be an ISO string (Firestore) or a revived Timestamp (PG
+      // adapter); new Date(Timestamp) = Invalid Date → guard like shiftRoutes.
+      const openedTime = registerData.openedAt?.toDate
+        ? registerData.openedAt.toDate()
+        : new Date(registerData.openedAt);
       if (orderTime < openedTime) return;
 
       // Only completed/billed orders are sales; count only the amount actually
@@ -366,7 +370,11 @@ router.get('/:registerId/x-report', async (req, res) => {
         return;
       }
 
-      const openedTime = new Date(registerData.openedAt);
+      // openedAt may be an ISO string (Firestore) or a revived Timestamp (PG
+      // adapter); new Date(Timestamp) = Invalid Date → guard like shiftRoutes.
+      const openedTime = registerData.openedAt?.toDate
+        ? registerData.openedAt.toDate()
+        : new Date(registerData.openedAt);
       if (orderTime < openedTime) return;
 
       // Only completed/billed orders; count only the amount actually COLLECTED
