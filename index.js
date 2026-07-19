@@ -23282,9 +23282,18 @@ async function checkFeaturePermission(req, feature, operation) {
 
     const pageAccess = userDoc.data()?.pageAccess;
 
-    // Legacy standalone boolean fallbacks
-    if (feature === 'orders' && operation === 'completeBill' && pageAccess?.completeBill !== undefined) {
-      return !!pageAccess.completeBill;
+    // completeBill: honor an explicit stored value (top-level flag or nested
+    // under orders), otherwise fall back to the ROLE default. Heals cashiers/
+    // staff whose stored pageAccess predates the completeBill flag (created
+    // before it existed, or via an older client) — they were denied billing
+    // even though their role grants it. An explicit `false` still revokes it.
+    if (feature === 'orders' && operation === 'completeBill') {
+      if (pageAccess?.completeBill !== undefined) return !!pageAccess.completeBill;
+      if (pageAccess?.orders && typeof pageAccess.orders === 'object' && pageAccess.orders.completeBill !== undefined) {
+        return !!pageAccess.orders.completeBill;
+      }
+      const roleDefault = ROLE_DEFAULT_PAGE_ACCESS[role] || ROLE_DEFAULT_PAGE_ACCESS[(role || '').toLowerCase()];
+      if (roleDefault && roleDefault.completeBill !== undefined) return !!roleDefault.completeBill;
     }
     if (feature === 'tables' && operation === 'reset' && pageAccess?.resetTables !== undefined) {
       return !!pageAccess.resetTables;
