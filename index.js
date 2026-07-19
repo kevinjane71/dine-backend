@@ -1112,7 +1112,13 @@ function normalizeModifierGroups(groups) {
       id: item.id || `cust_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
       name: item.name || '',
       price: typeof item.price === 'number' ? item.price : parseFloat(item.price) || 0,
-      description: item.description || ''
+      description: item.description || '',
+      // Optional inventory link — deducts stock when this add-on is selected on an order
+      ...(item.inventoryItemId ? {
+        inventoryItemId: item.inventoryItemId,
+        invQuantity: typeof item.invQuantity === 'number' ? item.invQuantity : parseFloat(item.invQuantity) || 0,
+        invUnit: item.invUnit || ''
+      } : {})
     })) : []
   }));
 }
@@ -7818,7 +7824,10 @@ app.post('/api/menus/:restaurantId', authenticateToken, async (req, res) => {
         ? variants.map(v => ({
             name: v.name,
             price: typeof v.price === 'number' ? v.price : parseFloat(v.price) || 0,
-            description: v.description || ''
+            description: v.description || '',
+            // Recipe scaling for inventory: a Half portion (0.5) deducts half the
+            // recipe. Defaults to 1 (full recipe) when unset.
+            recipeMultiplier: (parseFloat(v.recipeMultiplier) > 0) ? parseFloat(v.recipeMultiplier) : 1
           }))
         : [],
       // Modifier groups: structured groups with min/max selection rules
@@ -7997,11 +8006,12 @@ app.patch('/api/menus/item/:id', authenticateToken, async (req, res) => {
           updateData[field] = parseFloat(req.body[field]);
         } else if (field === 'variants') {
           // Ensure variants are arrays with parsed prices
-          updateData[field] = Array.isArray(req.body[field]) 
+          updateData[field] = Array.isArray(req.body[field])
             ? req.body[field].map(v => ({
                 name: v.name,
                 price: typeof v.price === 'number' ? v.price : parseFloat(v.price) || 0,
-                description: v.description || ''
+                description: v.description || '',
+                recipeMultiplier: (parseFloat(v.recipeMultiplier) > 0) ? parseFloat(v.recipeMultiplier) : 1
               }))
             : [];
         } else if (field === 'customizations') {
@@ -14327,7 +14337,7 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
         // Deduct inventory for added items (awaited, but non-blocking on failure)
         if (addedItems.length > 0) {
           try {
-            await inventoryService.deductInventoryForOrder(currentOrder.restaurantId, `${orderId}_edit_${Date.now()}`, addedItems);
+            await inventoryService.deductInventoryForOrder(currentOrder.restaurantId, orderId, addedItems, { referenceId: `${orderId}_edit_${Date.now()}` });
             await syncInventoryStockToMenuItems(currentOrder.restaurantId);
             await adjustDirectMenuItemStock(currentOrder.restaurantId, addedItems, 'decrement');
           } catch (err) {
@@ -23991,9 +24001,18 @@ async function checkFeaturePermission(req, feature, operation) {
 
     const pageAccess = userDoc.data()?.pageAccess;
 
-    // Legacy standalone boolean fallbacks
-    if (feature === 'orders' && operation === 'completeBill' && pageAccess?.completeBill !== undefined) {
-      return !!pageAccess.completeBill;
+    // completeBill: honor an explicit stored value (top-level flag or nested
+    // under orders), otherwise fall back to the ROLE default. Heals cashiers/
+    // staff whose stored pageAccess predates the completeBill flag (created
+    // before it existed, or via an older client) — they were denied billing
+    // even though their role grants it. An explicit `false` still revokes it.
+    if (feature === 'orders' && operation === 'completeBill') {
+      if (pageAccess?.completeBill !== undefined) return !!pageAccess.completeBill;
+      if (pageAccess?.orders && typeof pageAccess.orders === 'object' && pageAccess.orders.completeBill !== undefined) {
+        return !!pageAccess.orders.completeBill;
+      }
+      const roleDefault = ROLE_DEFAULT_PAGE_ACCESS[role] || ROLE_DEFAULT_PAGE_ACCESS[(role || '').toLowerCase()];
+      if (roleDefault && roleDefault.completeBill !== undefined) return !!roleDefault.completeBill;
     }
     if (feature === 'tables' && operation === 'reset' && pageAccess?.resetTables !== undefined) {
       return !!pageAccess.resetTables;
@@ -24752,7 +24771,14 @@ app.post('/api/inventory/:restaurantId', authenticateToken, async (req, res) => 
       expiryDate,
       mfgDate,
       expiryDays,
-      location
+      location,
+      // Purchase→usage conversion: buy in `purchaseUnit` (e.g. bottle/case), track
+      // + deduct stock in `unit` (e.g. ml/pcs). conversionFactor = usage units per
+      // purchase unit (1 bottle = 750 ml → 750). Defaults keep single-unit items unchanged.
+      purchaseUnit,
+      conversionFactor,
+      // Reverse-link: connect this inventory item to a menu item (inventory→menu)
+      linkedMenuItemId
     } = req.body;
 
     // Validate required fields
@@ -24804,6 +24830,10 @@ app.post('/api/inventory/:restaurantId', authenticateToken, async (req, res) => 
       mfgDate: mfgDate || null,
       expiryDays: expiryDays ? parseInt(expiryDays) : null,
       location: location?.trim() || '',
+      // Purchase/usage conversion (usageUnit == unit). Defaults: buy == stock unit, factor 1.
+      purchaseUnit: (purchaseUnit && purchaseUnit.trim()) ? purchaseUnit.trim() : unit.trim(),
+      conversionFactor: (parseFloat(conversionFactor) > 0) ? parseFloat(conversionFactor) : 1,
+      linkedMenuItemId: (linkedMenuItemId && String(linkedMenuItemId).trim()) ? String(linkedMenuItemId).trim() : null,
       status,
       createdAt: new Date(),
       updatedAt: new Date(),
@@ -24900,17 +24930,24 @@ app.patch('/api/inventory/:restaurantId/:itemId', authenticateToken, async (req,
     // Update fields if provided
     const fieldsToUpdate = [
       'name', 'category', 'unit', 'currentStock', 'minStock', 'maxStock',
-      'costPerUnit', 'supplier', 'description', 'barcode', 'expiryDate', 'mfgDate', 'expiryDays', 'location'
+      'costPerUnit', 'supplier', 'description', 'barcode', 'expiryDate', 'mfgDate', 'expiryDays', 'location',
+      'purchaseUnit', 'conversionFactor', 'linkedMenuItemId'
     ];
 
     fieldsToUpdate.forEach(field => {
       if (req.body[field] !== undefined) {
-        if (field === 'name' || field === 'category' || field === 'unit' ||
-            field === 'supplier' || field === 'description' || field === 'barcode' || field === 'location') {
+        if (field === 'linkedMenuItemId') {
+          updateData[field] = (req.body[field] && String(req.body[field]).trim()) ? String(req.body[field]).trim() : null;
+        } else if (field === 'name' || field === 'category' || field === 'unit' ||
+            field === 'supplier' || field === 'description' || field === 'barcode' || field === 'location' ||
+            field === 'purchaseUnit') {
           updateData[field] = req.body[field]?.trim() || '';
         } else if (field === 'currentStock' || field === 'minStock' || field === 'maxStock' || field === 'costPerUnit') {
           const parsed = parseFloat(req.body[field]);
           updateData[field] = isNaN(parsed) ? 0 : Math.max(0, parsed);
+        } else if (field === 'conversionFactor') {
+          const parsed = parseFloat(req.body[field]);
+          updateData[field] = (!isNaN(parsed) && parsed > 0) ? parsed : 1;
         } else if (field === 'expiryDate' || field === 'mfgDate') {
           updateData[field] = req.body[field] || null;
         } else if (field === 'expiryDays') {
@@ -31366,6 +31403,18 @@ app.get('/api/customers/:restaurantId', authenticateToken, async (req, res) => {
     const pageSize = Math.min(100, Math.max(1, parseInt(req.query.pageSize) || 50));
     const search = (req.query.search || '').trim().toLowerCase();
 
+    // createdAt may be a Firestore Timestamp, an ISO string, or null. Sort newest
+    // first; null/unparseable sorts last but is still INCLUDED (never-ordered
+    // customers must appear). Used in place of a Firestore orderBy, which would
+    // need a composite index (restaurantId + createdAt) that isn't provisioned.
+    const createdAtMs = (v) => {
+      if (!v) return 0;
+      if (typeof v.toDate === 'function') return v.toDate().getTime();
+      const t = new Date(v).getTime();
+      return isNaN(t) ? 0 : t;
+    };
+    const byCreatedAtDesc = (a, b) => createdAtMs(b.createdAt) - createdAtMs(a.createdAt);
+
     // Verify user has access to this restaurant
     const restaurant = await getCachedRestDoc(restaurantId);
     if (!restaurant.exists || restaurant.data().ownerId !== userId) {
@@ -31377,9 +31426,11 @@ app.get('/api/customers/:restaurantId', authenticateToken, async (req, res) => {
       // Firestore doesn't support full-text search; we use a capped scan
       // select() only fields needed for search matching + display (skip orderHistory to reduce data transfer)
       const scanLimit = 5000;
+      // No Firestore orderBy: where(restaurantId)+orderBy(createdAt) needs a
+      // composite index that isn't provisioned (→ 500), and orderBy would also
+      // drop null-createdAt docs. Fetch by restaurantId (auto-indexed), sort in JS.
       const allSnapshot = await db.collection(collections.customers)
         .where('restaurantId', '==', restaurantId)
-        .orderBy('lastOrderDate', 'desc')
         .select('name', 'phone', 'email', 'city', 'address', 'totalOrders', 'totalSpent', 'loyaltyPoints', 'lastOrderDate', 'source', 'createdAt', 'dob', 'outstandingBalance', 'restaurantId')
         .limit(scanLimit)
         .get();
@@ -31401,6 +31452,7 @@ app.get('/api/customers/:restaurantId', authenticateToken, async (req, res) => {
         }
       });
 
+      allCustomers.sort(byCreatedAtDesc);
       const total = allCustomers.length;
       const skip = (page - 1) * pageSize;
       const customers = allCustomers.slice(skip, skip + pageSize);
@@ -31421,43 +31473,35 @@ app.get('/api/customers/:restaurantId', authenticateToken, async (req, res) => {
       .get();
     const total = countSnapshot.data().count;
 
-    // Fetch paginated customers (select only fields needed for list view, skip orderHistory to reduce transfer)
-    // Supports cursor-based pagination (preferred, avoids reading skipped docs) and offset fallback
-    const cursor = req.query.cursor; // last document ID from previous page
+    // Fetch customers (select only list-view fields). No Firestore orderBy:
+    // where(restaurantId)+orderBy(createdAt) needs an unprovisioned composite
+    // index (→ 500) and would drop null-createdAt docs. Fetch a capped set by
+    // restaurantId (auto-indexed), sort by createdAt desc in JS, paginate by
+    // slice (page-based). Cursor pagination is dropped since it requires an
+    // ordered Firestore query; the frontend re-sorts each page client-side.
     const listFields = ['name', 'phone', 'email', 'city', 'totalOrders', 'totalSpent', 'loyaltyPoints', 'lastOrderDate', 'source', 'createdAt', 'dob', 'outstandingBalance', 'restaurantId'];
+    const scanLimit = 5000;
 
-    let query = db.collection(collections.customers)
+    const listSnapshot = await db.collection(collections.customers)
       .where('restaurantId', '==', restaurantId)
-      .orderBy('lastOrderDate', 'desc')
-      .select(...listFields);
+      .select(...listFields)
+      .limit(scanLimit)
+      .get();
 
-    if (cursor) {
-      // Cursor-based: start after the last doc from previous page (no wasted reads)
-      const cursorDoc = await db.collection(collections.customers).doc(cursor).get();
-      if (cursorDoc.exists) {
-        query = query.startAfter(cursorDoc);
-      }
-    } else if (page > 1) {
-      // Fallback: offset-based for backward compatibility
-      const skip = (page - 1) * pageSize;
-      query = query.offset(skip);
-    }
-
-    const customersSnapshot = await query.limit(pageSize).get();
-
-    const customers = [];
-    customersSnapshot.forEach(doc => {
+    const allList = [];
+    listSnapshot.forEach(doc => {
       const data = doc.data();
-      customers.push({
+      allList.push({
         id: doc.id,
         ...data,
         totalOrders: data.totalOrders || 0,
         totalSpent: data.totalSpent || 0,
       });
     });
+    allList.sort(byCreatedAtDesc);
 
-    // Include nextCursor for efficient next-page fetching
-    const nextCursor = customers.length === pageSize ? customers[customers.length - 1].id : null;
+    const skip = (page - 1) * pageSize;
+    const customers = allList.slice(skip, skip + pageSize);
 
     res.json({
       customers,
@@ -31465,7 +31509,7 @@ app.get('/api/customers/:restaurantId', authenticateToken, async (req, res) => {
       page,
       pageSize,
       totalPages: Math.ceil(total / pageSize),
-      nextCursor,
+      nextCursor: null, // page-based pagination (cursor needs a Firestore orderBy)
     });
   } catch (error) {
     console.error('Get customers error:', error);
@@ -34422,7 +34466,7 @@ app.patch('/api/orders/:orderId/edit-completed-items', authenticateToken, async 
       }
       if (addedInvItems.length > 0) {
         try {
-          await inventoryService.deductInventoryForOrder(currentOrder.restaurantId, `${orderId}_editcomplete_${Date.now()}`, addedInvItems);
+          await inventoryService.deductInventoryForOrder(currentOrder.restaurantId, orderId, addedInvItems, { referenceId: `${orderId}_editcomplete_${Date.now()}` });
           await syncInventoryStockToMenuItems(currentOrder.restaurantId);
           await adjustDirectMenuItemStock(currentOrder.restaurantId, addedInvItems, 'decrement');
         } catch (err) { console.error('Edit completed - inventory add error:', err); }
