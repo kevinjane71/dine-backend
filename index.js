@@ -17552,6 +17552,56 @@ app.post('/api/waitlist/:restaurantId/:entryId/notify', authenticateToken, async
   }
 });
 
+// Save the drag-and-drop floor-plan layout for a floor's tables. Bulk update of
+// position/size/shape only — never touches status/order/billing. Gated on
+// tables.manage. Body: { floorId, tables: [{ id, posX, posY, width, height, rotation, shape }] }.
+app.post('/api/tables/:restaurantId/layout', authenticateToken, async (req, res) => {
+  try {
+    if (!(await checkFeaturePermission(req, 'tables', 'manage'))) {
+      return res.status(403).json({ error: 'Access denied. Table management permission required.' });
+    }
+    const { restaurantId } = req.params;
+    const { floorId, tables } = req.body;
+    if (!Array.isArray(tables) || tables.length === 0) {
+      return res.status(400).json({ error: 'tables array is required.' });
+    }
+
+    const num = (v, d) => (v == null || isNaN(Number(v)) ? d : Number(v));
+    const allowedShapes = ['rect', 'round', 'square'];
+    let saved = 0;
+
+    for (const t of tables) {
+      if (!t || !t.id) continue;
+      const layout = {
+        posX: num(t.posX, 0),
+        posY: num(t.posY, 0),
+        width: num(t.width, 90),
+        height: num(t.height, 90),
+        rotation: num(t.rotation, 0),
+        shape: allowedShapes.includes(t.shape) ? t.shape : 'rect',
+        updatedAt: new Date(),
+      };
+      // Fast path with floorId; fallback to scan.
+      let ref = null;
+      if (floorId) {
+        const d = await db.collection('restaurants').doc(restaurantId)
+          .collection('floors').doc(floorId).collection('tables').doc(t.id).get();
+        if (d.exists) ref = d.ref;
+      }
+      if (!ref) {
+        const found = await findTableAcrossFloors(restaurantId, t.id);
+        if (found) ref = found.ref;
+      }
+      if (ref) { await ref.update(layout); saved++; }
+    }
+
+    res.json({ success: true, saved });
+  } catch (error) {
+    console.error('Save floor layout error:', error);
+    res.status(500).json({ error: 'Failed to save floor layout' });
+  }
+});
+
 app.post('/api/tables/:restaurantId', authenticateToken, async (req, res) => {
   try {
     // Granular permission check: tables.add
