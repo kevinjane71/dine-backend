@@ -17202,6 +17202,149 @@ app.get('/api/tables/:restaurantId/analytics', authenticateToken, async (req, re
   }
 });
 
+// Helper: locate a table doc across all floors of a restaurant.
+// Returns { ref, data, floorId } or null. Used by merge/unmerge.
+async function findTableAcrossFloors(restaurantId, tableId) {
+  const floorsSnap = await db.collection('restaurants').doc(restaurantId).collection('floors').get();
+  for (const floorDoc of floorsSnap.docs) {
+    const tDoc = await db.collection('restaurants').doc(restaurantId)
+      .collection('floors').doc(floorDoc.id).collection('tables').doc(tableId).get();
+    if (tDoc.exists) return { ref: tDoc.ref, data: tDoc.data(), floorId: floorDoc.id };
+  }
+  return null;
+}
+
+// Merge tables into one group. NON-DESTRUCTIVE: this only *links* tables — it
+// never combines or mutates any order/bill. Secondary tables must be free; if a
+// secondary has an active order, the caller is told to move/settle it first
+// (using the existing move-order flow). Fully reversible via /unmerge.
+app.post('/api/tables/:restaurantId/merge', authenticateToken, async (req, res) => {
+  try {
+    if (!(await checkFeaturePermission(req, 'tables', 'manage'))) {
+      return res.status(403).json({ error: 'Access denied. Table management permission required.' });
+    }
+    const { restaurantId } = req.params;
+    const { primaryTableId, tableIds } = req.body;
+
+    // Build the full set of table ids (primary + secondaries), de-duped.
+    let allIds = Array.isArray(tableIds) ? tableIds.filter(Boolean) : [];
+    if (primaryTableId && !allIds.includes(primaryTableId)) allIds = [primaryTableId, ...allIds];
+    allIds = [...new Set(allIds)];
+    const primaryId = primaryTableId || allIds[0];
+    if (allIds.length < 2) {
+      return res.status(400).json({ error: 'Select at least two tables to merge.' });
+    }
+
+    // Resolve every table doc.
+    const found = {};
+    for (const id of allIds) {
+      const t = await findTableAcrossFloors(restaurantId, id);
+      if (t) found[id] = t;
+    }
+    const missing = allIds.filter(id => !found[id]);
+    if (missing.length) return res.status(404).json({ error: 'One or more selected tables were not found.' });
+
+    // Reject tables already in a merge group.
+    const already = allIds.filter(id => found[id].data.mergeGroupId);
+    if (already.length) {
+      return res.status(400).json({ error: 'One or more tables are already merged. Un-merge them first.' });
+    }
+    // Secondaries must be free (no active order). Primary may be occupied.
+    const busy = allIds.filter(id => id !== primaryId && (found[id].data.status === 'occupied' || found[id].data.currentOrderId));
+    if (busy.length) {
+      const names = busy.map(id => found[id].data.name).join(', ');
+      return res.status(400).json({ error: `These tables have active orders and can't be merged: ${names}. Move or settle their orders first.` });
+    }
+
+    const secondaryIds = allIds.filter(id => id !== primaryId);
+    const mergeGroupId = `mg_${primaryId.slice(0, 8)}_${Date.now()}`;
+    const now = new Date();
+    const groupCapacity = allIds.reduce((s, id) => s + (Number(found[id].data.capacity) || 0), 0);
+
+    // Primary carries the group roster.
+    await found[primaryId].ref.update({
+      mergeGroupId,
+      mergePrimary: true,
+      mergedTables: secondaryIds,
+      mergedTableNames: secondaryIds.map(id => found[id].data.name),
+      mergedCapacity: groupCapacity,
+      updatedAt: now,
+    });
+    // Secondaries point back to the primary and go to a distinct 'merged' status.
+    for (const id of secondaryIds) {
+      await found[id].ref.update({
+        mergeGroupId,
+        mergePrimary: false,
+        mergedInto: primaryId,
+        mergedIntoName: found[primaryId].data.name,
+        status: 'merged',
+        updatedAt: now,
+      });
+      pusherService.triggerTableStatusUpdated(restaurantId, {
+        tableId: id, status: 'merged', orderId: null, tableNumber: found[id].data.name,
+      }).catch(() => {});
+    }
+    pusherService.triggerTableStatusUpdated(restaurantId, {
+      tableId: primaryId, status: found[primaryId].data.status || 'available', tableNumber: found[primaryId].data.name,
+    }).catch(() => {});
+
+    res.json({ success: true, mergeGroupId, primaryTableId: primaryId, mergedTables: secondaryIds, mergedCapacity: groupCapacity });
+  } catch (error) {
+    console.error('Merge tables error:', error);
+    res.status(500).json({ error: 'Failed to merge tables' });
+  }
+});
+
+// Un-merge a group. Clears merge fields on the primary and every secondary,
+// restoring secondaries to 'available'. Non-destructive — never touches orders.
+app.post('/api/tables/:restaurantId/unmerge', authenticateToken, async (req, res) => {
+  try {
+    if (!(await checkFeaturePermission(req, 'tables', 'manage'))) {
+      return res.status(403).json({ error: 'Access denied. Table management permission required.' });
+    }
+    const { restaurantId } = req.params;
+    const { primaryTableId } = req.body;
+    if (!primaryTableId) return res.status(400).json({ error: 'primaryTableId is required.' });
+
+    const primary = await findTableAcrossFloors(restaurantId, primaryTableId);
+    if (!primary) return res.status(404).json({ error: 'Primary table not found.' });
+    if (!primary.data.mergeGroupId) return res.status(400).json({ error: 'This table is not part of a merge group.' });
+
+    const secondaryIds = Array.isArray(primary.data.mergedTables) ? primary.data.mergedTables : [];
+    const clearFields = {
+      mergeGroupId: FieldValue.delete(),
+      mergePrimary: FieldValue.delete(),
+      mergedTables: FieldValue.delete(),
+      mergedTableNames: FieldValue.delete(),
+      mergedCapacity: FieldValue.delete(),
+      mergedInto: FieldValue.delete(),
+      mergedIntoName: FieldValue.delete(),
+      updatedAt: new Date(),
+    };
+
+    // Clear the primary.
+    await primary.ref.update(clearFields);
+    // Clear + free each secondary.
+    for (const id of secondaryIds) {
+      const sec = await findTableAcrossFloors(restaurantId, id);
+      if (sec) {
+        await sec.ref.update({ ...clearFields, status: 'available', currentOrderId: null });
+        pusherService.triggerTableStatusUpdated(restaurantId, {
+          tableId: id, status: 'available', orderId: null, tableNumber: sec.data.name,
+        }).catch(() => {});
+      }
+    }
+    pusherService.triggerTableStatusUpdated(restaurantId, {
+      tableId: primaryTableId, status: primary.data.status || 'available', tableNumber: primary.data.name,
+    }).catch(() => {});
+
+    res.json({ success: true, primaryTableId, unmerged: secondaryIds });
+  } catch (error) {
+    console.error('Unmerge tables error:', error);
+    res.status(500).json({ error: 'Failed to un-merge tables' });
+  }
+});
+
 app.post('/api/tables/:restaurantId', authenticateToken, async (req, res) => {
   try {
     // Granular permission check: tables.add

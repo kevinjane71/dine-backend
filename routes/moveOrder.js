@@ -170,4 +170,80 @@ router.post('/:orderId/move-table', authenticateToken, async (req, res) => {
   }
 });
 
+// ==========================================
+// Transfer an order/table to another server (waiter)
+// Metadata-only: reassigns waiterId/waiterName on the order and stamps the
+// table for at-a-glance attribution. Never touches items/money.
+// ==========================================
+router.post('/:orderId/transfer-server', authenticateToken, async (req, res) => {
+  try {
+    const { orderId } = req.params;
+    const { waiterId, waiterName, restaurantId } = req.body;
+    if (!waiterId && !waiterName) {
+      return res.status(400).json({ error: 'waiterId or waiterName is required.' });
+    }
+
+    const orderDoc = await db.collection(collections.orders).doc(orderId).get();
+    if (!orderDoc.exists) return res.status(404).json({ error: 'Order not found' });
+    const order = orderDoc.data();
+
+    const user = req.user;
+    const userRestaurantId = user.restaurantId || restaurantId || order.restaurantId;
+    if (order.restaurantId !== userRestaurantId && user.role !== 'admin' && user.role !== 'owner') {
+      return res.status(403).json({ error: 'Access denied' });
+    }
+    if (order.status === 'completed' || order.status === 'cancelled') {
+      return res.status(400).json({ error: 'Cannot reassign a completed or cancelled order.' });
+    }
+
+    const previousWaiter = order.waiterName || null;
+    await db.collection(collections.orders).doc(orderId).update({
+      waiterId: waiterId || null,
+      waiterName: waiterName || null,
+      updatedAt: new Date(),
+    });
+
+    // Stamp the table too (so the floor shows the current server).
+    const rid = order.restaurantId;
+    if (order.tableId) {
+      try {
+        let done = false;
+        if (order.floorId) {
+          const tDoc = await db.collection('restaurants').doc(rid)
+            .collection('floors').doc(order.floorId)
+            .collection('tables').doc(order.tableId).get();
+          if (tDoc.exists) {
+            await tDoc.ref.update({ waiterId: waiterId || null, waiterName: waiterName || null, updatedAt: new Date() });
+            done = true;
+          }
+        }
+        if (!done) {
+          const floorsSnap = await db.collection('restaurants').doc(rid).collection('floors').get();
+          for (const fd of floorsSnap.docs) {
+            const tDoc = await db.collection('restaurants').doc(rid)
+              .collection('floors').doc(fd.id)
+              .collection('tables').doc(order.tableId).get();
+            if (tDoc.exists) {
+              await tDoc.ref.update({ waiterId: waiterId || null, waiterName: waiterName || null, updatedAt: new Date() });
+              break;
+            }
+          }
+        }
+      } catch (e) {
+        console.error('Table server-stamp error (non-blocking):', e);
+      }
+    }
+
+    pusherService.notifyOrderUpdated(rid, orderId, {
+      status: order.status, tableNumber: order.tableNumber, orderNumber: order.orderNumber, dailyOrderId: order.dailyOrderId,
+    }).catch(err => console.error('Pusher order update error:', err));
+
+    console.log(`Order ${orderId} reassigned from "${previousWaiter}" to "${waiterName || waiterId}"`);
+    res.json({ success: true, orderId, waiterId: waiterId || null, waiterName: waiterName || null, previousWaiter });
+  } catch (error) {
+    console.error('Transfer server error:', error);
+    res.status(500).json({ error: 'Failed to transfer server' });
+  }
+});
+
 module.exports = router;
