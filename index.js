@@ -10271,7 +10271,11 @@ app.post('/api/orders', async (req, res) => {
     // frontend has already shown to the user. When these are present, override
     // the server-recalculated fields so the stored order matches what was billed.
     if (req.body.finalAmount != null && req.body.taxBreakdown && Array.isArray(req.body.taxBreakdown)) {
-      const feDiscount = parseFloat(req.body.discountAmount) || 0;
+      // Fall back to offerDiscount: some clients (order-edit modal) send the
+      // offer discount only under `offerDiscount`. Without this fallback the
+      // override would store discountAmount=0 while finalAmount still reflected
+      // the discount — receipt then showed subtotal>total with no discount line.
+      const feDiscount = parseFloat(req.body.discountAmount ?? req.body.offerDiscount) || 0;
       const feManual = parseFloat(req.body.manualDiscount) || 0;
       const feLoyalty = parseFloat(req.body.loyaltyDiscount) || 0;
       const feTotalDisc = parseFloat(req.body.totalDiscountAmount) || (feDiscount + feManual + feLoyalty);
@@ -13845,7 +13849,11 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
     // frontend has already shown to the user. When these are present, override
     // the server-recalculated fields so the stored order matches what was billed.
     if (req.body.finalAmount != null && req.body.taxBreakdown && Array.isArray(req.body.taxBreakdown)) {
-      const feDiscount = parseFloat(req.body.discountAmount) || 0;
+      // Fall back to offerDiscount: some clients (order-edit modal) send the
+      // offer discount only under `offerDiscount`. Without this fallback the
+      // override would store discountAmount=0 while finalAmount still reflected
+      // the discount — receipt then showed subtotal>total with no discount line.
+      const feDiscount = parseFloat(req.body.discountAmount ?? req.body.offerDiscount) || 0;
       const feManual = parseFloat(req.body.manualDiscount) || 0;
       const feLoyalty = parseFloat(req.body.loyaltyDiscount) || 0;
       const feTotalDisc = parseFloat(req.body.totalDiscountAmount) || (feDiscount + feManual + feLoyalty);
