@@ -13292,13 +13292,23 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
         const selectedVariant = cleanItem.selectedVariant || null;
         const customizations = Array.isArray(cleanItem.selectedCustomizations) ? cleanItem.selectedCustomizations : [];
 
+        // Editing an ALREADY-completed bill: preserve the price that was billed
+        // for lines already on the settled bill (existingItem). Re-resolving to
+        // today's menu (below) would silently change a settled total if menu
+        // prices changed since. Newly-added lines still price from the live menu.
+        const preserveBilledPrice = currentOrder?.status === 'completed' && !!existingItem;
+
         let resolvedBasePrice;
         let expectedMenuPricePatch = menuItem ? menuItem.price : 0;
         if (menuItem) {
           const fePricePatch = typeof cleanItem.basePrice === 'number' ? cleanItem.basePrice
             : (typeof cleanItem.price === 'number' ? cleanItem.price : null);
 
-          if (selectedVariant && typeof selectedVariant.price === 'number') {
+          if (preserveBilledPrice && fePricePatch !== null) {
+            // Settled line — trust the billed price the FE preserved (also for variants).
+            resolvedBasePrice = fePricePatch;
+            expectedMenuPricePatch = fePricePatch;
+          } else if (selectedVariant && typeof selectedVariant.price === 'number') {
             // Variant selected — validate against menu
             // Prefer name match; only fall back to price match when name is absent
             const matchedVariant = (menuItem.variants || []).find(v =>
@@ -13320,7 +13330,7 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
           // Multi-tier pricing: override base price for non-variant items
           // Skip if staff explicitly edited the price
           const wasManuallyEditedPatch = cleanItem.priceEdited === true || (allowPriceEditPatch && fePricePatch !== null && fePricePatch !== menuItem.price);
-          if (multiPricing?.enabled && activePricingRuleId && !selectedVariant && !wasManuallyEditedPatch) {
+          if (multiPricing?.enabled && activePricingRuleId && !selectedVariant && !wasManuallyEditedPatch && !preserveBilledPrice) {
             const rulePrice = resolveItemPriceForRule(menuItem, activePricingRuleId, multiPricing.rules);
             if (rulePrice !== null) {
               resolvedBasePrice = rulePrice;
@@ -14299,8 +14309,10 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
       }
     }
 
-    // Release table if order is being completed (Complete Billing in edit mode)
-    if (status === 'completed' && currentOrder.tableNumber && currentOrder.tableNumber.trim()) {
+    // Release table on FIRST completion only. Re-editing an already-completed
+    // order must NOT re-release — the table may since have been re-seated by a
+    // new order, and re-releasing would free that live table / null its order.
+    if (status === 'completed' && currentOrder.status !== 'completed' && currentOrder.tableNumber && currentOrder.tableNumber.trim()) {
       try {
         console.log('🔄 Releasing table due to order completion:', currentOrder.tableNumber);
 
