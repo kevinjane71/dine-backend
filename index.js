@@ -16754,6 +16754,131 @@ app.post('/api/tables/:restaurantId/assign-section-server', authenticateToken, a
   }
 });
 
+// ==========================================
+// Walk-in waitlist (host stand)
+// Additive: its own `waitlist` collection; never touches orders/tables/billing.
+// ==========================================
+
+// Add a walk-in party to the waitlist.
+app.post('/api/waitlist/:restaurantId', authenticateToken, async (req, res) => {
+  try {
+    if (!(await checkFeaturePermission(req, 'tables', 'update'))) {
+      return res.status(403).json({ error: 'Access denied. Tables update permission required.' });
+    }
+    const { restaurantId } = req.params;
+    const { name, phone = null, partySize = 1, quotedWait = null, notes = null } = req.body;
+    if (!name || !String(name).trim()) return res.status(400).json({ error: 'Guest name is required.' });
+
+    const doc = {
+      restaurantId,
+      name: String(name).trim(),
+      phone: phone ? String(phone).trim() : null,
+      partySize: Math.max(1, Number(partySize) || 1),
+      quotedWait: quotedWait != null && quotedWait !== '' ? Number(quotedWait) : null,
+      notes: notes ? String(notes).trim() : null,
+      status: 'waiting',
+      createdAt: new Date(),
+      addedBy: req.user?.userId || req.user?.id || null,
+    };
+    const ref = await db.collection('waitlist').add(doc);
+    res.json({ success: true, id: ref.id, ...doc });
+  } catch (error) {
+    console.error('Waitlist add error:', error);
+    res.status(500).json({ error: 'Failed to add to waitlist' });
+  }
+});
+
+// List active waitlist entries (waiting + notified), oldest first.
+// Single-field query + JS filter/sort → no composite index needed.
+app.get('/api/waitlist/:restaurantId', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+    const snap = await db.collection('waitlist').where('restaurantId', '==', restaurantId).get();
+    const toMs = (v) => (v && v.toDate) ? v.toDate().getTime() : (v ? new Date(v).getTime() : 0);
+    const entries = [];
+    snap.forEach(d => {
+      const data = d.data();
+      if (['waiting', 'notified'].includes(data.status)) entries.push({ id: d.id, ...data });
+    });
+    entries.sort((a, b) => toMs(a.createdAt) - toMs(b.createdAt));
+    res.json({ waitlist: entries });
+  } catch (error) {
+    console.error('Waitlist list error:', error);
+    res.status(500).json({ error: 'Failed to load waitlist' });
+  }
+});
+
+// Update a waitlist entry — status changes (seat / cancel / no-show) or edits.
+app.patch('/api/waitlist/:restaurantId/:entryId', authenticateToken, async (req, res) => {
+  try {
+    if (!(await checkFeaturePermission(req, 'tables', 'update'))) {
+      return res.status(403).json({ error: 'Access denied. Tables update permission required.' });
+    }
+    const { entryId } = req.params;
+    const { status, tableId, tableName, partySize, quotedWait, notes, name, phone } = req.body;
+
+    const update = { updatedAt: new Date() };
+    if (status) {
+      update.status = status;
+      if (status === 'seated') { update.seatedAt = new Date(); update.tableId = tableId || null; update.tableName = tableName || null; }
+      if (status === 'cancelled') update.cancelledAt = new Date();
+      if (status === 'no-show') update.noShowAt = new Date();
+    }
+    if (partySize != null) update.partySize = Math.max(1, Number(partySize) || 1);
+    if (quotedWait !== undefined) update.quotedWait = quotedWait === '' || quotedWait == null ? null : Number(quotedWait);
+    if (notes !== undefined) update.notes = notes ? String(notes).trim() : null;
+    if (name) update.name = String(name).trim();
+    if (phone !== undefined) update.phone = phone ? String(phone).trim() : null;
+
+    await db.collection('waitlist').doc(entryId).update(update);
+    res.json({ success: true, id: entryId, ...update });
+  } catch (error) {
+    console.error('Waitlist update error:', error);
+    res.status(500).json({ error: 'Failed to update waitlist entry' });
+  }
+});
+
+// Notify a waiting party (WhatsApp) that their table is ready. Reuses the same
+// per-restaurant WhatsApp credential resolution as the order-ready alert.
+app.post('/api/waitlist/:restaurantId/:entryId/notify', authenticateToken, async (req, res) => {
+  try {
+    if (!(await checkFeaturePermission(req, 'tables', 'update'))) {
+      return res.status(403).json({ error: 'Access denied. Tables update permission required.' });
+    }
+    const { restaurantId, entryId } = req.params;
+    const entryDoc = await db.collection('waitlist').doc(entryId).get();
+    if (!entryDoc.exists) return res.status(404).json({ error: 'Waitlist entry not found.' });
+    const entry = entryDoc.data();
+    if (!entry.phone) return res.status(400).json({ error: 'No phone number on file for this guest.' });
+
+    const restDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
+    const restaurantName = restDoc.exists ? (restDoc.data().name || restDoc.data().restaurantName || 'the restaurant') : 'the restaurant';
+
+    const snapshot = await db.collection(collections.automationSettings)
+      .where('restaurantId', '==', restaurantId)
+      .where('type', '==', 'whatsapp')
+      .limit(1)
+      .get();
+    if (snapshot.empty || !snapshot.docs[0].data().connected) {
+      return res.status(400).json({ error: 'WhatsApp is not connected. Connect it in Settings to notify guests.' });
+    }
+    const wa = snapshot.docs[0].data();
+    const credentials = wa.mode === 'dineopen'
+      ? { accessToken: process.env.DINEOPEN_WHATSAPP_ACCESS_TOKEN, phoneNumberId: wa.phoneNumberId || process.env.DINEOPEN_WHATSAPP_PHONE_NUMBER_ID, businessAccountId: process.env.DINEOPEN_WHATSAPP_BUSINESS_ACCOUNT_ID }
+      : { accessToken: wa.accessToken, phoneNumberId: wa.phoneNumberId || process.env.DINEOPEN_WHATSAPP_PHONE_NUMBER_ID, businessAccountId: wa.businessAccountId };
+    if (!credentials.accessToken) return res.status(400).json({ error: 'WhatsApp credentials are missing.' });
+
+    const message = `Hi ${entry.name}! 🎉 Your table at ${restaurantName} is ready. Please head over to the host stand.`;
+    await whatsappService.sendTextMessage(entry.phone, message, credentials);
+    await db.collection('waitlist').doc(entryId).update({ status: 'notified', notifiedAt: new Date() });
+
+    res.json({ success: true, notified: true });
+  } catch (error) {
+    console.error('Waitlist notify error:', error);
+    res.status(500).json({ error: 'Failed to notify guest' });
+  }
+});
+
 app.post('/api/tables/:restaurantId', authenticateToken, async (req, res) => {
   try {
     // Granular permission check: tables.add
