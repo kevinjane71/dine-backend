@@ -17058,6 +17058,141 @@ app.get('/api/tables/:restaurantId', async (req, res) => {
   }
 });
 
+// Turn-time & covers analytics for the Tables page.
+// Purely read-only/additive: aggregates completed orders in a date range into
+// avg table turn time, covers, covers/hour, turns/table and a per-table + peak-hour
+// breakdown. Does not touch any order/billing state.
+app.get('/api/tables/:restaurantId/analytics', authenticateToken, async (req, res) => {
+  try {
+    if (!(await checkFeaturePermission(req, 'analytics', 'read'))) {
+      return res.status(403).json({ error: 'Access denied. Analytics permission required.' });
+    }
+    const { restaurantId } = req.params;
+    const { date, startDate, endDate } = req.query;
+
+    // Resolve the date window (timezone-aware, mirrors the order-history path).
+    const _tz = parseTZ(req);
+    let rangeStart, rangeEnd;
+    if (startDate && endDate) {
+      rangeStart = new Date(startDate);
+      rangeEnd = new Date(endDate);
+    } else if (date) {
+      if (_tz !== undefined) {
+        const b = dateBoundsInTZ(date, _tz);
+        rangeStart = b.start; rangeEnd = b.end;
+      } else {
+        rangeStart = new Date(date);
+        rangeEnd = new Date(date); rangeEnd.setDate(rangeEnd.getDate() + 1);
+      }
+    } else {
+      // Default: today
+      if (_tz !== undefined) {
+        const t = todayInTZ(_tz);
+        rangeStart = t.start; rangeEnd = t.end;
+      } else {
+        rangeStart = new Date(); rangeStart.setHours(0, 0, 0, 0);
+        rangeEnd = new Date(); rangeEnd.setHours(23, 59, 59, 999);
+      }
+    }
+
+    const snapshot = await db.collection(collections.orders)
+      .where('restaurantId', '==', restaurantId)
+      .where('createdAt', '>=', rangeStart)
+      .where('createdAt', '<=', rangeEnd)
+      .get();
+
+    const toDate = (v) => (v && v.toDate) ? v.toDate() : (v ? new Date(v) : null);
+
+    let completedCount = 0;
+    let totalCovers = 0;
+    let totalRevenue = 0;
+    const turnDurations = [];          // minutes, dine-in with valid times only
+    const perTable = {};               // tableKey -> { orders, coversSum, revenue, durations[] }
+    const hourBuckets = new Array(24).fill(0);
+
+    snapshot.forEach(doc => {
+      const o = doc.data() || {};
+      // A "completed" order is one that has a completion timestamp.
+      const completedAt = toDate(o.completedAt);
+      if (!completedAt) return;
+      if (o.status === 'deleted' || o.status === 'expired' || o.status === 'cancelled') return;
+
+      completedCount++;
+      const covers = Number(o.covers) || 1;
+      totalCovers += covers;
+      const revenue = Number(o.finalAmount != null ? o.finalAmount : o.totalAmount) || 0;
+      totalRevenue += revenue;
+
+      const createdAt = toDate(o.createdAt);
+      if (createdAt) {
+        const h = createdAt.getHours();
+        if (h >= 0 && h < 24) hourBuckets[h]++;
+      }
+
+      // Turn time only meaningful for dine-in (a table was occupied then freed).
+      const tableKey = o.tableNumber || o.tableId || null;
+      if (tableKey && createdAt) {
+        const mins = (completedAt - createdAt) / 60000;
+        // Guard against clock skew / stale saved orders: keep 0 < mins <= 24h.
+        if (mins > 0 && mins <= 1440) {
+          turnDurations.push(mins);
+          const key = String(tableKey);
+          if (!perTable[key]) perTable[key] = { table: key, orders: 0, covers: 0, revenue: 0, durations: [] };
+          perTable[key].orders++;
+          perTable[key].covers += covers;
+          perTable[key].revenue += revenue;
+          perTable[key].durations.push(mins);
+        }
+      }
+    });
+
+    const mean = (arr) => arr.length ? arr.reduce((a, b) => a + b, 0) / arr.length : 0;
+    const median = (arr) => {
+      if (!arr.length) return 0;
+      const s = [...arr].sort((a, b) => a - b);
+      const mid = Math.floor(s.length / 2);
+      return s.length % 2 ? s[mid] : (s[mid - 1] + s[mid]) / 2;
+    };
+    const round1 = (n) => Math.round(n * 10) / 10;
+
+    // Active hours = distinct hour buckets that saw at least one order (approx. open hours).
+    const activeHours = hourBuckets.filter(c => c > 0).length || 1;
+    const distinctTables = Object.keys(perTable).length;
+    let peakHour = null, peakCount = -1;
+    hourBuckets.forEach((c, h) => { if (c > peakCount) { peakCount = c; peakHour = h; } });
+
+    const perTableOut = Object.values(perTable)
+      .map(t => ({
+        table: t.table,
+        orders: t.orders,
+        covers: t.covers,
+        revenue: round1(t.revenue),
+        avgTurnMinutes: round1(mean(t.durations)),
+      }))
+      .sort((a, b) => b.orders - a.orders)
+      .slice(0, 50);
+
+    res.json({
+      range: { start: rangeStart, end: rangeEnd },
+      completedOrders: completedCount,
+      totalCovers,
+      totalRevenue: round1(totalRevenue),
+      avgTurnMinutes: round1(mean(turnDurations)),
+      medianTurnMinutes: round1(median(turnDurations)),
+      avgCoversPerOrder: completedCount ? round1(totalCovers / completedCount) : 0,
+      coversPerHour: round1(totalCovers / activeHours),
+      turnsPerTable: distinctTables ? round1(turnDurations.length / distinctTables) : 0,
+      tablesUsed: distinctTables,
+      peakHour,               // 0-23, local hour with most orders
+      peakHourOrders: peakCount < 0 ? 0 : peakCount,
+      perTable: perTableOut,
+    });
+  } catch (error) {
+    console.error('Table analytics error:', error);
+    res.status(500).json({ error: 'Failed to compute table analytics' });
+  }
+});
+
 app.post('/api/tables/:restaurantId', authenticateToken, async (req, res) => {
   try {
     // Granular permission check: tables.add
