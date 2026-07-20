@@ -9483,6 +9483,10 @@ app.post('/api/orders', authenticateOrderCreate, async (req, res) => {
     const orderItems = [];
     let tableSection = null;
     let tableFloorData = null;
+    // Offline-sync flag — defined at handler scope so BOTH the table-claim block
+    // AND the item-availability loop can use it (the item loop at the out-of-stock
+    // check is a sibling scope, so a block-local const would ReferenceError there).
+    const isOfflineSync = req.headers['x-sync-source'] === 'offline';
 
     // Get restaurant document to access embedded menu items
     const restaurantDoc = await getCachedRestDoc(restaurantId);
@@ -14090,9 +14094,12 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
       }
     }
     
-    // Don't allow updates to completed or cancelled orders unless we're completing them or updating payment status
+    // Don't allow updates to completed or cancelled orders unless we're completing
+    // them, updating payment status, or making a harmless metadata-only change
+    // (reassigning the staff attribution on a settled bill — no items/money change).
     const isPaymentUpdate = req.body.paymentStatus || req.body.paidAmount !== undefined || req.body.outstandingAmount !== undefined;
-    if ((currentOrder.status === 'completed' || currentOrder.status === 'cancelled') && status !== 'completed' && !isPaymentUpdate) {
+    const isStaffReassign = req.body.assignedStaff !== undefined;
+    if ((currentOrder.status === 'completed' || currentOrder.status === 'cancelled') && status !== 'completed' && !isPaymentUpdate && !isStaffReassign) {
       return res.status(400).json({ error: 'Cannot update completed or cancelled orders' });
     }
 
