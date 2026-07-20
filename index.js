@@ -16760,9 +16760,12 @@ app.post('/api/tables/:restaurantId/reset-all', authenticateToken, async (req, r
 // Update table details
 app.patch('/api/tables/:tableId', authenticateToken, async (req, res) => {
   try {
-    // Granular permission check: tables.update
-    if (!(await checkFeaturePermission(req, 'tables', 'update'))) {
-      return res.status(403).json({ error: 'Access denied. Tables update permission required.' });
+    // Editing a table's config (name/floor/capacity/section) requires the
+    // "manage" capability — owner/admin by default, grantable to other roles.
+    // (Status changes go through PATCH /:tableId/status which stays on 'update'
+    // so regular staff can still occupy/free/clean tables.)
+    if (!(await checkFeaturePermission(req, 'tables', 'manage'))) {
+      return res.status(403).json({ error: 'Access denied. Table management permission required.' });
     }
     const { tableId } = req.params;
     const { name, floor, capacity, section, restaurantId } = req.body;
@@ -16829,9 +16832,10 @@ app.patch('/api/tables/:tableId', authenticateToken, async (req, res) => {
 // Delete table
 app.delete('/api/tables/:tableId', authenticateToken, async (req, res) => {
   try {
-    // Granular permission check: tables.delete
-    if (!(await checkFeaturePermission(req, 'tables', 'delete'))) {
-      return res.status(403).json({ error: 'Access denied. Tables delete permission required.' });
+    // Deleting a table requires the "manage" capability — owner/admin by
+    // default, grantable to other roles via the staff permission editor.
+    if (!(await checkFeaturePermission(req, 'tables', 'manage'))) {
+      return res.status(403).json({ error: 'Access denied. Table management permission required.' });
     }
     const { tableId } = req.params;
     const { restaurantId } = req.body;
@@ -23972,7 +23976,7 @@ const FEATURE_OPS = {
   inventory: ['read', 'add', 'update', 'delete'],
   menu: ['read', 'add', 'update', 'delete', 'markOutOfStock'],
   orders: ['read', 'update', 'cancel', 'refund', 'completeBill'],
-  tables: ['read', 'add', 'update', 'delete', 'reset'],
+  tables: ['read', 'add', 'update', 'delete', 'reset', 'manage'],
   customers: ['read', 'add', 'update', 'delete'],
   offers: ['read', 'add', 'update', 'delete'],
   bookings: ['read', 'add', 'update', 'delete', 'complete'],
