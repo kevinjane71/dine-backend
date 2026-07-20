@@ -15285,7 +15285,16 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
     // Release table if order is being completed (Complete Billing in edit mode)
     if (status === 'completed' && currentOrder.tableNumber && currentOrder.tableNumber.trim()) {
       try {
-        console.log('🔄 Releasing table due to order completion:', currentOrder.tableNumber);
+        // Auto-dirty: when posSettings.autoDirtyOnPayment is on, a completed
+        // table moves to 'cleaning' (staff must reset it) instead of going
+        // straight back to 'available'. Guarded — any lookup failure falls
+        // back to the normal 'available' release, so billing never breaks.
+        let tableReleaseStatus = 'available';
+        try {
+          const _rdDoc = await getCachedRestDoc(currentOrder.restaurantId);
+          if (_rdDoc.exists && _rdDoc.data()?.posSettings?.autoDirtyOnPayment) tableReleaseStatus = 'cleaning';
+        } catch (_) { /* keep 'available' */ }
+        console.log('🔄 Releasing table due to order completion:', currentOrder.tableNumber, '→', tableReleaseStatus);
         let tableReleased = false;
 
         // FAST PATH: Use stored floorId + tableId from the order
@@ -15293,10 +15302,10 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
           const directRef = db.collection('restaurants').doc(currentOrder.restaurantId)
             .collection('floors').doc(currentOrder.floorId)
             .collection('tables').doc(currentOrder.tableId);
-          await directRef.update({ status: 'available', currentOrderId: null, updatedAt: new Date() });
+          await directRef.update({ status: tableReleaseStatus, currentOrderId: null, updatedAt: new Date() });
           console.log('✅ Table released (direct path):', currentOrder.tableNumber);
           pusherService.triggerTableStatusUpdated(currentOrder.restaurantId, {
-            tableId: currentOrder.tableId, status: 'available', orderId: null, tableNumber: currentOrder.tableNumber,
+            tableId: currentOrder.tableId, status: tableReleaseStatus, orderId: null, tableNumber: currentOrder.tableNumber,
           }).catch(err => console.error('RTDB table-status-updated error:', err));
           tableReleased = true;
         }
@@ -15319,10 +15328,10 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
 
             if (!tablesSnapshot.empty) {
               const tableDoc = tablesSnapshot.docs[0];
-              await tableDoc.ref.update({ status: 'available', currentOrderId: null, updatedAt: new Date() });
+              await tableDoc.ref.update({ status: tableReleaseStatus, currentOrderId: null, updatedAt: new Date() });
               console.log('✅ Table released after order completion:', currentOrder.tableNumber);
               pusherService.triggerTableStatusUpdated(currentOrder.restaurantId, {
-                tableId: tableDoc.id, status: 'available', orderId: null, tableNumber: currentOrder.tableNumber,
+                tableId: tableDoc.id, status: tableReleaseStatus, orderId: null, tableNumber: currentOrder.tableNumber,
               }).catch(err => console.error('RTDB table-status-updated error:', err));
               tableReleased = true;
               break;
@@ -17708,7 +17717,7 @@ app.get('/api/floors/:restaurantId', async (req, res) => {
       const floorTables = [];
       for (const tableDoc of tablesSnapshot.docs) {
         const tableData = tableDoc.data();
-        const tbl = { id: tableDoc.id, ...tableData, currentOrderTotal: null };
+        const tbl = { id: tableDoc.id, ...tableData, currentOrderTotal: null, currentOrderCovers: null };
         floorTables.push(tbl);
         if (tableData.currentOrderId && tableData.status === 'occupied') {
           orderIds.add(tableData.currentOrderId);
@@ -17729,6 +17738,7 @@ app.get('/api/floors/:restaurantId', async (req, res) => {
 
     // Batch-read all orders at once for currentOrderTotal
     const orderTotals = {};
+    const orderCovers = {};
     if (orderIds.size > 0) {
       {
         const orderRefs = [...orderIds].map(id => db.collection(collections.orders).doc(id));
@@ -17742,6 +17752,7 @@ app.get('/api/floors/:restaurantId', async (req, res) => {
             if (doc.exists) {
               const data = doc.data();
               orderTotals[doc.id] = data.finalAmount || data.totalAmount || 0;
+              orderCovers[doc.id] = Number(data.covers) || null;
             }
           });
         }
@@ -17753,6 +17764,9 @@ app.get('/api/floors/:restaurantId', async (req, res) => {
       floor.tables.forEach(tbl => {
         if (tbl.currentOrderId && orderTotals[tbl.currentOrderId] !== undefined) {
           tbl.currentOrderTotal = orderTotals[tbl.currentOrderId];
+        }
+        if (tbl.currentOrderId && orderCovers[tbl.currentOrderId]) {
+          tbl.currentOrderCovers = orderCovers[tbl.currentOrderId];
         }
       });
     }
