@@ -17345,6 +17345,88 @@ app.post('/api/tables/:restaurantId/unmerge', authenticateToken, async (req, res
   }
 });
 
+// Assign (or clear) the server (waiter) on a table. If the table has an active
+// order, the order's waiterId/waiterName are updated too so tip/sales
+// attribution follows. Metadata only — never touches items/money.
+// Pass waiterId=null to clear. Gated on tables.update.
+app.patch('/api/tables/:tableId/assign-server', authenticateToken, async (req, res) => {
+  try {
+    if (!(await checkFeaturePermission(req, 'tables', 'update'))) {
+      return res.status(403).json({ error: 'Access denied. Tables update permission required.' });
+    }
+    const { tableId } = req.params;
+    const { restaurantId, waiterId = null, waiterName = null } = req.body;
+    if (!restaurantId) return res.status(400).json({ error: 'restaurantId is required.' });
+
+    const t = await findTableAcrossFloors(restaurantId, tableId);
+    if (!t) return res.status(404).json({ error: 'Table not found.' });
+
+    await t.ref.update({
+      waiterId: waiterId || null,
+      waiterName: waiterName || null,
+      updatedAt: new Date(),
+    });
+
+    // Keep the active order's attribution in sync.
+    if (t.data.currentOrderId) {
+      try {
+        await db.collection(collections.orders).doc(t.data.currentOrderId).update({
+          waiterId: waiterId || null,
+          waiterName: waiterName || null,
+          updatedAt: new Date(),
+        });
+      } catch (e) { console.error('Assign-server: order sync failed (non-blocking):', e.message); }
+    }
+
+    pusherService.triggerTableStatusUpdated(restaurantId, {
+      tableId, status: t.data.status || 'available', tableNumber: t.data.name,
+    }).catch(() => {});
+
+    res.json({ success: true, tableId, waiterId: waiterId || null, waiterName: waiterName || null });
+  } catch (error) {
+    console.error('Assign server error:', error);
+    res.status(500).json({ error: 'Failed to assign server' });
+  }
+});
+
+// Assign a server to every table in a section (or floor). Convenience bulk
+// version of assign-server. Body: { restaurantId, section?, floorId?, waiterId, waiterName }.
+app.post('/api/tables/:restaurantId/assign-section-server', authenticateToken, async (req, res) => {
+  try {
+    if (!(await checkFeaturePermission(req, 'tables', 'update'))) {
+      return res.status(403).json({ error: 'Access denied. Tables update permission required.' });
+    }
+    const { restaurantId } = req.params;
+    const { section = null, floorId = null, waiterId = null, waiterName = null } = req.body;
+    if (!section && !floorId) return res.status(400).json({ error: 'section or floorId is required.' });
+
+    const floorsSnap = await db.collection('restaurants').doc(restaurantId).collection('floors').get();
+    let assigned = 0;
+    for (const floorDoc of floorsSnap.docs) {
+      if (floorId && floorDoc.id !== floorId) continue;
+      const tablesSnap = await db.collection('restaurants').doc(restaurantId)
+        .collection('floors').doc(floorDoc.id).collection('tables').get();
+      for (const tableDoc of tablesSnap.docs) {
+        const td = tableDoc.data();
+        if (section && (td.section || null) !== section) continue;
+        await tableDoc.ref.update({ waiterId: waiterId || null, waiterName: waiterName || null, updatedAt: new Date() });
+        if (td.currentOrderId) {
+          try {
+            await db.collection(collections.orders).doc(td.currentOrderId).update({
+              waiterId: waiterId || null, waiterName: waiterName || null, updatedAt: new Date(),
+            });
+          } catch (_) { /* non-blocking */ }
+        }
+        assigned++;
+      }
+    }
+    res.json({ success: true, assigned, waiterId: waiterId || null, waiterName: waiterName || null });
+  } catch (error) {
+    console.error('Assign section server error:', error);
+    res.status(500).json({ error: 'Failed to assign server to section' });
+  }
+});
+
 app.post('/api/tables/:restaurantId', authenticateToken, async (req, res) => {
   try {
     // Granular permission check: tables.add
