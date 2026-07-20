@@ -14206,9 +14206,18 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
           // was placed can't silently alter a completed total or revert a manual
           // price edit. Only for lines already on the completed order; genuinely
           // new lines added during the edit still price at the current menu.
-          const isSettledExistingLine = currentOrder.status === 'completed' && existingItem && typeof existingItem.basePrice === 'number';
+          const isSettledExistingLine = currentOrder.status === 'completed' && !!existingItem;
+          // Prefer the order's own stored basePrice (server-authoritative); fall
+          // back to the FE-preserved price for legacy lines without a stored base.
+          const settledBasePrice = typeof existingItem?.basePrice === 'number' ? existingItem.basePrice
+            : (fePricePatch !== null ? fePricePatch : null);
 
-          if (selectedVariant && typeof selectedVariant.price === 'number') {
+          if (isSettledExistingLine && settledBasePrice !== null) {
+            // Settled line (incl. variants) — keep the billed price; never re-price
+            // to today's menu (which would silently change a completed total).
+            resolvedBasePrice = settledBasePrice;
+            expectedMenuPricePatch = settledBasePrice;
+          } else if (selectedVariant && typeof selectedVariant.price === 'number') {
             // Variant selected — validate against menu
             // Prefer name match; only fall back to price match when name is absent
             const matchedVariant = (menuItem.variants || []).find(v =>
@@ -14216,9 +14225,6 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
             );
             resolvedBasePrice = matchedVariant ? matchedVariant.price : selectedVariant.price;
             expectedMenuPricePatch = resolvedBasePrice; // variant price is the expected price
-          } else if (isSettledExistingLine) {
-            resolvedBasePrice = existingItem.basePrice;
-            expectedMenuPricePatch = existingItem.basePrice;
           } else if (allowPriceEditPatch && fePricePatch !== null) {
             // Price edit enabled — trust FE price
             resolvedBasePrice = fePricePatch;
@@ -15290,8 +15296,10 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
       }
     }
 
-    // Release table if order is being completed (Complete Billing in edit mode)
-    if (status === 'completed' && currentOrder.tableNumber && currentOrder.tableNumber.trim()) {
+    // Release table on FIRST completion only. Re-editing an already-completed
+    // order must NOT re-release — the table may since have been re-seated by a
+    // new order, and re-releasing would free that live table / null its order.
+    if (status === 'completed' && currentOrder.status !== 'completed' && currentOrder.tableNumber && currentOrder.tableNumber.trim()) {
       try {
         // Auto-dirty: when posSettings.autoDirtyOnPayment is on, a completed
         // table moves to 'cleaning' (staff must reset it) instead of going
