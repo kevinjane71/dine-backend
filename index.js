@@ -13304,10 +13304,15 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
           const fePricePatch = typeof cleanItem.basePrice === 'number' ? cleanItem.basePrice
             : (typeof cleanItem.price === 'number' ? cleanItem.price : null);
 
-          if (preserveBilledPrice && fePricePatch !== null) {
-            // Settled line — trust the billed price the FE preserved (also for variants).
-            resolvedBasePrice = fePricePatch;
-            expectedMenuPricePatch = fePricePatch;
+          // Prefer the order's own stored basePrice (server-authoritative, not
+          // FE-claimed); fall back to the FE-preserved price for legacy lines.
+          const settledBasePrice = typeof existingItem?.basePrice === 'number' ? existingItem.basePrice
+            : (fePricePatch !== null ? fePricePatch : null);
+
+          if (preserveBilledPrice && settledBasePrice !== null) {
+            // Settled line (incl. variants) — keep the billed price; never re-price.
+            resolvedBasePrice = settledBasePrice;
+            expectedMenuPricePatch = settledBasePrice;
           } else if (selectedVariant && typeof selectedVariant.price === 'number') {
             // Variant selected — validate against menu
             // Prefer name match; only fall back to price match when name is absent
