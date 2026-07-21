@@ -13474,7 +13474,21 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
     if (paymentMethod) updateData.paymentMethod = paymentMethod;
     if (status) updateData.status = status;
     if (paymentStatus) updateData.paymentStatus = paymentStatus;
-    if (completedAt) updateData.completedAt = new Date(completedAt);
+    if (completedAt) {
+      // completedAt may arrive as a date string/number, a Firestore Timestamp
+      // instance, or a serialized Timestamp object ({_seconds}/{seconds}) — the
+      // last case is what the order-history edit re-sends. `new Date({object})`
+      // yields an Invalid Date, which Firestore rejects on save ("seconds is not
+      // a valid integer"). Parse robustly and only set when it's a valid date.
+      const _ca = completedAt;
+      const _caDate = (_ca && typeof _ca.toDate === 'function') ? _ca.toDate()
+        : (_ca && typeof _ca._seconds === 'number') ? new Date(_ca._seconds * 1000)
+        : (_ca && typeof _ca.seconds === 'number') ? new Date(_ca.seconds * 1000)
+        : new Date(_ca);
+      if (_caDate instanceof Date && !isNaN(_caDate.getTime())) {
+        updateData.completedAt = _caDate;
+      }
+    }
     if (customerInfo) updateData.customerInfo = customerInfo;
     if (specialInstructions !== undefined) updateData.specialInstructions = specialInstructions;
     if (lastUpdatedBy) updateData.lastUpdatedBy = lastUpdatedBy;
