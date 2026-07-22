@@ -126,6 +126,7 @@ const bucket = lazyInit(() => {
 
 const { db, collections } = require('./firebase');
 const { FieldValue } = require('firebase-admin/firestore');
+const categoryTree = require('./utils/categoryTree');
 const performanceOptimizer = require('./middleware/performanceOptimizer');
 const firestoreOptimizer = require('./utils/firestoreOptimizer');
 const { kvGet, kvSet, kvDel, getCachedRestaurant, invalidateRestaurantCache, invalidateUserCache } = require('./utils/kvCache');
@@ -413,10 +414,13 @@ function updateDailyStats(restaurantId, order, operation, tzOffset, dayStartHour
         update[`itemCounts.${key}.revenue`] = FieldValue.increment(val.revenue);
       }
 
-      // Category breakdown — track sales per category
+      // Category breakdown — track sales per category. Key by the LEAF category
+      // (subCategory when present, else category) so hierarchical stores can roll
+      // it up under parents at read time; flat stores (no subCategory) are
+      // unchanged. Uses only the item's own fields — no tree needed here.
       const catCounts = {};
       order.items.forEach(item => {
-        const cat = (item.category || 'Uncategorized').replace(/[.\/]/g, '_');
+        const cat = (item.subCategory || item.category || 'Uncategorized').replace(/[.\/]/g, '_');
         if (!catCounts[cat]) catCounts[cat] = { itemsSold: 0, revenue: 0 };
         catCounts[cat].itemsSold += (item.quantity || 1) * sign;
         catCounts[cat].revenue += ((item.price || 0) * (item.quantity || 1)) * sign;
@@ -2738,6 +2742,10 @@ const tryParseStructuredCSV = (buffer, fileName) => {
     const priceKey = findOrig(priceCol);
     const catCol = headers.find(h => /^(category_?name|category|type|group|section)$/i.test(h));
     const catKey = catCol ? findOrig(catCol) : null;
+    // Optional sub-category column (e.g. "Sub Category", "Subcategory", "Sub-Category").
+    // When present, the sub-category nests under the row's category.
+    const subCatCol = headers.find(h => /^(sub[\s_-]?category([\s_-]?name)?|sub[\s_-]?section|sub[\s_-]?type)$/i.test(h));
+    const subCatKey = subCatCol ? findOrig(subCatCol) : null;
     const nameArCol = headers.find(h => /^(name_?ar|arabic_?name|arabic|namear)$/i.test(h));
     const nameArKey = nameArCol ? findOrig(nameArCol) : null;
     const isVegCol = headers.find(h => /^(is_?veg|veg|vegetarian)$/i.test(h));
@@ -2770,10 +2778,14 @@ const tryParseStructuredCSV = (buffer, fileName) => {
 
       const price = parseFloat(row[priceKey]) || 0;
       const categoryName = catKey ? String(row[catKey] || '').trim() : 'Other';
+      const subCategoryName = subCatKey ? String(row[subCatKey] || '').trim() : '';
 
-      // Collect categories
+      // Collect categories (parent), then the sub-category nested under it.
       if (categoryName && !categoriesMap.has(categoryName)) {
         categoriesMap.set(categoryName, { name: categoryName, order: categoriesMap.size + 1 });
+      }
+      if (subCategoryName && !categoriesMap.has(subCategoryName)) {
+        categoriesMap.set(subCategoryName, { name: subCategoryName, parentName: categoryName || null, order: categoriesMap.size + 1 });
       }
 
       // Collect variants from variant columns or JSON variants column
@@ -2808,6 +2820,7 @@ const tryParseStructuredCSV = (buffer, fileName) => {
         description: descKey ? String(row[descKey] || '').trim() : '',
         price,
         category: categoryName,
+        subCategory: subCategoryName || null,
         isVeg,
         shortCode: String(shortCode++),
         variants,
@@ -3282,11 +3295,12 @@ const extractMenuFromImage = async (imageUrl, businessType = 'restaurant') => {
 STEP 1 – CATEGORIES FROM THE MENU (PRIORITY):
 - Menus are usually organized by SECTION HEADERS (e.g. "Starters", "Main Course", "Beverages", "Desserts", "Rice", "Breads", "Curries", "Chinese", "Pizza", custom names like "Chef Specials", "Today’s Special", etc.).
 - FIRST list ALL section/section headers you see in the menu, in the ORDER they appear. Use the EXACT name as written (e.g. "Starters", "Main Course", "Tandoor", "Indian Breads").
+- NESTED SECTIONS (sub-categories): many menus group sections under a bigger heading — e.g. "Beverages" containing sub-sections "Cognac", "Gin", "Whisky"; or "Food" containing "Starters", "Mains". When a section clearly sits UNDER a bigger heading, still list it as its own category but add "parentName" set to the EXACT bigger heading (e.g. { "name": "Cognac", "parentName": "Beverages" }). Top-level sections omit parentName (or use null). Preserve as many levels as the menu shows (a sub-section can itself have a parentName that is another sub-section).
 - If the menu has NO section headers at all, use: "categories": []
 - DO NOT use a fixed list – use ONLY the category/section names that appear in THIS menu.
 
 STEP 2 – MENU ITEMS WITH VARIANTS:
-- Extract EVERY menu item. For each item, set "category" to the EXACT section name under which it appears (must match one of the names in "categories").
+- Extract EVERY menu item. For each item, set "category" to the EXACT section name under which it appears (must match one of the names in "categories"). When the item sits under a nested sub-section, set "category" to the MOST SPECIFIC (deepest) sub-section name (e.g. "Cognac", not "Beverages").
 - If the menu has no sections (categories: []), set each item’s "category" to "Other".
 
 IMPORTANT – VARIANTS DETECTION:
@@ -7630,9 +7644,19 @@ app.get('/api/menus/:restaurantId', async (req, res) => {
     // Filter only active items
     menuItems = menuItems.filter(item => item.status === 'active');
 
+    // Include the category tree (id, name, emoji, parentId, displayOrder) so the
+    // POS can render sub-category drill-down. Additive + backward compatible:
+    // clients that ignore it are unaffected; a flat store just has no parentId,
+    // so the POS falls back to deriving flat categories from item.category.
+    // Prefer the canonical CRUD list (restaurantData.categories); fall back to
+    // the embedded menu.categories for older stores that only have that one.
+    const categories = Array.isArray(restaurantData.categories) && restaurantData.categories.length
+      ? restaurantData.categories
+      : (Array.isArray(menuData.categories) ? menuData.categories : []);
+
     // Cache at Vercel Edge for 1 min, serve stale for 30s while revalidating
     res.set('Cache-Control', 'public, s-maxage=60, stale-while-revalidate=30');
-    res.json({ menuItems, hasDefaultMenu: !!restaurantData.hasDefaultMenu });
+    res.json({ menuItems, categories, hasDefaultMenu: !!restaurantData.hasDefaultMenu });
 
   } catch (error) {
     console.error('Get menu error:', error);
@@ -12242,7 +12266,7 @@ app.get('/api/analytics/:restaurantId/daily-summary', authenticateToken, async (
           const refundAdj = (order.refundAmount && order.status !== 'refunded') ? order.refundAmount : 0;
           if (order.items && Array.isArray(order.items)) {
             order.items.forEach(item => {
-              const cat = item.category || 'Uncategorized';
+              const cat = item.subCategory || item.category || 'Uncategorized';
               if (!categoryMap[cat]) categoryMap[cat] = { itemsSold: 0, revenue: 0 };
               categoryMap[cat].itemsSold += (item.quantity || 1);
               categoryMap[cat].revenue += ((item.price || 0) * (item.quantity || 1));
@@ -12342,8 +12366,8 @@ app.get('/api/analytics/:restaurantId/daily-summary', authenticateToken, async (
               itemMap[name].qty += (item.quantity || 1);
               itemMap[name].revenue += ((item.price || 0) * (item.quantity || 1));
             }
-            // Category breakdown
-            const cat = item.category || 'Uncategorized';
+            // Category breakdown (leaf = subCategory when present, else category)
+            const cat = item.subCategory || item.category || 'Uncategorized';
             if (!categoryMap[cat]) categoryMap[cat] = { itemsSold: 0, revenue: 0 };
             categoryMap[cat].itemsSold += (item.quantity || 1);
             categoryMap[cat].revenue += ((item.price || 0) * (item.quantity || 1));
@@ -12420,6 +12444,27 @@ app.get('/api/analytics/:restaurantId/daily-summary', authenticateToken, async (
       }
     }
 
+    // Build the category breakdown, then nest it under parent categories when
+    // the store has a hierarchy (additive: flat stores get the same flat list).
+    let categoryBreakdownArr = Object.entries(categoryMap).map(([name, d]) => ({
+      category: name,
+      itemsSold: d.itemsSold,
+      revenue: Math.round(d.revenue * 100) / 100,
+      percentage: totalRevenueWithTax > 0 ? Math.round((d.revenue / totalRevenueWithTax) * 10000) / 100 : 0
+    })).sort((a, b) => b.revenue - a.revenue);
+    try {
+      const { data: rdCats } = await getCachedRestaurant(db, collections.restaurants, restaurantId);
+      const catsList = (rdCats && Array.isArray(rdCats.categories)) ? rdCats.categories : [];
+      const nested = categoryTree.buildCategoryReport(categoryBreakdownArr, catsList);
+      categoryBreakdownArr = nested.map(r => ({
+        ...r,
+        revenue: Math.round((r.revenue || 0) * 100) / 100,
+        percentage: totalRevenueWithTax > 0 ? Math.round((r.revenue / totalRevenueWithTax) * 10000) / 100 : 0
+      }));
+    } catch (catErr) {
+      console.error('Category hierarchy rollup error (non-blocking):', catErr.message);
+    }
+
     res.json({
       success: true,
       summary: {
@@ -12433,12 +12478,7 @@ app.get('/api/analytics/:restaurantId/daily-summary', authenticateToken, async (
         hourlyBreakdown,
         dailyRevenue: dates.length > 1 ? dailyRevenue : undefined,
         uniqueCustomers: customerSet.size,
-        categoryBreakdown: Object.entries(categoryMap).map(([name, d]) => ({
-          category: name,
-          itemsSold: d.itemsSold,
-          revenue: Math.round(d.revenue * 100) / 100,
-          percentage: totalRevenueWithTax > 0 ? Math.round((d.revenue / totalRevenueWithTax) * 10000) / 100 : 0
-        })).sort((a, b) => b.revenue - a.revenue),
+        categoryBreakdown: categoryBreakdownArr,
         paymentBreakdown: Object.entries(paymentMap).map(([method, d]) => ({
           method,
           transactions: d.transactions,
@@ -15886,15 +15926,34 @@ app.post('/api/menus/bulk-save/:restaurantId', authenticateToken, async (req, re
     // This saves 10-20s of Pexels API calls per bulk-save. imageKeyword is still preserved on each item.
     const imageMap = {};
 
-    // Merge extracted categories into restaurant.categories (by unique id)
+    // Merge extracted categories into restaurant.categories (by unique id).
+    // Sub-category support: an extracted category may carry `parentName` (the
+    // section it nests under, e.g. Cognac under Beverages). We resolve it to a
+    // parentId and create the parent stub if the extraction didn't list it as
+    // its own row. Backward compatible: no parentName => flat top-level category.
     for (const c of extractedCategories) {
       const name = (c && c.name) ? String(c.name).trim() : '';
       if (!name) continue;
       const id = categoryNameToId(name);
       if (!id) continue;
-      if (!existingCategories.some(cat => (cat.id || '').toLowerCase() === id)) {
-        existingCategories.push({ id, name, emoji: '🍽️', description: '' });
-        console.log('📂 Merged extracted category:', id, name);
+      let parentId = null;
+      const parentName = (c && (c.parentName || c.parent)) ? String(c.parentName || c.parent).trim() : '';
+      if (parentName) {
+        const pid = categoryNameToId(parentName);
+        if (pid && pid !== id) {
+          parentId = pid;
+          if (!existingCategories.some(cat => (cat.id || '').toLowerCase() === pid)) {
+            existingCategories.push({ id: pid, name: parentName, emoji: '🍽️', description: '', parentId: null });
+            console.log('📂 Created parent category from extraction:', pid, parentName);
+          }
+        }
+      }
+      const existing = existingCategories.find(cat => (cat.id || '').toLowerCase() === id);
+      if (!existing) {
+        existingCategories.push({ id, name, emoji: '🍽️', description: '', parentId: parentId || null });
+        console.log('📂 Merged extracted category:', id, name, parentId ? `(under ${parentId})` : '');
+      } else if (parentId && !existing.parentId) {
+        existing.parentId = parentId; // backfill newly-known parent link
       }
     }
     // Ensure 'other' exists for items without a matching category
@@ -15914,6 +15973,10 @@ app.post('/api/menus/bulk-save/:restaurantId', authenticateToken, async (req, re
         const rawCat = (item.category != null && item.category !== '') ? String(item.category).trim() : '';
         const resolvedId = rawCat ? categoryNameToId(rawCat) : '';
         const categoryId = (resolvedId && validCategoryIds.has(resolvedId)) ? resolvedId : 'other';
+        // Sub-category (leaf) if the extraction provided one and it's a known category
+        const rawSub = (item.subCategory != null && item.subCategory !== '') ? String(item.subCategory).trim() : '';
+        const resolvedSubId = rawSub ? categoryNameToId(rawSub) : '';
+        const subCategoryId = (resolvedSubId && validCategoryIds.has(resolvedSubId)) ? resolvedSubId : null;
 
         // Process variants if present
         let variants = [];
@@ -15947,6 +16010,7 @@ app.post('/api/menus/bulk-save/:restaurantId', authenticateToken, async (req, re
           description: item.description || '',
           price: basePrice,
           category: categoryId,
+          subCategory: subCategoryId,
           isVeg: Boolean(item.isVeg),
           spiceLevel: item.spiceLevel || 'medium',
           allergens: Array.isArray(item.allergens) ? item.allergens : [],
@@ -20599,14 +20663,26 @@ app.get('/api/invoices/:restaurantId', authenticateToken, async (req, res) => {
  * Filter out items excluded from KOT printing by category or item ID.
  * Returns items unchanged when the feature is disabled.
  */
-function filterKotExcludedItems(items, printSettings) {
+function filterKotExcludedItems(items, printSettings, catIndex) {
   if (!printSettings?.kotExclusionEnabled) return items;
-  const excludedCats = new Set(printSettings.kotExcludedCategories || []);
+  const rawExcludedCats = printSettings.kotExcludedCategories || [];
   const excludedIds = new Set(printSettings.kotExcludedItemIds || []);
-  if (excludedCats.size === 0 && excludedIds.size === 0) return items;
+  if (rawExcludedCats.length === 0 && excludedIds.size === 0) return items;
+  const hasTree = catIndex && catIndex.hasTree;
+  // Legacy EXACT set — preserves the pre-existing flat-store behavior byte-for-byte.
+  const excludedExact = new Set(rawExcludedCats);
+  // Lowercased set — used ONLY for the hierarchical (tree) ancestor match below.
+  const excludedLower = hasTree ? new Set(rawExcludedCats.map(c => (c || '').toString().toLowerCase().trim())) : null;
   return items.filter(item => {
     if (excludedIds.has(item.id || item.menuItemId)) return false;
-    if (excludedCats.has(item.categoryId)) return false;
+    // Hierarchical stores only: exclude if the item's category OR any ancestor
+    // is excluded (so excluding a parent category excludes its whole sub-tree).
+    if (hasTree) {
+      const path = categoryTree.resolveCategoryPath(item, catIndex);
+      if (path.some(n => excludedLower.has((n.id || '').toString().toLowerCase().trim()) || excludedLower.has((n.name || '').toString().toLowerCase().trim()))) return false;
+    }
+    // Legacy exact behavior — unchanged for flat stores.
+    if (excludedExact.has(item.categoryId)) return false;
     return true;
   });
 }
@@ -20617,8 +20693,9 @@ function filterKotExcludedItems(items, printSettings) {
  * If no print stations configured, returns single group with all items.
  */
 function splitOrderByPrintStation(orderItems, printStations, restaurantCategories, printSettings) {
-  // KOT Exclusion: remove excluded items before station routing
-  orderItems = filterKotExcludedItems(orderItems || [], printSettings);
+  // KOT Exclusion: remove excluded items before station routing (ancestor-aware)
+  const kotCatIndex = categoryTree.buildCategoryIndex(restaurantCategories || []);
+  orderItems = filterKotExcludedItems(orderItems || [], printSettings, kotCatIndex);
 
   if (!printStations || printStations.length === 0 || !orderItems || orderItems.length === 0) {
     return orderItems && orderItems.length > 0
@@ -20637,20 +20714,36 @@ function splitOrderByPrintStation(orderItems, printStations, restaurantCategorie
     if (cat.name) nameToId[cat.name.toLowerCase().trim()] = cat.id;
   }
 
-  // Build categoryId → station lookup
+  // Build categoryId → station lookup (station.categoryIds are category slug ids)
+  const catIndex = kotCatIndex;
   const catToStation = {};
   let defaultStation = enabledStations.find(s => s.isDefault) || enabledStations[0];
   for (const station of enabledStations) {
     for (const catId of (station.categoryIds || [])) {
-      catToStation[catId] = station;
+      catToStation[catId] = station; // exact key — preserves legacy flat behavior
     }
   }
 
-  // Group items by resolved station
+  // Group items by resolved station. For a hierarchical menu, an item routes to
+  // the station configured for its category OR any ANCESTOR — so assigning a
+  // parent category (e.g. "Beverages") to a station also routes every
+  // sub-category under it (Cognac, Gin…). Flat stores use the exact legacy match.
   const groups = {};
   for (const item of orderItems) {
-    const catId = item.categoryId || nameToId[item.category?.toLowerCase()?.trim()] || item.category;
-    const station = catToStation[catId] || defaultStation;
+    let station = null;
+    if (catIndex.hasTree) {
+      const path = categoryTree.resolveCategoryPath(item, catIndex); // [root…leaf]
+      // Prefer the most specific (leaf) station config, walking up to the root.
+      for (let i = path.length - 1; i >= 0 && !station; i--) {
+        station = catToStation[path[i].id] || catToStation[path[i].name];
+      }
+    }
+    if (!station) {
+      // Legacy exact behavior — unchanged for flat stores.
+      const catId = item.categoryId || nameToId[item.category?.toLowerCase()?.trim()] || item.category;
+      station = catToStation[catId];
+    }
+    station = station || defaultStation;
     if (!station) continue;
     if (!groups[station.id]) {
       groups[station.id] = { stationId: station.id, stationName: station.name, items: [] };
@@ -21723,8 +21816,8 @@ app.get('/api/kot/render/:restaurantId/:orderId', async (req, res) => {
       items = items.filter(item => item.isNew === true || item.isUpdated === true);
     }
 
-    // KOT Exclusion: filter out excluded items
-    items = filterKotExcludedItems(items, printSettings);
+    // KOT Exclusion: filter out excluded items (ancestor-aware for tree menus)
+    items = filterKotExcludedItems(items, printSettings, categoryTree.buildCategoryIndex(restaurantData.categories || []));
     if (items.length === 0) {
       return res.json({ success: true, empty: true, reason: 'all_items_excluded' });
     }
