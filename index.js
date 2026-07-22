@@ -9567,8 +9567,14 @@ app.post('/api/orders', async (req, res) => {
     }
 
     for (const item of items) {
-      // Check if this is a custom item (added via "Add Custom Item" when price edit is enabled)
-      const isCustomItem = allowPriceEdit && typeof item.menuItemId === 'string' && item.menuItemId.startsWith('custom-');
+      // Custom item ("Add Custom Item"). Recognized by the FE's isCustomItem flag
+      // OR a `custom-` id prefix — NOT gated on allowPriceEdit. (The FE gates the
+      // feature on posSettings.allowCustomItems; tying it to allowPriceEdit here
+      // caused custom items to fall through to "menu item not found" → 400 → the
+      // client hung on "Processing…". Price is still clamped below.)
+      const isCustomItem = item.isCustomItem === true
+        || (typeof item.menuItemId === 'string' && item.menuItemId.startsWith('custom-'))
+        || (typeof item.id === 'string' && item.id.startsWith('custom-'));
 
       if (isCustomItem) {
         // Custom item — no menu lookup needed, use FE-provided name/price directly
@@ -9588,7 +9594,7 @@ app.post('/api/orders', async (req, res) => {
         totalAmount += itemTotal;
 
         orderItems.push({
-          menuItemId: item.menuItemId,
+          menuItemId: item.menuItemId || item.id || null,
           name: typeof item.name === 'string' ? item.name.substring(0, 200) : 'Custom Item',
           nameAr: typeof item.nameAr === 'string' ? item.nameAr.substring(0, 200) : null,
           price: fePrice,
@@ -13284,8 +13290,11 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
         // Clear any previous KOT diff flags to avoid stale flags from prior updates
         const { isNew: _isNew, isUpdated: _isUpdated, isRemoved: _isRemoved, addedAt: _addedAt, updatedAt: _updatedAt, removedAt: _removedAt, previousQuantity: _prevQty, quantityDelta: _qtyDelta, ...cleanItem } = newItem;
 
-        // Check if this is a custom item (added via "Add Custom Item" when price edit is enabled)
-        const isCustomItemPatch = allowPriceEditPatch && typeof cleanItem.menuItemId === 'string' && cleanItem.menuItemId.startsWith('custom-');
+        // Custom item — recognized by the isCustomItem flag OR a `custom-` id
+        // prefix, NOT gated on allowPriceEdit (see the POST handler note).
+        const isCustomItemPatch = cleanItem.isCustomItem === true
+          || (typeof cleanItem.menuItemId === 'string' && cleanItem.menuItemId.startsWith('custom-'))
+          || (typeof cleanItem.id === 'string' && cleanItem.id.startsWith('custom-'));
 
         // Server-side price resolution (mirrors POST handler logic)
         const menuItem = isCustomItemPatch ? null : menuItems.find(m => m.id === cleanItem.menuItemId);
