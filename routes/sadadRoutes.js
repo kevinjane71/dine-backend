@@ -1,7 +1,13 @@
 /**
- * Sadad Cloud Payment Routes
- * Handles create-order, poll, close, refund, and webhook callback
- * for Sadad/WiseCashier cloud-mode ECR integration.
+ * Sadad Cloud (WiseCashier / PayCloud) ECR Payment Routes
+ *
+ * Endpoints (mounted at /api/sadad):
+ *   POST /create-order          push a payment to the terminal
+ *   GET  /poll/:merchantOrderNo  check status (actively queries Sadad if stale)
+ *   POST /close-order            cancel a pending payment
+ *   POST /refund                 refund a completed payment
+ *   POST /webhook                async result from Sadad (public, signature-verified)
+ *   POST /test                   live connectivity + credential/signing check
  */
 
 const express = require('express');
@@ -11,8 +17,7 @@ const { getCachedRestDoc } = require('../utils/kvCache');
 
 module.exports = (db, collections, authenticateToken) => {
 
-  // ── Helper: load Sadad config from restaurant doc ──
-
+  // ── Load + normalise Sadad config from the restaurant doc ──
   async function loadSadadConfig(restaurantId) {
     const doc = await getCachedRestDoc(db, collections.restaurants, restaurantId);
     if (!doc.exists) throw { status: 404, message: 'Restaurant not found' };
@@ -20,17 +25,23 @@ module.exports = (db, collections, authenticateToken) => {
     const ecr = doc.data().ecrSettings;
     if (!ecr?.enabled) throw { status: 403, message: 'ECR is not enabled for this restaurant' };
     if (ecr.provider !== 'sadad-cloud') throw { status: 400, message: 'Restaurant is not configured for Sadad Cloud' };
-    if (!ecr.sadadMerchantNo || !ecr.sadadTerminalSn) throw { status: 400, message: 'Sadad configuration incomplete' };
+
+    const missing = [];
+    if (!ecr.sadadAppId) missing.push('App ID');
+    if (!ecr.sadadMerchantNo) missing.push('Merchant No');
+    if (!ecr.sadadTerminalSn) missing.push('Terminal SN');
+    if (!ecr.sadadPrivateKey) missing.push('App RSA Private Key');
+    if (missing.length) throw { status: 400, message: `Sadad configuration incomplete: ${missing.join(', ')}` };
 
     return {
-      sadadApiUrl: ecr.sadadApiUrl || 'https://open.sadadpos.com',
-      sadadAppId: ecr.sadadAppId || '',
-      sadadAccessToken: ecr.sadadAccessToken || '',
-      sadadMerchantNo: ecr.sadadMerchantNo,
-      sadadStoreNo: ecr.sadadStoreNo || '',
-      sadadTerminalSn: ecr.sadadTerminalSn,
-      sadadPrivateKey: ecr.sadadPrivateKey || '',
-      sadadPublicKey: ecr.sadadPublicKey || '',
+      apiUrl: ecr.sadadApiUrl || sadadService.SADAD_URLS.PRODUCTION,
+      appId: ecr.sadadAppId,
+      merchantNo: ecr.sadadMerchantNo,
+      storeNo: ecr.sadadStoreNo || '',
+      terminalSn: ecr.sadadTerminalSn,
+      privateKey: ecr.sadadPrivateKey,      // app RSA private key (ours)
+      publicKey: ecr.sadadPublicKey || '',  // gateway RSA public key (Sadad's)
+      currency: ecr.sadadCurrency || 'QAR',
     };
   }
 
@@ -42,38 +53,38 @@ module.exports = (db, collections, authenticateToken) => {
       .doc(merchantOrderNo);
   }
 
-  // ── POST /api/sadad/create-order ──
+  function webhookUrl() {
+    const base = process.env.BACKEND_URL
+      || (process.env.VERCEL_URL ? `https://${process.env.VERCEL_URL}` : 'https://dine-be2-phi.vercel.app');
+    return `${base}/api/sadad/webhook`;
+  }
 
+  // ── POST /create-order ──
   router.post('/create-order', authenticateToken, async (req, res) => {
     const { restaurantId, amount, description, merchantOrderNo } = req.body;
-
     if (!restaurantId || !amount || !merchantOrderNo) {
       return res.status(400).json({ error: 'Missing required fields: restaurantId, amount, merchantOrderNo' });
     }
 
     try {
       const config = await loadSadadConfig(restaurantId);
-
-      // Build notify URL for webhook
-      const backendUrl = process.env.BACKEND_URL
-        || (process.env.VERCEL_URL ? `https://${process.env.VERCEL_URL}` : 'https://dine-be2-phi.vercel.app');
-      const notifyUrl = `${backendUrl}/api/sadad/webhook`;
+      const orderAmount = parseFloat(amount).toFixed(2);
 
       const result = await sadadService.createOrder(config, {
         merchantOrderNo,
-        orderAmount: parseFloat(amount).toFixed(2),
+        orderAmount,
         description: description || 'POS Payment',
-        notifyUrl,
+        notifyUrl: webhookUrl(),
       });
 
-      // Store pending transaction in Firestore
       await txnRef(restaurantId, merchantOrderNo).set({
         merchantOrderNo,
-        transNo: result.trans_no || '',
-        messageId: result.message_id || '',
-        orderAmount: parseFloat(amount).toFixed(2),
-        transStatus: 9, // pending/pre-order
         restaurantId,
+        transNo: result.transNo || '',
+        messageId: result.messageId || '',
+        orderAmount,
+        transStatus: sadadService.TRANS_STATUS.PENDING, // 9 = pre-order
+        terminalOnlineStatus: result.terminalOnlineStatus || '',
         authNo: null,
         cardNetwork: null,
         payUserAccountId: null,
@@ -84,74 +95,56 @@ module.exports = (db, collections, authenticateToken) => {
 
       res.json({
         success: true,
-        transNo: result.trans_no || '',
+        transNo: result.transNo || '',
         merchantOrderNo,
+        terminalOnlineStatus: result.terminalOnlineStatus || '',
         status: 'pending',
       });
     } catch (err) {
-      console.error('Sadad create-order error:', err);
+      console.error('Sadad create-order error:', err.message);
       const status = err.status || 502;
       res.status(status).json({ error: err.message || 'Failed to create Sadad order' });
     }
   });
 
-  // ── GET /api/sadad/poll/:merchantOrderNo ──
-
+  // ── GET /poll/:merchantOrderNo ──
   router.get('/poll/:merchantOrderNo', authenticateToken, async (req, res) => {
     const { merchantOrderNo } = req.params;
     const { restaurantId } = req.query;
-
-    if (!restaurantId) {
-      return res.status(400).json({ error: 'Missing restaurantId query parameter' });
-    }
+    if (!restaurantId) return res.status(400).json({ error: 'Missing restaurantId query parameter' });
 
     try {
       const docRef = txnRef(restaurantId, merchantOrderNo);
       const doc = await docRef.get();
-
-      if (!doc.exists) {
-        return res.status(404).json({ error: 'Transaction not found' });
-      }
+      if (!doc.exists) return res.status(404).json({ error: 'Transaction not found' });
 
       let txn = doc.data();
 
-      // If still pending and last update > 3s ago, actively query Sadad
-      const isPending = txn.transStatus === 9;
+      // Still pending and last update > 3s ago → actively query Sadad.
+      const isPending = txn.transStatus === sadadService.TRANS_STATUS.PENDING;
       const staleMs = Date.now() - (txn.updatedAt?.toDate?.()?.getTime?.() || 0);
 
       if (isPending && staleMs > 3000) {
         try {
           const config = await loadSadadConfig(restaurantId);
-          const result = await sadadService.queryOrder(config, merchantOrderNo);
+          const q = await sadadService.queryOrder(config, merchantOrderNo);
+          console.log(`[Sadad] poll query ${merchantOrderNo} → trans_status=${q.transStatus} (${q.status})`);
 
-          const newStatus = parseInt(result.trans_status, 10);
-          const update = {
-            transStatus: newStatus,
-            updatedAt: new Date(),
-          };
-
-          // Fill in details if available
-          if (result.auth_no) update.authNo = result.auth_no;
-          if (result.card_network) update.cardNetwork = result.card_network;
-          if (result.pay_user_account_id) update.payUserAccountId = result.pay_user_account_id;
+          const update = { transStatus: q.transStatus, updatedAt: new Date() };
+          if (q.authNo) update.authNo = q.authNo;
+          if (q.cardNetwork) update.cardNetwork = q.cardNetwork;
+          if (q.payUserAccountId) update.payUserAccountId = q.payUserAccountId;
+          if (q.transNo) update.transNo = q.transNo;
 
           await docRef.update(update);
           txn = { ...txn, ...update };
         } catch (queryErr) {
-          // Query failed — return last known status from Firestore
-          console.error('Sadad poll query error (returning cached):', queryErr.message);
+          console.error('[Sadad] poll query failed (returning cached):', queryErr.message);
         }
       }
 
-      // Map transStatus to a simple string
-      let status = 'pending';
-      if (txn.transStatus === 2) status = 'success';
-      else if (txn.transStatus === 11) status = 'failed';
-      else if (txn.transStatus === 13) status = 'cancelled';
-      else if (txn.transStatus === 14 || txn.transStatus === 17) status = 'refunded';
-
       res.json({
-        status,
+        status: sadadService.mapTransStatus(txn.transStatus),
         transStatus: txn.transStatus,
         transNo: txn.transNo || '',
         merchantOrderNo: txn.merchantOrderNo,
@@ -161,45 +154,34 @@ module.exports = (db, collections, authenticateToken) => {
         payUserAccountId: txn.payUserAccountId || '',
       });
     } catch (err) {
-      console.error('Sadad poll error:', err);
-      const status = err.status || 500;
-      res.status(status).json({ error: err.message || 'Failed to poll transaction' });
+      console.error('Sadad poll error:', err.message);
+      res.status(err.status || 500).json({ error: err.message || 'Failed to poll transaction' });
     }
   });
 
-  // ── POST /api/sadad/close-order ──
-
+  // ── POST /close-order ──
   router.post('/close-order', authenticateToken, async (req, res) => {
     const { restaurantId, merchantOrderNo } = req.body;
-
-    if (!restaurantId || !merchantOrderNo) {
-      return res.status(400).json({ error: 'Missing required fields' });
-    }
+    if (!restaurantId || !merchantOrderNo) return res.status(400).json({ error: 'Missing required fields' });
 
     try {
       const config = await loadSadadConfig(restaurantId);
       await sadadService.closeOrder(config, merchantOrderNo);
 
-      // Update Firestore
       const docRef = txnRef(restaurantId, merchantOrderNo);
       const doc = await docRef.get();
-      if (doc.exists) {
-        await docRef.update({ transStatus: 13, updatedAt: new Date() });
-      }
+      if (doc.exists) await docRef.update({ transStatus: sadadService.TRANS_STATUS.CANCELLED, updatedAt: new Date() });
 
       res.json({ success: true });
     } catch (err) {
-      console.error('Sadad close-order error:', err);
-      const status = err.status || 502;
-      res.status(status).json({ error: err.message || 'Failed to close order' });
+      console.error('Sadad close-order error:', err.message);
+      res.status(err.status || 502).json({ error: err.message || 'Failed to close order' });
     }
   });
 
-  // ── POST /api/sadad/refund ──
-
+  // ── POST /refund ──
   router.post('/refund', authenticateToken, async (req, res) => {
     const { restaurantId, merchantOrderNo, refundAmount, transNo, description } = req.body;
-
     if (!restaurantId || !merchantOrderNo || !refundAmount || !transNo) {
       return res.status(400).json({ error: 'Missing required fields' });
     }
@@ -212,27 +194,35 @@ module.exports = (db, collections, authenticateToken) => {
         transNo,
         description: description || 'Refund',
       });
-
-      res.json({ success: true, refundTransNo: result.trans_no || '' });
+      res.json({ success: true, refundTransNo: result.refundTransNo });
     } catch (err) {
-      console.error('Sadad refund error:', err);
-      const status = err.status || 502;
-      res.status(status).json({ error: err.message || 'Failed to process refund' });
+      console.error('Sadad refund error:', err.message);
+      res.status(err.status || 502).json({ error: err.message || 'Failed to process refund' });
     }
   });
 
-  // ── POST /api/sadad/webhook — Public endpoint, signature-verified ──
-
+  // ── POST /webhook — public, signature-verified async result ──
+  // ⚠ Exact notify payload shape needs Sadad confirmation. We parse defensively:
+  //   the business fields may be flat on the body OR nested in a `data` JSON string.
   router.post('/webhook', async (req, res) => {
-    const payload = req.body;
-    const merchantOrderNo = payload.merchant_order_no;
-    const transStatus = parseInt(payload.trans_status, 10);
+    const body = req.body || {};
+
+    // Business fields may be flat or nested inside a stringified `data`.
+    let biz = body;
+    if (typeof body.data === 'string' && body.data.length) {
+      try { biz = { ...body, ...JSON.parse(body.data) }; } catch (e) { /* keep flat */ }
+    } else if (body.data && typeof body.data === 'object') {
+      biz = { ...body, ...body.data };
+    }
+
+    const merchantOrderNo = biz.merchant_order_no || body.merchant_order_no;
+    const transStatus = parseInt(biz.trans_status, 10);
 
     console.log('[Sadad Webhook] Received:', JSON.stringify({
       merchant_order_no: merchantOrderNo,
-      trans_status: transStatus,
-      trans_no: payload.trans_no,
-      order_amount: payload.order_amount,
+      trans_status: biz.trans_status,
+      trans_no: biz.trans_no,
+      order_amount: biz.order_amount || biz.trans_amount,
     }));
 
     if (!merchantOrderNo) {
@@ -240,9 +230,7 @@ module.exports = (db, collections, authenticateToken) => {
       return res.status(400).send('missing merchant_order_no');
     }
 
-    // Find the transaction across restaurants (merchant_order_no is globally unique with timestamp)
     try {
-      // Query all restaurants for this merchantOrderNo
       const snapshot = await db.collectionGroup('sadadTransactions')
         .where('merchantOrderNo', '==', merchantOrderNo)
         .limit(1)
@@ -250,87 +238,93 @@ module.exports = (db, collections, authenticateToken) => {
 
       if (snapshot.empty) {
         console.error(`[Sadad Webhook] Transaction not found: ${merchantOrderNo}`);
-        // Still return success to stop retries
-        return res.send('success');
+        return res.send('success'); // stop retries
       }
 
       const txnDoc = snapshot.docs[0];
       const txn = txnDoc.data();
 
-      // Verify signature if we have the public key
-      if (txn.restaurantId) {
+      // Verify signature with the gateway public key when configured.
+      if (txn.restaurantId && body.sign) {
         try {
-          const restaurantDoc = await getCachedRestDoc(db, collections.restaurants, txn.restaurantId);
-          const sadadPublicKey = restaurantDoc.data()?.ecrSettings?.sadadPublicKey;
-          if (sadadPublicKey) {
-            const isValid = sadadService.verifyCallback(payload, sadadPublicKey);
-            if (!isValid) {
-              console.error(`[Sadad Webhook] Invalid signature for ${merchantOrderNo}`);
-              return res.status(400).send('invalid signature');
-            }
+          const rDoc = await getCachedRestDoc(db, collections.restaurants, txn.restaurantId);
+          const pub = rDoc.data()?.ecrSettings?.sadadPublicKey;
+          if (pub && !sadadService.verifySign(body, pub)) {
+            console.error(`[Sadad Webhook] Invalid signature for ${merchantOrderNo}`);
+            return res.status(400).send('invalid signature');
           }
         } catch (verifyErr) {
-          // Log but don't block — signature verification is best-effort if key is misconfigured
-          console.error('[Sadad Webhook] Signature verification error:', verifyErr.message);
+          console.error('[Sadad Webhook] Signature check error:', verifyErr.message);
         }
       }
 
-      // Idempotent: if already in terminal state (success/failed/cancelled), skip update
-      const terminalStatuses = [2, 11, 13, 14, 17];
-      if (terminalStatuses.includes(txn.transStatus) && txn.transStatus !== 9) {
-        console.log(`[Sadad Webhook] Transaction ${merchantOrderNo} already in terminal state ${txn.transStatus}, skipping`);
+      // Idempotent: once in a terminal state, don't overwrite.
+      const TS = sadadService.TRANS_STATUS;
+      const terminal = [TS.SUCCESS, TS.FAILED, TS.CANCELLED, TS.PARTIAL_REFUND, TS.FULL_REFUND];
+      if (terminal.includes(txn.transStatus)) {
+        console.log(`[Sadad Webhook] ${merchantOrderNo} already terminal (${txn.transStatus}), skipping`);
         return res.send('success');
       }
 
-      // Update transaction
+      if (Number.isNaN(transStatus)) {
+        console.error('[Sadad Webhook] Missing/invalid trans_status; leaving as pending');
+        return res.send('success');
+      }
+
       const update = {
         transStatus,
         updatedAt: new Date(),
         webhookReceivedAt: new Date(),
       };
-
-      if (payload.auth_no) update.authNo = payload.auth_no;
-      if (payload.card_network) update.cardNetwork = payload.card_network;
-      if (payload.pay_user_account_id) update.payUserAccountId = payload.pay_user_account_id;
-      if (payload.trans_no) update.transNo = payload.trans_no;
+      if (biz.auth_no || biz.approval_code) update.authNo = biz.auth_no || biz.approval_code;
+      if (biz.card_network || biz.card_org) update.cardNetwork = biz.card_network || biz.card_org;
+      if (biz.pay_user_account_id || biz.card_no) update.payUserAccountId = biz.pay_user_account_id || biz.card_no;
+      if (biz.trans_no) update.transNo = biz.trans_no;
 
       await txnDoc.ref.update(update);
-      console.log(`[Sadad Webhook] Updated ${merchantOrderNo} to status ${transStatus}`);
-
+      console.log(`[Sadad Webhook] Updated ${merchantOrderNo} → ${transStatus} (${sadadService.mapTransStatus(transStatus)})`);
       res.send('success');
     } catch (err) {
-      console.error('[Sadad Webhook] Error:', err);
-      // Return success to prevent retries even on internal error
-      // (we've logged it for debugging)
-      res.send('success');
+      console.error('[Sadad Webhook] Error:', err.message);
+      res.send('success'); // avoid infinite retries; logged for debugging
     }
   });
 
-  // ── POST /api/sadad/test — Test configuration ──
-
+  // ── POST /test — live connectivity + credential/signing check ──
+  // Runs a real Query Order round-trip against a throwaway order number.
+  // Reaching Sadad and getting a structured response back (even a business
+  // "order not found") proves URL + app_id + signing + keys all work.
   router.post('/test', authenticateToken, async (req, res) => {
     const { restaurantId } = req.body;
+    if (!restaurantId) return res.status(400).json({ error: 'Missing restaurantId' });
 
-    if (!restaurantId) {
-      return res.status(400).json({ error: 'Missing restaurantId' });
+    let config;
+    try {
+      config = await loadSadadConfig(restaurantId);
+    } catch (err) {
+      return res.json({ success: false, message: err.message || 'Configuration incomplete' });
     }
 
+    const probeOrderNo = `CONNTEST_${Date.now()}`;
     try {
-      const config = await loadSadadConfig(restaurantId);
-      // Try signing a test request to verify the private key works
-      const testParams = { test: 'true', timestamp: Date.now().toString() };
-      sadadService.signRequest(testParams, config.sadadPrivateKey);
-
-      res.json({
-        success: true,
-        message: 'Sadad configuration is valid. Keys and credentials verified.',
-      });
+      await sadadService.queryOrder(config, probeOrderNo);
+      // Unlikely to succeed for a random order, but if it did, everything works.
+      res.json({ success: true, message: 'Connected to Sadad. Credentials and signing verified.' });
     } catch (err) {
-      console.error('Sadad test error:', err);
-      res.json({
-        success: false,
-        message: err.message || 'Configuration test failed',
-      });
+      // A "business" error means we reached Sadad and it accepted our signed
+      // request (auth + signing OK) but the throwaway order doesn't exist.
+      if (err.kind === 'business') {
+        res.json({
+          success: true,
+          message: `Connected to Sadad. Credentials and signing verified (probe returned: ${err.message}).`,
+        });
+      } else if (err.kind === 'signature') {
+        res.json({ success: false, message: `Signing failed — check the App RSA Private Key. ${err.message}` });
+      } else if (err.kind === 'timeout' || err.kind === 'network') {
+        res.json({ success: false, message: `Cannot reach Sadad (${config.apiUrl}). ${err.message}` });
+      } else {
+        res.json({ success: false, message: err.message || 'Configuration test failed' });
+      }
     }
   });
 

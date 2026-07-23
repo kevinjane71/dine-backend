@@ -7684,7 +7684,9 @@ app.post('/api/menus/:restaurantId', authenticateToken, async (req, res) => {
       shortCode,
       variants,
       customizations,
-      subCategory
+      subCategory,
+      kraItemClassCode,
+      kraTaxBand
     } = req.body;
 
     if (!name || !price || !category) {
@@ -7735,6 +7737,8 @@ app.post('/api/menus/:restaurantId', authenticateToken, async (req, res) => {
       price: parseFloat(price),
       category,
       subCategory: subCategory || null,
+      kraItemClassCode: kraItemClassCode || null,
+      kraTaxBand: kraTaxBand || null,
       isVeg: isVeg || false,
       spiceLevel: spiceLevel || 'medium',
       allergens: allergens || [],
@@ -7921,6 +7925,7 @@ app.patch('/api/menus/item/:id', authenticateToken, async (req, res) => {
     // Update allowed fields
     const allowedFields = [
       'name', 'description', 'price', 'category', 'subCategory', 'isVeg', 'spiceLevel',
+      'kraItemClassCode', 'kraTaxBand',
       'allergens', 'image', 'shortCode', 'status', 'order',
       'isAvailable', 'stockQuantity', 'lowStockThreshold', 'isStockManaged', 'deductionQuantity',
       'availableFrom', 'availableUntil', 'variants', 'customizations', 'modifierGroups',
@@ -19370,6 +19375,10 @@ app.put('/api/admin/tax/:restaurantId', authenticateToken, async (req, res) => {
 // ==================== CURRENCY SETTINGS ====================
 // Currency routes moved to ./routes/currencyRoutes.js
 app.use('/api', currencyRoutes);
+
+// Kenya KRA eTIMS routes — self-contained module, gated on isKenya() per store.
+// Dormant for every non-Kenya store; never affects existing users.
+app.use(require('./routes/etimsRoutes')(db, collections, authenticateToken, validateRestaurantAccess));
 
 // ==================== OWNER CHAIN DASHBOARD ====================
 // Owner dashboard routes for multi-restaurant management
