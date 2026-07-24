@@ -23,21 +23,44 @@ const initializeDodoPaymentRoutes = (db) => {
     }
   };
 
-  // Dodo plan mapping - product IDs from env variables
+  // Dodo plan mapping — product IDs from env variables. Plan keys match the
+  // frontend/Razorpay plan ids so getFeaturesByPlan() applies the same limits.
+  // Prices mirror the public pricing page (dineopen.com/pricing → USD).
+  // Each entry needs a Dodo product created in the Dodo dashboard with the matching
+  // price + billing interval; put the product id in the corresponding env var.
   const DODO_PLANS = {
+    'starter-monthly': {
+      productId: process.env.DODO_PRODUCT_ID_STARTER_MONTHLY || 'pdt_0NjtZoveZfObeCmhTnhHW',
+      name: 'Starter', priceUSD: 20, interval: 'month',
+    },
+    'starter-yearly': {
+      productId: process.env.DODO_PRODUCT_ID_STARTER_YEARLY || 'pdt_0Njta2mM6WZVhhXhxGVYT',
+      name: 'Starter', priceUSD: 215, interval: 'year',
+    },
+    'growth-monthly': {
+      productId: process.env.DODO_PRODUCT_ID_GROWTH_MONTHLY || 'pdt_0Njta82Jh7fqR9Nh6kA0Y',
+      name: 'Growth', priceUSD: 50, interval: 'month',
+    },
+    'growth-yearly': {
+      productId: process.env.DODO_PRODUCT_ID_GROWTH_YEARLY || 'pdt_0NjtaGGIP5s02dYAIZx9t',
+      name: 'Growth', priceUSD: 550, interval: 'year',
+    },
+    'pro-monthly': {
+      productId: process.env.DODO_PRODUCT_ID_PRO_MONTHLY || 'pdt_0NjtaN5OcuQnncb7rS9hK',
+      name: 'Pro', priceUSD: 99, interval: 'month',
+    },
+    'pro-yearly': {
+      productId: process.env.DODO_PRODUCT_ID_PRO_YEARLY || 'pdt_0NjtaS0JWeyjGcITvAnKp',
+      name: 'Pro', priceUSD: 999, interval: 'year',
+    },
+    // Legacy plans — kept so existing Spark/Flame subscribers keep resolving on renewal.
     spark: {
       productId: process.env.DODO_PRODUCT_ID_SPARK || 'pdt_0NYkVJEF5ywGL040N55IY',
-      name: 'Spark',
-      priceUSD: 9.99,
-      priceGBP: 7.99,
-      interval: 'month',
+      name: 'Spark', priceUSD: 9.99, priceGBP: 7.99, interval: 'month',
     },
     flame: {
       productId: process.env.DODO_PRODUCT_ID_FLAME || 'pdt_0NYkVvCPauMPQSMaIzqTS',
-      name: 'Flame',
-      priceUSD: 89,
-      priceGBP: 69,
-      interval: 'month',
+      name: 'Flame', priceUSD: 89, priceGBP: 69, interval: 'month',
     }
   };
 
@@ -750,7 +773,7 @@ const initializeDodoPaymentRoutes = (db) => {
             }
 
             // Match plan by product ID if planId not in metadata
-            let resolvedPlanId = planId || 'spark';
+            let resolvedPlanId = planId || 'starter-monthly';
             if (!planId) {
               const productId = subData.product_id || subData.items?.[0]?.product_id;
               for (const [key, plan] of Object.entries(DODO_PLANS)) {

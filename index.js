@@ -21611,6 +21611,21 @@ const buildRestaurantBlock = (restaurantId, data) => ({
 const assembleBillRenderPayload = (orderId, orderData, restaurantId, restaurantData) => {
   const taxSettings = restaurantData.taxSettings || getDefaultTaxSettings(restaurantData);
 
+  // Resolve a human-friendly display label for the payment method. The order stores
+  // the method id (e.g. 'gpay', 'bank_transfer', 'card-terminal'); bills should show
+  // the restaurant's configured label ("GPay", "Bank Transfer") — not the raw id.
+  const _pmId = orderData.paymentMethod || 'cash';
+  const _pmBuiltIn = { cash: 'Cash', card: 'Card', upi: 'UPI', 'card-terminal': 'Card', split: 'Split', due: 'Due' };
+  let paymentMethodLabel = _pmBuiltIn[_pmId] || null;
+  if (!paymentMethodLabel && Array.isArray(restaurantData.posSettings?.paymentMethods)) {
+    const _found = restaurantData.posSettings.paymentMethods.find(m => m && m.id === _pmId);
+    if (_found?.label) paymentMethodLabel = _found.label;
+  }
+  if (!paymentMethodLabel) {
+    // Fallback: prettify the id ("bank_transfer" -> "Bank Transfer").
+    paymentMethodLabel = String(_pmId).replace(/[_-]+/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
+  }
+
   const itemsSubtotal = (orderData.items || [])
     .reduce((sum, it) => {
       if (it.soldByWeight && it.itemWeight) {
@@ -21706,6 +21721,7 @@ const assembleBillRenderPayload = (orderId, orderData, restaurantId, restaurantD
     finalAmount: grandTotal,
     totalAmount: r2(orderData.totalAmount || (subtotal - totalDiscount)),
     paymentMethod: orderData.paymentMethod || 'cash',
+    paymentMethodLabel,
     serviceChargeRate: orderData.serviceChargeRate || null,
     serviceChargeAmount,
     tipAmount,
