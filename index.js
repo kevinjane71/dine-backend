@@ -4332,6 +4332,24 @@ app.post('/api/auth/email/verify-otp', async (req, res) => {
   }
 });
 
+// Resolve the owner's primary restaurant for a login payload. The mobile app
+// seeds its active restaurant from user.restaurantId (a fresh install has no
+// local fallback), so login responses include it. Prefers the owner's chosen
+// defaultRestaurantId when they still own it, else the passed owned doc. Purely
+// additive to the response — web ignores these fields (it uses getRestaurants()).
+async function buildPrimaryRestaurant(userId, ownedDoc, defaultRestaurantId) {
+  let rDoc = ownedDoc || null;
+  try {
+    if (defaultRestaurantId && (!rDoc || defaultRestaurantId !== rDoc.id)) {
+      const defDoc = await db.collection(collections.restaurants).doc(defaultRestaurantId).get();
+      if (defDoc.exists && defDoc.data().ownerId === userId) rDoc = defDoc;
+    }
+  } catch (_) { /* fall back to ownedDoc */ }
+  if (!rDoc) return null;
+  const rData = rDoc.data() || {};
+  return { id: rDoc.id, name: rData.name || null, businessType: rData.businessType || null, currency: rData.currency || null };
+}
+
 // Email/Password Login
 app.post('/api/auth/email/login', async (req, res) => {
   try {
@@ -4403,6 +4421,15 @@ app.post('/api/auth/email/login', async (req, res) => {
     
     const hasRestaurants = !restaurantsQuery.empty;
 
+    // Primary restaurant summary — the mobile app resolves the active restaurant
+    // from user.restaurantId (a fresh install has no local seed to fall back on),
+    // so include it in the login payload. Web ignores it (uses getRestaurants()).
+    let primaryRestaurantId = null, primaryRestaurant = null;
+    if (hasRestaurants) {
+      primaryRestaurant = await buildPrimaryRestaurant(userId, restaurantsQuery.docs[0], userData.defaultRestaurantId);
+      primaryRestaurantId = primaryRestaurant ? primaryRestaurant.id : null;
+    }
+
     // Get subdomain URL if enabled
     let subdomainUrl = null;
     if (SUBDOMAIN_FEATURE_ENABLED && hasRestaurants) {
@@ -4432,6 +4459,8 @@ app.post('/api/auth/email/login', async (req, res) => {
         name: userData.name,
         phone: userData.phone || null,
         role: userData.role,
+        restaurantId: primaryRestaurantId,
+        restaurant: primaryRestaurant,
         emailVerified: true,
         phoneVerified: userData.phoneVerified || false,
         setupComplete: userData.setupComplete || false
@@ -4894,6 +4923,9 @@ app.post('/api/auth/google', async (req, res) => {
     let isNewUser = false;
     let hasRestaurants = false;
     let linkedPhone = false;
+    // Mobile app resolves the active restaurant from user.restaurantId (fresh
+    // installs have no local seed), so surface the primary restaurant here.
+    let primaryRestaurantId = null, primaryRestaurant = null;
 
     console.log('🔍 Gmail login debug - User exists by email:', !userDoc.empty);
     console.log('🔍 Gmail login debug - Email:', email);
@@ -5002,8 +5034,12 @@ app.post('/api/auth/google', async (req, res) => {
         .where('ownerId', '==', userId)
         .limit(1)
         .get();
-      
+
       hasRestaurants = !restaurantsQuery.empty;
+      if (hasRestaurants) {
+        primaryRestaurant = await buildPrimaryRestaurant(userId, restaurantsQuery.docs[0], userDoc.docs[0].data().defaultRestaurantId);
+        primaryRestaurantId = primaryRestaurant ? primaryRestaurant.id : null;
+      }
     }
 
     const userRole = userDoc.empty ? 'owner' : userDoc.docs[0].data().role;
@@ -5024,6 +5060,8 @@ app.post('/api/auth/google', async (req, res) => {
         name,
         picture,
         role: userRole,
+        restaurantId: primaryRestaurantId,
+        restaurant: primaryRestaurant,
         setupComplete: userDoc.empty ? true : userDoc.docs[0].data().setupComplete || false
       },
       firstTimeUser: isNewUser || (!userDoc.empty && !userDoc.docs[0].data().setupComplete && !hasRestaurants),
@@ -5062,6 +5100,7 @@ app.post('/api/auth/apple', async (req, res) => {
     let userId;
     let isNewUser = false;
     let hasRestaurants = false;
+    let primaryRestaurantId = null, primaryRestaurant = null; // mobile app active-restaurant seed
 
     console.log('🍎 Apple login debug - User exists by email:', !userDoc.empty);
 
@@ -5142,6 +5181,10 @@ app.post('/api/auth/apple', async (req, res) => {
         .get();
 
       hasRestaurants = !restaurantsQuery.empty;
+      if (hasRestaurants) {
+        primaryRestaurant = await buildPrimaryRestaurant(userId, restaurantsQuery.docs[0], userDoc.docs[0].data().defaultRestaurantId);
+        primaryRestaurantId = primaryRestaurant ? primaryRestaurant.id : null;
+      }
     }
 
     const userRole = userDoc.empty ? 'owner' : userDoc.docs[0].data().role;
@@ -5162,6 +5205,8 @@ app.post('/api/auth/apple', async (req, res) => {
         name: name || (userDoc.empty ? 'Restaurant Owner' : userDoc.docs[0].data().name),
         picture: picture || (userDoc.empty ? '' : userDoc.docs[0].data().picture || ''),
         role: userRole,
+        restaurantId: primaryRestaurantId,
+        restaurant: primaryRestaurant,
         setupComplete: userDoc.empty ? true : userDoc.docs[0].data().setupComplete || false
       },
       firstTimeUser: isNewUser || (!userDoc.empty && !userDoc.docs[0].data().setupComplete && !hasRestaurants),
