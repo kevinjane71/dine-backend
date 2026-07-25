@@ -491,6 +491,78 @@ function updateDailyStatsRevenueDiff(restaurantId, order, oldAmount, newAmount, 
   }
 }
 
+// Reconcile dailyStats when a due (khata) amount is settled later. The
+// collected money becomes revenue, the outstanding-due total and the 'due'
+// payment bucket shrink, and the settlement method's bucket grows. Uses the
+// ORDER's date (same convention as the revenue-diff it replaces), so the
+// buckets it decrements are the ones the order originally recorded. Amounts
+// only — transaction counts are a secondary metric and reconciling them per
+// partial/full settlement risks double-counting, so they are left as-is.
+function updateDailyStatsOnDueSettlement(restaurantId, order, settleAmount, settlementMethod, tzOffset, dayStartHour) {
+  try {
+    const amt = Math.round((Number(settleAmount) || 0) * 100) / 100;
+    if (amt <= 0) return;
+    const orderDate = order.createdAt?.toDate ? order.createdAt.toDate()
+      : (order.createdAt instanceof Date ? order.createdAt : new Date(order.createdAt || Date.now()));
+    const dateStr = dateStrInTZ(orderDate, tzOffset, dayStartHour);
+    const docId = `${restaurantId}_${dateStr}`;
+    const statsRef = db.collection('dailyStats').doc(docId);
+    const method = (settlementMethod || 'cash').toLowerCase();
+    const update = {
+      restaurantId,
+      date: dateStr,
+      updatedAt: FieldValue.serverTimestamp(),
+      totalRevenue: FieldValue.increment(amt),
+      totalRevenueWithTax: FieldValue.increment(amt),
+      totalDueAmount: FieldValue.increment(-amt),
+      'paymentMethod_due.amount': FieldValue.increment(-amt),
+      [`paymentMethod_${method}.amount`]: FieldValue.increment(amt),
+    };
+    statsRef.set(update, { merge: true })
+      .catch(err => console.error('dailyStats settlement error (non-blocking):', err));
+    if (order.subRestaurantId) {
+      const subDocId = `${restaurantId}_sub_${order.subRestaurantId}_${dateStr}`;
+      db.collection('dailyStats').doc(subDocId).set({
+        ...update, subRestaurantId: order.subRestaurantId, subRestaurantName: order.subRestaurantName || null,
+      }, { merge: true }).catch(() => {});
+    }
+  } catch (err) {
+    console.error('dailyStats settlement helper error (non-blocking):', err);
+  }
+}
+
+// Track the amount refunded on a day for the "Refunds" report tile. Deliberately
+// a SEPARATE field from totalRefunds (which stays 0): revenue is already reported
+// NET of refunds (the refund handler reduces it via cancel/revenue-diff), and
+// every report computes revenue as `totalRevenueWithTax - totalRefunds`. Keeping
+// totalRefunds at 0 means that formula stays `- 0` everywhere and revenue can
+// never be double-subtracted; refundsIssued is display-only.
+function updateDailyStatsRefundsIssued(restaurantId, order, amount, tzOffset, dayStartHour) {
+  try {
+    const amt = Math.round((Number(amount) || 0) * 100) / 100;
+    if (amt <= 0) return;
+    const orderDate = order.createdAt?.toDate ? order.createdAt.toDate()
+      : (order.createdAt instanceof Date ? order.createdAt : new Date(order.createdAt || Date.now()));
+    const dateStr = dateStrInTZ(orderDate, tzOffset, dayStartHour);
+    const docId = `${restaurantId}_${dateStr}`;
+    const update = {
+      restaurantId, date: dateStr,
+      updatedAt: FieldValue.serverTimestamp(),
+      refundsIssued: FieldValue.increment(amt),
+    };
+    db.collection('dailyStats').doc(docId).set(update, { merge: true })
+      .catch(err => console.error('dailyStats refundsIssued error (non-blocking):', err));
+    if (order.subRestaurantId) {
+      const subDocId = `${restaurantId}_sub_${order.subRestaurantId}_${dateStr}`;
+      db.collection('dailyStats').doc(subDocId).set({
+        ...update, subRestaurantId: order.subRestaurantId, subRestaurantName: order.subRestaurantName || null,
+      }, { merge: true }).catch(() => {});
+    }
+  } catch (err) {
+    console.error('dailyStats refundsIssued helper error (non-blocking):', err);
+  }
+}
+
 // Calculate pricing adjustments (zone surcharge, time-based pricing)
 function calculatePricingAdjustments(restaurantData, { tableSection, floorData, orderTime, subtotal }) {
   const result = { zoneSurcharge: 0, appliedRules: [] };
@@ -1055,16 +1127,37 @@ function normalizeModifierGroups(groups) {
   }));
 }
 
+// Sanitize a per-item seat number (seat-level ordering / pivot seating).
+// Valid: integer 1..65 (industry cap, per Oracle Simphony). Anything else → null (= shared/table).
+function sanitizeSeat(seat) {
+  const n = typeof seat === 'string' && seat.trim() !== '' ? Number(seat) : seat;
+  return Number.isInteger(n) && n >= 1 && n <= 65 ? n : null;
+}
+
+// Resolve a seat for storage, enforcing the restaurant's feature flag
+// server-side: when posSettings.seatOrdering is off/absent, seats are nulled
+// regardless of what the client sent (stale apps, replayed/crafted payloads).
+function resolveSeat(seat, restaurantData) {
+  const mode = restaurantData?.posSettings?.seatOrdering;
+  if (mode !== 'optional' && mode !== 'required') return null;
+  return sanitizeSeat(seat);
+}
+
 // Generate a composite key for an order item that uniquely identifies it.
 // Used everywhere items are matched, deduped, or compared for KOT diffs.
 // Key format: "menuItemId|variantName|custId1,custId2" (sorted customizations)
+// When the item has a seat assigned (seat-level ordering), the seat joins the
+// key so identical items on different seats stay separate lines. Items with
+// no seat produce the exact same key as before — zero behavior change for
+// existing orders and restaurants with the feature off.
 function getOrderItemKey(item) {
   const id = item.menuItemId || item.id || '';
   const variant = item.selectedVariant?.name || '';
   const custs = Array.isArray(item.selectedCustomizations) && item.selectedCustomizations.length > 0
     ? [...item.selectedCustomizations].map(c => c.id || c.name || '').sort().join(',')
     : '';
-  return `${id}|${variant}|${custs}`;
+  const seat = sanitizeSeat(item.seat);
+  return seat === null ? `${id}|${variant}|${custs}` : `${id}|${variant}|${custs}|s${seat}`;
 }
 
 // Server-side deduplication: merge items with the same composite key (menuItemId + variant + customizations).
@@ -8545,6 +8638,12 @@ app.post('/api/public/orders/:restaurantId', vercelSecurityMiddleware.publicAPI,
       razorpayPaymentId,
       razorpayOrderId,
       razorpaySignature,
+      // Tip + service charge the customer was actually charged (Razorpay charges
+      // the FE total including these). Recorded so the stored order and reports
+      // match the charge — the server total is a RECORD only, it does not drive
+      // the charge, so trusting these (clamped) is safe.
+      tipAmount: reqTipAmount,
+      serviceCharge: reqServiceCharge,
     } = req.body;
 
     if (!restaurantId || !items || items.length === 0) {
@@ -8723,14 +8822,31 @@ app.post('/api/public/orders/:restaurantId', vercelSecurityMiddleware.publicAPI,
         return res.status(400).json({ error: `Menu item ${item.menuItemId} not found` });
       }
 
-      const itemTotal = menuItem.price * item.quantity;
+      // Validate quantity (mirror the authenticated POS path) — a public client
+      // could otherwise send a negative/invalid quantity to deflate the subtotal.
+      const parsedQty = parseInt(item.quantity, 10);
+      if (!Number.isFinite(parsedQty) || parsedQty <= 0) {
+        return res.status(400).json({ error: `Invalid quantity for item "${menuItem.name}"` });
+      }
+      if (parsedQty > ORDER_MAX_QUANTITY) {
+        return res.status(400).json({ error: `Quantity for "${menuItem.name}" cannot exceed ${ORDER_MAX_QUANTITY}` });
+      }
+      const itemQuantity = parsedQty;
+
+      // Block out-of-stock items (mirror the POS path)
+      if (menuItem.isAvailable === false) {
+        return res.status(400).json({ error: `"${menuItem.name}" is currently out of stock` });
+      }
+
+      const itemTotal = menuItem.price * itemQuantity;
       subtotal += itemTotal;
 
       orderItems.push({
         menuItemId: item.menuItemId,
         name: menuItem.name,
         price: menuItem.price,
-        quantity: item.quantity,
+        seat: resolveSeat(item.seat, restaurantData),
+        quantity: itemQuantity,
         total: itemTotal,
         category: menuItem.category || '',
         categoryId: menuItem.categoryId || menuItem.category || '',
@@ -8942,8 +9058,18 @@ app.post('/api/public/orders/:restaurantId', vercelSecurityMiddleware.publicAPI,
       orderItems, taxSettings, categories, totalDiscount, 0 // no service charge for public orders
     );
 
-    // Only add exclusive tax (inclusive tax already embedded in prices)
-    const finalTotal = preTaxTotal + exclusiveTaxAmount;
+    // Tip + service charge (what the customer was charged via Razorpay). Clamp
+    // to non-negative; no upper cap so the record matches the charge exactly.
+    const publicTipAmount = Math.max(0, Math.round((Number(reqTipAmount) || 0) * 100) / 100);
+    const publicServiceChargeAmount = Math.max(0, Math.round((Number(reqServiceCharge?.amount) || 0) * 100) / 100);
+    const publicServiceChargeRate = Math.max(0, Number(reqServiceCharge?.rate) || 0);
+
+    // Only add exclusive tax (inclusive tax already embedded in prices), then
+    // the service charge and tip the customer actually paid.
+    // loyaltyEarnBase excludes tip/SC so loyalty is earned exactly as before
+    // (points on food + tax, never on a tip).
+    const loyaltyEarnBase = preTaxTotal + exclusiveTaxAmount;
+    const finalTotal = loyaltyEarnBase + publicServiceChargeAmount + publicTipAmount;
 
     // Calculate loyalty points earned
     let loyaltyPointsEarned = 0;
@@ -8975,13 +9101,13 @@ app.post('/api/public/orders/:restaurantId', vercelSecurityMiddleware.publicAPI,
           console.log(`💎 Loyalty points (on full ₹${amountBeforeRedemption}): ${loyaltyPointsEarned} points`);
         } else {
           // Default: Earn points only on the remaining amount after redemption
-          loyaltyPointsEarned = Math.floor(finalTotal / earnPerAmount) * pointsEarned;
-          console.log(`💎 Loyalty points (on remaining ₹${finalTotal}): ${loyaltyPointsEarned} points`);
+          loyaltyPointsEarned = Math.floor(loyaltyEarnBase / earnPerAmount) * pointsEarned;
+          console.log(`💎 Loyalty points (on remaining ₹${loyaltyEarnBase}): ${loyaltyPointsEarned} points`);
         }
       } else {
-        // No redemption - earn points normally on final total
-        loyaltyPointsEarned = Math.floor(finalTotal / earnPerAmount) * pointsEarned;
-        console.log(`💎 Loyalty points calculation: ₹${finalTotal} / ₹${earnPerAmount} * ${pointsEarned} = ${loyaltyPointsEarned} points`);
+        // No redemption - earn points normally on the food+tax total (excl. tip/SC)
+        loyaltyPointsEarned = Math.floor(loyaltyEarnBase / earnPerAmount) * pointsEarned;
+        console.log(`💎 Loyalty points calculation: ₹${loyaltyEarnBase} / ₹${earnPerAmount} * ${pointsEarned} = ${loyaltyPointsEarned} points`);
       }
 
       // Apply tier multiplier if customer has a loyalty tier
@@ -9093,9 +9219,9 @@ app.post('/api/public/orders/:restaurantId', vercelSecurityMiddleware.publicAPI,
       finalAmount: Math.round(finalTotal * 100) / 100,
       taxAmount: Math.round((taxAmount || 0) * 100) / 100,
       taxBreakdown: taxBreakdown || [],
-      serviceChargeAmount: 0,
-      serviceChargeRate: 0,
-      tipAmount: 0,
+      serviceChargeAmount: publicServiceChargeAmount,
+      serviceChargeRate: publicServiceChargeRate,
+      tipAmount: publicTipAmount,
       roundOffAmount: 0,
       discountAmount: Math.round((discountAmount || 0) * 100) / 100,
       manualDiscount: 0,
@@ -9236,7 +9362,21 @@ app.post('/api/public/orders/:restaurantId', vercelSecurityMiddleware.publicAPI,
 const ORDER_MAX_QUANTITY = 10000;
 const ORDER_MAX_UNIT_PRICE = 1000000; // ₹10 lakh per unit
 
-app.post('/api/orders', async (req, res) => {
+// POST /api/orders authentication: all staff clients (web POS, dine-app,
+// local-login offline devices) carry a JWT — require it. The single carve-out
+// is the legacy customer self-order QR flow (orderType 'customer_self_order'),
+// which has no staff token; for that flow the FE billing override below is
+// also disabled so billing stays fully server-computed. Verified senders:
+// crave → /api/customer/orders, public QR → /api/public/orders (both separate).
+function authenticateOrderCreate(req, res, next) {
+  if (req.body && req.body.orderType === 'customer_self_order') {
+    req.user = null;
+    return next();
+  }
+  return authenticateToken(req, res, next);
+}
+
+app.post('/api/orders', authenticateOrderCreate, async (req, res) => {
   try {
     // ── Rate limit: prevent order spam (e.g. 2000+ orders in 1 minute) ──
     if (req.body.restaurantId) {
@@ -9620,6 +9760,7 @@ app.post('/api/orders', async (req, res) => {
         orderItems.push({
           menuItemId: item.menuItemId || item.id || null,
           name: typeof item.name === 'string' ? item.name.substring(0, 200) : 'Custom Item',
+          seat: resolveSeat(item.seat, restaurantData),
           nameAr: typeof item.nameAr === 'string' ? item.nameAr.substring(0, 200) : null,
           price: fePrice,
           quantity: itemQuantity,
@@ -9659,6 +9800,7 @@ app.post('/api/orders', async (req, res) => {
           orderItems.push({
             menuItemId: item.menuItemId,
             name: typeof item.name === 'string' ? item.name.substring(0, 200) : 'Unknown Item',
+            seat: resolveSeat(item.seat, restaurantData),
             nameAr: typeof item.nameAr === 'string' ? item.nameAr.substring(0, 200) : null,
             price: unitPrice,
             quantity: itemQuantity,
@@ -9787,6 +9929,7 @@ app.post('/api/orders', async (req, res) => {
         menuItemId: item.menuItemId,
         name: menuItem.name,
         nameAr: menuItem.nameAr || null,
+        seat: resolveSeat(item.seat, restaurantData),
         price: unitPrice,
         quantity: itemQuantity,
         total: itemTotal,
@@ -10254,6 +10397,7 @@ app.post('/api/orders', async (req, res) => {
       syncSource: syncSource, // 'online' | 'offline' — tracks how order was placed
       ...(idempotencyKey ? { idempotencyKey } : {}),
       walletRedeemAmount: req.body.walletRedeemAmount ? Math.round(Number(req.body.walletRedeemAmount) * 100) / 100 : null,
+      walletCustomerId: req.body.walletCustomerId || null,
       // Coupon fields
       couponCode: req.body.couponCode || null,
       couponId: req.body.couponId || null,
@@ -10315,6 +10459,38 @@ app.post('/api/orders', async (req, res) => {
       const feTotalDisc = parseFloat(req.body.totalDiscountAmount) || (feDiscount + feManual + feLoyalty);
       const feSubtotal = parseFloat(req.body.totalAmount) || subtotalForDiscount;
       const feTaxAmt = req.body.taxBreakdown.reduce((s, t) => s + (t.amount || 0), 0);
+
+      // ── Sanity clamp: the override may only refine, never rewrite, billing ──
+      // Server-priced subtotal is authoritative (items were re-priced above).
+      // Reject the override entirely (keep server-computed orderData) when the
+      // client's numbers are impossible: negative discounts, discounts
+      // exceeding the subtotal, subtotal far from server pricing, or a final
+      // amount below what the discounts can explain. Self-order (no auth) never
+      // gets the override at all.
+      const feCouponPre = parseFloat(req.body.couponDiscount) || 0;
+      const claimedDiscTotal = Math.max(feTotalDisc, feDiscount + feManual + feLoyalty) + feCouponPre;
+      const serverSubtotal = Math.round(subtotalForDiscount * 100) / 100;
+      const subtotalTolerance = Math.max(2, serverSubtotal * 0.01);
+      const feFinalPre = parseFloat(req.body.finalAmount) || 0;
+      // Final-amount floor = (subtotal − discounts) minus whatever round-off the
+      // FE applied (tax/service-charge/tip only push finalAmount UP, so they are
+      // not credited — the floor stays conservative). This accommodates
+      // round-to-nearest-₹10/₹50 and inclusive-tax bills without false rejects.
+      const feRoundOff = Math.abs(parseFloat(req.body.roundOffAmount) || 0);
+      const finalFloor = (serverSubtotal - claimedDiscTotal) - feRoundOff - subtotalTolerance;
+      const overrideInvalid =
+        req.user === null ||
+        feDiscount < 0 || feManual < 0 || feLoyalty < 0 || feCouponPre < 0 || feTaxAmt < 0 ||
+        claimedDiscTotal > serverSubtotal + subtotalTolerance ||
+        Math.abs(feSubtotal - serverSubtotal) > subtotalTolerance ||
+        feFinalPre < 0 ||
+        feFinalPre < finalFloor;
+      if (overrideInvalid) {
+        orderData.billingClamped = true;
+        console.warn(`🚫 POS override REJECTED (server values kept) — restaurant ${restaurantId}: ` +
+          `feSubtotal=₹${feSubtotal} vs server=₹${serverSubtotal}, claimedDisc=₹${claimedDiscTotal}, feFinal=₹${feFinalPre}, auth=${!!req.user}`);
+      }
+      if (!overrideInvalid) {
       orderData.subtotal = Math.round(feSubtotal * 100) / 100;
       orderData.discountAmount = Math.round(feDiscount * 100) / 100;
       orderData.offerDiscount = Math.round(feDiscount * 100) / 100;
@@ -10338,6 +10514,7 @@ app.post('/api/orders', async (req, res) => {
       }
       orderData.finalAmount = Math.max(0, orderData.finalAmount);
       console.log(`📊 POS override: Using frontend billing values (Subtotal: ₹${orderData.subtotal}, Disc: ₹${orderData.totalDiscountAmount}, Tax: ₹${orderData.taxAmount}, Final: ₹${orderData.finalAmount})`);
+      }
     }
 
     // Billing audit: compare FE-sent values vs BE-resolved values
@@ -10516,7 +10693,11 @@ app.post('/api/orders', async (req, res) => {
         loyaltyPointsEarned: loyaltyPointsEarned,
         loyaltyPointsRedeemed: loyaltyPointsRedeemed,
         outstandingAmount: req.body.partialPayAmount != null ? Math.round((finalAmount - Number(req.body.partialPayAmount)) * 100) / 100 : 0,
-        paidAmount: req.body.partialPayAmount != null ? Math.round(Number(req.body.partialPayAmount) * 100) / 100 : 0,
+        // paidAmount = amount actually collected. Fully-paid orders (no
+        // partialPayAmount) must record finalAmount, NOT 0 — the totalSpent
+        // recompute reads paidAmount directly (0 != null, so 0 would count the
+        // order as ₹0 spent). Due/partial record the partial amount.
+        paidAmount: req.body.partialPayAmount != null ? Math.round(Number(req.body.partialPayAmount) * 100) / 100 : Math.round(finalAmount * 100) / 100,
         paymentStatus: req.body.partialPayAmount != null ? (Number(req.body.partialPayAmount) === 0 ? 'due' : 'partial') : 'paid',
         orderDate: new Date(),
         tableNumber: tableNumber || seatNumber || null,
@@ -10847,6 +11028,10 @@ app.post('/api/orders', async (req, res) => {
       const crypto = require('crypto');
       const shareToken = crypto.randomBytes(16).toString('hex');
       orderRef.update({ shareToken }).catch(err => console.error('ShareToken update error:', err));
+
+      // Fire-and-forget: cashback wallet credit (offer promotionType 'cashback')
+      processCashbackForOrder(orderRef.id, { ...orderData, restaurantId }).catch(() => {});
+      processWalletRedemptionForOrder(orderRef.id).catch(() => {});
 
       // Fire-and-forget: send bill_notification template on WhatsApp
       (async () => {
@@ -12551,6 +12736,16 @@ app.patch('/api/orders/:orderId/status', authenticateToken, async (req, res) => 
       return res.status(403).json({ error: 'Access denied: Order does not belong to your restaurant' });
     }
 
+    // Configurable role gate for kitchen-progression statuses (preparing/ready/served)
+    if (!(await canAdvanceOrderStatus(req, orderData.restaurantId, status))) {
+      return res.status(403).json({ error: 'Access denied. Your role is not permitted to update order status.' });
+    }
+
+    // Fire the customer "order ready" alert when this endpoint bumps to ready.
+    if (status === 'ready' && orderData.status !== 'ready') {
+      maybeNotifyCustomerOrderReady({ id: orderId, ...orderData }).catch(() => {});
+    }
+
     // NEW: Handle deferred loyalty/stats updates on completion
     if (status === 'completed' && orderData.status !== 'completed') {
       console.log(`✅ Order ${orderId} marked as completed. Processing deferred updates...`);
@@ -12574,6 +12769,13 @@ app.patch('/api/orders/:orderId/status', authenticateToken, async (req, res) => 
             orderDate: new Date(),
             tableNumber: orderData.tableNumber || null,
             orderType: orderData.orderType,
+            // paidAmount = amount actually collected, so the totalSpent recompute
+            // doesn't over-count a due order linked to a customer at completion.
+            paymentStatus: orderData.paymentStatus || 'paid',
+            paidAmount: (orderData.paymentStatus === 'due' || orderData.paymentStatus === 'partial')
+              ? Math.round(Number(orderData.paidAmount || 0) * 100) / 100
+              : Math.round(orderFinalAmount * 100) / 100,
+            outstandingAmount: Math.round(Number(orderData.outstandingAmount || 0) * 100) / 100,
           };
           // Normalize phone helper
           const normPhone = (p) => {
@@ -12869,6 +13071,12 @@ app.patch('/api/orders/:orderId/status', authenticateToken, async (req, res) => 
       }
     }
 
+    // Fire-and-forget: cashback wallet credit (offer promotionType 'cashback')
+    if (status === 'completed') {
+      processCashbackForOrder(orderId, orderData).catch(() => {});
+      processWalletRedemptionForOrder(orderId).catch(() => {});
+    }
+
     // Fire-and-forget: send bill on WhatsApp if enabled
     if (status === 'completed') {
       (async () => {
@@ -13129,6 +13337,9 @@ app.patch('/api/orders/:orderId/status', authenticateToken, async (req, res) => 
 app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
   try {
     const { orderId } = req.params;
+    // Seat-level ordering: set true when this PATCH only moves items between
+    // seats (no quantity change) — suppresses the KOT reprint below
+    let isSeatOnlyItemsPatch = false;
     const {
       items,
       tableNumber,
@@ -13316,15 +13527,30 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
 
       // Compare with existing items to mark new/updated items
       const existingItems = currentOrder.items || [];
+      // (assigned after reconciliation below; read by the KOT reprint block)
       const allowPriceEditPatch = restaurantData?.posSettings?.allowPriceEdit === true;
+      // Base-key (menuItemId + variant, no seat) quantity sums — used to
+      // recognize pure seat moves before per-line processing
+      const patchBaseKey = (it) => `${it.menuItemId}|${it.selectedVariant?.name || ''}`;
+      const preOldBaseQty = new Map();
+      existingItems.forEach(it => preOldBaseQty.set(patchBaseKey(it), (preOldBaseQty.get(patchBaseKey(it)) || 0) + (it.quantity || 0)));
+      const preNewBaseQty = new Map();
+      items.forEach(it => preNewBaseQty.set(patchBaseKey(it), (preNewBaseQty.get(patchBaseKey(it)) || 0) + (it.quantity || 0)));
       const processedItems = items.map(newItem => {
         // Match by menuItemId + variant name so items with different variants
-        // (e.g., Half vs Full) are correctly treated as separate line items
+        // (e.g., Half vs Full) are correctly treated as separate line items.
+        // Seat-level ordering: same item on different seats must stay separate
+        // lines too (both null when feature off → identical to old behavior).
         const newVariantName = newItem.selectedVariant?.name || null;
+        // resolveSeat (not sanitizeSeat): when the flag is off, both sides
+        // resolve to null → matching is byte-identical to pre-seat behavior
+        // even against clients that send seats anyway
+        const newSeat = resolveSeat(newItem.seat, restaurantData);
         const existingItem = existingItems.find(existing => {
           if (existing.menuItemId !== newItem.menuItemId) return false;
           const existingVariantName = existing.selectedVariant?.name || null;
-          return existingVariantName === newVariantName;
+          if (existingVariantName !== newVariantName) return false;
+          return resolveSeat(existing.seat, restaurantData) === newSeat;
         });
 
         // Clear any previous KOT diff flags to avoid stale flags from prior updates
@@ -13339,10 +13565,18 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
         // Server-side price resolution (mirrors POST handler logic)
         const menuItem = isCustomItemPatch ? null : menuItems.find(m => m.id === cleanItem.menuItemId);
 
-        // Check availability for NEW items being added to the order
+        // Check availability for NEW items being added to the order.
+        // A line that is "new" only because its seat changed (base quantity
+        // for this item+variant is unchanged and existed before) is NOT a
+        // genuine addition — moving an 86'd item between seats must not fail.
         const isNewItem = !existingItem;
         if (isNewItem && menuItem && menuItem.isAvailable === false) {
-          throw new Error(`Item "${menuItem.name}" is currently unavailable and cannot be added to the order`);
+          const bk = patchBaseKey(newItem);
+          const priorQty = preOldBaseQty.get(bk) || 0;
+          const isSeatMoveOnly = priorQty > 0 && (preNewBaseQty.get(bk) || 0) <= priorQty;
+          if (!isSeatMoveOnly) {
+            throw new Error(`Item "${menuItem.name}" is currently unavailable and cannot be added to the order`);
+          }
         }
 
         const selectedVariant = cleanItem.selectedVariant || null;
@@ -13444,6 +13678,7 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
           ...cleanItem,
           price: resolvedUnitPrice,
           total: patchItemTotal,
+          seat: resolveSeat(cleanItem.seat, restaurantData),
           selectedVariant: selectedVariant ? { name: selectedVariant.name, price: selectedVariant.price || 0 } : null,
           selectedCustomizations: customizations.map(c => ({ id: c.id || null, name: c.name || c, price: typeof c.price === 'number' ? c.price : 0 })),
           // Per-item price edit tracking — only flag genuine manual edits, not variant/rule price differences
@@ -13478,11 +13713,12 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
       });
 
       // Detect removed items — items that existed before but are NOT in the new items list
-      // Match by menuItemId + variant name (consistent with existingItem matching above)
+      // Match by menuItemId + variant name + seat (consistent with existingItem matching above)
       const removedItems = existingItems
         .filter(existing => !items.find(newItem => {
           if (newItem.menuItemId !== existing.menuItemId) return false;
-          return (newItem.selectedVariant?.name || null) === (existing.selectedVariant?.name || null);
+          if ((newItem.selectedVariant?.name || null) !== (existing.selectedVariant?.name || null)) return false;
+          return resolveSeat(newItem.seat, restaurantData) === resolveSeat(existing.seat, restaurantData);
         }))
         .map(removedItem => ({
           ...removedItem,
@@ -13498,8 +13734,51 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
         console.warn(`⚠️ PATCH /api/orders: Deduped ${processedItems.length} → ${dedupedPatchItems.length} items`);
       }
 
+      // Seat-move reconciliation: moving an item between seats must NOT re-fire
+      // the kitchen. The seat-aware matching above marks a moved line as
+      // removed(old seat)+new(new seat) — but if the BASE quantity (ignoring
+      // seat) is unchanged, it's a pure seat move: strip the KOT diff flags.
+      // No-op when no seats are in play (base key === seat key for all items).
+      // Base key mirrors the line-match signature above (menuItemId + variant,
+      // WITHOUT seat) — using the customization-aware composite key here would
+      // strip legitimate KOT flags in no-seat orders that carry two
+      // customization variants of the same item.
+      const baseKey = (it) => `${it.menuItemId}|${it.selectedVariant?.name || ''}`;
+      const sumByBaseKey = (arr) => {
+        const m = new Map();
+        for (const it of arr) m.set(baseKey(it), (m.get(baseKey(it)) || 0) + (it.quantity || 0));
+        return m;
+      };
+      const oldBaseQty = sumByBaseKey(existingItems);
+      const newBaseQty = sumByBaseKey(dedupedPatchItems);
+      const seatMoveKeys = new Set();
+      for (const [k, oldQ] of oldBaseQty) {
+        if ((newBaseQty.get(k) || 0) === oldQ) seatMoveKeys.add(k);
+      }
+      const reconciledRemovedItems = removedItems.filter(it => !seatMoveKeys.has(baseKey(it)));
+      for (const it of dedupedPatchItems) {
+        if ((it.isNew || it.isUpdated) && seatMoveKeys.has(baseKey(it))) {
+          delete it.isNew;
+          delete it.isUpdated;
+          delete it.addedAt;
+          delete it.updatedAt;
+          delete it.previousQuantity;
+          delete it.quantityDelta;
+        }
+      }
+
+      // Pure seat move (some seat-aware key changed, no base quantity changed,
+      // nothing removed): kitchen must not be re-notified — even for clients
+      // that don't send skipKOT
+      {
+        const oldSeatKeys = new Set(existingItems.map(i => getOrderItemKey(i)));
+        const seatKeysChanged = dedupedPatchItems.some(i => !oldSeatKeys.has(getOrderItemKey(i)));
+        const noFlagsLeft = dedupedPatchItems.every(i => !i.isNew && !i.isUpdated);
+        isSeatOnlyItemsPatch = seatKeysChanged && noFlagsLeft && reconciledRemovedItems.length === 0;
+      }
+
       // Store removed items separately so they don't affect totals but are available for KOT display
-      updateData.removedItems = removedItems;
+      updateData.removedItems = reconciledRemovedItems;
       updateData.items = dedupedPatchItems;
       updateData.itemCount = dedupedPatchItems.reduce((sum, item) => sum + item.quantity, 0);
       let itemsSubtotal = await calculateOrderTotal(dedupedPatchItems);
@@ -14102,15 +14381,19 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
         const newItems = updateData.items || [];
 
         // Build maps using composite key (menuItemId + variant + customizations)
-        // so variant items are tracked separately for inventory
+        // so variant items are tracked separately for inventory.
+        // Seat is deliberately EXCLUDED: moving an item between seats is not a
+        // stock change — seat-aware keys here caused phantom deduct/restore
+        // churn (and stock inflation when deduct clamped at 0 but restore didn't).
+        const invKey = (i) => getOrderItemKey({ ...i, seat: null });
         const oldQtyMap = {};
         oldItems.forEach(i => {
-          const key = getOrderItemKey(i);
+          const key = invKey(i);
           oldQtyMap[key] = (oldQtyMap[key] || 0) + (i.quantity || 1);
         });
         const newQtyMap = {};
         newItems.forEach(i => {
-          const key = getOrderItemKey(i);
+          const key = invKey(i);
           newQtyMap[key] = (newQtyMap[key] || 0) + (i.quantity || 1);
         });
 
@@ -14126,13 +14409,13 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
 
           if (delta > 0) {
             // More of this item — need to deduct additional inventory
-            const itemData = newItems.find(i => getOrderItemKey(i) === key);
+            const itemData = newItems.find(i => invKey(i) === key);
             if (itemData) {
               addedItems.push({ ...itemData, quantity: delta });
             }
           } else if (delta < 0) {
             // Less of this item — need to restore inventory
-            const itemData = oldItems.find(i => getOrderItemKey(i) === key);
+            const itemData = oldItems.find(i => invKey(i) === key);
             if (itemData) {
               removedItems.push({ ...itemData, quantity: Math.abs(delta) });
             }
@@ -14208,7 +14491,14 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
                 loyaltyPointsEarned: pointsEarned,
                 loyaltyPointsRedeemed: pointsRedeemed,
                 paymentStatus: updateData.paymentStatus || 'paid',
-                paidAmount: updateData.paidAmount || null,
+                // paidAmount = amount actually collected. `updateData.paidAmount || null`
+                // wrongly turned a full-due ₹0 into null → the totalSpent recompute
+                // then counted the FULL finalAmount as spent (and settle-credit later
+                // added it again → double-count). Record the true collected amount:
+                // 0 for due, the partial for partial, finalAmount for paid.
+                paidAmount: (updateData.paymentStatus === 'due' || updateData.paymentStatus === 'partial')
+                  ? Math.round(Number(updateData.paidAmount || 0) * 100) / 100
+                  : Math.round(orderFinalAmount * 100) / 100,
                 outstandingAmount: updateData.outstandingAmount || 0,
               };
               const newHistory = [...existingHistory, histEntry];
@@ -14321,12 +14611,31 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
         updateDailyStats(currentOrder.restaurantId, currentOrder, 'cancel', parseTZ(req), parseDayStart(req));
       }
     } else if (prevCounted && nowCounted) {
-      // Order stayed counted — check if amount changed (items update, billing fields, or payment status change)
+      // Order stayed counted. Two distinct kinds of change need different handling:
+      //  1. Payment method OR payment status changed (billing a KOT order:
+      //     pending→paid/due, cash→UPI). The payment-method bucket and the
+      //     due/revenue classification were FROZEN at order creation (a KOT
+      //     order is added to dailyStats as pending/cash at POST). A revenue-diff
+      //     can't move a bucket or reclassify due, so re-bucket the whole order:
+      //     cancel(old) + add(new) — the same proven pattern the /status and
+      //     edit-completed paths use. Fixes payment breakdown (R1) and the khata
+      //     revenue double-count (R2: due orders were kept in revenue, then
+      //     added again on settlement).
+      //  2. Otherwise, a pure amount change (item edit) uses the cheaper
+      //     revenue-diff (unchanged behavior).
       const newTotal = updateData.totalAmount !== undefined ? updateData.totalAmount : currentOrder.totalAmount;
       const newFinal = updateData.finalAmount !== undefined ? updateData.finalAmount : currentOrder.finalAmount;
       const oldTotal = currentOrder.totalAmount || 0;
       const oldFinal = currentOrder.finalAmount || 0;
-      if (newTotal !== oldTotal || newFinal !== oldFinal) {
+      const oldPm = (currentOrder.paymentMethod || 'cash').toLowerCase();
+      const newPm = (updateData.paymentMethod !== undefined ? updateData.paymentMethod : (currentOrder.paymentMethod || 'cash')).toLowerCase();
+      const oldPs = (currentOrder.paymentStatus || '').toLowerCase();
+      const newPs = (updateData.paymentStatus !== undefined ? updateData.paymentStatus : (currentOrder.paymentStatus || '')).toLowerCase();
+      const paymentChanged = oldPm !== newPm || oldPs !== newPs;
+      if (paymentChanged) {
+        updateDailyStats(currentOrder.restaurantId, currentOrder, 'cancel', parseTZ(req), parseDayStart(req));
+        updateDailyStats(currentOrder.restaurantId, { ...currentOrder, ...updateData }, 'add', parseTZ(req), parseDayStart(req));
+      } else if (newTotal !== oldTotal || newFinal !== oldFinal) {
         updateDailyStatsRevenueDiff(currentOrder.restaurantId, currentOrder, oldTotal, newTotal, oldFinal, newFinal, parseTZ(req), parseDayStart(req));
       }
     }
@@ -14389,7 +14698,16 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
     // new order, and re-releasing would free that live table / null its order.
     if (status === 'completed' && currentOrder.status !== 'completed' && currentOrder.tableNumber && currentOrder.tableNumber.trim()) {
       try {
-        console.log('🔄 Releasing table due to order completion:', currentOrder.tableNumber);
+        // Auto-dirty: when posSettings.autoDirtyOnPayment is on, a completed
+        // table moves to 'cleaning' (staff must reset it) instead of going
+        // straight back to 'available'. Guarded — any lookup failure falls
+        // back to the normal 'available' release, so billing never breaks.
+        let tableReleaseStatus = 'available';
+        try {
+          const _rdDoc = await getCachedRestDoc(currentOrder.restaurantId);
+          if (_rdDoc.exists && _rdDoc.data()?.posSettings?.autoDirtyOnPayment) tableReleaseStatus = 'cleaning';
+        } catch (_) { /* keep 'available' */ }
+        console.log('🔄 Releasing table due to order completion:', currentOrder.tableNumber, '→', tableReleaseStatus);
 
         let tableReleased = false;
 
@@ -14398,10 +14716,10 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
           const directRef = db.collection('restaurants').doc(currentOrder.restaurantId)
             .collection('floors').doc(currentOrder.floorId)
             .collection('tables').doc(currentOrder.tableId);
-          await directRef.update({ status: 'available', currentOrderId: null, updatedAt: new Date() });
+          await directRef.update({ status: tableReleaseStatus, currentOrderId: null, updatedAt: new Date() });
           console.log('✅ Table released (direct path):', currentOrder.tableNumber);
           pusherService.triggerTableStatusUpdated(currentOrder.restaurantId, {
-            tableId: currentOrder.tableId, status: 'available', orderId: null, tableNumber: currentOrder.tableNumber,
+            tableId: currentOrder.tableId, status: tableReleaseStatus, orderId: null, tableNumber: currentOrder.tableNumber,
           }).catch(err => console.error('RTDB table-status-updated error:', err));
           tableReleased = true;
         }
@@ -14424,10 +14742,10 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
 
             if (!tablesSnapshot.empty) {
               const tableDoc = tablesSnapshot.docs[0];
-              await tableDoc.ref.update({ status: 'available', currentOrderId: null, updatedAt: new Date() });
+              await tableDoc.ref.update({ status: tableReleaseStatus, currentOrderId: null, updatedAt: new Date() });
               console.log('✅ Table released after order completion:', currentOrder.tableNumber);
               pusherService.triggerTableStatusUpdated(currentOrder.restaurantId, {
-                tableId: tableDoc.id, status: 'available', orderId: null, tableNumber: currentOrder.tableNumber,
+                tableId: tableDoc.id, status: tableReleaseStatus, orderId: null, tableNumber: currentOrder.tableNumber,
               }).catch(err => console.error('RTDB table-status-updated error:', err));
               tableReleased = true;
               break;
@@ -14548,7 +14866,7 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
     // If items were updated and order is NOT completed/cancelled/deleted/saved, trigger KOT reprint
     const orderStatus = status || currentOrder.status;
     const nonKitchenStatuses = ['completed', 'cancelled', 'deleted', 'saved'];
-    if (items && items.length > 0 && !nonKitchenStatuses.includes(orderStatus) && !skipKOT) {
+    if (items && items.length > 0 && !nonKitchenStatuses.includes(orderStatus) && !skipKOT && !isSeatOnlyItemsPatch) {
       try {
         // Reset kotPrinted so pending-print API returns this order (polling mode)
         await db.collection(collections.orders).doc(orderId).update({
@@ -14590,6 +14908,12 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
       } catch (kotError) {
         console.error('KOT reprint error (non-blocking):', kotError);
       }
+    }
+
+    // Fire-and-forget: cashback wallet credit (offer promotionType 'cashback')
+    if (status === 'completed' && currentOrder.status !== 'completed') {
+      processCashbackForOrder(orderId, currentOrder).catch(() => {});
+      processWalletRedemptionForOrder(orderId).catch(() => {});
     }
 
     // If status changed to completed, trigger billing print
@@ -16177,6 +16501,541 @@ app.get('/api/tables/:restaurantId', async (req, res) => {
   }
 });
 
+// Turn-time & covers analytics for the Tables page.
+// Purely read-only/additive: aggregates completed orders in a date range into
+// avg table turn time, covers, covers/hour, turns/table and a per-table + peak-hour
+// breakdown. Does not touch any order/billing state.
+app.get('/api/tables/:restaurantId/analytics', authenticateToken, async (req, res) => {
+  try {
+    if (!(await checkFeaturePermission(req, 'analytics', 'read'))) {
+      return res.status(403).json({ error: 'Access denied. Analytics permission required.' });
+    }
+    const { restaurantId } = req.params;
+    const { date, startDate, endDate } = req.query;
+
+    // Resolve the date window (timezone-aware, mirrors the order-history path).
+    const _tz = parseTZ(req);
+    let rangeStart, rangeEnd;
+    if (startDate && endDate) {
+      rangeStart = new Date(startDate);
+      rangeEnd = new Date(endDate);
+    } else if (date) {
+      if (_tz !== undefined) {
+        const b = dateBoundsInTZ(date, _tz);
+        rangeStart = b.start; rangeEnd = b.end;
+      } else {
+        rangeStart = new Date(date);
+        rangeEnd = new Date(date); rangeEnd.setDate(rangeEnd.getDate() + 1);
+      }
+    } else {
+      // Default: today
+      if (_tz !== undefined) {
+        const t = todayInTZ(_tz);
+        rangeStart = t.start; rangeEnd = t.end;
+      } else {
+        rangeStart = new Date(); rangeStart.setHours(0, 0, 0, 0);
+        rangeEnd = new Date(); rangeEnd.setHours(23, 59, 59, 999);
+      }
+    }
+
+    const snapshot = await db.collection(collections.orders)
+      .where('restaurantId', '==', restaurantId)
+      .where('createdAt', '>=', rangeStart)
+      .where('createdAt', '<=', rangeEnd)
+      .get();
+
+    const toDate = (v) => (v && v.toDate) ? v.toDate() : (v ? new Date(v) : null);
+
+    let completedCount = 0;
+    let totalCovers = 0;
+    let totalRevenue = 0;
+    const turnDurations = [];          // minutes, dine-in with valid times only
+    const perTable = {};               // tableKey -> { orders, coversSum, revenue, durations[] }
+    const hourBuckets = new Array(24).fill(0);
+
+    snapshot.forEach(doc => {
+      const o = doc.data() || {};
+      // A "completed" order is one that has a completion timestamp.
+      const completedAt = toDate(o.completedAt);
+      if (!completedAt) return;
+      if (o.status === 'deleted' || o.status === 'expired' || o.status === 'cancelled') return;
+
+      completedCount++;
+      const covers = Number(o.covers) || 1;
+      totalCovers += covers;
+      const revenue = Number(o.finalAmount != null ? o.finalAmount : o.totalAmount) || 0;
+      totalRevenue += revenue;
+
+      const createdAt = toDate(o.createdAt);
+      if (createdAt) {
+        const h = createdAt.getHours();
+        if (h >= 0 && h < 24) hourBuckets[h]++;
+      }
+
+      // Turn time only meaningful for dine-in (a table was occupied then freed).
+      const tableKey = o.tableNumber || o.tableId || null;
+      if (tableKey && createdAt) {
+        const mins = (completedAt - createdAt) / 60000;
+        // Guard against clock skew / stale saved orders: keep 0 < mins <= 24h.
+        if (mins > 0 && mins <= 1440) {
+          turnDurations.push(mins);
+          const key = String(tableKey);
+          if (!perTable[key]) perTable[key] = { table: key, orders: 0, covers: 0, revenue: 0, durations: [] };
+          perTable[key].orders++;
+          perTable[key].covers += covers;
+          perTable[key].revenue += revenue;
+          perTable[key].durations.push(mins);
+        }
+      }
+    });
+
+    const mean = (arr) => arr.length ? arr.reduce((a, b) => a + b, 0) / arr.length : 0;
+    const median = (arr) => {
+      if (!arr.length) return 0;
+      const s = [...arr].sort((a, b) => a - b);
+      const mid = Math.floor(s.length / 2);
+      return s.length % 2 ? s[mid] : (s[mid - 1] + s[mid]) / 2;
+    };
+    const round1 = (n) => Math.round(n * 10) / 10;
+
+    // Active hours = distinct hour buckets that saw at least one order (approx. open hours).
+    const activeHours = hourBuckets.filter(c => c > 0).length || 1;
+    const distinctTables = Object.keys(perTable).length;
+    let peakHour = null, peakCount = -1;
+    hourBuckets.forEach((c, h) => { if (c > peakCount) { peakCount = c; peakHour = h; } });
+
+    const perTableOut = Object.values(perTable)
+      .map(t => ({
+        table: t.table,
+        orders: t.orders,
+        covers: t.covers,
+        revenue: round1(t.revenue),
+        avgTurnMinutes: round1(mean(t.durations)),
+      }))
+      .sort((a, b) => b.orders - a.orders)
+      .slice(0, 50);
+
+    res.json({
+      range: { start: rangeStart, end: rangeEnd },
+      completedOrders: completedCount,
+      totalCovers,
+      totalRevenue: round1(totalRevenue),
+      avgTurnMinutes: round1(mean(turnDurations)),
+      medianTurnMinutes: round1(median(turnDurations)),
+      avgCoversPerOrder: completedCount ? round1(totalCovers / completedCount) : 0,
+      coversPerHour: round1(totalCovers / activeHours),
+      turnsPerTable: distinctTables ? round1(turnDurations.length / distinctTables) : 0,
+      tablesUsed: distinctTables,
+      peakHour,               // 0-23, local hour with most orders
+      peakHourOrders: peakCount < 0 ? 0 : peakCount,
+      perTable: perTableOut,
+    });
+  } catch (error) {
+    console.error('Table analytics error:', error);
+    res.status(500).json({ error: 'Failed to compute table analytics' });
+  }
+});
+
+// Helper: locate a table doc across all floors of a restaurant.
+// Returns { ref, data, floorId } or null. Used by merge/unmerge.
+async function findTableAcrossFloors(restaurantId, tableId) {
+  const floorsSnap = await db.collection('restaurants').doc(restaurantId).collection('floors').get();
+  for (const floorDoc of floorsSnap.docs) {
+    const tDoc = await db.collection('restaurants').doc(restaurantId)
+      .collection('floors').doc(floorDoc.id).collection('tables').doc(tableId).get();
+    if (tDoc.exists) return { ref: tDoc.ref, data: tDoc.data(), floorId: floorDoc.id };
+  }
+  return null;
+}
+
+// Merge tables into one group. NON-DESTRUCTIVE: this only *links* tables — it
+// never combines or mutates any order/bill. Secondary tables must be free; if a
+// secondary has an active order, the caller is told to move/settle it first
+// (using the existing move-order flow). Fully reversible via /unmerge.
+app.post('/api/tables/:restaurantId/merge', authenticateToken, async (req, res) => {
+  try {
+    if (!(await checkFeaturePermission(req, 'tables', 'manage'))) {
+      return res.status(403).json({ error: 'Access denied. Table management permission required.' });
+    }
+    const { restaurantId } = req.params;
+    const { primaryTableId, tableIds } = req.body;
+
+    // Build the full set of table ids (primary + secondaries), de-duped.
+    let allIds = Array.isArray(tableIds) ? tableIds.filter(Boolean) : [];
+    if (primaryTableId && !allIds.includes(primaryTableId)) allIds = [primaryTableId, ...allIds];
+    allIds = [...new Set(allIds)];
+    const primaryId = primaryTableId || allIds[0];
+    if (allIds.length < 2) {
+      return res.status(400).json({ error: 'Select at least two tables to merge.' });
+    }
+
+    // Resolve every table doc.
+    const found = {};
+    for (const id of allIds) {
+      const t = await findTableAcrossFloors(restaurantId, id);
+      if (t) found[id] = t;
+    }
+    const missing = allIds.filter(id => !found[id]);
+    if (missing.length) return res.status(404).json({ error: 'One or more selected tables were not found.' });
+
+    // Reject tables already in a merge group.
+    const already = allIds.filter(id => found[id].data.mergeGroupId);
+    if (already.length) {
+      return res.status(400).json({ error: 'One or more tables are already merged. Un-merge them first.' });
+    }
+    // Secondaries must be free (no active order). Primary may be occupied.
+    const busy = allIds.filter(id => id !== primaryId && (found[id].data.status === 'occupied' || found[id].data.currentOrderId));
+    if (busy.length) {
+      const names = busy.map(id => found[id].data.name).join(', ');
+      return res.status(400).json({ error: `These tables have active orders and can't be merged: ${names}. Move or settle their orders first.` });
+    }
+
+    const secondaryIds = allIds.filter(id => id !== primaryId);
+    const mergeGroupId = `mg_${primaryId.slice(0, 8)}_${Date.now()}`;
+    const now = new Date();
+    const groupCapacity = allIds.reduce((s, id) => s + (Number(found[id].data.capacity) || 0), 0);
+
+    // Primary carries the group roster.
+    await found[primaryId].ref.update({
+      mergeGroupId,
+      mergePrimary: true,
+      mergedTables: secondaryIds,
+      mergedTableNames: secondaryIds.map(id => found[id].data.name),
+      mergedCapacity: groupCapacity,
+      updatedAt: now,
+    });
+    // Secondaries point back to the primary and go to a distinct 'merged' status.
+    for (const id of secondaryIds) {
+      await found[id].ref.update({
+        mergeGroupId,
+        mergePrimary: false,
+        mergedInto: primaryId,
+        mergedIntoName: found[primaryId].data.name,
+        status: 'merged',
+        updatedAt: now,
+      });
+      pusherService.triggerTableStatusUpdated(restaurantId, {
+        tableId: id, status: 'merged', orderId: null, tableNumber: found[id].data.name,
+      }).catch(() => {});
+    }
+    pusherService.triggerTableStatusUpdated(restaurantId, {
+      tableId: primaryId, status: found[primaryId].data.status || 'available', tableNumber: found[primaryId].data.name,
+    }).catch(() => {});
+
+    res.json({ success: true, mergeGroupId, primaryTableId: primaryId, mergedTables: secondaryIds, mergedCapacity: groupCapacity });
+  } catch (error) {
+    console.error('Merge tables error:', error);
+    res.status(500).json({ error: 'Failed to merge tables' });
+  }
+});
+
+// Un-merge a group. Clears merge fields on the primary and every secondary,
+// restoring secondaries to 'available'. Non-destructive — never touches orders.
+app.post('/api/tables/:restaurantId/unmerge', authenticateToken, async (req, res) => {
+  try {
+    if (!(await checkFeaturePermission(req, 'tables', 'manage'))) {
+      return res.status(403).json({ error: 'Access denied. Table management permission required.' });
+    }
+    const { restaurantId } = req.params;
+    const { primaryTableId } = req.body;
+    if (!primaryTableId) return res.status(400).json({ error: 'primaryTableId is required.' });
+
+    const primary = await findTableAcrossFloors(restaurantId, primaryTableId);
+    if (!primary) return res.status(404).json({ error: 'Primary table not found.' });
+    if (!primary.data.mergeGroupId) return res.status(400).json({ error: 'This table is not part of a merge group.' });
+
+    const secondaryIds = Array.isArray(primary.data.mergedTables) ? primary.data.mergedTables : [];
+    const clearFields = {
+      mergeGroupId: FieldValue.delete(),
+      mergePrimary: FieldValue.delete(),
+      mergedTables: FieldValue.delete(),
+      mergedTableNames: FieldValue.delete(),
+      mergedCapacity: FieldValue.delete(),
+      mergedInto: FieldValue.delete(),
+      mergedIntoName: FieldValue.delete(),
+      updatedAt: new Date(),
+    };
+
+    // Clear the primary.
+    await primary.ref.update(clearFields);
+    // Clear + free each secondary.
+    for (const id of secondaryIds) {
+      const sec = await findTableAcrossFloors(restaurantId, id);
+      if (sec) {
+        await sec.ref.update({ ...clearFields, status: 'available', currentOrderId: null });
+        pusherService.triggerTableStatusUpdated(restaurantId, {
+          tableId: id, status: 'available', orderId: null, tableNumber: sec.data.name,
+        }).catch(() => {});
+      }
+    }
+    pusherService.triggerTableStatusUpdated(restaurantId, {
+      tableId: primaryTableId, status: primary.data.status || 'available', tableNumber: primary.data.name,
+    }).catch(() => {});
+
+    res.json({ success: true, primaryTableId, unmerged: secondaryIds });
+  } catch (error) {
+    console.error('Unmerge tables error:', error);
+    res.status(500).json({ error: 'Failed to un-merge tables' });
+  }
+});
+
+// Assign (or clear) the server (waiter) on a table. If the table has an active
+// order, the order's waiterId/waiterName are updated too so tip/sales
+// attribution follows. Metadata only — never touches items/money.
+// Pass waiterId=null to clear. Gated on tables.update.
+app.patch('/api/tables/:tableId/assign-server', authenticateToken, async (req, res) => {
+  try {
+    if (!(await checkFeaturePermission(req, 'tables', 'update'))) {
+      return res.status(403).json({ error: 'Access denied. Tables update permission required.' });
+    }
+    const { tableId } = req.params;
+    const { restaurantId, waiterId = null, waiterName = null } = req.body;
+    if (!restaurantId) return res.status(400).json({ error: 'restaurantId is required.' });
+
+    const t = await findTableAcrossFloors(restaurantId, tableId);
+    if (!t) return res.status(404).json({ error: 'Table not found.' });
+
+    await t.ref.update({
+      waiterId: waiterId || null,
+      waiterName: waiterName || null,
+      updatedAt: new Date(),
+    });
+
+    // Keep the active order's attribution in sync.
+    if (t.data.currentOrderId) {
+      try {
+        await db.collection(collections.orders).doc(t.data.currentOrderId).update({
+          waiterId: waiterId || null,
+          waiterName: waiterName || null,
+          updatedAt: new Date(),
+        });
+      } catch (e) { console.error('Assign-server: order sync failed (non-blocking):', e.message); }
+    }
+
+    pusherService.triggerTableStatusUpdated(restaurantId, {
+      tableId, status: t.data.status || 'available', tableNumber: t.data.name,
+    }).catch(() => {});
+
+    res.json({ success: true, tableId, waiterId: waiterId || null, waiterName: waiterName || null });
+  } catch (error) {
+    console.error('Assign server error:', error);
+    res.status(500).json({ error: 'Failed to assign server' });
+  }
+});
+
+// Assign a server to every table in a section (or floor). Convenience bulk
+// version of assign-server. Body: { restaurantId, section?, floorId?, waiterId, waiterName }.
+app.post('/api/tables/:restaurantId/assign-section-server', authenticateToken, async (req, res) => {
+  try {
+    if (!(await checkFeaturePermission(req, 'tables', 'update'))) {
+      return res.status(403).json({ error: 'Access denied. Tables update permission required.' });
+    }
+    const { restaurantId } = req.params;
+    const { section = null, floorId = null, waiterId = null, waiterName = null } = req.body;
+    if (!section && !floorId) return res.status(400).json({ error: 'section or floorId is required.' });
+
+    const floorsSnap = await db.collection('restaurants').doc(restaurantId).collection('floors').get();
+    let assigned = 0;
+    for (const floorDoc of floorsSnap.docs) {
+      if (floorId && floorDoc.id !== floorId) continue;
+      const tablesSnap = await db.collection('restaurants').doc(restaurantId)
+        .collection('floors').doc(floorDoc.id).collection('tables').get();
+      for (const tableDoc of tablesSnap.docs) {
+        const td = tableDoc.data();
+        if (section && (td.section || null) !== section) continue;
+        await tableDoc.ref.update({ waiterId: waiterId || null, waiterName: waiterName || null, updatedAt: new Date() });
+        if (td.currentOrderId) {
+          try {
+            await db.collection(collections.orders).doc(td.currentOrderId).update({
+              waiterId: waiterId || null, waiterName: waiterName || null, updatedAt: new Date(),
+            });
+          } catch (_) { /* non-blocking */ }
+        }
+        assigned++;
+      }
+    }
+    res.json({ success: true, assigned, waiterId: waiterId || null, waiterName: waiterName || null });
+  } catch (error) {
+    console.error('Assign section server error:', error);
+    res.status(500).json({ error: 'Failed to assign server to section' });
+  }
+});
+
+// ==========================================
+// Walk-in waitlist (host stand)
+// Additive: its own `waitlist` collection; never touches orders/tables/billing.
+// ==========================================
+
+// Add a walk-in party to the waitlist.
+app.post('/api/waitlist/:restaurantId', authenticateToken, async (req, res) => {
+  try {
+    if (!(await checkFeaturePermission(req, 'tables', 'update'))) {
+      return res.status(403).json({ error: 'Access denied. Tables update permission required.' });
+    }
+    const { restaurantId } = req.params;
+    const { name, phone = null, partySize = 1, quotedWait = null, notes = null } = req.body;
+    if (!name || !String(name).trim()) return res.status(400).json({ error: 'Guest name is required.' });
+
+    const doc = {
+      restaurantId,
+      name: String(name).trim(),
+      phone: phone ? String(phone).trim() : null,
+      partySize: Math.max(1, Number(partySize) || 1),
+      quotedWait: quotedWait != null && quotedWait !== '' ? Number(quotedWait) : null,
+      notes: notes ? String(notes).trim() : null,
+      status: 'waiting',
+      createdAt: new Date(),
+      addedBy: req.user?.userId || req.user?.id || null,
+    };
+    const ref = await db.collection('waitlist').add(doc);
+    res.json({ success: true, id: ref.id, ...doc });
+  } catch (error) {
+    console.error('Waitlist add error:', error);
+    res.status(500).json({ error: 'Failed to add to waitlist' });
+  }
+});
+
+// List active waitlist entries (waiting + notified), oldest first.
+// Single-field query + JS filter/sort → no composite index needed.
+app.get('/api/waitlist/:restaurantId', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+    const snap = await db.collection('waitlist').where('restaurantId', '==', restaurantId).get();
+    const toMs = (v) => (v && v.toDate) ? v.toDate().getTime() : (v ? new Date(v).getTime() : 0);
+    const entries = [];
+    snap.forEach(d => {
+      const data = d.data();
+      if (['waiting', 'notified'].includes(data.status)) entries.push({ id: d.id, ...data });
+    });
+    entries.sort((a, b) => toMs(a.createdAt) - toMs(b.createdAt));
+    res.json({ waitlist: entries });
+  } catch (error) {
+    console.error('Waitlist list error:', error);
+    res.status(500).json({ error: 'Failed to load waitlist' });
+  }
+});
+
+// Update a waitlist entry — status changes (seat / cancel / no-show) or edits.
+app.patch('/api/waitlist/:restaurantId/:entryId', authenticateToken, async (req, res) => {
+  try {
+    if (!(await checkFeaturePermission(req, 'tables', 'update'))) {
+      return res.status(403).json({ error: 'Access denied. Tables update permission required.' });
+    }
+    const { entryId } = req.params;
+    const { status, tableId, tableName, partySize, quotedWait, notes, name, phone } = req.body;
+
+    const update = { updatedAt: new Date() };
+    if (status) {
+      update.status = status;
+      if (status === 'seated') { update.seatedAt = new Date(); update.tableId = tableId || null; update.tableName = tableName || null; }
+      if (status === 'cancelled') update.cancelledAt = new Date();
+      if (status === 'no-show') update.noShowAt = new Date();
+    }
+    if (partySize != null) update.partySize = Math.max(1, Number(partySize) || 1);
+    if (quotedWait !== undefined) update.quotedWait = quotedWait === '' || quotedWait == null ? null : Number(quotedWait);
+    if (notes !== undefined) update.notes = notes ? String(notes).trim() : null;
+    if (name) update.name = String(name).trim();
+    if (phone !== undefined) update.phone = phone ? String(phone).trim() : null;
+
+    await db.collection('waitlist').doc(entryId).update(update);
+    res.json({ success: true, id: entryId, ...update });
+  } catch (error) {
+    console.error('Waitlist update error:', error);
+    res.status(500).json({ error: 'Failed to update waitlist entry' });
+  }
+});
+
+// Notify a waiting party (WhatsApp) that their table is ready. Reuses the same
+// per-restaurant WhatsApp credential resolution as the order-ready alert.
+app.post('/api/waitlist/:restaurantId/:entryId/notify', authenticateToken, async (req, res) => {
+  try {
+    if (!(await checkFeaturePermission(req, 'tables', 'update'))) {
+      return res.status(403).json({ error: 'Access denied. Tables update permission required.' });
+    }
+    const { restaurantId, entryId } = req.params;
+    const entryDoc = await db.collection('waitlist').doc(entryId).get();
+    if (!entryDoc.exists) return res.status(404).json({ error: 'Waitlist entry not found.' });
+    const entry = entryDoc.data();
+    if (!entry.phone) return res.status(400).json({ error: 'No phone number on file for this guest.' });
+
+    const restDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
+    const restaurantName = restDoc.exists ? (restDoc.data().name || restDoc.data().restaurantName || 'the restaurant') : 'the restaurant';
+
+    const snapshot = await db.collection(collections.automationSettings)
+      .where('restaurantId', '==', restaurantId)
+      .where('type', '==', 'whatsapp')
+      .limit(1)
+      .get();
+    if (snapshot.empty || !snapshot.docs[0].data().connected) {
+      return res.status(400).json({ error: 'WhatsApp is not connected. Connect it in Settings to notify guests.' });
+    }
+    const wa = snapshot.docs[0].data();
+    const credentials = wa.mode === 'dineopen'
+      ? { accessToken: process.env.DINEOPEN_WHATSAPP_ACCESS_TOKEN, phoneNumberId: wa.phoneNumberId || process.env.DINEOPEN_WHATSAPP_PHONE_NUMBER_ID, businessAccountId: process.env.DINEOPEN_WHATSAPP_BUSINESS_ACCOUNT_ID }
+      : { accessToken: wa.accessToken, phoneNumberId: wa.phoneNumberId || process.env.DINEOPEN_WHATSAPP_PHONE_NUMBER_ID, businessAccountId: wa.businessAccountId };
+    if (!credentials.accessToken) return res.status(400).json({ error: 'WhatsApp credentials are missing.' });
+
+    const message = `Hi ${entry.name}! 🎉 Your table at ${restaurantName} is ready. Please head over to the host stand.`;
+    await whatsappService.sendTextMessage(entry.phone, message, credentials);
+    await db.collection('waitlist').doc(entryId).update({ status: 'notified', notifiedAt: new Date() });
+
+    res.json({ success: true, notified: true });
+  } catch (error) {
+    console.error('Waitlist notify error:', error);
+    res.status(500).json({ error: 'Failed to notify guest' });
+  }
+});
+
+// Save the drag-and-drop floor-plan layout for a floor's tables. Bulk update of
+// position/size/shape only — never touches status/order/billing. Gated on
+// tables.manage. Body: { floorId, tables: [{ id, posX, posY, width, height, rotation, shape }] }.
+app.post('/api/tables/:restaurantId/layout', authenticateToken, async (req, res) => {
+  try {
+    if (!(await checkFeaturePermission(req, 'tables', 'manage'))) {
+      return res.status(403).json({ error: 'Access denied. Table management permission required.' });
+    }
+    const { restaurantId } = req.params;
+    const { floorId, tables } = req.body;
+    if (!Array.isArray(tables) || tables.length === 0) {
+      return res.status(400).json({ error: 'tables array is required.' });
+    }
+
+    const num = (v, d) => (v == null || isNaN(Number(v)) ? d : Number(v));
+    const allowedShapes = ['rect', 'round', 'square'];
+    let saved = 0;
+
+    for (const t of tables) {
+      if (!t || !t.id) continue;
+      const layout = {
+        posX: num(t.posX, 0),
+        posY: num(t.posY, 0),
+        width: num(t.width, 90),
+        height: num(t.height, 90),
+        rotation: num(t.rotation, 0),
+        shape: allowedShapes.includes(t.shape) ? t.shape : 'rect',
+        updatedAt: new Date(),
+      };
+      // Fast path with floorId; fallback to scan.
+      let ref = null;
+      if (floorId) {
+        const d = await db.collection('restaurants').doc(restaurantId)
+          .collection('floors').doc(floorId).collection('tables').doc(t.id).get();
+        if (d.exists) ref = d.ref;
+      }
+      if (!ref) {
+        const found = await findTableAcrossFloors(restaurantId, t.id);
+        if (found) ref = found.ref;
+      }
+      if (ref) { await ref.update(layout); saved++; }
+    }
+
+    res.json({ success: true, saved });
+  } catch (error) {
+    console.error('Save floor layout error:', error);
+    res.status(500).json({ error: 'Failed to save floor layout' });
+  }
+});
+
 app.post('/api/tables/:restaurantId', authenticateToken, async (req, res) => {
   try {
     // Granular permission check: tables.add
@@ -16552,9 +17411,12 @@ app.post('/api/tables/:restaurantId/reset-all', authenticateToken, async (req, r
 // Update table details
 app.patch('/api/tables/:tableId', authenticateToken, async (req, res) => {
   try {
-    // Granular permission check: tables.update
-    if (!(await checkFeaturePermission(req, 'tables', 'update'))) {
-      return res.status(403).json({ error: 'Access denied. Tables update permission required.' });
+    // Editing a table's config (name/floor/capacity/section) requires the
+    // "manage" capability — owner/admin by default, grantable to other roles.
+    // (Status changes go through PATCH /:tableId/status which stays on 'update'
+    // so regular staff can still occupy/free/clean tables.)
+    if (!(await checkFeaturePermission(req, 'tables', 'manage'))) {
+      return res.status(403).json({ error: 'Access denied. Table management permission required.' });
     }
     const { tableId } = req.params;
     const { name, floor, capacity, section, restaurantId } = req.body;
@@ -16621,9 +17483,10 @@ app.patch('/api/tables/:tableId', authenticateToken, async (req, res) => {
 // Delete table
 app.delete('/api/tables/:tableId', authenticateToken, async (req, res) => {
   try {
-    // Granular permission check: tables.delete
-    if (!(await checkFeaturePermission(req, 'tables', 'delete'))) {
-      return res.status(403).json({ error: 'Access denied. Tables delete permission required.' });
+    // Deleting a table requires the "manage" capability — owner/admin by
+    // default, grantable to other roles via the staff permission editor.
+    if (!(await checkFeaturePermission(req, 'tables', 'manage'))) {
+      return res.status(403).json({ error: 'Access denied. Table management permission required.' });
     }
     const { tableId } = req.params;
     const { restaurantId } = req.body;
@@ -16703,7 +17566,7 @@ app.get('/api/floors/:restaurantId', async (req, res) => {
       const floorTables = [];
       for (const tableDoc of tablesSnapshot.docs) {
         const tableData = tableDoc.data();
-        const tbl = { id: tableDoc.id, ...tableData, currentOrderTotal: null };
+        const tbl = { id: tableDoc.id, ...tableData, currentOrderTotal: null, currentOrderCovers: null };
         floorTables.push(tbl);
         if (tableData.currentOrderId && tableData.status === 'occupied') {
           orderIds.add(tableData.currentOrderId);
@@ -16714,6 +17577,7 @@ app.get('/api/floors/:restaurantId', async (req, res) => {
 
     // Batch-read all orders at once (instead of N+1 individual reads)
     const orderTotals = {};
+    const orderCovers = {};
     if (orderIds.size > 0) {
       const orderRefs = [...orderIds].map(id => db.collection(collections.orders).doc(id));
       // getAll supports up to 100 refs; chunk if needed
@@ -16727,6 +17591,7 @@ app.get('/api/floors/:restaurantId', async (req, res) => {
           if (doc.exists) {
             const data = doc.data();
             orderTotals[doc.id] = data.finalAmount || data.totalAmount || 0;
+            orderCovers[doc.id] = Number(data.covers) || null;
           }
         });
       }
@@ -16737,6 +17602,9 @@ app.get('/api/floors/:restaurantId', async (req, res) => {
       tables.forEach(tbl => {
         if (tbl.currentOrderId && orderTotals[tbl.currentOrderId] !== undefined) {
           tbl.currentOrderTotal = orderTotals[tbl.currentOrderId];
+        }
+        if (tbl.currentOrderId && orderCovers[tbl.currentOrderId]) {
+          tbl.currentOrderCovers = orderCovers[tbl.currentOrderId];
         }
       });
       floors.push({
@@ -19875,7 +20743,8 @@ app.get('/api/admin/print-settings/:restaurantId', authenticateToken, async (req
       autoPrintOnCompleteBilling: false,   // Native: silent print bill on Complete Billing
       autoPrintOnBillAndPrint: true,       // Native: silent print bill on Bill & Print
       kotTemplate: 'classic',              // KOT print template: classic, compact, bold, grouped, numbered
-      billTemplate: 'classic'              // Bill print template: classic, compact, detailed, elegant, minimal
+      billTemplate: 'classic',             // Bill print template: classic, compact, detailed, elegant, minimal
+      showOrderStatusQR: false             // Print a "track your order" QR on the bill (links to /order-status/<id>)
     };
 
     const printSettings = { ...defaultSettings, ...(restaurantData.printSettings || {}) };
@@ -19930,7 +20799,8 @@ app.put('/api/admin/print-settings/:restaurantId', authenticateToken, async (req
       'autoPrintOnPlaceOrder',
       'autoPrintOnKOTAndPrint',
       'autoPrintOnCompleteBilling',
-      'autoPrintOnBillAndPrint'
+      'autoPrintOnBillAndPrint',
+      'showOrderStatusQR'
     ];
 
     // Numeric fields
@@ -20883,7 +21753,78 @@ app.get('/api/kot/:restaurantId', async (req, res) => {
 });
 
 // Update KOT cooking status and timer
-app.patch('/api/kot/:orderId/status', async (req, res) => {
+// Which roles may ADVANCE an order's kitchen/service status (preparing/ready/served).
+// owner/admin are always allowed. `billingSettings.orderStatusRoles` lets each store
+// widen this beyond the kitchen (e.g. waiter, cashier, manager). An empty/unset list
+// means "any authenticated staff" so existing setups keep working. Statuses outside
+// the kitchen-progression set are gated by their own checks (cancel/completeBill).
+const KITCHEN_PROGRESSION_STATUSES = ['preparing', 'ready', 'served'];
+async function canAdvanceOrderStatus(req, restaurantId, targetStatus) {
+  if (!KITCHEN_PROGRESSION_STATUSES.includes(targetStatus)) return true;
+  const role = (req.user?.role || '').toLowerCase();
+  if (role === 'owner' || role === 'admin') return true;
+  if (!restaurantId) return true;
+  try {
+    const restDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
+    const roles = restDoc.exists ? restDoc.data()?.billingSettings?.orderStatusRoles : null;
+    if (Array.isArray(roles) && roles.length > 0) return roles.includes(role);
+    return true; // not configured → allow any authenticated staff (kitchen included)
+  } catch (e) {
+    console.error('canAdvanceOrderStatus check error (allowing):', e.message);
+    return true;
+  }
+}
+
+// Sends the customer an "order ready" alert (WhatsApp/SMS) when their order is
+// bumped to ready. Fully implemented below (P2); safe no-op guard here so the
+// call sites never throw. Fire-and-forget — never blocks a status update.
+async function maybeNotifyCustomerOrderReady(order) {
+  try {
+    return await sendCustomerOrderReadyAlert(order);
+  } catch (e) {
+    console.error('maybeNotifyCustomerOrderReady error (non-blocking):', e.message);
+  }
+}
+
+// Sends the customer a WhatsApp "your order is ready" message when an order is
+// bumped to ready. Opt-in per store (posSettings.orderReadyAlertEnabled) and only
+// when WhatsApp is connected — so it's silent/cost-free unless enabled. Includes a
+// link to the customer's own live status page.
+async function sendCustomerOrderReadyAlert(order) {
+  const phone = order?.customerInfo?.phone || order?.customerPhone;
+  if (!phone || phone === 'null' || String(phone).trim() === '') return;
+  const restaurantId = order.restaurantId;
+  if (!restaurantId) return;
+
+  const restDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
+  if (!restDoc.exists) return;
+  const rest = restDoc.data();
+  if (!rest?.posSettings?.orderReadyAlertEnabled) return; // off by default (opt-in)
+  const restaurantName = rest.name || rest.restaurantName || 'your order';
+
+  // WhatsApp credentials — same resolution as the messaging endpoints.
+  const snapshot = await db.collection(collections.automationSettings)
+    .where('restaurantId', '==', restaurantId)
+    .where('type', '==', 'whatsapp')
+    .limit(1)
+    .get();
+  if (snapshot.empty || !snapshot.docs[0].data().connected) return;
+  const wa = snapshot.docs[0].data();
+  const credentials = wa.mode === 'dineopen'
+    ? { accessToken: process.env.DINEOPEN_WHATSAPP_ACCESS_TOKEN, phoneNumberId: wa.phoneNumberId || process.env.DINEOPEN_WHATSAPP_PHONE_NUMBER_ID, businessAccountId: process.env.DINEOPEN_WHATSAPP_BUSINESS_ACCOUNT_ID }
+    : { accessToken: wa.accessToken, phoneNumberId: wa.phoneNumberId || process.env.DINEOPEN_WHATSAPP_PHONE_NUMBER_ID, businessAccountId: wa.businessAccountId };
+  if (!credentials.accessToken) return;
+
+  const token = order.dailyOrderId || order.orderNumber || (order.id ? String(order.id).slice(-6) : '');
+  const baseUrl = process.env.FRONTEND_URL || 'https://www.dineopen.com';
+  const link = order.id ? `${baseUrl}/order-status/${order.id}` : '';
+  const name = order?.customerInfo?.name ? ` ${order.customerInfo.name}` : '';
+  const message = `Hi${name}! 🎉 Your order${token ? ` #${token}` : ''} at ${restaurantName} is READY.${link ? `\n\nTrack it live: ${link}` : ''}`;
+
+  await whatsappService.sendTextMessage(phone, message, credentials);
+}
+
+app.patch('/api/kot/:orderId/status', authenticateToken, async (req, res) => {
   try {
     const { orderId } = req.params;
     const { status, cookingStartTime, cookingEndTime, notes } = req.body;
@@ -20891,6 +21832,28 @@ app.patch('/api/kot/:orderId/status', async (req, res) => {
     const validStatuses = ['pending', 'confirmed', 'preparing', 'ready', 'served', 'completed', 'cancelled'];
     if (!validStatuses.includes(status)) {
       return res.status(400).json({ error: 'Invalid status' });
+    }
+
+    // Load the order once — used for auth scoping, timing calc and the RTDB payload.
+    const orderRef = db.collection(collections.orders).doc(orderId);
+    const orderSnap = await orderRef.get();
+    if (!orderSnap.exists) {
+      return res.status(404).json({ error: 'Order not found' });
+    }
+    const existingOrder = orderSnap.data();
+
+    // Restaurant-scope check: staff are limited to their store; owner/admin to the
+    // selected store (falls back to the order's store).
+    const role = (req.user?.role || '').toLowerCase();
+    const userRestaurantId = req.user?.restaurantId
+      || ((role === 'owner' || role === 'admin') ? (req.body.restaurantId || existingOrder.restaurantId) : null);
+    if (userRestaurantId && existingOrder.restaurantId !== userRestaurantId) {
+      return res.status(403).json({ error: 'Access denied: Order does not belong to your restaurant' });
+    }
+
+    // Role gate — who is allowed to move an order to preparing/ready/served.
+    if (!(await canAdvanceOrderStatus(req, existingOrder.restaurantId, status))) {
+      return res.status(403).json({ error: 'Access denied. Your role is not permitted to update order status.' });
     }
 
     const updateData = {
@@ -20906,17 +21869,13 @@ app.patch('/api/kot/:orderId/status', async (req, res) => {
 
     if (status === 'ready') {
       updateData.cookingEndTime = new Date();
-      
-      // Calculate actual cooking time if we have start time
-      const orderDoc = await db.collection(collections.orders).doc(orderId).get();
-      if (orderDoc.exists) {
-        const orderData = orderDoc.data();
-        if (orderData.cookingStartTime) {
-          const startTime = orderData.cookingStartTime.toDate();
-          const endTime = new Date();
-          const cookingDuration = Math.floor((endTime - startTime) / (1000 * 60)); // in minutes
-          updateData.actualCookingTime = cookingDuration;
-        }
+      // Calculate actual cooking time if we have a start time (reuse loaded order)
+      if (existingOrder.cookingStartTime) {
+        const startTime = existingOrder.cookingStartTime.toDate
+          ? existingOrder.cookingStartTime.toDate()
+          : new Date(existingOrder.cookingStartTime);
+        const cookingDuration = Math.floor((new Date() - startTime) / (1000 * 60)); // minutes
+        updateData.actualCookingTime = cookingDuration;
       }
     }
 
@@ -20932,23 +21891,25 @@ app.patch('/api/kot/:orderId/status', async (req, res) => {
       updateData.kitchenNotes = notes;
     }
 
-    await db.collection(collections.orders).doc(orderId).update(updateData);
+    await orderRef.update(updateData);
 
     // Push RTDB event so token display + other views get real-time updates
     try {
-      const od = (await db.collection(collections.orders).doc(orderId).get()).data();
-      if (od) {
-        await pusherService.notifyOrderStatusUpdated(od.restaurantId, orderId, status, {
-          orderNumber: od.orderNumber,
-          dailyOrderId: od.dailyOrderId,
-          totalAmount: od.totalAmount,
-          tableNumber: od.tableNumber,
-          tableId: od.tableId || null,
-          floorId: od.floorId || null,
-        });
-      }
+      await pusherService.notifyOrderStatusUpdated(existingOrder.restaurantId, orderId, status, {
+        orderNumber: existingOrder.orderNumber,
+        dailyOrderId: existingOrder.dailyOrderId,
+        totalAmount: existingOrder.totalAmount,
+        tableNumber: existingOrder.tableNumber,
+        tableId: existingOrder.tableId || null,
+        floorId: existingOrder.floorId || null,
+      });
     } catch (rtdbErr) {
       console.error('KOT RTDB notification error (non-blocking):', rtdbErr);
+    }
+
+    // Customer "order ready" alert (WhatsApp/SMS) — fire-and-forget (P2 hook).
+    if (status === 'ready' && existingOrder.status !== 'ready') {
+      maybeNotifyCustomerOrderReady({ id: orderId, ...existingOrder }).catch(() => {});
     }
 
     res.json({
@@ -21688,6 +22649,8 @@ const assembleBillRenderPayload = (orderId, orderData, restaurantId, restaurantD
     restaurantLegalName: restaurant.legalBusinessName || '',
     restaurantAddress: printSettings.receiptAddress || restaurant.address,
     restaurantPhone: printSettings.receiptPhone || restaurant.phone,
+    cashbackEarned: orderData.cashbackEarned || 0,
+    cashbackOfferName: orderData.cashbackOfferName || null,
     restaurantEmail: restaurant.email,
     gstin: restaurant.gstin || '',
     fssai: restaurant.fssai || '',
@@ -22017,7 +22980,7 @@ app.get('/api/token/render/:restaurantId/:orderId', async (req, res) => {
 // ========================================
 async function reverseOrderSideEffects(orderId, orderData) {
   const restaurantId = orderData.restaurantId;
-  const results = { inventory: false, customer: false, loyalty: false, offers: false, credit: false };
+  const results = { inventory: false, customer: false, loyalty: false, offers: false, credit: false, wallet: false };
 
   console.log(`🔄 Reversing side effects for Order ${orderId} (was: ${orderData.status})`);
 
@@ -22060,9 +23023,16 @@ async function reverseOrderSideEffects(orderId, orderData) {
           updatedAt: new Date()
         };
 
-        // Reverse loyalty points: undo earned, restore redeemed
-        const pointsEarned = orderData.loyaltyPointsEarned || 0;
-        const pointsRedeemed = orderData.loyaltyPointsRedeemed || 0;
+        // Reverse loyalty points ONLY if the order was actually completed —
+        // loyalty is awarded/deducted at completion, so a pre-completion cancel
+        // never touched points and must not reverse them (that wrongly dropped
+        // the customer's balance for an order they never paid). orderData holds
+        // the pre-mutation status at every caller: cancel → never 'completed'
+        // (cancel is blocked for completed orders); refund/delete → 'completed'
+        // when the order was billed.
+        const wasCompleted = orderData.status === 'completed';
+        const pointsEarned = wasCompleted ? (orderData.loyaltyPointsEarned || 0) : 0;
+        const pointsRedeemed = wasCompleted ? (orderData.loyaltyPointsRedeemed || 0) : 0;
         const netReverse = -pointsEarned + pointsRedeemed; // subtract earned, add back redeemed
         if (netReverse !== 0) {
           custUpdate.loyaltyPoints = FieldValue.increment(netReverse);
@@ -22085,6 +23055,18 @@ async function reverseOrderSideEffects(orderId, orderData) {
         await custRef.update(custUpdate);
         results.customer = true;
         console.log(`👤 Customer ${customerId} stats reversed: orders ${custData.totalOrders} → ${newTotalOrders}, spent ₹${custData.totalSpent} → ₹${Math.round(newTotalSpent * 100) / 100}`);
+
+        // Reverse wallet effects (only for orders that actually completed —
+        // pre-completion cancels never debited wallet or credited cashback).
+        // Credits back the wallet payment and claws back the cashback, reading
+        // the wallet history so only real effects are reversed; idempotent.
+        if (wasCompleted) {
+          const walletRev = await reverseWalletForRefundedOrder(customerId, orderId, orderData);
+          if (walletRev.reversed) {
+            results.wallet = true;
+            console.log(`💸 Wallet reversed for refunded order ${orderId}: +₹${walletRev.walletRefunded} payment, -₹${walletRev.cashbackClawedBack} cashback (net ${walletRev.net >= 0 ? '+' : ''}₹${walletRev.net})`);
+          }
+        }
       }
     } catch (err) {
       console.error(`⚠️ Customer stats reversal failed for Order ${orderId}:`, err.message);
@@ -22310,6 +23292,231 @@ app.patch('/api/orders/:orderId/cancel', authenticateToken, async (req, res) => 
   }
 });
 
+// ========================================
+// Wallet debit — atomic + idempotent per order.
+// Idempotency key: a 'redeem' walletHistory entry carrying this orderId. Safe to
+// call from BOTH the /wallet/redeem endpoint and the completion hook below — the
+// wallet is only ever debited once per order regardless of who triggers it or of
+// races (the transaction serializes concurrent calls). This is what lets the
+// server-side completion hook coexist with the pre-existing client-side debit
+// without ever double-charging.
+// ========================================
+async function debitWalletForOrder({ customerId, orderId, amount, staffId = null, staffName = 'System', notes = '' }) {
+  const amt = Math.round(Number(amount) * 100) / 100;
+  if (!customerId || !amt || amt <= 0) return { success: false, reason: 'invalid_args' };
+  const customerRef = db.collection('customers').doc(customerId);
+  try {
+    return await db.runTransaction(async (tx) => {
+      const doc = await tx.get(customerRef);
+      if (!doc.exists) return { success: false, reason: 'customer_not_found' };
+      const data = doc.data();
+      const history = Array.isArray(data.walletHistory) ? data.walletHistory : [];
+      // Idempotency: already debited for this order?
+      if (orderId && history.some(h => h && h.type === 'redeem' && h.orderId === orderId)) {
+        return { success: true, alreadyDone: true, walletBalance: data.walletBalance || 0 };
+      }
+      const currentBalance = data.walletBalance || 0;
+      if (currentBalance < amt) return { success: false, reason: 'insufficient_balance', walletBalance: currentBalance };
+      const newBalance = Math.round((currentBalance - amt) * 100) / 100;
+      const txn = {
+        id: `txn_${Date.now()}_${Math.random().toString(36).substr(2, 6)}`,
+        type: 'redeem',
+        amount: amt,
+        reason: 'redemption',
+        notes: notes || (orderId ? `Redeemed for order ${orderId}` : ''),
+        orderId: orderId || null,
+        staffId,
+        staffName,
+        balanceAfter: newBalance,
+        createdAt: new Date().toISOString(),
+      };
+      tx.update(customerRef, {
+        walletBalance: newBalance,
+        walletHistory: [...history, txn],
+        updatedAt: new Date().toISOString(),
+      });
+      return { success: true, walletBalance: newBalance, transaction: txn };
+    });
+  } catch (err) {
+    console.error(`Wallet debit error (order ${orderId}, customer ${customerId}):`, err.message);
+    return { success: false, reason: 'error', error: err.message };
+  }
+}
+
+// Fire-and-forget wallet debit at order completion. Ensures wallet-paid orders
+// are debited server-side even when the client never calls (table billing) or
+// can't (offline sync) — the previous client-only debit silently missed both.
+// Re-reads the persisted order (like the cashback processor) so it always sees
+// the merged walletRedeemAmount/walletCustomerId regardless of the caller.
+async function processWalletRedemptionForOrder(orderId) {
+  try {
+    const freshDoc = await db.collection(collections.orders).doc(orderId).get();
+    if (!freshDoc.exists) return;
+    const fresh = freshDoc.data();
+    const amt = Math.round(Number(fresh.walletRedeemAmount || 0) * 100) / 100;
+    if (!amt || amt <= 0) return;
+    const customerId = fresh.walletCustomerId || fresh.customerId;
+    if (!customerId) {
+      console.warn(`⚠️ Wallet redemption ₹${amt} on order ${orderId} has no customer — skipped`);
+      return;
+    }
+    const result = await debitWalletForOrder({
+      customerId,
+      orderId,
+      amount: amt,
+      notes: `Wallet payment for order ${fresh.dailyOrderId || orderId}`,
+    });
+    if (result.success && !result.alreadyDone) {
+      console.log(`💰 Wallet debited ₹${amt} for order ${orderId} (customer ${customerId})`);
+    } else if (!result.success) {
+      console.warn(`⚠️ Wallet debit not applied for order ${orderId}: ${result.reason}`);
+    }
+  } catch (err) {
+    console.error('processWalletRedemptionForOrder error (non-blocking):', err.message);
+  }
+}
+
+// Reverse an order's wallet effects when it is fully refunded / cancelled /
+// deleted after completion: credit back what the customer actually paid from
+// their wallet (the completion debit) and claw back the cashback that was
+// actually credited. Reads the wallet HISTORY (not the order's claimed amounts)
+// so it only reverses effects that truly happened — the completion debit/credit
+// can fail. Idempotent per order via a 'refund_reversal' history entry; atomic.
+async function reverseWalletForRefundedOrder(customerId, orderId, orderData) {
+  if (!customerId) return { reversed: false };
+  const customerRef = db.collection('customers').doc(customerId);
+  try {
+    return await db.runTransaction(async (tx) => {
+      const doc = await tx.get(customerRef);
+      if (!doc.exists) return { reversed: false };
+      const data = doc.data();
+      const history = Array.isArray(data.walletHistory) ? data.walletHistory : [];
+      if (history.some(h => h && h.type === 'refund_reversal' && h.orderId === orderId)) {
+        return { reversed: false, alreadyDone: true };
+      }
+      const redeemEntry = history.find(h => h && h.type === 'redeem' && h.orderId === orderId);
+      const cashbackEntry = history.find(h => h && h.type === 'credit' && h.reason === 'cashback' && h.orderId === orderId);
+      const walletRefunded = redeemEntry ? Math.round((Number(redeemEntry.amount) || 0) * 100) / 100 : 0;      // give back
+      const cashbackClawedBack = cashbackEntry ? Math.round((Number(cashbackEntry.amount) || 0) * 100) / 100 : 0; // take back
+      const net = Math.round((walletRefunded - cashbackClawedBack) * 100) / 100;
+      if (net === 0) return { reversed: false };
+      const currentBalance = data.walletBalance || 0;
+      const newBalance = Math.round((currentBalance + net) * 100) / 100; // may go negative if cashback was already spent
+      const txn = {
+        id: `txn_${Date.now()}_${Math.random().toString(36).substr(2, 6)}`,
+        type: 'refund_reversal',
+        amount: net,
+        reason: 'order_refunded',
+        notes: `Order ${orderData.dailyOrderId || orderId} refunded — wallet payment +${walletRefunded}, cashback -${cashbackClawedBack}`,
+        orderId,
+        walletRefunded,
+        cashbackClawedBack,
+        balanceAfter: newBalance,
+        createdAt: new Date().toISOString(),
+      };
+      tx.update(customerRef, {
+        walletBalance: newBalance,
+        walletHistory: [...history, txn],
+        updatedAt: new Date().toISOString(),
+      });
+      return { reversed: true, net, walletRefunded, cashbackClawedBack };
+    });
+  } catch (err) {
+    console.error(`reverseWalletForRefundedOrder error (order ${orderId}):`, err.message);
+    return { reversed: false, error: err.message };
+  }
+}
+
+// ========================================
+// Cashback — automatic post-payment wallet credit (offer promotionType 'cashback')
+// Evaluated at order completion from the paid amount; credits the customer's
+// wallet for use on the NEXT order. Fire-and-forget; never blocks completion.
+// ========================================
+async function processCashbackForOrder(orderId, orderData) {
+  try {
+    const restaurantId = orderData.restaurantId;
+    if (!restaurantId) return;
+
+    // Double-credit guard: re-read the order; skip if already processed
+    const freshDoc = await db.collection(collections.orders).doc(orderId).get();
+    if (!freshDoc.exists) return;
+    const fresh = freshDoc.data();
+    if (fresh.cashbackEarned != null) return;
+    if ((fresh.outstandingAmount || 0) > 0) return; // khata/partial: no cashback until fully paid
+
+    const paidAmount = Number(fresh.finalAmount != null ? fresh.finalAmount : fresh.totalAmount) || 0;
+    if (paidAmount <= 0) return;
+
+    // Active cashback offers for this restaurant (filtered in code — small set)
+    const offersSnap = await db.collection('offers')
+      .where('restaurantId', '==', restaurantId)
+      .where('isActive', '==', true)
+      .get();
+    if (offersSnap.empty) return;
+
+    const restDoc = await getCachedRestDoc(restaurantId);
+    const restTimezone = (restDoc.exists ? restDoc.data().posSettings?.timezone : null) || 'Asia/Kolkata';
+    const now = new Date();
+
+    let best = null;
+    offersSnap.docs.forEach(doc => {
+      const offer = { id: doc.id, ...doc.data() };
+      if (offer.promotionType !== 'cashback') return;
+      if (!offerEngine.isDateValid(offer, now)) return;
+      if (!offerEngine.isScheduleValid(offer, now, restTimezone)) return;
+      if (offer.usageLimit && (offer.usageCount || 0) >= offer.usageLimit) return;
+      const amount = offerEngine.resolveCashbackAmount(offer, paidAmount);
+      if (amount > 0 && (!best || amount > best.amount)) best = { offer, amount };
+    });
+    if (!best) return;
+
+    // Resolve the customer — cashback needs a wallet to land in
+    let customerId = fresh.customerId || null;
+    const customerPhone = fresh.customerInfo?.phone || fresh.customerPhone || null;
+    if (!customerId && customerPhone) {
+      const custSnap = await db.collection('customers')
+        .where('restaurantId', '==', restaurantId)
+        .where('phone', '==', customerPhone)
+        .limit(1).get();
+      if (!custSnap.empty) customerId = custSnap.docs[0].id;
+    }
+    if (!customerId) {
+      console.log(`💸 Cashback: order ${orderId} qualifies for ₹${best.amount} but has no customer attached — skipped`);
+      return;
+    }
+
+    // Mark the order first (idempotency anchor), then credit the wallet
+    await db.collection(collections.orders).doc(orderId).update({
+      cashbackEarned: best.amount,
+      cashbackOfferId: best.offer.id,
+      cashbackOfferName: best.offer.name || 'Cashback',
+    });
+
+    const txn = {
+      id: `txn_${Date.now()}_${Math.random().toString(36).substr(2, 6)}`,
+      type: 'credit',
+      amount: best.amount,
+      reason: 'cashback',
+      notes: `Cashback on order ${fresh.dailyOrderId || orderId} (${best.offer.name || 'Cashback offer'})`,
+      orderId,
+      offerId: best.offer.id,
+      balanceAfter: null, // computed client-side from running balance; increments are atomic
+      createdAt: new Date().toISOString(),
+    };
+    await db.collection('customers').doc(customerId).update({
+      walletBalance: FieldValue.increment(best.amount),
+      walletHistory: FieldValue.arrayUnion(txn),
+      updatedAt: new Date().toISOString(),
+    });
+
+    const customerKey = offerEngine.buildCustomerKey(customerId, customerPhone || '');
+    offerEngine.incrementUsage(db, best.offer.id, customerKey).catch(() => {});
+    console.log(`💸 Cashback: ₹${best.amount} credited to customer ${customerId} for order ${orderId} (paid ₹${paidAmount})`);
+  } catch (err) {
+    console.error('Cashback processing error (non-blocking):', err.message);
+  }
+}
+
 // Restore Order — reapply side effects (inverse of reverseOrderSideEffects)
 async function reapplyOrderSideEffects(orderId, orderData) {
   const restaurantId = orderData.restaurantId;
@@ -22341,8 +23548,16 @@ async function reapplyOrderSideEffects(orderId, orderData) {
         const custData = custDoc.data();
         const orderHistory = custData.orderHistory || [];
 
-        // Re-add this order to history (if not already there)
-        if (!orderHistory.some(h => h.orderId === orderId)) {
+        // Only re-add to history / re-apply loyalty if the order was completed
+        // before cancellation (mirror of the reverse guard). Cancel is blocked
+        // for completed orders, so a restored order is always pre-completion —
+        // its history entry and loyalty are applied when it is genuinely
+        // completed later, NOT on restore (else totalOrders/totalSpent inflate
+        // and points are granted for an unpaid order).
+        const wasCompleted = orderData.lastStatus === 'completed';
+
+        // Re-add this order to history (if completed and not already there)
+        if (wasCompleted && !orderHistory.some(h => h.orderId === orderId)) {
           orderHistory.push({
             orderId,
             date: orderData.createdAt || new Date(),
@@ -22364,8 +23579,8 @@ async function reapplyOrderSideEffects(orderId, orderData) {
         };
 
         // Re-apply loyalty points: add earned back, deduct redeemed again
-        const pointsEarned = orderData.loyaltyPointsEarned || 0;
-        const pointsRedeemed = orderData.loyaltyPointsRedeemed || 0;
+        const pointsEarned = wasCompleted ? (orderData.loyaltyPointsEarned || 0) : 0;
+        const pointsRedeemed = wasCompleted ? (orderData.loyaltyPointsRedeemed || 0) : 0;
         const netReapply = pointsEarned - pointsRedeemed;
         if (netReapply !== 0) {
           custUpdate.loyaltyPoints = FieldValue.increment(netReapply);
@@ -23462,7 +24677,7 @@ const FEATURE_OPS = {
   inventory: ['read', 'add', 'update', 'delete'],
   menu: ['read', 'add', 'update', 'delete', 'markOutOfStock'],
   orders: ['read', 'update', 'cancel', 'refund', 'completeBill'],
-  tables: ['read', 'add', 'update', 'delete', 'reset'],
+  tables: ['read', 'add', 'update', 'delete', 'reset', 'manage'],
   customers: ['read', 'add', 'update', 'delete'],
   offers: ['read', 'add', 'update', 'delete'],
   bookings: ['read', 'add', 'update', 'delete', 'complete'],
@@ -29200,14 +30415,16 @@ app.get('/api/books/:restaurantId/revenue', authenticateToken, async (req, res) 
       curDocs.forEach((doc, i) => {
         if (!doc.exists) return;
         const data = doc.data();
-        // Revenue = collected amounts minus refunds; due tracked separately
+        // Revenue is already NET of refunds (the refund handler reduces
+        // totalRevenueWithTax). totalRefunds stays 0, so this keeps revenue net.
+        // The Refunds tile reads refundsIssued (display-only, never subtracted).
         const docRefunds = data.totalRefunds || 0;
         const docRevenue = (data.totalRevenueWithTax || 0) - docRefunds;
         totalRevenue += docRevenue;
         totalDueAmount += data.totalDueAmount || 0;
         totalTax += data.totalTax || 0;
         totalDiscounts += data.totalDiscounts || 0;
-        refunds += docRefunds;
+        refunds += (data.refundsIssued || 0);
         orderCount += data.totalOrders || 0;
 
         // Payment method breakdown from paymentMethod_* fields
@@ -32333,8 +33550,15 @@ app.get('/api/public/offers/:restaurantId', vercelSecurityMiddleware.publicAPI, 
       kvSet(offersCacheKey, allOffers, 180).catch(() => {});
     }
 
-    // Filter cached offers by date, usage, and first-order eligibility
+    // Filter cached offers by date, usage, and first-order eligibility.
+    // Cashback offers are automatic post-payment wallet credits, NOT selectable
+    // bill discounts — exclude them here so the public ordering page (which has
+    // its own offer math and would otherwise render them as "₹X off" and
+    // underpay via Razorpay) never treats them as discounts. Filtered on every
+    // response so a stale cache can't leak them either. Cashback still credits:
+    // processCashbackForOrder reads Firestore directly at completion.
     const offers = allOffers.filter(offer => {
+      if (offer.promotionType === 'cashback') return false;
       const validFrom = offer.validFrom ? new Date(offer.validFrom) : null;
       const validUntil = offer.validUntil ? new Date(offer.validUntil) : null;
       const isValidDate = (!validFrom || now >= validFrom) && (!validUntil || now <= validUntil);
@@ -32986,6 +34210,8 @@ app.get('/api/restaurants/:restaurantId/billing-settings', authenticateToken, as
       completeBillingRoles: Array.isArray(existing.completeBillingRoles) ? existing.completeBillingRoles : [],
       billAndPrintRoles: Array.isArray(existing.billAndPrintRoles) ? existing.billAndPrintRoles : [],
       paymentMethodRoles: Array.isArray(existing.paymentMethodRoles) ? existing.paymentMethodRoles : [],
+      // Who can advance order status (preparing/ready/served). Empty = any staff.
+      orderStatusRoles: Array.isArray(existing.orderStatusRoles) ? existing.orderStatusRoles : [],
       // Split Bill (divide order among guests)
       splitBillEnabled: existing.splitBillEnabled ?? false,
       splitBillDefaultMethod: ['equal','by-item','by-amount'].includes(existing.splitBillDefaultMethod) ? existing.splitBillDefaultMethod : 'equal',
@@ -33085,6 +34311,10 @@ app.put('/api/restaurants/:restaurantId/billing-settings', authenticateToken, as
         : [],
       paymentMethodRoles: Array.isArray(settings.paymentMethodRoles)
         ? settings.paymentMethodRoles.filter(r => typeof r === 'string' && r.length > 0 && r.length <= 50)
+        : [],
+      // Who can advance order status (preparing/ready/served). Empty = any staff.
+      orderStatusRoles: Array.isArray(settings.orderStatusRoles)
+        ? settings.orderStatusRoles.filter(r => typeof r === 'string' && r.length > 0 && r.length <= 50)
         : [],
       // Split Bill (divide order among guests)
       splitBillEnabled: settings.splitBillEnabled ?? false,
@@ -33226,6 +34456,7 @@ app.post('/api/orders/:orderId/refund', authenticateToken, async (req, res) => {
       // Update daily stats — full refund effectively removes from revenue
       if (!['saved', 'cancelled', 'deleted'].includes(orderData.status)) {
         updateDailyStats(orderData.restaurantId, orderData, 'cancel', parseTZ(req), parseDayStart(req));
+        updateDailyStatsRefundsIssued(orderData.restaurantId, orderData, roundedRefundAmount, parseTZ(req), parseDayStart(req));
       }
     } else {
       // Partial refund — subtract refund amount from daily stats revenue (order still counts)
@@ -33233,6 +34464,7 @@ app.post('/api/orders/:orderId/refund', authenticateToken, async (req, res) => {
         const oldFinal = orderData.finalAmount || orderData.totalAmount || 0;
         const oldBase = orderData.totalAmount || 0;
         updateDailyStatsRevenueDiff(orderData.restaurantId, orderData, oldBase, oldBase - refundAmount, oldFinal, oldFinal - refundAmount, parseTZ(req), parseDayStart(req));
+        updateDailyStatsRefundsIssued(orderData.restaurantId, orderData, roundedRefundAmount, parseTZ(req), parseDayStart(req));
       }
     }
 
@@ -33740,6 +34972,7 @@ app.patch('/api/orders/:orderId/edit-completed-items', authenticateToken, async 
         price: resolvedUnitPrice,
         total: itemTotal,
         quantity: itemQuantity,
+        seat: resolveSeat(cleanItem.seat, restaurantData),
         selectedVariant: selectedVariant ? { name: selectedVariant.name, price: selectedVariant.price || 0 } : null,
         selectedCustomizations: customizations.map(c => ({ id: c.id || null, name: c.name || c, price: typeof c.price === 'number' ? c.price : 0 })),
         isStockManaged: menuItem?.isStockManaged || cleanItem.isStockManaged || false,
@@ -34215,7 +35448,7 @@ app.post('/api/customers/:customerId/settle-credit', authenticateToken, async (r
 
         // Update daily stats: add settled amount to revenue for the order's original date
         const tzOffset = parseTZ(req);
-        updateDailyStatsRevenueDiff(orderData.restaurantId, orderData, 0, settleAmount, 0, settleAmount, tzOffset, parseDayStart(req));
+        updateDailyStatsOnDueSettlement(orderData.restaurantId, orderData, settleAmount, paymentMethod, tzOffset, parseDayStart(req));
       }
     }
 
@@ -34281,7 +35514,7 @@ app.post('/api/customers/:customerId/bulk-settle-credit', authenticateToken, asy
 
       // Update daily stats: add settled amount to revenue for the order's original date
       const tzOffset = parseTZ(req);
-      updateDailyStatsRevenueDiff(orderData.restaurantId, orderData, 0, outstanding, 0, outstanding, tzOffset, parseDayStart(req));
+      updateDailyStatsOnDueSettlement(orderData.restaurantId, orderData, outstanding, paymentMethod, tzOffset, parseDayStart(req));
     }
 
     // Update customer: decrement balance, mark credit history entries as settled
@@ -34365,40 +35598,47 @@ app.post('/api/customers/:customerId/wallet/credit', authenticateToken, async (r
     }
 
     const customerRef = db.collection('customers').doc(customerId);
-    const customerDoc = await customerRef.get();
-    if (!customerDoc.exists) {
+    const parsedAmt = Math.round(parseFloat(amount) * 100) / 100;
+    const staffId = req.user?.userId || req.user?.id || null;
+    const staffName = req.user?.name || 'Staff';
+
+    // Atomic read-modify-write so a concurrent wallet debit (order billing)
+    // can't clobber this top-up (or vice-versa). Preserves the exact stored
+    // shape (balanceAfter is the true post-credit balance).
+    const txResult = await db.runTransaction(async (tx) => {
+      const doc = await tx.get(customerRef);
+      if (!doc.exists) return { notFound: true };
+      const data = doc.data();
+      const currentBalance = data.walletBalance || 0;
+      const newBalance = Math.round((currentBalance + parsedAmt) * 100) / 100;
+      const history = Array.isArray(data.walletHistory) ? data.walletHistory : [];
+      const transaction = {
+        id: `txn_${Date.now()}_${Math.random().toString(36).substr(2, 6)}`,
+        type: 'credit',
+        amount: parsedAmt,
+        reason: reason || 'advance_payment',
+        notes: notes || '',
+        staffId,
+        staffName,
+        balanceAfter: newBalance,
+        createdAt: new Date().toISOString(),
+      };
+      tx.update(customerRef, {
+        walletBalance: newBalance,
+        walletHistory: [...history, transaction],
+        updatedAt: new Date().toISOString(),
+      });
+      return { newBalance, transaction };
+    });
+
+    if (txResult.notFound) {
       return res.status(404).json({ error: 'Customer not found' });
     }
 
-    const customer = customerDoc.data();
-    const currentBalance = customer.walletBalance || 0;
-    const newBalance = currentBalance + parseFloat(amount);
-
-    const transaction = {
-      id: `txn_${Date.now()}_${Math.random().toString(36).substr(2, 6)}`,
-      type: 'credit',
-      amount: parseFloat(amount),
-      reason: reason || 'advance_payment',
-      notes: notes || '',
-      staffId: req.user?.userId || req.user?.id || null,
-      staffName: req.user?.name || 'Staff',
-      balanceAfter: newBalance,
-      createdAt: new Date().toISOString()
-    };
-
-    const walletHistory = customer.walletHistory || [];
-    walletHistory.push(transaction);
-
-    await customerRef.update({
-      walletBalance: newBalance,
-      walletHistory: walletHistory,
-      updatedAt: new Date().toISOString()
-    });
-
     res.json({
       success: true,
-      walletBalance: newBalance,
-      transaction
+      walletBalance: txResult.newBalance,
+      transaction: txResult.transaction
     });
   } catch (error) {
     console.error('Error adding wallet credit:', error);
@@ -34422,41 +35662,32 @@ app.post('/api/customers/:customerId/wallet/redeem', authenticateToken, async (r
       return res.status(404).json({ error: 'Customer not found' });
     }
 
-    const customer = customerDoc.data();
-    const currentBalance = customer.walletBalance || 0;
-
-    if (currentBalance < parseFloat(amount)) {
-      return res.status(400).json({ error: 'Insufficient wallet balance' });
-    }
-
-    const newBalance = currentBalance - parseFloat(amount);
-
-    const transaction = {
-      id: `txn_${Date.now()}_${Math.random().toString(36).substr(2, 6)}`,
-      type: 'redeem',
-      amount: parseFloat(amount),
-      reason: 'redemption',
-      notes: notes || '',
+    // Atomic + idempotent-per-order debit (shared with the completion hook, so
+    // a client call and the server-side hook can never double-charge one order).
+    const result = await debitWalletForOrder({
+      customerId,
       orderId: orderId || null,
+      amount: parseFloat(amount),
       staffId: req.user?.userId || req.user?.id || null,
       staffName: req.user?.name || 'Staff',
-      balanceAfter: newBalance,
-      createdAt: new Date().toISOString()
-    };
-
-    const walletHistory = customer.walletHistory || [];
-    walletHistory.push(transaction);
-
-    await customerRef.update({
-      walletBalance: newBalance,
-      walletHistory: walletHistory,
-      updatedAt: new Date().toISOString()
+      notes: notes || '',
     });
+
+    if (!result.success) {
+      if (result.reason === 'insufficient_balance') {
+        return res.status(400).json({ error: 'Insufficient wallet balance' });
+      }
+      if (result.reason === 'customer_not_found') {
+        return res.status(404).json({ error: 'Customer not found' });
+      }
+      return res.status(500).json({ error: 'Failed to redeem from wallet' });
+    }
 
     res.json({
       success: true,
-      walletBalance: newBalance,
-      transaction
+      walletBalance: result.walletBalance,
+      transaction: result.transaction || null,
+      alreadyRedeemed: result.alreadyDone === true,
     });
   } catch (error) {
     console.error('Error redeeming wallet:', error);
@@ -34690,6 +35921,54 @@ app.get('/api/public/token-display/:restaurantId', vercelSecurityMiddleware.publ
   } catch (error) {
     console.error('Token display error:', error);
     res.status(500).json({ error: 'Failed to fetch token display data' });
+  }
+});
+
+// Customer's own live order status ("track my order"). Public — the unguessable
+// orderId is the access token. Returns only non-sensitive fields (status, token,
+// timeline, item count, total) so a guest can watch their order go ready on their
+// phone. Frontend page: /order-status/<orderId>.
+app.get('/api/public/order-status/:orderId', vercelSecurityMiddleware.publicAPI, async (req, res) => {
+  try {
+    const { orderId } = req.params;
+    const orderDoc = await db.collection(collections.orders).doc(orderId).get();
+    if (!orderDoc.exists) return res.status(404).json({ error: 'Order not found' });
+    const o = orderDoc.data();
+
+    let restaurantName = '';
+    let logo = '';
+    if (o.restaurantId) {
+      const restDoc = await getCachedRestDoc(o.restaurantId);
+      if (restDoc.exists) {
+        const rd = restDoc.data();
+        restaurantName = rd.name || rd.restaurantName || '';
+        logo = rd.logoUrl || '';
+      }
+    }
+
+    const toIso = (t) => (t?.toDate ? t.toDate().toISOString() : (t || null));
+    const items = Array.isArray(o.items) ? o.items : (Array.isArray(o.orderItems) ? o.orderItems : []);
+
+    res.set('Cache-Control', 'public, s-maxage=3, stale-while-revalidate=5');
+    res.json({
+      id: orderId,
+      status: o.status,                       // pending|confirmed|preparing|ready|served|completed|cancelled
+      token: o.dailyOrderId || o.orderNumber || String(orderId).slice(-6),
+      orderType: o.orderType || 'dine-in',
+      customerName: (o.customerInfo?.name || o.customerName || '').split(' ')[0] || '',
+      itemCount: items.reduce((n, it) => n + (Number(it.quantity) || 1), 0),
+      total: o.finalAmount || o.grandTotal || o.totalAmount || 0,
+      restaurant: { name: restaurantName, logo },
+      timeline: {
+        placedAt: toIso(o.createdAt),
+        preparingAt: toIso(o.cookingStartTime || o.kotTime),
+        readyAt: toIso(o.cookingEndTime),
+        updatedAt: toIso(o.updatedAt),
+      },
+    });
+  } catch (error) {
+    console.error('Public order-status error:', error);
+    res.status(500).json({ error: 'Failed to fetch order status' });
   }
 });
 
