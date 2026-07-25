@@ -22586,7 +22586,13 @@ app.get('/api/restaurant/info/:restaurantId', async (req, res) => {
         cuisine: data.cuisine || '',
         logo: data.logo || '',
         currency: data.currency || 'INR',
-        printSettings
+        printSettings,
+        // Needed by the Electron LOCAL KOT renderer (offline/LAN print) to route
+        // per print-station. Without these the local router can't filter items to
+        // a station and prints the whole order to every station's printer.
+        printStations: data.printStations || [],
+        categories: data.categories || [],
+        kotPrintingMode: data.kotPrintingMode || 'single'
       }
     });
 
