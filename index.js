@@ -21191,9 +21191,10 @@ app.put('/api/admin/print-settings/:restaurantId', authenticateToken, async (req
 // Get print stations for a restaurant
 app.get('/api/admin/print-stations/:restaurantId', authenticateToken, async (req, res) => {
   try {
-    if (!(await checkFeaturePermission(req, 'admin', 'print'))) {
-      return res.status(403).json({ error: 'Access denied. Print settings permission required.' });
-    }
+    // No permission check for GET — ALL staff (cashier, waiter, manager, kitchen)
+    // must be able to READ the print-station routing so auto-print / multi-station
+    // KOT printing works for them. Mirrors the print-settings GET, which was
+    // opened for the same reason. The PUT (save) endpoint below stays admin-only.
     const { restaurantId } = req.params;
     const restaurantDoc = await getCachedRestDoc(restaurantId);
     if (!restaurantDoc.exists) {
