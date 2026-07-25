@@ -16829,6 +16829,156 @@ app.post('/api/tables/:restaurantId/unmerge', authenticateToken, async (req, res
   }
 });
 
+// Split ONE table into N sub-tables (e.g. Table 7 → 7A / 7B / 7C). The inverse
+// of merge: a big/shared table is divided so different parties each get their
+// own independent order + bill. Sub-tables are REAL child table docs, so orders,
+// billing and reports work for them automatically (they key off tableId/name).
+// The parent must be FREE (no active order) and not already split/merged/a-sub.
+// Fully reversible via /unsplit. Gated on tables.manage.
+app.post('/api/tables/:restaurantId/split', authenticateToken, async (req, res) => {
+  try {
+    if (!(await checkFeaturePermission(req, 'tables', 'manage'))) {
+      return res.status(403).json({ error: 'Access denied. Table management permission required.' });
+    }
+    const { restaurantId } = req.params;
+    const { tableId } = req.body;
+    const count = Math.max(2, Math.min(parseInt(req.body.count, 10) || 2, 8)); // 2..8 sub-tables
+
+    if (!tableId) return res.status(400).json({ error: 'tableId is required.' });
+
+    const parent = await findTableAcrossFloors(restaurantId, tableId);
+    if (!parent) return res.status(404).json({ error: 'Table not found.' });
+    const p = parent.data;
+
+    if (p.isSplit) return res.status(400).json({ error: 'This table is already split. Un-split it first.' });
+    if (p.isSubTable) return res.status(400).json({ error: 'A sub-table cannot be split again.' });
+    if (p.mergeGroupId) return res.status(400).json({ error: 'This table is part of a merge group. Un-merge it first.' });
+    if (p.status === 'occupied' || p.currentOrderId) {
+      return res.status(400).json({ error: `Table ${p.name} has an active order. Settle or move it before splitting.` });
+    }
+
+    const tablesRef = db.collection('restaurants').doc(restaurantId)
+      .collection('floors').doc(parent.floorId).collection('tables');
+
+    // Build sub-table names (7A, 7B, …) and guard against collisions.
+    const labels = Array.from({ length: count }, (_, i) => String.fromCharCode(65 + i)); // A,B,C…
+    const subNames = labels.map(l => `${p.name}${l}`);
+    for (const nm of subNames) {
+      const clash = await tablesRef.where('name', '==', nm).limit(1).get();
+      if (!clash.empty) {
+        return res.status(400).json({ error: `A table named "${nm}" already exists. Rename or remove it before splitting.` });
+      }
+    }
+
+    const splitGroupId = `sp_${tableId.slice(0, 8)}_${Date.now()}`;
+    const now = new Date();
+    const parentCap = Number(p.capacity) || count;
+    const perSeat = Math.max(1, Math.round(parentCap / count));
+
+    // Create each sub-table as a real, independently-billable table.
+    const created = [];
+    for (let i = 0; i < count; i++) {
+      const subData = {
+        name: subNames[i],
+        floor: p.floor,
+        section: p.section || 'Main',
+        capacity: perSeat,
+        status: 'available',
+        currentOrderId: null,
+        lastOrderTime: null,
+        isSubTable: true,
+        parentTableId: tableId,
+        parentTableName: p.name,
+        subLabel: labels[i],
+        splitGroupId,
+        createdAt: now,
+        updatedAt: now,
+      };
+      const ref = await tablesRef.add(subData);
+      created.push({ id: ref.id, ...subData });
+      pusherService.triggerTableStatusUpdated(restaurantId, {
+        tableId: ref.id, status: 'available', orderId: null, tableNumber: subNames[i],
+      }).catch(() => {});
+    }
+
+    // Parent becomes a non-bookable container that carries the sub-table roster.
+    await parent.ref.update({
+      isSplit: true,
+      splitGroupId,
+      subTables: created.map(c => c.id),
+      subTableNames: subNames,
+      status: 'split',
+      updatedAt: now,
+    });
+    pusherService.triggerTableStatusUpdated(restaurantId, {
+      tableId, status: 'split', orderId: null, tableNumber: p.name,
+    }).catch(() => {});
+
+    res.json({ success: true, splitGroupId, parentTableId: tableId, subTables: created });
+  } catch (error) {
+    console.error('Split table error:', error);
+    res.status(500).json({ error: 'Failed to split table' });
+  }
+});
+
+// Un-split a table: delete its sub-tables and restore the parent. Every
+// sub-table must be FREE (no active order) — otherwise the caller is told to
+// settle/move those bills first. Non-destructive to orders.
+app.post('/api/tables/:restaurantId/unsplit', authenticateToken, async (req, res) => {
+  try {
+    if (!(await checkFeaturePermission(req, 'tables', 'manage'))) {
+      return res.status(403).json({ error: 'Access denied. Table management permission required.' });
+    }
+    const { restaurantId } = req.params;
+    const { tableId } = req.body;
+    if (!tableId) return res.status(400).json({ error: 'tableId is required.' });
+
+    const parent = await findTableAcrossFloors(restaurantId, tableId);
+    if (!parent) return res.status(404).json({ error: 'Parent table not found.' });
+    if (!parent.data.isSplit) return res.status(400).json({ error: 'This table is not split.' });
+
+    const subIds = Array.isArray(parent.data.subTables) ? parent.data.subTables : [];
+    // Resolve every sub-table and ensure none is busy.
+    const subs = [];
+    for (const id of subIds) {
+      const s = await findTableAcrossFloors(restaurantId, id);
+      if (s) subs.push(s);
+    }
+    const busy = subs.filter(s => s.data.status === 'occupied' || s.data.currentOrderId);
+    if (busy.length) {
+      const names = busy.map(s => s.data.name).join(', ');
+      return res.status(400).json({ error: `These sub-tables have active orders: ${names}. Settle or move them first.` });
+    }
+
+    // Delete the sub-tables.
+    for (const s of subs) {
+      await s.ref.delete();
+      pusherService.triggerTableStatusUpdated(restaurantId, {
+        tableId: s.ref.id, status: 'deleted', orderId: null, tableNumber: s.data.name,
+      }).catch(() => {});
+    }
+
+    // Restore the parent to a normal, bookable table.
+    await parent.ref.update({
+      isSplit: FieldValue.delete(),
+      splitGroupId: FieldValue.delete(),
+      subTables: FieldValue.delete(),
+      subTableNames: FieldValue.delete(),
+      status: 'available',
+      currentOrderId: null,
+      updatedAt: new Date(),
+    });
+    pusherService.triggerTableStatusUpdated(restaurantId, {
+      tableId, status: 'available', orderId: null, tableNumber: parent.data.name,
+    }).catch(() => {});
+
+    res.json({ success: true, parentTableId: tableId, removed: subIds });
+  } catch (error) {
+    console.error('Unsplit table error:', error);
+    res.status(500).json({ error: 'Failed to un-split table' });
+  }
+});
+
 // Assign (or clear) the server (waiter) on a table. If the table has an active
 // order, the order's waiterId/waiterName are updated too so tip/sales
 // attribution follows. Metadata only — never touches items/money.
