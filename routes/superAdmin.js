@@ -7,7 +7,7 @@ const { authenticateSuperAdmin, requireSuperAdmin } = require('../middleware/sup
 const { checkPermission } = require('../middleware/checkPermission');
 const { parseTZ, todayInTZ, dateStrInTZ, dateBoundsInTZ } = require('../utils/timezone');
 const subAdminRoutes = require('./subAdmin');
-const { getCachedRestDoc, invalidateRestaurantCache } = require('../utils/kvCache');
+const { getCachedRestDoc, invalidateRestaurantCache, kvGet, kvSet } = require('../utils/kvCache');
 
 
 // ─── Constants ───────────────────────────────────────────────────────
@@ -2412,90 +2412,130 @@ router.get('/firestore-usage', authenticateSuperAdmin, async (req, res) => {
 
 const whatsappService = require('../services/whatsappService');
 
-// GET /api/super-admin/whatsapp/conversations — list conversations grouped by phone
-// Uses indexed queries: type + timestamp composite index required
-router.get('/whatsapp/conversations', authenticateSuperAdmin, requireSuperAdmin, async (req, res) => {
-  try {
-    // Two indexed queries — only fetch what we need (incoming + replies)
-    // Requires composite index: automationLogs (type ASC, timestamp DESC)
-    const [incomingSnap, repliesSnap] = await Promise.all([
-      db.collection(collections.automationLogs)
-        .where('type', '==', 'incoming')
+// Build the COMPLETE list of WhatsApp conversations (grouped by phone) by
+// cursor-looping the whole message log — not just the most recent window, so no
+// conversation is dropped. Result is sorted newest-first and cached in Redis.
+// Requires composite index: automationLogs (type ASC, timestamp DESC)
+async function buildAllWhatsAppConversations() {
+  const BATCH = 500;
+  const MAX_BATCHES = 60; // safety cap: up to 30k messages per type
+  const convosMap = {};
+  const seenMsgIds = new Set(); // Meta can fire webhooks multiple times
+
+  const processDoc = (d) => {
+    if (d.messageId && seenMsgIds.has(d.messageId)) return; // skip duplicate
+    if (d.messageId) seenMsgIds.add(d.messageId);
+    const phone = d.phone || d.customerPhone;
+    if (!phone) return;
+
+    const ts = toISO(d.timestamp);
+    const isIncoming = d.type === 'incoming';
+
+    if (!convosMap[phone]) {
+      convosMap[phone] = {
+        phone,
+        contactName: d.contactName || d.customerName || '',
+        lastMessage: d.message || '',
+        lastTimestamp: ts,
+        lastDirection: isIncoming ? 'incoming' : 'outgoing',
+        unreadCount: 0,
+        sessionActive: false,
+        lastIncomingAt: null,
+        hasIncoming: false,
+      };
+    }
+
+    if (ts && (!convosMap[phone].lastTimestamp || ts > convosMap[phone].lastTimestamp)) {
+      convosMap[phone].lastMessage = d.message || '';
+      convosMap[phone].lastTimestamp = ts;
+      convosMap[phone].lastDirection = isIncoming ? 'incoming' : 'outgoing';
+    }
+
+    if (!convosMap[phone].contactName && (d.contactName || d.customerName)) {
+      convosMap[phone].contactName = d.contactName || d.customerName;
+    }
+
+    if (isIncoming && d.status !== 'read_by_staff') {
+      convosMap[phone].unreadCount++;
+    }
+
+    if (isIncoming) {
+      convosMap[phone].hasIncoming = true;
+      const tsDate = toDate(d.timestamp);
+      if (tsDate && (!convosMap[phone].lastIncomingAt || tsDate > convosMap[phone].lastIncomingAt)) {
+        convosMap[phone].lastIncomingAt = tsDate;
+      }
+    }
+  };
+
+  // Page through ALL incoming + reply messages via snapshot cursors.
+  for (const type of ['incoming', 'reply']) {
+    let last = null;
+    for (let b = 0; b < MAX_BATCHES; b++) {
+      let q = db.collection(collections.automationLogs)
+        .where('type', '==', type)
         .orderBy('timestamp', 'desc')
-        .limit(500)
-        .get(),
-      db.collection(collections.automationLogs)
-        .where('type', '==', 'reply')
-        .orderBy('timestamp', 'desc')
-        .limit(200)
-        .get(),
-    ]);
+        .limit(BATCH);
+      if (last) q = q.startAfter(last);
+      const snap = await q.get();
+      if (snap.empty) break;
+      snap.docs.forEach(doc => processDoc(doc.data()));
+      last = snap.docs[snap.docs.length - 1];
+      if (snap.size < BATCH) break;
+    }
+  }
 
-    const convosMap = {};
-    const allDocs = [...incomingSnap.docs, ...repliesSnap.docs];
-    // Deduplicate by messageId (Meta can fire webhooks multiple times)
-    const seenMsgIds = new Set();
-
-    allDocs.forEach(doc => {
-      const d = doc.data();
-      if (d.messageId && seenMsgIds.has(d.messageId)) return; // Skip duplicate
-      if (d.messageId) seenMsgIds.add(d.messageId);
-      const phone = d.phone || d.customerPhone;
-      if (!phone) return;
-
-      const ts = toISO(d.timestamp);
-      const isIncoming = d.type === 'incoming';
-
-      if (!convosMap[phone]) {
-        convosMap[phone] = {
-          phone,
-          contactName: d.contactName || d.customerName || '',
-          lastMessage: d.message || '',
-          lastTimestamp: ts,
-          lastDirection: isIncoming ? 'incoming' : 'outgoing',
-          unreadCount: 0,
-          sessionActive: false,
-          lastIncomingAt: null,
-          hasIncoming: false,
-        };
-      }
-
-      if (ts && (!convosMap[phone].lastTimestamp || ts > convosMap[phone].lastTimestamp)) {
-        convosMap[phone].lastMessage = d.message || '';
-        convosMap[phone].lastTimestamp = ts;
-        convosMap[phone].lastDirection = isIncoming ? 'incoming' : 'outgoing';
-      }
-
-      if (!convosMap[phone].contactName && (d.contactName || d.customerName)) {
-        convosMap[phone].contactName = d.contactName || d.customerName;
-      }
-
-      if (isIncoming && d.status !== 'read_by_staff') {
-        convosMap[phone].unreadCount++;
-      }
-
-      if (isIncoming) {
-        convosMap[phone].hasIncoming = true;
-        const tsDate = toDate(d.timestamp);
-        if (tsDate && (!convosMap[phone].lastIncomingAt || tsDate > convosMap[phone].lastIncomingAt)) {
-          convosMap[phone].lastIncomingAt = tsDate;
-        }
-      }
+  const now = Date.now();
+  const conversations = Object.values(convosMap)
+    .filter(c => c.hasIncoming)
+    .map(c => {
+      c.sessionActive = c.lastIncomingAt ? (now - c.lastIncomingAt.getTime() < 24 * 60 * 60 * 1000) : false;
+      delete c.lastIncomingAt;
+      delete c.hasIncoming;
+      return c;
     });
 
-    const now = Date.now();
-    const conversations = Object.values(convosMap)
-      .filter(c => c.hasIncoming)
-      .map(c => {
-        c.sessionActive = c.lastIncomingAt ? (now - c.lastIncomingAt.getTime() < 24 * 60 * 60 * 1000) : false;
-        delete c.lastIncomingAt;
-        delete c.hasIncoming;
-        return c;
-      });
+  conversations.sort((a, b) => (b.lastTimestamp || '').localeCompare(a.lastTimestamp || ''));
+  return conversations;
+}
 
-    conversations.sort((a, b) => (b.lastTimestamp || '').localeCompare(a.lastTimestamp || ''));
+// GET /api/super-admin/whatsapp/conversations?offset=0&limit=40[&refresh=1]
+// Returns a page of the full conversation list (infinite scroll). The complete
+// grouped list is cached in Redis (120s) so paging/scrolling doesn't re-scan.
+router.get('/whatsapp/conversations', authenticateSuperAdmin, requireSuperAdmin, async (req, res) => {
+  try {
+    const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 40, 1), 100);
+    const offset = Math.max(parseInt(req.query.offset, 10) || 0, 0);
+    const refresh = req.query.refresh === '1' || req.query.refresh === 'true';
+    const CACHE_KEY = 'wa:sa:convos:v1';
 
-    res.json({ success: true, conversations });
+    let all = null;
+    if (!refresh) {
+      try { all = await kvGet(CACHE_KEY); } catch { /* cache miss/disabled — rebuild */ }
+    }
+    if (!Array.isArray(all)) {
+      all = await buildAllWhatsAppConversations();
+      kvSet(CACHE_KEY, all, 120).catch(() => {});
+    }
+
+    // Optional server-side search over the FULL list so matches that haven't
+    // been scrolled into view are still found.
+    const search = (req.query.search || '').toString().trim().toLowerCase();
+    const list = search
+      ? all.filter(c =>
+          (c.phone || '').toLowerCase().includes(search) ||
+          (c.contactName || '').toLowerCase().includes(search))
+      : all;
+
+    const page = list.slice(offset, offset + limit);
+    res.json({
+      success: true,
+      conversations: page,
+      total: list.length,
+      offset,
+      limit,
+      hasMore: offset + limit < list.length,
+    });
   } catch (error) {
     console.error('WhatsApp conversations error:', error);
     res.status(500).json({ success: false, error: 'Failed to fetch conversations' });
