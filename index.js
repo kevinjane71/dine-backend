@@ -11829,17 +11829,14 @@ app.get('/api/analytics/:restaurantId', authenticateToken, async (req, res) => {
 
     // Custom date range: read raw orders for the specified range
     if (startDate && endDate) {
-      let rangeStart, rangeEnd;
-      if (tzOffset !== undefined) {
-        // Extract YYYY-MM-DD from ISO timestamps (dateBoundsInTZ expects date-only strings)
-        const startDateStr = String(startDate).split('T')[0];
-        const endDateStr = String(endDate).split('T')[0];
-        rangeStart = dateBoundsInTZ(startDateStr, tzOffset, parseDayStart(req)).start;
-        rangeEnd = dateBoundsInTZ(endDateStr, tzOffset, parseDayStart(req)).end;
-      } else {
-        rangeStart = new Date(startDate); rangeStart.setHours(0, 0, 0, 0);
-        rangeEnd = new Date(endDate); rangeEnd.setHours(23, 59, 59, 999);
-      }
+      // Use the client-provided ISO instants directly — they are already correct
+      // local-day boundaries (computed in the browser timezone by getDateRange).
+      // Re-flooring them with setHours()/dateBoundsInTZ shifted the window by the
+      // timezone offset, making "yesterday" swallow the previous UTC day — so the
+      // 7-day stats matched the yesterday stats. This mirrors the orders-list
+      // endpoint's straight createdAt comparison, keeping list and stats in sync.
+      const rangeStart = new Date(startDate);
+      const rangeEnd = new Date(endDate);
 
       const ordersQuery = await db.collection(collections.orders)
         .where('restaurantId', '==', restaurantId)
