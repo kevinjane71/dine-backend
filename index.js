@@ -7735,7 +7735,9 @@ app.post('/api/menus/:restaurantId', authenticateToken, async (req, res) => {
       shortCode,
       variants,
       customizations,
-      subCategory
+      subCategory,
+      kraItemClassCode,
+      kraTaxBand
     } = req.body;
 
     if (!name || !price || !category) {
@@ -7786,6 +7788,8 @@ app.post('/api/menus/:restaurantId', authenticateToken, async (req, res) => {
       price: parseFloat(price),
       category,
       subCategory: subCategory || null,
+      kraItemClassCode: kraItemClassCode || null,
+      kraTaxBand: kraTaxBand || null,
       isVeg: isVeg || false,
       spiceLevel: spiceLevel || 'medium',
       allergens: allergens || [],
@@ -7975,6 +7979,7 @@ app.patch('/api/menus/item/:id', authenticateToken, async (req, res) => {
     // Update allowed fields
     const allowedFields = [
       'name', 'description', 'price', 'category', 'subCategory', 'isVeg', 'spiceLevel',
+      'kraItemClassCode', 'kraTaxBand',
       'allergens', 'image', 'shortCode', 'status', 'order',
       'isAvailable', 'stockQuantity', 'lowStockThreshold', 'isStockManaged', 'deductionQuantity',
       'availableFrom', 'availableUntil', 'variants', 'customizations', 'modifierGroups',
@@ -9252,16 +9257,22 @@ app.post('/api/public/orders/:restaurantId', vercelSecurityMiddleware.publicAPI,
     console.log(`🏷️ Order Type: ${orderType}`);
     console.log(`💰 Total: ₹${finalTotal} (Subtotal: ₹${subtotal}, Discount: ₹${discountAmount}, Loyalty: ₹${loyaltyDiscount})`);
 
-    // SMART INVENTORY: Deduct stock (awaited, but non-blocking on failure)
-    try {
-      await inventoryService.deductInventoryForOrder(restaurantId, orderRef.id, orderItems);
-      await syncInventoryStockToMenuItems(restaurantId);
-      await adjustDirectMenuItemStock(restaurantId, orderItems, 'decrement');
-    } catch (invErr) {
-      console.error('⚠️ Inventory Deduction Error (order still created):', invErr);
-      // Record failure in order for later reconciliation
-      orderRef.update({ inventoryDeductionFailed: true, inventoryError: invErr.message }).catch(() => {});
-    }
+    // SMART INVENTORY: deduct stock + sync menu badges in the BACKGROUND (like
+    // updateDailyStats below). These load all inventory/recipes and rewrite the
+    // menu, which for large-menu restaurants blew past the serverless timeout and
+    // left the order stuck on "Processing payment…" with no KOT/bill returned.
+    // Never block the sale on inventory bookkeeping — it reconciles async, and a
+    // failure is flagged on the order (inventoryDeductionFailed) for later fixup.
+    (async () => {
+      try {
+        await inventoryService.deductInventoryForOrder(restaurantId, orderRef.id, orderItems);
+        await syncInventoryStockToMenuItems(restaurantId);
+        await adjustDirectMenuItemStock(restaurantId, orderItems, 'decrement');
+      } catch (invErr) {
+        console.error('⚠️ Background inventory deduction error (order still created):', invErr);
+        orderRef.update({ inventoryDeductionFailed: true, inventoryError: invErr.message }).catch(() => {});
+      }
+    })();
 
     // Update daily analytics stats (fire-and-forget)
     updateDailyStats(restaurantId, orderData, 'add', parseTZ(req), parseDayStart(req));
@@ -10836,20 +10847,21 @@ app.post('/api/orders', authenticateOrderCreate, async (req, res) => {
     // to minimize total response time (parallel max vs sequential sum).
     const postOrderTasks = [];
 
-    // 1. INVENTORY: Deduct stock then sync to menu items (sequential internally)
-    // Note: syncInventoryStockToMenuItems removed — adjustDirectMenuItemStock already
-    // syncs inventory-linked items AND decrements stock-managed items in one transaction.
-    postOrderTasks.push(
-      (async () => {
-        try {
-          await inventoryService.deductInventoryForOrder(restaurantId, orderRef.id, orderItems);
-          await adjustDirectMenuItemStock(restaurantId, orderItems, 'decrement');
-        } catch (invErr) {
-          console.error('⚠️ Inventory Deduction Error (order still created):', invErr);
-          orderRef.update({ inventoryDeductionFailed: true, inventoryError: invErr.message }).catch(() => {});
-        }
-      })()
-    );
+    // 1. INVENTORY: deduct stock in the BACKGROUND — deliberately NOT added to the
+    // awaited postOrderTasks. deductInventoryForOrder loads all inventory + recipes
+    // (+ the menu), which for large-menu restaurants was the slow task that blew
+    // past the serverless timeout and left the order stuck on "Processing payment…"
+    // with no KOT/bill. The sale must never wait on inventory bookkeeping; it
+    // reconciles async and flags inventoryDeductionFailed on error.
+    (async () => {
+      try {
+        await inventoryService.deductInventoryForOrder(restaurantId, orderRef.id, orderItems);
+        await adjustDirectMenuItemStock(restaurantId, orderItems, 'decrement');
+      } catch (invErr) {
+        console.error('⚠️ Background inventory deduction error (order still created):', invErr);
+        orderRef.update({ inventoryDeductionFailed: true, inventoryError: invErr.message }).catch(() => {});
+      }
+    })();
 
     // 2. TABLE STATUS: Update to "occupied" if table number is provided
     if (tableNumber && tableNumber.trim()) {
@@ -14250,27 +14262,25 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
         const selectedVariant = cleanItem.selectedVariant || null;
         const customizations = Array.isArray(cleanItem.selectedCustomizations) ? cleanItem.selectedCustomizations : [];
 
+        // Editing an ALREADY-completed bill: preserve the price that was billed
+        // for lines already on the settled bill (existingItem). Re-resolving to
+        // today's menu (below) would silently change a settled total if menu
+        // prices changed since. Newly-added lines still price from the live menu.
+        const preserveBilledPrice = currentOrder?.status === 'completed' && !!existingItem;
+
         let resolvedBasePrice;
         let expectedMenuPricePatch = menuItem ? menuItem.price : 0;
         if (menuItem) {
           const fePricePatch = typeof cleanItem.basePrice === 'number' ? cleanItem.basePrice
             : (typeof cleanItem.price === 'number' ? cleanItem.price : null);
 
-          // Editing a SETTLED bill: keep the base price this existing line was
-          // originally billed at (from the order's own stored basePrice — server-
-          // authoritative, not FE-claimed), so a menu price change since the bill
-          // was placed can't silently alter a completed total or revert a manual
-          // price edit. Only for lines already on the completed order; genuinely
-          // new lines added during the edit still price at the current menu.
-          const isSettledExistingLine = currentOrder.status === 'completed' && !!existingItem;
-          // Prefer the order's own stored basePrice (server-authoritative); fall
-          // back to the FE-preserved price for legacy lines without a stored base.
+          // Prefer the order's own stored basePrice (server-authoritative, not
+          // FE-claimed); fall back to the FE-preserved price for legacy lines.
           const settledBasePrice = typeof existingItem?.basePrice === 'number' ? existingItem.basePrice
             : (fePricePatch !== null ? fePricePatch : null);
 
-          if (isSettledExistingLine && settledBasePrice !== null) {
-            // Settled line (incl. variants) — keep the billed price; never re-price
-            // to today's menu (which would silently change a completed total).
+          if (preserveBilledPrice && settledBasePrice !== null) {
+            // Settled line (incl. variants) — keep the billed price; never re-price.
             resolvedBasePrice = settledBasePrice;
             expectedMenuPricePatch = settledBasePrice;
           } else if (selectedVariant && typeof selectedVariant.price === 'number') {
@@ -14292,11 +14302,10 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
             }
           }
 
-          // Multi-tier pricing: override base price for non-variant items.
-          // Skip if staff explicitly edited the price OR this is a preserved
-          // settled-bill line (must not be re-priced by a current pricing rule).
-          const wasManuallyEditedPatch = cleanItem.priceEdited === true || isSettledExistingLine || (allowPriceEditPatch && fePricePatch !== null && fePricePatch !== menuItem.price);
-          if (multiPricing?.enabled && activePricingRuleId && !selectedVariant && !wasManuallyEditedPatch) {
+          // Multi-tier pricing: override base price for non-variant items
+          // Skip if staff explicitly edited the price
+          const wasManuallyEditedPatch = cleanItem.priceEdited === true || (allowPriceEditPatch && fePricePatch !== null && fePricePatch !== menuItem.price);
+          if (multiPricing?.enabled && activePricingRuleId && !selectedVariant && !wasManuallyEditedPatch && !preserveBilledPrice) {
             const rulePrice = resolveItemPriceForRule(menuItem, activePricingRuleId, multiPricing.rules);
             if (rulePrice !== null) {
               resolvedBasePrice = rulePrice;
@@ -15381,6 +15390,7 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
           if (_rdDoc.exists && _rdDoc.data()?.posSettings?.autoDirtyOnPayment) tableReleaseStatus = 'cleaning';
         } catch (_) { /* keep 'available' */ }
         console.log('🔄 Releasing table due to order completion:', currentOrder.tableNumber, '→', tableReleaseStatus);
+
         let tableReleased = false;
 
         // FAST PATH: Use stored floorId + tableId from the order
@@ -18212,6 +18222,7 @@ app.get('/api/floors/:restaurantId', async (req, res) => {
     const { restaurantId } = req.params;
 
     let floors = [];
+    const allTables = [];
     const orderIds = new Set();
 
     // Fetch floors and their tables
@@ -18233,6 +18244,41 @@ app.get('/api/floors/:restaurantId', async (req, res) => {
           orderIds.add(tableData.currentOrderId);
         }
       }
+      allTables.push({ floorDoc, floorData, tables: floorTables });
+    }
+
+    // Batch-read all orders at once (instead of N+1 individual reads)
+    const orderTotals = {};
+    const orderCovers = {};
+    if (orderIds.size > 0) {
+      const orderRefs = [...orderIds].map(id => db.collection(collections.orders).doc(id));
+      // getAll supports up to 100 refs; chunk if needed
+      const chunks = [];
+      for (let i = 0; i < orderRefs.length; i += 100) {
+        chunks.push(orderRefs.slice(i, i + 100));
+      }
+      for (const chunk of chunks) {
+        const docs = await db.getAll(...chunk);
+        docs.forEach(doc => {
+          if (doc.exists) {
+            const data = doc.data();
+            orderTotals[doc.id] = data.finalAmount || data.totalAmount || 0;
+            orderCovers[doc.id] = Number(data.covers) || null;
+          }
+        });
+      }
+    }
+
+    // Assign order totals and build floors array
+    for (const { floorDoc, floorData, tables } of allTables) {
+      tables.forEach(tbl => {
+        if (tbl.currentOrderId && orderTotals[tbl.currentOrderId] !== undefined) {
+          tbl.currentOrderTotal = orderTotals[tbl.currentOrderId];
+        }
+        if (tbl.currentOrderId && orderCovers[tbl.currentOrderId]) {
+          tbl.currentOrderCovers = orderCovers[tbl.currentOrderId];
+        }
+      });
       floors.push({
         id: floorDoc.id,
         name: floorData.name,
@@ -18243,41 +18289,6 @@ app.get('/api/floors/:restaurantId', async (req, res) => {
         order: floorData.order !== undefined ? floorData.order : Infinity,
         restaurantId,
         tables: floorTables,
-      });
-    }
-
-    // Batch-read all orders at once for currentOrderTotal
-    const orderTotals = {};
-    const orderCovers = {};
-    if (orderIds.size > 0) {
-      {
-        const orderRefs = [...orderIds].map(id => db.collection(collections.orders).doc(id));
-        const chunks = [];
-        for (let i = 0; i < orderRefs.length; i += 100) {
-          chunks.push(orderRefs.slice(i, i + 100));
-        }
-        for (const chunk of chunks) {
-          const docs = await db.getAll(...chunk);
-          docs.forEach(doc => {
-            if (doc.exists) {
-              const data = doc.data();
-              orderTotals[doc.id] = data.finalAmount || data.totalAmount || 0;
-              orderCovers[doc.id] = Number(data.covers) || null;
-            }
-          });
-        }
-      }
-    }
-
-    // Assign order totals
-    for (const floor of floors) {
-      floor.tables.forEach(tbl => {
-        if (tbl.currentOrderId && orderTotals[tbl.currentOrderId] !== undefined) {
-          tbl.currentOrderTotal = orderTotals[tbl.currentOrderId];
-        }
-        if (tbl.currentOrderId && orderCovers[tbl.currentOrderId]) {
-          tbl.currentOrderCovers = orderCovers[tbl.currentOrderId];
-        }
       });
     }
 
@@ -20894,6 +20905,10 @@ app.put('/api/admin/tax/:restaurantId', authenticateToken, async (req, res) => {
 // Currency routes moved to ./routes/currencyRoutes.js
 app.use('/api', currencyRoutes);
 
+// Kenya KRA eTIMS routes — self-contained module, gated on isKenya() per store.
+// Dormant for every non-Kenya store; never affects existing users.
+app.use(require('./routes/etimsRoutes')(db, collections, authenticateToken, validateRestaurantAccess));
+
 // ==================== OWNER CHAIN DASHBOARD ====================
 // Owner dashboard routes for multi-restaurant management
 app.use('/api/owner', ownerDashboardRoutes);
@@ -23220,6 +23235,21 @@ const buildRestaurantBlock = (restaurantId, data) => ({
 const assembleBillRenderPayload = (orderId, orderData, restaurantId, restaurantData) => {
   const taxSettings = restaurantData.taxSettings || getDefaultTaxSettings(restaurantData);
 
+  // Resolve a human-friendly display label for the payment method. The order stores
+  // the method id (e.g. 'gpay', 'bank_transfer', 'card-terminal'); bills should show
+  // the restaurant's configured label ("GPay", "Bank Transfer") — not the raw id.
+  const _pmId = orderData.paymentMethod || 'cash';
+  const _pmBuiltIn = { cash: 'Cash', card: 'Card', upi: 'UPI', 'card-terminal': 'Card', split: 'Split', due: 'Due' };
+  let paymentMethodLabel = _pmBuiltIn[_pmId] || null;
+  if (!paymentMethodLabel && Array.isArray(restaurantData.posSettings?.paymentMethods)) {
+    const _found = restaurantData.posSettings.paymentMethods.find(m => m && m.id === _pmId);
+    if (_found?.label) paymentMethodLabel = _found.label;
+  }
+  if (!paymentMethodLabel) {
+    // Fallback: prettify the id ("bank_transfer" -> "Bank Transfer").
+    paymentMethodLabel = String(_pmId).replace(/[_-]+/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
+  }
+
   const itemsSubtotal = (orderData.items || [])
     .reduce((sum, it) => {
       if (it.soldByWeight && it.itemWeight) {
@@ -23317,6 +23347,7 @@ const assembleBillRenderPayload = (orderId, orderData, restaurantId, restaurantD
     finalAmount: grandTotal,
     totalAmount: r2(orderData.totalAmount || (subtotal - totalDiscount)),
     paymentMethod: orderData.paymentMethod || 'cash',
+    paymentMethodLabel,
     serviceChargeRate: orderData.serviceChargeRate || null,
     serviceChargeAmount,
     tipAmount,
@@ -32807,10 +32838,12 @@ app.get('/api/customers/:restaurantId', authenticateToken, async (req, res) => {
       .get();
     const total = countSnapshot.data().count;
 
-    // Fetch customers (list-view fields). No Firestore orderBy: where(restaurantId)
-    // +orderBy(createdAt) needs an unprovisioned composite index (→ 500 on
-    // Firestore) and drops null-createdAt docs. Fetch by restaurantId (auto-
-    // indexed), sort by createdAt desc in JS, paginate by slice (page-based).
+    // Fetch customers (select only list-view fields). No Firestore orderBy:
+    // where(restaurantId)+orderBy(createdAt) needs an unprovisioned composite
+    // index (→ 500) and would drop null-createdAt docs. Fetch a capped set by
+    // restaurantId (auto-indexed), sort by createdAt desc in JS, paginate by
+    // slice (page-based). Cursor pagination is dropped since it requires an
+    // ordered Firestore query; the frontend re-sorts each page client-side.
     const listFields = ['name', 'phone', 'email', 'city', 'totalOrders', 'totalSpent', 'loyaltyPoints', 'lastOrderDate', 'source', 'createdAt', 'dob', 'outstandingBalance', 'restaurantId'];
     const scanLimit = 5000;
 

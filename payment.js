@@ -479,9 +479,12 @@ const initializePaymentRoutes = (db, razorpay) => {
         return;
       }
 
-      // Handle offline/manual payments (cash/card/upi)
+      // Handle offline/manual payments (cash/card/upi + restaurant-defined custom
+      // methods like gpay/phonepe/paytm/bank/wallet/card-terminal). Razorpay flows
+      // already returned above; any request reaching here with an orderId is an
+      // offline manual payment — persist the real method as-is (do NOT collapse to cash).
       const offlineMethod = paymentMethod || 'cash';
-      if (offlineMethod === 'cash' || offlineMethod === 'card' || offlineMethod === 'upi') {
+      if (orderId) {
         if (!orderId) {
           return res.status(400).json({
             success: false,
@@ -991,9 +994,9 @@ const initializePaymentRoutes = (db, razorpay) => {
         status: 'active',
         startDate: currentDate.toISOString(),
         trialStartDate: currentDate.toISOString(),
-        trialEndDate: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString(),
-        endDate: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString(),
-        trialDays: 30,
+        trialEndDate: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString(),
+        endDate: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString(),
+        trialDays: 7,
         amount: 0,
         currency: 'USD',
         features: getFeaturesByPlan('free-trial'),
@@ -1015,7 +1018,7 @@ const initializePaymentRoutes = (db, razorpay) => {
           const now = new Date();
           const diffTime = now - startDate;
           const diffDays = Math.floor(diffTime / (1000 * 60 * 60 * 24));
-          trialDaysRemaining = Math.max(0, 30 - diffDays);
+          trialDaysRemaining = Math.max(0, 7 - diffDays);
           trialIsExpired = trialDaysRemaining === 0;
 
           // Update status if trial expired
@@ -1109,9 +1112,9 @@ const initializePaymentRoutes = (db, razorpay) => {
       const currentDate = new Date();
       const planDetails = getPlanDetails(planId);
 
-      // For free-trial, set trial end date to 30 days from now
+      // For free-trial, set trial end date to 7 days from now
       const isTrial = planId === 'free-trial' || planId === 'starter';
-      const trialEndDate = isTrial ? new Date(Date.now() + 30 * 24 * 60 * 60 * 1000) : null;
+      const trialEndDate = isTrial ? new Date(Date.now() + 7 * 24 * 60 * 60 * 1000) : null;
 
       const newUserData = {
         uid: userId,
@@ -1130,7 +1133,7 @@ const initializePaymentRoutes = (db, razorpay) => {
           trialStartDate: isTrial ? currentDate.toISOString() : null,
           trialEndDate: trialEndDate ? trialEndDate.toISOString() : null,
           endDate: isTrial ? trialEndDate.toISOString() : new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString(),
-          trialDays: isTrial ? 30 : 0,
+          trialDays: isTrial ? 7 : 0,
           amount: 0,
           currency: 'USD',
           features: planDetails.features,
@@ -1591,8 +1594,8 @@ async function updateUserSubscriptionDoc(userRef, planId, extraData = {}) {
   // Preserve trial dates for trial plans, clear them for paid plans
   if (isTrial) {
     subscriptionData.trialStartDate = currentDate.toISOString();
-    subscriptionData.trialEndDate = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString();
-    subscriptionData.trialDays = 30;
+    subscriptionData.trialEndDate = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString();
+    subscriptionData.trialDays = 7;
     subscriptionData.autoRenew = false;
   }
 
