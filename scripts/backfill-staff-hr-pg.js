@@ -66,6 +66,13 @@ async function backfillCollection(collectionName, pgTable, toPgRowFn, jsonbCols)
         const pgRow = toPgRowFn({ id: doc.id, ...data });
         if (!pgRow.id) pgRow.id = doc.id;
 
+        // leave_config is stored as leaveConfig/{restaurantId} — some legacy docs
+        // omit the restaurantId FIELD but are keyed by it (doc.id). restaurant_id
+        // is NOT NULL, so fall back to the doc id to preserve those rows.
+        if (pgTable === 'leave_config' && (pgRow.restaurant_id === null || pgRow.restaurant_id === undefined)) {
+          pgRow.restaurant_id = doc.id;
+        }
+
         if (dryRun) {
           if (total <= 5) console.log(`  [DRY RUN] ${doc.id}`);
           migrated++;
