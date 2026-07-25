@@ -17661,9 +17661,26 @@ app.post('/api/waitlist/:restaurantId/:entryId/notify', authenticateToken, async
       : { accessToken: wa.accessToken, phoneNumberId: wa.phoneNumberId || process.env.DINEOPEN_WHATSAPP_PHONE_NUMBER_ID, businessAccountId: wa.businessAccountId };
     if (!credentials.accessToken) return res.status(400).json({ error: 'WhatsApp credentials are missing.' });
 
+    // Format the guest phone for WhatsApp: strip formatting, drop a leading 0, and
+    // prepend the restaurant's country dial code if it's a bare local number. The
+    // WhatsApp API rejects numbers without a country code — the host types only the
+    // local number, so this is what made "notify" silently fail.
+    const DIAL_CODES = { IN: '91', US: '1', CA: '1', GB: '44', AE: '971', QA: '974', SA: '966', KE: '254', PK: '92', BD: '880', LK: '94', NP: '977', SG: '65', MY: '60', AU: '61', NZ: '64', ZA: '27', NG: '234' };
+    const rCountry = (restDoc.exists ? (restDoc.data().currencySettings?.countryCode || restDoc.data().countryCode) : 'IN') || 'IN';
+    const dial = DIAL_CODES[String(rCountry).toUpperCase()] || '91';
+    let waPhone = String(entry.phone).replace(/\D/g, '');
+    if (waPhone.startsWith('0')) waPhone = waPhone.slice(1);
+    if (!waPhone.startsWith(dial) && waPhone.length <= 10) waPhone = dial + waPhone;
+
     const message = `Hi ${entry.name}! 🎉 Your table at ${restaurantName} is ready. Please head over to the host stand.`;
-    await whatsappService.sendTextMessage(entry.phone, message, credentials);
+    const waResult = await whatsappService.sendTextMessage(waPhone, message, credentials);
     await db.collection('waitlist').doc(entryId).update({ status: 'notified', notifiedAt: new Date() });
+    // Log to automation logs so it shows up alongside bill notifications.
+    db.collection(collections.automationLogs).add({
+      restaurantId, type: 'whatsapp_waitlist', phone: waPhone, customerName: entry.name,
+      message, messageId: waResult?.messageId || null, direction: 'outgoing',
+      status: waResult?.success ? 'sent' : 'failed', timestamp: new Date(),
+    }).catch(() => {});
 
     res.json({ success: true, notified: true });
   } catch (error) {
