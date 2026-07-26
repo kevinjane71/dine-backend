@@ -109,6 +109,9 @@ const notifyKOTPrintRequest = async (restaurantId, orderData) => {
     itemsCount: orderData.items?.length || 0,
     createdAt: orderData.createdAt || new Date().toISOString(),
     isReprint: orderData.isReprint || false,
+    // Order UPDATE → only the delta should print. The listener (useAutoPrint) reads this
+    // to request ?newOnly=true. Without it, real-time reprints dumped the whole station order.
+    isIncremental: orderData.isIncremental || false,
     forcePrint: orderData.forcePrint || false,
     printStationId: orderData.printStationId || null,
     printStationName: orderData.printStationName || null
