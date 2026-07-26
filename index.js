@@ -14927,9 +14927,27 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
           console.log('🖨️ Order items updated, triggering KOT reprint for order:', orderId);
           const restaurantFullData = restaurantDoc.data();
           const reprintItems = updateData.items || items;
-          const hasNewItems = reprintItems.some(i => i.isNew || i.isUpdated);
-          const stationGroups = splitOrderByPrintStation(reprintItems, restaurantFullData.printStations, restaurantFullData.categories, { ...DEFAULT_PRINT_SETTINGS, ...(restaurantFullData.printSettings || {}) });
-          for (const group of stationGroups) {
+          const removedForKot = updateData.removedItems || [];
+          // "Incremental" covers additions, quantity changes AND removals — so a
+          // remove-only update still prints a delta (CANCELLED) rather than the whole order.
+          const hasChanges = reprintItems.some(i => i.isNew || i.isUpdated) || removedForKot.length > 0;
+          const stationSettings = { ...DEFAULT_PRINT_SETTINGS, ...(restaurantFullData.printSettings || {}) };
+          const stationGroups = splitOrderByPrintStation(reprintItems, restaurantFullData.printStations, restaurantFullData.categories, stationSettings);
+          // Also fire an event for any station whose ONLY change is a removal (its category has
+          // no remaining items, so it isn't in stationGroups). The render endpoint routes the
+          // removed items to the right station by category; here we just ensure the event fires.
+          const notifiedStationIds = new Set(stationGroups.map(g => g.stationId));
+          const dispatchGroups = [...stationGroups];
+          if (removedForKot.length > 0) {
+            const removedGroups = splitOrderByPrintStation(removedForKot, restaurantFullData.printStations, restaurantFullData.categories, stationSettings);
+            for (const g of removedGroups) {
+              if (!notifiedStationIds.has(g.stationId)) {
+                notifiedStationIds.add(g.stationId);
+                dispatchGroups.push({ stationId: g.stationId, stationName: g.stationName, items: [] });
+              }
+            }
+          }
+          for (const group of dispatchGroups) {
             pusherPromises.push(
               pusherService.notifyKOTPrintRequest(currentOrder.restaurantId, {
                 id: orderId,
@@ -14938,14 +14956,14 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
                 tableNumber: tableNumber || currentOrder.tableNumber,
                 roomNumber: currentOrder.roomNumber,
                 items: group.items,
-                removedItems: updateData.removedItems || [],
+                removedItems: removedForKot,
                 notes: currentOrder.notes,
                 specialInstructions: updateData.specialInstructions || currentOrder.specialInstructions,
                 staffInfo: currentOrder.staffInfo,
                 orderType: orderType || currentOrder.orderType,
                 createdAt: currentOrder.createdAt?.toDate?.()?.toISOString() || new Date().toISOString(),
                 isReprint: true,
-                isIncremental: hasNewItems,
+                isIncremental: hasChanges,
                 printStationId: group.stationId,
                 printStationName: group.stationName
               }).catch(err => console.error('KOT reprint Pusher notification error (non-blocking):', err))
@@ -23013,16 +23031,35 @@ app.get('/api/kot/render/:restaurantId/:orderId', async (req, res) => {
 
     // Filter items by newOnly (incremental KOT) and/or print station
     const { stationId, newOnly } = req.query;
+    const incremental = newOnly === 'true';
     let items = orderData.items || [];
+    let removedItems = [];
 
-    // Incremental KOT: only return new/updated items
-    if (newOnly === 'true') {
-      items = items.filter(item => item.isNew === true || item.isUpdated === true);
+    // Incremental KOT (order UPDATE): only the delta prints.
+    //  - keep isNew / isUpdated items; for a quantity INCREASE print the delta qty (e.g. +1), not the full new qty
+    //  - surface removedItems so the station prints a *** CANCELLED *** slip
+    if (incremental) {
+      items = items
+        .filter(item => item.isNew === true || item.isUpdated === true)
+        .map(item => (item.isUpdated && Number(item.quantityDelta) > 0)
+          ? { ...item, quantity: Number(item.quantityDelta) }
+          : item);
+      // stored removed items carry quantity:0 + previousQuantity — show the removed count on the CANCELLED slip
+      removedItems = (orderData.removedItems || []).map(i => ({
+        ...i,
+        isRemoved: true,
+        quantity: Number(i.previousQuantity) || Number(i.quantity) || 1,
+      }));
     }
 
     // KOT Exclusion: filter out excluded items (ancestor-aware for tree menus)
-    items = filterKotExcludedItems(items, printSettings, categoryTree.buildCategoryIndex(restaurantData.categories || []));
-    if (items.length === 0) {
+    const kotCatIndex = categoryTree.buildCategoryIndex(restaurantData.categories || []);
+    items = filterKotExcludedItems(items, printSettings, kotCatIndex);
+    if (removedItems.length > 0) {
+      removedItems = filterKotExcludedItems(removedItems, printSettings, kotCatIndex);
+    }
+    // Nothing to print (all excluded, or an update with no changes for anyone)
+    if (items.length === 0 && removedItems.length === 0) {
       return res.json({ success: true, empty: true, reason: 'all_items_excluded' });
     }
     let printStationName = null;
@@ -23041,16 +23078,19 @@ app.get('/api/kot/render/:restaurantId/:orderId', async (req, res) => {
         for (const s of restaurantData.printStations) {
           for (const cId of (s.categoryIds || [])) allAssignedCatIds.add(cId);
         }
-        items = items.filter(item => {
+        const belongsToStation = (item) => {
           const catId = item.categoryId || nameToId[item.category?.toLowerCase()?.trim()] || item.category;
           // Include if category matches this station
           if (stationCatIds.has(catId)) return true;
           // Include unassigned categories if this is the default station
           if (station.isDefault && !allAssignedCatIds.has(catId)) return true;
           return false;
-        });
-        // No items for this station — return empty response
-        if (items.length === 0) {
+        };
+        items = items.filter(belongsToStation);
+        // Route removed/cancelled items to the same station as their category
+        if (removedItems.length > 0) removedItems = removedItems.filter(belongsToStation);
+        // No items (added or removed) for this station — return empty response
+        if (items.length === 0 && removedItems.length === 0) {
           return res.json({ success: true, empty: true, reason: 'no_items_for_station', stationId, stationName: station.name });
         }
       }
@@ -23072,6 +23112,7 @@ app.get('/api/kot/render/:restaurantId/:orderId', async (req, res) => {
         roomNumber: orderData.roomNumber || '',
         orderType: orderData.orderType || 'dine-in',
         items,
+        removedItems,
         notes: orderData.notes || '',
         specialInstructions: orderData.specialInstructions || '',
         staffInfo: orderData.staffInfo || null,
@@ -23079,7 +23120,7 @@ app.get('/api/kot/render/:restaurantId/:orderId', async (req, res) => {
         formattedDate,
         formattedTime,
         isReprint: orderData.kotPrinted === true,
-        isIncremental: newOnly === 'true',
+        isIncremental: incremental,
         printStationId: stationId || null,
         printStationName,
         currencySymbol: restaurantData.currencySymbol || restaurantData.currency || '',
