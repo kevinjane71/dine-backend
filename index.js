@@ -21692,6 +21692,7 @@ app.put('/api/admin/print-settings/:restaurantId', authenticateToken, async (req
       'enableUpdateWithoutKOT',
       'enableKOTAndPrint',
       'enableSaveAndPrint',
+      'kotThenBill',
       'showPrintNotifications',
       'showSuccessNotifications',
       'autoPrintOnPlaceOrder',
