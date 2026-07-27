@@ -41,6 +41,15 @@ CREATE TABLE IF NOT EXISTS production_entries (id TEXT PRIMARY KEY, restaurant_i
 ALTER TABLE customer_offer_usage ADD COLUMN IF NOT EXISTS extra_data JSONB DEFAULT '{}'::jsonb;
 ALTER TABLE order_counters       ADD COLUMN IF NOT EXISTS extra_data JSONB DEFAULT '{}'::jsonb;
 
+-- Admin multi-outlet: subRestaurants was UNMAPPED (Firestore fallback). Map it to
+-- a flat table (subcollection restaurants/{id}/subRestaurants) with status column
+-- so `.where('status','!=','deleted')` is a real column filter. Backfilled 7 rows.
+CREATE TABLE IF NOT EXISTS sub_restaurants (
+  id TEXT PRIMARY KEY, restaurant_id TEXT, status TEXT,
+  extra_data JSONB DEFAULT '{}'::jsonb, created_at TIMESTAMPTZ DEFAULT NOW(), updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_subrest_rid ON sub_restaurants(restaurant_id);
+
 -- 3) Widen every bounded NUMERIC(p,s) column -> unbounded NUMERIC (lossless).
 --    Eliminates "numeric field overflow" on oversized money/qty values.
 --    This block was applied dynamically; re-run to be safe:

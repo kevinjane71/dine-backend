@@ -399,6 +399,18 @@ const sadadUnpack = (row) => {
   return out;
 };
 
+// subRestaurants (multi-outlet, subcollection): promote status to a real column
+// so `.where('status','!=','deleted')` is an indexed column filter; rest -> extra_data.
+const subRestPack = (obj) => {
+  const { id, restaurantId, restaurant_id, status, ...rest } = obj || {};
+  const out = { extra_data: rest };
+  if (id !== undefined) out.id = id;
+  const rid = restaurantId || restaurant_id;
+  if (rid) out.restaurant_id = rid;
+  if (status !== undefined) out.status = status;
+  return out;
+};
+
 // ═══════════════════════════════════════════════════════════════════════════
 // Registry — Firestore collection name → PG table config
 // ═══════════════════════════════════════════════════════════════════════════
@@ -447,6 +459,7 @@ const REGISTRY = {
   'sub_admins':            { table: 'sub_admins',            fieldMap: {}, toPgRow: genericPack, toFirestoreObj: genericUnpack, jsonbCols: GENERIC_JSONB },
   'waitlist':              { table: 'waitlist',              fieldMap: {}, toPgRow: genericPack, toFirestoreObj: genericUnpack, jsonbCols: GENERIC_JSONB },
   'sadadTransactions':     { table: 'sadad_transactions',    fieldMap: {}, toPgRow: sadadPack,   toFirestoreObj: sadadUnpack,   jsonbCols: GENERIC_JSONB },
+  'subRestaurants':        { table: 'sub_restaurants',       fieldMap: { status: 'status' }, toPgRow: subRestPack, toFirestoreObj: genericUnpack, jsonbCols: GENERIC_JSONB },
 
   // ── cash registers & shifts ─────────────────────────────────────────────
   'cashRegisters':           { table: 'cash_registers',           fieldMap: REGISTER_FIELD_MAP,       toPgRow: registerToPgRow,       toFirestoreObj: registerToFirestoreObj,       jsonbCols: REGISTER_JSONB_COLUMNS },
