@@ -8954,8 +8954,8 @@ app.post('/api/public/orders/:restaurantId', vercelSecurityMiddleware.publicAPI,
         const now = new Date();
 
         // Legacy validity checks (preserved for back-compat)
-        const validFrom = offer.validFrom ? new Date(offer.validFrom) : null;
-        const validUntil = offer.validUntil ? new Date(offer.validUntil) : null;
+        const validFrom = offer.validFrom ? (offer.validFrom.toDate ? offer.validFrom.toDate() : new Date(offer.validFrom)) : null;
+        const validUntil = offer.validUntil ? (offer.validUntil.toDate ? offer.validUntil.toDate() : new Date(offer.validUntil)) : null;
         const isValidDate = (!validFrom || now >= validFrom) && (!validUntil || now <= validUntil);
         const isUnderUsageLimit = !offer.usageLimit || (offer.usageCount || 0) < offer.usageLimit;
         const meetsMinOrder = subtotal >= (offer.minOrderValue || 0);
@@ -10047,8 +10047,8 @@ app.post('/api/orders', authenticateOrderCreate, async (req, res) => {
           const offer = offerDoc.data();
           const now = new Date();
 
-          const validFrom = offer.validFrom ? new Date(offer.validFrom) : null;
-          const validUntil = offer.validUntil ? new Date(offer.validUntil) : null;
+          const validFrom = offer.validFrom ? (offer.validFrom.toDate ? offer.validFrom.toDate() : new Date(offer.validFrom)) : null;
+          const validUntil = offer.validUntil ? (offer.validUntil.toDate ? offer.validUntil.toDate() : new Date(offer.validUntil)) : null;
           const isValidDate = (!validFrom || now >= validFrom) && (!validUntil || now <= validUntil);
           const isUnderUsageLimit = !offer.usageLimit || (offer.usageCount || 0) < offer.usageLimit;
           const meetsMinOrder = subtotalForDiscount >= (offer.minOrderValue || offer.minimumOrder || 0);
@@ -14674,8 +14674,8 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
 
           // Basic validations
           if (offer.isActive === false) continue;
-          if (offer.validFrom && new Date() < new Date(offer.validFrom)) continue;
-          if (offer.validUntil && new Date() > new Date(offer.validUntil)) continue;
+          if (offer.validFrom && new Date() < (offer.validFrom.toDate ? offer.validFrom.toDate() : new Date(offer.validFrom))) continue;
+          if (offer.validUntil && new Date() > (offer.validUntil.toDate ? offer.validUntil.toDate() : new Date(offer.validUntil))) continue;
           if (offer.usageLimit && (offer.usageCount || 0) >= offer.usageLimit) continue;
           if (offer.minOrderValue && orderSubtotal < offer.minOrderValue) continue;
 
@@ -34462,8 +34462,8 @@ app.get('/api/public/offers/:restaurantId', vercelSecurityMiddleware.publicAPI, 
     // processCashbackForOrder reads Firestore directly at completion.
     const offers = allOffers.filter(offer => {
       if (offer.promotionType === 'cashback') return false;
-      const validFrom = offer.validFrom ? new Date(offer.validFrom) : null;
-      const validUntil = offer.validUntil ? new Date(offer.validUntil) : null;
+      const validFrom = offer.validFrom ? (offer.validFrom.toDate ? offer.validFrom.toDate() : new Date(offer.validFrom)) : null;
+      const validUntil = offer.validUntil ? (offer.validUntil.toDate ? offer.validUntil.toDate() : new Date(offer.validUntil)) : null;
       const isValidDate = (!validFrom || now >= validFrom) && (!validUntil || now <= validUntil);
       const isUnderUsageLimit = !offer.usageLimit || (offer.usageCount || 0) < offer.usageLimit;
       const isEligibleForFirstOrderOffer = !offer.isFirstOrderOnly || customerIsFirstOrder !== false;
@@ -36658,8 +36658,8 @@ app.get('/api/public/restaurant/code/:code', vercelSecurityMiddleware.publicAPI,
       offers = offersSnapshot.docs
         .map(doc => {
           const offer = doc.data();
-          const validFrom = offer.validFrom ? new Date(offer.validFrom) : null;
-          const validUntil = offer.validUntil ? new Date(offer.validUntil) : null;
+          const validFrom = offer.validFrom ? (offer.validFrom.toDate ? offer.validFrom.toDate() : new Date(offer.validFrom)) : null;
+          const validUntil = offer.validUntil ? (offer.validUntil.toDate ? offer.validUntil.toDate() : new Date(offer.validUntil)) : null;
           const isValidDate = (!validFrom || now >= validFrom) && (!validUntil || now <= validUntil);
           const isUnderUsageLimit = !offer.usageLimit || (offer.usageCount || 0) < offer.usageLimit;
 

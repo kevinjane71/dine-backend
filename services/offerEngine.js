@@ -84,16 +84,28 @@ const isScheduleValid = (offer, now = new Date(), timezone = null) => {
   return scheduleDays.includes(currentDay) && currentTime >= startTime && currentTime <= endTime;
 };
 
+// Normalize a stored date that may be a Firestore Timestamp (PG revives valid_from/
+// valid_until TIMESTAMPTZ into a Timestamp), an ISO string, or a Date. Bare
+// `new Date(Timestamp)` yields Invalid Date, which silently broke date-window checks.
+const toJsDate = (v) => {
+  if (!v) return null;
+  if (typeof v.toDate === 'function') return v.toDate();
+  const d = new Date(v);
+  return isNaN(d.getTime()) ? null : d;
+};
+
 const isDateValid = (offer, now = new Date()) => {
   if (!offer) return false;
   if (offer.validFrom) {
-    const from = new Date(offer.validFrom);
-    if (now < from) return false;
+    const from = toJsDate(offer.validFrom);
+    if (from && now < from) return false;
   }
   if (offer.validUntil) {
-    const until = new Date(offer.validUntil);
-    until.setHours(23, 59, 59, 999);
-    if (now > until) return false;
+    const until = toJsDate(offer.validUntil);
+    if (until) {
+      until.setHours(23, 59, 59, 999);
+      if (now > until) return false;
+    }
   }
   return true;
 };

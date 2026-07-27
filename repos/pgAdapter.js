@@ -1540,6 +1540,8 @@ class PgBatch {
             op.ref._firestoreDb,
             client
           );
+          // Preserve subcollection scope so scoped creates keep their FK columns
+          if (op.ref._scopeChain) txRef._scopeChain = op.ref._scopeChain;
           switch (op.type) {
             case 'set':
               await txRef.set(op.data, op.options);
@@ -1618,6 +1620,7 @@ class PgTransaction {
         docRefOrQuery._firestoreDb,
         this._client
       );
+      if (docRefOrQuery._scopeChain) txRef._scopeChain = docRefOrQuery._scopeChain;
       return txRef.get();
     }
     if (docRefOrQuery instanceof PgQuery) {
@@ -1641,6 +1644,7 @@ class PgTransaction {
         docRef._firestoreDb,
         this._client
       );
+      if (docRef._scopeChain) txRef._scopeChain = docRef._scopeChain;
       return txRef.set(data, options);
     }
     return docRef.set(data, options);
@@ -1658,6 +1662,7 @@ class PgTransaction {
         docRef._firestoreDb,
         this._client
       );
+      if (docRef._scopeChain) txRef._scopeChain = docRef._scopeChain;
       return txRef.update(data);
     }
     return docRef.update(data);
@@ -1675,6 +1680,7 @@ class PgTransaction {
         docRef._firestoreDb,
         this._client
       );
+      if (docRef._scopeChain) txRef._scopeChain = docRef._scopeChain;
       return txRef.delete();
     }
     return docRef.delete();
