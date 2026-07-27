@@ -363,6 +363,22 @@ const COUNTER_JSONB = new Set(['extra_data']);
 // ═══════════════════════════════════════════════════════════════════════════
 const GENERIC_JSONB = new Set(['extra_data']);
 
+// Full-doc passthrough: pack the entire doc (minus id) into extra_data JSONB and
+// spread it back on read. Avoids per-field column guessing entirely, so ANY doc
+// shape round-trips cleanly through a generic (id, restaurant_id, extra_data) table.
+const genericPack = (obj) => {
+  const { id, ...rest } = obj || {};
+  const out = { extra_data: rest };
+  if (id !== undefined) out.id = id;
+  if (rest.restaurantId || rest.restaurant_id) out.restaurant_id = rest.restaurantId || rest.restaurant_id;
+  return out;
+};
+const genericUnpack = (row) => {
+  if (!row || typeof row !== 'object') return row;
+  const { extra_data, ...cols } = row;
+  return { ...cols, ...(extra_data && typeof extra_data === 'object' ? extra_data : {}) };
+};
+
 // ═══════════════════════════════════════════════════════════════════════════
 // Registry — Firestore collection name → PG table config
 // ═══════════════════════════════════════════════════════════════════════════
@@ -403,6 +419,13 @@ const REGISTRY = {
   'dine_razorpay_orders':  { table: 'dine_razorpay_orders',  fieldMap: RZP_ORDERS_FIELD_MAP,    toPgRow: rzpOrdersToPgRow,        toFirestoreObj: rzpOrdersToFirestoreObj,        jsonbCols: RZP_ORDERS_JSONB_COLUMNS },
   'dine_orders':           { table: 'dine_orders',           fieldMap: {},                      toPgRow: counterIdentity,         toFirestoreObj: counterIdentity,               jsonbCols: GENERIC_JSONB },
   'subscriptions':         { table: 'dine_subscriptions',    fieldMap: SUBSCRIPTIONS_FIELD_MAP, toPgRow: subscriptionsToPgRow,    toFirestoreObj: subscriptionsToFirestoreObj,    jsonbCols: SUBSCRIPTIONS_JSONB_COLUMNS },
+
+  // ── generic passthrough (whole doc → extra_data JSONB; no Firestore fallback) ──
+  'dineai_conversations':  { table: 'dineai_conversations',  fieldMap: {}, toPgRow: genericPack, toFirestoreObj: genericUnpack, jsonbCols: GENERIC_JSONB },
+  'desktop_auth_sessions': { table: 'desktop_auth_sessions', fieldMap: {}, toPgRow: genericPack, toFirestoreObj: genericUnpack, jsonbCols: GENERIC_JSONB },
+  'adminTasks':            { table: 'admin_tasks',           fieldMap: {}, toPgRow: genericPack, toFirestoreObj: genericUnpack, jsonbCols: GENERIC_JSONB },
+  'sub_admins':            { table: 'sub_admins',            fieldMap: {}, toPgRow: genericPack, toFirestoreObj: genericUnpack, jsonbCols: GENERIC_JSONB },
+  'waitlist':              { table: 'waitlist',              fieldMap: {}, toPgRow: genericPack, toFirestoreObj: genericUnpack, jsonbCols: GENERIC_JSONB },
 
   // ── cash registers & shifts ─────────────────────────────────────────────
   'cashRegisters':           { table: 'cash_registers',           fieldMap: REGISTER_FIELD_MAP,       toPgRow: registerToPgRow,       toFirestoreObj: registerToFirestoreObj,       jsonbCols: REGISTER_JSONB_COLUMNS },
