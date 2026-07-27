@@ -379,6 +379,26 @@ const genericUnpack = (row) => {
   return { ...cols, ...(extra_data && typeof extra_data === 'object' ? extra_data : {}) };
 };
 
+// Sadad (Qatar) transactions subcollection: like genericPack, but promote
+// merchantOrderNo -> merchant_order_no as a real column so the webhook lookup
+// `.where('merchantOrderNo','==',...)` works on PG (WHERE can't read extra_data).
+const sadadPack = (obj) => {
+  const { id, merchantOrderNo, restaurantId, restaurant_id, ...rest } = obj || {};
+  const out = { extra_data: rest };
+  if (id !== undefined) out.id = id;
+  if (merchantOrderNo !== undefined) out.merchant_order_no = merchantOrderNo;
+  const rid = restaurantId || restaurant_id;
+  if (rid) out.restaurant_id = rid;
+  return out;
+};
+const sadadUnpack = (row) => {
+  if (!row || typeof row !== 'object') return row;
+  const { extra_data, merchant_order_no, ...cols } = row;
+  const out = { ...cols, ...(extra_data && typeof extra_data === 'object' ? extra_data : {}) };
+  if (merchant_order_no !== undefined && out.merchantOrderNo === undefined) out.merchantOrderNo = merchant_order_no;
+  return out;
+};
+
 // ═══════════════════════════════════════════════════════════════════════════
 // Registry — Firestore collection name → PG table config
 // ═══════════════════════════════════════════════════════════════════════════
@@ -426,6 +446,7 @@ const REGISTRY = {
   'adminTasks':            { table: 'admin_tasks',           fieldMap: {}, toPgRow: genericPack, toFirestoreObj: genericUnpack, jsonbCols: GENERIC_JSONB },
   'sub_admins':            { table: 'sub_admins',            fieldMap: {}, toPgRow: genericPack, toFirestoreObj: genericUnpack, jsonbCols: GENERIC_JSONB },
   'waitlist':              { table: 'waitlist',              fieldMap: {}, toPgRow: genericPack, toFirestoreObj: genericUnpack, jsonbCols: GENERIC_JSONB },
+  'sadadTransactions':     { table: 'sadad_transactions',    fieldMap: {}, toPgRow: sadadPack,   toFirestoreObj: sadadUnpack,   jsonbCols: GENERIC_JSONB },
 
   // ── cash registers & shifts ─────────────────────────────────────────────
   'cashRegisters':           { table: 'cash_registers',           fieldMap: REGISTER_FIELD_MAP,       toPgRow: registerToPgRow,       toFirestoreObj: registerToFirestoreObj,       jsonbCols: REGISTER_JSONB_COLUMNS },

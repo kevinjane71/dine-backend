@@ -105,6 +105,29 @@ function resolveField(fieldMap, field) {
   return col;
 }
 
+// Per-table real-column cache (lazy, module-lived). Lets a WHERE on a field whose
+// resolved column does NOT physically exist fall back to extra_data->>'field' —
+// the symmetric read side of write-overflow (unmapped writes go to
+// extra_data.<originalKey>). Prevents "column does not exist" on PG for any field
+// that isn't in the collection's field map. Returns null if introspection fails
+// (then callers behave exactly as before — no fallback).
+const _tableColsCache = new Map();
+async function getTableColumns(table) {
+  if (_tableColsCache.has(table)) return _tableColsCache.get(table);
+  try {
+    const res = await pgQuery(
+      "SELECT column_name FROM information_schema.columns WHERE table_schema = 'public' AND table_name = $1",
+      [table]
+    );
+    const set = new Set((res.rows || []).map((r) => String(r.column_name).toLowerCase()));
+    const val = set.size > 0 ? set : null;
+    if (val) _tableColsCache.set(table, val);
+    return val;
+  } catch (_) {
+    return null;
+  }
+}
+
 function generateId() {
   const chars =
     'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
@@ -954,7 +977,7 @@ class PgQuery {
    * Build WHERE conditions for this query's filters. Pushes parameters onto
    * `values` and returns { conditions, emptyResult }. Shared by get()/count().
    */
-  _buildConditions(values) {
+  _buildConditions(values, knownCols) {
     const { fieldMap, jsonbCols } = this._config;
     const conditions = [];
 
@@ -1010,6 +1033,49 @@ class PgQuery {
         continue;
       }
 
+      // Unmapped field whose column does NOT physically exist → query the JSONB
+      // overflow instead of throwing "column does not exist". Writes store such
+      // fields as extra_data.<originalKey>, so use the ORIGINAL field name as key.
+      if (
+        dotParts.length === 1 &&
+        knownCols &&
+        !knownCols.has(pgCol.toLowerCase()) &&
+        jsonbCols && jsonbCols.has('extra_data')
+      ) {
+        const keyIdx = addValue(topField);
+        const jsonExpr = `extra_data -> $${keyIdx}`;
+        const textExpr = `extra_data ->> $${keyIdx}`;
+        if (w.op === 'array-contains') {
+          const vIdx = addValue(JSON.stringify([cleanValue]));
+          conditions.push(`COALESCE(${jsonExpr}, '[]'::jsonb) @> $${vIdx}::jsonb`);
+        } else if (cleanValue === null && (w.op === '==' || w.op === '!=')) {
+          conditions.push(w.op === '==' ? `${textExpr} IS NULL` : `${textExpr} IS NOT NULL`);
+        } else if (w.op === 'in') {
+          if (!Array.isArray(cleanValue) || cleanValue.length === 0) {
+            return { conditions, emptyResult: true };
+          }
+          const vIdx = addValue(cleanValue.map((v) => (typeof v === 'string' ? v : String(v))));
+          conditions.push(`${textExpr} = ANY($${vIdx})`);
+        } else if (w.op === 'not-in') {
+          if (!Array.isArray(cleanValue) || cleanValue.length === 0) continue;
+          const vIdx = addValue(cleanValue.map((v) => (typeof v === 'string' ? v : String(v))));
+          conditions.push(`${textExpr} != ALL($${vIdx})`);
+        } else if (typeof cleanValue === 'number') {
+          const vIdx = addValue(cleanValue);
+          conditions.push(`(${textExpr})::numeric ${mappedOp} $${vIdx}`);
+        } else if (cleanValue instanceof Date) {
+          const vIdx = addValue(cleanValue);
+          conditions.push(`(${textExpr})::timestamptz ${mappedOp} $${vIdx}`);
+        } else if (typeof cleanValue === 'boolean') {
+          const vIdx = addValue(String(cleanValue));
+          conditions.push(`${textExpr} ${mappedOp} $${vIdx}`);
+        } else {
+          const vIdx = addValue(cleanValue);
+          conditions.push(`${textExpr} ${mappedOp} $${vIdx}`);
+        }
+        continue;
+      }
+
       // NULL equality — SQL 'col != NULL' matches nothing; Firestore semantics
       // are IS NULL / IS NOT NULL
       if (cleanValue === null && (w.op === '==' || w.op === '!=')) {
@@ -1050,7 +1116,8 @@ class PgQuery {
         try {
           const { table } = self._config;
           const values = [];
-          const { conditions, emptyResult } = self._buildConditions(values);
+          const knownCols = await getTableColumns(table);
+          const { conditions, emptyResult } = self._buildConditions(values, knownCols);
           if (emptyResult) return { data: () => ({ count: 0 }) };
 
           let sql = `SELECT COUNT(*) AS cnt FROM ${table}`;
@@ -1112,7 +1179,8 @@ class PgQuery {
       }
 
       const values = [];
-      const { conditions, emptyResult } = this._buildConditions(values);
+      const knownCols = await getTableColumns(table);
+      const { conditions, emptyResult } = this._buildConditions(values, knownCols);
       if (emptyResult) return makeQuerySnapshot([]);
 
       // ORDER BY — Firestore excludes documents that lack the orderBy field,

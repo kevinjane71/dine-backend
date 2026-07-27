@@ -26,6 +26,14 @@ CREATE TABLE IF NOT EXISTS print_diagnostics (
   created_at TIMESTAMPTZ DEFAULT NOW(), extra_data JSONB DEFAULT '{}'::jsonb
 );
 
+-- Sadad (Qatar) transactions subcollection -> flat table so collectionGroup
+-- lookup by merchantOrderNo works on PG (no Firestore fallback). 0 rows today.
+CREATE TABLE IF NOT EXISTS sadad_transactions (
+  id TEXT PRIMARY KEY, restaurant_id TEXT, merchant_order_no TEXT,
+  extra_data JSONB DEFAULT '{}'::jsonb, created_at TIMESTAMPTZ DEFAULT NOW(), updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_sadad_merchant_order ON sadad_transactions(merchant_order_no);
+
 -- 3) Widen every bounded NUMERIC(p,s) column -> unbounded NUMERIC (lossless).
 --    Eliminates "numeric field overflow" on oversized money/qty values.
 --    This block was applied dynamically; re-run to be safe:

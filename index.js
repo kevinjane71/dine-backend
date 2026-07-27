@@ -13778,7 +13778,7 @@ app.patch('/api/orders/:orderId/status', authenticateToken, async (req, res) => 
       if (staffId) {
         db.collection(collections.shifts || 'shifts')
           .where('restaurantId', '==', orderData.restaurantId)
-          .where('staffId', '==', staffId)
+          .where('openedBy.userId', '==', staffId)
           .where('status', '==', 'open')
           .limit(1).get().then(snap => {
             if (!snap.empty) {
