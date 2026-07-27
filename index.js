@@ -1062,11 +1062,39 @@ async function adjustDirectMenuItemStock(restaurantId, orderItems, mode = 'decre
   }
 }
 
-// Multi-tier pricing: resolve per-item price for a given pricing rule
-function resolveItemPriceForRule(menuItem, ruleId, rules) {
+// Multi-tier pricing: resolve per-item price for a given pricing rule.
+// When `variantDef` (the matched menu-item variant) is supplied, variant-level tier prices
+// take precedence over item-level ones — this powers per-variant multi-tier pricing.
+// Backward-compatible: variantDef defaults to null (item-level behaviour, unchanged).
+function resolveItemPriceForRule(menuItem, ruleId, rules, variantDef = null) {
   if (!ruleId || !rules?.length) return null;
   const rule = rules.find(r => r.id === ruleId && r.isActive);
   if (!rule) return null;
+
+  // ── Variant-level tiers (only when a variant is chosen) ──
+  if (variantDef) {
+    // Priority 1: per-variant price for this exact rule
+    if (variantDef.pricingRules && typeof variantDef.pricingRules[ruleId] === 'number') {
+      return variantDef.pricingRules[ruleId];
+    }
+    // Priority 2 (zone rules only): inherit from the variant's Dine-In price
+    if (isZoneRule(rule)) {
+      const dineInRule = findDineInRule(rules);
+      if (dineInRule && variantDef.pricingRules && typeof variantDef.pricingRules[dineInRule.id] === 'number') {
+        return variantDef.pricingRules[dineInRule.id];
+      }
+    }
+    // Priority 3: rule default markup off the variant's base price
+    const vBase = typeof variantDef.price === 'number' ? variantDef.price : menuItem.price;
+    if (rule.defaultMarkupType === 'percentage' && rule.defaultMarkupValue) {
+      return Math.round(vBase * (1 + rule.defaultMarkupValue / 100) * 100) / 100;
+    }
+    if (rule.defaultMarkupType === 'flat' && rule.defaultMarkupValue) {
+      return Math.round((vBase + rule.defaultMarkupValue) * 100) / 100;
+    }
+    return null; // no adjustment — caller uses the variant's own price
+  }
+
   // Priority 1: Per-item specific price
   if (menuItem.pricingRules && typeof menuItem.pricingRules[ruleId] === 'number') {
     return menuItem.pricingRules[ruleId];
@@ -1087,6 +1115,17 @@ function resolveItemPriceForRule(menuItem, ruleId, rules) {
     return Math.round((basePrice + rule.defaultMarkupValue) * 100) / 100;
   }
   return null; // no adjustment — use base price
+}
+
+// Sanitize a variant/item pricingRules map to { ruleId: number>=0 } (drops blanks/invalid).
+function cleanPricingRulesMap(pr) {
+  if (!pr || typeof pr !== 'object') return undefined;
+  const out = {};
+  for (const [k, v] of Object.entries(pr)) {
+    const n = typeof v === 'number' ? v : parseFloat(v);
+    if (!isNaN(n) && n >= 0) out[k] = n;
+  }
+  return Object.keys(out).length > 0 ? out : undefined;
 }
 
 // Flatten modifierGroups into a backward-compatible flat customizations array.
@@ -7858,7 +7897,9 @@ app.post('/api/menus/:restaurantId', authenticateToken, async (req, res) => {
             description: v.description || '',
             // Recipe scaling for inventory: a Half portion (0.5) deducts half the
             // recipe. Defaults to 1 (full recipe) when unset.
-            recipeMultiplier: (parseFloat(v.recipeMultiplier) > 0) ? parseFloat(v.recipeMultiplier) : 1
+            recipeMultiplier: (parseFloat(v.recipeMultiplier) > 0) ? parseFloat(v.recipeMultiplier) : 1,
+            // Per-variant multi-tier prices (zone → price). Omitted when none set.
+            ...(cleanPricingRulesMap(v.pricingRules) ? { pricingRules: cleanPricingRulesMap(v.pricingRules) } : {})
           }))
         : [],
       // Modifier groups: structured groups with min/max selection rules
@@ -8046,7 +8087,9 @@ app.patch('/api/menus/item/:id', authenticateToken, async (req, res) => {
                 name: v.name,
                 price: typeof v.price === 'number' ? v.price : parseFloat(v.price) || 0,
                 description: v.description || '',
-                recipeMultiplier: (parseFloat(v.recipeMultiplier) > 0) ? parseFloat(v.recipeMultiplier) : 1
+                recipeMultiplier: (parseFloat(v.recipeMultiplier) > 0) ? parseFloat(v.recipeMultiplier) : 1,
+                // Per-variant multi-tier prices (zone → price). Omitted when none set.
+                ...(cleanPricingRulesMap(v.pricingRules) ? { pricingRules: cleanPricingRulesMap(v.pricingRules) } : {})
               }))
             : [];
         } else if (field === 'modifierGroups') {
@@ -9863,6 +9906,8 @@ app.post('/api/orders', authenticateOrderCreate, async (req, res) => {
       // expectedMenuPrice = the price this item SHOULD be (variant price or base menu price)
       // Used to detect genuine manual price edits vs legitimate variant price differences
       let expectedMenuPrice = menuItem.price;
+      // The matched menu-item variant definition (carries per-variant pricingRules for multi-tier)
+      let matchedVariantDef = null;
 
       if (selectedVariant && typeof selectedVariant.price === 'number') {
         // Variant selected — validate variant exists in menu item
@@ -9870,6 +9915,7 @@ app.post('/api/orders', authenticateOrderCreate, async (req, res) => {
         const matchedVariant = (menuItem.variants || []).find(v =>
           selectedVariant.name ? v.name === selectedVariant.name : v.price === selectedVariant.price
         );
+        matchedVariantDef = matchedVariant || { name: selectedVariant.name, price: selectedVariant.price };
         basePrice = matchedVariant ? matchedVariant.price : selectedVariant.price;
         expectedMenuPrice = basePrice; // variant price is the expected price
       } else if (allowPriceEdit && fePrice !== null) {
@@ -9904,11 +9950,15 @@ app.post('/api/orders', authenticateOrderCreate, async (req, res) => {
         }
       }
 
-      // Multi-tier pricing: override base price for non-variant items
-      // Skip if staff explicitly edited the price (priceEdited flag or fePrice differs from menu)
-      const wasManuallyEdited = item.priceEdited === true || (allowPriceEdit && fePrice !== null && fePrice !== menuItem.price);
-      if (multiPricing?.enabled && activePricingRuleId && !selectedVariant && !wasManuallyEdited) {
-        const rulePrice = resolveItemPriceForRule(menuItem, activePricingRuleId, multiPricing.rules);
+      // Multi-tier pricing: override base price by the active zone rule (item- or variant-level).
+      // For variant lines the fePrice-vs-menuPrice heuristic doesn't apply (a variant price
+      // legitimately differs from the item base), so only an explicit priceEdited flag counts
+      // as a manual edit there.
+      const wasManuallyEdited = selectedVariant
+        ? (item.priceEdited === true)
+        : (item.priceEdited === true || (allowPriceEdit && fePrice !== null && fePrice !== menuItem.price));
+      if (multiPricing?.enabled && activePricingRuleId && !wasManuallyEdited) {
+        const rulePrice = resolveItemPriceForRule(menuItem, activePricingRuleId, multiPricing.rules, matchedVariantDef);
         if (rulePrice !== null) {
           basePrice = rulePrice;
           expectedMenuPrice = rulePrice; // pricing rule price is the expected price
@@ -14320,6 +14370,7 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
           // FE-claimed); fall back to the FE-preserved price for legacy lines.
           const settledBasePrice = typeof existingItem?.basePrice === 'number' ? existingItem.basePrice
             : (fePricePatch !== null ? fePricePatch : null);
+          let matchedVariantDefPatch = null; // matched menu variant (carries per-variant pricingRules)
 
           if (preserveBilledPrice && settledBasePrice !== null) {
             // Settled line (incl. variants) — keep the billed price; never re-price.
@@ -14331,6 +14382,7 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
             const matchedVariant = (menuItem.variants || []).find(v =>
               selectedVariant.name ? v.name === selectedVariant.name : v.price === selectedVariant.price
             );
+            matchedVariantDefPatch = matchedVariant || { name: selectedVariant.name, price: selectedVariant.price };
             resolvedBasePrice = matchedVariant ? matchedVariant.price : selectedVariant.price;
             expectedMenuPricePatch = resolvedBasePrice; // variant price is the expected price
           } else if (allowPriceEditPatch && fePricePatch !== null) {
@@ -14344,11 +14396,13 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
             }
           }
 
-          // Multi-tier pricing: override base price for non-variant items
-          // Skip if staff explicitly edited the price
-          const wasManuallyEditedPatch = cleanItem.priceEdited === true || (allowPriceEditPatch && fePricePatch !== null && fePricePatch !== menuItem.price);
-          if (multiPricing?.enabled && activePricingRuleId && !selectedVariant && !wasManuallyEditedPatch && !preserveBilledPrice) {
-            const rulePrice = resolveItemPriceForRule(menuItem, activePricingRuleId, multiPricing.rules);
+          // Multi-tier pricing: override base price by the active zone rule (item- or variant-level).
+          // Variant lines: only an explicit priceEdited flag counts as a manual edit.
+          const wasManuallyEditedPatch = selectedVariant
+            ? (cleanItem.priceEdited === true)
+            : (cleanItem.priceEdited === true || (allowPriceEditPatch && fePricePatch !== null && fePricePatch !== menuItem.price));
+          if (multiPricing?.enabled && activePricingRuleId && !wasManuallyEditedPatch && !preserveBilledPrice) {
+            const rulePrice = resolveItemPriceForRule(menuItem, activePricingRuleId, multiPricing.rules, matchedVariantDefPatch);
             if (rulePrice !== null) {
               resolvedBasePrice = rulePrice;
               expectedMenuPricePatch = rulePrice;
@@ -35817,19 +35871,22 @@ app.patch('/api/orders/:orderId/edit-completed-items', authenticateToken, async 
       const customizations = Array.isArray(cleanItem.selectedCustomizations) ? cleanItem.selectedCustomizations : [];
 
       let resolvedBasePrice;
+      let matchedVariantDefEC = null; // matched menu variant (carries per-variant pricingRules)
       if (menuItem) {
         if (selectedVariant && typeof selectedVariant.price === 'number') {
           const matchedVariant = (menuItem.variants || []).find(v =>
             selectedVariant.name ? v.name === selectedVariant.name : v.price === selectedVariant.price
           );
+          matchedVariantDefEC = matchedVariant || { name: selectedVariant.name, price: selectedVariant.price };
           resolvedBasePrice = matchedVariant ? matchedVariant.price : selectedVariant.price;
         } else if (allowPriceEdit && cleanItem.price != null) {
           resolvedBasePrice = cleanItem.price;
         } else {
           resolvedBasePrice = menuItem.price;
         }
-        if (multiPricing?.enabled && activePricingRuleId && !selectedVariant) {
-          const rulePrice = resolveItemPriceForRule(menuItem, activePricingRuleId, multiPricing.rules);
+        // Multi-tier override (item- or variant-level). Variant lines still re-price by tier.
+        if (multiPricing?.enabled && activePricingRuleId) {
+          const rulePrice = resolveItemPriceForRule(menuItem, activePricingRuleId, multiPricing.rules, matchedVariantDefEC);
           if (rulePrice !== null) resolvedBasePrice = rulePrice;
         }
       } else {
