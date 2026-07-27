@@ -1005,7 +1005,14 @@ class PgQuery {
           const vIdx = addValue(JSON.stringify([cleanValue]));
           conditions.push(`COALESCE(${pgCol}#>${pathParam}, '[]'::jsonb) @> $${vIdx}::jsonb`);
         } else if (cleanValue === null && (w.op === '==' || w.op === '!=')) {
-          conditions.push(w.op === '==' ? `${textExpr} IS NULL` : `${textExpr} IS NOT NULL`);
+          // Firestore `== null` matches only an EXPLICIT null (key present, value
+          // null) — NOT a missing key. jsonb_typeof distinguishes the two so PG
+          // matches Firestore exactly. (`!= null` = key present & not-null already.)
+          conditions.push(
+            w.op === '=='
+              ? `jsonb_typeof(${pgCol}#>${pathParam}) = 'null'`
+              : `${textExpr} IS NOT NULL`
+          );
         } else if (w.op === 'in') {
           if (!Array.isArray(cleanValue) || cleanValue.length === 0) {
             return { conditions, emptyResult: true };
@@ -1049,7 +1056,12 @@ class PgQuery {
           const vIdx = addValue(JSON.stringify([cleanValue]));
           conditions.push(`COALESCE(${jsonExpr}, '[]'::jsonb) @> $${vIdx}::jsonb`);
         } else if (cleanValue === null && (w.op === '==' || w.op === '!=')) {
-          conditions.push(w.op === '==' ? `${textExpr} IS NULL` : `${textExpr} IS NOT NULL`);
+          // Match Firestore: `== null` = explicit null only (key present, null value)
+          conditions.push(
+            w.op === '=='
+              ? `jsonb_typeof(${jsonExpr}) = 'null'`
+              : `${textExpr} IS NOT NULL`
+          );
         } else if (w.op === 'in') {
           if (!Array.isArray(cleanValue) || cleanValue.length === 0) {
             return { conditions, emptyResult: true };
