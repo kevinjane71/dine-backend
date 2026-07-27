@@ -34,6 +34,13 @@ CREATE TABLE IF NOT EXISTS sadad_transactions (
 );
 CREATE INDEX IF NOT EXISTS idx_sadad_merchant_order ON sadad_transactions(merchant_order_no);
 
+-- Query-parity audit: mapped collections whose tables/columns were missing
+-- (a .where() on them threw "does not exist" on PG). All 0-data today.
+CREATE TABLE IF NOT EXISTS stock_audits       (id TEXT PRIMARY KEY, restaurant_id TEXT, extra_data JSONB DEFAULT '{}'::jsonb, created_at TIMESTAMPTZ DEFAULT NOW(), updated_at TIMESTAMPTZ DEFAULT NOW());
+CREATE TABLE IF NOT EXISTS production_entries (id TEXT PRIMARY KEY, restaurant_id TEXT, extra_data JSONB DEFAULT '{}'::jsonb, created_at TIMESTAMPTZ DEFAULT NOW(), updated_at TIMESTAMPTZ DEFAULT NOW());
+ALTER TABLE customer_offer_usage ADD COLUMN IF NOT EXISTS extra_data JSONB DEFAULT '{}'::jsonb;
+ALTER TABLE order_counters       ADD COLUMN IF NOT EXISTS extra_data JSONB DEFAULT '{}'::jsonb;
+
 -- 3) Widen every bounded NUMERIC(p,s) column -> unbounded NUMERIC (lossless).
 --    Eliminates "numeric field overflow" on oversized money/qty values.
 --    This block was applied dynamically; re-run to be safe:

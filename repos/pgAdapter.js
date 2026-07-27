@@ -1259,10 +1259,13 @@ class PgQuery {
         sql += ' WHERE ' + conditions.join(' AND ');
       }
       if (orderParts.length > 0) {
-        // Doc-id tiebreak mirrors Firestore's implicit __name__ ordering
+        // Doc-id tiebreak mirrors Firestore's implicit __name__ ordering.
+        // COLLATE "C" sorts by UTF-8 byte order to match Firestore's __name__
+        // (code-point) ordering — the DB's locale collation would tie-break
+        // same-sort-key rows in a different order than Firestore.
         const lastDir =
           this._orderBys[this._orderBys.length - 1].direction === 'desc' ? 'DESC' : 'ASC';
-        sql += ' ORDER BY ' + orderParts.join(', ') + `, id ${lastDir}`;
+        sql += ' ORDER BY ' + orderParts.join(', ') + `, id COLLATE "C" ${lastDir}`;
       }
 
       // LIMIT
