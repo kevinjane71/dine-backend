@@ -17048,6 +17048,115 @@ app.post('/api/tables/:restaurantId/unsplit', authenticateToken, async (req, res
   }
 });
 
+// ── Dynamic parties (Path A) ─────────────────────────────────────────────────
+// Add another PARTY (independent check) to a table ON DEMAND — no pre-splitting.
+// The base table stays "Party A" (keeps its own order); each call creates the next
+// sibling party (e.g. 7-B, 7-C) as a real, independently-billable table. Works even
+// while the base table is occupied. Additive — does NOT touch /split or /unsplit.
+app.post('/api/tables/:restaurantId/add-party', authenticateToken, async (req, res) => {
+  try {
+    if (!(await checkFeaturePermission(req, 'tables', 'manage'))) {
+      return res.status(403).json({ error: 'Access denied. Table management permission required.' });
+    }
+    const { restaurantId } = req.params;
+    const { tableId } = req.body;
+    const partyName = (req.body.partyName || '').toString().trim().slice(0, 40) || null;
+    if (!tableId) return res.status(400).json({ error: 'tableId is required.' });
+
+    const found = await findTableAcrossFloors(restaurantId, tableId);
+    if (!found) return res.status(404).json({ error: 'Table not found.' });
+    const t = found.data;
+    if (t.isSubTable || t.isSplit) return res.status(400).json({ error: 'Parties are for normal tables, not pre-split tables.' });
+    if (t.mergeGroupId) return res.status(400).json({ error: 'This table is part of a merge group. Un-merge it first.' });
+
+    const tablesRef = db.collection('restaurants').doc(restaurantId)
+      .collection('floors').doc(found.floorId).collection('tables');
+
+    // The party group is anchored on the BASE table. Party "A" = the base table itself.
+    const partyGroupId = t.partyGroupId || `pty_${tableId.slice(0, 8)}_${Date.now()}`;
+
+    // Find existing sibling parties (B, C…) and pick the next free label after A.
+    const sibSnap = await tablesRef.where('partyGroupId', '==', partyGroupId).where('isPartyTable', '==', true).get();
+    const usedLabels = new Set(sibSnap.docs.map(d => (d.data().partyLabel || '')));
+    usedLabels.add('A'); // base table is Party A
+    let nextIdx = 1;
+    while (usedLabels.has(String.fromCharCode(65 + nextIdx))) nextIdx++;
+    if (nextIdx > 7) return res.status(400).json({ error: 'Maximum parties (8) reached for this table.' });
+    const label = String.fromCharCode(65 + nextIdx);
+    const partyTableName = `${t.name}-${label}`;
+
+    const clash = await tablesRef.where('name', '==', partyTableName).limit(1).get();
+    if (!clash.empty) return res.status(400).json({ error: `A table named "${partyTableName}" already exists.` });
+
+    const now = new Date();
+    const subData = {
+      name: partyTableName,
+      floor: t.floor, section: t.section || 'Main',
+      capacity: Number(t.capacity) || 4,
+      status: 'available', currentOrderId: null, lastOrderTime: null,
+      isPartyTable: true,
+      partyGroupId,
+      partyOfTableId: tableId,
+      partyOfTableName: t.name,
+      partyLabel: label,
+      partyName,
+      createdAt: now, updatedAt: now,
+    };
+    const ref = await tablesRef.add(subData);
+
+    // Anchor the group on the base table (marks it as the Party-A host). Never touches its order/status.
+    if (!t.partyGroupId) {
+      await found.ref.update({ partyGroupId, hasParties: true, partyLabel: 'A', updatedAt: now });
+    } else if (!t.hasParties) {
+      await found.ref.update({ hasParties: true, updatedAt: now });
+    }
+
+    pusherService.triggerTableStatusUpdated(restaurantId, {
+      tableId: ref.id, status: 'available', orderId: null, tableNumber: partyTableName,
+    }).catch(() => {});
+
+    res.json({ success: true, partyGroupId, party: { id: ref.id, ...subData } });
+  } catch (error) {
+    console.error('Add party error:', error);
+    res.status(500).json({ error: 'Failed to add party' });
+  }
+});
+
+// Remove an EMPTY party (no active order). Clears the base anchor when none remain.
+app.post('/api/tables/:restaurantId/remove-party', authenticateToken, async (req, res) => {
+  try {
+    if (!(await checkFeaturePermission(req, 'tables', 'manage'))) {
+      return res.status(403).json({ error: 'Access denied. Table management permission required.' });
+    }
+    const { restaurantId } = req.params;
+    const { tableId } = req.body;
+    if (!tableId) return res.status(400).json({ error: 'tableId is required.' });
+
+    const found = await findTableAcrossFloors(restaurantId, tableId);
+    if (!found) return res.status(404).json({ error: 'Party not found.' });
+    const t = found.data;
+    if (!t.isPartyTable) return res.status(400).json({ error: 'Not a party table.' });
+    if (t.status === 'occupied' || t.currentOrderId) {
+      return res.status(400).json({ error: 'This party has an active order. Settle it first.' });
+    }
+
+    const tablesRef = db.collection('restaurants').doc(restaurantId)
+      .collection('floors').doc(found.floorId).collection('tables');
+    await found.ref.delete();
+
+    // If no sibling parties remain, clear the base table's party anchor.
+    const remaining = await tablesRef.where('partyGroupId', '==', t.partyGroupId).where('isPartyTable', '==', true).limit(1).get();
+    if (remaining.empty && t.partyOfTableId) {
+      const base = await findTableAcrossFloors(restaurantId, t.partyOfTableId);
+      if (base) await base.ref.update({ hasParties: false, updatedAt: new Date() }).catch(() => {});
+    }
+    res.json({ success: true });
+  } catch (error) {
+    console.error('Remove party error:', error);
+    res.status(500).json({ error: 'Failed to remove party' });
+  }
+});
+
 // Assign (or clear) the server (waiter) on a table. If the table has an active
 // order, the order's waiterId/waiterName are updated too so tip/sales
 // attribution follows. Metadata only — never touches items/money.
