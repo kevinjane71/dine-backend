@@ -17055,8 +17055,11 @@ app.post('/api/tables/:restaurantId/unsplit', authenticateToken, async (req, res
 // while the base table is occupied. Additive — does NOT touch /split or /unsplit.
 app.post('/api/tables/:restaurantId/add-party', authenticateToken, async (req, res) => {
   try {
-    if (!(await checkFeaturePermission(req, 'tables', 'manage'))) {
-      return res.status(403).json({ error: 'Access denied. Table management permission required.' });
+    // Adding a party = starting another check on the same table (an order-taking action),
+    // so gate it by tables.update (waiters/cashiers who can seat/change table status) rather
+    // than the stricter tables.manage — matches who is allowed to take orders.
+    if (!(await checkFeaturePermission(req, 'tables', 'update'))) {
+      return res.status(403).json({ error: 'Access denied. Table update permission required.' });
     }
     const { restaurantId } = req.params;
     const { tableId } = req.body;
@@ -17125,8 +17128,9 @@ app.post('/api/tables/:restaurantId/add-party', authenticateToken, async (req, r
 // Remove an EMPTY party (no active order). Clears the base anchor when none remain.
 app.post('/api/tables/:restaurantId/remove-party', authenticateToken, async (req, res) => {
   try {
-    if (!(await checkFeaturePermission(req, 'tables', 'manage'))) {
-      return res.status(403).json({ error: 'Access denied. Table management permission required.' });
+    // Removing an empty party is part of the same order-taking flow — gate by tables.update.
+    if (!(await checkFeaturePermission(req, 'tables', 'update'))) {
+      return res.status(403).json({ error: 'Access denied. Table update permission required.' });
     }
     const { restaurantId } = req.params;
     const { tableId } = req.body;
