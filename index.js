@@ -21753,7 +21753,8 @@ app.put('/api/admin/print-settings/:restaurantId', authenticateToken, async (req
       'autoPrintOnKOTAndPrint',
       'autoPrintOnCompleteBilling',
       'autoPrintOnBillAndPrint',
-      'showOrderStatusQR'
+      'showOrderStatusQR',
+      'imagePrintEnabled'
     ];
 
     // Numeric fields
