@@ -39996,6 +39996,40 @@ app.get('/api/public/desktop-update', async (req, res) => {
   }
 });
 
+// ── Local-server ONE-TIME provisioning (offline deployments) ─────────────────
+// First-run "activation": pull a restaurant's config (staff/menu/tables/settings) from
+// the cloud into the LOCAL Postgres, then the server runs offline. Unauthenticated by
+// design (the local DB is empty before this runs); gated by CLOUD_DATABASE_URL being
+// configured on the server (only the operator sets it). Idempotent — safe to re-run.
+app.get('/api/provision/status', async (req, res) => {
+  try {
+    const configured = !!(process.env.CLOUD_DATABASE_URL && process.env.DATABASE_URL);
+    // "provisioned" = the local DB already has at least one restaurant.
+    let provisioned = false;
+    try {
+      const snap = await db.collection('restaurants').limit(1).get();
+      provisioned = !snap.empty;
+    } catch (_) {}
+    res.json({ configured, provisioned });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+app.post('/api/provision', async (req, res) => {
+  try {
+    const { restaurantId } = req.body || {};
+    if (!restaurantId) return res.status(400).json({ error: 'restaurantId is required' });
+    if (!process.env.CLOUD_DATABASE_URL) {
+      return res.status(400).json({ error: 'This server is not configured for provisioning (CLOUD_DATABASE_URL not set).' });
+    }
+    const { provisionRestaurant } = require('./services/provisioning');
+    const result = await provisionRestaurant(restaurantId);
+    res.json({ success: true, ...result });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // ── Local-server cloud-sync control (offline deployments) ────────────────────
 // Status + on-demand "Sync Now" for the local→cloud / cloud→local sync worker.
 app.get('/api/local-server/sync-status', authenticateToken, async (req, res) => {
