@@ -1,0 +1,146 @@
+name: Build DineOpen Server (desktop)
+
+# Builds the self-contained on-prem "DineOpen Server" desktop app (Electron + the
+# whole dine-backend + embedded PostgreSQL) for Windows and macOS. Mirrors the main
+# POS workflow in dine-frontend, but the Server app has NO native node modules to
+# rebuild and NO Next.js step — it just bundles the backend as extraResources.
+#
+# The per-OS Postgres binary comes from embedded-postgres' optional deps
+# (@embedded-postgres/<os>): each runner's `npm ci` in the backend installs its own
+# OS binary, which is exactly why Windows builds on windows-latest and mac on macos.
+#
+# Trigger: push a tag like `server-v1.0.1` (kept separate from the POS `v*` tags),
+# or run manually via "Run workflow".
+
+on:
+  push:
+    tags:
+      - 'server-v*'
+  workflow_dispatch:
+
+jobs:
+  # ── Windows (primary target) ────────────────────────────────────────────────
+  build-windows:
+    runs-on: windows-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: 'npm'
+          cache-dependency-path: |
+            package-lock.json
+            desktop-server/package-lock.json
+
+      - name: Extract version from tag
+        id: version
+        shell: bash
+        run: |
+          if [[ "${{ github.ref_type }}" == "tag" ]]; then
+            # server-v1.0.1 -> 1.0.1
+            VERSION="${GITHUB_REF_NAME#server-v}"
+          else
+            VERSION=$(node -p "require('./desktop-server/package.json').version")
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Version: $VERSION"
+
+      - name: Set app version
+        shell: bash
+        run: |
+          cd desktop-server
+          npm version ${{ steps.version.outputs.version }} --no-git-tag-version --allow-same-version
+
+      - name: Install backend deps (bundled — pulls @embedded-postgres/windows-x64)
+        run: npm ci
+
+      - name: Install desktop-server deps (electron + electron-builder)
+        run: npm ci
+        working-directory: desktop-server
+
+      - name: Build Windows installer (NSIS, unsigned)
+        shell: bash
+        run: npx electron-builder --win nsis --x64 --publish never
+        working-directory: desktop-server
+
+      - name: Upload Windows installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: DineOpen-Server-Windows-v${{ steps.version.outputs.version }}
+          path: |
+            desktop-server/dist/*Setup*.exe
+            desktop-server/dist/*.exe.blockmap
+            desktop-server/dist/latest.yml
+          retention-days: 30
+          if-no-files-found: error
+
+  # ── macOS (universal: Apple Silicon + Intel, unsigned) ──────────────────────
+  build-macos:
+    runs-on: macos-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: 'npm'
+          cache-dependency-path: |
+            package-lock.json
+            desktop-server/package-lock.json
+
+      - name: Extract version from tag
+        id: version
+        run: |
+          if [[ "${{ github.ref_type }}" == "tag" ]]; then
+            VERSION="${GITHUB_REF_NAME#server-v}"
+          else
+            VERSION=$(node -p "require('./desktop-server/package.json').version")
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Version: $VERSION"
+
+      - name: Set app version
+        run: |
+          cd desktop-server
+          npm version ${{ steps.version.outputs.version }} --no-git-tag-version --allow-same-version
+
+      - name: Install backend deps (bundled — pulls @embedded-postgres/darwin-arm64)
+        run: npm ci
+
+      # The runner is Apple Silicon, so `npm ci` only fetched the arm64 Postgres binary.
+      # A universal .app must also run on Intel, so pull the x64 binary too (force past
+      # the platform check; --no-save keeps the lockfile clean).
+      - name: Add Intel Postgres binary for universal build
+        run: npm install @embedded-postgres/darwin-x64@18.4.0-beta.17 --no-save --force
+
+      - name: Install desktop-server deps (electron + electron-builder)
+        run: npm ci
+        working-directory: desktop-server
+
+      - name: Build macOS DMG (universal, unsigned)
+        env:
+          # Explicitly disable code signing / notarization — unsigned build.
+          CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+        run: npx electron-builder --mac dmg --universal --publish never
+        working-directory: desktop-server
+
+      - name: Upload macOS DMG
+        uses: actions/upload-artifact@v4
+        with:
+          name: DineOpen-Server-macOS-v${{ steps.version.outputs.version }}
+          path: |
+            desktop-server/dist/*.dmg
+            desktop-server/dist/*.dmg.blockmap
+          retention-days: 30
+          if-no-files-found: error

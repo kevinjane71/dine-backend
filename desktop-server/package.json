@@ -19,6 +19,9 @@
   "build": {
     "appId": "com.dineopen.server",
     "productName": "DineOpen Server",
+    "directories": {
+      "output": "dist"
+    },
     "files": [
       "main.js",
       "preload.js",

@@ -27,6 +27,7 @@
     "cors": "^2.8.5",
     "dodopayments": "^2.19.1",
     "dotenv": "^17.2.2",
+    "embedded-postgres": "18.4.0-beta.17",
     "express": "^5.1.0",
     "firebase-admin": "^13.5.0",
     "google-auth-library": "^10.3.0",
