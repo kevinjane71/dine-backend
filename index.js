@@ -8509,12 +8509,15 @@ app.delete('/api/menus/:restaurantId/bulk-delete', authenticateToken, async (req
     // Get current menu
     const currentMenu = restaurantData.menu || { categories: [], items: [] };
 
-    // Count active items before deletion
+    // Count items before deletion. Guard on TOTAL (not just active) so a document
+    // that still holds soft-deleted items from an older build can be cleared/emptied
+    // even when 0 items are active — otherwise the doc stays bloated and un-clearable.
+    const totalItemsCount = (currentMenu.items || []).length;
     const activeItemsCount = (currentMenu.items || []).filter(item => item.status !== 'deleted').length;
 
-    if (activeItemsCount === 0) {
+    if (totalItemsCount === 0) {
       return res.status(400).json({
-        error: 'No active menu items to delete',
+        error: 'No menu items to delete',
         deletedCount: 0
       });
     }
@@ -8561,15 +8564,15 @@ app.delete('/api/menus/:restaurantId/bulk-delete', authenticateToken, async (req
       deletedByEmail: logUserEmail,
       deletedByPhone: logUserPhone,
       reason: typeof reason === 'string' ? reason.substring(0, 1000) : '',
-      deletedCount: activeItemsCount,
+      deletedCount: totalItemsCount,
       deletedAt: deletedTimestamp,
     };
     const bulkDeleteLogRef = await db.collection('menuBulkDeleteLogs').add(bulkDeleteLogData);
-    console.log(`✅ Bulk deleted ${activeItemsCount} menu items for restaurant ${restaurantId} | Reason: ${reason || 'N/A'}`);
+    console.log(`✅ Bulk deleted ${totalItemsCount} menu items for restaurant ${restaurantId} | Reason: ${reason || 'N/A'}`);
 
     res.json({
-      message: `Successfully deleted all ${activeItemsCount} menu items`,
-      deletedCount: activeItemsCount,
+      message: `Successfully deleted all ${totalItemsCount} menu items`,
+      deletedCount: totalItemsCount,
       note: 'All items have been soft deleted and can be restored if needed'
     });
 
