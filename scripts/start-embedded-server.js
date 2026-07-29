@@ -57,7 +57,9 @@ async function loadSchema(connString) {
 async function main() {
   let EmbeddedPostgres;
   try {
-    const M = require('embedded-postgres');
+    // embedded-postgres is ESM-only; use dynamic import() so it works on Node that
+    // can't require() ESM (e.g. Electron's bundled Node 20).
+    const M = await import('embedded-postgres');
     EmbeddedPostgres = M.default || M;
   } catch (e) {
     console.error('❌ `embedded-postgres` is not installed. Run once on this machine:');

@@ -46,9 +46,17 @@ function lanIPs() {
   return out;
 }
 
+async function loadEmbeddedPostgres() {
+  // embedded-postgres is ESM-only ("type":"module"). Electron's Node can't require() ESM,
+  // so load it via dynamic import() from its absolute entry (file:// URL for Windows too).
+  const { pathToFileURL } = require('url');
+  const entry = path.join(backendDir(), 'node_modules', 'embedded-postgres', 'dist', 'index.js');
+  const M = await import(pathToFileURL(entry).href);
+  return M.default || M;
+}
+
 async function startPostgres() {
-  const M = require(path.join(backendDir(), 'node_modules', 'embedded-postgres'));
-  const EmbeddedPostgres = M.default || M;
+  const EmbeddedPostgres = await loadEmbeddedPostgres();
   const dataDir = path.join(app.getPath('userData'), 'pgdata');
   const port = 5433;
   const user = 'dine_app';
