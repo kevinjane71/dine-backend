@@ -24,10 +24,52 @@ cloud sync, see "Sync back" below). Nothing on the client terminals changes.
 ## 0. Requirements (server terminal)
 
 - Node.js 18+ (bundle it, or install once).
-- PostgreSQL 14+ installed and running locally.
 - A fixed / reserved LAN IP for this machine (DHCP reservation or static). All
   terminals will use it — e.g. `192.168.1.50`.
 - Wired ethernet strongly recommended (this box is the whole store's backend).
+- Postgres: **not required to pre-install** if you use the one-click option below
+  (it ships a self-contained PostgreSQL). Only needed for the manual path.
+
+---
+
+## Option A — one-click server (recommended, any Windows/Mac/Linux box)
+
+No separate Postgres install. A self-contained PostgreSQL (the `embedded-postgres`
+package, real per-OS binaries incl. **windows-x64**) is started for you, then the real
+backend runs against it.
+
+```
+# Windows:   double-click  scripts\start-offline-server.bat
+# Mac/Linux:  ./scripts/start-offline-server.sh
+```
+
+First run downloads the PG binary and initialises a data dir at
+`~/dineopen-pgdata` (override with `PG_DATA_DIR`), creates the `dine` database, and —
+if present — loads `scripts/offline-schema.sql`. You still:
+
+1. Create `.env.local` from `.env.offline.example` and set `JWT_SECRET` (same as prod).
+   Leave `DATABASE_URL` unset — the launcher sets it to the embedded PG automatically.
+2. Provide the schema once (recommended): generate it from prod while online and drop
+   it at `scripts/offline-schema.sql`:
+   ```bash
+   pg_dump --schema-only --no-owner --no-privileges \
+     "postgresql://dine_app:PW@34.14.155.43:5432/dine?sslmode=no-verify" \
+     > scripts/offline-schema.sql
+   ```
+   (Without it the launcher applies the repo's `create-*.sql` best-effort and the
+   pgAdapter auto-adds unknown columns into `extra_data` — but a real schema clone is
+   safest.)
+3. Seed this restaurant's data once while online (see step 3 below), pointing
+   `DATABASE_URL` at the embedded PG: `postgresql://dine_app:dineopen_local@127.0.0.1:5433/dine`.
+
+That's it — the launcher prints the LAN URL the terminals should use.
+
+---
+
+## Option B — manual Postgres (existing DB / full control)
+
+Use this if the machine already runs PostgreSQL or you want to manage it yourself.
+Requires PostgreSQL 14+ installed and running locally.
 
 ---
 
