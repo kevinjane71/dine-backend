@@ -43,10 +43,11 @@ const pushEvent = async (restaurantId, category, eventType, data) => {
       ts: Date.now()
     });
     // Bound the wait: offline, an RTDB write can neither resolve nor reject quickly.
-    // We already delivered over LAN above, so give the cloud push at most 2s.
+    // We already delivered over LAN above, so cap the cloud push (default 2s, tunable).
+    const rtdbTimeout = parseInt(process.env.RTDB_PUSH_TIMEOUT_MS, 10) || 2000;
     await Promise.race([
       push,
-      new Promise((resolve) => setTimeout(resolve, 2000)),
+      new Promise((resolve) => setTimeout(resolve, rtdbTimeout)),
     ]);
     console.log(`📡 RTDB: Event '${eventType}' pushed to events/${restaurantId}/${category}`);
   } catch (error) {
