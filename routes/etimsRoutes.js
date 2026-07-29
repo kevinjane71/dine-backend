@@ -105,8 +105,27 @@ module.exports = function initEtimsRoutes(db, collections, authenticateToken, va
   router.post('/api/etims/:restaurantId/init-result', authenticateToken, async (req, res) => {
     try {
       const r = await requireKenya(req, res); if (!r) return;
-      const data = (req.body && (req.body.data || req.body.result || req.body)) || {};
-      if (!data.sdcId) return res.status(400).json({ error: 'VSCU response missing sdcId — initialisation failed.' });
+      const body = req.body || {};
+      // KRA's selectInitInfo nests the device fields under data.info on a first-time
+      // success; some VSCU builds return them flat under data. Unwrap either shape.
+      const outer = body.data || body.result || body;
+      const data = (outer && typeof outer === 'object' && outer.info && typeof outer.info === 'object') ? outer.info : (outer || {});
+      if (!data.sdcId) {
+        // Surface the VSCU's own result code/message so the operator knows WHY.
+        // The most common case: the device was already initialised on this PC — KRA
+        // only returns the sdcId + keys on the FIRST init (resultCd 902 afterwards).
+        const rc = body.resultCd || (outer && outer.resultCd) || null;
+        const rm = body.resultMsg || (outer && outer.resultMsg) || null;
+        console.error('[etims] init-result missing sdcId. resultCd=%s resultMsg=%s bodyKeys=%j', rc, rm, Object.keys(body));
+        let hint = 'VSCU response missing sdcId — initialisation failed.';
+        if (rc && String(rc) !== '000') {
+          hint = `VSCU rejected initialisation (code ${rc})${rm ? ': ' + rm : ''}.`;
+        }
+        if ((rc && String(rc) === '902') || /already/i.test(String(rm || ''))) {
+          hint = `This device is already initialised on this PC (VSCU code ${rc || '902'}${rm ? ': ' + rm : ''}). KRA only returns the SDC ID + keys on the FIRST initialisation. Either re-register/reset the device on the eTIMS portal, or contact support to enter the existing SDC ID/MRC No manually.`;
+        }
+        return res.status(400).json({ error: hint, resultCd: rc, resultMsg: rm });
+      }
       const existing = r.data.etimsConfig || {};
       const device = {
         dvcId: data.dvcId || null,
@@ -122,6 +141,34 @@ module.exports = function initEtimsRoutes(db, collections, authenticateToken, va
       await r.ref.update({ etimsConfig: { ...existing, enabled: true, device } });
       res.json({ success: true, device: { sdcId: device.sdcId, mrcNo: device.mrcNo, lastInvcNo: device.lastInvcNo } });
     } catch (e) { console.error('etims init-result:', e); res.status(500).json({ error: 'Failed to store init result' }); }
+  });
+
+  // Manual device registration — for a VSCU that was ALREADY initialised on the PC
+  // (KRA only returns the SDC ID + keys on the first init, so re-init returns none).
+  // The VSCU signs sales locally with its own keys, so the backend only needs the
+  // SDC ID + MRC No + the last invoice number to activate + print correct receipts.
+  router.post('/api/etims/:restaurantId/set-device-manual', authenticateToken, async (req, res) => {
+    try {
+      const r = await requireKenya(req, res); if (!r) return;
+      const b = req.body || {};
+      const sdcId = (b.sdcId != null ? String(b.sdcId) : '').trim();
+      const mrcNo = (b.mrcNo != null ? String(b.mrcNo) : '').trim();
+      if (!sdcId) return res.status(400).json({ error: 'SDC ID is required.' });
+      const existing = r.data.etimsConfig || {};
+      const prevDevice = existing.device || {};
+      const device = {
+        ...prevDevice,
+        dvcId: (b.dvcId != null ? String(b.dvcId) : prevDevice.dvcId) || null,
+        sdcId,
+        mrcNo: mrcNo || prevDevice.mrcNo || null,
+        lastInvcNo: b.lastInvcNo != null ? (Number(b.lastInvcNo) || 0) : (Number(prevDevice.lastInvcNo) || 0),
+        manual: true,
+        initialisedAt: prevDevice.initialisedAt || new Date(),
+        updatedAt: new Date(),
+      };
+      await r.ref.update({ etimsConfig: { ...existing, enabled: true, device } });
+      res.json({ success: true, device: { sdcId: device.sdcId, mrcNo: device.mrcNo, lastInvcNo: device.lastInvcNo } });
+    } catch (e) { console.error('etims set-device-manual:', e); res.status(500).json({ error: 'Failed to save device details' }); }
   });
 
   // --- Item registration (saveItems) ----------------------------------------
