@@ -72,8 +72,40 @@ function initializeFirebase() {
   }
 }
 
+// ── Offline (Postgres-only) boot guard ──────────────────────────────────────
+// A local/offline server runs everything against Postgres (DATABASE_URL). If Firebase
+// Admin can't initialize (creds absent, expired, or intentionally omitted on a local
+// box), we must NOT crash — Postgres is the real store. We swap in a stub Firestore
+// that only errors if an UNMAPPED collection is actually touched (all hot-path
+// collections are mapped to PG, so the stub is never hit in normal offline use).
+function makeOfflineFirestoreStub() {
+  const unavailable = () => {
+    throw new Error('Firestore unavailable in offline mode — this collection is not mapped to Postgres.');
+  };
+  return {
+    __offlineStub: true,
+    collection: unavailable,
+    collectionGroup: unavailable,
+    doc: unavailable,
+    batch: unavailable,
+    runTransaction: unavailable,
+    settings: () => {},
+  };
+}
+
 // Initialize on module load
-db = initializeFirebase();
+try {
+  db = initializeFirebase();
+} catch (fbErr) {
+  if (process.env.DATABASE_URL) {
+    console.warn('⚠️  Firebase Admin unavailable — booting in OFFLINE (Postgres-only) mode:', fbErr.message);
+    firestoreDb = makeOfflineFirestoreStub();
+    db = firestoreDb;
+    isInitialized = true;
+  } else {
+    throw fbErr;
+  }
+}
 
 // ── PostgreSQL adapter ──────────────────────────────────────────────────────
 // When DATABASE_URL is set, wrap the Firestore db with pgAdapter so all

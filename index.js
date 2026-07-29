@@ -40046,6 +40046,18 @@ const server = app.listen(PORT, '0.0.0.0', async () => {
     }
   });
 
+// ── LAN real-time (socket.io) ────────────────────────────────────────────────
+// Attach a local socket.io server to the SAME http.Server so terminals on the local
+// network receive live order/table/KOT/billing events even with no internet. This is
+// the offline sibling of Firebase RTDB; firebaseRealtimeService.pushEvent() emits to
+// both. No-op / harmless on serverless (Vercel) where the LAN isn't used.
+try {
+  const lanRealtime = require('./services/lanRealtime');
+  lanRealtime.initLanRealtime(server);
+} catch (e) {
+  console.warn('LAN real-time attach skipped:', e.message);
+}
+
 // Handle server errors
 // Temporary endpoint to fix table status
 app.post('/api/debug/fix-table', authenticateToken, async (req, res) => {

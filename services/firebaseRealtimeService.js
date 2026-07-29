@@ -1,5 +1,6 @@
 const { getRealtimeDb } = require('../firebase');
 const fcmService = require('./fcmService');
+const lanRealtime = require('./lanRealtime');
 
 /**
  * Firebase Realtime Database service — replaces Pusher for real-time events.
@@ -23,14 +24,30 @@ const fcmService = require('./fcmService');
  * @param {object} data      — event payload
  */
 const pushEvent = async (restaurantId, category, eventType, data) => {
+  // ── LAN fan-out FIRST (instant, offline-capable) ──────────────────────────
+  // Emit to the local socket.io bus before touching the cloud RTDB, so terminals
+  // on the local network get the event immediately even with no internet (and even
+  // if the RTDB push below is slow or fails). No-op when the LAN server isn't running
+  // (e.g. Vercel/Cloud Run), so cloud behaviour is unchanged.
+  try {
+    lanRealtime.emit(restaurantId, category, eventType, data);
+  } catch (_) { /* never let realtime break the caller */ }
+
+  // ── Cloud RTDB push (online path) — capped so it can't stall a request offline ──
   try {
     const rtdb = getRealtimeDb();
     const eventsRef = rtdb.ref(`events/${restaurantId}/${category}`);
-    await eventsRef.push({
+    const push = eventsRef.push({
       type: eventType,
       ...data,
       ts: Date.now()
     });
+    // Bound the wait: offline, an RTDB write can neither resolve nor reject quickly.
+    // We already delivered over LAN above, so give the cloud push at most 2s.
+    await Promise.race([
+      push,
+      new Promise((resolve) => setTimeout(resolve, 2000)),
+    ]);
     console.log(`📡 RTDB: Event '${eventType}' pushed to events/${restaurantId}/${category}`);
   } catch (error) {
     console.error('📡 RTDB Error:', error.message);
