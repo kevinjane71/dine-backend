@@ -39996,6 +39996,25 @@ app.get('/api/public/desktop-update', async (req, res) => {
   }
 });
 
+// ── Local-server cloud-sync control (offline deployments) ────────────────────
+// Status + on-demand "Sync Now" for the local→cloud / cloud→local sync worker.
+app.get('/api/local-server/sync-status', authenticateToken, async (req, res) => {
+  try {
+    const status = await require('./services/cloudSyncWorker').getSyncStatus();
+    res.json(status);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+app.post('/api/local-server/sync-now', authenticateToken, async (req, res) => {
+  try {
+    const result = await require('./services/cloudSyncWorker').triggerSync();
+    res.json(result);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // 404 handler - must be last (after all routes)
 app.use((req, res) => {
   res.status(404).json({
