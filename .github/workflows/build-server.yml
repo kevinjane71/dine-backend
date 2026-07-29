@@ -80,7 +80,7 @@ jobs:
           retention-days: 30
           if-no-files-found: error
 
-  # ── macOS (universal: Apple Silicon + Intel, unsigned) ──────────────────────
+  # ── macOS (Apple Silicon + Intel, two DMGs, unsigned) ───────────────────────
   build-macos:
     runs-on: macos-latest
     permissions:
@@ -119,20 +119,24 @@ jobs:
         run: npm ci
 
       # The runner is Apple Silicon, so `npm ci` only fetched the arm64 Postgres binary.
-      # A universal .app must also run on Intel, so pull the x64 binary too (force past
-      # the platform check; --no-save keeps the lockfile clean).
-      - name: Add Intel Postgres binary for universal build
+      # The x64 DMG needs the Intel binary bundled, so pull it too (force past the
+      # platform check; --no-save keeps the lockfile clean).
+      - name: Add Intel Postgres binary for the x64 DMG
         run: npm install @embedded-postgres/darwin-x64@18.4.0-beta.17 --no-save --force
 
       - name: Install desktop-server deps (electron + electron-builder)
         run: npm ci
         working-directory: desktop-server
 
-      - name: Build macOS DMG (universal, unsigned)
+      # Build TWO separate DMGs (arm64 + x64) rather than one --universal binary:
+      # @electron/universal's lipo merge can't reconcile the identical embedded-postgres
+      # Mach-O binaries (initdb etc.) that live in extraResources. Two DMGs sidestep the
+      # merge entirely and still cover both Apple Silicon and Intel Macs.
+      - name: Build macOS DMGs (arm64 + Intel, unsigned)
         env:
           # Explicitly disable code signing / notarization — unsigned build.
           CSC_IDENTITY_AUTO_DISCOVERY: 'false'
-        run: npx electron-builder --mac dmg --universal --publish never
+        run: npx electron-builder --mac dmg --arm64 --x64 --publish never
         working-directory: desktop-server
 
       - name: Upload macOS DMG
