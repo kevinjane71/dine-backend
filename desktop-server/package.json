@@ -57,7 +57,7 @@
     "mac": {
       "target": "dmg",
       "category": "public.app-category.business",
-      "artifactName": "DineOpen-Server-${version}.${ext}"
+      "artifactName": "DineOpen-Server-${version}-${arch}.${ext}"
     }
   }
 }

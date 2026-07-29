@@ -179,7 +179,7 @@ jobs:
             **Downloads**
             - **Windows:** `DineOpen-Server-Setup-*.exe` — SmartScreen → *More info* → *Run anyway* (unsigned).
             - **macOS (Apple Silicon):** `DineOpen-Server-*-arm64.dmg`
-            - **macOS (Intel):** `DineOpen-Server-*.dmg`
+            - **macOS (Intel):** `DineOpen-Server-*-x64.dmg`
             - macOS: right-click → *Open* the first time (unsigned).
           files: |
             artifacts/**/*.exe
