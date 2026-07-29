@@ -13835,6 +13835,32 @@ app.patch('/api/orders/:orderId/status', authenticateToken, async (req, res) => 
       processWalletRedemptionForOrder(orderId).catch(() => {});
     }
 
+    // Fire-and-forget: if this completed order belonged to a PARTY sub-table (B/C/…), the
+    // party's check is now settled — remove that party so it disappears from the table
+    // (Toast/Square behaviour). Base "Party A" and other siblings stay. Only party tables
+    // are removed here — split children and normal tables are never touched.
+    if (status === 'completed' && orderData.tableId) {
+      (async () => {
+        try {
+          const found = await findTableAcrossFloors(orderData.restaurantId, orderData.tableId);
+          if (!found || !found.data || !found.data.isPartyTable) return;
+          const pt = found.data;
+          const tablesRef = db.collection('restaurants').doc(orderData.restaurantId)
+            .collection('floors').doc(found.floorId).collection('tables');
+          await found.ref.delete();
+          // Clear the base table's party anchor once no sibling parties remain.
+          const rem = await tablesRef.where('partyGroupId', '==', pt.partyGroupId).where('isPartyTable', '==', true).limit(1).get();
+          if (rem.empty && pt.partyOfTableId) {
+            const base = await findTableAcrossFloors(orderData.restaurantId, pt.partyOfTableId);
+            if (base) await base.ref.update({ hasParties: false, updatedAt: new Date() }).catch(() => {});
+          }
+          pusherService.triggerTableStatusUpdated(orderData.restaurantId, {
+            tableId: orderData.tableId, status: 'available', orderId: null, tableNumber: pt.name, removed: true,
+          }).catch(() => {});
+        } catch (e) { console.error('Party auto-remove on settle (non-blocking):', e.message); }
+      })();
+    }
+
     // Fire-and-forget: send bill on WhatsApp if enabled
     if (status === 'completed') {
       (async () => {
