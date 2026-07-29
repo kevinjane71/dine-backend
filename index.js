@@ -18444,35 +18444,56 @@ app.post('/api/tables/:restaurantId/reset-all', authenticateToken, async (req, r
 
     let resetCount = 0;
     const batch = db.batch();
+    const now = new Date();
 
     for (const floorDoc of floorsSnapshot.docs) {
+      // Sweep ALL tables (not just occupied) so we can also tear down parties/splits and
+      // return every table to its original single form — like Toast/Square "reset floor".
       const tablesSnapshot = await db.collection('restaurants')
         .doc(restaurantId)
         .collection('floors')
         .doc(floorDoc.id)
         .collection('tables')
-        .where('status', '==', 'occupied')
         .get();
 
       for (const tableDoc of tablesSnapshot.docs) {
-        batch.update(tableDoc.ref, {
-          status: 'available',
-          currentOrderId: null,
-          updatedAt: new Date(),
-        });
-        resetCount++;
+        const d = tableDoc.data() || {};
+
+        // Party sub-tables (B/C/…) and split children are temporary — delete them so the
+        // base table stands alone again.
+        if (d.isPartyTable || d.isSubTable) {
+          batch.delete(tableDoc.ref);
+          resetCount++;
+          continue;
+        }
+
+        // Real/base tables: free any running order AND strip party/split anchors so the
+        // table reads as its original self (Party A host + split parent both cleared).
+        const upd = { updatedAt: now };
+        let changed = false;
+        if (d.status === 'occupied' || d.status === 'serving' || d.currentOrderId) {
+          upd.status = 'available'; upd.currentOrderId = null; changed = true;
+        }
+        if (d.hasParties || d.partyGroupId || d.partyLabel) {
+          upd.hasParties = false; upd.partyGroupId = FieldValue.delete(); upd.partyLabel = FieldValue.delete(); changed = true;
+        }
+        if (d.isSplit || d.splitGroupId) {
+          upd.isSplit = FieldValue.delete(); upd.splitGroupId = FieldValue.delete();
+          upd.status = 'available'; upd.currentOrderId = null; changed = true;
+        }
+        if (changed) { batch.update(tableDoc.ref, upd); resetCount++; }
       }
     }
 
     if (resetCount > 0) {
       await batch.commit();
-      // Send real-time event for table sync (Firebase RTDB)
+      // Send real-time event for table sync (Firebase RTDB + LAN)
       pusherService.pushEvent(restaurantId, 'tables', 'tables-reset', {
         resetCount,
       }).catch(err => console.error('RTDB tables-reset error:', err));
     }
 
-    res.json({ message: `${resetCount} table(s) reset to available`, resetCount });
+    res.json({ message: `${resetCount} table(s) reset to original`, resetCount });
   } catch (error) {
     console.error('Reset all tables error:', error);
     res.status(500).json({ error: 'Failed to reset tables' });
