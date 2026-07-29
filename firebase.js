@@ -99,6 +99,17 @@ try {
 } catch (fbErr) {
   if (process.env.DATABASE_URL) {
     console.warn('⚠️  Firebase Admin unavailable — booting in OFFLINE (Postgres-only) mode:', fbErr.message);
+    // Initialize a PLACEHOLDER Firebase app (no real creds) so services that eagerly
+    // call admin.firestore()/database()/messaging() at module-load don't crash the
+    // whole server. Their actual network calls will fail and be caught; the primary
+    // data path is Postgres via the pgAdapter below. Real (mapped) data never touches this.
+    try {
+      const admin = require('firebase-admin');
+      if (!admin.apps || !admin.apps.length) {
+        admin.initializeApp({ projectId: process.env.FIREBASE_PROJECT_ID || 'dineopen-offline' });
+        console.warn('   (placeholder Firebase app initialised so eager admin.* callers don\'t crash)');
+      }
+    } catch (_) { /* if even this fails, the stub below still handles the db path */ }
     firestoreDb = makeOfflineFirestoreStub();
     db = firestoreDb;
     isInitialized = true;

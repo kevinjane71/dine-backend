@@ -93,8 +93,37 @@ async function startPostgres() {
 
 function startBackend(databaseUrl) {
   const entry = path.join(backendDir(), 'index.js');
-  // Merge the operator's .env.local if present (JWT_SECRET, SYNC_MODE, cloud creds…).
-  const env = { ...process.env, DATABASE_URL: databaseUrl, PORT: '3003', NODE_ENV: 'production', ELECTRON_RUN_AS_NODE: '1' };
+
+  // Load the operator's optional config from userData/.env.local (JWT_SECRET, SYNC_MODE,
+  // CLOUD_DATABASE_URL, real API keys…). Anything set there overrides the placeholders below.
+  try {
+    const dotenv = require(path.join(backendDir(), 'node_modules', 'dotenv'));
+    const cfg = path.join(app.getPath('userData'), '.env.local');
+    if (fs.existsSync(cfg)) { dotenv.config({ path: cfg }); pushLog('⚙️  Loaded .env.local'); }
+  } catch (_) {}
+
+  const P = (k, v) => (process.env[k] && process.env[k].length ? process.env[k] : v);
+  const env = {
+    ...process.env,
+    DATABASE_URL: databaseUrl,
+    PORT: '3003',
+    NODE_ENV: 'production',
+    ELECTRON_RUN_AS_NODE: '1',
+    // Consistent local JWT secret so staff can log in offline (override in .env.local
+    // with your production secret to make cloud tokens interchangeable).
+    JWT_SECRET: P('JWT_SECRET', 'dineopen-offline-local-secret'),
+    // Offline placeholders so eager-init external SDKs (OpenAI, email, Razorpay, Pinecone,
+    // Twilio) don't crash the server at startup. These features simply no-op offline;
+    // real values from .env.local win.
+    OPENAI_API_KEY: P('OPENAI_API_KEY', 'sk-offline-placeholder'),
+    GODADY_EMAIL: P('GODADY_EMAIL', 'offline@example.com'),
+    GODADY_PA: P('GODADY_PA', 'offline'),
+    RAZORPAY_KEY_ID: P('RAZORPAY_KEY_ID', 'rzp_offline'),
+    RAZORPAY_KEY_SECRET: P('RAZORPAY_KEY_SECRET', 'offline'),
+    PINECONE_API_KEY: P('PINECONE_API_KEY', 'offline'),
+    TWILIO_ACCOUNT_SID: P('TWILIO_ACCOUNT_SID', 'AC00000000000000000000000000000000'),
+    TWILIO_AUTH_TOKEN: P('TWILIO_AUTH_TOKEN', 'offline'),
+  };
   backendProc = fork(entry, [], { cwd: backendDir(), env, stdio: ['ignore', 'pipe', 'pipe', 'ipc'] });
   backendProc.stdout.on('data', (d) => pushLog(d));
   backendProc.stderr.on('data', (d) => pushLog(d));
