@@ -16915,7 +16915,10 @@ app.post('/api/menus/bulk-upload/:restaurantId', authenticateToken, chatgptUsage
     console.log('Menus extracted:', extractedMenus.length);
     console.log('Extraction errors:', errors.length);
 
-    // Merge unique categories from all extractions (by id) for bulk-save
+    // Merge unique categories from all extractions (by id) for bulk-save.
+    // Preserve `parentName` so sub-categories (e.g. "Domestic Beers" under
+    // "Beverages") nest under their parent instead of becoming flat top-level
+    // categories. bulk-save resolves parentName -> parentId and creates the tree.
     const seenIds = new Set();
     const extractedCategories = [];
     for (const m of extractedMenus) {
@@ -16923,7 +16926,8 @@ app.post('/api/menus/bulk-upload/:restaurantId', authenticateToken, chatgptUsage
         const id = categoryNameToId(c.name);
         if (id && !seenIds.has(id)) {
           seenIds.add(id);
-          extractedCategories.push({ name: (c.name || '').trim() || 'Other', order: extractedCategories.length + 1 });
+          const parentName = (c.parentName || c.parent) ? String(c.parentName || c.parent).trim() : null;
+          extractedCategories.push({ name: (c.name || '').trim() || 'Other', parentName: parentName || null, order: extractedCategories.length + 1 });
         }
       }
     }
