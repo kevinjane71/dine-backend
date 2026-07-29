@@ -15,6 +15,25 @@
  */
 
 const { getDb } = require('../firebase');
+const { Pool } = require('pg');
+const ft = require('../repos/floorsTablesFieldMapper');
+
+// jsonb-safe value: stringify plain objects/arrays (Dates + scalars pass through).
+function pgVal(v) {
+  if (v && typeof v === 'object' && !(v instanceof Date)) return JSON.stringify(v);
+  return v;
+}
+// Raw upsert with an explicit conflict target — needed for tables with composite PKs
+// (e.g. floors PK = (id, restaurant_id)) that the pgAdapter's set() can't target.
+async function rawUpsert(pool, table, row, conflictCols) {
+  const cols = Object.keys(row);
+  const vals = cols.map((c) => pgVal(row[c]));
+  const ph = cols.map((_, i) => `$${i + 1}`).join(',');
+  const upd = cols.filter((c) => !conflictCols.includes(c)).map((c) => `"${c}"=EXCLUDED."${c}"`).join(',');
+  const sql = `INSERT INTO "${table}" (${cols.map((c) => `"${c}"`).join(',')}) VALUES (${ph})
+               ON CONFLICT (${conflictCols.map((c) => `"${c}"`).join(',')}) DO UPDATE SET ${upd}`;
+  await pool.query(sql, vals);
+}
 
 const DEFAULT_CLOUD_API = process.env.CLOUD_API_URL || 'https://dine-backend-lake.vercel.app';
 
@@ -93,22 +112,51 @@ async function provisionFromCloud(opts = {}) {
     }
   } catch (e) { summary.restaurant = 'err: ' + e.message; }
 
-  // 3) Floors + their tables (tables come nested under floors).
+  // 3) Floors + their tables — via raw upsert with correct conflict keys (floors PK is
+  //    composite (id, restaurant_id); tables FK-reference their floor, so floors must be
+  //    written first). Full docs preserved in extra_data so nothing is lost.
+  const pool = new Pool({ connectionString: process.env.DATABASE_URL, max: 3 });
   try {
     const fd = await cloudFetch(base, `/api/floors/${restaurantId}`, token);
     const floors = (fd && fd.floors) || fd || [];
-    let tcount = 0;
+    let fcount = 0, tcount = 0;
     for (const f of (Array.isArray(floors) ? floors : [])) {
       const { tables, ...floorDoc } = f;
-      await db.collection('restaurants').doc(restaurantId).collection('floors').doc(String(f.id)).set(normalize(floorDoc), { merge: true });
+      try {
+        const nf = normalize({ ...floorDoc, restaurantId, id: f.id });
+        const frow = ft.floorToPgRow(nf); frow.extra_data = nf;
+        await rawUpsert(pool, 'floors', frow, ['id', 'restaurant_id']);
+        fcount++;
+      } catch (fe) { summary.floorsWarning = fe.message; }
       for (const t of (tables || [])) {
-        await db.collection('restaurants').doc(restaurantId).collection('floors').doc(String(f.id)).collection('tables').doc(String(t.id)).set(normalize(t), { merge: true });
-        tcount++;
+        try {
+          const nt = normalize({ ...t, restaurantId, floorId: f.id, id: t.id });
+          const trow = ft.tableToPgRow(nt); trow.extra_data = nt;
+          await rawUpsert(pool, 'tables', trow, ['id']);
+          tcount++;
+        } catch (te) { summary.tablesWarning = te.message; }
       }
     }
-    summary.floors = Array.isArray(floors) ? floors.length : 0;
+    // Some restaurants keep tables flat instead of nested — pull those too.
+    try {
+      const td = await cloudFetch(base, `/api/tables/${restaurantId}`, token);
+      const flat = (td && td.tables) || [];
+      for (const t of (Array.isArray(flat) ? flat : [])) {
+        try {
+          const nt = normalize({ ...t, restaurantId, id: t.id });
+          const trow = ft.tableToPgRow(nt); trow.extra_data = nt;
+          await rawUpsert(pool, 'tables', trow, ['id']);
+          tcount++;
+        } catch (_) {}
+      }
+    } catch (_) {}
+    summary.floors = fcount;
     summary.tables = tcount;
-  } catch (e) { summary.floors = 'err: ' + e.message; }
+  } catch (e) {
+    summary.floors = 'err: ' + e.message;
+  } finally {
+    await pool.end().catch(() => {});
+  }
 
   // 4) Offers (optional).
   try {
