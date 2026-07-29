@@ -148,3 +148,40 @@ jobs:
             desktop-server/dist/*.dmg.blockmap
           retention-days: 30
           if-no-files-found: error
+
+  # ── Publish a GitHub Release with the installers attached ───────────────────
+  # Runs only on a server-v* tag push (not manual dispatch). Gives a permanent,
+  # public, one-click download page — no login, no zip, never expires — unlike the
+  # per-run Artifacts above.
+  release:
+    needs: [build-windows, build-macos]
+    if: startsWith(github.ref, 'refs/tags/server-v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Publish Release (exe + dmgs attached)
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: DineOpen Server ${{ github.ref_name }}
+          body: |
+            Self-contained on-prem **DineOpen Server** (backend + embedded PostgreSQL).
+            Install on the ONE machine that acts as the restaurant's local server; every
+            terminal on the LAN connects to it for full offline operation.
+
+            **Downloads**
+            - **Windows:** `DineOpen-Server-Setup-*.exe` — SmartScreen → *More info* → *Run anyway* (unsigned).
+            - **macOS (Apple Silicon):** `DineOpen-Server-*-arm64.dmg`
+            - **macOS (Intel):** `DineOpen-Server-*.dmg`
+            - macOS: right-click → *Open* the first time (unsigned).
+          files: |
+            artifacts/**/*.exe
+            artifacts/**/*.dmg
+          fail_on_unmatched_files: true
