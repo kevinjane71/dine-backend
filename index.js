@@ -16355,7 +16355,10 @@ app.post('/api/menus/bulk-save/:restaurantId', authenticateToken, async (req, re
       existingCategories = [];
       console.log('🔄 Clearing default seeded menu before bulk save');
     } else {
-      existingItems = [...(existingMenu.items || [])];
+      // Drop soft-deleted items (status: 'deleted') so a re-import after "Delete All"
+      // starts from a clean document instead of piling new items on top of the old
+      // (soft-deleted) ones — which bloats the doc past Firestore's per-document limit.
+      existingItems = (existingMenu.items || []).filter(it => it && it.status !== 'deleted');
       existingCategories = [...(restaurantData.categories || [])];
     }
 
