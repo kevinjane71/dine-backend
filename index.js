@@ -18682,7 +18682,7 @@ app.get('/api/floors/:restaurantId', async (req, res) => {
         areaChargeValue: floorData.areaChargeValue || 0,
         order: floorData.order !== undefined ? floorData.order : Infinity,
         restaurantId,
-        tables: floorTables,
+        tables,
       });
     }
 
@@ -40017,14 +40017,14 @@ app.get('/api/provision/status', async (req, res) => {
 });
 app.post('/api/provision', async (req, res) => {
   try {
-    const { restaurantId } = req.body || {};
+    const { restaurantId, cloudApiUrl, token, phone, otp } = req.body || {};
     if (!restaurantId) return res.status(400).json({ error: 'restaurantId is required' });
-    if (!process.env.CLOUD_DATABASE_URL) {
-      return res.status(400).json({ error: 'This server is not configured for provisioning (CLOUD_DATABASE_URL not set).' });
+    if (!token && !(phone && otp)) {
+      return res.status(400).json({ error: 'Provide a cloud token, or phone + otp, to authorize provisioning.' });
     }
-    const { provisionRestaurant } = require('./services/provisioning');
-    const result = await provisionRestaurant(restaurantId);
-    res.json({ success: true, ...result });
+    const { provisionFromCloud } = require('./services/provisioning');
+    const summary = await provisionFromCloud({ cloudApiUrl, restaurantId, token, phone, otp });
+    res.json({ success: true, ...summary });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
