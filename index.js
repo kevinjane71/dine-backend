@@ -40119,6 +40119,17 @@ if (process.env.LOCAL_SERVER_MODE === 'true') {
   } catch (e) {
     console.warn('LAN real-time attach skipped:', e.message);
   }
+
+  // Announce the server on the LAN via mDNS/Bonjour so terminals can use the fixed
+  // URL http://dineopen-server.local:3003 (or auto-discover it) with zero IP typing.
+  try {
+    const lanDiscovery = require('./services/lanDiscovery');
+    lanDiscovery.startDiscovery(PORT, { version: process.env.APP_VERSION || '' });
+    process.on('SIGINT', () => { try { lanDiscovery.stopDiscovery(); } catch (_) {} });
+    process.on('SIGTERM', () => { try { lanDiscovery.stopDiscovery(); } catch (_) {} });
+  } catch (e) {
+    console.warn('LAN discovery attach skipped:', e.message);
+  }
 }
 
 // ── Cloud sync worker ────────────────────────────────────────────────────────
