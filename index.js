@@ -40058,6 +40058,16 @@ try {
   console.warn('LAN real-time attach skipped:', e.message);
 }
 
+// ── Cloud sync worker ────────────────────────────────────────────────────────
+// On the on-prem local server only: push data created offline up to the cloud when
+// the internet returns (generic, idempotent local→cloud row replication). No-op
+// unless CLOUD_SYNC_ENABLED=true with a CLOUD_DATABASE_URL distinct from the local one.
+try {
+  require('./services/cloudSyncWorker').startCloudSync();
+} catch (e) {
+  console.warn('Cloud sync worker skipped:', e.message);
+}
+
 // Handle server errors
 // Temporary endpoint to fix table status
 app.post('/api/debug/fix-table', authenticateToken, async (req, res) => {
