@@ -34491,9 +34491,12 @@ app.get('/api/restaurants/:restaurantId/pricing-settings', authenticateToken, as
     if (!restaurantData) {
       return res.status(404).json({ error: 'Restaurant not found' });
     }
-    if (restaurantData.ownerId !== userId) {
-      return res.status(403).json({ error: 'Access denied' });
-    }
+    // No owner-only guard on READ — ALL staff (cashier, manager, waiter, kitchen)
+    // must load pricing zones so multi-tier / takeaway pricing resolves for them.
+    // Mirrors the print-settings / print-stations GET (opened for the same reason).
+    // The PUT (save) endpoint below stays owner-only.
+    // Bug fix: non-owner staff got 403 here → the app left multiPricing disabled →
+    // takeaway/zone price was never applied and base price was charged.
 
     const existing = restaurantData.pricingSettings || {};
     const pricingSettings = {
