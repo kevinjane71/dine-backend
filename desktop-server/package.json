@@ -1,0 +1,60 @@
+{
+  "name": "dineopen-server",
+  "productName": "DineOpen Server",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Self-contained on-prem server for DineOpen — bundles the backend + PostgreSQL so a restaurant installs one app and every terminal connects over the LAN.",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "dist": "electron-builder",
+    "dist:win": "electron-builder --win nsis",
+    "dist:mac": "electron-builder --mac dmg",
+    "dist:dir": "electron-builder --dir"
+  },
+  "devDependencies": {
+    "electron": "^33.0.0",
+    "electron-builder": "^25.1.8"
+  },
+  "build": {
+    "appId": "com.dineopen.server",
+    "productName": "DineOpen Server",
+    "files": [
+      "main.js",
+      "preload.js",
+      "index.html",
+      "renderer.js"
+    ],
+    "extraResources": [
+      {
+        "from": "../",
+        "to": "backend",
+        "filter": [
+          "**/*",
+          "!.git/**",
+          "!desktop-server/**",
+          "!**/*.map",
+          "!**/*.test.js",
+          "!**/__tests__/**",
+          "!.env",
+          "!.env.local"
+        ]
+      }
+    ],
+    "win": {
+      "target": "nsis",
+      "artifactName": "DineOpen-Server-Setup-${version}.${ext}"
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": true,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true
+    },
+    "mac": {
+      "target": "dmg",
+      "category": "public.app-category.business",
+      "artifactName": "DineOpen-Server-${version}.${ext}"
+    }
+  }
+}
