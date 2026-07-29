@@ -8551,31 +8551,17 @@ app.delete('/api/menus/:restaurantId/bulk-delete', authenticateToken, async (req
       });
     }
 
-    // Soft delete all items by setting status to 'deleted'
+    // Hard delete: actually REMOVE all items + categories from the document so it
+    // truly empties. Soft-delete (marking status:'deleted' but keeping the items)
+    // kept bloating the doc past Firestore's per-document limit — and no menu
+    // "restore" feature depends on soft-deleted items. This is "Delete All".
     const deletedTimestamp = new Date();
-    const updatedItems = (currentMenu.items || []).map(item => ({
-      ...item,
-      status: 'deleted',
-      deletedAt: deletedTimestamp,
-      updatedAt: deletedTimestamp
-    }));
 
-    // Update categories as well
-    const updatedCategories = (currentMenu.categories || []).map(category => ({
-      ...category,
-      items: (category.items || []).map(item => ({
-        ...item,
-        status: 'deleted',
-        deletedAt: deletedTimestamp,
-        updatedAt: deletedTimestamp
-      }))
-    }));
-
-    // Update the restaurant document — also clear categories so stale ones don't persist
+    // Update the restaurant document — clear items AND categories entirely
     await db.collection(collections.restaurants).doc(restaurantId).update({
       menu: {
-        categories: updatedCategories,
-        items: updatedItems,
+        categories: [],
+        items: [],
         lastUpdated: deletedTimestamp
       },
       categories: []
