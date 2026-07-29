@@ -37,11 +37,13 @@ const pushEvent = async (restaurantId, category, eventType, data) => {
   try {
     const rtdb = getRealtimeDb();
     const eventsRef = rtdb.ref(`events/${restaurantId}/${category}`);
+    // Attach a catch so that if the cap below wins the race, a later rejection of this
+    // orphaned push can't surface as an unhandledRejection.
     const push = eventsRef.push({
       type: eventType,
       ...data,
       ts: Date.now()
-    });
+    }).catch((e) => { console.warn('📡 RTDB late push error:', e && e.message); });
     // Bound the wait: offline, an RTDB write can neither resolve nor reject quickly.
     // We already delivered over LAN above, so cap the cloud push (default 2s, tunable).
     const rtdbTimeout = parseInt(process.env.RTDB_PUSH_TIMEOUT_MS, 10) || 2000;

@@ -76,8 +76,20 @@ async function loginPhone(base, phone, otp) {
  * Provision one restaurant from the cloud into the local Postgres.
  * @param {{cloudApiUrl?:string, restaurantId:string, token?:string, phone?:string, otp?:string, ownerUser?:object}} opts
  */
+// Only allow pulling from DineOpen's own cloud (or a local host during testing) — a
+// caller-supplied cloudApiUrl must not point at an arbitrary/attacker host (SSRF guard).
+function assertAllowedCloud(url) {
+  let host;
+  try { host = new URL(url).hostname.toLowerCase(); } catch (_) { throw new Error('Invalid cloudApiUrl'); }
+  const ok = host === 'localhost' || host === '127.0.0.1' ||
+    host.endsWith('.vercel.app') || host.endsWith('.run.app') ||
+    host === 'dineopen.com' || host.endsWith('.dineopen.com');
+  if (!ok) throw new Error(`cloudApiUrl host not allowed: ${host}`);
+}
+
 async function provisionFromCloud(opts = {}) {
   const base = opts.cloudApiUrl || DEFAULT_CLOUD_API;
+  assertAllowedCloud(base);
   const restaurantId = opts.restaurantId;
   if (!restaurantId) throw new Error('restaurantId is required');
 

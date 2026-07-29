@@ -39996,15 +39996,25 @@ app.get('/api/public/desktop-update', async (req, res) => {
   }
 });
 
-// ── Local-server ONE-TIME provisioning (offline deployments) ─────────────────
+// ── Local-server ONE-TIME provisioning (offline deployments ONLY) ────────────
 // First-run "activation": pull a restaurant's config (staff/menu/tables/settings) from
-// the cloud into the LOCAL Postgres, then the server runs offline. Unauthenticated by
-// design (the local DB is empty before this runs); gated by CLOUD_DATABASE_URL being
-// configured on the server (only the operator sets it). Idempotent — safe to re-run.
+// the cloud into the LOCAL Postgres, then the server runs offline. This writes to the
+// local DB and pulls from an operator-supplied cloud URL, so it is HARD-GATED to the
+// on-prem local server via LOCAL_SERVER_MODE=true (set only by the DineOpen Server app).
+// On any cloud deployment (Vercel/Cloud Run) the flag is unset → these endpoints 403,
+// so they can never touch production data. The owner still authenticates (phone+otp /
+// token) against an allow-listed DineOpen cloud, and the target restaurant is verified.
+function provisioningDisabled(res) {
+  if (process.env.LOCAL_SERVER_MODE !== 'true') {
+    res.status(403).json({ error: 'Provisioning is only available on the on-prem local server.' });
+    return true;
+  }
+  return false;
+}
 app.get('/api/provision/status', async (req, res) => {
+  if (provisioningDisabled(res)) return;
   try {
-    const configured = !!(process.env.CLOUD_DATABASE_URL && process.env.DATABASE_URL);
-    // "provisioned" = the local DB already has at least one restaurant.
+    const configured = !!process.env.DATABASE_URL;
     let provisioned = false;
     try {
       const snap = await db.collection('restaurants').limit(1).get();
@@ -40016,6 +40026,7 @@ app.get('/api/provision/status', async (req, res) => {
   }
 });
 app.post('/api/provision', async (req, res) => {
+  if (provisioningDisabled(res)) return;
   try {
     const { restaurantId, cloudApiUrl, token, phone, otp } = req.body || {};
     if (!restaurantId) return res.status(400).json({ error: 'restaurantId is required' });
@@ -40099,16 +40110,19 @@ const server = app.listen(PORT, '0.0.0.0', async () => {
     }
   });
 
-// ── LAN real-time (socket.io) ────────────────────────────────────────────────
+// ── LAN real-time (socket.io) — LOCAL SERVER ONLY ────────────────────────────
 // Attach a local socket.io server to the SAME http.Server so terminals on the local
-// network receive live order/table/KOT/billing events even with no internet. This is
-// the offline sibling of Firebase RTDB; firebaseRealtimeService.pushEvent() emits to
-// both. No-op / harmless on serverless (Vercel) where the LAN isn't used.
-try {
-  const lanRealtime = require('./services/lanRealtime');
-  lanRealtime.initLanRealtime(server);
-} catch (e) {
-  console.warn('LAN real-time attach skipped:', e.message);
+// network receive live order/table/KOT/billing events with no internet. Only attached
+// on the on-prem local server (LOCAL_SERVER_MODE=true); NOT on public cloud deployments
+// (cloud clients use Firebase RTDB), so no unauthenticated websocket surface is exposed
+// in production. firebaseRealtimeService.pushEvent() emits to it only when it's running.
+if (process.env.LOCAL_SERVER_MODE === 'true') {
+  try {
+    const lanRealtime = require('./services/lanRealtime');
+    lanRealtime.initLanRealtime(server);
+  } catch (e) {
+    console.warn('LAN real-time attach skipped:', e.message);
+  }
 }
 
 // ── Cloud sync worker ────────────────────────────────────────────────────────

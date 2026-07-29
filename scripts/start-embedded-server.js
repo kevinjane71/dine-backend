@@ -99,6 +99,7 @@ async function main() {
   // Hand off to the real backend against the embedded PG.
   process.env.DATABASE_URL = connString;
   if (!process.env.PORT) process.env.PORT = '3003';
+  process.env.LOCAL_SERVER_MODE = 'true'; // enables LAN socket + provisioning (off on cloud)
   console.log('🚀 Starting dine-backend against embedded Postgres ...');
   require(path.join(__dirname, '..', 'index.js'));
 
