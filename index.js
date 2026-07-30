@@ -20248,6 +20248,11 @@ app.post('/api/staff/:restaurantId', authenticateToken, requireOwnerRole, async 
     const temporaryPassword = Math.random().toString(36).slice(-8);
     const hashedPassword = await bcrypt.hash(temporaryPassword, 10);
 
+    // Generate a default 4-digit terminal-lock PIN so the staff can unlock the POS
+    // right away. Owner/manager can change or disable it later. Stored hashed only.
+    const temporaryPin = Math.floor(1000 + Math.random() * 9000).toString();
+    const hashedPin = await bcrypt.hash(temporaryPin, 10);
+
     const staffData = {
       name,
       phone,
@@ -20265,6 +20270,9 @@ app.post('/api/staff/:restaurantId', authenticateToken, requireOwnerRole, async 
       updatedAt: new Date(),
       lastLogin: null,
       temporaryPassword: true, // Flag to indicate password needs to be changed
+      // Terminal-lock PIN (hashed). pinEnabled lets owner/manager disable it per staff.
+      pinHash: hashedPin,
+      pinEnabled: true,
       loginId: userId, // Use the generated 5-digit numeric ID
       ...(username != null && { username, usernameLower }),
       // Use pageAccess from request if provided, otherwise use role-based defaults
@@ -20295,6 +20303,7 @@ app.post('/api/staff/:restaurantId', authenticateToken, requireOwnerRole, async 
       staffId: staffRef.id,
       loginId: userId,
       temporaryPassword: temporaryPassword,
+      terminalPin: temporaryPin, // shown once to the owner so they can share it
       createdAt: new Date(),
       expiresAt: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000) // 7 days
     });
@@ -20324,13 +20333,80 @@ app.post('/api/staff/:restaurantId', authenticateToken, requireOwnerRole, async 
       credentials: {
         loginId: userId,
         username: username || null,
-        password: temporaryPassword
+        password: temporaryPassword,
+        terminalPin: temporaryPin
       }
     });
 
   } catch (error) {
     console.error('Add staff error:', error);
     res.status(500).json({ error: 'Failed to add staff member' });
+  }
+});
+
+// ── Terminal-lock PIN ────────────────────────────────────────────────────────
+// Verify an operator PIN against this restaurant's staff (+ owner). Returns which
+// operator the PIN belongs to, so the terminal can attribute the next orders.
+// The terminal is already token-authenticated for the restaurant; the PIN only
+// identifies WHO is operating it. PINs are stored hashed (bcrypt), never returned.
+app.post('/api/staff/:restaurantId/verify-pin', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+    const pin = req.body && req.body.pin != null ? String(req.body.pin) : '';
+    if (!/^\d{4,8}$/.test(pin)) return res.status(400).json({ error: 'Enter a 4–8 digit PIN' });
+    const hasAccess = await validateRestaurantAccess(req.user.userId, restaurantId);
+    if (!hasAccess) return res.status(403).json({ error: 'Access denied' });
+
+    // Candidates = staff of this restaurant + the owner.
+    const staffSnap = await db.collection(collections.staffUsers).where('restaurantId', '==', restaurantId).get();
+    const candidates = staffSnap.docs.map(d => ({ id: d.id, ...d.data() }));
+    try {
+      const restDoc = await getCachedRestDoc(restaurantId);
+      const ownerId = restDoc.exists ? restDoc.data().ownerId : null;
+      if (ownerId) {
+        const od = await db.collection(collections.users).doc(ownerId).get();
+        if (od.exists) candidates.push({ id: od.id, ...od.data() });
+      }
+    } catch (_) { /* owner lookup non-fatal */ }
+
+    for (const c of candidates) {
+      if (c.pinEnabled === false || !c.pinHash) continue;
+      // eslint-disable-next-line no-await-in-loop
+      if (await bcrypt.compare(pin, c.pinHash)) {
+        return res.json({ valid: true, operator: { id: c.id, name: c.name || '', role: c.role || 'staff' } });
+      }
+    }
+    return res.status(401).json({ valid: false, error: 'Wrong PIN' });
+  } catch (error) {
+    console.error('verify-pin error:', error);
+    res.status(500).json({ error: 'Failed to verify PIN' });
+  }
+});
+
+// Set / change / disable a staff member's terminal PIN (owner/manager only).
+// Body: { pin?: '4-8 digits' }  and/or  { enabled?: boolean }.
+app.patch('/api/staff/:staffId/pin', authenticateToken, requireOwnerRole, async (req, res) => {
+  try {
+    const { staffId } = req.params;
+    const { pin, enabled } = req.body || {};
+    const found = await findStaffDoc(staffId);
+    if (!found || !found.doc || !found.doc.exists) return res.status(404).json({ error: 'Staff not found' });
+    const update = { updatedAt: new Date() };
+    if (pin != null && String(pin) !== '') {
+      if (!/^\d{4,8}$/.test(String(pin))) return res.status(400).json({ error: 'PIN must be 4–8 digits' });
+      update.pinHash = await bcrypt.hash(String(pin), 10);
+      update.pinEnabled = true;
+    }
+    if (enabled === false) update.pinEnabled = false;
+    if (enabled === true && update.pinEnabled === undefined) update.pinEnabled = true;
+    if (update.pinHash === undefined && update.pinEnabled === undefined) {
+      return res.status(400).json({ error: 'Nothing to update — send a pin or enabled flag' });
+    }
+    await found.doc.ref.update(update);
+    res.json({ success: true, pinEnabled: update.pinEnabled });
+  } catch (error) {
+    console.error('set-pin error:', error);
+    res.status(500).json({ error: 'Failed to update PIN' });
   }
 });
 
