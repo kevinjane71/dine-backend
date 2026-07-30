@@ -30,6 +30,9 @@ const STAFF_FIELD_MAP = {
   temporaryPassword:'temporary_password',
   lastLogin:        'last_login',
   pageAccess:       'page_access',
+  // Terminal PIN lock (shared POS) — hashed PIN + per-staff enable flag
+  pinHash:          'pin_hash',
+  pinEnabled:       'pin_enabled',
   createdAt:        'created_at',
   updatedAt:        'updated_at',
 };

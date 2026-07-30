@@ -40,6 +40,9 @@ const FIELD_MAP = {
   // Staff
   staffInfo: 'staff_info',
   assignedStaff: 'assigned_staff',
+  // Terminal-lock attribution — which staff (by PIN) placed this at a shared terminal
+  operatorId: 'operator_id',
+  operatorName: 'operator_name',
 
   // Items
   items: 'items',

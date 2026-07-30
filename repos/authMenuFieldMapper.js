@@ -164,6 +164,7 @@ const STAFF_CREDENTIAL_FIELD_MAP = {
   staffId: 'staff_id',
   loginId: 'login_id',
   temporaryPassword: 'temporary_password',
+  terminalPin: 'terminal_pin', // one-time plaintext terminal PIN shown to the owner
   extra_data: 'extra_data',
   createdAt: 'created_at',
   expiresAt: 'expires_at',
