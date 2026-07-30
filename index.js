@@ -701,9 +701,20 @@ function resolveTaxesForItem(item, taxSettings, categories) {
   return globalTaxes;
 }
 
+// Order-type tax gating (mirrors dine-frontend OrderSummary + dine-app). A tax
+// with NO `orderTypes` (absent/empty) applies to ALL order types — today's
+// behavior. When set, it applies only to the listed types. Normalizes dine_in.
+function taxAppliesToOrderType(tax, orderType) {
+  const list = tax && tax.orderTypes;
+  if (!Array.isArray(list) || list.length === 0) return true;
+  const canon = (x) => String(x || '').toLowerCase().replace(/[_\s]+/g, '-');
+  const cur = canon(orderType);
+  return list.some((x) => canon(x) === cur);
+}
+
 // Calculate per-item tax and aggregate by (name, rate)
 // Supports discountApplicable: when false, item gets 0 discount share (full tax on price)
-function calculatePerItemTax(orderItems, taxSettings, categories, totalDiscount, serviceChargeAmount) {
+function calculatePerItemTax(orderItems, taxSettings, categories, totalDiscount, serviceChargeAmount, orderType) {
   const subtotal = orderItems.reduce((sum, item) => sum + (item.total || item.price * item.quantity), 0);
 
   // Discountable subtotal: only items where discountApplicable !== false
@@ -734,7 +745,8 @@ function calculatePerItemTax(orderItems, taxSettings, categories, totalDiscount,
       : (subtotal > 0 ? (itemTotal / subtotal) * (serviceChargeAmount || 0) : 0);
     const itemTaxableWithSC = itemTaxable + itemSCShare;
 
-    const itemTaxes = resolveTaxesForItem(item, taxSettings, categories);
+    const itemTaxes = resolveTaxesForItem(item, taxSettings, categories)
+      .filter(tax => taxAppliesToOrderType(tax, orderType));
     // Total combined rate for this item (needed for inclusive back-calculation)
     const totalRate = itemTaxes.reduce((sum, t) => sum + (t.rate || 0), 0);
     let itemTaxAmount = 0;
@@ -9105,7 +9117,7 @@ app.post('/api/public/orders/:restaurantId', vercelSecurityMiddleware.publicAPI,
     }
 
     const { taxBreakdown, totalTaxAmount: taxAmount, inclusiveTaxAmount, exclusiveTaxAmount } = calculatePerItemTax(
-      orderItems, taxSettings, categories, totalDiscount, 0 // no service charge for public orders
+      orderItems, taxSettings, categories, totalDiscount, 0, orderType // 0 = no service charge for public orders
     );
 
     // Tip + service charge (what the customer was charged via Razorpay). Clamp
@@ -10296,7 +10308,7 @@ app.post('/api/orders', authenticateOrderCreate, async (req, res) => {
 
     const totalDiscount = discountAmount + manualDiscountAmount + loyaltyDiscount;
     const { taxBreakdown, totalTaxAmount: taxAmount, inclusiveTaxAmount, exclusiveTaxAmount } = calculatePerItemTax(
-      orderItems, taxSettings, posCategories, totalDiscount, scAmt
+      orderItems, taxSettings, posCategories, totalDiscount, scAmt, orderType
     );
 
     // Only add exclusive tax to final amount (inclusive tax is already embedded in item prices)
@@ -14921,7 +14933,7 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
           const isGlobalInclusive = taxSettings.taxInclusivePricing === true;
 
           if (taxSettings.taxes && Array.isArray(taxSettings.taxes) && taxSettings.taxes.length > 0) {
-            const enabledTaxes = taxSettings.taxes.filter(tax => tax.enabled);
+            const enabledTaxes = taxSettings.taxes.filter(tax => tax.enabled && taxAppliesToOrderType(tax, orderType));
             const totalRate = enabledTaxes.reduce((sum, t) => sum + (t.rate || 0), 0);
             enabledTaxes.forEach(tax => {
                 // Inclusive: back-calculate tax from price. Exclusive: add on top.
@@ -21730,7 +21742,7 @@ app.put('/api/admin/business/:restaurantId', authenticateToken, async (req, res)
 app.post('/api/tax/calculate/:restaurantId', authenticateToken, async (req, res) => {
   try {
     const { restaurantId } = req.params;
-    const { items, subtotal } = req.body;
+    const { items, subtotal, orderType } = req.body;
 
     console.log(`Calculating tax for restaurant: ${restaurantId}, subtotal: ${subtotal}`);
 
@@ -21758,7 +21770,7 @@ app.post('/api/tax/calculate/:restaurantId', authenticateToken, async (req, res)
     if (items && items.length > 0 && taxSettings.taxGroups?.length > 0) {
       const categories = restaurant.categories || [];
       const { taxBreakdown, totalTaxAmount, exclusiveTaxAmount } = calculatePerItemTax(
-        items, taxSettings, categories, 0, 0
+        items, taxSettings, categories, 0, 0, orderType
       );
       return res.json({
         success: true,
@@ -21773,7 +21785,7 @@ app.post('/api/tax/calculate/:restaurantId', authenticateToken, async (req, res)
     let totalTax = 0;
 
     for (const tax of taxSettings.taxes) {
-      if (tax.enabled) {
+      if (tax.enabled && taxAppliesToOrderType(tax, orderType)) {
         const taxAmount = (subtotal * tax.rate) / 100;
         taxBreakdown.push({
           id: tax.id,
@@ -36176,7 +36188,7 @@ app.patch('/api/orders/:orderId/edit-completed-items', authenticateToken, async 
 
     if (taxSettings.enabled && taxableAmount > 0) {
       if (taxSettings.taxes && Array.isArray(taxSettings.taxes) && taxSettings.taxes.length > 0) {
-        const enabledTaxes = taxSettings.taxes.filter(t => t.enabled);
+        const enabledTaxes = taxSettings.taxes.filter(t => t.enabled && taxAppliesToOrderType(t, currentOrder.orderType));
         const totalRate = enabledTaxes.reduce((sum, t) => sum + (t.rate || 0), 0);
         enabledTaxes.forEach(tax => {
           const amt = isGlobalInclusive
