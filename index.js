@@ -40280,6 +40280,19 @@ const server = app.listen(PORT, '0.0.0.0', async () => {
     console.log(`🍽️ Ready to serve your restaurant management app!`);
     console.log(`🔗 Database: dine`);
     console.log(`📁 Collections: ${Object.keys(collections).join(', ')}`);
+
+    // ── Schema migrations ──
+    // Bring the Postgres schema up to date on boot (versioned, forward-only,
+    // advisory-locked). Runs on Cloud Run, the one-click embedded server, and the
+    // desktop-server (which forks this backend) — so an app update self-heals its
+    // schema. No-op when there's no DATABASE_URL, or when AUTO_MIGRATE=false.
+    if (process.env.DATABASE_URL && process.env.AUTO_MIGRATE !== 'false') {
+      try {
+        await require('./repos/migrationRunner').runMigrations();
+      } catch (e) {
+        console.error('❌ Schema migration failed on boot:', e.message);
+      }
+    }
     
     // Clear localhost blocks for development
     try {
