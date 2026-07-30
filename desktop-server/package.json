@@ -35,7 +35,8 @@
       "main.js",
       "preload.js",
       "index.html",
-      "renderer.js"
+      "renderer.js",
+      "build/tray.png"
     ],
     "extraResources": [
       {
@@ -61,7 +62,8 @@
       "oneClick": false,
       "perMachine": true,
       "allowToChangeInstallationDirectory": true,
-      "createDesktopShortcut": true
+      "createDesktopShortcut": true,
+      "include": "build/installer.nsh"
     },
     "mac": {
       "target": "dmg",

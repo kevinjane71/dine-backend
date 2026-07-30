@@ -11,10 +11,12 @@
  *   cd desktop-server && npm install && npm run dist:win   # → DineOpen Server Setup.exe
  *                                        npm run dist:mac   # → DineOpen Server.dmg
  */
-const { app, BrowserWindow, shell, ipcMain, dialog } = require('electron');
+const { app, BrowserWindow, shell, ipcMain, dialog, Tray, Menu, nativeImage } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
+const http = require('http');
+const { execFile } = require('child_process');
 const { fork } = require('child_process');
 
 const PG_PORT = 5433;
@@ -73,10 +75,18 @@ let autoUpdater = null;
 try { ({ autoUpdater } = require('electron-updater')); } catch (_) { autoUpdater = null; }
 
 let win = null;
+let tray = null;
 let pgInstance = null;
 let backendProc = null;
 let isInstalling = false;
-let manualUpdateCheck = false; // true only while an admin-initiated check is in flight
+let isRestarting = false;        // intentional backend restart in progress (don't double-respawn)
+let quitting = false;            // real quit requested (don't auto-respawn)
+let manualUpdateCheck = false;   // true only while an admin-initiated check is in flight
+let lastDbUrl = null;            // remembered so we can respawn the backend on crash
+let backendRestarts = 0;         // consecutive crash count → exponential backoff
+let backendUpTimer = null;       // resets the crash count after a stable run
+let watchdogTimer = null;
+let watchdogFails = 0;
 const logs = [];
 
 function backendDir() {
@@ -222,11 +232,61 @@ function startBackend(databaseUrl) {
     TWILIO_ACCOUNT_SID: P('TWILIO_ACCOUNT_SID', 'AC00000000000000000000000000000000'),
     TWILIO_AUTH_TOKEN: P('TWILIO_AUTH_TOKEN', 'offline'),
   };
+  lastDbUrl = databaseUrl;
   backendProc = fork(entry, [], { cwd: backendDir(), env, stdio: ['ignore', 'pipe', 'pipe', 'ipc'] });
   backendProc.stdout.on('data', (d) => pushLog(d));
   backendProc.stderr.on('data', (d) => pushLog(d));
-  backendProc.on('exit', (code) => pushLog(`❌ Backend exited (${code}). Restart the app.`));
+
+  // Reset the crash counter once the process has run stably for a while.
+  if (backendUpTimer) clearTimeout(backendUpTimer);
+  backendUpTimer = setTimeout(() => { backendRestarts = 0; }, 60000);
+
+  backendProc.on('exit', (code) => {
+    backendProc = null;
+    if (quitting || isInstalling || isRestarting) return; // intentional stop — don't respawn
+    // Self-heal: respawn with exponential backoff so a crash doesn't take the store down.
+    const delay = Math.min(30000, 2000 * Math.pow(2, backendRestarts));
+    backendRestarts++;
+    pushLog(`❌ Backend exited (${code}). ↻ Auto-restarting in ${Math.round(delay / 1000)}s (attempt ${backendRestarts})…`);
+    setTimeout(() => { if (!quitting && lastDbUrl) startBackend(lastDbUrl); }, delay);
+  });
   pushLog('🚀 Backend started on port 3003.');
+  updateTray();
+}
+
+// ── Watchdog ─────────────────────────────────────────────────────────────────
+// Poll the backend's health endpoint. A few misses → bounce the backend process
+// (respawns via the exit handler). Persistent failure → full app relaunch, which
+// also recovers a wedged Postgres. Runs only while the server should be up.
+function pingHealth() {
+  return new Promise((resolve) => {
+    const req = http.get({ host: '127.0.0.1', port: 3003, path: '/api/health', timeout: 4000 }, (res) => {
+      res.resume(); resolve(res.statusCode >= 200 && res.statusCode < 500);
+    });
+    req.on('error', () => resolve(false));
+    req.on('timeout', () => { req.destroy(); resolve(false); });
+  });
+}
+function startWatchdog() {
+  if (watchdogTimer) clearInterval(watchdogTimer);
+  watchdogFails = 0;
+  watchdogTimer = setInterval(async () => {
+    if (quitting || isInstalling || isRestarting || backupBusy) return;
+    if (!backendProc) return; // exit handler is already respawning
+    const ok = await pingHealth();
+    if (ok) { watchdogFails = 0; return; }
+    watchdogFails++;
+    pushLog(`🩺 Health check failed (${watchdogFails}).`);
+    if (watchdogFails === 3) {
+      pushLog('🩺 Backend unresponsive — restarting it…');
+      try { isRestarting = true; backendProc.kill(); } catch (_) {}
+      setTimeout(() => { isRestarting = false; if (!backendProc && lastDbUrl && !quitting) startBackend(lastDbUrl); }, 2000);
+    } else if (watchdogFails >= 8) {
+      pushLog('🩺 Still unresponsive — relaunching the app to recover…');
+      watchdogFails = 0;
+      await relaunchApp();
+    }
+  }, 20000);
 }
 
 // ── Backup / Restore ─────────────────────────────────────────────────────────
@@ -309,6 +369,79 @@ function scheduleAutoBackup() {
   }, hours * 3600 * 1000);
 }
 
+// ── System tray (so the server isn't lost / accidentally quit) ───────────────
+function showWindow() {
+  if (win && !win.isDestroyed()) { if (win.isMinimized()) win.restore(); win.show(); win.focus(); }
+  else createWindow();
+}
+function trayIcon() {
+  try {
+    const img = nativeImage.createFromPath(path.join(__dirname, 'build', 'tray.png'));
+    if (!img.isEmpty()) return process.platform === 'darwin' ? img.resize({ width: 18, height: 18 }) : img;
+  } catch (_) {}
+  return nativeImage.createEmpty();
+}
+function updateTray() {
+  if (!tray) return;
+  const running = !!backendProc;
+  tray.setToolTip(`DineOpen Server — ${running ? 'running' : 'starting…'}`);
+  tray.setContextMenu(Menu.buildFromTemplate([
+    { label: `DineOpen Server — ${running ? 'running' : 'starting…'}`, enabled: false },
+    { type: 'separator' },
+    { label: 'Open window', click: showWindow },
+    { label: 'Back up now…', click: async () => { try { await triggerBackupDialog(); } catch (_) {} } },
+    { type: 'separator' },
+    { label: 'Quit server', click: quitServer },
+  ]));
+}
+function setupTray() {
+  if (tray) return;
+  try {
+    tray = new Tray(trayIcon());
+    tray.on('click', showWindow);
+    tray.on('double-click', showWindow);
+    updateTray();
+  } catch (e) { pushLog(`Tray unavailable: ${e.message}`); }
+}
+
+// ── Auto-launch on machine boot (survives power cuts) ────────────────────────
+function setAutoLaunch(enabled) {
+  try {
+    app.setLoginItemSettings({ openAtLogin: !!enabled, openAsHidden: false });
+    writeConfig({ autoLaunch: !!enabled });
+  } catch (e) { pushLog(`Auto-launch setting failed: ${e.message}`); }
+}
+function applyAutoLaunchDefault() {
+  const cfg = readConfig();
+  const enabled = cfg.autoLaunch === undefined ? true : !!cfg.autoLaunch; // default ON
+  setAutoLaunch(enabled);
+}
+
+// ── Windows Firewall: allow inbound 3003 so terminals can connect ────────────
+// Best-effort at runtime (the NSIS installer also adds it, elevated — see
+// build/installer.nsh). Silently no-ops if not permitted or not Windows.
+function ensureFirewallRule() {
+  if (process.platform !== 'win32') return;
+  if (readConfig().firewallDone) return;
+  const args = ['advfirewall', 'firewall', 'add', 'rule', 'name=DineOpen Server',
+    'dir=in', 'action=allow', 'protocol=TCP', 'localport=3003'];
+  execFile('netsh', args, (err) => {
+    if (err) { pushLog('ℹ️ Could not add a firewall rule automatically — if terminals cannot connect, allow port 3003 in Windows Firewall.'); }
+    else { pushLog('🛡️  Firewall rule added for port 3003.'); writeConfig({ firewallDone: true }); }
+  });
+}
+
+function quitServer() {
+  const choice = dialog.showMessageBoxSync(win || null, {
+    type: 'warning', buttons: ['Cancel', 'Quit server'], defaultId: 0, cancelId: 0,
+    message: 'Quit the DineOpen Server?',
+    detail: 'All terminals will lose their connection until you open it again.',
+  });
+  if (choice !== 1) return;
+  quitting = true;
+  app.quit();
+}
+
 function createWindow() {
   win = new BrowserWindow({
     width: 640, height: 560, resizable: true,
@@ -334,17 +467,20 @@ ipcMain.handle('choose-folder', async (_e, title) => {
   const r = await dialog.showOpenDialog(win, { title: title || 'Choose folder', properties: ['openDirectory', 'createDirectory'] });
   return (r.canceled || !r.filePaths.length) ? null : r.filePaths[0];
 });
+async function triggerBackupDialog() {
+  const r = await dialog.showOpenDialog(win, {
+    title: 'Choose a backup location (an external drive / USB is safest)',
+    properties: ['openDirectory', 'createDirectory'],
+  });
+  if (r.canceled || !r.filePaths.length) return { ok: false, canceled: true };
+  const dest = await runBackup(r.filePaths[0]);
+  return { ok: true, path: dest, at: Date.now() };
+}
 ipcMain.handle('backup-now', async () => {
-  try {
-    const r = await dialog.showOpenDialog(win, {
-      title: 'Choose a backup location (an external drive / USB is safest)',
-      properties: ['openDirectory', 'createDirectory'],
-    });
-    if (r.canceled || !r.filePaths.length) return { ok: false, canceled: true };
-    const dest = await runBackup(r.filePaths[0]);
-    return { ok: true, path: dest, at: Date.now() };
-  } catch (e) { pushLog(`⚠️ Backup: ${e.message}`); return { ok: false, reason: e.message }; }
+  try { return await triggerBackupDialog(); }
+  catch (e) { pushLog(`⚠️ Backup: ${e.message}`); return { ok: false, reason: e.message }; }
 });
+ipcMain.handle('set-auto-launch', (_e, enabled) => { setAutoLaunch(enabled); return readConfig(); });
 ipcMain.handle('restore-backup', async () => {
   try {
     const r = await dialog.showOpenDialog(win, {
@@ -418,34 +554,58 @@ ipcMain.handle('install-update', async () => {
   return { ok: true };
 });
 
-app.whenReady().then(async () => {
-  createWindow();
-  try {
-    pgDataDir();                      // resolve/relocate data dir to the safe folder
-    // Clean up a previous restore's set-aside data once the app is back up.
+// Single-instance lock: a second copy would fight over port 3003 and the same data
+// dir (corruption risk). Refuse to start twice; focus the existing window instead.
+if (!app.requestSingleInstanceLock()) {
+  app.exit(0);
+} else {
+  app.on('second-instance', showWindow);
+
+  app.whenReady().then(async () => {
+    setupTray();
+    createWindow();
     try {
-      const pend = readConfig().pendingRestoreCleanup;
-      if (pend && fs.existsSync(pend)) { fs.rmSync(pend, { recursive: true, force: true }); }
-      if (pend) writeConfig({ pendingRestoreCleanup: null });
-    } catch (_) {}
-    backupIfUpgraded();               // snapshot DB if the app was just updated
-    const dbUrl = await startPostgres();
-    startBackend(dbUrl);              // forked backend runs schema migrations on boot
-    initUpdater();
-    scheduleAutoBackup();             // start the scheduled external backup, if enabled
-    // Silent check on launch so the admin sees a badge without hunting for it.
-    if (autoUpdater) setTimeout(() => { autoUpdater.checkForUpdates().catch(() => {}); }, 8000);
-  } catch (e) {
-    pushLog(`❌ Startup failed: ${e.message}`);
-  }
-});
+      applyAutoLaunchDefault();         // start on machine boot (default on)
+      ensureFirewallRule();             // Windows: allow inbound 3003
+      pgDataDir();                      // resolve/relocate data dir to the safe folder
+      // Clean up a previous restore's set-aside data once the app is back up.
+      try {
+        const pend = readConfig().pendingRestoreCleanup;
+        if (pend && fs.existsSync(pend)) { fs.rmSync(pend, { recursive: true, force: true }); }
+        if (pend) writeConfig({ pendingRestoreCleanup: null });
+      } catch (_) {}
+      backupIfUpgraded();               // snapshot DB if the app was just updated
+      const dbUrl = await startPostgres();
+      startBackend(dbUrl);              // forked backend runs schema migrations on boot
+      setTimeout(startWatchdog, 30000); // health-poll → self-heal (grace for first boot)
+      initUpdater();
+      scheduleAutoBackup();             // start the scheduled external backup, if enabled
+      // Silent check on launch so the admin sees a badge without hunting for it.
+      if (autoUpdater) setTimeout(() => { autoUpdater.checkForUpdates().catch(() => {}); }, 8000);
+    } catch (e) {
+      pushLog(`❌ Startup failed: ${e.message}`);
+    }
+  });
+}
 
 async function shutdown() {
+  quitting = true;
+  try { if (watchdogTimer) clearInterval(watchdogTimer); } catch (_) {}
+  try { if (backupTimer) clearInterval(backupTimer); } catch (_) {}
   try { if (backendProc) backendProc.kill(); } catch (_) {}
   try { if (pgInstance) await pgInstance.stop(); } catch (_) {}
 }
+
+// Clean stop (release port 3003 + 5433) then relaunch a fresh process.
+async function relaunchApp() {
+  isInstalling = true;                // bypass the before-quit shutdown; we do it here
+  try { await shutdown(); } catch (_) {}
+  app.relaunch();
+  setTimeout(() => app.exit(0), 400);
+}
 app.on('before-quit', (e) => {
   if (isInstalling) return;           // let the updater relaunch the installer
+  quitting = true;
   e.preventDefault();
   shutdown().finally(() => app.exit(0));
 });

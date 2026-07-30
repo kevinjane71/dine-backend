@@ -39,7 +39,10 @@ function applyInfo(info) {
   if (!info) return;
   if (info.version) document.getElementById('ver').textContent = 'v' + info.version;
   if (info.dataDir) document.getElementById('datadir').textContent = info.dataDir;
-  applyBackupConfig(info.config || {});
+  const cfg = info.config || {};
+  const al = document.getElementById('autolaunch');
+  if (al) al.checked = cfg.autoLaunch === undefined ? true : !!cfg.autoLaunch;
+  applyBackupConfig(cfg);
 }
 
 window.server.onInfo(applyInfo);
@@ -144,3 +147,6 @@ bfolder.onclick = async () => {
 };
 bauto.onchange = saveAutoBackup;
 bhours.onchange = saveAutoBackup;
+
+const autolaunch = document.getElementById('autolaunch');
+if (autolaunch) autolaunch.onchange = () => window.server.setAutoLaunch(autolaunch.checked);

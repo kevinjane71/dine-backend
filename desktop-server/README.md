@@ -45,6 +45,23 @@ into the app's resources, so the shipped installer needs nothing on the target m
    as a pure offline island.
 3. Launch it — it shows `http://<ip>:3003`. Enter that on each terminal.
 
+## Runs unattended (self-healing)
+
+Built to sit in a restaurant with nobody watching it:
+
+- **Auto-restart on crash** — if the backend stops unexpectedly it respawns automatically
+  (exponential backoff). A health watchdog polls `/api/health`; a wedged backend is
+  bounced, and a persistently stuck server triggers a clean app relaunch (which also
+  recovers Postgres).
+- **Starts on boot** — after a power cut the server comes back by itself (toggle:
+  "Start automatically when this computer turns on").
+- **Single instance** — a second copy can't start (would fight over port 3003 / the data
+  dir); it just focuses the existing window.
+- **System tray** — closing the window keeps the server running; use the tray icon to
+  reopen it or to **Quit server** (with confirmation, so it isn't shut down by accident).
+- **Windows Firewall** — the installer opens inbound TCP **3003** so terminals can
+  connect (also attempted at runtime as a fallback). On Mac, allow it if macOS prompts.
+
 ## Software updates (in-app)
 
 The status window has a **Software update** card:

@@ -17,4 +17,5 @@ contextBridge.exposeInMainWorld('server', {
   restoreBackup: () => ipcRenderer.invoke('restore-backup'),
   getBackupConfig: () => ipcRenderer.invoke('get-backup-config'),
   setBackupConfig: (cfg) => ipcRenderer.invoke('set-backup-config', cfg),
+  setAutoLaunch: (on) => ipcRenderer.invoke('set-auto-launch', on),
 });
