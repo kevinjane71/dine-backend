@@ -146,6 +146,12 @@ const vercelSecurityMiddleware = {
 
   // Main security middleware
   middleware(type = 'public') {
+    // On the on-prem LAN server there is no public internet exposure, so the cloud
+    // DDoS / IP-block / rate-limit protection adds only latency + a DB read+write on
+    // every request (measurably slow offline). Skip it entirely for the local server.
+    if (process.env.LOCAL_SERVER_MODE === 'true') {
+      return (req, res, next) => next();
+    }
     return async (req, res, next) => {
       try {
         // Run cleanup if needed

@@ -17,6 +17,10 @@ let redisDisabled = false;
 
 function getRedis() {
   if (redisDisabled) return null;
+  // On the on-prem LAN server, never reach for cloud Redis (Upstash): the local
+  // Postgres is authoritative and fast, and any attempt to hit Upstash when the
+  // restaurant is offline would stall every cacheable read. Fully self-contained.
+  if (process.env.LOCAL_SERVER_MODE === 'true') { redisDisabled = true; return null; }
   if (redis) return redis;
 
   try {
