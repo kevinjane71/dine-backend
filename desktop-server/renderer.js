@@ -2,27 +2,30 @@
 const logEl = document.getElementById('log');
 const addrsEl = document.getElementById('addrs');
 
+function addrRow(url, note) {
+  const row = document.createElement('div');
+  row.className = 'addr';
+  const span = document.createElement('span');
+  span.textContent = url;
+  if (note) { const n = document.createElement('span'); n.className = 'sub'; n.style.marginLeft = '8px'; n.textContent = note; span.appendChild(n); }
+  const btn = document.createElement('button');
+  btn.textContent = 'Copy';
+  btn.onclick = () => { navigator.clipboard.writeText(url); btn.textContent = 'Copied'; setTimeout(() => (btn.textContent = 'Copy'), 1200); };
+  row.appendChild(span); row.appendChild(btn);
+  addrsEl.appendChild(row);
+}
+
 function renderAddrs(info) {
   const ips = (info && info.ips) || [];
   const port = (info && info.port) || 3003;
   addrsEl.innerHTML = '';
-  if (!ips.length) {
+  // Stable name first — keeps working even if the IP changes.
+  if (info && info.stableHost) addrRow(`http://${info.stableHost}:${port}`, 'stable name — best');
+  if (!ips.length && !(info && info.stableHost)) {
     addrsEl.innerHTML = '<div class="sub">No LAN address found — connect this machine to the restaurant Wi-Fi/ethernet.</div>';
     return;
   }
-  ips.forEach((ip) => {
-    const url = `http://${ip}:${port}`;
-    const row = document.createElement('div');
-    row.className = 'addr';
-    const span = document.createElement('span');
-    span.textContent = url;
-    const btn = document.createElement('button');
-    btn.textContent = 'Copy';
-    btn.onclick = () => { navigator.clipboard.writeText(url); btn.textContent = 'Copied'; setTimeout(() => (btn.textContent = 'Copy'), 1200); };
-    row.appendChild(span);
-    row.appendChild(btn);
-    addrsEl.appendChild(row);
-  });
+  ips.forEach((ip) => addrRow(`http://${ip}:${port}`));
 }
 
 function timeAgo(ts) {
@@ -150,3 +153,11 @@ bhours.onchange = saveAutoBackup;
 
 const autolaunch = document.getElementById('autolaunch');
 if (autolaunch) autolaunch.onchange = () => window.server.setAutoLaunch(autolaunch.checked);
+
+const diag = document.getElementById('diag');
+if (diag) diag.onclick = async () => {
+  diag.textContent = 'Saving…';
+  const r = await window.server.exportDiagnostics();
+  diag.textContent = r && r.ok ? 'Saved ✓' : (r && r.canceled ? 'Copy diagnostics…' : 'Failed');
+  setTimeout(() => (diag.textContent = 'Copy diagnostics…'), 1800);
+};

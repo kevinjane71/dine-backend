@@ -77,12 +77,15 @@
     <div class="card">
       <div class="lbl">Terminals connect to</div>
       <div id="addrs"></div>
-      <div class="sub" style="margin-top:6px">Enter one of these in each terminal → Settings → Local Server.</div>
+      <div class="sub" style="margin-top:6px">Enter one of these in each terminal → Settings → Local Server. Tip: reserve a fixed IP for this machine in your Wi-Fi router so the address never changes.</div>
       <label class="chk" style="margin-top:12px"><input type="checkbox" id="autolaunch" checked /> Start automatically when this computer turns on</label>
     </div>
 
     <div class="card">
-      <div class="lbl">Activity</div>
+      <div class="row" style="margin-bottom:8px">
+        <div class="lbl grow" style="margin:0">Activity</div>
+        <button class="link" id="diag">Copy diagnostics…</button>
+      </div>
       <pre id="log"></pre>
     </div>
   </div>

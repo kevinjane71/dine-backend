@@ -61,6 +61,12 @@ Built to sit in a restaurant with nobody watching it:
   reopen it or to **Quit server** (with confirmation, so it isn't shut down by accident).
 - **Windows Firewall** — the installer opens inbound TCP **3003** so terminals can
   connect (also attempted at runtime as a fallback). On Mac, allow it if macOS prompts.
+- **Stable address** — terminals can use `http://dineopen-server.local:3003` (shown first
+  in the window), which keeps working even if the machine's IP changes. Best practice:
+  also reserve a fixed IP for this machine in the Wi-Fi router.
+- **Copy diagnostics** — the Activity card has a one-click export (versions, OS, data dir,
+  backup status, recent logs — no secrets) to send for remote support. Logs also persist to
+  `~/DineOpenServer/logs/server.log` (rotated at 2 MB).
 
 ## Software updates (in-app)
 
@@ -98,7 +104,12 @@ on first launch. The **Open** button in the window opens this folder.
 - **Auto-backup** → toggle on, set an interval and a target folder; the app backs up on
   schedule and keeps the newest 7.
 - **Restore…** → pick a backup folder; the current data is set aside first (reversible),
-  then replaced and the server restarts.
+  then replaced and the server restarts. Cross-Postgres-major-version restores are blocked
+  with a clear message (can't restore e.g. a PG 16 backup into a PG 18 app).
+- Every backup is **verified** (checked to be a complete, restorable data dir) before it's
+  counted — a copy that came out incomplete is discarded and reported, not silently kept.
+- If a scheduled backup was **missed** because the machine was off, one runs shortly after
+  the next launch (catch-up).
 - Pre-update snapshots are also kept in `~/DineOpenServer/backups` automatically.
 
 **Off-site backup:** set `SYNC_MODE=periodic` + `CLOUD_DATABASE_URL` in `.env.local` to

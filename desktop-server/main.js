@@ -94,11 +94,21 @@ function backendDir() {
   return app.isPackaged ? path.join(process.resourcesPath, 'backend') : path.join(__dirname, '..');
 }
 
+function logFilePath() { const d = path.join(dataRoot(), 'logs'); try { fs.mkdirSync(d, { recursive: true }); } catch (_) {} return path.join(d, 'server.log'); }
+function appendLogFile(line) {
+  try {
+    const f = logFilePath();
+    // Rotate at ~2 MB so the log can't grow without bound.
+    try { if (fs.statSync(f).size > 2 * 1024 * 1024) fs.renameSync(f, f + '.1'); } catch (_) {}
+    fs.appendFileSync(f, new Date().toISOString() + '  ' + line + '\n');
+  } catch (_) {}
+}
 function pushLog(line) {
   const s = String(line).replace(/\s+$/, '');
   if (!s) return;
   logs.push(s);
   if (logs.length > 500) logs.shift();
+  appendLogFile(s);
   if (win && !win.isDestroyed()) win.webContents.send('log', s);
 }
 
@@ -297,6 +307,14 @@ function startWatchdog() {
 // if the machine's data is ever lost the backup is elsewhere and can be restored.
 let backupBusy = false;
 
+// A valid Postgres data dir has these; used to verify a backup is complete/restorable.
+function isValidPgDataDir(dir) {
+  return fs.existsSync(path.join(dir, 'PG_VERSION'))
+    && fs.existsSync(path.join(dir, 'base'))
+    && fs.existsSync(path.join(dir, 'global'));
+}
+function pgMajorOf(dir) { try { return fs.readFileSync(path.join(dir, 'PG_VERSION'), 'utf8').trim(); } catch { return null; } }
+
 async function runBackup(targetDir, { prune = 0 } = {}) {
   if (backupBusy) throw new Error('A backup is already running.');
   const src = pgDataDir();
@@ -315,9 +333,15 @@ async function runBackup(targetDir, { prune = 0 } = {}) {
     } finally {
       if (wasRunning) { try { await pgInstance.start(); } catch (e) { pushLog(`⚠️ DB restart after backup: ${e.message}`); } }
     }
+    // Verify the copy is a complete, restorable data dir — a backup you can't restore
+    // is worse than none. Remove and fail loudly if the copy looks incomplete.
+    if (!isValidPgDataDir(dest)) {
+      try { fs.rmSync(dest, { recursive: true, force: true }); } catch (_) {}
+      throw new Error('Backup verification failed — the copy looks incomplete. Not saved.');
+    }
     if (prune > 0) pruneBackupsIn(targetDir, prune);
     writeConfig({ lastBackupAt: Date.now(), lastBackupPath: dest });
-    pushLog('✅ Backup complete.');
+    pushLog('✅ Backup complete and verified.');
     return dest;
   } finally {
     backupBusy = false;
@@ -325,10 +349,17 @@ async function runBackup(targetDir, { prune = 0 } = {}) {
 }
 
 async function restoreBackup(backupDir) {
-  if (!backupDir || !fs.existsSync(path.join(backupDir, 'PG_VERSION'))) {
+  if (!backupDir || !isValidPgDataDir(backupDir)) {
     throw new Error('That folder is not a valid database backup.');
   }
   const target = pgDataDir();
+  // Block cross-major-version restores (e.g. a PG 16 backup into a PG 18 app) — these
+  // fail cryptically at startup; surface a clear message instead.
+  const backupVer = pgMajorOf(backupDir);
+  const curVer = pgMajorOf(target);
+  if (backupVer && curVer && backupVer !== curVer) {
+    throw new Error(`This backup is from PostgreSQL ${backupVer}, but this app uses PostgreSQL ${curVer}. It can't be restored across major versions.`);
+  }
   pushLog('♻️  Restoring database — the app will restart…');
   // Fully stop backend + Postgres, then swap the data dir and RELAUNCH the app. A fresh
   // process boots cleanly on the restored data (the normal startup path) — far more
@@ -367,6 +398,21 @@ function scheduleAutoBackup() {
     try { await runBackup(target, { prune: keep }); }
     catch (e) { pushLog(`⚠️ Scheduled backup failed: ${e.message}`); }
   }, hours * 3600 * 1000);
+}
+
+// If auto-backup is on but the last one is overdue (the machine was off at the
+// scheduled time), run one shortly after launch so a gap doesn't go unbacked.
+function maybeCatchUpBackup() {
+  const ab = readConfig().autoBackup;
+  if (!ab || !ab.enabled) return;
+  const hours = Math.max(1, Number(ab.everyHours) || 24);
+  const target = ab.target || autoBackupDir();
+  const keep = Math.max(1, Number(ab.keep) || 7);
+  const last = readConfig().lastBackupAt || 0;
+  if (Date.now() - last >= hours * 3600 * 1000) {
+    pushLog('⏱️  A scheduled backup was missed (machine was off?) — running one shortly…');
+    setTimeout(() => { runBackup(target, { prune: keep }).catch((e) => pushLog(`⚠️ Catch-up backup: ${e.message}`)); }, 45000);
+  }
 }
 
 // ── System tray (so the server isn't lost / accidentally quit) ───────────────
@@ -450,14 +496,14 @@ function createWindow() {
   });
   win.loadFile(path.join(__dirname, 'index.html'));
   win.webContents.on('did-finish-load', () => {
-    win.webContents.send('info', { ips: lanIPs(), port: 3003, version: app.getVersion(), dataDir: pgDataDir(), config: readConfig() });
+    win.webContents.send('info', { ips: lanIPs(), port: 3003, version: app.getVersion(), dataDir: pgDataDir(), config: readConfig(), stableHost: 'dineopen-server.local' });
     logs.forEach((l) => win.webContents.send('log', l));
   });
 }
 
 ipcMain.handle('get-info', () => ({
   ips: lanIPs(), port: 3003, running: !!backendProc, version: app.getVersion(),
-  dataDir: pgDataDir(), config: readConfig(),
+  dataDir: pgDataDir(), config: readConfig(), stableHost: 'dineopen-server.local',
 }));
 ipcMain.handle('open-external', (_e, url) => shell.openExternal(url));
 ipcMain.handle('open-data-folder', () => shell.openPath(dataRoot()));
@@ -481,6 +527,32 @@ ipcMain.handle('backup-now', async () => {
   catch (e) { pushLog(`⚠️ Backup: ${e.message}`); return { ok: false, reason: e.message }; }
 });
 ipcMain.handle('set-auto-launch', (_e, enabled) => { setAutoLaunch(enabled); return readConfig(); });
+ipcMain.handle('export-diagnostics', async () => {
+  try {
+    const cfg = readConfig();  // server-config.json holds no secrets (those live in .env.local)
+    const report = [
+      'DineOpen Server — diagnostics',
+      'Generated: ' + new Date().toISOString(),
+      'App version: ' + app.getVersion(),
+      'Platform: ' + process.platform + ' ' + process.arch + ' (' + os.release() + ')',
+      'Data dir: ' + pgDataDir(),
+      'LAN IPs: ' + lanIPs().join(', '),
+      'Stable host: dineopen-server.local:3003',
+      'Backend running: ' + (!!backendProc),
+      'Backend restarts (session): ' + backendRestarts,
+      'Auto-launch: ' + (cfg.autoLaunch !== false),
+      'Auto-backup: ' + JSON.stringify(cfg.autoBackup || { enabled: false }),
+      'Last backup: ' + (cfg.lastBackupAt ? new Date(cfg.lastBackupAt).toISOString() : 'never') + (cfg.lastBackupPath ? ' → ' + cfg.lastBackupPath : ''),
+      '',
+      '── Recent activity ──',
+      ...logs.slice(-300),
+    ].join('\n');
+    const r = await dialog.showSaveDialog(win, { title: 'Save diagnostics', defaultPath: `dineopen-diagnostics-${Date.now()}.txt` });
+    if (r.canceled || !r.filePath) return { ok: false, canceled: true };
+    fs.writeFileSync(r.filePath, report);
+    return { ok: true, path: r.filePath };
+  } catch (e) { return { ok: false, reason: e.message }; }
+});
 ipcMain.handle('restore-backup', async () => {
   try {
     const r = await dialog.showOpenDialog(win, {
@@ -580,6 +652,7 @@ if (!app.requestSingleInstanceLock()) {
       setTimeout(startWatchdog, 30000); // health-poll → self-heal (grace for first boot)
       initUpdater();
       scheduleAutoBackup();             // start the scheduled external backup, if enabled
+      maybeCatchUpBackup();             // run a missed backup if the machine was off
       // Silent check on launch so the admin sees a badge without hunting for it.
       if (autoUpdater) setTimeout(() => { autoUpdater.checkForUpdates().catch(() => {}); }, 8000);
     } catch (e) {

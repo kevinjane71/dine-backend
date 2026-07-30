@@ -18,4 +18,5 @@ contextBridge.exposeInMainWorld('server', {
   getBackupConfig: () => ipcRenderer.invoke('get-backup-config'),
   setBackupConfig: (cfg) => ipcRenderer.invoke('set-backup-config', cfg),
   setAutoLaunch: (on) => ipcRenderer.invoke('set-auto-launch', on),
+  exportDiagnostics: () => ipcRenderer.invoke('export-diagnostics'),
 });
