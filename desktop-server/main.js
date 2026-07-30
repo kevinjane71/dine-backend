@@ -79,7 +79,10 @@ async function startPostgres() {
         const { Client } = require(path.join(backendDir(), 'node_modules', 'pg'));
         const c = new Client({ connectionString: connString });
         await c.connect();
-        await c.query(fs.readFileSync(schemaFile, 'utf8'));
+        // Strip psql meta-commands (\restrict/\unrestrict/\connect) — node-postgres
+        // can't parse backslash commands emitted by newer pg_dump.
+        const sql = fs.readFileSync(schemaFile, 'utf8').split('\n').filter((l) => !/^\s*\\/.test(l)).join('\n');
+        await c.query(sql);
         await c.end();
         pushLog('📐 Database schema loaded.');
       } catch (e) { pushLog(`⚠️ Schema load: ${e.message}`); }

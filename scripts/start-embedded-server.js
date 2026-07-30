@@ -18,6 +18,13 @@ const path = require('path');
 const fs = require('fs');
 const os = require('os');
 
+// pg_dump (PG 17+/18) wraps output in psql meta-commands (\restrict / \unrestrict,
+// and sometimes \connect). node-postgres executes raw SQL and can't parse backslash
+// commands, so strip any line that is a psql meta-command before running the dump.
+function sanitizeDumpSql(sql) {
+  return sql.split('\n').filter((line) => !/^\s*\\/.test(line)).join('\n');
+}
+
 async function loadSchema(connString) {
   const { Client } = require('pg');
   const client = new Client({ connectionString: connString });
@@ -29,7 +36,7 @@ async function loadSchema(connString) {
         .find((p) => fs.existsSync(p));
     if (schemaFile && fs.existsSync(schemaFile)) {
       console.log(`📐 Loading schema from ${schemaFile} ...`);
-      await client.query(fs.readFileSync(schemaFile, 'utf8'));
+      await client.query(sanitizeDumpSql(fs.readFileSync(schemaFile, 'utf8')));
       console.log('✅ Schema loaded.');
       return true;
     }

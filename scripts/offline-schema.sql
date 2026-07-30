@@ -6835,3 +6835,17 @@ ALTER TABLE ONLY public.tables
 
 \unrestrict GF6xWoXrEeJT0EtN9rTp2o9ODlBiMNdOkVQIgLuSEHB6sL2RVg3dDLrq9nKAwWn
 
+
+--
+-- Terminal PIN lock (shared POS) columns — additive, idempotent.
+-- Kept here so fresh offline installs (one-click embedded PG / desktop-server) get
+-- real columns instead of extra_data JSONB overflow. Mirrors
+-- scripts/add-terminal-lock-columns.js. (app_users.pin_hash/pin_enabled already
+-- exist above.)
+--
+ALTER TABLE public.staff_users ADD COLUMN IF NOT EXISTS pin_hash text;
+ALTER TABLE public.staff_users ADD COLUMN IF NOT EXISTS pin_enabled boolean DEFAULT true;
+ALTER TABLE public.staff_credentials ADD COLUMN IF NOT EXISTS terminal_pin text;
+ALTER TABLE public.orders ADD COLUMN IF NOT EXISTS operator_id text;
+ALTER TABLE public.orders ADD COLUMN IF NOT EXISTS operator_name text;
+CREATE INDEX IF NOT EXISTS idx_orders_operator ON public.orders (restaurant_id, operator_id);
