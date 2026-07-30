@@ -67,10 +67,30 @@ If no feed is configured, the app runs fine and the update card shows "not confi
 
 ## Data & backups
 
-- Postgres data lives in the app's userData dir (`.../pgdata`), so it survives updates.
-- Automatic pre-update backups are kept alongside it (`pgdata-backup-*`, newest 2).
-- Take a periodic manual backup too: `pg_dump "postgresql://dine_app:dineopen_local@127.0.0.1:5433/dine"`.
+**Where the data lives (survives uninstall):** the database is stored in a stable
+folder **outside the app** — `~/DineOpenServer/pgdata` (Windows: `C:\Users\<name>\DineOpenServer\pgdata`).
+Uninstalling or reinstalling the app does **not** touch it. Override the location with
+`DINEOPEN_DATA_DIR` in `.env.local` (e.g. a dedicated data drive). Existing installs
+that had data in the old in-app location are migrated to the new folder automatically
+on first launch. The **Open** button in the window opens this folder.
+
+**Backup & restore (in the app):**
+- **Back up now** → pick a folder (an **external drive / USB** is safest — if the
+  machine dies, the backup is elsewhere). Postgres pauses for a few seconds for a
+  consistent copy, then resumes; terminals reconnect automatically. Do it after service.
+- **Auto-backup** → toggle on, set an interval and a target folder; the app backs up on
+  schedule and keeps the newest 7.
+- **Restore…** → pick a backup folder; the current data is set aside first (reversible),
+  then replaced and the server restarts.
+- Pre-update snapshots are also kept in `~/DineOpenServer/backups` automatically.
+
+**Off-site backup:** set `SYNC_MODE=periodic` + `CLOUD_DATABASE_URL` in `.env.local` to
+also sync up to your cloud Postgres whenever the internet is available (see
+`docs/offline-local-server.md`). Local backup + cloud sync together = the safest setup.
+
 - Keep the machine on a UPS (Postgres WAL survives power loss).
+- `pg_dump` is **not** bundled with the embedded Postgres — use the in-app Backup button
+  (a full data-dir copy), not `pg_dump`.
 
 ## Notes
 

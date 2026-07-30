@@ -28,6 +28,10 @@
     .bar { height:6px; background:#0e1626; border:1px solid var(--border); border-radius:6px; overflow:hidden; margin-top:8px; display:none; }
     .bar > div { height:100%; width:0%; background:var(--accent); }
     .ver { font-size:11px; color:var(--muted); }
+    .mono { font-family:ui-monospace,Menlo,Consolas,monospace; color:var(--ink); }
+    .link { background:none; border:none; color:var(--accent); cursor:pointer; font-size:12px; padding:0; text-decoration:underline; }
+    .chk { display:flex; align-items:center; gap:6px; font-size:12.5px; color:var(--ink); font-weight:700; }
+    .num { width:56px; background:#0e1626; border:1px solid var(--border); color:var(--ink); border-radius:6px; padding:5px 8px; font-size:12.5px; text-align:center; }
   </style>
 </head>
 <body>
@@ -50,6 +54,24 @@
       </div>
       <div class="bar" id="ubar"><div></div></div>
       <div class="sub" style="margin-top:6px">Update after service — installing briefly restarts the server. Your database is backed up automatically first.</div>
+    </div>
+
+    <div class="card">
+      <div class="lbl">Backup &amp; restore</div>
+      <div class="sub" style="margin-bottom:8px">Your data lives in <span id="datadir" class="mono">…</span> <button class="link" id="opendata">Open</button></div>
+      <div class="row">
+        <div class="grow ustat" id="bstat">No backup yet.</div>
+        <button class="btn" id="bnow">Back up now</button>
+        <button class="btn ghost" id="brestore">Restore…</button>
+      </div>
+      <div class="row" style="margin-top:12px">
+        <label class="chk"><input type="checkbox" id="bauto" /> Auto-backup</label>
+        <span class="sub">every</span>
+        <input type="number" id="bhours" min="1" max="168" value="24" class="num" />
+        <span class="sub">hours →</span>
+        <button class="btn ghost" id="bfolder">Choose folder…</button>
+      </div>
+      <div class="sub" id="bfolderlbl" style="margin-top:6px">Tip: back up to an <b>external drive / USB</b> — if this machine's data is ever lost, the backup is safe elsewhere and can be restored.</div>
     </div>
 
     <div class="card">

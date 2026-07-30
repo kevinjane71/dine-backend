@@ -10,4 +10,11 @@ contextBridge.exposeInMainWorld('server', {
   checkUpdate: () => ipcRenderer.invoke('check-update'),
   downloadUpdate: () => ipcRenderer.invoke('download-update'),
   installUpdate: () => ipcRenderer.invoke('install-update'),
+  // Backup / Restore
+  openDataFolder: () => ipcRenderer.invoke('open-data-folder'),
+  chooseFolder: (title) => ipcRenderer.invoke('choose-folder', title),
+  backupNow: () => ipcRenderer.invoke('backup-now'),
+  restoreBackup: () => ipcRenderer.invoke('restore-backup'),
+  getBackupConfig: () => ipcRenderer.invoke('get-backup-config'),
+  setBackupConfig: (cfg) => ipcRenderer.invoke('set-backup-config', cfg),
 });
