@@ -22759,6 +22759,17 @@ app.get('/api/kot/:restaurantId', async (req, res) => {
 
     console.log(`📅 Filtering orders from: ${yesterdayStart.toISOString()}`);
 
+    // Robustly coerce any timestamp shape to a valid Date (or null). On the PG branch a
+    // field like kotTime can revive as a Firestore Timestamp object or {_seconds,_nanoseconds}
+    // blob — `new Date(obj)` on those yields an Invalid Date and `.toISOString()` throws.
+    const safeDate = (v) => {
+      if (!v) return null;
+      if (v instanceof Date) return isNaN(v.getTime()) ? null : v;
+      if (typeof v.toDate === 'function') { try { const d = v.toDate(); return isNaN(d.getTime()) ? null : d; } catch (_) { return null; } }
+      if (typeof v === 'object' && typeof v._seconds === 'number') return new Date(v._seconds * 1000 + Math.floor((v._nanoseconds || 0) / 1e6));
+      const d = new Date(v); return isNaN(d.getTime()) ? null : d;
+    };
+
     // Helper: enrich orders with KOT-specific fields and table info
     const enrichKotOrders = (rawOrders, tableMap) => {
       const validKotStatuses = ['pending', 'confirmed', 'preparing', 'ready', 'completed'];
@@ -22775,16 +22786,13 @@ app.get('/api/kot/:restaurantId', async (req, res) => {
         const tableInfo = orderData.tableNumber != null ? (tableMap[orderData.tableNumber] || null) : null;
 
         let estimatedTime = 15;
-        let kotTime = orderData.createdAt instanceof Date ? orderData.createdAt : (orderData.createdAt ? new Date(orderData.createdAt) : new Date());
-        if (orderData.kotTime) {
-          kotTime = orderData.kotTime instanceof Date ? orderData.kotTime : new Date(orderData.kotTime);
-        }
+        const kotTime = safeDate(orderData.kotTime) || safeDate(orderData.createdAt) || new Date();
 
         if (orderData.items && orderData.items.length > 0) {
           estimatedTime = Math.max(15, orderData.items.length * 8);
         }
 
-        const kotId = `KOT-${orderData.id.slice(-6).toUpperCase()}`;
+        const kotId = `KOT-${String(orderData.id || '').slice(-6).toUpperCase()}`;
 
         enriched.push({
           ...orderData,
@@ -22792,8 +22800,8 @@ app.get('/api/kot/:restaurantId', async (req, res) => {
           kotTime: kotTime.toISOString(),
           estimatedTime,
           tableInfo,
-          createdAt: (orderData.createdAt instanceof Date ? orderData.createdAt : (orderData.createdAt ? new Date(orderData.createdAt) : new Date())).toISOString(),
-          updatedAt: (orderData.updatedAt instanceof Date ? orderData.updatedAt : (orderData.updatedAt ? new Date(orderData.updatedAt) : new Date())).toISOString(),
+          createdAt: (safeDate(orderData.createdAt) || new Date()).toISOString(),
+          updatedAt: (safeDate(orderData.updatedAt) || new Date()).toISOString(),
         });
       }
 
@@ -22834,9 +22842,9 @@ app.get('/api/kot/:restaurantId', async (req, res) => {
       return {
         id: doc.id,
         ...data,
-        createdAt: data.createdAt instanceof Date ? data.createdAt : (data.createdAt ? new Date(data.createdAt) : new Date()),
-        updatedAt: data.updatedAt instanceof Date ? data.updatedAt : (data.updatedAt ? new Date(data.updatedAt) : new Date()),
-        kotTime: data.kotTime instanceof Date ? data.kotTime : (data.kotTime ? new Date(data.kotTime) : null),
+        createdAt: safeDate(data.createdAt) || new Date(),
+        updatedAt: safeDate(data.updatedAt) || new Date(),
+        kotTime: safeDate(data.kotTime),
       };
     });
 
