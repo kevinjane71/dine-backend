@@ -26,6 +26,7 @@ let win = null;
 let pgInstance = null;
 let backendProc = null;
 let isInstalling = false;
+let manualUpdateCheck = false; // true only while an admin-initiated check is in flight
 const logs = [];
 
 function backendDir() {
@@ -213,15 +214,22 @@ function initUpdater() {
     try { autoUpdater.setFeedURL({ provider: 'generic', url: process.env.UPDATE_FEED_URL }); } catch (_) {}
   }
   autoUpdater.on('checking-for-update', () => sendUpdate({ state: 'checking' }));
-  autoUpdater.on('update-available', (i) => { pushLog(`⬆️  Update available: v${i.version}`); sendUpdate({ state: 'available', version: i.version }); });
-  autoUpdater.on('update-not-available', () => sendUpdate({ state: 'none', version: app.getVersion() }));
-  autoUpdater.on('error', (e) => { pushLog(`⚠️ Update error: ${e.message}`); sendUpdate({ state: 'error', message: e.message }); });
+  autoUpdater.on('update-available', (i) => { manualUpdateCheck = false; pushLog(`⬆️  Update available: v${i.version}`); sendUpdate({ state: 'available', version: i.version }); });
+  autoUpdater.on('update-not-available', () => { manualUpdateCheck = false; sendUpdate({ state: 'none', version: app.getVersion() }); });
+  // Offline servers can't reach the feed — that's normal, so only surface the error
+  // in the UI when the admin explicitly clicked Check. Always log it either way.
+  autoUpdater.on('error', (e) => {
+    pushLog(`⚠️ Update check: ${e.message}`);
+    if (manualUpdateCheck) sendUpdate({ state: 'error', message: e.message });
+    manualUpdateCheck = false;
+  });
   autoUpdater.on('download-progress', (p) => sendUpdate({ state: 'downloading', percent: Math.round(p.percent) }));
   autoUpdater.on('update-downloaded', (i) => { pushLog(`✅ Update v${i.version} downloaded — ready to install.`); sendUpdate({ state: 'downloaded', version: i.version }); });
 }
 
 ipcMain.handle('check-update', async () => {
   if (!autoUpdater) return { ok: false, reason: 'Updates are not configured for this build.' };
+  manualUpdateCheck = true; // user-initiated → surface errors in the UI
   try { await autoUpdater.checkForUpdates(); return { ok: true }; }
   catch (e) { return { ok: false, reason: e.message }; }
 });

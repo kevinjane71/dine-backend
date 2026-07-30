@@ -47,8 +47,15 @@ async function runMigrations({ logger = console } = {}) {
   const applied = [];
   let locked = false;
   try {
-    // Serialise across processes/instances; other boots block here until we finish.
-    await client.query('SELECT pg_advisory_lock($1)', [ADVISORY_LOCK_KEY]);
+    // Serialise across processes/instances WITHOUT blocking: if another boot already
+    // holds the lock it's migrating, so we skip (rather than stall this instance's
+    // startup behind a deploy-time migration). Migrations are idempotent + additive,
+    // so proceeding on the soon-to-be-migrated schema is safe.
+    const lockRes = await client.query('SELECT pg_try_advisory_lock($1) AS got', [ADVISORY_LOCK_KEY]);
+    if (!lockRes.rows[0] || lockRes.rows[0].got !== true) {
+      logger.log('🧱 Another instance is applying migrations — skipping on this boot.');
+      return { applied: [], skipped: 'lock held by another instance' };
+    }
     locked = true;
 
     await client.query(`CREATE TABLE IF NOT EXISTS schema_migrations (
