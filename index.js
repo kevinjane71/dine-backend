@@ -32641,7 +32641,9 @@ app.get('/api/admin/settings/:restaurantId/status', authenticateToken, async (re
 
     // Check if restaurant is currently open
     const now = new Date();
-    const currentDay = now.toLocaleLowerCase().substring(0, 3); // mon, tue, etc.
+    // 3-letter lowercase weekday (mon, tue, …) matching operatingHours keys.
+    // (was `now.toLocaleLowerCase()` — not a Date method → TypeError → 500.)
+    const currentDay = now.toLocaleDateString('en-US', { weekday: 'short' }).toLowerCase();
     const currentTime = now.toTimeString().substring(0, 5); // HH:MM format
 
     const todayHours = operatingHours[currentDay];
