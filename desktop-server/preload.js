@@ -5,4 +5,9 @@ contextBridge.exposeInMainWorld('server', {
   onInfo: (cb) => ipcRenderer.on('info', (_e, info) => cb(info)),
   getInfo: () => ipcRenderer.invoke('get-info'),
   openExternal: (url) => ipcRenderer.invoke('open-external', url),
+  // Updates
+  onUpdateStatus: (cb) => ipcRenderer.on('update-status', (_e, s) => cb(s)),
+  checkUpdate: () => ipcRenderer.invoke('check-update'),
+  downloadUpdate: () => ipcRenderer.invoke('download-update'),
+  installUpdate: () => ipcRenderer.invoke('install-update'),
 });

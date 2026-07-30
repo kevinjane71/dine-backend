@@ -17,7 +17,17 @@
     .lbl { font-size:11px; letter-spacing:.08em; text-transform:uppercase; color:var(--muted); font-weight:700; margin-bottom:8px; }
     .addr { display:flex; align-items:center; gap:8px; font-family:ui-monospace,Menlo,Consolas,monospace; font-size:15px; font-weight:700; color:var(--accent); padding:8px 10px; background:#0e1626; border:1px solid var(--border); border-radius:8px; margin:4px 0; }
     .addr button { margin-left:auto; background:transparent; border:1px solid var(--border); color:var(--muted); border-radius:6px; padding:3px 8px; cursor:pointer; font-size:11px; }
-    pre { margin:0; background:#0a1120; border:1px solid var(--border); border-radius:8px; padding:12px; height:210px; overflow:auto; font-family:ui-monospace,Menlo,Consolas,monospace; font-size:11.5px; color:#a9b6d0; white-space:pre-wrap; }
+    pre { margin:0; background:#0a1120; border:1px solid var(--border); border-radius:8px; padding:12px; height:180px; overflow:auto; font-family:ui-monospace,Menlo,Consolas,monospace; font-size:11.5px; color:#a9b6d0; white-space:pre-wrap; }
+    .row { display:flex; align-items:center; gap:10px; }
+    .row .grow { flex:1; }
+    .btn { background:var(--accent); border:none; color:#0b1120; border-radius:8px; padding:8px 14px; cursor:pointer; font-size:12.5px; font-weight:800; }
+    .btn:disabled { opacity:.5; cursor:default; }
+    .btn.ghost { background:transparent; border:1px solid var(--border); color:var(--ink); }
+    .ustat { font-size:12.5px; color:var(--muted); }
+    .ustat.good { color:var(--good); }
+    .bar { height:6px; background:#0e1626; border:1px solid var(--border); border-radius:6px; overflow:hidden; margin-top:8px; display:none; }
+    .bar > div { height:100%; width:0%; background:var(--accent); }
+    .ver { font-size:11px; color:var(--muted); }
   </style>
 </head>
 <body>
@@ -26,8 +36,20 @@
       <span class="dot"></span>
       <div>
         <h1>DineOpen Server — running</h1>
-        <div class="sub">Keep this app open. Every terminal on this Wi-Fi connects here.</div>
+        <div class="sub">Keep this app open. Every terminal on this Wi-Fi connects here. <span class="ver" id="ver"></span></div>
       </div>
+    </div>
+
+    <div class="card">
+      <div class="lbl">Software update</div>
+      <div class="row">
+        <div class="grow ustat" id="ustat">Up to date.</div>
+        <button class="btn ghost" id="ucheck">Check for updates</button>
+        <button class="btn" id="udownload" style="display:none">Download update</button>
+        <button class="btn" id="uinstall" style="display:none">Restart &amp; install</button>
+      </div>
+      <div class="bar" id="ubar"><div></div></div>
+      <div class="sub" style="margin-top:6px">Update after service — installing briefly restarts the server. Your database is backed up automatically first.</div>
     </div>
 
     <div class="card">

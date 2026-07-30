@@ -17,9 +17,15 @@ const fs = require('fs');
 const os = require('os');
 const { fork } = require('child_process');
 
+// Auto-updater (electron-updater). Guarded so the app still runs if the dep or a
+// release feed isn't configured — the update button then reports "not configured".
+let autoUpdater = null;
+try { ({ autoUpdater } = require('electron-updater')); } catch (_) { autoUpdater = null; }
+
 let win = null;
 let pgInstance = null;
 let backendProc = null;
+let isInstalling = false;
 const logs = [];
 
 function backendDir() {
@@ -53,6 +59,45 @@ async function loadEmbeddedPostgres() {
   const entry = path.join(backendDir(), 'node_modules', 'embedded-postgres', 'dist', 'index.js');
   const M = await import(pathToFileURL(entry).href);
   return M.default || M;
+}
+
+// Keep only the newest N database backups (each is a full pgdata copy).
+function pruneBackups(keep = 2) {
+  try {
+    const base = app.getPath('userData');
+    const backups = fs.readdirSync(base)
+      .filter((d) => d.startsWith('pgdata-backup-'))
+      .map((d) => ({ d, t: fs.statSync(path.join(base, d)).mtimeMs }))
+      .sort((a, b) => b.t - a.t);
+    for (const old of backups.slice(keep)) {
+      try { fs.rmSync(path.join(base, old.d), { recursive: true, force: true }); } catch (_) {}
+    }
+  } catch (_) {}
+}
+
+// Before applying a new version's migrations, snapshot the database if the app was
+// just upgraded. Postgres is NOT started yet here, so a plain recursive copy of the
+// data dir is a safe cold backup — a bad migration is always recoverable.
+function backupIfUpgraded() {
+  const base = app.getPath('userData');
+  const dataDir = path.join(base, 'pgdata');
+  const verFile = path.join(base, 'app-version.json');
+  const cur = app.getVersion();
+  let prev = null;
+  try { prev = JSON.parse(fs.readFileSync(verFile, 'utf8')).version; } catch (_) {}
+
+  if (prev && prev !== cur && fs.existsSync(dataDir)) {
+    const dest = path.join(base, `pgdata-backup-${prev}-${Date.now()}`);
+    try {
+      pushLog(`🗄️  Updating ${prev} → ${cur}. Backing up the database first…`);
+      fs.cpSync(dataDir, dest, { recursive: true });
+      pruneBackups(2);
+      pushLog(`🗄️  Database backup saved (${path.basename(dest)}).`);
+    } catch (e) {
+      pushLog(`⚠️ Backup failed (continuing): ${e.message}`);
+    }
+  }
+  try { fs.writeFileSync(verFile, JSON.stringify({ version: cur })); } catch (_) {}
 }
 
 async function startPostgres() {
@@ -150,14 +195,60 @@ function createWindow() {
   });
 }
 
-ipcMain.handle('get-info', () => ({ ips: lanIPs(), port: 3003, running: !!backendProc }));
+ipcMain.handle('get-info', () => ({ ips: lanIPs(), port: 3003, running: !!backendProc, version: app.getVersion() }));
 ipcMain.handle('open-external', (_e, url) => shell.openExternal(url));
+
+// ── Auto-update (admin-triggered) ────────────────────────────────────────────
+function sendUpdate(payload) {
+  if (win && !win.isDestroyed()) win.webContents.send('update-status', payload);
+}
+
+function initUpdater() {
+  if (!autoUpdater) { sendUpdate({ state: 'unsupported' }); return; }
+  autoUpdater.autoDownload = false;            // admin decides when to download
+  autoUpdater.autoInstallOnAppQuit = true;
+  autoUpdater.logger = { info: pushLog, warn: pushLog, error: pushLog, debug: () => {} };
+  // Optional override of the release feed for on-prem/self-hosted distribution.
+  if (process.env.UPDATE_FEED_URL) {
+    try { autoUpdater.setFeedURL({ provider: 'generic', url: process.env.UPDATE_FEED_URL }); } catch (_) {}
+  }
+  autoUpdater.on('checking-for-update', () => sendUpdate({ state: 'checking' }));
+  autoUpdater.on('update-available', (i) => { pushLog(`⬆️  Update available: v${i.version}`); sendUpdate({ state: 'available', version: i.version }); });
+  autoUpdater.on('update-not-available', () => sendUpdate({ state: 'none', version: app.getVersion() }));
+  autoUpdater.on('error', (e) => { pushLog(`⚠️ Update error: ${e.message}`); sendUpdate({ state: 'error', message: e.message }); });
+  autoUpdater.on('download-progress', (p) => sendUpdate({ state: 'downloading', percent: Math.round(p.percent) }));
+  autoUpdater.on('update-downloaded', (i) => { pushLog(`✅ Update v${i.version} downloaded — ready to install.`); sendUpdate({ state: 'downloaded', version: i.version }); });
+}
+
+ipcMain.handle('check-update', async () => {
+  if (!autoUpdater) return { ok: false, reason: 'Updates are not configured for this build.' };
+  try { await autoUpdater.checkForUpdates(); return { ok: true }; }
+  catch (e) { return { ok: false, reason: e.message }; }
+});
+ipcMain.handle('download-update', async () => {
+  if (!autoUpdater) return { ok: false };
+  try { await autoUpdater.downloadUpdate(); return { ok: true }; }
+  catch (e) { sendUpdate({ state: 'error', message: e.message }); return { ok: false, reason: e.message }; }
+});
+ipcMain.handle('install-update', async () => {
+  if (!autoUpdater) return { ok: false };
+  isInstalling = true;
+  pushLog('⤴️  Installing update — stopping the server, then relaunching…');
+  await shutdown();
+  // Relaunch after install so the restaurant is back up without a manual open.
+  setImmediate(() => autoUpdater.quitAndInstall(false, true));
+  return { ok: true };
+});
 
 app.whenReady().then(async () => {
   createWindow();
   try {
+    backupIfUpgraded();               // snapshot DB if the app was just updated
     const dbUrl = await startPostgres();
-    startBackend(dbUrl);
+    startBackend(dbUrl);              // forked backend runs schema migrations on boot
+    initUpdater();
+    // Silent check on launch so the admin sees a badge without hunting for it.
+    if (autoUpdater) setTimeout(() => { autoUpdater.checkForUpdates().catch(() => {}); }, 8000);
   } catch (e) {
     pushLog(`❌ Startup failed: ${e.message}`);
   }
@@ -167,5 +258,9 @@ async function shutdown() {
   try { if (backendProc) backendProc.kill(); } catch (_) {}
   try { if (pgInstance) await pgInstance.stop(); } catch (_) {}
 }
-app.on('before-quit', (e) => { e.preventDefault(); shutdown().finally(() => app.exit(0)); });
+app.on('before-quit', (e) => {
+  if (isInstalling) return;           // let the updater relaunch the installer
+  e.preventDefault();
+  shutdown().finally(() => app.exit(0));
+});
 app.on('window-all-closed', () => { /* keep the server running in the tray/background */ });

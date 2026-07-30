@@ -12,6 +12,9 @@
     "dist:mac": "electron-builder --mac dmg",
     "dist:dir": "electron-builder --dir"
   },
+  "dependencies": {
+    "electron-updater": "^6.3.9"
+  },
   "devDependencies": {
     "electron": "^33.0.0",
     "electron-builder": "^25.1.8"
@@ -22,6 +25,12 @@
     "directories": {
       "output": "dist"
     },
+    "publish": [
+      {
+        "provider": "generic",
+        "url": "https://updates.dineopen.com/server/"
+      }
+    ],
     "files": [
       "main.js",
       "preload.js",

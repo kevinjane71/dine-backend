@@ -45,10 +45,31 @@ into the app's resources, so the shipped installer needs nothing on the target m
    as a pure offline island.
 3. Launch it — it shows `http://<ip>:3003`. Enter that on each terminal.
 
+## Software updates (in-app)
+
+The status window has a **Software update** card:
+
+- **Check for updates → Download → Restart & install** (admin-triggered, never forced —
+  installing briefly restarts the server, so do it after service).
+- Before a new version's schema migrations run, the app **automatically snapshots the
+  database** (a cold copy of `pgdata` → `pgdata-backup-<oldversion>-<ts>`, last 2 kept),
+  so a bad update is always recoverable.
+- On boot the forked backend runs **versioned schema migrations** (`/migrations/NNN_*.sql`,
+  tracked in `schema_migrations`) — so an update self-heals the schema with **no manual
+  SQL step**. This is the single mechanism for schema changes across cloud + offline.
+
+**Publishing an update (you, per release):** bump `desktop-server/package.json` `version`,
+`npm run dist:win` / `dist:mac`, then upload the generated installer **and** `latest.yml` /
+`latest-mac.yml` to the feed URL in `build.publish` (`https://updates.dineopen.com/server/`
+— change to your host). Terminals reconnect automatically after the ~10 s restart. To point
+a site at a different feed without rebuilding, set `UPDATE_FEED_URL` in the app's `.env.local`.
+If no feed is configured, the app runs fine and the update card shows "not configured".
+
 ## Data & backups
 
 - Postgres data lives in the app's userData dir (`.../pgdata`), so it survives updates.
-- Take a periodic backup: `pg_dump "postgresql://dine_app:dineopen_local@127.0.0.1:5433/dine"`.
+- Automatic pre-update backups are kept alongside it (`pgdata-backup-*`, newest 2).
+- Take a periodic manual backup too: `pg_dump "postgresql://dine_app:dineopen_local@127.0.0.1:5433/dine"`.
 - Keep the machine on a UPS (Postgres WAL survives power loss).
 
 ## Notes
