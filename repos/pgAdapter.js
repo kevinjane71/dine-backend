@@ -1196,13 +1196,23 @@ class PgQuery {
       if (emptyResult) return makeQuerySnapshot([]);
 
       // ORDER BY — Firestore excludes documents that lack the orderBy field,
-      // so filter NULLs (also fixes NULLS-first-on-DESC surprises)
+      // so filter NULLs (also fixes NULLS-first-on-DESC surprises).
+      // Symmetric with WHERE: if the orderBy field isn't a real column it lives in the
+      // extra_data JSONB overflow (stored under its ORIGINAL key) — order on that instead
+      // of emitting `ORDER BY <col>` for a column that doesn't exist (which 500s).
+      const orderJsonbCols = this._config.jsonbCols;
       const orderParts = [];
       for (const o of this._orderBys) {
-        const col = resolveField(fieldMap, o.field);
+        const pgCol = resolveField(fieldMap, o.field);
         const dir = o.direction === 'desc' ? 'DESC' : 'ASC';
-        orderParts.push(`${col} ${dir}`);
-        conditions.push(`${col} IS NOT NULL`);
+        let colExpr = pgCol;
+        const simpleField = typeof o.field === 'string' && !o.field.includes('.');
+        if (simpleField && knownCols && !knownCols.has(pgCol.toLowerCase()) && orderJsonbCols && orderJsonbCols.has('extra_data')) {
+          values.push(o.field);
+          colExpr = `extra_data ->> $${values.length}`;
+        }
+        orderParts.push(`${colExpr} ${dir}`);
+        conditions.push(`${colExpr} IS NOT NULL`);
       }
 
       // startAfter — cursor pagination
