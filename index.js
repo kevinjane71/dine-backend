@@ -9621,6 +9621,25 @@ app.post('/api/orders', authenticateOrderCreate, async (req, res) => {
     const restaurantData = restaurantDoc.data();
     const menuItems = restaurantData.menu?.items || [];
 
+    // ── Terminal PIN lock: server-side enforcement (opt-in) ──
+    // When the shared-terminal lock is enabled AND set to strict/server-enforced,
+    // a staff-placed POS order must carry a valid operator (a staff/owner who
+    // unlocked with their PIN). This blocks bypassing the client lock via dev tools.
+    // Scoped to authenticated staff orders only — public/QR/customer self-orders
+    // (req.user is null) and aggregator webhooks use separate routes and are unaffected.
+    try {
+      const tl = restaurantData.posSettings?.terminalLock;
+      if (req.user && tl?.enabled && tl?.serverEnforced && orderType !== 'customer_self_order') {
+        const okOperator = await isValidTerminalOperator(restaurantId, req.body.operatorId, restaurantData);
+        if (!okOperator) {
+          console.warn(`🔒 Terminal-lock rejected order: restaurant ${restaurantId}, operatorId ${req.body.operatorId || 'none'}`);
+          return res.status(403).json({ error: 'Terminal locked — a staff PIN is required to place orders.', code: 'TERMINAL_LOCK_REQUIRED' });
+        }
+      }
+    } catch (tlErr) {
+      console.error('Terminal-lock enforcement check failed (non-blocking):', tlErr.message);
+    }
+
     // Variables for resolved table identity — declared here so orderData can access them
     let tableId_resolved = null;
     let tableFloor = null;
@@ -10463,6 +10482,8 @@ app.post('/api/orders', authenticateOrderCreate, async (req, res) => {
         kitchenNotes: 'Direct customer order'
       } : (staffInfo || null),
       assignedStaff: assignedStaff || null,
+      // Terminal-lock attribution: which staff (by PIN) placed this at a shared terminal.
+      ...(req.body.operatorId ? { operatorId: req.body.operatorId, operatorName: req.body.operatorName || null } : {}),
       notes: notes || (orderType === 'customer_self_order' ? `Customer self-order from seat ${seatNumber || 'Walk-in'}` : ''),
       specialInstructions: specialInstructions || null, // Kitchen special instructions
       status: req.body.status || 'confirmed',
@@ -20349,6 +20370,31 @@ app.post('/api/staff/:restaurantId', authenticateToken, requireOwnerRole, async 
 // operator the PIN belongs to, so the terminal can attribute the next orders.
 // The terminal is already token-authenticated for the restaurant; the PIN only
 // identifies WHO is operating it. PINs are stored hashed (bcrypt), never returned.
+// Server-side terminal-lock enforcement helper. Returns true if `operatorId` is a
+// real staff member or the owner of `restaurantId` with an active terminal PIN.
+// Used to reject POS orders that bypassed the client lock (e.g. via dev tools).
+async function isValidTerminalOperator(restaurantId, operatorId, restaurantData) {
+  if (!operatorId) return false;
+  try {
+    // Check staffUsers first (most operators).
+    const staffDoc = await db.collection(collections.staffUsers).doc(String(operatorId)).get();
+    if (staffDoc.exists) {
+      const s = staffDoc.data();
+      if (s.restaurantId === restaurantId && s.pinEnabled !== false && s.pinHash) return true;
+    }
+    // Owner may also operate the terminal.
+    const ownerId = restaurantData?.ownerId
+      || (await getCachedRestDoc(restaurantId).then(d => d.exists ? d.data().ownerId : null).catch(() => null));
+    if (ownerId && String(ownerId) === String(operatorId)) {
+      const od = await db.collection(collections.users).doc(String(ownerId)).get();
+      if (od.exists) { const o = od.data(); if (o.pinEnabled !== false && o.pinHash) return true; }
+    }
+  } catch (e) {
+    console.error('isValidTerminalOperator error:', e.message);
+  }
+  return false;
+}
+
 app.post('/api/staff/:restaurantId/verify-pin', authenticateToken, async (req, res) => {
   try {
     const { restaurantId } = req.params;
