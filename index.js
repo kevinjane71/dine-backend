@@ -143,7 +143,10 @@ let globalRateLimiter = null;
 let rateLimitRedis = null;
 
 try {
-  if (process.env.RATELIMIT_REDIS_URL && process.env.RATELIMIT_REDIS_TOKEN) {
+  // Never use cloud Upstash rate-limiting on the on-prem LAN server: a trusted network
+  // needs no rate limit, and any Upstash creds that leaked into the offline env would make
+  // every request hang. Falls through to the safe in-memory limiter.
+  if (process.env.LOCAL_SERVER_MODE !== 'true' && process.env.RATELIMIT_REDIS_URL && process.env.RATELIMIT_REDIS_TOKEN) {
     const { Ratelimit } = require('@upstash/ratelimit');
     const { Redis } = require('@upstash/redis');
     rateLimitRedis = new Redis({ url: process.env.RATELIMIT_REDIS_URL, token: process.env.RATELIMIT_REDIS_TOKEN });
@@ -20794,6 +20797,11 @@ app.patch('/api/user/features', authenticateToken, async (req, res) => {
 
 // Get a Firebase custom token for the authenticated user (for RTDB access)
 app.get('/api/auth/firebase-token', authenticateToken, async (req, res) => {
+  // No Firebase/RTDB on the on-prem LAN server (real-time is LAN socket.io); return a
+  // null token immediately instead of stalling on a Google IAM network call offline.
+  if (process.env.LOCAL_SERVER_MODE === 'true') {
+    return res.json({ success: true, firebaseCustomToken: null, localServer: true });
+  }
   try {
     const fbAdmin = require('firebase-admin');
     const token = await fbAdmin.auth().createCustomToken(req.user.userId, {
@@ -21045,16 +21053,21 @@ app.post('/api/auth/staff/login', async (req, res) => {
     );
 
     // Generate Firebase custom token so the frontend can sign into Firebase Auth
-    // (needed for Firebase RTDB security rules that require auth)
+    // (needed for Firebase RTDB security rules that require auth).
+    // On the on-prem LAN server there is no Firebase/RTDB (real-time is LAN socket.io),
+    // and createCustomToken would fall back to a Google IAM network call that STALLS the
+    // login response several seconds offline — so skip it entirely in LOCAL_SERVER_MODE.
     let firebaseCustomToken = null;
-    try {
-      const fbAdmin = require('firebase-admin');
-      firebaseCustomToken = await fbAdmin.auth().createCustomToken(staffDoc.id, {
-        role: staffData.role,
-        restaurantId: staffData.restaurantId
-      });
-    } catch (fbErr) {
-      console.warn('Failed to create Firebase custom token for staff:', fbErr.message);
+    if (process.env.LOCAL_SERVER_MODE !== 'true') {
+      try {
+        const fbAdmin = require('firebase-admin');
+        firebaseCustomToken = await fbAdmin.auth().createCustomToken(staffDoc.id, {
+          role: staffData.role,
+          restaurantId: staffData.restaurantId
+        });
+      } catch (fbErr) {
+        console.warn('Failed to create Firebase custom token for staff:', fbErr.message);
+      }
     }
 
     res.json({
