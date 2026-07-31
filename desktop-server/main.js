@@ -227,6 +227,9 @@ function startBackend(databaseUrl) {
     // Marks this as the on-prem local server: enables the LAN socket + the provisioning
     // endpoints (both HARD-DISABLED on cloud deployments that don't set this).
     LOCAL_SERVER_MODE: 'true',
+    // Store uploaded images in the stable data folder (~/DineOpenServer/uploads — survives
+    // app uninstall), served over the LAN at /uploads.
+    LOCAL_UPLOAD_DIR: P('LOCAL_UPLOAD_DIR', path.join(dataRoot(), 'uploads')),
     // Consistent local JWT secret so staff can log in offline (override in .env.local
     // with your production secret to make cloud tokens interchangeable).
     JWT_SECRET: P('JWT_SECRET', 'dineopen-offline-local-secret'),

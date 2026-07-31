@@ -16439,6 +16439,30 @@ app.use('/api/feedback', feedbackRoutes);
 app.use('/api/bulk-staff', bulkStaffRoutes);
 
 // Generic image upload API
+// ── Offline image storage (on-prem LAN server) ──────────────────────────────
+// There is no Google Cloud Storage offline. Under LOCAL_SERVER_MODE, save uploads to
+// a local folder and serve them over the LAN, so menu photos work with no internet and
+// a GCS write can't stall the request for ~30s on retries. The returned URL uses the
+// same host the terminal reached us on, so every LAN terminal can load the image.
+const LOCAL_UPLOAD_DIR = process.env.LOCAL_UPLOAD_DIR
+  || require('path').join(require('os').homedir(), 'DineOpenServer', 'uploads');
+function saveLocalUpload(file, subdir, req) {
+  const path = require('path'); const fs = require('fs');
+  const safe = String(file.originalname || 'image').replace(/[^a-zA-Z0-9._-]/g, '_');
+  const rel = `${subdir}/${Date.now()}-${Math.floor(Math.random() * 1e6)}-${safe}`;
+  const abs = path.join(LOCAL_UPLOAD_DIR, rel);
+  fs.mkdirSync(path.dirname(abs), { recursive: true });
+  fs.writeFileSync(abs, file.buffer);
+  const host = req.headers['x-forwarded-host'] || req.headers.host;
+  const proto = req.headers['x-forwarded-proto'] || req.protocol || 'http';
+  return `${proto}://${host}/uploads/${rel}`;
+}
+if (process.env.LOCAL_SERVER_MODE === 'true') {
+  try { require('fs').mkdirSync(LOCAL_UPLOAD_DIR, { recursive: true }); } catch (_) {}
+  app.use('/uploads', express.static(LOCAL_UPLOAD_DIR));
+  console.log(`🖼️  Offline image storage at ${LOCAL_UPLOAD_DIR} (served at /uploads)`);
+}
+
 app.post('/api/upload/image', authenticateToken, upload.single('image'), async (req, res) => {
   try {
     const { userId } = req.user;
@@ -16468,6 +16492,12 @@ app.post('/api/upload/image', authenticateToken, upload.single('image'), async (
       return res.status(400).json({ 
         error: 'File too large. Maximum file size is 5MB.' 
       });
+    }
+
+    // Offline: store locally + serve over the LAN (no GCS).
+    if (process.env.LOCAL_SERVER_MODE === 'true') {
+      const imageUrl = saveLocalUpload(file, 'images', req);
+      return res.json({ success: true, imageUrl, fileName: imageUrl, originalName: file.originalname, size: file.size, message: 'Image saved (local)' });
     }
 
     // Upload to Firebase Storage
@@ -16589,20 +16619,26 @@ app.post('/api/menu-items/:itemId/images', authenticateToken, upload.array('imag
     for (let i = 0; i < files.length; i++) {
       const file = files[i];
       try {
-        const filename = `menu-items/${restaurantId}/${itemId}/${Date.now()}-${i}-${file.originalname}`;
-        const blob = bucket.file(filename);
-        
-        await blob.save(file.buffer, {
-          contentType: file.mimetype,
-          metadata: {
-            restaurantId: menuItem.restaurantId,
-            menuItemId: itemId,
-            uploadedAt: new Date().toISOString(),
-            uploadedBy: userId
-          }
-        });
-        
-        const imageUrl = `https://storage.googleapis.com/${bucket.name}/${filename}`;
+        let imageUrl;
+        let filename;
+        if (process.env.LOCAL_SERVER_MODE === 'true') {
+          // Offline: store locally + serve over the LAN (no GCS).
+          imageUrl = saveLocalUpload(file, `menu-items/${restaurantId}/${itemId}`, req);
+          filename = imageUrl;
+        } else {
+          filename = `menu-items/${restaurantId}/${itemId}/${Date.now()}-${i}-${file.originalname}`;
+          const blob = bucket.file(filename);
+          await blob.save(file.buffer, {
+            contentType: file.mimetype,
+            metadata: {
+              restaurantId: menuItem.restaurantId,
+              menuItemId: itemId,
+              uploadedAt: new Date().toISOString(),
+              uploadedBy: userId
+            }
+          });
+          imageUrl = `https://storage.googleapis.com/${bucket.name}/${filename}`;
+        }
         uploadedImages.push({
           url: imageUrl,
           filename: filename,
