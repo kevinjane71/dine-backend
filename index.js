@@ -15950,6 +15950,7 @@ app.post('/api/menu-items/:itemId/images', authenticateToken, upload.array('imag
       'menu.items': updatedMenuItems,
       'menu.lastUpdated': new Date().toISOString()
     });
+    invalidateRestaurantCache(restaurantId); // menu is embedded in the cached restaurant doc
 
     console.log(`✅ Menu item ${itemId} updated with ${uploadedImages.length} new images`);
 
@@ -16040,6 +16041,7 @@ app.delete('/api/menu-items/:itemId/images/:imageIndex', authenticateToken, asyn
       'menu.items': updatedMenuItems,
       'menu.lastUpdated': new Date().toISOString()
     });
+    invalidateRestaurantCache(restaurantId); // menu is embedded in the cached restaurant doc
 
     res.json({
       success: true,
