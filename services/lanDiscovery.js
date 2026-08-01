@@ -23,11 +23,54 @@
 
 // A stable, human-free address the terminals can hardcode. `.local` is resolved by
 // the OS mDNS resolver on the LAN — no DNS server, no router setup.
+const os = require('os');
 const STABLE_HOST = 'dineopen-server.local';
 const SERVICE_TYPE = 'dineopen'; // advertised as _dineopen._tcp
 
 let bonjour = null;
 let service = null;
+let ipWatchTimer = null;
+let lastIPs = '';
+
+// Sorted, comma-joined list of this machine's non-internal IPv4 addresses.
+function currentLanIPs() {
+  const ifs = os.networkInterfaces();
+  const ips = [];
+  for (const name of Object.keys(ifs)) {
+    for (const ni of ifs[name] || []) {
+      if (ni.family === 'IPv4' && !ni.internal) ips.push(ni.address);
+    }
+  }
+  return ips.sort().join(',');
+}
+
+function publish(port, opts) {
+  const { Bonjour } = require('bonjour-service');
+  bonjour = new Bonjour();
+  service = bonjour.publish({
+    name: opts.name || 'DineOpen Server',
+    type: SERVICE_TYPE,
+    protocol: 'tcp',
+    port: Number(port) || 3003,
+    // Announce A records for this fixed hostname → `dineopen-server.local` resolves
+    // to whatever IP this machine currently has. This is the terminals' fixed URL.
+    host: STABLE_HOST,
+    txt: {
+      name: opts.name || 'DineOpen Server',
+      restaurantId: opts.restaurantId || '',
+      version: opts.version || '',
+      path: '/api/health',
+    },
+  });
+  service.on && service.on('error', (e) => console.warn('📡 mDNS service error:', e && e.message));
+}
+
+function unpublish() {
+  try { if (service && service.stop) service.stop(); } catch (_) {}
+  try { if (bonjour && bonjour.destroy) bonjour.destroy(); } catch (_) {}
+  service = null;
+  bonjour = null;
+}
 
 /**
  * Start announcing this server on the LAN.
@@ -38,25 +81,24 @@ let service = null;
 function startDiscovery(port, opts = {}) {
   if (service) return true; // already advertising
   try {
-    const { Bonjour } = require('bonjour-service');
-    bonjour = new Bonjour();
-    service = bonjour.publish({
-      name: opts.name || 'DineOpen Server',
-      type: SERVICE_TYPE,
-      protocol: 'tcp',
-      port: Number(port) || 3003,
-      // Announce A records for this fixed hostname → `dineopen-server.local` resolves
-      // to whatever IP this machine currently has. This is the terminals' fixed URL.
-      host: STABLE_HOST,
-      txt: {
-        name: opts.name || 'DineOpen Server',
-        restaurantId: opts.restaurantId || '',
-        version: opts.version || '',
-        path: '/api/health',
-      },
-    });
-    service.on && service.on('error', (e) => console.warn('📡 mDNS service error:', e && e.message));
+    publish(port, opts);
+    lastIPs = currentLanIPs();
     console.log(`📡 LAN discovery on — terminals can use http://${STABLE_HOST}:${port} (also browsable as _${SERVICE_TYPE}._tcp)`);
+
+    // Re-advertise when the machine's IP changes (new Wi-Fi / DHCP lease / reboot),
+    // so `dineopen-server.local` always resolves to the CURRENT IP — without this,
+    // a single IP change leaves the hostname pointing at a dead address.
+    if (ipWatchTimer) clearInterval(ipWatchTimer);
+    ipWatchTimer = setInterval(() => {
+      const now = currentLanIPs();
+      if (now !== lastIPs) {
+        lastIPs = now;
+        console.log(`📡 LAN IP changed → re-advertising mDNS (now ${now || 'none'})`);
+        unpublish();
+        try { publish(port, opts); } catch (e) { console.warn('📡 re-advertise failed:', e && e.message); }
+      }
+    }, 15000);
+    if (ipWatchTimer.unref) ipWatchTimer.unref();
     return true;
   } catch (err) {
     // Non-fatal: the server still works via its IP address.
@@ -69,10 +111,8 @@ function startDiscovery(port, opts = {}) {
 
 /** Stop advertising (best-effort; called on shutdown). */
 function stopDiscovery() {
-  try { if (service && service.stop) service.stop(); } catch (_) {}
-  try { if (bonjour && bonjour.destroy) bonjour.destroy(); } catch (_) {}
-  service = null;
-  bonjour = null;
+  if (ipWatchTimer) { clearInterval(ipWatchTimer); ipWatchTimer = null; }
+  unpublish();
 }
 
 module.exports = { startDiscovery, stopDiscovery, STABLE_HOST, SERVICE_TYPE };
