@@ -1684,6 +1684,27 @@ app.use((req, res, next) => {
 
 app.use(helmet({ crossOriginResourcePolicy: { policy: "cross-origin" } }));
 
+// Offline local server: force `Cache-Control: no-store` on every response.
+// Many GET endpoints set `public, s-maxage=…, stale-while-revalidate=…` for the cloud/CDN.
+// In the installed POS (Electron/Chromium) talking to a loopback LAN server, that makes
+// the terminal render STALE data right after a change (browser serves the cached body and
+// revalidates in the background) — e.g. a reset/settled table still shows "occupied" until
+// you navigate away and back. On a local server caching buys nothing and staleness breaks
+// live updates, so we override any Cache-Control a handler sets, and disable ETag 304s.
+if (process.env.LOCAL_SERVER_MODE === 'true') {
+  app.set('etag', false);
+  app.use((req, res, next) => {
+    const NOSTORE = 'no-store, no-cache, must-revalidate, private';
+    const origSetHeader = res.setHeader.bind(res);
+    res.setHeader = function (name, value) {
+      if (String(name).toLowerCase() === 'cache-control') return origSetHeader('Cache-Control', NOSTORE);
+      return origSetHeader(name, value);
+    };
+    origSetHeader('Cache-Control', NOSTORE);
+    next();
+  });
+}
+
 // Note: compression removed — Vercel Edge applies gzip/brotli automatically.
 // Running compression() in serverless adds CPU overhead without benefit.
 
