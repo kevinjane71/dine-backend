@@ -20470,6 +20470,34 @@ app.post('/api/staff/:restaurantId/verify-pin', authenticateToken, async (req, r
 
 // Set / change / disable a staff member's terminal PIN (owner/manager only).
 // Body: { pin?: '4-8 digits' }  and/or  { enabled?: boolean }.
+// Set the CURRENT authenticated user's OWN terminal PIN (owner/admin/staff self-service).
+// Uses the identity from the JWT, so the frontend never has to know the user's doc id.
+// Registered BEFORE the :staffId route so "me" isn't matched as a staffId.
+app.patch('/api/staff/me/pin', authenticateToken, async (req, res) => {
+  try {
+    const myId = req.user.userId || req.user.id;
+    const { pin, enabled } = req.body || {};
+    const found = await findStaffDoc(myId);
+    if (!found || !found.doc || !found.doc.exists) return res.status(404).json({ error: 'Your account was not found' });
+    const update = { updatedAt: new Date() };
+    if (pin != null && String(pin) !== '') {
+      if (!/^\d{4,8}$/.test(String(pin))) return res.status(400).json({ error: 'PIN must be 4–8 digits' });
+      update.pinHash = await bcrypt.hash(String(pin), 10);
+      update.pinEnabled = true;
+    }
+    if (enabled === false) update.pinEnabled = false;
+    if (enabled === true && update.pinEnabled === undefined) update.pinEnabled = true;
+    if (update.pinHash === undefined && update.pinEnabled === undefined) {
+      return res.status(400).json({ error: 'Nothing to update — send a pin or enabled flag' });
+    }
+    await found.doc.ref.update(update);
+    res.json({ success: true, pinEnabled: update.pinEnabled });
+  } catch (error) {
+    console.error('set-my-pin error:', error);
+    res.status(500).json({ error: 'Failed to update PIN' });
+  }
+});
+
 app.patch('/api/staff/:staffId/pin', authenticateToken, requireOwnerRole, async (req, res) => {
   try {
     const { staffId } = req.params;
