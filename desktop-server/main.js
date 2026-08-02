@@ -589,7 +589,10 @@ function initUpdater() {
   if (!autoUpdater) { sendUpdate({ state: 'unsupported' }); return; }
   autoUpdater.autoDownload = false;            // admin decides when to download
   autoUpdater.autoInstallOnAppQuit = true;
-  autoUpdater.logger = { info: pushLog, warn: pushLog, error: pushLog, debug: () => {} };
+  // Quiet logger: the 'error' handler below logs a clean one-liner, so don't let
+  // electron-updater dump the full HttpError object + headers + stack into the log
+  // (an offline server 404s the feed on every check — that must not spam the log).
+  autoUpdater.logger = { info: pushLog, warn: pushLog, error: () => {}, debug: () => {} };
   // Optional override of the release feed for on-prem/self-hosted distribution.
   if (process.env.UPDATE_FEED_URL) {
     try { autoUpdater.setFeedURL({ provider: 'generic', url: process.env.UPDATE_FEED_URL }); } catch (_) {}
@@ -656,8 +659,22 @@ if (!app.requestSingleInstanceLock()) {
       initUpdater();
       scheduleAutoBackup();             // start the scheduled external backup, if enabled
       maybeCatchUpBackup();             // run a missed backup if the machine was off
-      // Silent check on launch so the admin sees a badge without hunting for it.
-      if (autoUpdater) setTimeout(() => { autoUpdater.checkForUpdates().catch(() => {}); }, 8000);
+      // Silent check on launch so the admin sees a badge without hunting for it — but
+      // ONLY when the machine actually has internet. An offline restaurant can never reach
+      // the update feed, so trying just 404s and logs noise every boot. Probe first.
+      if (autoUpdater) setTimeout(async () => {
+        try {
+          const dns = require('dns').promises;
+          await Promise.race([
+            dns.lookup('updates.dineopen.com'),
+            new Promise((_, rej) => setTimeout(() => rej(new Error('offline')), 2500)),
+          ]);
+        } catch (_) {
+          pushLog('🌐 Offline — skipping update check (server keeps running normally).');
+          return;
+        }
+        autoUpdater.checkForUpdates().catch(() => {});
+      }, 8000);
     } catch (e) {
       pushLog(`❌ Startup failed: ${e.message}`);
     }

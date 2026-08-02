@@ -1,7 +1,7 @@
 {
   "name": "dineopen-server",
   "productName": "DineOpen Server",
-  "version": "1.1.1",
+  "version": "1.1.4",
   "private": true,
   "description": "Self-contained on-prem server for DineOpen — bundles the backend + PostgreSQL so a restaurant installs one app and every terminal connects over the LAN.",
   "main": "main.js",
