@@ -603,8 +603,12 @@ function initUpdater() {
   // Offline servers can't reach the feed — that's normal, so only surface the error
   // in the UI when the admin explicitly clicked Check. Always log it either way.
   autoUpdater.on('error', (e) => {
-    pushLog(`⚠️ Update check: ${e.message}`);
-    if (manualUpdateCheck) sendUpdate({ state: 'error', message: e.message });
+    // electron-updater's HttpError.message is a huge multi-line blob (full URL + all
+    // response headers + stack). Log only the first line so an unreachable/404 feed
+    // (normal on an offline restaurant) never floods the server log.
+    const first = String((e && e.message) || e || 'unknown').split('\n')[0].trim().slice(0, 120);
+    pushLog(`⚠️ Update check skipped: ${first}`);
+    if (manualUpdateCheck) sendUpdate({ state: 'error', message: first });
     manualUpdateCheck = false;
   });
   autoUpdater.on('download-progress', (p) => sendUpdate({ state: 'downloading', percent: Math.round(p.percent) }));
