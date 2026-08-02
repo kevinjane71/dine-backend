@@ -227,18 +227,32 @@ function makeToPgRow(fieldMap, jsonbColumns, skipFields = new Set()) {
  * Create a toFirestoreObj function for a given reverse map.
  */
 function makeToFirestoreObj(reverseMap) {
+  // Keys that correspond to REAL mapped columns. A value for any of these must come from
+  // the column, never from a stale copy left inside extra_data by a past missing-column
+  // write — otherwise extra_data (spread last) would overwrite the authoritative column
+  // and silently scramble data (e.g. table status showing occupied when it's available).
+  const mappedKeys = new Set([...Object.keys(reverseMap), ...Object.values(reverseMap)]);
   return function toFirestoreObj(pgRow) {
     const obj = {};
 
-    for (const [col, value] of Object.entries(pgRow)) {
-      if (value === null || value === undefined) continue;
-
-      const camelKey = reverseMap[col];
-      if (camelKey) {
-        obj[camelKey] = value;
-      } else if (col === 'extra_data' && typeof value === 'object') {
-        Object.assign(obj, value);
+    // 1. extra_data (unmapped/overflow fields) FIRST, at lowest priority — but skip any
+    //    key that is actually a mapped column (it will be filled from the real column).
+    const ed = pgRow.extra_data;
+    if (ed && typeof ed === 'object') {
+      for (const [k, v] of Object.entries(ed)) {
+        if (v === null || v === undefined) continue;
+        if (mappedKeys.has(k)) continue;
+        obj[k] = v;
       }
+    }
+
+    // 2. Real mapped columns override — authoritative. (Unmapped non-extra_data columns
+    //    are dropped, preserving prior behavior.)
+    for (const [col, value] of Object.entries(pgRow)) {
+      if (col === 'extra_data') continue;
+      if (value === null || value === undefined) continue;
+      const camelKey = reverseMap[col];
+      if (camelKey) obj[camelKey] = value;
     }
 
     return obj;

@@ -292,27 +292,26 @@ function toPgRow(firestoreObj) {
 function toFirestoreObj(pgRow) {
   const result = {};
 
+  // 1. extra_data (unmapped/overflow fields) FIRST, at lowest priority — but skip any key
+  //    that is actually a mapped column. Otherwise a stale copy of e.g. `status` that
+  //    leaked into extra_data during an old missing-column write would overwrite the real
+  //    column and scramble the order/table data on read.
+  const ed = pgRow.extra_data;
+  if (ed && typeof ed === 'object') {
+    for (const [k, v] of Object.entries(ed)) {
+      if (v === null || v === undefined) continue;
+      if (FIELD_MAP[k] || REVERSE_MAP[k]) continue; // mapped column → use the real column
+      result[k] = v;
+    }
+  }
+
+  // 2. Real columns override — authoritative. Unmapped non-extra_data columns pass through.
   for (const [col, value] of Object.entries(pgRow)) {
+    if (col === 'extra_data') continue;
     if (value === null || value === undefined) continue;
-
-    if (col === 'id') {
-      result.id = value;
-      continue;
-    }
-
-    if (col === 'extra_data' && typeof value === 'object') {
-      // Spread extra_data fields back into top-level
-      Object.assign(result, value);
-      continue;
-    }
-
+    if (col === 'id') { result.id = value; continue; }
     const camelKey = REVERSE_MAP[col];
-    if (camelKey) {
-      result[camelKey] = value;
-    } else {
-      // PG column with no reverse mapping — pass through as-is
-      result[col] = value;
-    }
+    result[camelKey || col] = value;
   }
 
   return result;

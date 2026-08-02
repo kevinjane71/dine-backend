@@ -52,16 +52,23 @@ function makeToPgRow(fieldMap, skipFields = new Set()) {
 }
 
 function makeToFirestoreObj(reverseMap) {
+  // A mapped column must come from the real column, never a stale extra_data copy.
+  const mappedKeys = new Set([...Object.keys(reverseMap), ...Object.values(reverseMap)]);
   return function toFirestoreObj(pgRow) {
     const obj = {};
+    const ed = pgRow.extra_data;
+    if (ed && typeof ed === 'object') {
+      for (const [k, v] of Object.entries(ed)) {
+        if (v === null || v === undefined) continue;
+        if (mappedKeys.has(k)) continue;
+        obj[k] = v;
+      }
+    }
     for (const [col, value] of Object.entries(pgRow)) {
+      if (col === 'extra_data') continue;
       if (value === null || value === undefined) continue;
       const camelKey = reverseMap[col];
-      if (camelKey) {
-        obj[camelKey] = value;
-      } else if (col === 'extra_data' && typeof value === 'object') {
-        Object.assign(obj, value);
-      }
+      if (camelKey) obj[camelKey] = value;
     }
     return obj;
   };

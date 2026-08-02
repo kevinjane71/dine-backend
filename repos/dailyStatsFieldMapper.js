@@ -172,6 +172,17 @@ function toPgRow(firestoreObj) {
 function toFirestoreObj(pgRow) {
   const result = {};
 
+  // extra_data (unmapped/overflow) first, at lowest priority; skip any key that is a mapped
+  // column so a stale copy left in extra_data can never overwrite the real column.
+  const ed = pgRow.extra_data;
+  if (ed && typeof ed === 'object') {
+    for (const [k, v] of Object.entries(ed)) {
+      if (v === null || v === undefined) continue;
+      if (FIELD_MAP[k] || REVERSE_MAP[k]) continue;
+      result[k] = v;
+    }
+  }
+
   for (const [col, value] of Object.entries(pgRow)) {
     if (value === null || value === undefined) continue;
 
@@ -180,10 +191,7 @@ function toFirestoreObj(pgRow) {
       continue;
     }
 
-    if (col === 'extra_data' && typeof value === 'object') {
-      Object.assign(result, value);
-      continue;
-    }
+    if (col === 'extra_data') continue; // handled above
 
     // Unpack payment_methods JSONB → flat paymentMethod_* keys
     if (col === 'payment_methods' && typeof value === 'object') {
