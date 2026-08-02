@@ -11023,6 +11023,12 @@ app.post('/api/orders', authenticateOrderCreate, async (req, res) => {
                 updatedAt: new Date()
               });
               firestoreUpdated = true;
+              // Broadcast the table change so every terminal flips it to occupied live
+              // (event-sourced — same path completing a bill uses). Without this, placing
+              // an order only fired order-created and the table lagged/was inconsistent.
+              pusherService.triggerTableStatusUpdated(restaurantId, {
+                tableId: orderData.tableId, status: 'occupied', orderId: orderRef.id, tableNumber: tableNumber.trim(),
+              }).catch(err => console.error('table-status-updated (occupied) error:', err));
             }
             if (!firestoreUpdated) {
               const floorsSnapshot = await db.collection('restaurants')
@@ -11037,6 +11043,9 @@ app.post('/api/orders', authenticateOrderCreate, async (req, res) => {
                     lastOrderTime: new Date(), updatedAt: new Date()
                   });
                   firestoreUpdated = true;
+                  pusherService.triggerTableStatusUpdated(restaurantId, {
+                    tableId: tablesSnapshot.docs[0].id, status: 'occupied', orderId: orderRef.id, tableNumber: tableNumber.trim(),
+                  }).catch(err => console.error('table-status-updated (occupied) error:', err));
                   break;
                 }
               }

@@ -84,20 +84,22 @@ function floorToPgRow(firestoreObj) {
 function floorToFirestoreObj(pgRow) {
   const result = {};
 
+  // extra_data first (lowest priority); a key that is a mapped column must come from the
+  // real column, never from a stale extra_data copy. See tableToFirestoreObj for details.
+  if (pgRow.extra_data && typeof pgRow.extra_data === 'object') {
+    for (const [k, v] of Object.entries(pgRow.extra_data)) {
+      if (v === null || v === undefined) continue;
+      if (FLOOR_FIELD_MAP[k]) continue;
+      result[k] = v;
+    }
+  }
+
   for (const [col, value] of Object.entries(pgRow)) {
+    if (col === 'extra_data') continue;
     if (value === null || value === undefined) continue;
     if (col === 'id') { result.id = value; continue; }
-    if (col === 'extra_data' && typeof value === 'object') {
-      Object.assign(result, value);
-      continue;
-    }
-
     const camelKey = FLOOR_REVERSE_MAP[col];
-    if (camelKey) {
-      result[camelKey] = value;
-    } else {
-      result[col] = value;
-    }
+    result[camelKey || col] = value;
   }
 
   return result;
@@ -128,20 +130,25 @@ function tableToPgRow(firestoreObj) {
 function tableToFirestoreObj(pgRow) {
   const result = {};
 
+  // 1. extra_data (unmapped/overflow fields) is LOWEST priority. Critically, a key that
+  //    is actually a mapped column (e.g. `status`, `currentOrderId`) must NEVER be taken
+  //    from extra_data — it can be a stale value left there by a past missing-column write
+  //    and would otherwise overwrite the real column and scramble table status.
+  if (pgRow.extra_data && typeof pgRow.extra_data === 'object') {
+    for (const [k, v] of Object.entries(pgRow.extra_data)) {
+      if (v === null || v === undefined) continue;
+      if (TABLE_FIELD_MAP[k]) continue; // mapped column → take the real column below
+      result[k] = v;
+    }
+  }
+
+  // 2. Real columns override — always authoritative.
   for (const [col, value] of Object.entries(pgRow)) {
+    if (col === 'extra_data') continue;
     if (value === null || value === undefined) continue;
     if (col === 'id') { result.id = value; continue; }
-    if (col === 'extra_data' && typeof value === 'object') {
-      Object.assign(result, value);
-      continue;
-    }
-
     const camelKey = TABLE_REVERSE_MAP[col];
-    if (camelKey) {
-      result[camelKey] = value;
-    } else {
-      result[col] = value;
-    }
+    result[camelKey || col] = value;
   }
 
   return result;
