@@ -617,6 +617,12 @@ class PgDocRef {
       // several unmapped fields into extra_data, must combine — not emit N
       // clauses. Keyed by column → current RHS SQL expression.
       const jsonbAccum = {};
+      // Track which parent prefixes we've already ensured exist, per column, within THIS
+      // statement. A prefix must be created only once — re-creating it for a later sibling
+      // rebuilds it from the raw column and discards the earlier sibling's write (the
+      // dailyStats sibling-clobber bug). Once ensured, later siblings find the parent in
+      // the evolving expression and jsonb_set their leaf without touching it.
+      const jsonbEnsured = {};
       const jsonbBase = (col) => (jsonbAccum[col] !== undefined ? jsonbAccum[col] : `COALESCE(${col}, '{}'::jsonb)`);
 
       for (const [key, val] of Object.entries(data)) {
@@ -644,8 +650,15 @@ class PgDocRef {
           // baseExpr chains off any prior write to this same column so multiple
           // path writes collapse into one SET clause (see jsonbAccum above).
           let baseExpr = jsonbBase(pgCol);
+          const ensured = jsonbEnsured[pgCol] || (jsonbEnsured[pgCol] = new Set());
           for (let d = 1; d < jsonPath.length; d++) {
-            const prefixIdx = addValue(jsonPath.slice(0, d));
+            const prefix = jsonPath.slice(0, d);
+            const pkey = prefix.join(' ');
+            // Only ensure each parent prefix once per statement — otherwise a later sibling
+            // resets it from the raw column and wipes the earlier sibling's write.
+            if (ensured.has(pkey)) continue;
+            ensured.add(pkey);
+            const prefixIdx = addValue(prefix);
             baseExpr = `jsonb_set(${baseExpr}, $${prefixIdx}::text[], COALESCE(${pgCol}#>$${prefixIdx}::text[], '{}'::jsonb), true)`;
           }
           const pathIdx = addValue(jsonPath);
@@ -1201,8 +1214,18 @@ class PgQuery {
       // extra_data JSONB overflow (stored under its ORIGINAL key) — order on that instead
       // of emitting `ORDER BY <col>` for a column that doesn't exist (which 500s).
       const orderJsonbCols = this._config.jsonbCols;
+      // Firestore implicitly orders by an inequality/range field (ASC) when the query has
+      // such a filter and no explicit orderBy — without this, `where(x,'>',n).limit(k)`
+      // returns an arbitrary heap-order slice instead of the k smallest. Scope this to the
+      // exact case (no explicit orderBy, no cursor) so cursor/multi-orderBy paths are untouched.
+      let orderBys = this._orderBys;
+      if (orderBys.length === 0 && !usingCursor) {
+        const INEQ = new Set(['<', '<=', '>', '>=', '!=']);
+        const ineq = this._wheres.find(w => INEQ.has(w.op) && typeof w.field === 'string');
+        if (ineq) orderBys = [{ field: ineq.field, direction: 'asc' }];
+      }
       const orderParts = [];
-      for (const o of this._orderBys) {
+      for (const o of orderBys) {
         const pgCol = resolveField(fieldMap, o.field);
         const dir = o.direction === 'desc' ? 'DESC' : 'ASC';
         let colExpr = pgCol;
@@ -1286,7 +1309,7 @@ class PgQuery {
         // (code-point) ordering — the DB's locale collation would tie-break
         // same-sort-key rows in a different order than Firestore.
         const lastDir =
-          this._orderBys[this._orderBys.length - 1].direction === 'desc' ? 'DESC' : 'ASC';
+          orderBys[orderBys.length - 1].direction === 'desc' ? 'DESC' : 'ASC';
         sql += ' ORDER BY ' + orderParts.join(', ') + `, id COLLATE "C" ${lastDir}`;
       }
 
