@@ -29,6 +29,9 @@ pg.types.setTypeParser(1700, (val) => parseFloat(val));
 // INT8 / BIGINT (OID 20)
 pg.types.setTypeParser(20, (val) => parseInt(val, 10));
 
+// Monotonic counter for unique SAVEPOINT names inside transactions/batches.
+let _savepointSeq = 0;
+
 // ---------------------------------------------------------------------------
 // Redis Cache Layer (Upstash — kvCache)
 // ---------------------------------------------------------------------------
@@ -355,7 +358,23 @@ class PgDocRef {
    */
   async _exec(text, values) {
     if (this._client) {
-      return this._client.query(text, values);
+      // On a transaction/batch connection, wrap each WRITE in a SAVEPOINT so a failing
+      // statement (e.g. a missing column that the caller retries into extra_data) can be
+      // rolled back to the savepoint WITHOUT poisoning the whole transaction (Postgres
+      // 25P02 would otherwise abort every other write in the batch). Reads are left alone.
+      if (/^\s*SELECT/i.test(text)) {
+        return this._client.query(text, values);
+      }
+      const sp = `pgsp_${++_savepointSeq}`;
+      await this._client.query(`SAVEPOINT ${sp}`);
+      try {
+        const r = await this._client.query(text, values);
+        await this._client.query(`RELEASE SAVEPOINT ${sp}`);
+        return r;
+      } catch (e) {
+        try { await this._client.query(`ROLLBACK TO SAVEPOINT ${sp}`); } catch (_) {}
+        throw e;
+      }
     }
     return pgQuery(text, values);
   }
