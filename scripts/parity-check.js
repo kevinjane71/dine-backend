@@ -56,6 +56,7 @@ function expectIds(docs, spec) {
         case '<': return v !== undefined && v < target;
         case '<=': return v !== undefined && v <= target;
         case 'in': return (val).map(toMillis).includes(v);
+        case 'not-in': return v !== undefined && !(val).map(toMillis).includes(v);
         case 'array-contains': return Array.isArray(getField(d, f)) && getField(d, f).includes(val);
         default: return true;
       }
@@ -91,6 +92,11 @@ const GROUPS = {
     { coll: 'orders', desc: 'status == completed, latest 30', where: [['status', '==', 'completed']], orderBy: ['createdAt', 'desc'], limit: 30 },
     { coll: 'orders', desc: 'status in [confirmed,pending,preparing,ready] (KOT)', where: [['status', 'in', ['confirmed', 'pending', 'preparing', 'ready']]], limit: 100 },
     { coll: 'orders', desc: 'finalAmount > 500, top 25 (inequality+order)', where: [['finalAmount', '>', 500]], orderBy: ['finalAmount', 'desc'], limit: 25 },
+    { coll: 'orders', desc: 'status != completed, latest 40 (!=, excludes missing field)', where: [['status', '!=', 'completed']], orderBy: ['status', 'asc'], limit: 40 },
+    { coll: 'orders', desc: 'status not-in [completed,cancelled], 40', where: [['status', 'not-in', ['completed', 'cancelled']]], orderBy: ['status', 'asc'], limit: 40 },
+    { coll: 'orders', desc: 'compound: status==completed AND finalAmount>100, top 30', where: [['status', '==', 'completed'], ['finalAmount', '>', 100]], orderBy: ['finalAmount', 'desc'], limit: 30 },
+    { coll: 'orders', desc: 'orderBy completedAt desc (many docs MISSING this field)', orderBy: ['completedAt', 'desc'], limit: 40 },
+    { coll: 'orders', desc: 'paymentMethod == cash, 40', where: [['paymentMethod', '==', 'cash']], orderBy: ['createdAt', 'desc'], limit: 40 },
   ],
   customers: [
     { coll: 'customers', desc: 'latest 50 by createdAt desc', orderBy: ['createdAt', 'desc'], limit: 50 },
@@ -132,11 +138,14 @@ const GROUPS = {
       try {
         const exp = expectIds(fsDocs, spec);
         const act = await pgIds({ ...spec, where: [['restaurantId', '==', RID], ...(spec.where || [])] });
-        const sameOrder = exp.join(',') === act.join(',');
         const se = new Set(exp), sa = new Set(act);
         const missing = exp.filter(x => !sa.has(x)), extra = act.filter(x => !se.has(x));
-        if (sameOrder) { console.log(`  ✓ ${spec.desc}  (${exp.length} docs, order match)`); pass++; }
-        else if (missing.length === 0 && extra.length === 0) { console.log(`  ~ ${spec.desc}  (${exp.length}, SET ok, ORDER differs)`); fail++; fails.push(`${label}: order`); }
+        const sameSet = missing.length === 0 && extra.length === 0;
+        // Order is only defined when the query has an orderBy; otherwise compare set only.
+        const ordered = !!spec.orderBy;
+        const sameOrder = exp.join(',') === act.join(',');
+        if (ordered ? sameOrder : sameSet) { console.log(`  ✓ ${spec.desc}  (${exp.length} docs${ordered ? ', order match' : ', set match (unordered)'})`); pass++; }
+        else if (sameSet && ordered) { console.log(`  ✗ ${spec.desc}  (${exp.length}, SET ok but ORDER differs)`); fail++; fails.push(`${label}: order`); }
         else {
           console.log(`  ✗ ${spec.desc}  exp=${exp.length} pg=${act.length} | missingInPG=${missing.length} extraInPG=${extra.length}`);
           if (missing.length) console.log(`       missing: ${missing.slice(0, 4).join(', ')}`);
@@ -146,6 +155,27 @@ const GROUPS = {
       } catch (e) { console.log(`  ⚠ ${spec.desc}  ERROR ${e.message.slice(0, 60)}`); err++; fails.push(`${label}: ERR`); }
     }
   }
+  // ── cursor pagination (startAfter with a doc snapshot) on the pgAdapter ──
+  if (!FILTER || FILTER === 'orders') {
+    try {
+      const base = () => db.collection('orders').where('restaurantId', '==', RID).orderBy('createdAt', 'desc');
+      const p1 = await base().limit(10).get();
+      const p1ids = p1.docs.map(d => d.id);
+      const last = p1.docs[p1.docs.length - 1];
+      const p2ids = (await base().startAfter(last).limit(10).get()).docs.map(d => d.id);
+      const combined = await base().limit(20).get();
+      const cIds = combined.docs.map(d => d.id);
+      const paged = [...p1ids, ...p2ids];
+      const overlap = p1ids.filter(x => p2ids.includes(x));
+      const ok = overlap.length === 0 && paged.join(',') === cIds.join(',');
+      if (ok) { console.log(`✓ orders      | cursor: page1(10)+page2(10) == limit(20), no overlap`); pass++; }
+      else {
+        console.log(`✗ orders      | cursor pagination broken  overlap=${overlap.length}  paged==limit20? ${paged.join(',') === cIds.join(',')}`);
+        fail++; fails.push('orders cursor pagination');
+      }
+    } catch (e) { console.log(`⚠ orders      | cursor test ERROR ${e.message.slice(0, 60)}`); err++; }
+  }
+
   console.log(`\n=== RESULT: ${pass} pass, ${fail} mismatch, ${err} error ===`);
   if (fails.length) { console.log('ISSUES:'); fails.forEach(f => console.log('  - ' + f)); }
   process.exit(fail + err > 0 ? 1 : 0);
