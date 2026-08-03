@@ -1066,10 +1066,10 @@ class PgQuery {
         } else if (typeof cleanValue === 'number') {
           // ->> returns text — cast so numeric comparisons aren't lexicographic
           const vIdx = addValue(cleanValue);
-          conditions.push(`(${textExpr})::numeric ${mappedOp} $${vIdx}`);
+          conditions.push(`(CASE WHEN (${textExpr}) ~ '^-?[0-9]+([.][0-9]+)?$' THEN (${textExpr})::numeric END) ${mappedOp} $${vIdx}`);
         } else if (cleanValue instanceof Date) {
           const vIdx = addValue(cleanValue);
-          conditions.push(`(${textExpr})::timestamptz ${mappedOp} $${vIdx}`);
+          conditions.push(`(CASE WHEN (${textExpr}) ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}' THEN (${textExpr})::timestamptz END) ${mappedOp} $${vIdx}`);
         } else if (typeof cleanValue === 'boolean') {
           const vIdx = addValue(String(cleanValue));
           conditions.push(`${textExpr} ${mappedOp} $${vIdx}`);
@@ -1114,10 +1114,10 @@ class PgQuery {
           conditions.push(`${textExpr} != ALL($${vIdx})`);
         } else if (typeof cleanValue === 'number') {
           const vIdx = addValue(cleanValue);
-          conditions.push(`(${textExpr})::numeric ${mappedOp} $${vIdx}`);
+          conditions.push(`(CASE WHEN (${textExpr}) ~ '^-?[0-9]+([.][0-9]+)?$' THEN (${textExpr})::numeric END) ${mappedOp} $${vIdx}`);
         } else if (cleanValue instanceof Date) {
           const vIdx = addValue(cleanValue);
-          conditions.push(`(${textExpr})::timestamptz ${mappedOp} $${vIdx}`);
+          conditions.push(`(CASE WHEN (${textExpr}) ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}' THEN (${textExpr})::timestamptz END) ${mappedOp} $${vIdx}`);
         } else if (typeof cleanValue === 'boolean') {
           const vIdx = addValue(String(cleanValue));
           conditions.push(`${textExpr} ${mappedOp} $${vIdx}`);
