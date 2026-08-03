@@ -115,21 +115,29 @@ function resolveField(fieldMap, field) {
 // that isn't in the collection's field map. Returns null if introspection fails
 // (then callers behave exactly as before — no fallback).
 const _tableColsCache = new Map();
+const _tableTextColsCache = new Map(); // table -> Set of text-typed column names (for COLLATE "C")
+const _TEXT_TYPES = new Set(['text', 'character varying', 'character', 'varchar', 'char', 'citext', 'name']);
 async function getTableColumns(table) {
   if (_tableColsCache.has(table)) return _tableColsCache.get(table);
   try {
     const res = await pgQuery(
-      "SELECT column_name FROM information_schema.columns WHERE table_schema = 'public' AND table_name = $1",
+      "SELECT column_name, data_type FROM information_schema.columns WHERE table_schema = 'public' AND table_name = $1",
       [table]
     );
     const set = new Set((res.rows || []).map((r) => String(r.column_name).toLowerCase()));
+    const textSet = new Set((res.rows || [])
+      .filter((r) => _TEXT_TYPES.has(String(r.data_type).toLowerCase()))
+      .map((r) => String(r.column_name).toLowerCase()));
     const val = set.size > 0 ? set : null;
-    if (val) _tableColsCache.set(table, val);
+    if (val) { _tableColsCache.set(table, val); _tableTextColsCache.set(table, textSet); }
     return val;
   } catch (_) {
     return null;
   }
 }
+// Text-typed columns for a table (populated by getTableColumns). Used to add COLLATE "C"
+// so string ORDER BY matches Firestore's byte-order sort instead of the DB's locale collation.
+function getTextColumns(table) { return _tableTextColsCache.get(table) || null; }
 
 function generateId() {
   const chars =
@@ -1243,17 +1251,24 @@ class PgQuery {
         const ineq = this._wheres.find(w => INEQ.has(w.op) && typeof w.field === 'string');
         if (ineq) orderBys = [{ field: ineq.field, direction: 'asc' }];
       }
+      const textCols = getTextColumns(table);
       const orderParts = [];
       for (const o of orderBys) {
         const pgCol = resolveField(fieldMap, o.field);
         const dir = o.direction === 'desc' ? 'DESC' : 'ASC';
         let colExpr = pgCol;
+        // Firestore sorts strings by UTF-8 byte order; Postgres default is the DB locale
+        // (en_US here), which reorders case/accents. Add COLLATE "C" to TEXT sort keys so
+        // string ordering (and which docs fall under a limit) matches Firestore.
+        let isTextExpr = !!(textCols && textCols.has(pgCol.toLowerCase()));
         const simpleField = typeof o.field === 'string' && !o.field.includes('.');
         if (simpleField && knownCols && !knownCols.has(pgCol.toLowerCase()) && orderJsonbCols && orderJsonbCols.has('extra_data')) {
           values.push(o.field);
           colExpr = `extra_data ->> $${values.length}`;
+          isTextExpr = true; // JSONB ->> yields text
         }
-        orderParts.push(`${colExpr} ${dir}`);
+        const collate = isTextExpr ? ' COLLATE "C"' : '';
+        orderParts.push(`${colExpr}${collate} ${dir}`);
         conditions.push(`${colExpr} IS NOT NULL`);
       }
 
