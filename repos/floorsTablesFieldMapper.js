@@ -67,7 +67,7 @@ function floorToPgRow(firestoreObj) {
 
   for (const [key, value] of Object.entries(firestoreObj)) {
     if (key === 'id') { pgRow.id = value; continue; }
-    if (value && typeof value === 'object' && typeof value.isEqual === 'function') continue;
+    if (value && typeof value === 'object' && typeof value.isEqual === 'function' && typeof value.toDate !== 'function' && value._seconds === undefined) continue;
 
     const pgCol = FLOOR_FIELD_MAP[key];
     if (pgCol) {
@@ -113,7 +113,7 @@ function tableToPgRow(firestoreObj) {
 
   for (const [key, value] of Object.entries(firestoreObj)) {
     if (key === 'id') { pgRow.id = value; continue; }
-    if (value && typeof value === 'object' && typeof value.isEqual === 'function') continue;
+    if (value && typeof value === 'object' && typeof value.isEqual === 'function' && typeof value.toDate !== 'function' && value._seconds === undefined) continue;
 
     const pgCol = TABLE_FIELD_MAP[key];
     if (pgCol) {

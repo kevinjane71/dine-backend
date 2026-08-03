@@ -89,7 +89,7 @@ function toPgRow(firestoreObj) {
     }
 
     // Skip FieldValue sentinels (serverTimestamp, etc.)
-    if (value && typeof value === 'object' && typeof value.isEqual === 'function') {
+    if (value && typeof value === 'object' && typeof value.isEqual === 'function' && typeof value.toDate !== 'function' && value._seconds === undefined) {
       continue;
     }
 

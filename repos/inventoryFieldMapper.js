@@ -16,7 +16,7 @@ function buildReverse(map) {
 // ── Helper: convert Firestore Timestamps / FieldValue sentinels ──────────
 function cleanValue(value) {
   if (value === undefined) return undefined;
-  if (value !== null && typeof value === 'object' && typeof value.isEqual === 'function') {
+  if (value !== null && typeof value === 'object' && typeof value.isEqual === 'function' && typeof value.toDate !== 'function' && value._seconds === undefined) {
     return undefined; // Skip FieldValue.delete(), serverTimestamp(), etc.
   }
   if (value && typeof value.toDate === 'function') {

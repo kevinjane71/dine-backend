@@ -113,7 +113,7 @@ function toPgRow(firestoreObj) {
     if (value === undefined) continue;
 
     // Handle Firestore FieldValue sentinels
-    if (value !== null && typeof value === 'object' && typeof value.isEqual === 'function') {
+    if (value !== null && typeof value === 'object' && typeof value.isEqual === 'function' && typeof value.toDate !== 'function' && value._seconds === undefined) {
       continue; // Skip FieldValue.delete(), serverTimestamp(), etc.
     }
 

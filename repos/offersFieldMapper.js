@@ -55,7 +55,7 @@ function toPgRow(firestoreObj) {
   for (const [key, value] of Object.entries(firestoreObj)) {
     if (SKIP_FIELDS.has(key)) continue;
     if (value === undefined) continue;
-    if (value !== null && typeof value === 'object' && typeof value.isEqual === 'function') continue;
+    if (value !== null && typeof value === 'object' && typeof value.isEqual === 'function' && typeof value.toDate !== 'function' && value._seconds === undefined) continue;
 
     let cleanValue = value;
     if (value && typeof value.toDate === 'function') {

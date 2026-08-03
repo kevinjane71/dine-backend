@@ -87,8 +87,12 @@ function toPgRow(firestoreObj) {
     if (SKIP_FIELDS.has(key)) continue;
     if (value === undefined) continue;
 
-    // Handle Firestore FieldValue sentinels
-    if (value !== null && typeof value === 'object' && typeof value.isEqual === 'function') {
+    // Skip Firestore FieldValue sentinels (serverTimestamp/increment/…) — but NOT
+    // Timestamp values, which ALSO expose isEqual() and must be converted below.
+    // (A Timestamp has toDate()/_seconds; a sentinel does not.) Dropping them here was
+    // silently discarding createdAt/updatedAt so the column defaulted to NOW().
+    if (value !== null && typeof value === 'object' && typeof value.isEqual === 'function'
+        && typeof value.toDate !== 'function' && value._seconds === undefined) {
       continue;
     }
 
