@@ -17,7 +17,45 @@ function getRedis() {
   if (redis) return redis;
 
   try {
-    // Only use explicit REST API vars — these are the correct ones for @upstash/redis
+    // ── Local / co-located Redis (VM deployment) — preferred when REDIS_URL is set ──
+    // A standard Redis on the same box speaks the Redis protocol (redis://host:port),
+    // which @upstash/redis (REST) cannot use. We wrap ioredis in an adapter that matches
+    // the small subset of the @upstash interface kvGet/kvSet/kvIncrBy rely on
+    // (get → auto-parsed value, set(key,val,{ex}), incrby, expire, del). JSON is handled
+    // here so callers keep passing/receiving objects exactly like with Upstash.
+    if (process.env.REDIS_URL) {
+      const IORedis = require('ioredis');
+      const client = new IORedis(process.env.REDIS_URL, {
+        // Buffer commands issued during the brief startup connect (offline queue ON), but cap
+        // retries so a genuinely-down Redis fails fast; kvGet's 2s withTimeout then returns null
+        // → the request falls through to Firestore. Local co-located Redis connects in <50ms.
+        maxRetriesPerRequest: 3,
+        connectTimeout: 3000,
+        retryStrategy: (times) => (times > 10 ? null : Math.min(times * 200, 2000)),
+      });
+      // Swallow connection errors — every kv* helper already guards and degrades to Firestore.
+      client.on('error', (e) => { if (!getRedis._warned) { console.warn('KV Cache: Redis error:', e.message); getRedis._warned = true; } });
+      redis = {
+        _mode: 'ioredis',
+        async get(key) {
+          const v = await client.get(key);
+          if (v == null) return null;
+          try { return JSON.parse(v); } catch (_) { return v; }
+        },
+        async set(key, val, opts) {
+          const s = typeof val === 'string' ? val : JSON.stringify(val);
+          if (opts && opts.ex) return client.set(key, s, 'EX', opts.ex);
+          return client.set(key, s);
+        },
+        incrby(key, n) { return client.incrby(key, n); },
+        expire(key, ttl) { return client.expire(key, ttl); },
+        del(key) { return client.del(key); },
+      };
+      console.log('KV Cache: Initialized from REDIS_URL (local/standard Redis via ioredis)');
+      return redis;
+    }
+
+    // ── Upstash REST (Vercel / serverless) ──
     if (process.env.KV_REST_API_URL && process.env.KV_REST_API_TOKEN) {
       const { Redis } = require('@upstash/redis');
       redis = new Redis({
@@ -28,8 +66,6 @@ function getRedis() {
       return redis;
     }
 
-    // REDIS_URL is the Redis protocol URL — NOT usable by @upstash/redis REST client.
-    // If you only have REDIS_URL, you need to also add KV_REST_API_URL and KV_REST_API_TOKEN.
     return null;
   } catch (err) {
     console.error('KV Cache: Failed to initialize Redis:', err.message);
