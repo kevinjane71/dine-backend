@@ -986,6 +986,7 @@ class DineAIToolExecutor {
 
       console.log(`🍽️ Creating order document...`);
       const orderRef = await db.collection('orders').add(orderData);
+      try { require('../../utils/kvCache').invalidateOrdersCache(restaurantId); } catch (_) {}
       console.log(`✅ Order document created: ${orderRef.id}`);
 
       // Update table status to occupied if table number provided
@@ -1130,6 +1131,7 @@ class DineAIToolExecutor {
       status,
       updatedAt: FieldValue.serverTimestamp()
     });
+    try { require('../../utils/kvCache').invalidateOrdersCache(restaurantId); } catch (_) {}
 
     return {
       success: true,
@@ -1155,6 +1157,7 @@ class DineAIToolExecutor {
       cancelledAt: FieldValue.serverTimestamp(),
       updatedAt: FieldValue.serverTimestamp()
     });
+    try { require('../../utils/kvCache').invalidateOrdersCache(restaurantId); } catch (_) {}
 
     // Release table if order had a table
     if (order.tableNumber) {
@@ -1374,6 +1377,7 @@ class DineAIToolExecutor {
 
       // Apply update
       await db.collection('orders').doc(currentOrder.id).update(updateData);
+      try { require('../../utils/kvCache').invalidateOrdersCache(restaurantId); } catch (_) {}
 
       console.log(`✅ Order #${currentOrder.orderId} updated successfully`);
 
@@ -1470,6 +1474,7 @@ class DineAIToolExecutor {
       updatedAt: FieldValue.serverTimestamp(),
       billPrinted: false // Reset for print trigger
     });
+    try { require('../../utils/kvCache').invalidateOrdersCache(restaurantId); } catch (_) {}
 
     // Release the table (set to available, not cleaning)
     if (order.tableNumber) {

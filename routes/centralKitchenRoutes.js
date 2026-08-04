@@ -315,6 +315,7 @@ router.patch('/:orgId/production-orders/:orderId/complete', ...ckMiddleware, asy
         currentStock: newStock,
         updatedAt: new Date()
       });
+      try { require('../utils/kvCache').invalidateInventoryCache(invData.restaurantId); } catch (_) {}
 
       // Create inventory transaction
       await createInventoryTransaction({
@@ -359,6 +360,7 @@ router.patch('/:orgId/production-orders/:orderId/complete', ...ckMiddleware, asy
         currentStock: updatedStock,
         updatedAt: new Date()
       });
+      try { require('../utils/kvCache').invalidateInventoryCache(fgData.restaurantId); } catch (_) {}
 
       await createInventoryTransaction({
         restaurantId: order.centralKitchenId,
@@ -686,6 +688,7 @@ router.patch('/:orgId/distribution-plans/:planId/dispatch/:outletId', ...ckMiddl
         currentStock: newStock,
         updatedAt: new Date()
       });
+      try { require('../utils/kvCache').invalidateInventoryCache(invData.restaurantId); } catch (_) {}
 
       await createInventoryTransaction({
         restaurantId: plan.centralKitchenId,
@@ -789,8 +792,10 @@ router.patch('/:orgId/distribution-plans/:planId/receive/:outletId', ...ckMiddle
         currentStock: newStock,
         updatedAt: new Date()
       });
+      try { require('../utils/kvCache').invalidateInventoryCache(invData.restaurantId); } catch (_) {}
     } else {
       // Create new inventory item at outlet
+      try { require('../utils/kvCache').invalidateInventoryCache(outletId); } catch (_) {}
       const newInvRef = await db.collection(collections.inventory).add({
         restaurantId: outletId,
         name: plan.itemName,
