@@ -152,6 +152,27 @@ function invalidateUserCache(userId) {
   kvDel(`user:${userId}`).catch(() => {});
 }
 
+// ── Orders list cache: version-counter invalidation ───────────────────────────
+// GET /api/orders/:restaurantId (dashboard + order history) caches its result under a
+// per-restaurant version. ANY order write bumps the version, so every cached order-list
+// variant (status filters, pagination, date range) instantly misses → next read is fresh.
+// This keeps orders LIVE (a new/edited order invalidates immediately) while killing the
+// repeated idle re-fetches that dominate the read cost.
+async function getOrdersVersion(restaurantId) {
+  const v = await kvGet(`orders:${restaurantId}:ver`);
+  return v != null ? String(v) : '0';
+}
+function invalidateOrdersCache(restaurantId) {
+  if (!restaurantId) return;
+  // 1h TTL on the counter — if it ever expires the cache just misses (safe).
+  kvIncrBy(`orders:${restaurantId}:ver`, 1, 3600).catch(() => {});
+}
+function ordersCacheKey(restaurantId, version, queryDesc) {
+  const crypto = require('crypto');
+  const hash = crypto.createHash('md5').update(String(queryDesc || '')).digest('hex').slice(0, 16);
+  return `orders:${restaurantId}:v${version}:${hash}`;
+}
+
 /**
  * Normalize phone number for cache key consistency
  */
@@ -205,4 +226,7 @@ module.exports = {
   getCachedCustomerByPhone,
   invalidateCustomerCache,
   normalizePhoneForCache,
+  getOrdersVersion,
+  invalidateOrdersCache,
+  ordersCacheKey,
 };

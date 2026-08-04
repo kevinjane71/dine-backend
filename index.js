@@ -129,7 +129,7 @@ const { FieldValue } = require('firebase-admin/firestore');
 const categoryTree = require('./utils/categoryTree');
 const performanceOptimizer = require('./middleware/performanceOptimizer');
 const firestoreOptimizer = require('./utils/firestoreOptimizer');
-const { kvGet, kvSet, kvDel, getCachedRestaurant, invalidateRestaurantCache, invalidateUserCache } = require('./utils/kvCache');
+const { kvGet, kvSet, kvDel, getCachedRestaurant, invalidateRestaurantCache, invalidateUserCache, getOrdersVersion, invalidateOrdersCache, ordersCacheKey } = require('./utils/kvCache');
 
 // ── Rate Limiters ──
 // Uses a SEPARATE Upstash Redis database (RATELIMIT_REDIS_URL) so it doesn't eat
@@ -10690,6 +10690,9 @@ app.post('/api/orders', authenticateOrderCreate, async (req, res) => {
     console.log('🛒 Creating order in database...');
     const orderRef = await db.collection(collections.orders).add(orderData);
     console.log('🛒 Backend Order Creation - Order saved to DB with ID:', orderRef.id);
+    // Invalidate the cached order lists immediately so dashboard/order-history reflect the
+    // new order at once (not waiting on the async realtime event, which also invalidates).
+    invalidateOrdersCache(restaurantId);
 
     // Store idempotency key for deduplication (use key as doc ID for atomic uniqueness)
     // Update idempotency key with the actual orderId (key was reserved atomically before creation)
@@ -11489,6 +11492,25 @@ app.get('/api/orders/:restaurantId', authenticateToken, async (req, res) => {
       myOrdersOnly,
       floorIds
     } = req.query;
+
+    // ── Redis order-list cache (version-counter; invalidated on any order write) ──
+    // Serves the repeated dashboard/order-history re-fetches from Redis instead of
+    // Firestore. Keyed by the full query + the calling user (myOrdersOnly/permission are
+    // user-specific) + the per-restaurant version. A new/edited order bumps the version
+    // (see pushEvent + POST /api/orders) so this goes fresh immediately — never stale.
+    // Short TTL (45s) is a safety net for any write path that doesn't emit an event.
+    const _ordersVer = await getOrdersVersion(restaurantId);
+    const _ordersKey = ordersCacheKey(
+      restaurantId, _ordersVer,
+      JSON.stringify(req.query) + '|u:' + (req.user?.userId || req.user?.id || '')
+    );
+    const _ordersCached = await kvGet(_ordersKey);
+    if (_ordersCached) return res.json(_ordersCached);
+    const _ordersOrigJson = res.json.bind(res);
+    res.json = (body) => {
+      try { if ((res.statusCode || 200) === 200) kvSet(_ordersKey, body, 45).catch(() => {}); } catch (_) {}
+      return _ordersOrigJson(body);
+    };
 
     console.log(`🔍 Orders API - Restaurant: ${restaurantId}, Page: ${page}, Limit: ${limit}, Status: ${status || 'all'}, Search: ${search || 'none'}, Waiter: ${waiterId || 'all'}, TodayOnly: ${todayOnly}, PaymentMethod: ${paymentMethod || 'all'}`);
 

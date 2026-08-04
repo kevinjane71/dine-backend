@@ -23,6 +23,12 @@ const fcmService = require('./fcmService');
  * @param {object} data      — event payload
  */
 const pushEvent = async (restaurantId, category, eventType, data) => {
+  // Any order/billing change (create/status/edit/settle/refund/void/cancel/restore) that
+  // notifies the frontend also invalidates the cached order lists for that restaurant, so
+  // dashboard + order-history reads go fresh immediately. Fire-and-forget; safe if it fails.
+  if (restaurantId && (category === 'orders' || category === 'billing')) {
+    try { require('../utils/kvCache').invalidateOrdersCache(restaurantId); } catch (_) {}
+  }
   try {
     const rtdb = getRealtimeDb();
     const eventsRef = rtdb.ref(`events/${restaurantId}/${category}`);
