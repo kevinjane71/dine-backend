@@ -680,6 +680,9 @@ class InventoryService {
         console.warn('Bar inventory deduction failed (non-blocking):', barErr.message);
       }
 
+      if (deductions.length > 0) {
+        try { require('../utils/kvCache').invalidateInventoryCache(restaurantId); } catch (_) {}
+      }
       return deductions;
 
     } catch (error) {
@@ -795,6 +798,7 @@ class InventoryService {
       if (restorations.length > 0) {
         await batch.commit();
         console.log(`✅ Inventory restored for Order ${orderId}: ${restorations.length} items`);
+        try { require('../utils/kvCache').invalidateInventoryCache(restaurantId); } catch (_) {}
       }
 
       return restorations;
@@ -926,6 +930,7 @@ class InventoryService {
       if (restorations.length > 0) {
         await batch.commit();
         console.log(`✅ Inventory restored for edited Order ${orderId}: ${restorations.length} items`);
+        try { require('../utils/kvCache').invalidateInventoryCache(restaurantId); } catch (_) {}
       }
 
       return restorations;

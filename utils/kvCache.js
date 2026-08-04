@@ -195,6 +195,25 @@ function ordersCacheKey(restaurantId, version, queryDesc) {
   return `orders:${restaurantId}:v${version}:${hash}`;
 }
 
+// ── Inventory list cache: same version-counter pattern ────────────────────────
+// The inventory page (GET /api/inventory/:restaurantId) is re-fetched a lot but stock
+// changes on order-deduction, manual edits, purchases, waste, audits. Any of those bumps
+// the version → cached inventory reads go fresh. Order-time stock checks read Firestore
+// directly (not this cache), so deduction accuracy is never affected.
+async function getInventoryVersion(restaurantId) {
+  const v = await kvGet(`inventory:${restaurantId}:ver`);
+  return v != null ? String(v) : '0';
+}
+function invalidateInventoryCache(restaurantId) {
+  if (!restaurantId) return;
+  kvIncrBy(`inventory:${restaurantId}:ver`, 1, 3600).catch(() => {});
+}
+function inventoryCacheKey(restaurantId, version, queryDesc) {
+  const crypto = require('crypto');
+  const hash = crypto.createHash('md5').update(String(queryDesc || '')).digest('hex').slice(0, 16);
+  return `inventory:${restaurantId}:v${version}:${hash}`;
+}
+
 /**
  * Normalize phone number for cache key consistency
  */
@@ -251,4 +270,7 @@ module.exports = {
   getOrdersVersion,
   invalidateOrdersCache,
   ordersCacheKey,
+  getInventoryVersion,
+  invalidateInventoryCache,
+  inventoryCacheKey,
 };

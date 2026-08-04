@@ -132,7 +132,7 @@ const performanceOptimizer = require('./middleware/performanceOptimizer');
 // PostgreSQL counter repo — used for PG-first atomic counter operations
 const counterRepo = require('./repos/counterRepo');
 const firestoreOptimizer = require('./utils/firestoreOptimizer');
-const { kvGet, kvSet, kvDel, getCachedRestaurant, invalidateRestaurantCache, invalidateUserCache, getOrdersVersion, invalidateOrdersCache, ordersCacheKey } = require('./utils/kvCache');
+const { kvGet, kvSet, kvDel, getCachedRestaurant, invalidateRestaurantCache, invalidateUserCache, getOrdersVersion, invalidateOrdersCache, ordersCacheKey, getInventoryVersion, invalidateInventoryCache, inventoryCacheKey } = require('./utils/kvCache');
 
 // ── Rate Limiters ──
 // Uses a SEPARATE Upstash Redis database (RATELIMIT_REDIS_URL) so it doesn't eat
@@ -26172,10 +26172,41 @@ async function checkFeaturePermission(req, feature, operation) {
 async function checkInventoryPermission(req, operation) { return checkFeaturePermission(req, 'inventory', operation); }
 
 // Get all inventory items for a restaurant
+// Auto-invalidate the inventory cache on ANY successful inventory mutation.
+// One place covers every current + future inventory write endpoint (manual edits,
+// waste, stock audits, production, smart-import, etc.) without touching each handler.
+// Order-driven stock changes are invalidated centrally in inventoryService.
+app.use('/api/inventory', (req, res, next) => {
+  if (req.method === 'GET') return next();
+  const rid = req.path.split('/').filter(Boolean)[0] || null;
+  if (!rid) return next();
+  const bump = () => { try { invalidateInventoryCache(rid); } catch (_) {} };
+  const _oj = res.json.bind(res);
+  const _os = res.send.bind(res);
+  res.json = (body) => { if ((res.statusCode || 200) < 400) bump(); return _oj(body); };
+  res.send = (body) => { if ((res.statusCode || 200) < 400) bump(); return _os(body); };
+  next();
+});
+
 app.get('/api/inventory/:restaurantId', authenticateToken, async (req, res) => {
   try {
     const { restaurantId } = req.params;
     const { category, status, search } = req.query;
+
+    // ── Redis inventory cache (version-counter; invalidated on any stock change) ──
+    // The inventory page re-fetches this a lot. Cached under a per-restaurant version that
+    // is bumped by order-deduction (inventoryService), manual edits, purchases, waste and
+    // audits — so it goes fresh on any stock change. 30s TTL is a backstop. Order-time
+    // stock checks read Firestore directly, so deduction accuracy is unaffected.
+    const _invVer = await getInventoryVersion(restaurantId);
+    const _invKey = inventoryCacheKey(restaurantId, _invVer, JSON.stringify(req.query));
+    const _invCached = await kvGet(_invKey);
+    if (_invCached) return res.json(_invCached);
+    const _invOrigJson = res.json.bind(res);
+    res.json = (body) => {
+      try { if ((res.statusCode || 200) === 200) kvSet(_invKey, body, 30).catch(() => {}); } catch (_) {}
+      return _invOrigJson(body);
+    };
 
     console.log(`📦 Inventory API - Restaurant: ${restaurantId}, Category: ${category || 'all'}, Status: ${status || 'all'}, Search: ${search || 'none'}`);
 
