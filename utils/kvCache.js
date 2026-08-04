@@ -192,6 +192,41 @@ function inventoryCacheKey(restaurantId, version, queryDesc) {
   return `inventory:${restaurantId}:v${version}:${hash}`;
 }
 
+// ── Floors/tables cache: version-counter (LIVE table status) ──────────────────
+// GET /api/floors + GET /api/tables re-fetch constantly. Table status must stay LIVE,
+// so the version is bumped by ANY table/floor write AND any order/billing/table realtime
+// event (order placement occupies a table, settle frees it). Short TTL is only a backstop —
+// correctness comes from event + write invalidation, so users never see a stale table.
+async function getFloorsVersion(restaurantId) {
+  const v = await kvGet(`floors:${restaurantId}:ver`);
+  return v != null ? String(v) : '0';
+}
+function invalidateFloorsCache(restaurantId) {
+  if (!restaurantId) return;
+  kvIncrBy(`floors:${restaurantId}:ver`, 1, 3600).catch(() => {});
+}
+function floorsCacheKey(restaurantId, version, queryDesc) {
+  const crypto = require('crypto');
+  const hash = crypto.createHash('md5').update(String(queryDesc || '')).digest('hex').slice(0, 16);
+  return `floors:${restaurantId}:v${version}:${hash}`;
+}
+
+// ── KOT + owner-dashboard caches ──────────────────────────────────────────────
+// Both are DERIVED from orders, so they ride on the ORDERS version counter: any order
+// write (create/status/edit/settle/cancel/…) already bumps orders:<rid>:ver, which makes
+// these keys miss too — so the kitchen screen and dashboard refresh the instant an order
+// changes. Callers pass the current orders version into the key.
+function kotCacheKey(restaurantId, ordersVersion, queryDesc) {
+  const crypto = require('crypto');
+  const hash = crypto.createHash('md5').update(String(queryDesc || '')).digest('hex').slice(0, 16);
+  return `kot:${restaurantId}:v${ordersVersion}:${hash}`;
+}
+function dashboardCacheKey(restaurantId, ordersVersion, queryDesc) {
+  const crypto = require('crypto');
+  const hash = crypto.createHash('md5').update(String(queryDesc || '')).digest('hex').slice(0, 16);
+  return `dash:${restaurantId}:v${ordersVersion}:${hash}`;
+}
+
 /**
  * Normalize phone number for cache key consistency
  */
@@ -251,4 +286,9 @@ module.exports = {
   getInventoryVersion,
   invalidateInventoryCache,
   inventoryCacheKey,
+  getFloorsVersion,
+  invalidateFloorsCache,
+  floorsCacheKey,
+  kotCacheKey,
+  dashboardCacheKey,
 };

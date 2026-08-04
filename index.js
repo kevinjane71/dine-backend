@@ -129,7 +129,7 @@ const { FieldValue } = require('firebase-admin/firestore');
 const categoryTree = require('./utils/categoryTree');
 const performanceOptimizer = require('./middleware/performanceOptimizer');
 const firestoreOptimizer = require('./utils/firestoreOptimizer');
-const { kvGet, kvSet, kvDel, getCachedRestaurant, invalidateRestaurantCache, invalidateUserCache, getOrdersVersion, invalidateOrdersCache, ordersCacheKey, getInventoryVersion, invalidateInventoryCache, inventoryCacheKey } = require('./utils/kvCache');
+const { kvGet, kvSet, kvDel, getCachedRestaurant, invalidateRestaurantCache, invalidateUserCache, getOrdersVersion, invalidateOrdersCache, ordersCacheKey, getInventoryVersion, invalidateInventoryCache, inventoryCacheKey, getFloorsVersion, invalidateFloorsCache, floorsCacheKey, kotCacheKey, dashboardCacheKey } = require('./utils/kvCache');
 
 // ── Rate Limiters ──
 // Uses a SEPARATE Upstash Redis database (RATELIMIT_REDIS_URL) so it doesn't eat
@@ -16673,10 +16673,41 @@ app.get('/api/menus/upload-status/:restaurantId', authenticateToken, async (req,
 
 
 
+// Any successful table/floor mutation invalidates that restaurant's floors/tables cache so
+// table status stays LIVE. One place covers every current + future table/floor write endpoint.
+// For /:restaurantId routes the first path segment IS the restaurant id; for the few /:tableId
+// routes it's a table id (a harmless stray bump) — but those are ALSO covered by their realtime
+// table events (pushEvent 'tables' → invalidateFloorsCache). With the 10s TTL backstop on top,
+// a user never sees a stale table.
+function floorsCacheInvalidator(req, res, next) {
+  if (req.method === 'GET') return next();
+  const rid = req.path.split('/').filter(Boolean)[0] || null;
+  if (!rid) return next();
+  const bump = () => { try { invalidateFloorsCache(rid); } catch (_) {} };
+  const _oj = res.json.bind(res);
+  const _os = res.send.bind(res);
+  res.json = (b) => { if ((res.statusCode || 200) < 400) bump(); return _oj(b); };
+  res.send = (b) => { if ((res.statusCode || 200) < 400) bump(); return _os(b); };
+  next();
+}
+app.use('/api/tables', floorsCacheInvalidator);
+app.use('/api/floors', floorsCacheInvalidator);
+
 // Table Management APIs
 app.get('/api/tables/:restaurantId', async (req, res) => {
   try {
     const { restaurantId } = req.params;
+
+    // ── Redis floors/tables cache (same version counter as /api/floors) ──
+    const _tblVer = await getFloorsVersion(restaurantId);
+    const _tblKey = floorsCacheKey(restaurantId, _tblVer, 'tables|' + JSON.stringify(req.query || {}));
+    const _tblCached = await kvGet(_tblKey);
+    if (_tblCached) return res.json(_tblCached);
+    const _tblOrigJson = res.json.bind(res);
+    res.json = (body) => {
+      try { if ((res.statusCode || 200) === 200) kvSet(_tblKey, body, 10).catch(() => {}); } catch (_) {}
+      return _tblOrigJson(body);
+    };
 
     const snapshot = await db.collection(collections.tables)
       .where('restaurantId', '==', restaurantId)
@@ -18042,6 +18073,19 @@ app.delete('/api/tables/:tableId', authenticateToken, async (req, res) => {
 app.get('/api/floors/:restaurantId', async (req, res) => {
   try {
     const { restaurantId } = req.params;
+
+    // ── Redis floors/tables cache (version-counter; LIVE table status) ──
+    // Bumped by any table/floor write + any order/billing/table realtime event, so a table
+    // going occupied/free/moved refreshes instantly. 10s TTL is only a backstop.
+    const _flVer = await getFloorsVersion(restaurantId);
+    const _flKey = floorsCacheKey(restaurantId, _flVer, 'floors|' + JSON.stringify(req.query || {}));
+    const _flCached = await kvGet(_flKey);
+    if (_flCached) return res.json(_flCached);
+    const _flOrigJson = res.json.bind(res);
+    res.json = (body) => {
+      try { if ((res.statusCode || 200) === 200) kvSet(_flKey, body, 10).catch(() => {}); } catch (_) {}
+      return _flOrigJson(body);
+    };
 
     // Get floors from restaurant subcollection
     const floorsSnapshot = await db.collection('restaurants')
@@ -22270,6 +22314,19 @@ app.get('/api/kot/:restaurantId', async (req, res) => {
   try {
     const { restaurantId } = req.params;
     const { status } = req.query;
+
+    // ── Redis KOT cache (rides on the ORDERS version) ──
+    // KOT is derived from orders, so any order write already bumps orders:<rid>:ver → this
+    // key misses → the kitchen screen refreshes the instant an order changes. 15s TTL backstop.
+    const _kotVer = await getOrdersVersion(restaurantId);
+    const _kotKey = kotCacheKey(restaurantId, _kotVer, JSON.stringify(req.query || {}));
+    const _kotCached = await kvGet(_kotKey);
+    if (_kotCached) return res.json(_kotCached);
+    const _kotOrigJson = res.json.bind(res);
+    res.json = (body) => {
+      try { if ((res.statusCode || 200) === 200) kvSet(_kotKey, body, 15).catch(() => {}); } catch (_) {}
+      return _kotOrigJson(body);
+    };
 
     console.log(`🔍 KOT API - Getting orders for restaurant: ${restaurantId}, status filter: ${status || 'all'}`);
 
@@ -37200,6 +37257,7 @@ app.post('/api/dinebot/query', vercelSecurityMiddleware.chatbotAPI, chatgptUsage
           updatedAt: new Date(),
           updatedBy: userId
         });
+        invalidateFloorsCache(restaurantId); // dinebot changed a table → refresh floors/tables
       },
       createTable: async (restaurantId, tableData) => {
         const docRef = await db.collection('tables').add({
@@ -37209,10 +37267,12 @@ app.post('/api/dinebot/query', vercelSecurityMiddleware.chatbotAPI, chatgptUsage
           updatedAt: new Date(),
           createdBy: userId
         });
+        invalidateFloorsCache(restaurantId);
         return { id: docRef.id };
       },
       deleteTable: async (tableId) => {
         await db.collection('tables').doc(tableId).delete();
+        invalidateFloorsCache(restaurantId); // dinebot deleted a table → refresh floors/tables
       },
       getOrders: async (restaurantId) => {
         const snapshot = await db.collection('orders').where('restaurantId', '==', restaurantId).get();

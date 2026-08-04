@@ -22,7 +22,7 @@ let pusherService;
 function getPusherService() {
   if (!pusherService) {
     pusherService = require('../services/firebaseRealtimeService');
-const { getCachedRestDoc } = require('../utils/kvCache');
+const { getCachedRestDoc, invalidateRestaurantCache } = require('../utils/kvCache');
   }
   return pusherService;
 }
@@ -373,6 +373,7 @@ router.post('/talabat/connect/:restaurantId', authenticateToken, async (req, res
     await db.collection(collections.restaurants).doc(restaurantId).update({
       'aggregatorConfig.talabat': talabatConfig,
     });
+    invalidateRestaurantCache(restaurantId);
 
     res.json({
       success: true,
@@ -408,6 +409,7 @@ router.delete('/talabat/disconnect/:restaurantId', authenticateToken, async (req
     await db.collection(collections.restaurants).doc(restaurantId).update({
       'aggregatorConfig.talabat': FieldValue.delete(),
     });
+    invalidateRestaurantCache(restaurantId);
 
     res.json({ success: true, message: 'Disconnected from Talabat' });
   } catch (err) {
@@ -478,6 +480,7 @@ router.patch('/talabat/settings/:restaurantId', authenticateToken, async (req, r
 
     if (Object.keys(updates).length > 0) {
       await db.collection(collections.restaurants).doc(restaurantId).update(updates);
+      invalidateRestaurantCache(restaurantId);
     }
 
     res.json({ success: true, message: 'Settings updated' });
@@ -529,6 +532,7 @@ router.post('/talabat/push-menu/:restaurantId', authenticateToken, async (req, r
       'aggregatorConfig.talabat.lastMenuSyncStatus': 'submitted',
       'aggregatorConfig.talabat.lastMenuSyncJobId': result.job_id || result.jobId || null,
     });
+    invalidateRestaurantCache(restaurantId);
 
     res.json({
       success: true,
@@ -571,6 +575,7 @@ router.post('/talabat/store-status/:restaurantId', authenticateToken, async (req
     await db.collection(collections.restaurants).doc(restaurantId).update({
       'aggregatorConfig.talabat.storeStatus': isOpen ? 'open' : 'closed',
     });
+    invalidateRestaurantCache(restaurantId);
 
     res.json({
       success: true,

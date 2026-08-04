@@ -1,7 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const { db, collections } = require('../firebase');
-const { getCachedRestDoc } = require('../utils/kvCache');
+const { getCachedRestDoc, kvGet, kvSet, getOrdersVersion, dashboardCacheKey } = require('../utils/kvCache');
 const { authenticateToken, requireOwnerRole } = require('../middleware/auth');
 const { parseTZ, parseDayStart, buildDateRange, dateStrInTZ, dateBoundsInTZ } = require('../utils/timezone');
 
@@ -67,6 +67,23 @@ router.get('/dashboard', authenticateToken, requireOwnerRole, async (req, res) =
         ...doc.data()
       });
     });
+
+    // ── Redis owner-dashboard cache (folds in every owned restaurant's ORDERS version) ──
+    // The heavy per-restaurant order/staff/inventory scans below are cached under a key that
+    // includes each owned restaurant's orders version — so a new/edited order in ANY of them
+    // makes this miss → the chain owner sees fresh totals immediately. 60s TTL is a backstop.
+    let _dashKey = null;
+    try {
+      const _vers = await Promise.all(restaurantIds.map(rid => getOrdersVersion(rid)));
+      _dashKey = dashboardCacheKey(userId, _vers.join('.'), JSON.stringify(req.query || {}));
+      const _dashCached = await kvGet(_dashKey);
+      if (_dashCached) return res.json(_dashCached);
+    } catch (_) { _dashKey = null; }
+    const _dashOrigJson = res.json.bind(res);
+    res.json = (body) => {
+      try { if (_dashKey && (res.statusCode || 200) === 200) kvSet(_dashKey, body, 60).catch(() => {}); } catch (_) {}
+      return _dashOrigJson(body);
+    };
 
     // Get date range based on period parameter (timezone-aware via client tz offset)
     const { period = 'today', startDate, endDate } = req.query;

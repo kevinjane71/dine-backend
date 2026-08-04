@@ -23,11 +23,23 @@ const fcmService = require('./fcmService');
  * @param {object} data      — event payload
  */
 const pushEvent = async (restaurantId, category, eventType, data) => {
-  // Any order/billing change (create/status/edit/settle/refund/void/cancel/restore) that
-  // notifies the frontend also invalidates the cached order lists for that restaurant, so
-  // dashboard + order-history reads go fresh immediately. Fire-and-forget; safe if it fails.
-  if (restaurantId && (category === 'orders' || category === 'billing')) {
-    try { require('../utils/kvCache').invalidateOrdersCache(restaurantId); } catch (_) {}
+  // Central cache invalidation on any realtime event. Fire-and-forget; safe if it fails.
+  if (restaurantId) {
+    let kv = null;
+    try { kv = require('../utils/kvCache'); } catch (_) {}
+    if (kv) {
+      // Order/billing change (create/status/edit/settle/refund/void/cancel/restore) → refresh
+      // the cached order lists (dashboard + order history), and KOT + owner dashboard which
+      // ride on the same orders version.
+      if (category === 'orders' || category === 'billing') {
+        try { kv.invalidateOrdersCache(restaurantId); } catch (_) {}
+      }
+      // Table status is LIVE: table events AND order/billing events (an order occupies a
+      // table, settling frees it) must refresh the floors/tables cache immediately.
+      if (category === 'tables' || category === 'orders' || category === 'billing') {
+        try { kv.invalidateFloorsCache(restaurantId); } catch (_) {}
+      }
+    }
   }
   try {
     const rtdb = getRealtimeDb();
