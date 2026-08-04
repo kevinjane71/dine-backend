@@ -47,18 +47,29 @@ function decodeValue(raw) {
   try { return JSON.parse(raw); } catch (_) { return raw; }
 }
 
+// True only for a Redis on this same machine (redis://[user:pass@]127.0.0.1|localhost|::1).
+// A remote redis:// URL (e.g. Upstash's TCP endpoint left in a serverless env) returns false
+// so it never hijacks the Upstash REST path.
+function isLoopbackRedisUrl(u) {
+  if (!u) return false;
+  try {
+    const host = new URL(u).hostname.replace(/^\[|\]$/g, '');
+    return host === '127.0.0.1' || host === 'localhost' || host === '::1';
+  } catch (_) { return false; }
+}
+
 function getRedis() {
   if (redisDisabled) return null;
   if (redis) return redis;
 
   try {
-    // ── Local / co-located Redis (VM deployment) — preferred when REDIS_URL is set ──
-    // A standard Redis on the same box speaks the Redis protocol (redis://host:port),
-    // which @upstash/redis (REST) cannot use. We wrap ioredis in an adapter matching the
-    // small @upstash subset kvGet/kvSet/kvIncrBy rely on. It is a DUMB STRING STORE —
-    // JSON + gzip are handled centrally in encodeValue/decodeValue, so get/set pass raw
-    // strings through untouched.
-    if (process.env.REDIS_URL) {
+    // ── Local / co-located Redis (VM deployment) — ONLY when REDIS_URL is loopback ──
+    // A standard Redis on the SAME box (redis://127.0.0.1) speaks the Redis protocol, which
+    // @upstash/redis (REST) can't use, so we use ioredis. But we deliberately accept ONLY a
+    // loopback REDIS_URL: on serverless (Vercel) a leftover REMOTE redis:// URL (e.g. the
+    // Upstash TCP endpoint) must NOT hijack the fast REST path — so a non-local REDIS_URL is
+    // ignored and we fall through to Upstash REST below. Foolproof across both deployments.
+    if (isLoopbackRedisUrl(process.env.REDIS_URL)) {
       const IORedis = require('ioredis');
       const client = new IORedis(process.env.REDIS_URL, {
         // Buffer commands issued during the brief startup connect (offline queue ON), but cap
