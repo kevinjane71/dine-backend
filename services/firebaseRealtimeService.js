@@ -24,6 +24,13 @@ const lanRealtime = require('./lanRealtime');
  * @param {object} data      — event payload
  */
 const pushEvent = async (restaurantId, category, eventType, data) => {
+  // Any order/billing change (create/status/edit/settle/refund/void/cancel/restore) that
+  // notifies the frontend also invalidates the cached order lists for that restaurant, so
+  // dashboard + order-history reads go fresh immediately. Fire-and-forget; safe if it fails.
+  if (restaurantId && (category === 'orders' || category === 'billing')) {
+    try { require('../utils/kvCache').invalidateOrdersCache(restaurantId); } catch (_) {}
+  }
+
   // ── LAN fan-out FIRST (instant, offline-capable) ──────────────────────────
   // Emit to the local socket.io bus before touching the cloud RTDB, so terminals
   // on the local network get the event immediately even with no internet (and even
