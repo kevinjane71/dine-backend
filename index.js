@@ -35245,6 +35245,7 @@ app.post('/api/orders/:orderId/partial-payment', authenticateToken, async (req, 
       });
     }
 
+    invalidateOrdersCache(orderData.restaurantId); // payment changed → refresh order lists now
     res.json({ success: true, paidAmount: totalPaid, outstandingAmount: outstanding });
   } catch (error) {
     console.error('Error recording partial payment:', error);
@@ -35312,6 +35313,7 @@ app.post('/api/orders/:orderId/comp-void', authenticateToken, async (req, res) =
       updatedAt: new Date(),
     });
 
+    invalidateOrdersCache(orderData.restaurantId); // comp/void changed totals → refresh order lists
     res.json({
       success: true,
       message: `Items ${type === 'comp' ? 'comped' : 'voided'} successfully`,
@@ -35512,6 +35514,7 @@ app.patch('/api/orders/:orderId/edit-completed', authenticateToken, async (req, 
       }
     }
 
+    invalidateOrdersCache(currentOrder.restaurantId); // completed order edited → refresh order lists
     const updatedDoc = await orderRef.get();
     res.json({
       success: true,
@@ -35911,6 +35914,7 @@ app.patch('/api/orders/:orderId/edit-completed-items', authenticateToken, async 
       }
     }
 
+    invalidateOrdersCache(currentOrder.restaurantId); // items/amount changed → refresh order lists
     const updatedDoc = await orderRef.get();
     res.json({
       success: true,
