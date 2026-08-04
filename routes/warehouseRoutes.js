@@ -359,6 +359,7 @@ router.patch('/:orgId/indents/:indentId/receive', ...commonMiddleware, async (re
     });
 
     await batch.commit();
+    try { require('../utils/kvCache').invalidateInventoryCache(indent.requestingOutletId); } catch (_) {} // indent received → outlet stock changed
 
     // Audit log
     const receiveAuditData = {

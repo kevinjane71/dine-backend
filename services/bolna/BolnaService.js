@@ -522,6 +522,7 @@ class BolnaService {
     };
 
     const docRef = await db.collection(collections.orders).add(order);
+    try { require('../../utils/kvCache').invalidateOrdersCache(restaurantId); } catch (_) {}
 
     return {
       success: true,

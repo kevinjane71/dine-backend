@@ -15,6 +15,11 @@ function generateTrackingToken() {
   return crypto.randomBytes(16).toString('hex');
 }
 
+// Delivery status changes mutate the order → refresh the cached order lists.
+function bustOrders(restaurantId) {
+  try { require('../utils/kvCache').invalidateOrdersCache(restaurantId); } catch (_) {}
+}
+
 function isAdminRole(role) {
   return ['owner', 'admin', 'manager'].includes(role);
 }
@@ -128,6 +133,7 @@ async function assignDeliveryPartner(restaurantId, orderId, staffId, staffName, 
     deliveryTrackingToken: trackingToken,
     updatedAt: now,
   });
+  bustOrders(restaurantId);
 
   return {
     orderId,
@@ -177,6 +183,7 @@ async function respondToAssignment(restaurantId, orderId, staffId, action) {
       deliveryAcceptedAt: now,
       updatedAt: now,
     });
+    bustOrders(restaurantId);
     return { orderId, deliveryStatus: 'accepted' };
   } else if (action === 'reject') {
     await orderRef.update({
@@ -185,6 +192,7 @@ async function respondToAssignment(restaurantId, orderId, staffId, action) {
       deliveryAssignedAt: null,
       updatedAt: now,
     });
+    bustOrders(restaurantId);
     return { orderId, deliveryStatus: 'rejected' };
   } else {
     throw new Error('Invalid action. Use "accept" or "reject"');
@@ -215,6 +223,7 @@ async function markPickedUp(restaurantId, orderId, staffId) {
     deliveryPickedUpAt: now,
     updatedAt: now,
   });
+  bustOrders(restaurantId);
 
   return { orderId, deliveryStatus: 'picked_up' };
 }
@@ -252,6 +261,7 @@ async function markDelivered(restaurantId, orderId, staffId, paymentInfo = {}) {
   }
 
   await orderRef.update(updateData);
+  bustOrders(restaurantId);
 
   // Clean up RTDB location data
   try {

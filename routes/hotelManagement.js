@@ -369,6 +369,7 @@ router.post('/hotel/link-order', authenticateToken, async (req, res) => {
       linkedToHotel: true,
       hotelLinkTimestamp: FieldValue.serverTimestamp()
     });
+    try { require('../utils/kvCache').invalidateOrdersCache(checkInData.restaurantId); } catch (_) {}
 
     res.json({
       success: true,
@@ -497,6 +498,7 @@ router.post('/hotel/checkout/:checkInId', authenticateToken, async (req, res) =>
       }
 
       await batch.commit();
+      try { require('../utils/kvCache').invalidateOrdersCache(checkInData.restaurantId); } catch (_) {}
       console.log(`✅ Marked ${checkInData.foodOrders.length} orders as billed and checked-out`);
     }
 

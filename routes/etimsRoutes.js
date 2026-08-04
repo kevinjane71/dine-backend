@@ -279,6 +279,7 @@ module.exports = function initEtimsRoutes(db, collections, authenticateToken, va
       // Full-object merge (no dot-path — Firestore + pgAdapter safe). The device
       // counter was already advanced atomically at prepare-sale.
       await oRef.set({ etims: etimsRecord }, { merge: true });
+      try { require('../utils/kvCache').invalidateOrdersCache(restaurantId); } catch (_) {}
       res.json({ success: true, etims: etimsRecord });
     } catch (e) { console.error('etims confirm-sale:', e); res.status(500).json({ error: 'Failed to confirm sale' }); }
   });

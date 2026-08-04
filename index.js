@@ -899,6 +899,7 @@ async function linkMenuItemToInventory(restaurantId, menuItem, userId) {
       }
       console.log(`📦 Menu→Inventory created: ${menuItem.name} (${inventoryItemId}) stock=${stockQty}`);
     }
+    invalidateInventoryCache(restaurantId); // menu-linked item created/updated → refresh inventory
 
     // Ensure a 1:1 recipe exists for this menu item
     const recipeSnap = await db.collection(collections.recipes)
@@ -11809,7 +11810,7 @@ app.get('/api/orders/:restaurantId', authenticateToken, async (req, res) => {
         console.log(`Auto-expiring ${expiredIds.length} saved orders older than 24h`);
         Promise.all(expiredIds.map(id =>
           db.collection(collections.orders).doc(id).update({ status: 'expired', expiredAt: new Date() })
-        )).catch(err => console.error('Error expiring saved orders:', err));
+        )).then(() => invalidateOrdersCache(restaurantId)).catch(err => console.error('Error expiring saved orders:', err));
       }
     }
 
@@ -18063,6 +18064,7 @@ app.post('/api/tables/:restaurantId/assign-section-server', authenticateToken, a
         assigned++;
       }
     }
+    invalidateOrdersCache(restaurantId); // server assignment changed on orders → refresh lists
     res.json({ success: true, assigned, waiterId: waiterId || null, waiterName: waiterName || null });
   } catch (error) {
     console.error('Assign section server error:', error);
@@ -22780,6 +22782,7 @@ app.post('/api/invoice/generate/:orderId', authenticateToken, async (req, res) =
       invoiceId: invoice.id,
       invoiceGeneratedAt: new Date()
     });
+    invalidateOrdersCache(order.restaurantId); // invoice linked to order → refresh lists
 
     res.json({
       success: true,
@@ -23522,6 +23525,7 @@ app.patch('/api/kot/:orderId/printed', async (req, res) => {
     }
 
     await orderRef.update(updateData);
+    invalidateOrdersCache(orderDoc.data().restaurantId); // KOT print flag changed → refresh lists
 
     console.log(`✅ Order ${orderId} marked as printed${stationId ? ` (station: ${stationId})` : ''}`);
 
@@ -23674,6 +23678,7 @@ app.patch('/api/billing/:orderId/printed', async (req, res) => {
       billPrintedBy: printedBy || 'kiosk',
       updatedAt: new Date()
     });
+    invalidateOrdersCache(orderDoc.data().restaurantId); // bill print flag changed → refresh lists
 
     console.log(`✅ Bill ${orderId} marked as printed`);
 
@@ -25123,6 +25128,7 @@ app.patch('/api/orders/:orderId/restore', authenticateToken, async (req, res) =>
     updateData.restorationHistory = restorationHistory;
 
     await db.collection(collections.orders).doc(orderId).update(updateData);
+    invalidateOrdersCache(orderData.restaurantId); // order restored → refresh lists (only 'tables' event fired otherwise)
 
     // Reapply all side effects
     const reapplyResults = await reapplyOrderSideEffects(orderId, orderData);
@@ -26833,6 +26839,7 @@ Return [] if no items could be identified.`
       };
 
       const orderRef = await db.collection(collections.orders).add(orderData);
+      invalidateOrdersCache(restaurantId); // quick-log creates a real order → refresh order lists
       console.log('📦 Quick order created:', orderRef.id);
 
       // Deduct inventory via recipes (synchronous for user feedback)
@@ -29642,6 +29649,7 @@ app.patch('/api/purchase-orders/:restaurantId/:orderId', authenticateToken, asyn
             currentStock: currentStock + item.quantity,
             lastUpdated: new Date()
           });
+          invalidateInventoryCache(restaurantId); // PO received → stock in, refresh inventory
         }
       }
     }
@@ -30042,6 +30050,7 @@ app.post('/api/grn/:restaurantId', authenticateToken, async (req, res) => {
             currentStock: currentStock + item.acceptedQuantity,
             lastUpdated: new Date()
           });
+          invalidateInventoryCache(restaurantId); // GRN received → stock in, refresh inventory
         }
       }
     }
@@ -31431,6 +31440,7 @@ app.patch('/api/supplier-returns/:restaurantId/:returnId', authenticateToken, as
             currentStock: Math.max(0, currentStock - item.quantity),
             lastUpdated: new Date()
           });
+          invalidateInventoryCache(restaurantId); // supplier return → stock out, refresh inventory
         }
       }
     }
@@ -31631,6 +31641,7 @@ app.patch('/api/stock-transfers/:restaurantId/:transferId', authenticateToken, a
               currentStock: Math.max(0, currentStock - item.quantity),
               lastUpdated: new Date()
             });
+            invalidateInventoryCache(restaurantId); // stock transfer → source/dest changed, refresh
           }
 
           // Add to destination location
@@ -36847,6 +36858,7 @@ app.post('/api/customers/:customerId/settle-credit', authenticateToken, async (r
           orderUpdate.paymentMethod = paymentMethod;
         }
         await orderRef.update(orderUpdate);
+        invalidateOrdersCache(orderData.restaurantId); // credit settled → order now paid, refresh lists
 
         // Update customer totalSpent (was not counted when order was created as due)
         await customerRef.update({
@@ -36926,6 +36938,7 @@ app.post('/api/customers/:customerId/bulk-settle-credit', authenticateToken, asy
         orderUpdate.status = 'completed';
       }
       await orderRef.update(orderUpdate);
+      invalidateOrdersCache(orderData.restaurantId); // credit settled → order now paid, refresh lists
       settledOrderNumbers.push(orderData.orderNumber || orderData.dailyOrderId || oid);
       settledDetails.push({ orderId: oid, orderNumber: orderData.orderNumber, amount: outstanding });
 
@@ -40715,7 +40728,7 @@ app.post('/api/sync/batch', authenticateToken, async (req, res) => {
             if (payload.items) updateData.items = payload.items;
 
             await orderRef.update(updateData);
-
+            invalidateOrdersCache(orderDoc.data().restaurantId); // offline order synced → refresh lists
             result = { order: { id: orderId, ...updateData } };
             break;
           }
@@ -40773,6 +40786,7 @@ app.post('/api/sync/batch', authenticateToken, async (req, res) => {
             if (status === 'ready') kotUpdateData.cookingEndTime = new Date();
 
             await db.collection(collections.orders).doc(orderId).update(kotUpdateData);
+            invalidateOrdersCache(payload.restaurantId); // offline KOT status synced → refresh lists
             result = { orderId, status };
             break;
           }

@@ -1814,7 +1814,8 @@ class FunctionCallingAgent {
 
       // Create order in database
       const orderRef = await db.collection(collections.orders).add(orderData);
-      
+      try { require('../utils/kvCache').invalidateOrdersCache(restaurantId); } catch (_) {}
+
       // AUTO-DEDUCT INVENTORY (Asynchronous - Fire and Forget)
       inventoryService.deductInventoryForOrder(restaurantId, orderRef.id, orderData.items)
         .catch(err => console.error('Agent BG Inventory Deduction Error:', err));
