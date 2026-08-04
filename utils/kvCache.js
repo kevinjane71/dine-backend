@@ -1,16 +1,51 @@
 /**
- * KV Cache Utility (Upstash Redis)
- * Persistent cache layer for Vercel serverless — survives cold starts.
+ * KV Cache Utility (Redis)
+ * Persistent cache layer — survives serverless cold starts.
  *
- * All methods are safe: if Redis is not configured or fails,
- * they return null / silently fail. Zero impact on existing functionality.
+ * Backends (auto-selected):
+ *   • REDIS_URL set              → local / co-located Redis (ioredis) — VM deployment
+ *   • KV_REST_API_URL + _TOKEN   → Upstash REST — Vercel / serverless
+ *   • neither                    → cache disabled (all ops no-op → reads hit the DB)
  *
- * REQUIRES: KV_REST_API_URL + KV_REST_API_TOKEN env vars.
- * REDIS_URL alone is NOT enough (it's the Redis protocol URL, not the REST API).
+ * All methods are safe: on any Redis failure they degrade to null / silent no-op,
+ * so the caller falls through to Firestore. Zero impact on correctness.
+ *
+ * Storage format: values are stored as STRINGS. Payloads larger than
+ * COMPRESS_THRESHOLD are gzip-compressed (base64 + 'GZ1:' marker) — the order-list
+ * responses are ~250KB of JSON that shrink ~6-8x, which slashes Redis memory AND
+ * metered bandwidth (e.g. Upstash's monthly bandwidth cap). Small values (version
+ * counters, tiny docs) are stored plain. Decoding is transparent + backward-compatible
+ * with older uncompressed entries.
  */
+
+const zlib = require('zlib');
 
 let redis = null;
 let redisDisabled = false;
+
+// Only compress payloads bigger than this (below it, gzip overhead isn't worth it).
+const COMPRESS_THRESHOLD = 1024; // bytes
+const GZ_PREFIX = 'GZ1:';
+
+// Object → storable string (gzip+base64 with marker when large enough).
+function encodeValue(data) {
+  const json = JSON.stringify(data);
+  if (typeof json === 'string' && Buffer.byteLength(json) > COMPRESS_THRESHOLD) {
+    try { return GZ_PREFIX + zlib.gzipSync(json).toString('base64'); } catch (_) { /* fall back to plain */ }
+  }
+  return json;
+}
+
+// Stored value → object. Handles gzipped, plain-JSON, and legacy already-parsed values.
+function decodeValue(raw) {
+  if (raw == null) return null;
+  if (typeof raw !== 'string') return raw; // legacy/auto-deserialized entry or a raw number
+  if (raw.startsWith(GZ_PREFIX)) {
+    try { return JSON.parse(zlib.gunzipSync(Buffer.from(raw.slice(GZ_PREFIX.length), 'base64')).toString()); }
+    catch (_) { return null; }
+  }
+  try { return JSON.parse(raw); } catch (_) { return raw; }
+}
 
 function getRedis() {
   if (redisDisabled) return null;
@@ -19,10 +54,10 @@ function getRedis() {
   try {
     // ── Local / co-located Redis (VM deployment) — preferred when REDIS_URL is set ──
     // A standard Redis on the same box speaks the Redis protocol (redis://host:port),
-    // which @upstash/redis (REST) cannot use. We wrap ioredis in an adapter that matches
-    // the small subset of the @upstash interface kvGet/kvSet/kvIncrBy rely on
-    // (get → auto-parsed value, set(key,val,{ex}), incrby, expire, del). JSON is handled
-    // here so callers keep passing/receiving objects exactly like with Upstash.
+    // which @upstash/redis (REST) cannot use. We wrap ioredis in an adapter matching the
+    // small @upstash subset kvGet/kvSet/kvIncrBy rely on. It is a DUMB STRING STORE —
+    // JSON + gzip are handled centrally in encodeValue/decodeValue, so get/set pass raw
+    // strings through untouched.
     if (process.env.REDIS_URL) {
       const IORedis = require('ioredis');
       const client = new IORedis(process.env.REDIS_URL, {
@@ -37,15 +72,10 @@ function getRedis() {
       client.on('error', (e) => { if (!getRedis._warned) { console.warn('KV Cache: Redis error:', e.message); getRedis._warned = true; } });
       redis = {
         _mode: 'ioredis',
-        async get(key) {
-          const v = await client.get(key);
-          if (v == null) return null;
-          try { return JSON.parse(v); } catch (_) { return v; }
-        },
-        async set(key, val, opts) {
-          const s = typeof val === 'string' ? val : JSON.stringify(val);
-          if (opts && opts.ex) return client.set(key, s, 'EX', opts.ex);
-          return client.set(key, s);
+        get(key) { return client.get(key); }, // raw string | null — decoded by kvGet
+        set(key, val, opts) {                  // val is already an encoded string
+          if (opts && opts.ex) return client.set(key, val, 'EX', opts.ex);
+          return client.set(key, val);
         },
         incrby(key, n) { return client.incrby(key, n); },
         expire(key, ttl) { return client.expire(key, ttl); },
@@ -61,6 +91,9 @@ function getRedis() {
       redis = new Redis({
         url: process.env.KV_REST_API_URL,
         token: process.env.KV_REST_API_TOKEN,
+        // We JSON-encode + gzip ourselves (encodeValue/decodeValue); keep Upstash from
+        // re-parsing so get/set round-trip our exact strings deterministically.
+        automaticDeserialization: false,
       });
       console.log('KV Cache: Initialized from KV_REST_API_URL');
       return redis;
@@ -91,8 +124,8 @@ async function kvGet(key) {
   try {
     const client = getRedis();
     if (!client) return null;
-    const value = await withTimeout(client.get(key), 2000);
-    return value || null;
+    const raw = await withTimeout(client.get(key), 2000);
+    return decodeValue(raw); // handles gzip + JSON + legacy passthrough; null-safe
   } catch (err) {
     console.warn('KV Cache: kvGet failed, disabling:', err.message);
     redisDisabled = true;
@@ -107,7 +140,7 @@ async function kvSet(key, data, ttlSeconds = 180) {
   try {
     const client = getRedis();
     if (!client) return;
-    await withTimeout(client.set(key, data, { ex: ttlSeconds }), 2000);
+    await withTimeout(client.set(key, encodeValue(data), { ex: ttlSeconds }), 2000);
   } catch (err) {
     // Silent fail
   }
