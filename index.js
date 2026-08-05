@@ -133,6 +133,9 @@ const performanceOptimizer = require('./middleware/performanceOptimizer');
 const counterRepo = require('./repos/counterRepo');
 const firestoreOptimizer = require('./utils/firestoreOptimizer');
 const { kvGet, kvSet, kvDel, getCachedRestaurant, invalidateRestaurantCache, invalidateUserCache, getOrdersVersion, invalidateOrdersCache, ordersCacheKey, getInventoryVersion, invalidateInventoryCache, inventoryCacheKey } = require('./utils/kvCache');
+// Offline sync dual-write hook — flag-gated (OFFLINE_SYNC_EVENTS) + fire-and-forget + guarded.
+// Default OFF → zero impact on the order path. See services/offlineSync/orderEventHooks.js.
+const { emitOrderEventSafe } = require('./services/offlineSync/orderEventHooks');
 
 // ── Rate Limiters ──
 // Uses a SEPARATE Upstash Redis database (RATELIMIT_REDIS_URL) so it doesn't eat
@@ -9307,6 +9310,7 @@ app.post('/api/public/orders/:restaurantId', vercelSecurityMiddleware.publicAPI,
     };
 
     const orderRef = await db.collection(collections.orders).add(orderData);
+    emitOrderEventSafe(orderData.restaurantId, orderRef.id, 'order.created', { order: orderData }); // offline sync (flag-gated, guarded)
 
     // Prepare order history entry
     const orderHistoryEntry = {
@@ -10692,6 +10696,7 @@ app.post('/api/orders', authenticateOrderCreate, async (req, res) => {
     // Invalidate the cached order lists immediately so dashboard/order-history reflect the
     // new order at once (not waiting on the async realtime event, which also invalidates).
     invalidateOrdersCache(restaurantId);
+    emitOrderEventSafe(restaurantId, orderRef.id, 'order.created', { order: orderData }); // offline sync (flag-gated, guarded)
 
     // Store idempotency key for deduplication (use key as doc ID for atomic uniqueness)
     // Update idempotency key with the actual orderId (key was reserved atomically before creation)
@@ -24556,6 +24561,7 @@ app.patch('/api/orders/:orderId/cancel', authenticateToken, async (req, res) => 
     };
 
     await db.collection(collections.orders).doc(orderId).update(updateData);
+    emitOrderEventSafe(orderData.restaurantId, orderId, 'order.cancelled', { reason: updateData.cancelReason || null }); // offline sync (flag-gated, guarded)
 
     // Reverse all side effects (inventory, customer, loyalty, offers)
     const reversal = await reverseOrderSideEffects(orderId, orderData);

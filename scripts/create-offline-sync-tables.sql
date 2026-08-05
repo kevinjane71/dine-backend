@@ -31,7 +31,7 @@ CREATE INDEX IF NOT EXISTS idx_device_registry_restaurant ON device_registry(res
 CREATE TABLE IF NOT EXISTS order_events (
   event_id       UUID PRIMARY KEY,             -- client-generated; dedup key (idempotent apply)
   restaurant_id  TEXT NOT NULL,
-  order_id       UUID NOT NULL,                -- canonical order id (UUID)
+  order_id       TEXT NOT NULL,                -- order id (Firestore-style ids are already collision-safe; TEXT also accepts UUIDs)
   device_id      UUID,                         -- which device emitted it
   device_seq     BIGINT,                       -- per-order sequence from the emitting device
   hub_seq        BIGSERIAL,                    -- Hub-assigned global order (authoritative ordering)
@@ -77,7 +77,7 @@ CREATE TABLE IF NOT EXISTS stock_oversell_log (
   id             BIGSERIAL PRIMARY KEY,
   restaurant_id  TEXT NOT NULL,
   item_id        TEXT,
-  order_id       UUID,
+  order_id       TEXT,
   device_id      UUID,
   qty            NUMERIC,
   resulting_stock NUMERIC,                     -- how negative it went
@@ -85,3 +85,11 @@ CREATE TABLE IF NOT EXISTS stock_oversell_log (
   resolved       BOOLEAN NOT NULL DEFAULT false
 );
 CREATE INDEX IF NOT EXISTS idx_oversell_open ON stock_oversell_log(restaurant_id) WHERE resolved = false;
+
+-- Migrate already-created tables (M1 created order_id as UUID) to TEXT.
+-- Idempotent: TEXT→TEXT is a no-op; wrapped so a re-run never errors.
+DO $$
+BEGIN
+  BEGIN ALTER TABLE order_events       ALTER COLUMN order_id TYPE TEXT USING order_id::text; EXCEPTION WHEN others THEN NULL; END;
+  BEGIN ALTER TABLE stock_oversell_log ALTER COLUMN order_id TYPE TEXT USING order_id::text; EXCEPTION WHEN others THEN NULL; END;
+END $$;
