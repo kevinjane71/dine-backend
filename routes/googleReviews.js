@@ -721,6 +721,8 @@ router.get('/reviews/:restaurantId', authenticateToken, async (req, res) => {
       if (!placesRes.ok) {
         const errorBody = await placesRes.text();
         console.error('Places API error:', placesRes.status, errorBody);
+        let hint = '';
+        try { hint = (JSON.parse(errorBody).error || {}).message || ''; } catch (_) { hint = errorBody.slice(0, 160); }
         return res.json({
           success: true,
           source: 'none',
@@ -728,7 +730,9 @@ router.get('/reviews/:restaurantId', authenticateToken, async (req, res) => {
           averageRating: null,
           totalReviewCount: 0,
           nextPageToken: null,
-          message: 'Failed to fetch reviews from Google Places API.'
+          message: 'Failed to fetch reviews from Google Places API.',
+          placesStatus: placesRes.status,
+          placesError: hint
         });
       }
 
