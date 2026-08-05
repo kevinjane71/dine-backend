@@ -8,6 +8,7 @@ const router = express.Router();
 const { authenticateToken } = require('../middleware/auth');
 const registry = require('../services/offlineSync/deviceRegistry');
 const orderEvents = require('../services/offlineSync/orderEvents');
+const syncEngine = require('../services/offlineSync/syncEngine');
 
 // Register (or refresh) this device; returns its record incl. auto-assigned name.
 router.post('/offline/devices/register', authenticateToken, async (req, res) => {
@@ -66,6 +67,35 @@ router.get('/offline/orders/:restaurantId/:orderId/projection', authenticateToke
   } catch (e) {
     console.error('order projection error:', e.message);
     res.status(500).json({ error: 'Failed to project order' });
+  }
+});
+
+// ── Sync transport (receiver side; called by a Terminal on the Hub, or Hub on Cloud) ──
+
+// Push a batch of events up. Idempotent. Returns acked event_ids + high-water mark.
+router.post('/offline/sync/push', authenticateToken, async (req, res) => {
+  try {
+    const { events } = req.body || {};
+    if (!Array.isArray(events)) return res.status(400).json({ error: 'events[] required' });
+    if (events.length > 1000) return res.status(413).json({ error: 'batch too large (max 1000)' });
+    const result = await syncEngine.applyPush(events);
+    res.json({ success: true, ...result });
+  } catch (e) {
+    console.error('sync push error:', e.message);
+    res.status(500).json({ error: 'Failed to apply sync batch' });
+  }
+});
+
+// Pull events after a cursor (down direction). Returns events + next cursor.
+router.get('/offline/sync/pull', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId, since = '0', limit = '200' } = req.query;
+    if (!restaurantId) return res.status(400).json({ error: 'restaurantId required' });
+    const result = await syncEngine.pullSince(restaurantId, parseInt(since) || 0, parseInt(limit) || 200);
+    res.json({ success: true, ...result });
+  } catch (e) {
+    console.error('sync pull error:', e.message);
+    res.status(500).json({ error: 'Failed to pull sync batch' });
   }
 });
 
