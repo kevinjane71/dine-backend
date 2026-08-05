@@ -16482,6 +16482,9 @@ app.use('/api/print-installer', printInstallerRoutes);
 // Bulk menu upload (signed URL + async extraction)
 app.use('/api/menus', require('./routes/bulkMenuUpload'));
 
+// Unified offline/online POS — device registry + event log (additive; needs sync tables).
+app.use('/api', require('./routes/offlineDevices'));
+
 // Public AI tools (no auth, IP rate-limited)
 app.use('/api/public/tools', vercelSecurityMiddleware.publicAPI, publicToolsRoutes);
 
