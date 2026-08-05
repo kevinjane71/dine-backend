@@ -9,6 +9,8 @@ const { authenticateToken } = require('../middleware/auth');
 const registry = require('../services/offlineSync/deviceRegistry');
 const orderEvents = require('../services/offlineSync/orderEvents');
 const syncEngine = require('../services/offlineSync/syncEngine');
+const numbering = require('../services/offlineSync/orderNumbering');
+const stockReconcile = require('../services/offlineSync/stockReconcile');
 
 // Register (or refresh) this device; returns its record incl. auto-assigned name.
 router.post('/offline/devices/register', authenticateToken, async (req, res) => {
@@ -96,6 +98,40 @@ router.get('/offline/sync/pull', authenticateToken, async (req, res) => {
   } catch (e) {
     console.error('sync pull error:', e.message);
     res.status(500).json({ error: 'Failed to pull sync batch' });
+  }
+});
+
+// ── Order numbering (Hub issues the real sequential number) ──
+router.post('/offline/order-number/:restaurantId', authenticateToken, async (req, res) => {
+  try {
+    const { day } = req.body || {};
+    if (!day) return res.status(400).json({ error: 'day (YYYY-MM-DD) required' });
+    const seq = await numbering.issueDailyNumber(req.params.restaurantId, day);
+    res.json({ success: true, seq });
+  } catch (e) {
+    console.error('order-number error:', e.message);
+    res.status(500).json({ error: 'Failed to issue order number' });
+  }
+});
+
+// ── Oversell log (manager reviews offline oversells) ──
+router.get('/offline/oversells/:restaurantId', authenticateToken, async (req, res) => {
+  try {
+    const rows = await stockReconcile.listOpenOversells(req.params.restaurantId);
+    res.json({ success: true, oversells: rows });
+  } catch (e) {
+    console.error('oversell list error:', e.message);
+    res.status(500).json({ error: 'Failed to list oversells' });
+  }
+});
+
+router.post('/offline/oversells/:id/resolve', authenticateToken, async (req, res) => {
+  try {
+    await stockReconcile.resolveOversell(req.params.id);
+    res.json({ success: true });
+  } catch (e) {
+    console.error('oversell resolve error:', e.message);
+    res.status(500).json({ error: 'Failed to resolve oversell' });
   }
 });
 

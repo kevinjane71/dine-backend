@@ -86,6 +86,17 @@ CREATE TABLE IF NOT EXISTS stock_oversell_log (
 );
 CREATE INDEX IF NOT EXISTS idx_oversell_open ON stock_oversell_log(restaurant_id) WHERE resolved = false;
 
+-- 6. Order-number counters — Hub-authoritative per-restaurant-per-day sequence.
+--    Offline terminals show a device-tagged PROVISIONAL number; the Hub assigns the
+--    real sequential number here (atomic UPSERT) on create/sync, so numbers never collide.
+CREATE TABLE IF NOT EXISTS order_number_counters (
+  restaurant_id  TEXT NOT NULL,
+  day            TEXT NOT NULL,               -- 'YYYY-MM-DD' in the restaurant's tz
+  last_seq       INT NOT NULL DEFAULT 0,
+  updated_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (restaurant_id, day)
+);
+
 -- Migrate already-created tables (M1 created order_id as UUID) to TEXT.
 -- Idempotent: TEXT→TEXT is a no-op; wrapped so a re-run never errors.
 DO $$
