@@ -12829,6 +12829,96 @@ app.get('/api/analytics/:restaurantId/daily-summary', authenticateToken, async (
   }
 });
 
+// Merge multiple active bills into one (Toast-style "merge checks"). Combines the source
+// orders' items into the primary, sums display amounts, marks each source status='merged'
+// (auto-excluded from KOT + order counts), and points every merged table's currentOrderId at
+// the primary. Billing-only — no KOT re-fire. Settlement of the merged bill frees all its
+// mergedTableIds (see the completion path). Additive; existing flows untouched.
+app.post('/api/orders/merge', authenticateToken, async (req, res) => {
+  try {
+    if (!(await checkFeaturePermission(req, 'orders', 'update'))) {
+      return res.status(403).json({ error: 'Access denied. Order update permission required.' });
+    }
+    const { restaurantId, primaryOrderId, sourceOrderIds } = req.body || {};
+    if (!restaurantId || !primaryOrderId || !Array.isArray(sourceOrderIds) || !sourceOrderIds.length) {
+      return res.status(400).json({ error: 'restaurantId, primaryOrderId and sourceOrderIds[] are required.' });
+    }
+    const srcIds = [...new Set(sourceOrderIds.filter((id) => id && id !== primaryOrderId))];
+    if (!srcIds.length) return res.status(400).json({ error: 'Select at least one other order to merge in.' });
+
+    const DEAD = ['completed', 'cancelled', 'deleted', 'merged'];
+    const primarySnap = await db.collection(collections.orders).doc(primaryOrderId).get();
+    if (!primarySnap.exists) return res.status(404).json({ error: 'Primary order not found.' });
+    const primary = primarySnap.data();
+    if (primary.restaurantId !== restaurantId) return res.status(400).json({ error: 'Order does not belong to this restaurant.' });
+    if (DEAD.includes(String(primary.status || '').toLowerCase())) {
+      return res.status(400).json({ error: `Cannot merge into an order that is ${primary.status}.` });
+    }
+
+    const sources = [];
+    for (const id of srcIds) {
+      const s = await db.collection(collections.orders).doc(id).get();
+      if (!s.exists) return res.status(404).json({ error: `Order ${id} not found.` });
+      const sd = s.data();
+      if (sd.restaurantId !== restaurantId) return res.status(400).json({ error: 'All orders must be from the same restaurant.' });
+      if (DEAD.includes(String(sd.status || '').toLowerCase())) {
+        return res.status(400).json({ error: `Order #${sd.dailyOrderId || id} is ${sd.status} and cannot be merged.` });
+      }
+      sources.push({ id, ref: s.ref, data: sd });
+    }
+
+    const num = (v) => Number(v) || 0;
+    const primaryItems = Array.isArray(primary.items) ? primary.items : [];
+    const mergedItems = [...primaryItems];
+    const mergedTableIds = new Set();
+    const mergedTableNames = new Set();
+    if (primary.tableId) mergedTableIds.add(primary.tableId);
+    if (primary.tableNumber) mergedTableNames.add(primary.tableNumber);
+    for (const s of sources) {
+      for (const it of (Array.isArray(s.data.items) ? s.data.items : [])) {
+        // Tag each merged-in line with its source table so the combined bill can show it.
+        mergedItems.push({ ...it, _mergedFromTable: s.data.tableNumber || null, _mergedFromOrderId: s.id });
+      }
+      if (s.data.tableId) mergedTableIds.add(s.data.tableId);
+      if (s.data.tableNumber) mergedTableNames.add(s.data.tableNumber);
+    }
+
+    const sumField = (f) => num(primary[f]) + sources.reduce((a, s) => a + num(s.data[f]), 0);
+    await primarySnap.ref.update({
+      items: mergedItems,
+      item_count: mergedItems.length,
+      totalAmount: sumField('totalAmount'),
+      finalAmount: sumField('finalAmount'),
+      taxAmount: sumField('taxAmount'),
+      serviceChargeAmount: sumField('serviceChargeAmount'),
+      totalDiscountAmount: sumField('totalDiscountAmount'),
+      tipAmount: sumField('tipAmount'),
+      paidAmount: sumField('paidAmount'),
+      isMergedBill: true,
+      mergedFromOrders: [...(primary.mergedFromOrders || []), ...srcIds],
+      mergedTableIds: [...mergedTableIds],
+      mergedTableNames: [...mergedTableNames],
+      updatedAt: new Date(),
+    });
+
+    for (const s of sources) {
+      await s.ref.update({ status: 'merged', mergedInto: primaryOrderId, mergedIntoNumber: primary.dailyOrderId || null, updatedAt: new Date() });
+    }
+    for (const tid of mergedTableIds) {
+      try {
+        const t = await findTableAcrossFloors(restaurantId, tid);
+        if (t) await t.ref.update({ status: 'occupied', currentOrderId: primaryOrderId, updatedAt: new Date() });
+      } catch (_) {}
+    }
+
+    try { invalidateOrdersCache(restaurantId); } catch (_) {}
+    res.json({ success: true, primaryOrderId, mergedOrders: srcIds, mergedTables: [...mergedTableNames], itemCount: mergedItems.length });
+  } catch (error) {
+    console.error('Merge orders error:', error);
+    res.status(500).json({ error: 'Failed to merge orders' });
+  }
+});
+
 app.patch('/api/orders/:orderId/status', authenticateToken, async (req, res) => {
   try {
     const { orderId } = req.params;
@@ -14902,6 +14992,23 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
             tableId: currentOrder.tableId, status: tableReleaseStatus, orderId: null, tableNumber: currentOrder.tableNumber,
           }).catch(err => console.error('RTDB table-status-updated error:', err));
           tableReleased = true;
+        }
+
+        // MERGED BILL: release every OTHER table that was pointing at this combined bill
+        // (the primary's own table is handled by the direct/fallback path; skip it).
+        if (Array.isArray(currentOrder.mergedTableIds) && currentOrder.mergedTableIds.length) {
+          for (const tid of currentOrder.mergedTableIds) {
+            if (tid === currentOrder.tableId) continue;
+            try {
+              const t = await findTableAcrossFloors(currentOrder.restaurantId, tid);
+              if (t) {
+                await t.ref.update({ status: tableReleaseStatus, currentOrderId: null, updatedAt: new Date() });
+                pusherService.triggerTableStatusUpdated(currentOrder.restaurantId, {
+                  tableId: tid, status: tableReleaseStatus, orderId: null, tableNumber: t.data.name,
+                }).catch(() => {});
+              }
+            } catch (_) {}
+          }
         }
 
         // FALLBACK: Search by table name across all floors
