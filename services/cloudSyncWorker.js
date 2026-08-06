@@ -101,6 +101,27 @@ async function ensureWatermarkTable() {
     )`);
 }
 
+// Make the shared updated_at trigger PRESERVE an explicitly-supplied timestamp (which sync
+// writes always do) and only auto-bump when the caller DIDN'T change it. Without this, the
+// BEFORE UPDATE trigger rewrites updated_at=now() on every sync write, so a just-synced row
+// looks "new" forever and orders ping-pong up↔local every cycle. Local DB only, and fully
+// backward-compatible: a normal app UPDATE (no explicit updated_at) still bumps to now().
+async function ensureIdempotentUpdatedAt() {
+  try {
+    await localPool.query(`
+      CREATE OR REPLACE FUNCTION update_updated_at_column() RETURNS trigger AS $$
+      BEGIN
+        IF NEW.updated_at IS NOT DISTINCT FROM OLD.updated_at THEN
+          NEW.updated_at := now();
+        END IF;
+        RETURN NEW;
+      END;
+      $$ LANGUAGE plpgsql`);
+  } catch (e) {
+    console.warn('cloudSync: could not make updated_at trigger idempotent:', e.message);
+  }
+}
+
 async function getWatermark(key) {
   const r = await localPool.query('SELECT last_updated_at FROM sync_watermark WHERE key = $1', [key]);
   return (r.rows[0] && r.rows[0].last_updated_at) || new Date(0);
@@ -144,7 +165,11 @@ async function replicate(src, dst, table, key, scopeRid = null) {
   const ph = names.map((_, i) => `$${i + 1}`).join(',');
   const conflictTgt = pk.map((c) => `"${c}"`).join(',');
   const upd = setCols.length ? setCols.map((c) => `"${c}"=EXCLUDED."${c}"`).join(',') : `"${pk[0]}"=EXCLUDED."${pk[0]}"`;
-  const sql = `INSERT INTO "${table}" (${quoted}) VALUES (${ph}) ON CONFLICT (${conflictTgt}) DO UPDATE SET ${upd}`;
+  // Idempotency guard: only overwrite when the incoming row is STRICTLY NEWER. An already-
+  // in-sync row (equal updated_at) is skipped entirely — no write, no trigger fire, no
+  // timestamp bump — so the watermark advances past it and it is never re-synced. This is
+  // what stops orders (bidirectional) from ping-ponging up↔down every cycle.
+  const sql = `INSERT INTO "${table}" (${quoted}) VALUES (${ph}) ON CONFLICT (${conflictTgt}) DO UPDATE SET ${upd} WHERE "${table}".updated_at < EXCLUDED.updated_at`;
 
   // The restaurants table is keyed by `id` (= the restaurant id); every other table scopes
   // by `restaurant_id`. Only scope when the column exists (skips truly-global tables).
@@ -243,6 +268,7 @@ function startCloudSync(opts = {}) {
     return 'off';
   }
   ensureWatermarkTable()
+    .then(() => ensureIdempotentUpdatedAt())
     .then(() => {
       const dirs = `↑${UP_TABLES.length}${DOWN_TABLES.length ? ` ↓${DOWN_TABLES.length}` : ''} tables`;
       if (mode === 'periodic') {
