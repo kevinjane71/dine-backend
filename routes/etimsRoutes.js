@@ -262,7 +262,15 @@ module.exports = function initEtimsRoutes(db, collections, authenticateToken, va
 
       const parsed = etims.parseSaleResult(vscuResponse);
       if (!parsed.rcptSign) {
-        return res.status(422).json({ error: 'VSCU did not return a receipt signature', detail: parsed.resultMsg || parsed.resultCd, parsed });
+        // The VSCU received the sale but refused to SIGN it — it returned an error
+        // code instead of a receipt signature. Log the real reason (lands in Vercel
+        // logs) AND put it in the error string, which the frontend shows verbatim,
+        // so the cashier sees WHY on screen. Mirrors the init-result logging.
+        const rc = parsed.resultCd || 'none';
+        const rm = parsed.resultMsg || null;
+        console.error('[etims] confirm-sale: VSCU returned no rcptSign. resultCd=%s resultMsg=%s raw=%j', rc, rm, vscuResponse);
+        const reason = rm ? `${rm} (code ${rc})` : `no receipt signature returned (code ${rc})`;
+        return res.status(422).json({ error: `VSCU rejected the sale: ${reason}`, detail: rm || rc, resultCd: rc, resultMsg: rm, parsed });
       }
       // Use the invoice number RESERVED at prepare-sale (never the client's).
       const etimsRecord = {
