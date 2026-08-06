@@ -5931,6 +5931,41 @@ app.post('/api/auth/pin/login', async (req, res) => {
       .get();
 
     if (userQuery.empty) {
+      // Not an owner/user — try a STAFF member (staffUsers uses the same pinHash/pinEnabled
+      // scheme). This is what makes the offline PIN-pad work for staff, not just the owner.
+      try {
+        let staffDoc = null;
+        for (const field of [queryField, 'username']) {
+          const val = field === 'username' ? identifier.trim() : normalizedIdentifier;
+          const sQ = await db.collection(collections.staffUsers).where(field, '==', val).limit(1).get();
+          if (!sQ.empty) { staffDoc = sQ.docs[0]; break; }
+        }
+        if (staffDoc) {
+          const s = staffDoc.data() || {};
+          if (!s.pinEnabled || !s.pinHash) {
+            return res.status(403).json({ error: 'PIN login is not enabled for this staff member.' });
+          }
+          const ok = await bcrypt.compare(pin, s.pinHash);
+          if (!ok) return res.status(401).json({ error: 'Invalid PIN' });
+          await staffDoc.ref.update({ lastLogin: new Date(), updatedAt: new Date(), ...(req.body.platform ? { lastLoginPlatform: req.body.platform } : {}) });
+          let ownerId = s.ownerId || null;
+          if (!ownerId && s.restaurantId) {
+            try { const rd = await db.collection(collections.restaurants).doc(s.restaurantId).get(); if (rd.exists) ownerId = rd.data().ownerId || null; } catch (_) {}
+          }
+          const staffToken = jwt.sign(
+            { userId: staffDoc.id, email: s.email || null, phone: s.phone || null, role: s.role || 'staff', restaurantId: s.restaurantId || null, ownerId, source: 'staffUsers' },
+            process.env.JWT_SECRET,
+            { expiresIn: '30d' }
+          );
+          return res.json({
+            success: true, message: 'PIN login successful', token: staffToken,
+            user: { id: staffDoc.id, name: s.name || s.username || 'Staff', role: s.role || 'staff', restaurantId: s.restaurantId || null, email: s.email || null, phone: s.phone || null },
+            hasRestaurants: true, redirectTo: '/dashboard',
+          });
+        }
+      } catch (staffErr) {
+        console.error('staff pin-login error:', staffErr.message);
+      }
       return res.status(401).json({ error: 'Account not found' });
     }
 
@@ -13531,6 +13566,96 @@ app.get('/api/analytics/:restaurantId/audit-trail', authenticateToken, async (re
   }
 });
 
+// Merge multiple open orders/checks into ONE bill (Toast-style "merge checks"). Combines the
+// source orders' items into the primary and marks the sources 'merged' so they no longer settle
+// on their own; every merged table points at the primary bill. Totals are re-derived from the
+// combined items when the bill screen opens — we also sum the display amounts so the order list
+// shows the combined figure at once. Billing-only: does NOT re-fire KOT (items already sent).
+app.post('/api/orders/merge', authenticateToken, async (req, res) => {
+  try {
+    if (!(await checkFeaturePermission(req, 'orders', 'update'))) {
+      return res.status(403).json({ error: 'Access denied. Order update permission required.' });
+    }
+    const { restaurantId, primaryOrderId, sourceOrderIds } = req.body || {};
+    if (!restaurantId || !primaryOrderId || !Array.isArray(sourceOrderIds) || !sourceOrderIds.length) {
+      return res.status(400).json({ error: 'restaurantId, primaryOrderId and sourceOrderIds[] are required.' });
+    }
+    const srcIds = [...new Set(sourceOrderIds.filter((id) => id && id !== primaryOrderId))];
+    if (!srcIds.length) return res.status(400).json({ error: 'Select at least one other order to merge in.' });
+
+    const DEAD = ['completed', 'cancelled', 'deleted', 'merged'];
+    const primarySnap = await db.collection(collections.orders).doc(primaryOrderId).get();
+    if (!primarySnap.exists) return res.status(404).json({ error: 'Primary order not found.' });
+    const primary = primarySnap.data();
+    if (primary.restaurantId !== restaurantId) return res.status(400).json({ error: 'Order does not belong to this restaurant.' });
+    if (DEAD.includes(String(primary.status || '').toLowerCase())) {
+      return res.status(400).json({ error: `Cannot merge into an order that is ${primary.status}.` });
+    }
+
+    const sources = [];
+    for (const id of srcIds) {
+      const s = await db.collection(collections.orders).doc(id).get();
+      if (!s.exists) return res.status(404).json({ error: `Order ${id} not found.` });
+      const sd = s.data();
+      if (sd.restaurantId !== restaurantId) return res.status(400).json({ error: 'All orders must be from the same restaurant.' });
+      if (DEAD.includes(String(sd.status || '').toLowerCase())) {
+        return res.status(400).json({ error: `Order #${sd.dailyOrderId || id} is ${sd.status} and cannot be merged.` });
+      }
+      sources.push({ id, ref: s.ref, data: sd });
+    }
+
+    const num = (v) => Number(v) || 0;
+    const primaryItems = Array.isArray(primary.items) ? primary.items : [];
+    const mergedItems = [...primaryItems];
+    const mergedTableIds = new Set();
+    const mergedTableNames = new Set();
+    if (primary.tableId) mergedTableIds.add(primary.tableId);
+    if (primary.tableNumber) mergedTableNames.add(primary.tableNumber);
+    for (const s of sources) {
+      for (const it of (Array.isArray(s.data.items) ? s.data.items : [])) {
+        // Tag each merged-in line with its source table so the combined bill can show it.
+        mergedItems.push({ ...it, _mergedFromTable: s.data.tableNumber || null, _mergedFromOrderId: s.id });
+      }
+      if (s.data.tableId) mergedTableIds.add(s.data.tableId);
+      if (s.data.tableNumber) mergedTableNames.add(s.data.tableNumber);
+    }
+
+    const sumField = (f) => num(primary[f]) + sources.reduce((a, s) => a + num(s.data[f]), 0);
+    await primarySnap.ref.update({
+      items: mergedItems,
+      item_count: mergedItems.length,
+      totalAmount: sumField('totalAmount'),
+      finalAmount: sumField('finalAmount'),
+      taxAmount: sumField('taxAmount'),
+      serviceChargeAmount: sumField('serviceChargeAmount'),
+      totalDiscountAmount: sumField('totalDiscountAmount'),
+      tipAmount: sumField('tipAmount'),
+      paidAmount: sumField('paidAmount'),
+      isMergedBill: true,
+      mergedFromOrders: [...(primary.mergedFromOrders || []), ...srcIds],
+      mergedTableIds: [...mergedTableIds],
+      mergedTableNames: [...mergedTableNames],
+      updatedAt: new Date(),
+    });
+
+    for (const s of sources) {
+      await s.ref.update({ status: 'merged', mergedInto: primaryOrderId, mergedIntoNumber: primary.dailyOrderId || null, updatedAt: new Date() });
+    }
+    for (const tid of mergedTableIds) {
+      try {
+        const t = await findTableAcrossFloors(restaurantId, tid);
+        if (t) await t.ref.update({ status: 'occupied', currentOrderId: primaryOrderId, updatedAt: new Date() });
+      } catch (_) {}
+    }
+
+    try { invalidateOrdersCache(restaurantId); } catch (_) {}
+    res.json({ success: true, primaryOrderId, mergedOrders: srcIds, mergedTables: [...mergedTableNames], itemCount: mergedItems.length });
+  } catch (error) {
+    console.error('Merge orders error:', error);
+    res.status(500).json({ error: 'Failed to merge orders' });
+  }
+});
+
 app.patch('/api/orders/:orderId/status', authenticateToken, async (req, res) => {
   try {
     const { orderId } = req.params;
@@ -15609,6 +15734,22 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
             tableId: currentOrder.tableId, status: tableReleaseStatus, orderId: null, tableNumber: currentOrder.tableNumber,
           }).catch(err => console.error('RTDB table-status-updated error:', err));
           tableReleased = true;
+        }
+
+        // MERGED BILL: release every OTHER table that was pointing at this combined bill.
+        if (Array.isArray(currentOrder.mergedTableIds) && currentOrder.mergedTableIds.length) {
+          for (const tid of currentOrder.mergedTableIds) {
+            if (tid === currentOrder.tableId) continue;
+            try {
+              const t = await findTableAcrossFloors(currentOrder.restaurantId, tid);
+              if (t) {
+                await t.ref.update({ status: tableReleaseStatus, currentOrderId: null, updatedAt: new Date() });
+                pusherService.triggerTableStatusUpdated(currentOrder.restaurantId, {
+                  tableId: tid, status: tableReleaseStatus, orderId: null, tableNumber: t.data.name,
+                }).catch(() => {});
+              }
+            } catch (_) {}
+          }
         }
 
         // FALLBACK: Search by table name across all floors
@@ -40414,6 +40555,72 @@ app.post('/api/provision', async (req, res) => {
   }
 });
 
+// Public roster for the offline PIN-pad login (LOCAL SERVER ONLY). Returns the provisioned
+// restaurant's owner + staff with just enough to render tappable tiles — name, role, the
+// login identifier (phone/email), and whether a PIN is set. NO secrets (no hashes). This is
+// hard-disabled on cloud deployments (provisioningDisabled gates on LOCAL_SERVER_MODE).
+app.get('/api/local-server/roster', async (req, res) => {
+  if (provisioningDisabled(res)) return;
+  try {
+    const rAll = await db.collection(collections.restaurants).get();
+    if (rAll.empty) return res.json({ restaurant: null, members: [] });
+    // Skip the bundled demo seed (DEMO1 / Demo Cafe) so a provisioned device shows the REAL
+    // restaurant, not the placeholder. Fall back to whatever exists if only the demo is present.
+    const isDemo = (d) => d.id === 'DEMO1' || (d.data() || {}).ownerId === 'DEMO-OWNER' || /^demo\b/i.test((d.data() || {}).name || '');
+    const reals = rAll.docs.filter((d) => !isDemo(d));
+    const rDoc = (reals.length ? reals : rAll.docs)[0];
+    const restaurantId = rDoc.id;
+    const rData = rDoc.data() || {};
+    const members = [];
+    // Owner from the users collection (restaurant.ownerId).
+    if (rData.ownerId) {
+      try {
+        const oDoc = await db.collection(collections.users).doc(rData.ownerId).get();
+        if (oDoc.exists) {
+          const o = oDoc.data() || {};
+          members.push({
+            id: oDoc.id, name: o.name || o.displayName || 'Owner', role: 'owner',
+            identifier: o.phone || o.email || null, hasPin: !!(o.pinEnabled && o.pinHash), source: 'users',
+          });
+        }
+      } catch (_) {}
+    }
+    // Staff from staffUsers for this restaurant.
+    try {
+      const sSnap = await db.collection(collections.staffUsers).where('restaurantId', '==', restaurantId).get();
+      sSnap.forEach((d) => {
+        const s = d.data() || {};
+        members.push({
+          id: d.id, name: s.name || s.username || 'Staff', role: s.role || 'staff',
+          identifier: s.phone || s.email || s.username || null, hasPin: !!(s.pinEnabled && s.pinHash), source: 'staffUsers',
+        });
+      });
+    } catch (_) {}
+    res.json({
+      restaurant: { id: restaurantId, name: rData.name || rData.restaurantName || 'Restaurant' },
+      members,
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Public sync progress for the first-run loader + status pill (LOCAL SERVER ONLY, no secrets:
+// just cycle counts, reachability, and per-table row totals). Polled by the UI.
+app.get('/api/local-server/sync-progress', async (req, res) => {
+  if (provisioningDisabled(res)) return;
+  try {
+    const s = await require('./services/cloudSyncWorker').getSyncStatus();
+    res.json({
+      mode: s.mode, reachable: !!s.reachable, running: !!s.running,
+      firstSyncDone: !!s.firstSyncDone, cyclesCompleted: s.cyclesCompleted || 0,
+      totalSynced: s.totalSynced || 0, categories: s.categories || [], lastCycleAt: s.lastCycleAt || null,
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // ── Local-server cloud-sync control (offline deployments) ────────────────────
 // Status + on-demand "Sync Now" for the local→cloud / cloud→local sync worker.
 app.get('/api/local-server/sync-status', authenticateToken, async (req, res) => {
@@ -40526,8 +40733,69 @@ if (process.env.LOCAL_SERVER_MODE === 'true') {
 // On the on-prem local server only: push data created offline up to the cloud when
 // the internet returns (generic, idempotent local→cloud row replication). No-op
 // unless CLOUD_SYNC_ENABLED=true with a CLOUD_DATABASE_URL distinct from the local one.
+
+// Recompute derived aggregates (daily_stats: revenue, order counts, payment/type/category
+// breakdown) FROM the orders themselves. Aggregates are maintained per-order via
+// FieldValue.increment; sync copies order ROWS without firing that increment, so after a sync
+// we rebuild the affected days by deleting their daily_stats and replaying updateDailyStats
+// over the day's orders. Orders are the source of truth → stats always match, no double-count.
+let _statsFullRecomputeDone = false;
+async function recomputeDailyStatsFromOrders(restaurantId, { fullHistory = false } = {}) {
+  if (!restaurantId) return;
+  try {
+    // Use the restaurant's own tz so day boundaries match how the orders were bucketed.
+    let tzOffset = -330, dayStartHour = 0; // default: IST (-330 min), day starts midnight
+    try {
+      const rd = await db.collection('restaurants').doc(restaurantId).get();
+      const s = rd.exists ? (rd.data() || {}) : {};
+      const cfg = s.settings || s;
+      if (typeof cfg.tzOffset === 'number') tzOffset = cfg.tzOffset;
+      if (typeof cfg.dayStartHour === 'number') dayStartHour = cfg.dayStartHour;
+    } catch (_) {}
+
+    const sinceMs = fullHistory ? 0 : Date.now() - 3 * 24 * 3600 * 1000; // recent 3 days by default
+    const snap = await db.collection('orders').where('restaurantId', '==', restaurantId).get();
+    const orders = [];
+    snap.forEach((d) => {
+      const o = { id: d.id, ...d.data() };
+      const t = o.createdAt?.toDate ? o.createdAt.toDate().getTime() : new Date(o.createdAt || 0).getTime();
+      if (t >= sinceMs) orders.push(o);
+    });
+
+    // Which days are affected → delete those daily_stats docs so the replay rebuilds from 0.
+    const days = new Set();
+    for (const o of orders) {
+      const od = o.createdAt?.toDate ? o.createdAt.toDate() : new Date(o.createdAt || Date.now());
+      days.add(dateStrInTZ(od, tzOffset, dayStartHour));
+    }
+    for (const day of days) {
+      await db.collection('dailyStats').doc(`${restaurantId}_${day}`).delete().catch(() => {});
+    }
+    // Replay only orders that COUNT (exclude cancelled/deleted). Atomic increments → order-safe.
+    let replayed = 0;
+    for (const o of orders) {
+      const st = String(o.status || '').toLowerCase();
+      if (st === 'cancelled' || st === 'canceled' || o.deleted === true) continue;
+      updateDailyStats(restaurantId, o, 'add', tzOffset, dayStartHour);
+      replayed++;
+    }
+    console.log(`📊 daily_stats recomputed for ${restaurantId}: ${days.size} day(s), ${replayed} orders (${fullHistory ? 'full history' : 'recent'}).`);
+  } catch (e) {
+    console.warn('recomputeDailyStatsFromOrders error:', e.message);
+  }
+}
+
 try {
-  require('./services/cloudSyncWorker').startCloudSync();
+  require('./services/cloudSyncWorker').startCloudSync({
+    // After order rows sync, rebuild the affected days' stats from the orders. First run does a
+    // full-history recompute (the initial pull brings in historical orders); after that, recent.
+    onOrdersChanged: async () => {
+      const rid = (process.env.SYNC_RESTAURANT_ID || '').trim();
+      if (!rid) return;
+      await recomputeDailyStatsFromOrders(rid, { fullHistory: !_statsFullRecomputeDone });
+      _statsFullRecomputeDone = true;
+    },
+  });
 } catch (e) {
   console.warn('Cloud sync worker skipped:', e.message);
 }

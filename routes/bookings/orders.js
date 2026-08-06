@@ -1,7 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const { FieldValue } = require('firebase-admin/firestore');
-const { generateBookingNumber, checkVenueConflict, syncCustomerData } = require('./helpers');
+const { generateBookingNumber, checkVenueConflict, checkTableConflict, syncCustomerData } = require('./helpers');
 
 module.exports = function(db, collections, authenticateToken, checkFeaturePermission) {
 
@@ -108,11 +108,12 @@ module.exports = function(db, collections, authenticateToken, checkFeaturePermis
       const {
         type, customer, eventName, eventDate, eventEndDate, eventTime, eventEndTime,
         guestCount, specialInstructions, venue, items, subtotal, discount,
-        taxAmount, serviceCharge, totalAmount, payments, trackExpense, forceBook
+        taxAmount, serviceCharge, totalAmount, payments, trackExpense, forceBook,
+        tables, tableIds, // #19 table reservation — supports multiple tables in one booking
       } = req.body;
 
-      // Validation
-      if (!type || !['catering', 'advance_order', 'venue'].includes(type)) {
+      // Validation — 'table' is a first-class type now (table reservations).
+      if (!type || !['catering', 'advance_order', 'venue', 'table'].includes(type)) {
         return res.status(400).json({ error: 'Invalid booking type' });
       }
       if (!eventDate) {
@@ -151,6 +152,28 @@ module.exports = function(db, collections, authenticateToken, checkFeaturePermis
                 conflicts: conflict.conflicts
               });
             }
+          }
+        }
+      }
+
+      // #18 Table reservation overlap check — reject if any requested table clashes with an
+      // existing confirmed reservation on the same date/time (owner may forceBook to override).
+      const normTableIds = (tableIds && tableIds.length ? tableIds : (tables || []).map((t) => t.id))
+        .filter(Boolean).map(String);
+      if (type === 'table') {
+        if (!normTableIds.length) {
+          return res.status(400).json({ error: 'Select at least one table for the reservation.' });
+        }
+        const conflict = await checkTableConflict(
+          db, collections, restaurantId, normTableIds, eventDate, eventTime || null, eventEndTime || null, null
+        );
+        if (!conflict.available) {
+          const isOwner = req.user.role === 'owner' || req.user.role === 'admin';
+          if (!forceBook || !isOwner) {
+            return res.status(409).json({
+              error: 'One or more tables are already reserved for that date/time.',
+              conflicts: conflict.conflicts,
+            });
           }
         }
       }
@@ -197,6 +220,8 @@ module.exports = function(db, collections, authenticateToken, checkFeaturePermis
         guestCount: guestCount || 0,
         specialInstructions: specialInstructions || '',
         venue: type === 'venue' ? (venue || null) : null,
+        tables: type === 'table' ? (tables || []) : null,   // #19 reserved tables [{id,name}]
+        tableIds: type === 'table' ? normTableIds : null,   // flat ids for overlap querying
         items: (type !== 'venue') ? (items || []) : [],
         subtotal: subtotal || 0,
         discount: discount || null,
@@ -223,6 +248,26 @@ module.exports = function(db, collections, authenticateToken, checkFeaturePermis
       };
 
       const ref = await db.collection(collections.bookings).add(bookingData);
+
+      // #9 Send a confirmation to the client (best-effort, non-blocking). No-op if the
+      // restaurant hasn't configured WhatsApp. The message includes the booker's name (#17).
+      if (type === 'table' && customer.phone) {
+        (async () => {
+          try {
+            const restDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
+            const rd = restDoc.exists ? (restDoc.data() || {}) : {};
+            const ws = rd.whatsappSettings || {};
+            if (!ws.accessToken) return;
+            const credentials = { accessToken: ws.accessToken, phoneNumberId: ws.phoneNumberId, businessAccountId: ws.businessAccountId };
+            const tableNames = (tables || []).map((t) => t.name).filter(Boolean).join(', ') || normTableIds.join(', ');
+            const when = `${eventDate}${eventTime ? `  ${eventTime}${eventEndTime ? '–' + eventEndTime : ''}` : ''}`;
+            const msg = `Hi ${customer.name || ''}, your table reservation at ${rd.name || 'our restaurant'} is confirmed.\n` +
+              `When: ${when}\nTable(s): ${tableNames}\nRef: ${bookingNumber}\nSee you soon!`;
+            const whatsappService = require('../../services/whatsappService');
+            await whatsappService.sendTextMessage(customer.phone, msg, credentials);
+          } catch (e) { console.warn('booking confirmation send failed (non-fatal):', e.message); }
+        })();
+      }
 
       res.status(201).json({
         success: true,

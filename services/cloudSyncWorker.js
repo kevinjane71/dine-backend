@@ -28,13 +28,27 @@ const { Pool } = require('pg');
 const INTERVAL_MS = parseInt(process.env.CLOUD_SYNC_INTERVAL_MS, 10) || 45000;
 const BATCH = parseInt(process.env.CLOUD_SYNC_BATCH, 10) || 500;
 
-// Up = transactions (local → cloud). Parent→child order for FK safety.
+// FULL restaurant sync, split-authority (bidirectional overall, conflict-free):
+//   UP (local → cloud): transactions + things created/mutated offline (local is truth offline).
+//   DOWN (cloud → local): catalog/config the owner edits on the web (cloud is truth).
+// Missing tables are skipped gracefully, so listing extras is safe. Override per-site via env.
 const UP_TABLES = (process.env.CLOUD_SYNC_TABLES ||
-  'customers,tables,orders,payments,daily_stats,shifts,cash_registers,inventory')
+  'orders,payments,daily_stats,shifts,cash_registers,customers')
   .split(',').map((s) => s.trim()).filter(Boolean);
-// Down = catalog/config (cloud → local). Empty by default (opt in per site).
-const DOWN_TABLES = (process.env.CLOUD_SYNC_DOWN_TABLES || '')
+// NOTE: `restaurants` (and its embedded menu) is intentionally NOT here — the menu lives in
+// Firestore and is pulled via API provisioning (provisioning.js). Syncing the menu-less cloud
+// Postgres restaurant row would clobber the menu. Structural/config tables sync down here.
+//
+// orders + payments are in BOTH up and down → true two-way: orders placed on the web (or on
+// another terminal) flow DOWN into this app, and orders placed here flow UP. Safe because each
+// order has a globally-unique id, so merge = UNION by id (never a double-count); edits resolve
+// last-write-wins by updated_at. (daily_stats stays UP-only — it's an aggregate, not row-keyed,
+// so two-waying it would clobber; the cloud recomputes its own.)
+const DOWN_TABLES = (process.env.CLOUD_SYNC_DOWN_TABLES ||
+  'orders,payments,staff_users,floors,tables,offers,recipes,suppliers,inventory,customers,discount_settings,coupons,customer_segments,tax_groups')
   .split(',').map((s) => s.trim()).filter(Boolean);
+// One-restaurant device: DOWN pulls ONLY this restaurant's rows from the shared cloud DB.
+const SCOPE_RID = (process.env.SYNC_RESTAURANT_ID || '').trim() || null;
 
 function resolveMode() {
   let m = (process.env.SYNC_MODE || '').toLowerCase().trim();
@@ -47,6 +61,8 @@ let localPool = null;
 let cloudPool = null;
 let timer = null;
 let cycleRunning = false;
+let cyclesCompleted = 0;   // how many full sync cycles have finished (UI uses this to detect
+let lastCycleAt = null;    // "first sync done" and to show a live progress/status pill)
 let mode = 'off';
 
 async function getColumns(client, table) {
@@ -54,6 +70,24 @@ async function getColumns(client, table) {
     `SELECT column_name, data_type FROM information_schema.columns
      WHERE table_schema = 'public' AND table_name = $1`, [table]);
   return r.rows;
+}
+
+// Real primary-key columns for a table (handles composite PKs like floors=(id,restaurant_id)),
+// so ON CONFLICT targets the actual PK instead of assuming (id).
+const _pkCache = new Map();
+async function getPk(client, table) {
+  if (_pkCache.has(table)) return _pkCache.get(table);
+  let pk = ['id'];
+  try {
+    const r = await client.query(
+      `SELECT a.attname FROM pg_index i
+       JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey)
+       WHERE i.indrelid = ('public.' || $1)::regclass AND i.indisprimary
+       ORDER BY array_position(i.indkey, a.attnum)`, [table]);
+    if (r.rows.length) pk = r.rows.map((x) => x.attname);
+  } catch (_) {}
+  _pkCache.set(table, pk);
+  return pk;
 }
 
 async function ensureWatermarkTable() {
@@ -89,7 +123,10 @@ function coerce(value, dataType) {
 }
 
 // Replicate one table from src → dst. `key` namespaces the watermark (direction:table).
-async function replicate(src, dst, table, key) {
+// scopeRid (optional): restrict to ONE restaurant. CRITICAL for DOWN (cloud→local) — the
+// cloud holds every restaurant's rows, and a single-restaurant device must pull ONLY its
+// own. Applied only when the table actually has a restaurant_id column (skips globals).
+async function replicate(src, dst, table, key, scopeRid = null) {
   const srcCols = await getColumns(src, table);
   if (!srcCols.length) return { table, key, skipped: 'missing at source' };
   const srcNames = srcCols.map((c) => c.column_name);
@@ -101,36 +138,46 @@ async function replicate(src, dst, table, key) {
   const cols = srcCols.filter((c) => dstNames.has(c.column_name));
   const names = cols.map((c) => c.column_name);
   const typeOf = Object.fromEntries(cols.map((c) => [c.column_name, c.data_type]));
-  const setCols = names.filter((c) => c !== 'id');
+  const pk = await getPk(dst, table);            // real PK (composite-aware) at the destination
+  const setCols = names.filter((c) => !pk.includes(c));
   const quoted = names.map((c) => `"${c}"`).join(',');
   const ph = names.map((_, i) => `$${i + 1}`).join(',');
-  const upd = setCols.map((c) => `"${c}"=EXCLUDED."${c}"`).join(',');
-  const sql = `INSERT INTO "${table}" (${quoted}) VALUES (${ph}) ON CONFLICT (id) DO UPDATE SET ${upd}`;
+  const conflictTgt = pk.map((c) => `"${c}"`).join(',');
+  const upd = setCols.length ? setCols.map((c) => `"${c}"=EXCLUDED."${c}"`).join(',') : `"${pk[0]}"=EXCLUDED."${pk[0]}"`;
+  const sql = `INSERT INTO "${table}" (${quoted}) VALUES (${ph}) ON CONFLICT (${conflictTgt}) DO UPDATE SET ${upd}`;
+
+  // The restaurants table is keyed by `id` (= the restaurant id); every other table scopes
+  // by `restaurant_id`. Only scope when the column exists (skips truly-global tables).
+  const scopeCol = table === 'restaurants' ? 'id' : 'restaurant_id';
+  const scoped = scopeRid && srcNames.includes(scopeCol);
+  const scopeSql = scoped ? ` AND "${scopeCol}" = $2` : '';
 
   let wm = await getWatermark(key);
   let lastGood = wm;
-  let total = 0;
+  let total = 0, failed = 0;
+  let lastErr = null;
   for (;;) {
     const res = await src.query(
-      `SELECT ${quoted} FROM "${table}" WHERE updated_at > $1 ORDER BY updated_at ASC LIMIT ${BATCH}`, [wm]);
+      `SELECT ${quoted} FROM "${table}" WHERE updated_at > $1${scopeSql} ORDER BY updated_at ASC LIMIT ${BATCH}`,
+      scoped ? [wm, scopeRid] : [wm]);
     if (!res.rows.length) break;
     let batch = 0;
     for (const row of res.rows) {
       try {
         await dst.query(sql, names.map((c) => coerce(row[c], typeOf[c])));
         batch++; total++;
-        if (row.updated_at && row.updated_at > lastGood) lastGood = row.updated_at;
       } catch (rowErr) {
-        // Stop this table WITHOUT skipping the failed row → retried next cycle.
-        await setWatermark(key, lastGood, `${row.id}: ${rowErr.message}`.slice(0, 300), batch);
-        return { table, key, synced: total, error: rowErr.message, stoppedAt: row.id };
+        // SKIP the bad row and keep going (one malformed row must not block the whole table
+        // or wedge the watermark). Record the last error for visibility.
+        failed++; lastErr = `${row.id}: ${rowErr.message}`;
       }
+      if (row.updated_at && row.updated_at > lastGood) lastGood = row.updated_at;
     }
     wm = lastGood;
-    await setWatermark(key, wm, null, batch); // per-batch delta (rows_synced accumulates)
+    await setWatermark(key, wm, lastErr, batch); // advance watermark past processed rows
     if (res.rows.length < BATCH) break;
   }
-  return { table, key, synced: total };
+  return { table, key, synced: total, ...(failed ? { failed, error: lastErr } : {}) };
 }
 
 async function cloudReachable() {
@@ -140,25 +187,32 @@ async function cloudReachable() {
 async function runCycle() {
   if (cycleRunning || !localPool || !cloudPool) return { skipped: 'not-ready' };
   cycleRunning = true;
-  const summary = { up: 0, down: 0, tables: [], reachable: false };
+  const summary = { up: 0, down: 0, tables: [], reachable: false, ordersMoved: 0 };
+  const ORDER_TABLES = new Set(['orders', 'payments']);
   try {
     if (!(await cloudReachable())) return summary;
     summary.reachable = true;
     for (const t of UP_TABLES) {
       const r = await replicate(localPool, cloudPool, t, `up:${t}`);
-      if (r.synced) summary.up += r.synced;
+      if (r.synced) { summary.up += r.synced; if (ORDER_TABLES.has(t)) summary.ordersMoved += r.synced; }
       if (r.error || r.skipped) summary.tables.push(r);
     }
     for (const t of DOWN_TABLES) {
-      const r = await replicate(cloudPool, localPool, t, `down:${t}`);
-      if (r.synced) summary.down += r.synced;
+      const r = await replicate(cloudPool, localPool, t, `down:${t}`, SCOPE_RID);
+      if (r.synced) { summary.down += r.synced; if (ORDER_TABLES.has(t)) summary.ordersMoved += r.synced; }
       if (r.error || r.skipped) summary.tables.push(r);
     }
     if (summary.up || summary.down) console.log(`☁️  cloud-sync: ↑${summary.up} ↓${summary.down} rows`);
+    // Recompute derived aggregates (revenue/daily_stats) from the synced orders — copied-in
+    // rows don't trigger the per-order increment, so the host rebuilds stats from orders.
+    if (summary.ordersMoved && onOrdersChanged) {
+      try { await onOrdersChanged(summary); } catch (e) { console.warn('☁️  onOrdersChanged hook error:', e.message); }
+    }
   } catch (e) {
     console.warn('☁️  cloud-sync cycle error:', e.message);
   } finally {
     cycleRunning = false;
+    if (summary.reachable) { cyclesCompleted += 1; lastCycleAt = new Date().toISOString(); }
   }
   return summary;
 }
@@ -172,8 +226,15 @@ function initPools() {
   return true;
 }
 
-/** Start per SYNC_MODE. Returns the resolved mode. */
-function startCloudSync() {
+// Optional hook: called after a cycle that moved order rows, so the host can RECOMPUTE
+// derived aggregates (daily_stats/revenue) from the now-synced orders. Aggregates are
+// incrementally maintained per-order, so copied-in rows won't update them — the host
+// recomputes instead (source of truth = orders).
+let onOrdersChanged = null;
+
+/** Start per SYNC_MODE. opts.onOrdersChanged({up,down}) fires after order rows sync. */
+function startCloudSync(opts = {}) {
+  onOrdersChanged = typeof opts.onOrdersChanged === 'function' ? opts.onOrdersChanged : null;
   mode = resolveMode();
   if (mode === 'off') { console.log('☁️  cloud-sync: OFF (complete offline island).'); return 'off'; }
   if (!initPools()) {
@@ -204,12 +265,24 @@ async function triggerSync() {
 }
 
 async function getSyncStatus() {
-  const status = { mode, upTables: UP_TABLES, downTables: DOWN_TABLES, intervalMs: INTERVAL_MS, running: cycleRunning, watermarks: [] };
+  const status = {
+    mode, upTables: UP_TABLES, downTables: DOWN_TABLES, intervalMs: INTERVAL_MS,
+    running: cycleRunning, cyclesCompleted, lastCycleAt, watermarks: [],
+    firstSyncDone: cyclesCompleted >= 1, totalSynced: 0, categories: [],
+  };
   if (!localPool) return status;
   try {
     status.reachable = await cloudReachable();
     const r = await localPool.query('SELECT key, last_updated_at, last_run, last_error, rows_synced FROM sync_watermark ORDER BY key');
     status.watermarks = r.rows;
+    // Friendly rollup for the loader: one row per table (direction stripped), total rows moved.
+    const byTable = {};
+    for (const w of r.rows) {
+      const table = String(w.key).replace(/^(up|down):/, '');
+      byTable[table] = (byTable[table] || 0) + Number(w.rows_synced || 0);
+      status.totalSynced += Number(w.rows_synced || 0);
+    }
+    status.categories = Object.entries(byTable).map(([table, rows]) => ({ table, rows }));
   } catch (_) {}
   return status;
 }

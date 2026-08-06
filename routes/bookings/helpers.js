@@ -93,6 +93,58 @@ function timeToMinutes(time) {
 }
 
 /**
+ * Table-reservation overlap check (#18). A table is unavailable if ANY confirmed table
+ * reservation for the SAME table on the SAME date has an overlapping time window. Handles
+ * multi-table requests (#19) — flags every requested table that clashes. Uses proper interval
+ * overlap: two windows clash unless one ends at/before the other starts.
+ * Query is restaurantId-only (+ JS filter) so it needs no composite index on Firestore and
+ * works identically through the PG adapter.
+ * @returns {available:boolean, conflicts:[{bookingId,bookingNumber,tables:[],time,customerName}]}
+ */
+async function checkTableConflict(db, collections, restaurantId, tableIds, eventDate, eventTime, eventEndTime, excludeBookingId) {
+  const wanted = new Set((tableIds || []).map(String));
+  if (!wanted.size || !eventDate) return { available: true, conflicts: [] };
+
+  const snap = await db.collection(collections.bookings)
+    .where('restaurantId', '==', restaurantId)
+    .get();
+
+  const reqStart = eventTime ? timeToMinutes(eventTime) : null;
+  const reqEnd = eventEndTime ? timeToMinutes(eventEndTime) : null;
+  const conflicts = [];
+
+  snap.forEach((doc) => {
+    if (excludeBookingId && doc.id === excludeBookingId) return;
+    const b = doc.data() || {};
+    if (b.type !== 'table') return;
+    if (b.eventDate !== eventDate) return;
+    if (!['confirmed', 'in_progress'].includes(b.status)) return;
+
+    const bTableIds = (b.tableIds && b.tableIds.length ? b.tableIds : (b.tables || []).map((t) => t.id)).map(String);
+    const shared = bTableIds.filter((id) => wanted.has(id));
+    if (!shared.length) return;
+
+    // If BOTH have a time window, only a real overlap clashes; if either lacks times, treat
+    // the whole day as taken (conservative — better to warn than double-book).
+    if (reqStart != null && reqEnd != null && b.eventTime && b.eventEndTime) {
+      const bStart = timeToMinutes(b.eventTime);
+      const bEnd = timeToMinutes(b.eventEndTime);
+      if (reqEnd <= bStart || reqStart >= bEnd) return; // no overlap
+    }
+
+    conflicts.push({
+      bookingId: doc.id,
+      bookingNumber: b.bookingNumber,
+      tables: shared,
+      time: `${b.eventTime || ''} - ${b.eventEndTime || ''}`.trim(),
+      customerName: b.customer?.name || '',
+    });
+  });
+
+  return { available: conflicts.length === 0, conflicts };
+}
+
+/**
  * Create expense entry in inv_expenses on booking completion
  */
 async function createExpenseEntry(db, collections, booking, userId) {
@@ -179,6 +231,7 @@ async function syncCustomerData(db, collections, restaurantId, customerData) {
 module.exports = {
   generateBookingNumber,
   checkVenueConflict,
+  checkTableConflict,
   timeToMinutes,
   createExpenseEntry,
   buildDateFilter,

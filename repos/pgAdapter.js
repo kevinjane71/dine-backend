@@ -1753,6 +1753,22 @@ class PgTransaction {
     this._client = client;
     this._registry = registry;
     this._firestoreDb = firestoreDb;
+    // Firestore's transaction.set/update/delete are SYNCHRONOUS (writes are buffered and
+    // applied atomically at commit), so app code legitimately does NOT await them. Our
+    // versions execute immediately and async. If we don't track them, runTransaction()
+    // can COMMIT before an un-awaited write's SAVEPOINT/RELEASE finishes, which then hits
+    // "RELEASE SAVEPOINT ... no active transaction" (25P01) and crashes. We collect every
+    // write promise here and runTransaction() drains them before COMMIT.
+    this._pending = [];
+  }
+
+  /** Await all writes issued in this transaction (even un-awaited ones) before commit. */
+  async _drain() {
+    if (this._pending.length) {
+      const p = this._pending;
+      this._pending = [];
+      await Promise.all(p);
+    }
   }
 
   /**
@@ -1795,7 +1811,9 @@ class PgTransaction {
         this._client
       );
       if (docRef._scopeChain) txRef._scopeChain = docRef._scopeChain;
-      return txRef.set(data, options);
+      const p = txRef.set(data, options);
+      this._pending.push(p);
+      return p;
     }
     return docRef.set(data, options);
   }
@@ -1813,7 +1831,9 @@ class PgTransaction {
         this._client
       );
       if (docRef._scopeChain) txRef._scopeChain = docRef._scopeChain;
-      return txRef.update(data);
+      const p = txRef.update(data);
+      this._pending.push(p);
+      return p;
     }
     return docRef.update(data);
   }
@@ -1831,7 +1851,9 @@ class PgTransaction {
         this._client
       );
       if (docRef._scopeChain) txRef._scopeChain = docRef._scopeChain;
-      return txRef.delete();
+      const p = txRef.delete();
+      this._pending.push(p);
+      return p;
     }
     return docRef.delete();
   }
@@ -1932,6 +1954,10 @@ function createPgDb(registry, firestoreDb) {
         await client.query('BEGIN');
         const transaction = new PgTransaction(client, registry, firestoreDb);
         const result = await updateFn(transaction);
+        // Drain any writes the callback issued without awaiting (Firestore-style
+        // synchronous set/update/delete) so they finish INSIDE the transaction — before
+        // COMMIT — otherwise their SAVEPOINT/RELEASE races the commit and 25P01-crashes.
+        await transaction._drain();
         await client.query('COMMIT');
         return result;
       } catch (err) {
