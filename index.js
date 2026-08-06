@@ -10438,10 +10438,18 @@ app.post('/api/orders', authenticateOrderCreate, async (req, res) => {
       }
     }
 
+    const _termPrefix = (process.env.TERMINAL_PREFIX || '').trim();
     const orderData = {
       restaurantId,
       orderNumber,
       dailyOrderId,
+      // Toast-style multi-terminal numbering: each terminal keeps its OWN counter, so stamp
+      // WHICH terminal created this order and pre-format the human number as <prefix>-<n>
+      // (e.g. T2-45). Two terminals both ringing #45 stay distinct (T1-45 vs T2-45); order
+      // identity is still the unique id, so totals never double-count. Prefix only set on
+      // offline terminals (TERMINAL_PREFIX env); cloud / single-terminal orders keep plain n.
+      terminalPrefix: _termPrefix || null,
+      orderNumberDisplay: _termPrefix ? `${_termPrefix}-${dailyOrderId}` : String(dailyOrderId),
       tabNumber,
       tableNumber: tableNumber || seatNumber || null,
       floorId: tableFloorId_resolved || floorId || null,
