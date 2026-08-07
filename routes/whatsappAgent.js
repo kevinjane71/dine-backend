@@ -1,9 +1,9 @@
 /**
  * WhatsApp AI agent for the DineOpen sales/support number.
  * ---------------------------------------------------------------------------
- * FULLY ISOLATED + FLAG-GATED. It runs only when WA_AI_AGENT_ENABLED === 'true'
- * and is invoked from the webhook inside a single try/catch, so it can NEVER
- * break the existing inbox/lead flow. Default OFF.
+ * FULLY ISOLATED + FLAG-GATED. It is ENABLED BY DEFAULT (live) and only disabled
+ * when WA_AI_AGENT_ENABLED === 'false'. It is invoked from the webhook inside a
+ * single try/catch, so it can NEVER break the existing inbox/lead flow.
  *
  * Behaviour (per product spec):
  *  - Acts ONLY on the DineOpen number's conversations (general leads), inside WA's
@@ -66,7 +66,7 @@ const DELAY_MS = parseInt(process.env.WA_AGENT_DELAY_MS, 10) || 10 * 60 * 1000; 
 const HISTORY_MAX = 20;
 const INTERNAL_BASE = process.env.BACKEND_URL || `http://127.0.0.1:${process.env.PORT || 3003}`;
 
-const isEnabled = () => process.env.WA_AI_AGENT_ENABLED === 'true';
+const isEnabled = () => process.env.WA_AI_AGENT_ENABLED !== 'false';
 const isDineOpenNumber = (phoneNumberId) =>
   !!phoneNumberId && phoneNumberId === process.env.DINEOPEN_WHATSAPP_PHONE_NUMBER_ID;
 
