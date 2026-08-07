@@ -286,7 +286,9 @@ router.get('/:restaurantId/active-all', async (req, res) => {
         }
         ordersSnap.docs.forEach(oDoc => {
           const order = oDoc.data();
-          if (['cancelled', 'refunded', 'deleted'].includes(order.status)) return;
+          // Count only settled sales (exclude open/unpaid 'confirmed'/'pending' + cancelled/
+          // refunded/deleted/saved) so live per-staff Total Sales matches the shift close-out.
+          if (!['completed', 'paid', 'settled'].includes(order.status)) return;
           const orderDate = order.createdAt?.toDate ? order.createdAt.toDate() : new Date(order.createdAt);
           if (orderDate < openedAt) return;
           if (!isShiftOwnerAdmin && shiftUserId) {

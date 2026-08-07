@@ -131,9 +131,10 @@ router.get('/dashboard', authenticateToken, requireOwnerRole, async (req, res) =
     let totalLowStockItems = 0;
 
     const restaurantData = restaurants.map((restaurant, index) => {
-      // Process orders for the period — exclude cancelled/deleted/saved/refunded orders
-      const nonCountedStatuses = ['cancelled', 'deleted', 'saved', 'refunded'];
-      const orders = ordersResults[index].docs.filter(doc => !nonCountedStatuses.includes(doc.data().status));
+      // Count only settled sales (exclude open/unpaid, cancelled, saved, deleted, refunded).
+      // Allowlist, not blocklist: a blocklist wrongly counts open 'confirmed'/'pending' orders.
+      const countedStatuses = ['completed', 'paid', 'settled'];
+      const orders = ordersResults[index].docs.filter(doc => countedStatuses.includes(doc.data().status));
       const periodOrders = orders.length;
       // Subtract partial refund amounts; exclude unpaid due amounts from revenue
       let periodDueAmount = 0;
@@ -330,11 +331,11 @@ router.get('/analytics', authenticateToken, requireOwnerRole, async (req, res) =
     const revenueByRestaurant = [];
     const allOrders = [];
 
-    const nonCountedStatuses = ['cancelled', 'deleted', 'saved', 'refunded'];
+    // Count only settled sales (exclude open/unpaid, cancelled, saved, deleted, refunded).
+    const countedStatuses = ['completed', 'paid', 'settled'];
 
     restaurantIds.forEach((restaurantId, index) => {
-      // Exclude cancelled/deleted/saved/refunded orders from analytics
-      const orders = ordersResults[index].docs.filter(doc => !nonCountedStatuses.includes(doc.data().status));
+      const orders = ordersResults[index].docs.filter(doc => countedStatuses.includes(doc.data().status));
       // Subtract partial refund amounts; exclude unpaid due amounts from revenue
       let restaurantDueAmount = 0;
       const restaurantRevenue = orders.reduce((sum, doc) => {
@@ -379,7 +380,7 @@ router.get('/analytics', authenticateToken, requireOwnerRole, async (req, res) =
     const prevAllOrders = [];
 
     restaurantIds.forEach((restaurantId, index) => {
-      const prevOrders = prevOrdersResults[index].docs.filter(doc => !nonCountedStatuses.includes(doc.data().status));
+      const prevOrders = prevOrdersResults[index].docs.filter(doc => countedStatuses.includes(doc.data().status));
       previousTotalRevenue += prevOrders.reduce((sum, doc) => sum + getEffectiveOrderRevenue(doc.data()).amount, 0);
       previousTotalOrders += prevOrders.length;
       prevOrders.forEach(doc => {

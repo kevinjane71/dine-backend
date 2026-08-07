@@ -263,7 +263,9 @@ router.get('/:restaurantId/summary', async (req, res) => {
     // Aggregate orders
     orderSnap.docs.forEach(doc => {
       const o = doc.data();
-      if (o.status === 'cancelled') return;
+      // Count only settled sales (exclude open/unpaid 'confirmed'/'pending', cancelled,
+      // saved, deleted, refunded) so Books revenue matches the dashboard.
+      if (!['completed', 'paid', 'settled'].includes(o.status)) return;
       const key = getKey(o.createdAt, period);
       if (!summaryMap[key]) summaryMap[key] = { period: key, revenue: 0, tax: 0, orders: 0, expenses: 0, profit: 0 };
       summaryMap[key].revenue += o.finalAmount || o.totalAmount || 0;
