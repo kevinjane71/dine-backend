@@ -26,7 +26,20 @@
  * State: Firestore collection `wa_agent_state`, doc id = sender phone (digits only).
  */
 const axios = require('axios');
+const jwt = require('jsonwebtoken');
 const { getDb, collections } = require('../firebase');
+
+// Mint a service JWT for a resolved account so the agent can act AS that owner on the
+// existing authed endpoints (bulk-upload, restaurant-create) without their password.
+// Same payload shape the app signs ({userId,email,role}) so authenticateToken accepts it.
+// Short-lived — only used for this one automated onboarding action.
+function mintToken(user) {
+  return jwt.sign(
+    { userId: user.userId, email: user.email || null, role: user.role || 'owner' },
+    process.env.JWT_SECRET,
+    { expiresIn: '2h' }
+  );
+}
 
 const STATE_COLLECTION = 'wa_agent_state';
 const DELAY_MS = parseInt(process.env.WA_AGENT_DELAY_MS, 10) || 10 * 60 * 1000; // ~10 min debounce
@@ -228,37 +241,56 @@ Return strict JSON: {"type":"menu_setup|greeting|other|different_number","draft"
 // ── Account resolve/create (reuses existing endpoints — no schema reimplementation)
 async function resolveOrCreateAccount(phone, name) {
   const db = getDb();
-  // Already registered on this phone?
+  // 1. Already registered on this phone? -> mint a token for that owner (works for
+  //    ANY existing account, WA-created or not — fixes the "returning account" gap).
   const existing = await db.collection(collections.users).where('phone', '==', phone).limit(1).get();
   if (!existing.empty) {
-    const userId = existing.docs[0].id;
-    // find their restaurant
-    let restaurantId = null;
-    try {
-      const links = await db.collection(collections.userRestaurants).where('userId', '==', userId).limit(1).get();
-      if (!links.empty) restaurantId = links.docs[0].data().restaurantId;
-    } catch (_) {}
+    const doc = existing.docs[0];
+    const d = doc.data();
+    const token = mintToken({ userId: doc.id, email: d.email, role: d.role });
+    let restaurantId = await findRestaurantId(doc.id);
     if (!restaurantId) {
-      const rs = await db.collection(collections.restaurants).where('ownerId', '==', userId).limit(1).get();
-      if (!rs.empty) restaurantId = rs.docs[0].id;
+      // account exists but no restaurant yet -> create one with the minted token
+      const rest = await internalPost('/api/restaurants', { name: name || d.name || `Restaurant ${phone.slice(-4)}`, phone, businessType: 'restaurant' }, token);
+      restaurantId = rest?.restaurant?.id || rest?.id || null;
     }
-    const token = await internalLogin(existing.docs[0].data().email, phone);
-    return restaurantId && token ? { userId, restaurantId, token } : null;
+    return restaurantId ? { userId: doc.id, restaurantId, token } : null;
   }
-  // New: create via the real register + restaurant-create endpoints.
+  // 2. New: create the account via the real register endpoint, then MINT our own token
+  //    (don't depend on register's response containing one), then create the restaurant.
   const email = `wa${phone}@wa.dineopen.com`;
   const password = `Wa!${Math.random().toString(36).slice(2, 10)}${Date.now().toString(36)}`;
+  const displayName = name || `Restaurant ${phone.slice(-4)}`;
   const reg = await internalPost('/api/auth/register', {
-    email, password, name: name || `Restaurant ${phone.slice(-4)}`,
-    phone, restaurantName: name || `Restaurant ${phone.slice(-4)}`, role: 'owner', source: 'whatsapp',
+    email, password, name: displayName, phone, restaurantName: displayName, role: 'owner', source: 'whatsapp',
   });
-  if (!reg || !reg.token) return null;
-  // Create the restaurant with the fresh token.
-  const rest = await internalPost('/api/restaurants', {
-    name: name || `Restaurant ${phone.slice(-4)}`, phone, businessType: 'restaurant',
-  }, reg.token);
-  const restaurantId = rest?.restaurant?.id || rest?.id || reg.restaurantId || null;
-  return restaurantId ? { userId: reg.userId, restaurantId, token: reg.token } : null;
+  // Resolve the new userId (from the response, else look it up by the email we just used).
+  let userId = reg?.userId || reg?.user?.id || null;
+  if (!userId) {
+    const u = await db.collection(collections.users).where('email', '==', email).limit(1).get();
+    if (!u.empty) userId = u.docs[0].id;
+  }
+  if (!userId) return null;
+  const token = mintToken({ userId, email, role: 'owner' });
+  let restaurantId = reg?.restaurant?.id || reg?.restaurantId || await findRestaurantId(userId);
+  if (!restaurantId) {
+    const rest = await internalPost('/api/restaurants', { name: displayName, phone, businessType: 'restaurant' }, token);
+    restaurantId = rest?.restaurant?.id || rest?.id || null;
+  }
+  return restaurantId ? { userId, restaurantId, token } : null;
+}
+
+async function findRestaurantId(userId) {
+  const db = getDb();
+  try {
+    const links = await db.collection(collections.userRestaurants).where('userId', '==', userId).limit(1).get();
+    if (!links.empty) return links.docs[0].data().restaurantId;
+  } catch (_) {}
+  try {
+    const rs = await db.collection(collections.restaurants).where('ownerId', '==', userId).limit(1).get();
+    if (!rs.empty) return rs.docs[0].id;
+  } catch (_) {}
+  return null;
 }
 
 async function uploadMenu(restaurantId, token, files) {
@@ -289,14 +321,4 @@ async function internalPost(path, body, token) {
     return null;
   }
 }
-async function internalLogin(email, phone) {
-  // WA-created accounts share a deterministic-ish flow; for existing accounts we can't
-  // know their password, so mint a token via a support path if available. For now, only
-  // WA-origin accounts (email @wa.dineopen.com) get an auto token; others are escalated.
-  if (!String(email || '').endsWith('@wa.dineopen.com')) return null;
-  // The register flow returns a token at creation; for a returning WA account we skip
-  // (menu will just be attached on their existing restaurant on next fresh onboarding).
-  return null;
-}
-
-module.exports = { onInbound, processDue, isEnabled };
+module.exports = { onInbound, processDue, isEnabled, mintToken, resolveOrCreateAccount };
