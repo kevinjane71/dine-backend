@@ -359,4 +359,59 @@ async function internalPost(path, body, token) {
     return null;
   }
 }
-module.exports = { onInbound, processDue, isEnabled, mintToken, resolveOrCreateAccount, checkRate, RL, ELEVATED_ROLES };
+// ── Draft approval workflow (Step 2 — used by the dine-admin WhatsApp tab) ────
+// The agent stores a drafted reply (status 'needs_approval') for any "other" question or
+// escalation; a human approves/edits/sends or dismisses it. These are NOT flag-gated so
+// admins can always clear the queue, and don't create/modify customer accounts.
+
+// List conversations waiting for admin approval, newest first.
+async function listDrafts(limit = 50) {
+  const snap = await getDb().collection(STATE_COLLECTION)
+    .where('status', '==', 'needs_approval')
+    .limit(limit).get();
+  const rows = snap.docs.map((d) => {
+    const s = d.data();
+    return {
+      phone: s.phone,
+      name: s.name || '',
+      reason: s.draft?.reason || '',
+      draftText: s.draft?.text || '',
+      lastMessage: (s.history || []).filter(h => h.role === 'user').slice(-1)[0]?.text || '',
+      history: (s.history || []).slice(-6),
+      createdAt: s.draft?.createdAt || s.updatedAt || null,
+    };
+  });
+  rows.sort((a, b) => new Date(b.createdAt || 0) - new Date(a.createdAt || 0));
+  return rows;
+}
+
+// Approve: send the (optionally edited) text on WhatsApp, then clear the draft.
+async function approveDraft(phone, textOverride, approvedBy) {
+  const p = digits(phone);
+  const { ref, data } = await loadState(p);
+  if (!data) return { ok: false, error: 'conversation not found' };
+  const text = (textOverride && String(textOverride).trim()) || data.draft?.text || '';
+  if (!text) return { ok: false, error: 'no reply text' };
+  await sendReply(p, text);
+  await ref.set({
+    status: 'idle', draft: null,
+    lastApproved: { text, by: approvedBy || 'admin', at: new Date() },
+    history: [...(data.history || []), { role: 'assistant', text, at: Date.now(), approvedBy: approvedBy || 'admin' }].slice(-HISTORY_MAX),
+    updatedAt: new Date(),
+  }, { merge: true });
+  return { ok: true, sent: text };
+}
+
+// Dismiss: drop the draft without sending.
+async function dismissDraft(phone, by) {
+  const p = digits(phone);
+  const { ref, data } = await loadState(p);
+  if (!data) return { ok: false, error: 'conversation not found' };
+  await ref.set({ status: 'idle', draft: null, lastDismiss: { by: by || 'admin', at: new Date() }, updatedAt: new Date() }, { merge: true });
+  return { ok: true };
+}
+
+module.exports = {
+  onInbound, processDue, isEnabled, mintToken, resolveOrCreateAccount, checkRate, RL, ELEVATED_ROLES,
+  listDrafts, approveDraft, dismissDraft,
+};
