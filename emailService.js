@@ -335,6 +335,21 @@ DineOpen AI Analytics
       </h3>
     </div>
 
+    <!-- Open / Unsettled Orders — shown separately, NOT counted in sales -->
+    ${(data.todayReport.openOrders && data.todayReport.openOrders.total.count > 0) ? `
+    <div style="padding: 0 30px 20px;">
+      <div style="border-radius: 12px; border: 1px solid #fde68a; background: #fffbeb; padding: 14px 16px;">
+        <table width="100%" cellpadding="0" cellspacing="0"><tr>
+          <td style="font-size: 13px; font-weight: 700; color: #92400e;">⚠️ Open orders — not settled</td>
+          <td style="font-size: 15px; font-weight: 800; color: #92400e; text-align: right;">${data.todayReport.openOrders.total.count} · ${_ca(data.todayReport.openOrders.total.amount.toLocaleString())}</td>
+        </tr></table>
+        <div style="font-size: 11.5px; color: #a16207; margin-top: 6px; line-height: 1.5;">
+          Not included in the sales figures above. ${data.todayReport.openOrders.today.count} opened today${data.todayReport.openOrders.aged.count > 0 ? ` · <b style="color:#b45309;">${data.todayReport.openOrders.aged.count} carried over from earlier days</b> (oldest ${data.todayReport.openOrders.aged.oldestDays}d) — please settle or void them` : ''}.
+        </div>
+      </div>
+    </div>
+    ` : ''}
+
     <!-- Payment Breakdown -->
     ${data.todayReport.payments && Object.keys(data.todayReport.payments).length > 0 ? `
     <div style="padding: 0 30px 20px;">
@@ -871,6 +886,23 @@ DineOpen Analytics Team`;
       });
 
       y += 65;
+
+      // ========================
+      // OPEN / UNSETTLED ORDERS (shown separately, NOT counted in sales)
+      // ========================
+      const _open = data.todayReport?.openOrders;
+      if (_open && _open.total && _open.total.count > 0) {
+        const hasAged = (_open.aged?.count || 0) > 0;
+        const boxH = hasAged ? 46 : 32;
+        doc.roundedRect(50, y, pageWidth, boxH, 6).fillAndStroke('#fffbeb', '#fde68a');
+        doc.fontSize(11).font('DejaVuSans-Bold').fillColor('#92400e')
+          .text(`Open orders - not settled: ${_open.total.count}  -  ${fmtCurrency((_open.total.amount || 0).toLocaleString())}`, 60, y + 8, { width: pageWidth - 20 });
+        let sub = `Not included in the sales figures above. ${_open.today.count} opened today`;
+        if (hasAged) sub += `; ${_open.aged.count} carried over from earlier days (oldest ${_open.aged.oldestDays}d) - please settle or void.`;
+        else sub += '.';
+        doc.fontSize(8.5).font('DejaVuSans').fillColor('#a16207').text(sub, 60, y + (hasAged ? 26 : 20), { width: pageWidth - 20 });
+        y += boxH + 15;
+      }
 
       // ========================
       // AI SUMMARY

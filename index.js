@@ -12492,6 +12492,7 @@ app.get('/api/analytics/:restaurantId/daily-summary', authenticateToken, async (
 
     // Aggregate across all dates
     let totalOrders = 0, totalRevenue = 0, totalRevenueWithTax = 0;
+    let openOrdersCount = 0, openOrdersAmount = 0; // unsettled orders — shown separately, NOT sales
     const itemMap = {};
     const ordersByType = {};
     const hourlyBreakdown = {};
@@ -12675,6 +12676,12 @@ app.get('/api/analytics/:restaurantId/daily-summary', authenticateToken, async (
       ordersSnap.docs.forEach(doc => {
         const order = doc.data();
         if (['cancelled', 'deleted', 'saved', 'refunded'].includes(order.status)) return;
+        // Open (unsettled) orders — tally separately, keep OUT of sales totals + payment breakdown.
+        if (!['completed', 'paid', 'settled'].includes(order.status)) {
+          openOrdersCount++;
+          openOrdersAmount += (order.finalAmount || order.totalAmount || 0);
+          return;
+        }
         totalOrders++;
         // Subtract any partial refund amount from revenue
         const refundAdj = (order.refundAmount && order.status !== 'refunded') ? order.refundAmount : 0;
@@ -12820,12 +12827,95 @@ app.get('/api/analytics/:restaurantId/daily-summary', authenticateToken, async (
           amount: Math.round(d.amount * 100) / 100,
           percentage: totalRevenueWithTax > 0 ? Math.round((d.amount / totalRevenueWithTax) * 10000) / 100 : 0
         })).sort((a, b) => b.amount - a.amount),
+        openOrders: { count: openOrdersCount, amount: Math.round(openOrdersAmount * 100) / 100 },
         subRestaurantBreakdown: subRestaurantBreakdown.length > 0 ? subRestaurantBreakdown : undefined
       }
     });
   } catch (error) {
     console.error('Daily summary error:', error);
     res.status(500).json({ error: 'Failed to fetch daily summary' });
+  }
+});
+
+// List all currently OPEN (unsettled) orders for a restaurant — any date, with age. Powers the
+// "Open Orders" dashboard indicator + the resolution page (settle / cancel / delete). Bounded
+// lookback keeps reads small (open tabs are rare) and reuses the (restaurantId, createdAt) index.
+app.get('/api/orders/:restaurantId/open', authenticateToken, async (req, res) => {
+  try {
+    if (!(await checkFeaturePermission(req, 'orders', 'read'))) {
+      return res.status(403).json({ error: 'Access denied: insufficient permissions' });
+    }
+    const { restaurantId } = req.params;
+    const SETTLED = ['completed', 'paid', 'settled'];
+    const VOID = ['cancelled', 'deleted', 'refunded', 'saved'];
+    const lookbackDays = Math.min(parseInt(req.query.lookbackDays) || 90, 365);
+    const since = new Date(Date.now() - lookbackDays * 86400000);
+    const tzOffset = parseTZ(req), dayStartHour = parseDayStart(req);
+    const todayBounds = dateBoundsInTZ(dateStrInTZ(new Date(), tzOffset, dayStartHour), tzOffset, dayStartHour);
+    const todayStartMs = todayBounds.start.getTime();
+
+    // Redis cache keyed by the orders version-counter: ANY order write (create/status/settle/
+    // cancel/delete/edit) bumps the version via pushEvent + the cancel/delete paths, so a cached
+    // result auto-misses the moment orders change — never stale. Short TTL is a safety net.
+    const _ver = await getOrdersVersion(restaurantId);
+    const _key = ordersCacheKey(restaurantId, _ver, `open:${lookbackDays}`);
+    const _cached = await kvGet(_key);
+    if (_cached) return res.json(_cached);
+    const _origJson = res.json.bind(res);
+    res.json = (body) => {
+      try { if ((res.statusCode || 200) === 200) kvSet(_key, body, 60).catch(() => {}); } catch (_) {}
+      return _origJson(body);
+    };
+
+    const snap = await db.collection(collections.orders)
+      .where('restaurantId', '==', restaurantId)
+      .where('createdAt', '>=', since)
+      .get();
+
+    const open = [];
+    let amount = 0, agedCount = 0, agedAmount = 0, oldestDays = 0;
+    snap.docs.forEach(doc => {
+      const o = doc.data();
+      if (SETTLED.includes(o.status) || VOID.includes(o.status)) return;
+      const created = o.createdAt?.toDate ? o.createdAt.toDate() : new Date(o.createdAt);
+      const amt = o.finalAmount || o.totalAmount || 0;
+      const ageDays = Math.max(0, Math.floor((todayStartMs - created.getTime()) / 86400000));
+      const aged = created.getTime() < todayStartMs;
+      amount += amt;
+      if (aged) { agedCount++; agedAmount += amt; if (ageDays > oldestDays) oldestDays = ageDays; }
+      open.push({
+        id: doc.id,
+        orderNumber: o.dailyOrderId || o.orderNumber || null,
+        status: o.status,
+        paymentStatus: o.paymentStatus || null,
+        paymentMethod: o.paymentMethod || null,
+        amount: amt,
+        orderType: o.orderType || null,
+        tableNumber: o.tableNumber || (o.tables && o.tables[0] && (o.tables[0].name || o.tables[0].number)) || null,
+        customerName: o.customerInfo?.name || o.customer?.name || null,
+        itemCount: Array.isArray(o.items) ? o.items.reduce((s, i) => s + (i.quantity || 1), 0) : 0,
+        items: Array.isArray(o.items) ? o.items.slice(0, 6).map(i => ({ name: i.name || i.itemName, qty: i.quantity || 1 })) : [],
+        createdBy: o.staffInfo?.waiterName || o.staffInfo?.name || o.waiterName || o.createdBy?.name || null,
+        createdAt: created.toISOString(),
+        ageDays,
+        aged,
+      });
+    });
+    open.sort((a, b) => new Date(a.createdAt) - new Date(b.createdAt)); // oldest first
+    res.json({
+      success: true,
+      openOrders: open,
+      summary: {
+        count: open.length,
+        amount: Math.round(amount * 100) / 100,
+        agedCount,
+        agedAmount: Math.round(agedAmount * 100) / 100,
+        oldestDays,
+      },
+    });
+  } catch (error) {
+    console.error('Open orders error:', error);
+    res.status(500).json({ error: 'Failed to fetch open orders' });
   }
 });
 
@@ -15588,6 +15678,8 @@ app.delete('/api/orders/:orderId', authenticateToken, async (req, res) => {
     if (!['saved', 'cancelled', 'deleted'].includes(order.status)) {
       updateDailyStats(order.restaurantId, order, 'delete', parseTZ(req), parseDayStart(req));
     }
+
+    try { invalidateOrdersCache(order.restaurantId); } catch (_) {} // refresh order lists (incl. Open Orders)
 
     // Release table if assigned
     if (order.tableNumber && order.tableNumber.trim()) {
@@ -24118,6 +24210,8 @@ app.patch('/api/orders/:orderId/cancel', authenticateToken, async (req, res) => 
         console.error('WhatsApp cancel notification error (non-blocking):', waErr.message);
       }
     })();
+
+    try { invalidateOrdersCache(orderData.restaurantId); } catch (_) {} // refresh order lists (incl. Open Orders)
 
     res.json({
       success: true,

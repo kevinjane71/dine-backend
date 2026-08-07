@@ -1519,8 +1519,9 @@ class FunctionCallingAgent {
     allOrders.forEach(orderData => {
       const data = orderData;
       
-      // Skip cancelled orders
-      if (data.status === 'cancelled') {
+      // Count only settled sales (exclude open/unpaid 'confirmed'/'pending', cancelled,
+      // saved, deleted, refunded) so the AI's sales answers match the dashboard.
+      if (!['completed', 'paid', 'settled'].includes(data.status)) {
         return;
       }
 

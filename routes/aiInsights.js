@@ -10,6 +10,16 @@ const { parseTZ, parseDayStart, todayInTZ, dateStrInTZ, dateBoundsInTZ, ianaToTz
 // Provides AI-powered analytics and automated emails
 // ============================================
 
+// Order statuses that represent a real, settled sale. Revenue/order-count/cash reporting
+// must count ONLY these — never open/unpaid ('confirmed'/'pending'), cancelled, saved,
+// deleted or refunded orders. Mirrors the HQ reports' allowlist (the correct reference).
+const SETTLED_ORDER_STATUSES = ['completed', 'paid', 'settled'];
+// Voided / non-sale statuses. Neither a sale nor "open money".
+const VOID_ORDER_STATUSES = ['cancelled', 'deleted', 'refunded', 'saved'];
+// An OPEN order = fired but not yet settled and not voided (e.g. status 'confirmed' with
+// paymentStatus 'pending'). Shown separately as "unsettled money", never counted as sales.
+const isOpenOrder = (o) => !SETTLED_ORDER_STATUSES.includes(o.status) && !VOID_ORDER_STATUSES.includes(o.status);
+
 /**
  * Convert a local time + timezone to UTC hour for cron matching.
  * E.g. "08:00" in "Asia/Kolkata" → 2 (08:00 IST = 02:30 UTC → hour 2)
@@ -887,6 +897,11 @@ async function generateReportForOwner(userId, timezone, frequency = 'daily', rep
 
     ordersSnap.docs.forEach(doc => {
       const order = doc.data();
+      // Only settled sales count — matches the dashboard/Sales-Summary. Without this the
+      // report included open/unpaid ('confirmed'/'pending'), cancelled, saved, deleted and
+      // refunded orders, over-reporting revenue, order count, popular items, busy hours and
+      // order-type breakdowns. Allowlist mirrors the HQ reports (the correct reference).
+      if (!SETTLED_ORDER_STATUSES.includes(order.status)) return;
       const amount = order.finalAmount || order.totalAmount || 0;
       totalRevenue += amount;
       totalOrders++;
@@ -1010,6 +1025,10 @@ async function generateReportForOwner(userId, timezone, frequency = 'daily', rep
   const categoryWise = {};
   const todayItemCounts = {};
   const staffWise = {};
+  // Open (unsettled) orders — shown separately, NEVER counted as sales.
+  let openTodayCount = 0, openTodayAmount = 0;          // fired today, still not settled
+  let openAgedCount = 0, openAgedAmount = 0, openOldestDays = 0; // carried over from earlier days
+  const OPEN_AGED_LOOKBACK_DAYS = 30;                   // how far back to look for stale open tabs
 
   for (const restaurantId of restaurantIds) {
     const todayOrdersSnap = await db.collection(collections.orders)
@@ -1030,6 +1049,18 @@ async function generateReportForOwner(userId, timezone, frequency = 'daily', rep
         refundedAmount += order.finalAmount || order.totalAmount || 0;
         return;
       }
+
+      // Open (unsettled) order fired today — tally separately, not as a sale.
+      if (isOpenOrder(order)) {
+        openTodayCount++;
+        openTodayAmount += order.finalAmount || order.totalAmount || 0;
+        return;
+      }
+
+      // Only settled sales count toward revenue/cash/payments — skip open or unpaid orders
+      // (e.g. status 'confirmed' with paymentStatus 'pending') so the emailed report matches
+      // the dashboard's Sales Summary.
+      if (!SETTLED_ORDER_STATUSES.includes(order.status)) return;
 
       const amount = order.finalAmount || order.totalAmount || 0;
       todayRevenue += amount;
@@ -1088,6 +1119,29 @@ async function generateReportForOwner(userId, timezone, frequency = 'daily', rep
         });
       }
     });
+
+    // Carried-over open orders: fired on an EARLIER day but still not settled ("forgotten
+    // tabs"). Bounded lookback keeps reads small (open tabs are rare) and reuses the existing
+    // (restaurantId, createdAt) index — no new composite index needed.
+    try {
+      const startMs = startOfDay?.toDate ? startOfDay.toDate().getTime()
+        : (startOfDay instanceof Date ? startOfDay.getTime() : new Date(startOfDay).getTime());
+      const agedStart = new Date(startMs - OPEN_AGED_LOOKBACK_DAYS * 86400000);
+      const agedSnap = await db.collection(collections.orders)
+        .where('restaurantId', '==', restaurantId)
+        .where('createdAt', '>=', agedStart)
+        .where('createdAt', '<', startOfDay)
+        .get();
+      agedSnap.forEach(d => {
+        const o = d.data();
+        if (!isOpenOrder(o)) return;
+        openAgedCount++;
+        openAgedAmount += o.finalAmount || o.totalAmount || 0;
+        const created = o.createdAt?.toDate ? o.createdAt.toDate() : new Date(o.createdAt);
+        const ageDays = Math.floor((startMs - created.getTime()) / 86400000);
+        if (ageDays > openOldestDays) openOldestDays = ageDays;
+      });
+    } catch (_) { /* non-fatal — skip aged-open tally on error */ }
   }
 
   const topItems = Object.values(todayItemCounts).sort((a, b) => b.qty - a.qty).slice(0, 15);
@@ -1129,6 +1183,13 @@ async function generateReportForOwner(userId, timezone, frequency = 'daily', rep
       orderCount: todayOrderCount,
       avgOrderValue: todayOrderCount > 0 ? round(todayRevenue / todayOrderCount) : 0,
       cashCollected: round(todayCashCollected),
+    },
+    // Open (unsettled) orders — separate from sales. `today` = fired today & still open;
+    // `aged` = carried over from earlier days (forgotten tabs, needs attention).
+    openOrders: {
+      today: { count: openTodayCount, amount: round(openTodayAmount) },
+      aged: { count: openAgedCount, amount: round(openAgedAmount), oldestDays: openOldestDays },
+      total: { count: openTodayCount + openAgedCount, amount: round(openTodayAmount + openAgedAmount) },
     },
     payments: Object.fromEntries(Object.entries(paymentBreakdown).map(([k, v]) => [k, round(v)])),
     tax: {
