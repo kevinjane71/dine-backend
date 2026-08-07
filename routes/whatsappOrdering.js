@@ -151,6 +151,12 @@ router.post('/webhook', async (req, res) => {
     const match = await orderingService.findRestaurantByPhoneNumberId(phoneNumberId);
     if (!match) {
       console.warn(`No restaurant found for WhatsApp ordering phone number ID: ${phoneNumberId}`);
+      // AI sales/support agent for the DineOpen number (flag-gated + fully isolated —
+      // cannot affect the inbox flow above). Self-scopes to the DineOpen number.
+      if (process.env.WA_AI_AGENT_ENABLED === 'true') {
+        try { await require('./whatsappAgent').onInbound({ message, contact, phoneNumberId }); }
+        catch (agentErr) { console.error('[wa-agent] onInbound error (non-blocking):', agentErr.message); }
+      }
       return; // Ordering flow stops, but message is already logged above for inbox
     }
 
@@ -491,6 +497,23 @@ router.post('/test-message/:restaurantId', authenticateToken, async (req, res) =
   } catch (error) {
     console.error('Test message error:', error);
     res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// ── Cron: process due AI-agent replies (10-min debounce) ─────────────────────
+// Wire a Cloud Scheduler job every 1 min: POST /api/whatsapp-ordering/agent/process-due
+// with header  x-cron-secret: <CRON_SECRET>. No-op unless WA_AI_AGENT_ENABLED=true.
+router.post('/agent/process-due', async (req, res) => {
+  const secret = req.headers['x-cron-secret'] || req.query.secret;
+  if (!process.env.CRON_SECRET || secret !== process.env.CRON_SECRET) {
+    return res.status(403).json({ error: 'forbidden' });
+  }
+  try {
+    const result = await require('./whatsappAgent').processDue();
+    res.json({ ok: true, ...result });
+  } catch (e) {
+    console.error('[wa-agent] process-due error:', e.message);
+    res.status(500).json({ ok: false, error: e.message });
   }
 });
 
