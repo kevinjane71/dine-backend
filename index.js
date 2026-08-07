@@ -37325,7 +37325,9 @@ app.delete('/api/categories/:restaurantId/:categoryId', authenticateToken, async
 
     // Check if any menu items use this category or sub-category
     const menuItems = restaurantData.menu?.items || [];
-    const itemsUsingCategory = menuItems.filter(item => item.category === categoryId || item.subCategory === categoryId);
+    // Exclude soft-deleted items (status:'deleted') — the Menu UI hides them, so counting them
+    // here blocked deleting a category that only holds deleted items ("empty" but un-deletable).
+    const itemsUsingCategory = menuItems.filter(item => item.status !== 'deleted' && (item.category === categoryId || item.subCategory === categoryId));
 
     if (itemsUsingCategory.length > 0) {
       return res.status(400).json({
