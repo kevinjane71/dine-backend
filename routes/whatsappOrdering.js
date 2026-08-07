@@ -500,11 +500,14 @@ router.post('/test-message/:restaurantId', authenticateToken, async (req, res) =
   }
 });
 
-// ── Cron: process due AI-agent replies (10-min debounce) ─────────────────────
-// Wire a Cloud Scheduler job every 1 min: POST /api/whatsapp-ordering/agent/process-due
-// with header  x-cron-secret: <CRON_SECRET>. No-op unless WA_AI_AGENT_ENABLED=true.
-router.post('/agent/process-due', async (req, res) => {
-  const secret = req.headers['x-cron-secret'] || req.query.secret;
+// ── Cron: process due AI-agent replies (debounced) ───────────────────────────
+// Runs on the Vercel Cron in vercel.json (every 15 min) — Vercel calls it as a GET with
+// `Authorization: Bearer <CRON_SECRET>` (auto-injected because CRON_SECRET is set), same
+// as /api/cron/send-daily-reports. Also accepts POST + `x-cron-secret` (Cloud Scheduler)
+// or `?secret=`. No-op unless WA_AI_AGENT_ENABLED=true.
+const processDueHandler = async (req, res) => {
+  const bearer = (req.headers.authorization || '').replace(/^Bearer\s+/i, '');
+  const secret = bearer || req.headers['x-cron-secret'] || req.query.secret;
   if (!process.env.CRON_SECRET || secret !== process.env.CRON_SECRET) {
     return res.status(403).json({ error: 'forbidden' });
   }
@@ -515,6 +518,8 @@ router.post('/agent/process-due', async (req, res) => {
     console.error('[wa-agent] process-due error:', e.message);
     res.status(500).json({ ok: false, error: e.message });
   }
-});
+};
+router.get('/agent/process-due', processDueHandler);
+router.post('/agent/process-due', processDueHandler);
 
 module.exports = router;
