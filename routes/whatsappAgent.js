@@ -29,16 +29,36 @@ const axios = require('axios');
 const jwt = require('jsonwebtoken');
 const { getDb, collections } = require('../firebase');
 
+// Roles the agent must NEVER auto-act on / mint a token for (privilege-escalation guard).
+const ELEVATED_ROLES = new Set(['super-admin', 'admin', 'sub-admin']);
+
 // Mint a service JWT for a resolved account so the agent can act AS that owner on the
 // existing authed endpoints (bulk-upload, restaurant-create) without their password.
-// Same payload shape the app signs ({userId,email,role}) so authenticateToken accepts it.
-// Short-lived — only used for this one automated onboarding action.
+// SECURITY: role is FORCED to 'owner' (never elevated) + a `via:'wa-agent'` audit claim,
+// and it's very short-lived (15 min) — just long enough for the one onboarding action.
+// Ownership checks on the endpoints still scope it to that user's own restaurant only.
 function mintToken(user) {
   return jwt.sign(
-    { userId: user.userId, email: user.email || null, role: user.role || 'owner' },
+    { userId: user.userId, email: user.email || null, role: 'owner', via: 'wa-agent' },
     process.env.JWT_SECRET,
-    { expiresIn: '2h' }
+    { expiresIn: '15m' }
   );
+}
+
+// ── Per-phone daily rate limits (abuse guard on the automated actions) ───────
+const RL = {
+  replies: parseInt(process.env.WA_AGENT_MAX_REPLIES_DAY, 10) || 15,
+  menus: parseInt(process.env.WA_AGENT_MAX_MENUS_DAY, 10) || 3,
+  accounts: parseInt(process.env.WA_AGENT_MAX_ACCOUNTS_DAY, 10) || 1,
+};
+function todayStr() { const d = new Date(); return `${d.getUTCFullYear()}-${d.getUTCMonth() + 1}-${d.getUTCDate()}`; }
+// Returns { ok, rl } — increments `kind` for today if under the cap.
+function checkRate(state, kind) {
+  const day = todayStr();
+  const rl = (state.rl && state.rl.day === day) ? { ...state.rl } : { day, replies: 0, menus: 0, accounts: 0 };
+  if ((rl[kind] || 0) >= (RL[kind] || 0)) return { ok: false, rl };
+  rl[kind] = (rl[kind] || 0) + 1;
+  return { ok: true, rl };
 }
 
 const STATE_COLLECTION = 'wa_agent_state';
@@ -163,10 +183,12 @@ async function processDue() {
 async function runReplyFlow(ref, state) {
   const intent = await classifyIntent(state);
   if (intent.type === 'menu_setup' || intent.type === 'greeting') {
+    const { ok, rl } = checkRate(state, 'replies');
+    if (!ok) { await ref.set({ status: 'idle', rl, updatedAt: new Date() }, { merge: true }); return; } // over daily cap -> stay silent
     await sendReply(state.phone,
       "Hi! 👋 To set up your restaurant on DineOpen, just send your *menu photos or PDF* here. " +
       "We'll create your account on this number and add your menu — then you can start using it right away.");
-    await ref.set({ status: 'idle', stage: 'awaiting_menu', updatedAt: new Date() }, { merge: true });
+    await ref.set({ status: 'idle', stage: 'awaiting_menu', rl, updatedAt: new Date() }, { merge: true });
     return;
   }
   if (intent.type === 'different_number') {
@@ -189,11 +211,23 @@ async function runReplyFlow(ref, state) {
 // Menu flow (media present): ensure account for this phone, then AI-upload the menu.
 async function runMenuFlow(ref, state) {
   const phone = state.phone;
+  // Abuse guard: cap automated menu processing per phone per day.
+  const { ok, rl } = checkRate(state, 'menus');
+  if (!ok) {
+    await sendReply(phone, "Thanks! We've received your menus — our team will finish setting up your account shortly.");
+    await ref.set({ status: 'needs_approval', rl, draft: { reason: 'menu rate limit hit', createdAt: new Date() }, pendingMedia: [], updatedAt: new Date() }, { merge: true });
+    return;
+  }
   // 1. Ensure an account exists for THIS number (create if new).
   const acct = await resolveOrCreateAccount(phone, state.name);
+  if (acct && acct.escalate) {
+    // privileged account matched this phone -> never auto-act; hand to a human.
+    await ref.set({ status: 'needs_approval', rl, draft: { reason: 'privileged account matched — manual setup', createdAt: new Date() }, updatedAt: new Date() }, { merge: true });
+    return;
+  }
   if (!acct || !acct.restaurantId || !acct.token) {
     await sendReply(phone, "Thanks! We received your menu — our team will finish setting up your account shortly.");
-    await ref.set({ status: 'needs_approval', draft: { reason: 'account setup needs review', createdAt: new Date() }, updatedAt: new Date() }, { merge: true });
+    await ref.set({ status: 'needs_approval', rl, draft: { reason: 'account setup needs review', createdAt: new Date() }, updatedAt: new Date() }, { merge: true });
     return;
   }
   // 2. Download the menu media and AI-upload it to THIS restaurant only.
@@ -209,7 +243,7 @@ async function runMenuFlow(ref, state) {
   await sendReply(phone, added > 0
     ? `✅ Done! Your account is ready and ${added} items were added from your menu. You can start using DineOpen now — we'll message your login details next.`
     : `✅ Your account is ready! We couldn't read items automatically from that file — please resend a clearer menu photo/PDF and we'll add them.`);
-  await ref.set({ status: 'idle', stage: 'onboarded', resolvedRestaurantId: acct.restaurantId, pendingMedia: [], updatedAt: new Date() }, { merge: true });
+  await ref.set({ status: 'idle', stage: 'onboarded', resolvedRestaurantId: acct.restaurantId, pendingMedia: [], rl, updatedAt: new Date() }, { merge: true });
 }
 
 // ── Intent classification + draft (OpenAI) ──────────────────────────────────
@@ -247,7 +281,11 @@ async function resolveOrCreateAccount(phone, name) {
   if (!existing.empty) {
     const doc = existing.docs[0];
     const d = doc.data();
-    const token = mintToken({ userId: doc.id, email: d.email, role: d.role });
+    // SECURITY: never auto-act on a privileged account (super-admin/admin/sub-admin) —
+    // escalate to a human instead. Prevents a spoofed/matching phone from getting an
+    // agent-driven action on an elevated account.
+    if (ELEVATED_ROLES.has(String(d.role || '').toLowerCase())) return { escalate: true };
+    const token = mintToken({ userId: doc.id, email: d.email });
     let restaurantId = await findRestaurantId(doc.id);
     if (!restaurantId) {
       // account exists but no restaurant yet -> create one with the minted token
@@ -321,4 +359,4 @@ async function internalPost(path, body, token) {
     return null;
   }
 }
-module.exports = { onInbound, processDue, isEnabled, mintToken, resolveOrCreateAccount };
+module.exports = { onInbound, processDue, isEnabled, mintToken, resolveOrCreateAccount, checkRate, RL, ELEVATED_ROLES };
