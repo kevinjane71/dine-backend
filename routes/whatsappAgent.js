@@ -235,13 +235,18 @@ async function runMenuFlow(ref, state) {
   for (const m of (state.pendingMedia || []).slice(0, 10)) {
     try { files.push(await downloadMedia(m.id)); } catch (e) { console.error('[wa-agent] media dl failed', e.message); }
   }
+  // Default is APPEND (preserve the old menu). Only REPLACE when the customer explicitly asks
+  // (e.g. "replace my menu", "reset", "start over") — then the old menu is soft-deleted first.
+  const convoText = (state.history || []).map(h => (h && h.text) || '').join(' ').toLowerCase();
+  const wantsReplace = /\breplace\b|\breset\b|start over|overwrite|clear (the |my )?menu|delete (the |my )?(old |current )?menu/.test(convoText);
+
   let added = 0;
   if (files.length) {
-    added = await uploadMenu(acct.restaurantId, acct.token, files);
+    added = await uploadMenu(acct.restaurantId, acct.token, files, { replace: wantsReplace });
   }
   // 3. Confirm.
   await sendReply(phone, added > 0
-    ? `✅ Done! Your account is ready and ${added} items were added from your menu. You can start using DineOpen now — we'll message your login details next.`
+    ? `✅ Done! Your account is ready and ${added} items were ${wantsReplace ? 'set as your new menu (previous menu replaced)' : 'added to your menu'}. You can start using DineOpen now — we'll message your login details next.`
     : `✅ Your account is ready! We couldn't read items automatically from that file — please resend a clearer menu photo/PDF and we'll add them.`);
   await ref.set({ status: 'idle', stage: 'onboarded', resolvedRestaurantId: acct.restaurantId, pendingMedia: [], rl, updatedAt: new Date() }, { merge: true });
 }
@@ -331,16 +336,42 @@ async function findRestaurantId(userId) {
   return null;
 }
 
-async function uploadMenu(restaurantId, token, files) {
+// Extract → persist the menu, using the SAME two endpoints the web dashboard uses (unchanged):
+//   1) /bulk-upload  — AI-extracts items from the files (does NOT save)
+//   2) /bulk-save    — persists them; APPENDS by default (old menu preserved)
+// `replace` (only when the customer explicitly asks) soft-deletes the current menu first via
+// /bulk-delete (restorable); bulk-save then drops the soft-deleted rows → clean replace.
+async function uploadMenu(restaurantId, token, files, { replace = false } = {}) {
   try {
+    const authHeaders = { Authorization: `Bearer ${token}` };
+    // 1. Extract only.
     const FormData = require('form-data');
     const form = new FormData();
     for (const f of files) form.append('menuFiles', f.buffer, { filename: f.name, contentType: f.mime });
-    const res = await axios.post(`${INTERNAL_BASE}/api/menus/bulk-upload/${restaurantId}`, form, {
-      headers: { ...form.getHeaders(), Authorization: `Bearer ${token}` },
+    const ex = await axios.post(`${INTERNAL_BASE}/api/menus/bulk-upload/${restaurantId}`, form, {
+      headers: { ...form.getHeaders(), ...authHeaders },
       timeout: 120000, maxBodyLength: Infinity, maxContentLength: Infinity,
     });
-    return res.data?.itemsAdded ?? res.data?.count ?? (res.data?.menuItems?.length) ?? 0;
+    const extractedMenus = ex.data?.data || [];
+    const menuItems = extractedMenus.flatMap(m => (m && Array.isArray(m.menuItems)) ? m.menuItems : []);
+    const categories = ex.data?.extractedCategories || [];
+    if (!menuItems.length) return 0; // nothing readable in the file
+
+    // 2. Replace only on explicit request: soft-delete the current menu (restorable). Best-effort
+    //    — if it fails we fall back to appending rather than losing the customer's upload.
+    if (replace) {
+      try {
+        await axios.delete(`${INTERNAL_BASE}/api/menus/${restaurantId}/bulk-delete`, { headers: authHeaders, timeout: 60000 });
+      } catch (delErr) {
+        console.error('[wa-agent] menu replace (bulk-delete) failed, appending instead:', delErr.response?.data?.error || delErr.message);
+      }
+    }
+
+    // 3. Persist — appends (bulk-save keeps existing active items, drops soft-deleted ones).
+    const save = await axios.post(`${INTERNAL_BASE}/api/menus/bulk-save/${restaurantId}`,
+      { menuItems, categories },
+      { headers: { ...authHeaders, 'Content-Type': 'application/json' }, timeout: 120000 });
+    return save.data?.savedCount ?? menuItems.length;
   } catch (e) {
     console.error('[wa-agent] uploadMenu failed:', e.response?.data?.error || e.message);
     return 0;
