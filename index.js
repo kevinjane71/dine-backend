@@ -38141,6 +38141,20 @@ app.post('/api/automation/webhook/whatsapp', async (req, res) => {
                 }
               }
 
+              // DineOpen AI sales/support agent. Inbound to the DineOpen number lands on THIS
+              // webhook (not whatsapp-ordering), so invoke the agent here too. It self-gates via
+              // isEnabled() + isDineOpenNumber(phoneNumberId), so it only acts on the DineOpen
+              // number and is a no-op for every restaurant-owned number. Non-blocking.
+              try {
+                await require('./routes/whatsappAgent').onInbound({
+                  message,
+                  contact: (value.contacts || [])[0],
+                  phoneNumberId: value?.metadata?.phone_number_id,
+                });
+              } catch (agentErr) {
+                console.error('[wa-agent] onInbound (automation webhook) error (non-blocking):', agentErr.message);
+              }
+
               const processedMessage = whatsappService.handleIncomingMessage({
                 entry: [{
                   changes: [{

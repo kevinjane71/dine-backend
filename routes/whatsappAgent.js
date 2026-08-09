@@ -179,18 +179,40 @@ async function processDue() {
   return { processed };
 }
 
-// Reply flow (no media): classify intent, then auto-reply or draft-for-approval.
+const SETUP_PROMPT =
+  "Hi! 👋 Welcome to DineOpen. To finish setting up your restaurant, just send your *menu photos or PDF* here — " +
+  "we'll add all the items to your menu automatically and you can start using it right away.";
+
+// Reply flow (no media): classify intent, then auto-reply ONLY for genuine DineOpen prospects.
+// The shared number also carries restaurants' own diners, so we stay silent for them.
 async function runReplyFlow(ref, state) {
-  const intent = await classifyIntent(state);
-  if (intent.type === 'menu_setup' || intent.type === 'greeting') {
+  const ctx = await lookupPhoneContext(state.phone);
+  const intent = await classifyIntent(state, ctx);
+
+  // (1) Restaurant's own diner reaching us via the shared number → NEVER auto-reply. Stay silent
+  //     so we don't spam a restaurant's customer with a DineOpen sales pitch.
+  if (intent.type === 'restaurant_customer') {
+    await ref.set({ status: 'idle', stage: 'ignored_diner', updatedAt: new Date() }, { merge: true });
+    return;
+  }
+
+  // (2) Clear DineOpen prospect/owner (or an explicit menu-setup / signup) → auto-help.
+  const isSignup = intent.type === 'dineopen_signup' || intent.type === 'menu_setup';
+  // A bare "greeting" is only auto-answered when it does NOT look like a diner (i.e. the phone is
+  // not a known restaurant customer, or it IS a DineOpen owner). Otherwise treat it as a diner.
+  const greetingFromLead = intent.type === 'greeting' && (ctx.isDineOpenOwner || !ctx.isRestaurantCustomer);
+
+  if (isSignup || greetingFromLead) {
     const { ok, rl } = checkRate(state, 'replies');
-    if (!ok) { await ref.set({ status: 'idle', rl, updatedAt: new Date() }, { merge: true }); return; } // over daily cap -> stay silent
-    await sendReply(state.phone,
-      "Hi! 👋 To set up your restaurant on DineOpen, just send your *menu photos or PDF* here. " +
-      "We'll create your account on this number and add your menu — then you can start using it right away.");
+    if (!ok) { await ref.set({ status: 'idle', rl, updatedAt: new Date() }, { merge: true }); return; } // over daily cap -> silent
+    // Use the model's personalized welcome (acknowledges their restaurant name) when it drafted one,
+    // else fall back to the standard setup prompt.
+    const reply = (isSignup && intent.draft && intent.draft.trim()) ? intent.draft.trim() : SETUP_PROMPT;
+    await sendReply(state.phone, reply);
     await ref.set({ status: 'idle', stage: 'awaiting_menu', rl, updatedAt: new Date() }, { merge: true });
     return;
   }
+
   if (intent.type === 'different_number') {
     // Never auto-act on a different number — escalate for admin approval.
     await ref.set({
@@ -200,7 +222,14 @@ async function runReplyFlow(ref, state) {
     }, { merge: true });
     return;
   }
-  // Any OTHER question -> draft a reply for the admin to approve (never auto-send).
+
+  // (3) A greeting that looks like it's from a diner → stay silent (don't draft noise).
+  if (intent.type === 'greeting') {
+    await ref.set({ status: 'idle', stage: 'ignored_diner', updatedAt: new Date() }, { merge: true });
+    return;
+  }
+
+  // (4) Any OTHER genuine DineOpen question -> draft a reply for the admin to approve (never auto-send).
   await ref.set({
     status: 'needs_approval',
     draft: { text: intent.draft || '', reason: 'general question', createdAt: new Date() },
@@ -211,6 +240,21 @@ async function runReplyFlow(ref, state) {
 // Menu flow (media present): ensure account for this phone, then AI-upload the menu.
 async function runMenuFlow(ref, state) {
   const phone = state.phone;
+
+  // Shared-number guard: a restaurant's diner may send an image (a food photo, a receipt) that is
+  // NOT a menu for onboarding. Only auto-create an account + upload when the sender looks like a
+  // DineOpen prospect/owner — never for someone who only appears as a restaurant's customer.
+  const ctx = await lookupPhoneContext(phone);
+  if (!ctx.isDineOpenOwner && ctx.isRestaurantCustomer) {
+    const intent = await classifyIntent(state, ctx);
+    const looksLikeSetup = intent.type === 'dineopen_signup' || intent.type === 'menu_setup';
+    if (!looksLikeSetup) {
+      // Treat as a diner's image → do not onboard, do not reply. Drop the pending media.
+      await ref.set({ status: 'idle', stage: 'ignored_diner', pendingMedia: [], updatedAt: new Date() }, { merge: true });
+      return;
+    }
+  }
+
   // Abuse guard: cap automated menu processing per phone per day.
   const { ok, rl } = checkRate(state, 'menus');
   if (!ok) {
@@ -252,29 +296,65 @@ async function runMenuFlow(ref, state) {
 }
 
 // ── Intent classification + draft (OpenAI) ──────────────────────────────────
-async function classifyIntent(state) {
+// The DineOpen number is SHARED: it receives both (a) prospects/owners who want to set up or
+// use DineOpen, and (b) the ordinary CUSTOMERS of restaurants that message their diners through
+// our number. We must ONLY auto-engage (a). `ctx` carries what we know about the sender's phone
+// so the model (and the caller's guard) can tell the two apart.
+const VALID_INTENTS = ['dineopen_signup', 'menu_setup', 'greeting', 'restaurant_customer', 'other', 'different_number'];
+async function classifyIntent(state, ctx = {}) {
   try {
     const OpenAI = require('openai');
     const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
     const history = (state.history || []).map(h => `${h.role}: ${h.text}`).join('\n').slice(-2000);
-    const sys = `You are DineOpen's WhatsApp assistant. Classify the customer's latest intent and, ONLY for a general question, draft a SHORT helpful reply (1-3 sentences, friendly, no emojis spam).
-Return strict JSON: {"type":"menu_setup|greeting|other|different_number","draft":"..."}.
-- "menu_setup": they want to set up / add / upload their menu, or mention menu.
-- "greeting": hi/hello/interested with no specific question.
-- "different_number": they ask to register/use a phone number different from the one they are messaging from.
-- "other": any other question (pricing, features, support, etc.) — put your drafted reply in "draft".`;
+    const ctxLine = `Sender context: ${ctx.isDineOpenOwner ? 'ALREADY owns a DineOpen account' : 'no DineOpen owner account found'}; ${ctx.isRestaurantCustomer ? 'appears in a restaurant\'s CUSTOMER list (likely a diner of an existing restaurant)' : 'not found as any restaurant\'s customer'}.`;
+    const sys = `You are DineOpen's WhatsApp assistant on DineOpen's SHARED business number. This number is used by two very different groups:
+  (1) RESTAURANT OWNERS / PROSPECTS who want to sign up for or set up DineOpen (the POS/restaurant software), and
+  (2) ordinary DINERS who are messaging a specific restaurant that uses our shared number to talk to its customers (ordering food, asking about their bill/order/table/delivery, replying to a promo).
+Your job: classify the LATEST message and, where noted, draft a SHORT friendly reply (1-3 sentences, minimal emojis).
+${ctxLine}
+Return strict JSON: {"type":"dineopen_signup|menu_setup|greeting|restaurant_customer|other|different_number","draft":"..."}.
+- "dineopen_signup": they want to onboard/set up their OWN restaurant on DineOpen, say they signed up on DineOpen, ask for help setting up their menu/account, or are interested in DineOpen POS. Put a warm reply in "draft" that welcomes them (use their restaurant name if they mentioned one) and asks them to send their menu photo or PDF so you can add it.
+- "menu_setup": they explicitly want to add/upload/set up their menu. Draft = ask them to send the menu photo/PDF.
+- "greeting": a bare hi/hello with NO indication of whether they are a prospect or a diner.
+- "restaurant_customer": the message is a DINER talking to a restaurant — ordering food, asking about their order/bill/delivery/table/reservation, replying to a restaurant's message. NOT about the DineOpen product. Leave "draft" empty.
+- "different_number": they ask to register/use a phone number different from the one they message from. Leave draft empty.
+- "other": a genuine DineOpen product question (pricing, features, support) that isn't clearly a signup — put a helpful drafted reply in "draft".
+When unsure between a prospect and a diner, prefer "restaurant_customer" (we must not spam diners).`;
     const res = await openai.chat.completions.create({
       model: 'gpt-4o-mini',
       messages: [{ role: 'system', content: sys }, { role: 'user', content: history }],
-      response_format: { type: 'json_object' }, temperature: 0.3, max_tokens: 300,
+      response_format: { type: 'json_object' }, temperature: 0.2, max_tokens: 300,
     });
     const parsed = JSON.parse(res.choices[0].message.content || '{}');
-    if (!['menu_setup', 'greeting', 'other', 'different_number'].includes(parsed.type)) parsed.type = 'other';
+    if (!VALID_INTENTS.includes(parsed.type)) parsed.type = 'other';
     return parsed;
   } catch (e) {
     console.error('[wa-agent] classify failed, defaulting to draft-for-approval:', e.message);
     return { type: 'other', draft: '' };
   }
+}
+
+// What do we already know about this phone number? Used to guard the shared-number problem:
+// a number that is only a restaurant's CUSTOMER (and not a DineOpen owner) is almost certainly
+// a diner, so we stay silent unless the message itself is a clear DineOpen signup.
+async function lookupPhoneContext(phone) {
+  const db = getDb();
+  const p = digits(phone);
+  const ctx = { isDineOpenOwner: false, isRestaurantCustomer: false };
+  try {
+    const u = await db.collection(collections.users).where('phone', '==', p).limit(1).get();
+    if (!u.empty) ctx.isDineOpenOwner = true;
+    else {
+      // some owner phones are stored with a country-code/plus variant — cheap second try
+      const u2 = await db.collection(collections.users).where('phone', '==', '+' + p).limit(1).get();
+      if (!u2.empty) ctx.isDineOpenOwner = true;
+    }
+  } catch (_) {}
+  try {
+    const c = await db.collection(collections.customers).where('phone', 'in', [p, '+' + p]).limit(1).get();
+    if (!c.empty) ctx.isRestaurantCustomer = true;
+  } catch (_) {}
+  return ctx;
 }
 
 // ── Account resolve/create (reuses existing endpoints — no schema reimplementation)
