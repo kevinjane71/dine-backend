@@ -83,11 +83,14 @@ function waCreds() {
 async function sendReply(toPhone, text) {
   const whatsappService = require('../services/whatsappService');
   await whatsappService.sendTextMessage(toPhone, text, waCreds());
-  // Mirror to the admin inbox log so it shows in the WhatsApp tab.
+  // Mirror to the admin inbox log so it shows in the WhatsApp tab. Use type:'reply'
+  // (same as a manual admin reply) — the thread endpoint only fetches type incoming/reply,
+  // so type:'outgoing' would be invisible. sentByName labels it as the AI agent.
   try {
     await getDb().collection(collections.automationLogs).add({
-      type: 'outgoing', direction: 'outgoing', phone: digits(toPhone),
+      type: 'reply', direction: 'outgoing', phone: digits(toPhone),
       message: text, messageType: 'text', by: 'ai-agent',
+      sentBy: 'ai-agent', sentByName: 'AI Agent 🤖',
       timestamp: new Date(), status: 'sent', restaurantId: null,
     });
   } catch (_) {}
