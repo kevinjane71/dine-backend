@@ -153,14 +153,21 @@ async function onInbound({ message, contact, phoneNumberId }) {
 async function processDue() {
   if (!isEnabled()) return { processed: 0, skipped: 'disabled' };
   const db = getDb();
-  const now = new Date();
-  const dueSnap = await db.collection(STATE_COLLECTION)
+  const now = Date.now();
+  // Query by status only (single-field = auto-indexed) and filter replyDueAt in JS.
+  // A compound where(status)+where(replyDueAt) needs a composite index that isn't
+  // provisioned — without it the whole cron query throws and NO reply ever sends.
+  const pendingSnap = await db.collection(STATE_COLLECTION)
     .where('status', '==', 'pending')
-    .where('replyDueAt', '<=', now)
-    .limit(20).get();
+    .limit(50).get();
+  const dueDocs = pendingSnap.docs.filter((d) => {
+    const r = d.data().replyDueAt;
+    const t = r?.toDate ? r.toDate().getTime() : (r ? new Date(r).getTime() : 0);
+    return t && t <= now;
+  }).slice(0, 20);
 
   let processed = 0;
-  for (const doc of dueSnap.docs) {
+  for (const doc of dueDocs) {
     const state = doc.data();
     // Claim it so overlapping cron ticks don't double-send.
     await doc.ref.set({ status: 'processing', replyDueAt: null }, { merge: true });
