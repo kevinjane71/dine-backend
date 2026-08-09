@@ -189,60 +189,97 @@ async function processDue() {
   return { processed };
 }
 
-const SETUP_PROMPT =
-  "Hi! 👋 Welcome to DineOpen. To finish setting up your restaurant, just send your *menu photos or PDF* here — " +
-  "we'll add all the items to your menu automatically and you can start using it right away.";
+// Compact DineOpen sales knowledge — grounds the agent so it answers accurately without a huge prompt.
+const DINEOPEN_KB = `ABOUT DINEOPEN
+DineOpen is an all-in-one POS + management platform for restaurants, cafes, bars, cloud kitchens, bakeries, hotels, and retail/jewellery stores. Works on web, desktop (Windows/Mac), Android/iOS, and fully offline with auto-sync.
+KEY FEATURES: fast billing POS, menu & inventory management (stock, recipes, low-stock alerts), table & floor management, KOT/kitchen printing to thermal printers, multi-terminal + multi-station printing, waiter mobile app, QR/WhatsApp ordering, customer CRM & loyalty, offers/discounts/coupons, split/partial/khata bills, multi-tier pricing (AC/Non-AC/Takeaway/Delivery), GST & international tax + compliant invoices (India GST, UAE, KSA ZATCA, Qatar, Kenya eTIMS), reports/analytics, shifts/attendance, AI voice ordering & AI insights, aggregator sync (Talabat), payments (Razorpay/UPI/cards).
+GETTING STARTED: The fastest way to start is to send a photo or PDF of your menu on this WhatsApp — we auto-create the account and import the full menu in seconds, so they can explore it live immediately.
+DEMO: A live demo/walkthrough can be arranged — collect their preferred day/time and city (timezone) and tell them our team will connect. They can also self-start instantly by sending their menu.
+PRICING: Affordable, plan-based on the features/outlets needed, with a free trial. Do NOT quote specific numbers — offer to have the team share exact pricing or a demo.`;
 
-// Reply flow (no media): classify intent, then auto-reply ONLY for genuine DineOpen prospects.
+// Full conversational reply generator. Understands the WHOLE thread and answers like a smart human
+// sales/onboarding rep. Also decides the audience (real prospect vs a restaurant's own diner) so we
+// never spam diners, and flags anything that genuinely needs a human (exact price quote, complaint,
+// scheduling a real slot) as needsHuman.
+async function converse(state, ctx) {
+  try {
+    const OpenAI = require('openai');
+    const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+    const messages = (state.history || []).slice(-14).map(h => ({
+      role: h.role === 'user' ? 'user' : 'assistant',
+      content: String(h.text || ''),
+    }));
+    const ctxLine = `Sender context: ${ctx.isDineOpenOwner ? 'they ALREADY own a DineOpen account' : 'no DineOpen owner account found for this number'}; ${ctx.isRestaurantCustomer ? 'this number also appears in a restaurant\'s customer list (could be a diner)' : 'not found as any restaurant\'s customer'}.`;
+    const sys = `You are DineOpen's WhatsApp sales & onboarding assistant on DineOpen's SHARED business number. Two kinds of people message here:
+  (A) RESTAURANT/RETAIL OWNERS or PROSPECTS interested in DineOpen (the POS/management software) — you SHOULD help these.
+  (B) ordinary DINERS messaging a specific restaurant that uses our shared number (ordering food, asking about their own bill/order/table/delivery) — these are NOT for you; set audience "diner" and leave reply empty.
+
+${DINEOPEN_KB}
+
+${ctxLine}
+
+HOW TO REPLY (when audience is "prospect"):
+- Sound like a sharp, warm human sales rep — NOT a bot. Read the ENTIRE conversation and respond to what they ACTUALLY just said.
+- NEVER send a canned line that ignores context, and NEVER repeat a message you already sent. Move the conversation forward.
+- Keep it WhatsApp-style: 1-4 short sentences, friendly, minimal emojis.
+- If they ask for a DEMO: enthusiastically say yes, ask their preferred day/time + city (timezone), and tell them our team will connect — AND offer that they can send their menu now to explore it live instantly. Set needsHuman true (a human must book/confirm the slot).
+- If they ask PRICING: give a helpful high-level answer (affordable, plan-based, free trial) and offer to have the team share exact pricing or set up a demo. Never invent numbers. Set needsHuman true.
+- If they want to START/SET UP now, or just say they signed up: ask them to send their menu photo/PDF here so you set them up instantly.
+- If they ask a FEATURE/support question you can answer from the knowledge above: answer it directly and helpfully, then nudge toward a demo or sending the menu.
+- If they say something short like "great"/"ok": acknowledge and gently move forward (e.g. offer the demo or to get them started) — do not repeat the setup line.
+- If they clearly need a human (complaint, custom deal, exact quote, booking a real time): still give a warm holding reply and set needsHuman true.
+
+Return STRICT JSON: {"audience":"prospect|diner|unsure","reply":"<the message to send, empty if diner>","needsHuman":true|false}.`;
+    const res = await openai.chat.completions.create({
+      model: 'gpt-4o-mini',
+      messages: [{ role: 'system', content: sys }, ...messages],
+      response_format: { type: 'json_object' }, temperature: 0.5, max_tokens: 400,
+    });
+    const parsed = JSON.parse(res.choices[0].message.content || '{}');
+    if (!['prospect', 'diner', 'unsure'].includes(parsed.audience)) parsed.audience = 'unsure';
+    parsed.reply = typeof parsed.reply === 'string' ? parsed.reply.trim() : '';
+    parsed.needsHuman = parsed.needsHuman === true;
+    return parsed;
+  } catch (e) {
+    console.error('[wa-agent] converse failed:', e.message);
+    return { audience: 'unsure', reply: '', needsHuman: true };
+  }
+}
+
+// Reply flow (no media): have a real conversation, but ONLY with genuine DineOpen prospects/owners.
 // The shared number also carries restaurants' own diners, so we stay silent for them.
 async function runReplyFlow(ref, state) {
   const ctx = await lookupPhoneContext(state.phone);
-  const intent = await classifyIntent(state, ctx);
+  const c = await converse(state, ctx);
 
-  // (1) Restaurant's own diner reaching us via the shared number → NEVER auto-reply. Stay silent
-  //     so we don't spam a restaurant's customer with a DineOpen sales pitch.
-  if (intent.type === 'restaurant_customer') {
+  // (1) A restaurant's own diner reaching us via the shared number → NEVER auto-reply. If the phone
+  //     is a known restaurant customer AND not a DineOpen owner, treat "unsure" as a diner too.
+  const looksLikeDiner = c.audience === 'diner' || (c.audience === 'unsure' && ctx.isRestaurantCustomer && !ctx.isDineOpenOwner);
+  if (looksLikeDiner) {
     await ref.set({ status: 'idle', stage: 'ignored_diner', updatedAt: new Date() }, { merge: true });
     return;
   }
 
-  // (2) Clear DineOpen prospect/owner (or an explicit menu-setup / signup) → auto-help.
-  const isSignup = intent.type === 'dineopen_signup' || intent.type === 'menu_setup';
-  // A bare "greeting" is only auto-answered when it does NOT look like a diner (i.e. the phone is
-  // not a known restaurant customer, or it IS a DineOpen owner). Otherwise treat it as a diner.
-  const greetingFromLead = intent.type === 'greeting' && (ctx.isDineOpenOwner || !ctx.isRestaurantCustomer);
-
-  if (isSignup || greetingFromLead) {
-    const { ok, rl } = checkRate(state, 'replies');
-    if (!ok) { await ref.set({ status: 'idle', rl, updatedAt: new Date() }, { merge: true }); return; } // over daily cap -> silent
-    // Use the model's personalized welcome (acknowledges their restaurant name) when it drafted one,
-    // else fall back to the standard setup prompt.
-    const reply = (isSignup && intent.draft && intent.draft.trim()) ? intent.draft.trim() : SETUP_PROMPT;
-    await sendReply(state.phone, reply);
-    await ref.set({ status: 'idle', stage: 'awaiting_menu', rl, updatedAt: new Date() }, { merge: true });
-    return;
-  }
-
-  if (intent.type === 'different_number') {
-    // Never auto-act on a different number — escalate for admin approval.
+  // (2) No usable reply (model unsure / empty) → hand to a human instead of sending noise.
+  if (!c.reply) {
     await ref.set({
       status: 'needs_approval',
-      draft: { text: intent.draft || '', reason: 'customer asked to use a different number', createdAt: new Date() },
+      draft: { text: '', reason: 'agent unsure — needs a human', createdAt: new Date() },
       updatedAt: new Date(),
     }, { merge: true });
     return;
   }
 
-  // (3) A greeting that looks like it's from a diner → stay silent (don't draft noise).
-  if (intent.type === 'greeting') {
-    await ref.set({ status: 'idle', stage: 'ignored_diner', updatedAt: new Date() }, { merge: true });
-    return;
-  }
-
-  // (4) Any OTHER genuine DineOpen question -> draft a reply for the admin to approve (never auto-send).
+  // (3) Genuine prospect → send the smart contextual reply. Also leave a draft for the admin when
+  //     the model flags it needs a human follow-up (demo slot, exact pricing), so nothing is dropped.
+  const { ok, rl } = checkRate(state, 'replies');
+  if (!ok) { await ref.set({ status: 'idle', rl, updatedAt: new Date() }, { merge: true }); return; } // over daily cap -> silent
+  await sendReply(state.phone, c.reply);
   await ref.set({
-    status: 'needs_approval',
-    draft: { text: intent.draft || '', reason: 'general question', createdAt: new Date() },
+    status: c.needsHuman ? 'needs_approval' : 'idle',
+    stage: 'engaged',
+    rl,
+    ...(c.needsHuman ? { draft: { text: '', reason: 'auto-replied; human follow-up needed (demo/pricing)', createdAt: new Date(), lastAgentReply: c.reply } } : {}),
     updatedAt: new Date(),
   }, { merge: true });
 }
