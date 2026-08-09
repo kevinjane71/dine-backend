@@ -8,7 +8,7 @@
     },
     {
       "path": "/api/whatsapp-ordering/agent/process-due",
-      "schedule": "*/15 * * * *"
+      "schedule": "*/10 * * * *"
     }
   ],
   "builds": [
