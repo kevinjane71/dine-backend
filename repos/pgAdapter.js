@@ -1264,8 +1264,15 @@ class PgQuery {
         const simpleField = typeof o.field === 'string' && !o.field.includes('.');
         if (simpleField && knownCols && !knownCols.has(pgCol.toLowerCase()) && orderJsonbCols && orderJsonbCols.has('extra_data')) {
           values.push(o.field);
-          colExpr = `extra_data ->> $${values.length}`;
-          isTextExpr = true; // JSONB ->> yields text
+          const je = `(extra_data ->> $${values.length})`;
+          // A field that overflowed to extra_data (JSONB ->> is TEXT) must still sort like
+          // Firestore: numeric values numerically (not "10" < "2"), everything else by UTF-8
+          // bytes. Sort by a numeric cast first (NULL for non-numeric → NULLS LAST), then by the
+          // COLLATE "C" text key. Fixes lexicographic ordering of numeric extra_data fields.
+          orderParts.push(`(CASE WHEN ${je} ~ '^-?[0-9]+(\\.[0-9]+)?$' THEN ${je}::numeric END) ${dir} NULLS LAST`);
+          orderParts.push(`${je} COLLATE "C" ${dir}`);
+          conditions.push(`${je} IS NOT NULL`);
+          continue;
         }
         const collate = isTextExpr ? ' COLLATE "C"' : '';
         orderParts.push(`${colExpr}${collate} ${dir}`);

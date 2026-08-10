@@ -22,6 +22,15 @@
 let io = null;
 let connectionCount = 0;
 
+// Per-room ring buffer of recent events so a terminal that briefly drops its socket (a Wi-Fi
+// blip) can REPLAY what it missed on reconnect — closing the one gap vs cloud RTDB, which
+// replays buffered events automatically. Each event carries a monotonic `seq`; on `join` a
+// terminal passes the last seq it saw and we resend anything newer. Bounded memory: last
+// MAX_BUFFER events per restaurant room.
+const roomBuffers = new Map();  // restaurantId -> Array<event with .seq>
+let seqCounter = 0;
+const MAX_BUFFER = 300;
+
 /**
  * Attach a socket.io server to an existing http.Server. Call once, after app.listen().
  * @param {import('http').Server} httpServer
@@ -43,14 +52,20 @@ function initLanRealtime(httpServer) {
 
     io.on('connection', (socket) => {
       connectionCount++;
-      // A terminal announces which restaurant it belongs to (string or { restaurantId }).
+      // A terminal announces which restaurant it belongs to (string or { restaurantId, sinceSeq }).
       socket.on('join', (payload) => {
         const rid = typeof payload === 'string' ? payload : payload && payload.restaurantId;
-        if (rid) {
-          socket.join(String(rid));
-          socket.data.restaurantId = String(rid);
-          socket.emit('joined', { restaurantId: String(rid), ts: Date.now() });
+        if (!rid) return;
+        socket.join(String(rid));
+        socket.data.restaurantId = String(rid);
+        // Reconnect catch-up: replay any events this terminal missed while its socket was down.
+        const sinceSeq = (payload && typeof payload === 'object' && Number.isFinite(payload.sinceSeq))
+          ? payload.sinceSeq : null;
+        if (sinceSeq != null) {
+          const buf = roomBuffers.get(String(rid)) || [];
+          for (const evt of buf) { if (evt.seq > sinceSeq) socket.emit('event', evt); }
         }
+        socket.emit('joined', { restaurantId: String(rid), ts: Date.now(), seq: seqCounter });
       });
       socket.on('leave', (rid) => { if (rid) socket.leave(String(rid)); });
       socket.on('disconnect', () => { connectionCount = Math.max(0, connectionCount - 1); });
@@ -73,12 +88,14 @@ function initLanRealtime(httpServer) {
 function emit(restaurantId, category, eventType, data) {
   if (!io || !restaurantId) return;
   try {
-    io.to(String(restaurantId)).emit('event', {
-      category,
-      type: eventType,
-      ...data,
-      ts: Date.now(),
-    });
+    const rid = String(restaurantId);
+    const evt = { category, type: eventType, ...data, ts: Date.now(), seq: ++seqCounter };
+    // Buffer for reconnect replay (bounded ring per room).
+    let buf = roomBuffers.get(rid);
+    if (!buf) { buf = []; roomBuffers.set(rid, buf); }
+    buf.push(evt);
+    if (buf.length > MAX_BUFFER) buf.splice(0, buf.length - MAX_BUFFER);
+    io.to(rid).emit('event', evt);
   } catch (err) {
     // Never let a realtime failure affect the request that triggered it.
     console.warn('📶 LAN emit error:', err && err.message);
