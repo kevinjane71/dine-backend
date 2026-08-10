@@ -1845,7 +1845,7 @@ const authenticateToken = (req, res, next) => {
           kvSet(userCacheKey, userStatus, 300).catch(() => {});
         }
 
-        if (staffRoles.includes(userStatus.role) && userStatus.status === 'inactive') {
+        if (staffRoles.includes(userStatus.role) && (userStatus.status === 'inactive' || userStatus.status === 'deleted')) {
           return res.status(401).json({
             error: 'Account deactivated',
             message: 'Your account has been deactivated. Please contact your manager.',
@@ -5942,6 +5942,9 @@ app.post('/api/auth/pin/login', async (req, res) => {
         }
         if (staffDoc) {
           const s = staffDoc.data() || {};
+          if (s.status === 'deleted') {
+            return res.status(403).json({ error: 'This staff account has been removed.' });
+          }
           if (!s.pinEnabled || !s.pinHash) {
             return res.status(403).json({ error: 'PIN login is not enabled for this staff member.' });
           }
@@ -20371,6 +20374,7 @@ app.get('/api/staff/:restaurantId', authenticateToken, requireOwnerRole, async (
 
     // Process each staff member and fetch their credentials
     for (const staffEntry of allStaff) {
+      if (staffEntry && staffEntry.status === 'deleted') continue; // hide soft-deleted staff from the list
       const userData = staffEntry;
       const staffId = staffEntry.id;
 
@@ -20508,8 +20512,14 @@ app.delete('/api/staff/:staffId', authenticateToken, requireOwnerRole, async (re
 
     const staffData = staffDoc.data();
 
-    // Delete the staff member from the collection it was found in
-    await db.collection(staffColl === 'staffUsers' ? collections.staffUsers : collections.users).doc(staffId).delete();
+    // SOFT-delete (offline sync): a hard DELETE would never propagate to the local server through
+    // the insert/update-only cloud sync, so a fired staff member could still log in on the on-prem
+    // app. Instead mark the row deleted + disable PIN and bump updatedAt so the deletion syncs DOWN.
+    // Login, roster, and the staff list all skip status='deleted'; historical order/attendance
+    // references (by id/name) still resolve so past records are preserved.
+    await db.collection(staffColl === 'staffUsers' ? collections.staffUsers : collections.users)
+      .doc(staffId)
+      .update({ status: 'deleted', pinEnabled: false, deletedAt: new Date(), updatedAt: new Date() });
     invalidateUserCache(staffId);
 
     // Also delete any temporary credentials if they exist
@@ -21348,6 +21358,12 @@ app.post('/api/auth/staff/login', async (req, res) => {
 
     const staffDoc = foundDoc;
     const staffData = staffDoc.data();
+
+    // A removed/deactivated staff member must not be able to log in (soft-delete propagates here
+    // via sync, so this also blocks a staff fired on another terminal/the cloud).
+    if (staffData.status === 'deleted' || staffData.status === 'inactive') {
+      return res.status(403).json({ error: 'This staff account has been removed.' });
+    }
 
     // Check password
     const isValidPassword = await bcrypt.compare(password, staffData.password);
@@ -40694,6 +40710,7 @@ app.get('/api/local-server/roster', async (req, res) => {
       const sSnap = await db.collection(collections.staffUsers).where('restaurantId', '==', restaurantId).get();
       sSnap.forEach((d) => {
         const s = d.data() || {};
+        if (s.status === 'deleted') return; // fired staff never appear in the login roster
         members.push({
           id: d.id, name: s.name || s.username || 'Staff', role: s.role || 'staff',
           identifier: s.phone || s.email || s.username || null, hasPin: !!(s.pinEnabled && s.pinHash), source: 'staffUsers',
