@@ -62,6 +62,19 @@ async function incrementSequentialCounter(restaurantId, counterType) {
   return result.rows[0].last_value;
 }
 
+// Offline order-number namespace. The offline local server and the cloud each mint a
+// per-restaurant/per-date daily_order counter starting at 1 — so after sync two DIFFERENT
+// orders would share the same dailyOrderId (lookups return the wrong order; receipts show
+// duplicate numbers). In local-server mode we shift the offline numbers into a distinct high
+// range so they can never collide with the cloud's low sequence. The underlying counter still
+// stores 1,2,3… (small, resets daily); we only add the offset to the returned/stored id.
+// Configurable via OFFLINE_ORDER_ID_OFFSET; 0 disables (e.g. a single-source deployment).
+const OFFLINE_ORDER_ID_OFFSET = (() => {
+  if (process.env.LOCAL_SERVER_MODE !== 'true') return 0;
+  const v = parseInt(process.env.OFFLINE_ORDER_ID_OFFSET, 10);
+  return Number.isFinite(v) ? v : 500000;
+})();
+
 /**
  * Generate next daily order ID (resets each day).
  * Drop-in replacement for the Firestore-based generateDailyOrderId.
@@ -71,7 +84,9 @@ async function incrementSequentialCounter(restaurantId, counterType) {
  */
 async function generateDailyOrderId(restaurantId) {
   const todayStr = new Date().toISOString().split('T')[0];
-  return incrementDailyCounter(restaurantId, 'daily_order', todayStr);
+  const seq = await incrementDailyCounter(restaurantId, 'daily_order', todayStr);
+  // Shift offline order numbers clear of the cloud's range so they never collide after sync.
+  return OFFLINE_ORDER_ID_OFFSET ? OFFLINE_ORDER_ID_OFFSET + seq : seq;
 }
 
 /**
@@ -94,7 +109,9 @@ async function generateSequentialOrderId(restaurantId) {
  */
 async function getNextTabNumber(restaurantId) {
   const todayStr = new Date().toISOString().split('T')[0];
-  return incrementDailyCounter(restaurantId, 'tab', todayStr);
+  const seq = await incrementDailyCounter(restaurantId, 'tab', todayStr);
+  // Same offline namespace as dailyOrderId so tab numbers can't collide after sync either.
+  return OFFLINE_ORDER_ID_OFFSET ? OFFLINE_ORDER_ID_OFFSET + seq : seq;
 }
 
 /**
