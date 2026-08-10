@@ -143,6 +143,21 @@ function coerce(value, dataType) {
   return value;
 }
 
+// DOWN-sync live-state protection: these columns are LOCAL-authoritative operational state that
+// the local POS mutates constantly (occupy/free/reset a table, deduct stock). A cloud→local DOWN
+// upsert must NOT overwrite them, or a stale cloud row (cross-clock last-write-wins) would re-occupy
+// a just-reset table or reset stock back up (oversell). We still INSERT them for brand-new rows
+// (so a new table/item arrives with its state), but never overwrite them on an existing row.
+const DOWN_PRESERVE_COLS = {
+  tables: ['status', 'current_order_id'],
+  inventory: ['current_stock', 'stock_quantity'],
+};
+
+// Per-row failure counter so a row that throws is RETRIED (not silently skipped by an advancing
+// watermark) but also can't wedge a table forever — after MAX_ROW_RETRIES it is loudly dead-lettered.
+const _rowFailCounts = new Map();
+const MAX_ROW_RETRIES = 5;
+
 // Replicate one table from src → dst. `key` namespaces the watermark (direction:table).
 // scopeRid (optional): restrict to ONE restaurant. CRITICAL for DOWN (cloud→local) — the
 // cloud holds every restaurant's rows, and a single-restaurant device must pull ONLY its
@@ -160,7 +175,12 @@ async function replicate(src, dst, table, key, scopeRid = null) {
   const names = cols.map((c) => c.column_name);
   const typeOf = Object.fromEntries(cols.map((c) => [c.column_name, c.data_type]));
   const pk = await getPk(dst, table);            // real PK (composite-aware) at the destination
-  const setCols = names.filter((c) => !pk.includes(c));
+  // On DOWN (cloud→local), never OVERWRITE local live-state columns on an existing row — they are
+  // owned by the local POS. They're still INSERTed for brand-new rows (below), just excluded from
+  // the ON CONFLICT DO UPDATE SET, so a stale cloud row can't re-occupy a table or reset stock.
+  const isDown = key.startsWith('down:');
+  const preserveCols = isDown ? (DOWN_PRESERVE_COLS[table] || []) : [];
+  const setCols = names.filter((c) => !pk.includes(c) && !preserveCols.includes(c));
   const quoted = names.map((c) => `"${c}"`).join(',');
   const ph = names.map((_, i) => `$${i + 1}`).join(',');
   const conflictTgt = pk.map((c) => `"${c}"`).join(',');
@@ -179,8 +199,10 @@ async function replicate(src, dst, table, key, scopeRid = null) {
 
   let wm = await getWatermark(key);
   let lastGood = wm;
-  let total = 0, failed = 0;
+  let total = 0, failed = 0, deadLettered = 0;
   let lastErr = null;
+  let stopAdvancing = false;   // once a row fails (and hasn't exhausted retries), don't advance the
+                               // watermark past it — so it (and everything after) retries next cycle
   for (;;) {
     const res = await src.query(
       `SELECT ${quoted} FROM "${table}" WHERE updated_at > $1${scopeSql} ORDER BY updated_at ASC LIMIT ${BATCH}`,
@@ -188,21 +210,39 @@ async function replicate(src, dst, table, key, scopeRid = null) {
     if (!res.rows.length) break;
     let batch = 0;
     for (const row of res.rows) {
+      // Row identity for retry counting — include updated_at so a row that CHANGES gets a fresh count.
+      const stamp = row.updated_at && row.updated_at.getTime ? row.updated_at.getTime() : row.updated_at;
+      const fkey = `${key}:${row.id}:${stamp}`;
+      let resolved = false; // did we either write it or give up on it (safe to advance past)?
       try {
         await dst.query(sql, names.map((c) => coerce(row[c], typeOf[c])));
-        batch++; total++;
+        batch++; total++; resolved = true;
+        _rowFailCounts.delete(fkey);
       } catch (rowErr) {
-        // SKIP the bad row and keep going (one malformed row must not block the whole table
-        // or wedge the watermark). Record the last error for visibility.
         failed++; lastErr = `${row.id}: ${rowErr.message}`;
+        const n = (_rowFailCounts.get(fkey) || 0) + 1;
+        _rowFailCounts.set(fkey, n);
+        if (n >= MAX_ROW_RETRIES) {
+          // Give up so one poison row can't wedge the whole table forever — but LOUDLY (not silent).
+          console.error(`[cloudSync] DEAD-LETTER after ${n} attempts, skipping row ${key} id=${row.id}: ${rowErr.message}`);
+          _rowFailCounts.delete(fkey);
+          deadLettered++; resolved = true;
+        } else {
+          // Retry this row (and everything after it) on the next cycle — do NOT skip past it.
+          stopAdvancing = true;
+        }
       }
-      if (row.updated_at && row.updated_at > lastGood) lastGood = row.updated_at;
+      // Advance the watermark only across a contiguous run of resolved rows. The moment an
+      // unresolved failure appears, freeze the cursor so nothing after it is skipped.
+      if (!stopAdvancing && resolved && row.updated_at && row.updated_at > lastGood) lastGood = row.updated_at;
+      if (stopAdvancing) break;
     }
     wm = lastGood;
-    await setWatermark(key, wm, lastErr, batch); // advance watermark past processed rows
+    await setWatermark(key, wm, lastErr, batch); // advance watermark past the contiguous resolved rows
+    if (stopAdvancing) break;                    // retry the frozen row next cycle
     if (res.rows.length < BATCH) break;
   }
-  return { table, key, synced: total, ...(failed ? { failed, error: lastErr } : {}) };
+  return { table, key, synced: total, ...(failed ? { failed, error: lastErr } : {}), ...(deadLettered ? { deadLettered } : {}) };
 }
 
 async function cloudReachable() {
