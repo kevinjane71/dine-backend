@@ -1,6 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const { db, collections } = require('../firebase');
+const { FieldValue } = require('firebase-admin/firestore');
 const { authenticateToken } = require('../middleware/auth');
 const { requireOrgFeature, isRestaurantInOrg, requireOrgMember, getActorId } = require('../middleware/orgAccess');
 const { getCachedRestDoc } = require('../utils/kvCache');
@@ -16,13 +17,14 @@ const ckMiddleware = [authenticateToken, requireOrgMember({ minRole: 'manager' }
 // ─── Helper: Generate next production order number ───────────────────────────
 async function generateOrderNumber(orgId) {
   const counterRef = db.collection(collections.orgSettings).doc(`${orgId}_productionCounter`);
+  // Ensure the counter row EXISTS before the transaction: a FOR UPDATE lock can't lock a row
+  // that doesn't exist yet, so two concurrent first-ever creates would both read "missing" and
+  // mint the same PO number. increment(0) is an idempotent upsert (creates as 0, no-op if present).
+  await counterRef.set({ current: FieldValue.increment(0) }, { merge: true });
   const result = await db.runTransaction(async (t) => {
-    const counterDoc = await t.get(counterRef);
-    let seq = 1;
-    if (counterDoc.exists) {
-      seq = (counterDoc.data().current || 0) + 1;
-    }
-    t.set(counterRef, { current: seq }, { merge: true });
+    const counterDoc = await t.get(counterRef);            // now locks the existing row (FOR UPDATE)
+    const seq = ((counterDoc.exists && counterDoc.data().current) || 0) + 1;
+    t.update(counterRef, { current: seq });
     return seq;
   });
   const year = new Date().getFullYear();

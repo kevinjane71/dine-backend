@@ -1,6 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const { db, collections } = require('../firebase');
+const { FieldValue } = require('firebase-admin/firestore');
 const { authenticateToken } = require('../middleware/auth');
 const { requireOrgFeature, isRestaurantInOrg, requireOrgMember, getActorId } = require('../middleware/orgAccess');
 const { getCachedRestDoc } = require('../utils/kvCache');
@@ -20,16 +21,14 @@ async function generateIndentNumber(orgId) {
   const counterDocId = `${orgId}_indentCounter`;
   const counterRef = db.collection(collections.orgSettings).doc(counterDocId);
 
+  // Pre-create so the FOR UPDATE below actually locks (see generateOrderNumber in
+  // centralKitchenRoutes): a lock on a missing row is a no-op, so concurrent first-ever creates
+  // would mint duplicate indent numbers. increment(0) is an idempotent upsert.
+  await counterRef.set({ count: FieldValue.increment(0) }, { merge: true });
   const result = await db.runTransaction(async (transaction) => {
-    const counterDoc = await transaction.get(counterRef);
-    let currentCount = 0;
-
-    if (counterDoc.exists) {
-      currentCount = counterDoc.data().count || 0;
-    }
-
-    const newCount = currentCount + 1;
-    transaction.set(counterRef, { count: newCount, updatedAt: new Date() }, { merge: true });
+    const counterDoc = await transaction.get(counterRef);   // locks the existing row (FOR UPDATE)
+    const newCount = ((counterDoc.exists && counterDoc.data().count) || 0) + 1;
+    transaction.update(counterRef, { count: newCount, updatedAt: new Date() });
 
     const year = new Date().getFullYear();
     const padded = String(newCount).padStart(4, '0');

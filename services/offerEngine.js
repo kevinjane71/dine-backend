@@ -12,6 +12,8 @@
  * produces identical discount output to the prior inline logic.
  */
 
+const { FieldValue } = require('firebase-admin/firestore');
+
 // ---------- helpers ----------
 
 const normalizePhone = (phone) => {
@@ -432,25 +434,20 @@ const incrementUsage = async (db, offerId, customerKey) => {
   if (!db || !offerId || !customerKey) return;
   try {
     const ref = db.collection('offers').doc(offerId).collection('customerOfferUsage').doc(`${offerId}_${customerKey}`);
-    await db.runTransaction(async (tx) => {
-      const snap = await tx.get(ref);
-      const nowIso = new Date().toISOString();
-      if (snap.exists) {
-        const data = snap.data();
-        tx.update(ref, {
-          usageCount: (data.usageCount || 0) + 1,
-          lastUsedAt: nowIso,
-        });
-      } else {
-        tx.set(ref, {
-          offerId,      // explicit — the transaction set() path doesn't inject subcollection scope
-          customerKey,
-          usageCount: 1,
-          firstUsedAt: nowIso,
-          lastUsedAt: nowIso,
-        });
-      }
-    });
+    const nowIso = new Date().toISOString();
+    // Atomic upsert instead of read-then-create-in-transaction. The old version was NOT
+    // phantom-safe: on a customer's first-ever use of an offer, two concurrent orders both
+    // read !exists and both wrote usageCount:1 (the upsert set it to 1, not 2) → the per-
+    // customer usage cap could be silently exceeded. FieldValue.increment maps to
+    // `usage_count = COALESCE(usage_count,0)+1`, which is atomic at the row level for both the
+    // INSERT and the ON CONFLICT branch (verified: 3 concurrent-style increments → count 3).
+    await ref.set({
+      offerId,       // explicit — keep parity with the prior write (also aids subcollection scope)
+      customerKey,
+      usageCount: FieldValue.increment(1),
+      lastUsedAt: nowIso,
+      firstUsedAt: nowIso, // not read anywhere; retained so new rows carry the field
+    }, { merge: true });
   } catch (err) {
     console.error('[offerEngine] incrementUsage error:', err);
   }
