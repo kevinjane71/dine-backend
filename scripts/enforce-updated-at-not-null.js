@@ -45,7 +45,10 @@ async function main() {
   const url = useCloud ? process.env.CLOUD_DATABASE_URL : process.env.DATABASE_URL;
   if (!url) { console.error(`Missing ${useCloud ? 'CLOUD_DATABASE_URL' : 'DATABASE_URL'}`); process.exit(1); }
 
-  const c = new Client({ connectionString: url });
+  // Cloud SQL uses TLS with a self-signed chain (sslmode=no-verify in the URL). node-postgres does
+  // not always honour the URL's ssl params, so set it explicitly when the URL asks for TLS.
+  const wantsSsl = /sslmode=(require|no-verify|prefer)|[?&]ssl=true/.test(url);
+  const c = new Client({ connectionString: url, ssl: wantsSsl ? { rejectUnauthorized: false } : undefined });
   await c.connect();
   console.log(`Connected (${useCloud ? 'CLOUD' : 'LOCAL'}). Enforcing NOT NULL updated_at on ${SYNC_TABLES.length} sync tables…\n`);
 
