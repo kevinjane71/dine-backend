@@ -33,14 +33,37 @@ const BATCH = parseInt(process.env.CLOUD_SYNC_BATCH, 10) || 500;
 //   DOWN (cloud → local): catalog/config the owner edits on the web (cloud is truth).
 // Missing tables are skipped gracefully, so listing extras is safe. Override per-site via env.
 const UP_TABLES = (process.env.CLOUD_SYNC_TABLES ||
-  // orders/payments/daily_stats/shifts/cash_registers/customers = transactional data.
-  // floors/tables/rest_bookings = config edited on the terminal (table layout, occupancy,
-  // reservations) that must reach the cloud → two-way. `restaurants` is column-scoped to the
-  // embedded `menu` only (see SYNC_ONLY_COLS) so a menu edit on the terminal goes live on the
-  // cloud without touching the other config columns. FK order: floors before tables.
-  // attendance/leave_requests/expenses/stock_audits = append-only shop RECORDS (their `total_*`
-  // fields are per-row totals, not cross-record counters) → safe to flow UP so they reach the cloud.
-  'orders,payments,daily_stats,shifts,cash_registers,customers,floors,tables,rest_bookings,inventory,attendance,leave_requests,expenses,stock_audits,restaurants')
+  // Everything the shop GENERATES locally must flow UP so the cloud is complete. These are almost
+  // all RECORDS (globally-unique id → merge = UNION by id, never a double-count; edits resolve LWW
+  // on updated_at) plus a few LOCAL-authoritative aggregates (shifts/cash/inventory.current_stock/
+  // bar_bottles) where the terminal is the sole writer so there is no clobber.
+  //   NOTE ON TABLE NAMES: this worker replicates by RAW PG TABLE NAME, not by Firestore collection
+  //   name. `payments`→`pos_payments`, `customer_segments`→`customer_groups` etc. Using a collection
+  //   name that has no matching table = a silent no-op (the table is "missing at source").
+  [
+    // Orders / billing / payments (pos_payments = the real payments table; pos_invoices = tax bills)
+    'orders', 'pos_payments', 'pos_invoices', 'daily_stats', 'shifts', 'cash_registers', 'discount_approvals',
+    // Customers / CRM / feedback (customer_offer_usage = per-customer offer-cap counter, UP-authoritative)
+    'customers', 'customer_offer_usage', 'feedback_responses', 'waitlist',
+    // Layout / bookings
+    'floors', 'tables', 'rest_bookings',
+    // Inventory / supply chain / bar — inventory FIRST (parent) then its ledger/movements.
+    // inventory_transactions = the stock LEDGER (lets the cloud audit/recompute stock).
+    // bar_bottles = bar stock (running counters, local-authoritative, UP-only whole-row like shifts).
+    'inventory', 'inventory_transactions', 'stock_audits', 'stock_oversell_log', 'waste_entries',
+    'stock_batches', 'stock_transfers', 'goods_receipt_notes', 'supplier_invoices', 'supplier_returns',
+    'supplier_performance', 'purchase_orders', 'purchase_requisitions', 'production_entries',
+    'bar_bottles', 'bar_reconciliation',
+    // Staff / HR / payroll (payroll_runs before pay_slips; staff_availability/credentials have NO
+    // restaurant_id so they are UP-ONLY — never DOWN, or a single-tenant device would pull every
+    // restaurant's rows). leave_balances is a running balance but the shop is authoritative → UP.
+    'attendance', 'leave_requests', 'leave_balances', 'payroll_runs', 'pay_slips',
+    'staff_shifts', 'staff_availability', 'staff_credentials',
+    // Accounting (journal_entries = manual GL postings; account refs are by CODE so id-merge is safe)
+    'expenses', 'journal_entries',
+    // Menu (column-scoped to restaurants.menu only — see SYNC_ONLY_COLS)
+    'restaurants',
+  ].join(','))
   .split(',').map((s) => s.trim()).filter(Boolean);
 // The dine MENU is embedded in restaurants.menu (jsonb), not a separate table, so we two-way it
 // via a COLUMN-SCOPED sync of the restaurants row (only the `menu` column — see SYNC_ONLY_COLS).
@@ -54,7 +77,22 @@ const UP_TABLES = (process.env.CLOUD_SYNC_TABLES ||
 // rest_bookings is two-way. floors/tables come DOWN (structure) but their live occupancy columns
 // are preserved locally (DOWN_PRESERVE_COLS) while still flowing UP to the cloud.
 const DOWN_TABLES = (process.env.CLOUD_SYNC_DOWN_TABLES ||
-  'restaurants,orders,payments,staff_users,floors,tables,rest_bookings,offers,recipes,suppliers,inventory,customers,discount_settings,coupons,customer_segments,tax_groups')
+  // Owner-authoritative CONFIG the shop must receive from the web. DOWN is SCOPED to this one
+  // restaurant (SCOPE_RID) so every table here MUST have a restaurant_id column, or it would drag
+  // other tenants' rows onto this device — DO NOT add rid-less tables (staff_availability,
+  // customer_offer_usage, staff_credentials, distribution_plans/indent_requests/production_orders).
+  //   FIXED PHANTOMS: `payments`→`pos_payments`, `customer_segments`→`customer_groups`. Removed
+  //   `tax_groups` (no such table — tax lives in restaurants.tax_settings, now synced via
+  //   DOWN_ONLY_COLS) and `discount_settings` (dead table — real config is
+  //   restaurants.discount_approval_settings, also via DOWN_ONLY_COLS).
+  [
+    'restaurants', 'orders', 'pos_payments', 'staff_users', 'floors', 'tables', 'rest_bookings',
+    'offers', 'recipes', 'suppliers', 'inventory', 'customers', 'coupons', 'customer_groups',
+    // owner config that must reach the shop so offline payroll/leave/feedback/scheduling work:
+    'payroll_config', 'leave_config', 'inventory_categories', 'restaurant_shift_settings', 'feedback_forms',
+    // expenses two-way (web-added expenses appear in the terminal Books; RECORD → union by id)
+    'expenses',
+  ].join(','))
   .split(',').map((s) => s.trim()).filter(Boolean);
 // One-restaurant device: DOWN pulls ONLY this restaurant's rows from the shared cloud DB.
 const SCOPE_RID = (process.env.SYNC_RESTAURANT_ID || '').trim() || null;
@@ -168,6 +206,16 @@ const DOWN_PRESERVE_COLS = {
     'loyalty_points', 'lifetime_points', 'loyalty_tier', 'loyalty_transactions',
     'total_spent', 'total_orders', 'outstanding_balance', 'wallet_balance', 'wallet_history',
   ],
+  // offers/coupons are owner CONFIG (flow DOWN) but their redemption counters ACCRUE at billing on
+  // the terminal. A whole-row DOWN of an owner web-edit would reset the locally-counted usage → the
+  // per-offer/coupon cap stops being enforced. Preserve the counter locally; it still flows UP via
+  // customer_offer_usage (the per-customer ledger). (offers/coupons themselves stay OUT of UP so the
+  // whole-row usage_count is never pushed up and double-counted.)
+  offers: ['usage_count'],
+  coupons: ['used_count'],
+  // feedback_forms is CONFIG (flow DOWN) but response_count is incremented locally as diners submit;
+  // don't let a form edit on the web reset it.
+  feedback_forms: ['response_count'],
 };
 
 // Column-scoped tables: sync ONLY these columns (via a targeted UPDATE), never the rest of the
@@ -186,6 +234,25 @@ const SYNC_ONLY_COLS = {
 // stock flows up, config flows down. (Restock is therefore done on the terminal — the authority.)
 const UP_ONLY_COLS = {
   inventory: ['current_stock'],
+};
+
+// DOWN-direction-only column scope. The restaurant config (tax rates, prices, currency, billing/
+// order rules, discount-approval policy, aggregator keys) is embedded as jsonb columns on the
+// `restaurants` row and is OWNER-authoritative — edited on the web. Without this, only `menu` synced
+// (SYNC_ONLY_COLS) and an owner who changed the TAX RATE or PRICES on the web produced WRONG offline
+// bills. These columns flow DOWN (cloud→shop) only; they are NOT pushed UP, so terminal-local device
+// settings can't overwrite the owner's config. Terminal-owned device config (kot/print/pos settings)
+// is deliberately EXCLUDED so a DOWN never clobbers this device's printer/KOT setup.
+// Combined with SYNC_ONLY_COLS.restaurants=['menu'] the effective column scope per direction is:
+//   UP   → [menu]                        (menu edits made on the terminal reach the cloud)
+//   DOWN → [menu, ...DOWN_ONLY_COLS]      (owner menu + config edits reach the shop)
+// Both use the column-scoped UPDATE path (existing row, strictly-newer guard) — never an INSERT.
+const DOWN_ONLY_COLS = {
+  restaurants: [
+    'tax_settings', 'pricing_settings', 'currency_settings', 'billing_settings', 'order_settings',
+    'discount_approval_settings', 'booking_settings', 'feedback_settings', 'customer_app_settings',
+    'aggregator_config',
+  ],
 };
 
 // Per-row failure counter so a row that throws is RETRIED (not silently skipped by an advancing
@@ -213,10 +280,12 @@ async function replicate(src, dst, table, key, scopeRid = null) {
 
   let names, sql;
   // Column-scoped columns for this table + direction: SYNC_ONLY_COLS applies both ways;
-  // UP_ONLY_COLS applies only when pushing UP (local → cloud).
+  // UP_ONLY_COLS applies only when pushing UP (local → cloud); DOWN_ONLY_COLS only when pulling DOWN.
+  // Non-existent columns are filtered out here, so listing a column a device lacks is safe.
   const onlyCols = [
     ...(SYNC_ONLY_COLS[table] || []),
     ...(!isDown ? (UP_ONLY_COLS[table] || []) : []),
+    ...(isDown ? (DOWN_ONLY_COLS[table] || []) : []),
   ].filter((c, i, a) => a.indexOf(c) === i && dstNames.has(c) && srcNames.includes(c));
   if (onlyCols.length) {
     // Column-scoped: UPDATE only the allowlisted columns (+ advance updated_at) on the existing
@@ -251,6 +320,14 @@ async function replicate(src, dst, table, key, scopeRid = null) {
   const scopeCol = table === 'restaurants' ? 'id' : 'restaurant_id';
   const scoped = scopeRid && srcNames.includes(scopeCol);
   const scopeSql = scoped ? ` AND "${scopeCol}" = $2` : '';
+
+  // SAFETY: a DOWN sync MUST be restaurant-scoped — the cloud holds every tenant's rows. If a DOWN
+  // table lacks the scope column, pulling it unscoped would drag EVERY restaurant's data onto this
+  // single-restaurant device. Skip it loudly rather than leak. (All configured DOWN tables have
+  // restaurant_id or are `restaurants`; this guards against future misconfiguration.)
+  if (isDown && scopeRid && !scoped) {
+    return { table, key, skipped: 'DOWN not restaurant-scoped (no scope column) — refused to avoid tenant leak' };
+  }
 
   let wm = await getWatermark(key);
   let lastGood = wm;

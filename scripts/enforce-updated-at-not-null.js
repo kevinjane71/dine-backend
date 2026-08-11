@@ -17,11 +17,27 @@ const { Client } = require('pg');
 
 // Union of UP_TABLES + DOWN_TABLES in cloudSyncWorker.js (+ order_counters/sync_watermark are
 // operational, skipped). Keep in sync with that file if the sync table lists change.
+// The replicator SKIPS any table lacking `updated_at`, so a table that must sync but has no such
+// column is a silent data-loss bug — this script ADDS the column (see below) then constrains it.
 const SYNC_TABLES = [
-  'orders', 'payments', 'daily_stats', 'shifts', 'cash_registers', 'customers',
-  'staff_users', 'floors', 'tables', 'menu_items', 'rest_bookings', 'offers', 'recipes', 'suppliers',
-  'inventory', 'attendance', 'leave_requests', 'expenses', 'stock_audits',
-  'discount_settings', 'coupons', 'customer_segments', 'tax_groups',
+  // Orders / billing / payments
+  'orders', 'pos_payments', 'pos_invoices', 'daily_stats', 'shifts', 'cash_registers', 'discount_approvals',
+  // Customers / CRM / feedback
+  'customers', 'customer_groups', 'customer_offer_usage', 'feedback_responses', 'feedback_forms', 'waitlist',
+  // Layout / bookings
+  'floors', 'tables', 'rest_bookings',
+  // Inventory / supply chain / bar (records + ledger + stock movements)
+  'inventory', 'inventory_transactions', 'inventory_categories', 'stock_audits', 'stock_oversell_log',
+  'waste_entries', 'stock_batches', 'stock_transfers', 'goods_receipt_notes', 'supplier_invoices',
+  'supplier_returns', 'supplier_performance', 'purchase_orders', 'purchase_requisitions', 'production_entries',
+  'bar_bottles', 'bar_reconciliation', 'suppliers', 'recipes',
+  // Staff / HR / payroll / shifts
+  'staff_users', 'staff_credentials', 'staff_shifts', 'staff_availability', 'attendance', 'leave_requests',
+  'leave_balances', 'leave_config', 'payroll_config', 'payroll_runs', 'pay_slips', 'restaurant_shift_settings',
+  // Accounting
+  'expenses', 'journal_entries',
+  // Config
+  'restaurants', 'offers', 'coupons',
 ];
 
 async function main() {
@@ -35,11 +51,22 @@ async function main() {
 
   for (const t of SYNC_TABLES) {
     try {
-      // Table + column present?
-      const col = await c.query(
+      // Table present at all? (some entries are cloud-only / not provisioned on every device)
+      const tbl = await c.query(
+        `SELECT 1 FROM information_schema.tables
+         WHERE table_schema='public' AND table_name=$1 AND table_type='BASE TABLE'`, [t]);
+      if (!tbl.rows.length) { console.log(`  – ${t}: table absent — skipped`); continue; }
+
+      // updated_at column present? If NOT, ADD it — a syncable table must have it or the
+      // replicator silently skips the whole table (money/ledger records never reach the cloud).
+      let col = await c.query(
         `SELECT 1 FROM information_schema.columns
          WHERE table_schema='public' AND table_name=$1 AND column_name='updated_at'`, [t]);
-      if (!col.rows.length) { console.log(`  – ${t}: no updated_at column — skipped`); continue; }
+      let added = false;
+      if (!col.rows.length) {
+        await c.query(`ALTER TABLE "${t}" ADD COLUMN updated_at timestamptz`);
+        added = true;
+      }
 
       // Does the table have created_at to fall back to?
       const hasCreated = (await c.query(
@@ -50,7 +77,7 @@ async function main() {
       const upd = await c.query(`UPDATE "${t}" SET updated_at = ${fallback} WHERE updated_at IS NULL`);
       await c.query(`ALTER TABLE "${t}" ALTER COLUMN updated_at SET DEFAULT now()`);
       await c.query(`ALTER TABLE "${t}" ALTER COLUMN updated_at SET NOT NULL`);
-      console.log(`  ✓ ${t}: backfilled ${upd.rowCount} NULL row(s), set DEFAULT now() + NOT NULL`);
+      console.log(`  ✓ ${t}: ${added ? 'ADDED column, ' : ''}backfilled ${upd.rowCount} NULL row(s), set DEFAULT now() + NOT NULL`);
     } catch (e) {
       console.error(`  ✗ ${t}: ${e.message}`);
     }
