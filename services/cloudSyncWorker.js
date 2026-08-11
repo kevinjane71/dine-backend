@@ -62,6 +62,19 @@ const UP_TABLES = (process.env.CLOUD_SYNC_TABLES ||
     'staff_shifts', 'staff_availability', 'staff_credentials',
     // Accounting (journal_entries = manual GL postings; account refs are by CODE so id-merge is safe)
     'expenses', 'journal_entries',
+    // ── VERTICALS (hotel / parking / enterprise) — all reachable on the offline server ───────────
+    // HOTEL: hotel_checkins = the guest FOLIO (money; UP-only, NOT down — front desk is authority so
+    // a stale cloud copy can't clobber a running bill). hotel_guests needs updated_at (added by
+    // migration). rooms/bookings are also DOWN (see below). Folio totals are per-row (no increment).
+    'hotel_guests', 'hotel_checkins', 'hotel_bookings', 'hotel_rooms', 'room_maintenance_schedules',
+    // PARKING: parking_tickets = gate revenue (money RECORD). zones/slots carry live occupancy that
+    // is UP-authoritative (also DOWN with preserve — see below).
+    'parking_tickets', 'parking_zones', 'parking_slots',
+    // ENTERPRISE / central-kitchen: org-scoped RECORDS (NO restaurant_id) → UP-ONLY, NEVER DOWN
+    // (DOWN can't scope them → would drag every org's rows; the guard also refuses them).
+    'distribution_plans', 'indent_requests', 'production_orders',
+    // MISC money/records written on the offline terminal: Qatar ECR card payments + held/parked bills
+    'sadad_transactions', 'saved_carts',
     // Menu (column-scoped to restaurants.menu only — see SYNC_ONLY_COLS)
     'restaurants',
   ].join(','))
@@ -97,6 +110,16 @@ const DOWN_TABLES = (process.env.CLOUD_SYNC_DOWN_TABLES ||
     // staff_credentials DOWN: a staff created on the web has their login/PIN on the cloud — it must
     // reach the shop so they can log in offline. Needs restaurant_id (added by migration) to scope.
     'staff_credentials',
+    // ── VERTICALS DOWN (owner config reaches the shop) ──────────────────────────────────────────
+    // HOTEL: room definitions/tariff + reservations flow down; live occupancy preserved (see
+    // DOWN_PRESERVE). hotel_checkins is NOT here (folio is shop-authoritative, UP-only).
+    'hotel_rooms', 'hotel_bookings',
+    // PARKING: owner-set rates/config + zone/slot definitions reach the gate; live occupancy on
+    // zones/slots preserved (see DOWN_PRESERVE) so a stale cloud row can't re-occupy a freed slot.
+    'parking_rates', 'parking_configs', 'parking_zones', 'parking_slots',
+    // saved_carts two-way so a held bill is visible on every terminal; sub_restaurants gives the
+    // outlet its org linkage (rid-scoped, safe).
+    'saved_carts', 'sub_restaurants',
   ].join(','))
   .split(',').map((s) => s.trim()).filter(Boolean);
 // One-restaurant device: DOWN pulls ONLY this restaurant's rows from the shared cloud DB.
@@ -222,6 +245,11 @@ const DOWN_PRESERVE_COLS = {
   // feedback_forms is CONFIG (flow DOWN) but response_count is incremented locally as diners submit;
   // don't let a form edit on the web reset it.
   feedback_forms: ['response_count'],
+  // VERTICAL live-state (same pattern as tables.status): owner config flows DOWN, but the shop owns
+  // the live occupancy — never let a stale cloud row re-occupy a freed slot/room or reset a counter.
+  hotel_rooms: ['status', 'current_guest', 'check_in_id'],
+  parking_slots: ['status', 'current_ticket_id'],
+  parking_zones: ['occupied_slots'],
 };
 
 // Column-scoped tables: sync ONLY these columns (via a targeted UPDATE), never the rest of the
@@ -393,6 +421,8 @@ async function replicate(src, dst, table, key, scopeRid = null) {
 const TOMBSTONE_TABLES = [
   'offers', 'recipes', 'suppliers', 'coupons', 'customer_groups', 'inventory', 'inventory_categories',
   'tables', 'floors', 'booking_venues', 'bookings_v2', 'space_bookings',
+  // verticals: a deleted room/booking/held-cart should disappear on the other side too
+  'hotel_rooms', 'hotel_bookings', 'saved_carts',
 ];
 // A tombstone only propagates in a direction the table itself syncs (so we never delete something
 // that wasn't supposed to arrive from that side).

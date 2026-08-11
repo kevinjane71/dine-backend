@@ -38,6 +38,11 @@ const SYNC_TABLES = [
   'expenses', 'journal_entries',
   // Config
   'restaurants', 'offers', 'coupons',
+  // Verticals: hotel (hotel_guests gets the column ADDED), parking, enterprise/central-kitchen, misc
+  'hotel_guests', 'hotel_checkins', 'hotel_bookings', 'hotel_rooms', 'room_maintenance_schedules',
+  'parking_tickets', 'parking_zones', 'parking_slots', 'parking_rates', 'parking_configs',
+  'distribution_plans', 'indent_requests', 'production_orders',
+  'sadad_transactions', 'saved_carts', 'sub_restaurants',
 ];
 
 async function main() {
