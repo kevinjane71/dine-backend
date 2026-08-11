@@ -511,7 +511,7 @@ class PgDocRef {
             await this.update(payload, { allowMissing: true });
           }
         }
-        if (this._config.cacheTTL) bumpTableVersion(table).catch(() => {});
+        if (this._config.cacheTTL) await bumpTableVersion(table).catch(() => {}); // awaited so a read-after-write in the same request sees the new version (cloud Redis cache)
         return;
       }
 
@@ -541,7 +541,7 @@ class PgDocRef {
         }
       }
       // Invalidate cache
-      if (this._config.cacheTTL) bumpTableVersion(table).catch(() => {});
+      if (this._config.cacheTTL) await bumpTableVersion(table).catch(() => {}); // awaited so a read-after-write in the same request sees the new version (cloud Redis cache)
     } catch (err) {
       console.error(`[pgAdapter] DocRef.set() error (${this.path}):`, err.message);
       throw err;
@@ -572,7 +572,7 @@ class PgDocRef {
         err.code = 6; // Firestore ALREADY_EXISTS
         throw err;
       }
-      if (this._config.cacheTTL) bumpTableVersion(table).catch(() => {});
+      if (this._config.cacheTTL) await bumpTableVersion(table).catch(() => {}); // awaited so a read-after-write in the same request sees the new version (cloud Redis cache)
     } catch (err) {
       if (err.code !== 6) {
         console.error(`[pgAdapter] DocRef.create() error (${this.path}):`, err.message);
@@ -867,7 +867,7 @@ class PgDocRef {
       }
 
       // Invalidate cache
-      if (this._config.cacheTTL) bumpTableVersion(table).catch(() => {});
+      if (this._config.cacheTTL) await bumpTableVersion(table).catch(() => {}); // awaited so a read-after-write in the same request sees the new version (cloud Redis cache)
       return true;
     } catch (err) {
       console.error(
@@ -887,7 +887,7 @@ class PgDocRef {
       const scope = this._scopeConditions(2);
       await this._exec(`DELETE FROM ${table} WHERE id = $1${scope.sql}`, [this.id, ...scope.values]);
       // Invalidate cache
-      if (this._config.cacheTTL) bumpTableVersion(table).catch(() => {});
+      if (this._config.cacheTTL) await bumpTableVersion(table).catch(() => {}); // awaited so a read-after-write in the same request sees the new version (cloud Redis cache)
     } catch (err) {
       console.error(
         `[pgAdapter] DocRef.delete() error (${this.path}):`,
@@ -1541,7 +1541,7 @@ class PgCollectionRef {
         }
       }
       // Invalidate cache
-      if (this._config.cacheTTL) bumpTableVersion(table).catch(() => {});
+      if (this._config.cacheTTL) await bumpTableVersion(table).catch(() => {}); // awaited so a read-after-write in the same request sees the new version (cloud Redis cache)
       return new PgDocRef(this._collectionName, id, this._config, this._firestoreDb);
     } catch (err) {
       console.error(
