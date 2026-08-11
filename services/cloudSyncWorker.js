@@ -38,7 +38,7 @@ const UP_TABLES = (process.env.CLOUD_SYNC_TABLES ||
   // reservations) that must reach the cloud → two-way. `restaurants` is column-scoped to the
   // embedded `menu` only (see SYNC_ONLY_COLS) so a menu edit on the terminal goes live on the
   // cloud without touching the other config columns. FK order: floors before tables.
-  'orders,payments,daily_stats,shifts,cash_registers,customers,floors,tables,rest_bookings,restaurants')
+  'orders,payments,daily_stats,shifts,cash_registers,customers,floors,tables,rest_bookings,inventory,restaurants')
   .split(',').map((s) => s.trim()).filter(Boolean);
 // The dine MENU is embedded in restaurants.menu (jsonb), not a separate table, so we two-way it
 // via a COLUMN-SCOPED sync of the restaurants row (only the `menu` column — see SYNC_ONLY_COLS).
@@ -169,6 +169,15 @@ const SYNC_ONLY_COLS = {
   restaurants: ['menu'],
 };
 
+// UP-direction-only column scope. Inventory stock is LOCAL-authoritative (the shop deducts it on
+// every sale), so UP pushes ONLY current_stock to the cloud — never the config columns, which the
+// owner edits on the cloud and which flow DOWN. Combined with DOWN_PRESERVE_COLS.inventory (DOWN
+// leaves current_stock alone), this gives a clean split with no clobber in either direction:
+// stock flows up, config flows down. (Restock is therefore done on the terminal — the authority.)
+const UP_ONLY_COLS = {
+  inventory: ['current_stock'],
+};
+
 // Per-row failure counter so a row that throws is RETRIED (not silently skipped by an advancing
 // watermark) but also can't wedge a table forever — after MAX_ROW_RETRIES it is loudly dead-lettered.
 const _rowFailCounts = new Map();
@@ -193,7 +202,12 @@ async function replicate(src, dst, table, key, scopeRid = null) {
   const isDown = key.startsWith('down:');
 
   let names, sql;
-  const onlyCols = (SYNC_ONLY_COLS[table] || []).filter((c) => dstNames.has(c) && srcNames.includes(c));
+  // Column-scoped columns for this table + direction: SYNC_ONLY_COLS applies both ways;
+  // UP_ONLY_COLS applies only when pushing UP (local → cloud).
+  const onlyCols = [
+    ...(SYNC_ONLY_COLS[table] || []),
+    ...(!isDown ? (UP_ONLY_COLS[table] || []) : []),
+  ].filter((c, i, a) => a.indexOf(c) === i && dstNames.has(c) && srcNames.includes(c));
   if (onlyCols.length) {
     // Column-scoped: UPDATE only the allowlisted columns (+ advance updated_at) on the existing
     // row when the incoming is strictly newer. No INSERT — the row is provisioned, and we must not
