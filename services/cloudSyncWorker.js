@@ -45,8 +45,9 @@ const UP_TABLES = (process.env.CLOUD_SYNC_TABLES ||
     'orders', 'pos_payments', 'pos_invoices', 'daily_stats', 'shifts', 'cash_registers', 'discount_approvals',
     // Customers / CRM / feedback (customer_offer_usage = per-customer offer-cap counter, UP-authoritative)
     'customers', 'customer_offer_usage', 'feedback_responses', 'waitlist',
-    // Layout / bookings
-    'floors', 'tables', 'rest_bookings',
+    // Layout / bookings (rest_bookings + the venue/catering booking sub-module: all RECORDS with
+    // unique id → two-way union-by-id is safe)
+    'floors', 'tables', 'rest_bookings', 'bookings_v2', 'space_bookings',
     // Inventory / supply chain / bar — inventory FIRST (parent) then its ledger/movements.
     // inventory_transactions = the stock LEDGER (lets the cloud audit/recompute stock).
     // bar_bottles = bar stock (running counters, local-authoritative, UP-only whole-row like shifts).
@@ -87,11 +88,15 @@ const DOWN_TABLES = (process.env.CLOUD_SYNC_DOWN_TABLES ||
   //   restaurants.discount_approval_settings, also via DOWN_ONLY_COLS).
   [
     'restaurants', 'orders', 'pos_payments', 'staff_users', 'floors', 'tables', 'rest_bookings',
+    'bookings_v2', 'space_bookings', 'booking_venues',
     'offers', 'recipes', 'suppliers', 'inventory', 'customers', 'coupons', 'customer_groups',
     // owner config that must reach the shop so offline payroll/leave/feedback/scheduling work:
     'payroll_config', 'leave_config', 'inventory_categories', 'restaurant_shift_settings', 'feedback_forms',
     // expenses two-way (web-added expenses appear in the terminal Books; RECORD → union by id)
     'expenses',
+    // staff_credentials DOWN: a staff created on the web has their login/PIN on the cloud — it must
+    // reach the shop so they can log in offline. Needs restaurant_id (added by migration) to scope.
+    'staff_credentials',
   ].join(','))
   .split(',').map((s) => s.trim()).filter(Boolean);
 // One-restaurant device: DOWN pulls ONLY this restaurant's rows from the shared cloud DB.
@@ -111,6 +116,7 @@ let cycleRunning = false;
 let cyclesCompleted = 0;   // how many full sync cycles have finished (UI uses this to detect
 let lastCycleAt = null;    // "first sync done" and to show a live progress/status pill)
 let mode = 'off';
+let cloudInfraReady = false; // tombstone table/trigger ensured on the cloud DB (once, when reachable)
 
 async function getColumns(client, table) {
   const r = await client.query(
@@ -377,6 +383,104 @@ async function replicate(src, dst, table, key, scopeRid = null) {
   return { table, key, synced: total, ...(failed ? { failed, error: lastErr } : {}), ...(deadLettered ? { deadLettered } : {}) };
 }
 
+// ── Delete propagation via tombstones ───────────────────────────────────────────────────────────
+// The row replicator is UPSERT-ONLY, so a DELETE never propagates: a config item deleted on the web
+// would linger on the shop forever (and a table removed on the shop would reappear from the cloud).
+// We capture deletes with an AFTER DELETE trigger into `sync_tombstones`, then replay them as scoped
+// DELETEs on the other side. This needs NO change to the many read/delete endpoints — fully additive.
+// Only structural/config tables are tombstoned; append-only money records (orders/payments/invoices/
+// ledger) use soft-cancel and must never be destructively deleted across sides.
+const TOMBSTONE_TABLES = [
+  'offers', 'recipes', 'suppliers', 'coupons', 'customer_groups', 'inventory', 'inventory_categories',
+  'tables', 'floors', 'booking_venues', 'bookings_v2', 'space_bookings',
+];
+// A tombstone only propagates in a direction the table itself syncs (so we never delete something
+// that wasn't supposed to arrive from that side).
+const UP_TOMBSTONE = TOMBSTONE_TABLES.filter((t) => UP_TABLES.includes(t));
+const DOWN_TOMBSTONE = TOMBSTONE_TABLES.filter((t) => DOWN_TABLES.includes(t));
+
+// Idempotent: the tombstone table, the capture function (skips sync-applied deletes via a session
+// flag so there is no ping-pong), and one AFTER DELETE trigger per tombstoned table. Run on BOTH
+// the local and cloud DBs — a delete on either side must be captured to propagate to the other.
+async function ensureTombstoneInfra(pool) {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS sync_tombstones (
+      seq bigserial PRIMARY KEY,
+      table_name text NOT NULL,
+      row_id text NOT NULL,
+      restaurant_id text,
+      deleted_at timestamptz NOT NULL DEFAULT now()
+    )`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_sync_tombstones_deleted_at ON sync_tombstones (deleted_at)`);
+  await pool.query(`
+    CREATE OR REPLACE FUNCTION record_sync_tombstone() RETURNS trigger AS $$
+    BEGIN
+      IF current_setting('dine.sync_replicating', true) = 'on' THEN
+        RETURN OLD;   -- a delete the sync worker itself applied — don't re-tombstone it
+      END IF;
+      INSERT INTO sync_tombstones (table_name, row_id, restaurant_id)
+      VALUES (TG_TABLE_NAME, OLD.id::text,
+              CASE WHEN TG_TABLE_NAME = 'restaurants' THEN OLD.id::text
+                   ELSE (to_jsonb(OLD) ->> 'restaurant_id') END);
+      RETURN OLD;
+    END;
+    $$ LANGUAGE plpgsql`);
+  for (const t of TOMBSTONE_TABLES) {
+    try {
+      const ok = (await pool.query(
+        `SELECT 1 FROM information_schema.tables WHERE table_schema='public' AND table_name=$1`, [t])).rows.length;
+      if (!ok) continue;
+      await pool.query(`DROP TRIGGER IF EXISTS trg_sync_tombstone ON "${t}"`);
+      await pool.query(`CREATE TRIGGER trg_sync_tombstone AFTER DELETE ON "${t}"
+                        FOR EACH ROW EXECUTE FUNCTION record_sync_tombstone()`);
+    } catch (e) { console.warn(`cloudSync: tombstone trigger on ${t} failed:`, e.message); }
+  }
+  // Retention: tombstones are tiny (one row per config delete) but shouldn't grow forever. Prune old
+  // ones — by 60 days any online device has long since consumed them.
+  try { await pool.query(`DELETE FROM sync_tombstones WHERE deleted_at < now() - interval '60 days'`); } catch (_) {}
+}
+
+// Replay tombstones from src → dst for tables that sync in this direction. scopeRid (DOWN) limits to
+// this restaurant's deletes. Each delete runs with the session flag set so it doesn't tombstone on
+// the destination (no ping-pong). Watermark advances on deleted_at, like the row sync.
+async function replicateTombstones(src, dst, key, allowedTables, scopeRid = null) {
+  if (!allowedTables.length) return { key, deleted: 0 };
+  const isDown = key.startsWith('down:');
+  let wm = await getWatermark(key);
+  let last = wm, deleted = 0, lastErr = null;
+  const scopeSql = (isDown && scopeRid) ? ' AND (restaurant_id = $2 OR restaurant_id IS NULL)' : '';
+  try {
+    for (;;) {
+      const res = await src.query(
+        `SELECT seq, table_name, row_id, restaurant_id, deleted_at FROM sync_tombstones
+         WHERE deleted_at > $1${scopeSql} ORDER BY deleted_at ASC LIMIT ${BATCH}`,
+        (isDown && scopeRid) ? [wm, scopeRid] : [wm]);
+      if (!res.rows.length) break;
+      for (const row of res.rows) {
+        if (allowedTables.includes(row.table_name)) {
+          const client = await dst.connect();
+          try {
+            await client.query('BEGIN');
+            await client.query(`SET LOCAL dine.sync_replicating = 'on'`);
+            const hasRid = row.restaurant_id != null;
+            await client.query(
+              `DELETE FROM "${row.table_name}" WHERE id = $1${hasRid ? ' AND restaurant_id = $2' : ''}`,
+              hasRid ? [row.row_id, row.restaurant_id] : [row.row_id]);
+            await client.query('COMMIT');
+            deleted++;
+          } catch (e) { await client.query('ROLLBACK').catch(() => {}); lastErr = e.message; }
+          finally { client.release(); }
+        }
+        if (row.deleted_at > last) last = row.deleted_at;
+      }
+      wm = last;
+      if (res.rows.length < BATCH) break;
+    }
+    await setWatermark(key, last, lastErr, deleted);
+  } catch (e) { lastErr = e.message; }
+  return { key, deleted, ...(lastErr ? { error: lastErr } : {}) };
+}
+
 async function cloudReachable() {
   try { await cloudPool.query('SELECT 1'); return true; } catch (_) { return false; }
 }
@@ -389,6 +493,12 @@ async function runCycle() {
   try {
     if (!(await cloudReachable())) return summary;
     summary.reachable = true;
+    // Ensure the tombstone trigger/table exists on the cloud too (once) so web-side deletes are
+    // captured and can flow DOWN. Local infra is ensured at startup. Best-effort.
+    if (!cloudInfraReady) {
+      try { await ensureTombstoneInfra(cloudPool); cloudInfraReady = true; }
+      catch (e) { console.warn('☁️  cloud tombstone infra not ready:', e.message); }
+    }
     for (const t of UP_TABLES) {
       const r = await replicate(localPool, cloudPool, t, `up:${t}`);
       if (r.synced) { summary.up += r.synced; if (ORDER_TABLES.has(t)) summary.ordersMoved += r.synced; }
@@ -399,7 +509,19 @@ async function runCycle() {
       if (r.synced) { summary.down += r.synced; if (ORDER_TABLES.has(t)) summary.ordersMoved += r.synced; }
       if (r.error || r.skipped) summary.tables.push(r);
     }
-    if (summary.up || summary.down) console.log(`☁️  cloud-sync: ↑${summary.up} ↓${summary.down} rows`);
+    // Delete propagation: replay tombstones AFTER the upserts, in each direction. Local deletes flow
+    // UP (apply on cloud); this-restaurant's cloud deletes flow DOWN (apply locally, scoped).
+    try {
+      const tu = await replicateTombstones(localPool, cloudPool, 'up:__tombstones__', UP_TOMBSTONE);
+      const td = await replicateTombstones(cloudPool, localPool, 'down:__tombstones__', DOWN_TOMBSTONE, SCOPE_RID);
+      summary.deletesUp = tu.deleted; summary.deletesDown = td.deleted;
+      if (tu.error) summary.tables.push(tu);
+      if (td.error) summary.tables.push(td);
+    } catch (e) { console.warn('☁️  tombstone replay error:', e.message); }
+    if (summary.up || summary.down || summary.deletesUp || summary.deletesDown) {
+      console.log(`☁️  cloud-sync: ↑${summary.up} ↓${summary.down} rows` +
+        `${summary.deletesUp || summary.deletesDown ? ` · del ↑${summary.deletesUp || 0} ↓${summary.deletesDown || 0}` : ''}`);
+    }
     // Recompute derived aggregates (revenue/daily_stats) from the synced orders — copied-in
     // rows don't trigger the per-order increment, so the host rebuilds stats from orders.
     if (summary.ordersMoved && onOrdersChanged) {
@@ -441,6 +563,7 @@ function startCloudSync(opts = {}) {
   }
   ensureWatermarkTable()
     .then(() => ensureIdempotentUpdatedAt())
+    .then(() => ensureTombstoneInfra(localPool))   // capture LOCAL deletes so they can flow UP
     .then(() => {
       const dirs = `↑${UP_TABLES.length}${DOWN_TABLES.length ? ` ↓${DOWN_TABLES.length}` : ''} tables`;
       if (mode === 'periodic') {
@@ -491,6 +614,7 @@ function stopCloudSync() {
   if (localPool) localPool.end().catch(() => {});
   if (cloudPool) cloudPool.end().catch(() => {});
   localPool = cloudPool = null;
+  cloudInfraReady = false;
 }
 
-module.exports = { startCloudSync, stopCloudSync, runCycle, triggerSync, getSyncStatus };
+module.exports = { startCloudSync, stopCloudSync, runCycle, triggerSync, getSyncStatus, ensureTombstoneInfra };

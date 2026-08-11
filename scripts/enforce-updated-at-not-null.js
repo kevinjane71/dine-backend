@@ -24,8 +24,8 @@ const SYNC_TABLES = [
   'orders', 'pos_payments', 'pos_invoices', 'daily_stats', 'shifts', 'cash_registers', 'discount_approvals',
   // Customers / CRM / feedback
   'customers', 'customer_groups', 'customer_offer_usage', 'feedback_responses', 'feedback_forms', 'waitlist',
-  // Layout / bookings
-  'floors', 'tables', 'rest_bookings',
+  // Layout / bookings (+ venue/catering booking sub-module)
+  'floors', 'tables', 'rest_bookings', 'bookings_v2', 'space_bookings', 'booking_venues',
   // Inventory / supply chain / bar (records + ledger + stock movements)
   'inventory', 'inventory_transactions', 'inventory_categories', 'stock_audits', 'stock_oversell_log',
   'waste_entries', 'stock_batches', 'stock_transfers', 'goods_receipt_notes', 'supplier_invoices',
