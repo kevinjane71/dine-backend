@@ -20,7 +20,8 @@ const { Client } = require('pg');
 const SYNC_TABLES = [
   'orders', 'payments', 'daily_stats', 'shifts', 'cash_registers', 'customers',
   'staff_users', 'floors', 'tables', 'menu_items', 'rest_bookings', 'offers', 'recipes', 'suppliers',
-  'inventory', 'discount_settings', 'coupons', 'customer_segments', 'tax_groups',
+  'inventory', 'attendance', 'leave_requests', 'expenses', 'stock_audits',
+  'discount_settings', 'coupons', 'customer_segments', 'tax_groups',
 ];
 
 async function main() {

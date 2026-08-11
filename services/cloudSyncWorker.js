@@ -38,7 +38,9 @@ const UP_TABLES = (process.env.CLOUD_SYNC_TABLES ||
   // reservations) that must reach the cloud → two-way. `restaurants` is column-scoped to the
   // embedded `menu` only (see SYNC_ONLY_COLS) so a menu edit on the terminal goes live on the
   // cloud without touching the other config columns. FK order: floors before tables.
-  'orders,payments,daily_stats,shifts,cash_registers,customers,floors,tables,rest_bookings,inventory,restaurants')
+  // attendance/leave_requests/expenses/stock_audits = append-only shop RECORDS (their `total_*`
+  // fields are per-row totals, not cross-record counters) → safe to flow UP so they reach the cloud.
+  'orders,payments,daily_stats,shifts,cash_registers,customers,floors,tables,rest_bookings,inventory,attendance,leave_requests,expenses,stock_audits,restaurants')
   .split(',').map((s) => s.trim()).filter(Boolean);
 // The dine MENU is embedded in restaurants.menu (jsonb), not a separate table, so we two-way it
 // via a COLUMN-SCOPED sync of the restaurants row (only the `menu` column — see SYNC_ONLY_COLS).
@@ -158,6 +160,14 @@ function coerce(value, dataType) {
 const DOWN_PRESERVE_COLS = {
   tables: ['status', 'current_order_id'],
   inventory: ['current_stock', 'stock_quantity'],
+  // Customer loyalty/wallet/spend are running counters that ACCRUE at checkout on the shop
+  // terminal (points earned/redeemed, khata, wallet, totals). They must not be overwritten by a
+  // stale cloud copy on DOWN — the local value is authoritative and flows UP (customers is a
+  // two-way table, so the profile fields still sync both ways; only these counters are preserved).
+  customers: [
+    'loyalty_points', 'lifetime_points', 'loyalty_tier', 'loyalty_transactions',
+    'total_spent', 'total_orders', 'outstanding_balance', 'wallet_balance', 'wallet_history',
+  ],
 };
 
 // Column-scoped tables: sync ONLY these columns (via a targeted UPDATE), never the rest of the
