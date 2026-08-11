@@ -4426,7 +4426,10 @@ async function buildPrimaryRestaurant(userId, ownedDoc, defaultRestaurantId) {
   } catch (_) { /* fall back to ownedDoc */ }
   if (!rDoc) return null;
   const rData = rDoc.data() || {};
-  return { id: rDoc.id, name: rData.name || null, businessType: rData.businessType || null, currency: rData.currency || null };
+  // pgBackendUrl lets the client route all its API traffic to the restaurant's assigned backend
+  // (e.g. GCP Cloud Run) instead of the default — controlled from dine-admin. Included so web AND
+  // dine-app can switch backends after login (null = default). On PG it lives in extra_data.
+  return { id: rDoc.id, name: rData.name || null, businessType: rData.businessType || null, currency: rData.currency || null, pgBackendUrl: rData.pgBackendUrl || null };
 }
 
 // Email/Password Login
@@ -21324,6 +21327,8 @@ app.get('/api/user/profile', authenticateToken, async (req, res) => {
         posSettings: restaurantData.posSettings || {},
         currencySettings: restaurantData.currencySettings || null,
         ecrSettings: restaurantData.ecrSettings || null,
+        // Backend routing (dine-admin switch): the app/web routes API traffic here after login.
+        pgBackendUrl: restaurantData.pgBackendUrl || null,
       } : null,
       owner: ownerData ? {
         id: restaurantData.ownerId,
@@ -21490,6 +21495,8 @@ app.post('/api/auth/staff/login', async (req, res) => {
         posSettings: restaurantData.posSettings || {},
         currencySettings: restaurantData.currencySettings || null,
         ecrSettings: restaurantData.ecrSettings || null,
+        // Backend routing (dine-admin switch): the app/web routes API traffic here after login.
+        pgBackendUrl: restaurantData.pgBackendUrl || null,
       } : null,
       owner: ownerData ? {
         id: restaurantData.ownerId,
