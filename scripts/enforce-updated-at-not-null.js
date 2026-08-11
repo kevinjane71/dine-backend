@@ -19,8 +19,8 @@ const { Client } = require('pg');
 // operational, skipped). Keep in sync with that file if the sync table lists change.
 const SYNC_TABLES = [
   'orders', 'payments', 'daily_stats', 'shifts', 'cash_registers', 'customers',
-  'staff_users', 'floors', 'tables', 'offers', 'recipes', 'suppliers', 'inventory',
-  'discount_settings', 'coupons', 'customer_segments', 'tax_groups',
+  'staff_users', 'floors', 'tables', 'menu_items', 'rest_bookings', 'offers', 'recipes', 'suppliers',
+  'inventory', 'discount_settings', 'coupons', 'customer_segments', 'tax_groups',
 ];
 
 async function main() {

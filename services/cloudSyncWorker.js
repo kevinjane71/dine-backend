@@ -33,19 +33,26 @@ const BATCH = parseInt(process.env.CLOUD_SYNC_BATCH, 10) || 500;
 //   DOWN (cloud → local): catalog/config the owner edits on the web (cloud is truth).
 // Missing tables are skipped gracefully, so listing extras is safe. Override per-site via env.
 const UP_TABLES = (process.env.CLOUD_SYNC_TABLES ||
-  'orders,payments,daily_stats,shifts,cash_registers,customers')
+  // orders/payments/daily_stats/shifts/cash_registers/customers = transactional data.
+  // floors/tables/rest_bookings = config edited on the terminal (table layout, occupancy,
+  // reservations) that must reach the cloud → two-way. `restaurants` is column-scoped to the
+  // embedded `menu` only (see SYNC_ONLY_COLS) so a menu edit on the terminal goes live on the
+  // cloud without touching the other config columns. FK order: floors before tables.
+  'orders,payments,daily_stats,shifts,cash_registers,customers,floors,tables,rest_bookings,restaurants')
   .split(',').map((s) => s.trim()).filter(Boolean);
-// NOTE: `restaurants` (and its embedded menu) is intentionally NOT here — the menu lives in
-// Firestore and is pulled via API provisioning (provisioning.js). Syncing the menu-less cloud
-// Postgres restaurant row would clobber the menu. Structural/config tables sync down here.
+// The dine MENU is embedded in restaurants.menu (jsonb), not a separate table, so we two-way it
+// via a COLUMN-SCOPED sync of the restaurants row (only the `menu` column — see SYNC_ONLY_COLS).
+// Menu edits are admin/owner permission-gated, so churn is low and conflicts are rare.
 //
 // orders + payments are in BOTH up and down → true two-way: orders placed on the web (or on
 // another terminal) flow DOWN into this app, and orders placed here flow UP. Safe because each
 // order has a globally-unique id, so merge = UNION by id (never a double-count); edits resolve
 // last-write-wins by updated_at. (daily_stats stays UP-only — it's an aggregate, not row-keyed,
 // so two-waying it would clobber; the cloud recomputes its own.)
+// rest_bookings is two-way. floors/tables come DOWN (structure) but their live occupancy columns
+// are preserved locally (DOWN_PRESERVE_COLS) while still flowing UP to the cloud.
 const DOWN_TABLES = (process.env.CLOUD_SYNC_DOWN_TABLES ||
-  'orders,payments,staff_users,floors,tables,offers,recipes,suppliers,inventory,customers,discount_settings,coupons,customer_segments,tax_groups')
+  'restaurants,orders,payments,staff_users,floors,tables,rest_bookings,offers,recipes,suppliers,inventory,customers,discount_settings,coupons,customer_segments,tax_groups')
   .split(',').map((s) => s.trim()).filter(Boolean);
 // One-restaurant device: DOWN pulls ONLY this restaurant's rows from the shared cloud DB.
 const SCOPE_RID = (process.env.SYNC_RESTAURANT_ID || '').trim() || null;
@@ -153,6 +160,15 @@ const DOWN_PRESERVE_COLS = {
   inventory: ['current_stock', 'stock_quantity'],
 };
 
+// Column-scoped tables: sync ONLY these columns (via a targeted UPDATE), never the rest of the
+// row. The dine menu is embedded in restaurants.menu, so we two-way just that jsonb column and
+// leave the other ~54 operational/config columns untouched on both sides — a menu edit propagates
+// without any risk of clobbering settings. The row always exists (provisioned), so UPDATE-only is
+// safe (no INSERT that would fail on the NOT NULL columns we deliberately skip).
+const SYNC_ONLY_COLS = {
+  restaurants: ['menu'],
+};
+
 // Per-row failure counter so a row that throws is RETRIED (not silently skipped by an advancing
 // watermark) but also can't wedge a table forever — after MAX_ROW_RETRIES it is loudly dead-lettered.
 const _rowFailCounts = new Map();
@@ -172,24 +188,39 @@ async function replicate(src, dst, table, key, scopeRid = null) {
   if (!dstNames.size) return { table, key, skipped: 'missing at destination' };
 
   const cols = srcCols.filter((c) => dstNames.has(c.column_name));
-  const names = cols.map((c) => c.column_name);
   const typeOf = Object.fromEntries(cols.map((c) => [c.column_name, c.data_type]));
   const pk = await getPk(dst, table);            // real PK (composite-aware) at the destination
-  // On DOWN (cloud→local), never OVERWRITE local live-state columns on an existing row — they are
-  // owned by the local POS. They're still INSERTed for brand-new rows (below), just excluded from
-  // the ON CONFLICT DO UPDATE SET, so a stale cloud row can't re-occupy a table or reset stock.
   const isDown = key.startsWith('down:');
-  const preserveCols = isDown ? (DOWN_PRESERVE_COLS[table] || []) : [];
-  const setCols = names.filter((c) => !pk.includes(c) && !preserveCols.includes(c));
-  const quoted = names.map((c) => `"${c}"`).join(',');
-  const ph = names.map((_, i) => `$${i + 1}`).join(',');
-  const conflictTgt = pk.map((c) => `"${c}"`).join(',');
-  const upd = setCols.length ? setCols.map((c) => `"${c}"=EXCLUDED."${c}"`).join(',') : `"${pk[0]}"=EXCLUDED."${pk[0]}"`;
-  // Idempotency guard: only overwrite when the incoming row is STRICTLY NEWER. An already-
-  // in-sync row (equal updated_at) is skipped entirely — no write, no trigger fire, no
-  // timestamp bump — so the watermark advances past it and it is never re-synced. This is
-  // what stops orders (bidirectional) from ping-ponging up↔down every cycle.
-  const sql = `INSERT INTO "${table}" (${quoted}) VALUES (${ph}) ON CONFLICT (${conflictTgt}) DO UPDATE SET ${upd} WHERE "${table}".updated_at < EXCLUDED.updated_at`;
+
+  let names, sql;
+  const onlyCols = (SYNC_ONLY_COLS[table] || []).filter((c) => dstNames.has(c) && srcNames.includes(c));
+  if (onlyCols.length) {
+    // Column-scoped: UPDATE only the allowlisted columns (+ advance updated_at) on the existing
+    // row when the incoming is strictly newer. No INSERT — the row is provisioned, and we must not
+    // touch the columns we skip. Param order == `names` order below.
+    names = [...onlyCols, 'updated_at', ...pk];
+    const setClause = onlyCols.map((c, i) => `"${c}"=$${i + 1}`).join(', ');
+    const uaParam = onlyCols.length + 1;                 // $N for updated_at (SET + guard)
+    const pkClause = pk.map((c, i) => `"${c}"=$${onlyCols.length + 2 + i}`).join(' AND ');
+    sql = `UPDATE "${table}" SET ${setClause}, "updated_at"=$${uaParam} WHERE ${pkClause} AND "${table}".updated_at < $${uaParam}`;
+  } else {
+    // On DOWN (cloud→local), never OVERWRITE local live-state columns on an existing row — they are
+    // owned by the local POS. They're still INSERTed for brand-new rows, just excluded from the
+    // ON CONFLICT DO UPDATE SET, so a stale cloud row can't re-occupy a table or reset stock.
+    const preserveCols = isDown ? (DOWN_PRESERVE_COLS[table] || []) : [];
+    names = cols.map((c) => c.column_name);
+    const setCols = names.filter((c) => !pk.includes(c) && !preserveCols.includes(c));
+    const ph = names.map((_, i) => `$${i + 1}`).join(',');
+    const conflictTgt = pk.map((c) => `"${c}"`).join(',');
+    const upd = setCols.length ? setCols.map((c) => `"${c}"=EXCLUDED."${c}"`).join(',') : `"${pk[0]}"=EXCLUDED."${pk[0]}"`;
+    const quotedIns = names.map((c) => `"${c}"`).join(',');
+    // Idempotency guard: only overwrite when the incoming row is STRICTLY NEWER. An already-
+    // in-sync row (equal updated_at) is skipped entirely — no write, no trigger fire, no
+    // timestamp bump — so the watermark advances past it and it is never re-synced. This is
+    // what stops orders (bidirectional) from ping-ponging up↔down every cycle.
+    sql = `INSERT INTO "${table}" (${quotedIns}) VALUES (${ph}) ON CONFLICT (${conflictTgt}) DO UPDATE SET ${upd} WHERE "${table}".updated_at < EXCLUDED.updated_at`;
+  }
+  const quoted = names.map((c) => `"${c}"`).join(',');   // SELECT column list (both paths)
 
   // The restaurants table is keyed by `id` (= the restaurant id); every other table scopes
   // by `restaurant_id`. Only scope when the column exists (skips truly-global tables).
