@@ -79,16 +79,53 @@ function initializeFirebase() {
 // that only errors if an UNMAPPED collection is actually touched (all hot-path
 // collections are mapped to PG, so the stub is never hit in normal offline use).
 function makeOfflineFirestoreStub() {
-  const unavailable = () => {
-    throw new Error('Firestore unavailable in offline mode — this collection is not mapped to Postgres.');
+  // All hot-path collections are mapped to Postgres, so this stub is only reached by
+  // internet-only features whose collection isn't in the pg registry (FCM push tokens,
+  // DineAI chat history, etc.). Those genuinely can't work without internet, so we DEGRADE
+  // GRACEFULLY — empty reads / no-op writes — instead of THROWING (which used to 500 the
+  // whole request, e.g. delivery-assignment FCM registration). A one-time warn per name
+  // keeps a signal in the logs so a truly-missing mapping is still visible.
+  const warned = new Set();
+  const warn = (what) => {
+    if (warned.has(what)) return;
+    warned.add(what);
+    console.warn(`⚠️  Firestore no-op (offline): "${what}" is not mapped to Postgres — skipping this online-only feature.`);
+  };
+  const emptySnap = { empty: true, size: 0, docs: [], forEach: () => {} };
+  const noopDoc = (id) => ({
+    id: id || 'offline',
+    get: async () => ({ exists: false, id: id || 'offline', data: () => undefined, ref: noopDoc(id) }),
+    set: async () => {}, update: async () => {}, delete: async () => {},
+    collection: (n) => { warn(n); return noopCollection(n); },
+  });
+  const noopQuery = () => {
+    const q = {
+      where: () => q, orderBy: () => q, limit: () => q, offset: () => q,
+      startAfter: () => q, startAt: () => q, select: () => q,
+      get: async () => emptySnap,
+      count: () => ({ get: async () => ({ data: () => ({ count: 0 }) }) }),
+    };
+    return q;
+  };
+  function noopCollection(name) {
+    return {
+      doc: (id) => noopDoc(id),
+      add: async () => noopDoc(),
+      get: async () => emptySnap,
+      where: () => noopQuery(), orderBy: () => noopQuery(), limit: () => noopQuery(),
+    };
+  }
+  const noopBatch = () => {
+    const b = { set: () => b, update: () => b, delete: () => b, commit: async () => {} };
+    return b;
   };
   return {
     __offlineStub: true,
-    collection: unavailable,
-    collectionGroup: unavailable,
-    doc: unavailable,
-    batch: unavailable,
-    runTransaction: unavailable,
+    collection: (n) => { warn(n); return noopCollection(n); },
+    collectionGroup: (n) => { warn(n); return noopQuery(); },
+    doc: (p) => { warn(p); return noopDoc(p); },
+    batch: () => noopBatch(),
+    runTransaction: async () => { warn('runTransaction'); return undefined; },
     settings: () => {},
   };
 }
