@@ -1017,9 +1017,16 @@ class PgQuery {
    * Build WHERE conditions for this query's filters. Pushes parameters onto
    * `values` and returns { conditions, emptyResult }. Shared by get()/count().
    */
-  _buildConditions(values, knownCols) {
+  _buildConditions(values, knownCols, textCols) {
     const { fieldMap, jsonbCols } = this._config;
     const conditions = [];
+    // Range comparisons on TEXT keys must use byte order (COLLATE "C") to match Firestore's
+    // string sort. Without it, the DB's locale collation mis-scopes prefix ranges (the
+    // Firestore `` idiom) — e.g. it can silently under-count and produce duplicate
+    // booking numbers. Equality (`=`/`!=`) is byte-exact under either collation, so only the
+    // relational operators need it. Mirrors the COLLATE "C" already applied in ORDER BY.
+    const RANGE_OPS = new Set(['<', '<=', '>', '>=']);
+    const collateText = (expr, op) => (RANGE_OPS.has(op) ? `${expr} COLLATE "C"` : expr);
 
     for (const w of this._wheres) {
       const mappedOp = OP_MAP[w.op];
@@ -1075,7 +1082,7 @@ class PgQuery {
           conditions.push(`${textExpr} ${mappedOp} $${vIdx}`);
         } else {
           const vIdx = addValue(cleanValue);
-          conditions.push(`${textExpr} ${mappedOp} $${vIdx}`);
+          conditions.push(`${collateText(textExpr, w.op)} ${mappedOp} $${vIdx}`);
         }
         continue;
       }
@@ -1123,7 +1130,7 @@ class PgQuery {
           conditions.push(`${textExpr} ${mappedOp} $${vIdx}`);
         } else {
           const vIdx = addValue(cleanValue);
-          conditions.push(`${textExpr} ${mappedOp} $${vIdx}`);
+          conditions.push(`${collateText(textExpr, w.op)} ${mappedOp} $${vIdx}`);
         }
         continue;
       }
@@ -1150,7 +1157,9 @@ class PgQuery {
         conditions.push(`COALESCE(${pgCol}, '[]'::jsonb) @> $${vIdx}::jsonb`);
       } else {
         const vIdx = addValue(cleanValue);
-        conditions.push(`${pgCol} ${mappedOp} $${vIdx}`);
+        const isTextCol = textCols && textCols.has(pgCol.toLowerCase());
+        const lhs = isTextCol ? collateText(pgCol, w.op) : pgCol;
+        conditions.push(`${lhs} ${mappedOp} $${vIdx}`);
       }
     }
 
@@ -1169,7 +1178,7 @@ class PgQuery {
           const { table } = self._config;
           const values = [];
           const knownCols = await getTableColumns(table);
-          const { conditions, emptyResult } = self._buildConditions(values, knownCols);
+          const { conditions, emptyResult } = self._buildConditions(values, knownCols, getTextColumns(table));
           if (emptyResult) return { data: () => ({ count: 0 }) };
 
           let sql = `SELECT COUNT(*) AS cnt FROM ${table}`;
@@ -1232,7 +1241,7 @@ class PgQuery {
 
       const values = [];
       const knownCols = await getTableColumns(table);
-      const { conditions, emptyResult } = this._buildConditions(values, knownCols);
+      const { conditions, emptyResult } = this._buildConditions(values, knownCols, getTextColumns(table));
       if (emptyResult) return makeQuerySnapshot([]);
 
       // ORDER BY — Firestore excludes documents that lack the orderBy field,
