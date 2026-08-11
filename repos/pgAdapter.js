@@ -1314,7 +1314,15 @@ class PgQuery {
             .map(convertTimestamp);
         }
 
-        if (cursorVals && cursorVals.length > 0) {
+        // A cursor whose orderBy field overflowed to extra_data (not a physical column) would
+        // build a tuple comparison on a non-existent column and 500. ORDER BY has an extra_data
+        // fallback; the cursor tuple does not. No live query paginates by an overflow field, so
+        // degrade safely — skip the cursor bound (paginate from the start) rather than crash.
+        const cursorColsReal = !cursorVals || !knownCols
+          || this._orderBys.every((o) => knownCols.has(resolveField(fieldMap, o.field).toLowerCase()));
+        if (cursorVals && cursorVals.length > 0 && !cursorColsReal) {
+          console.warn('[pgAdapter] cursor on a non-column (extra_data) orderBy field — skipping cursor bound to avoid an invalid-column error');
+        } else if (cursorVals && cursorVals.length > 0) {
           const dirs = this._orderBys.map((o) => (o.direction === 'desc' ? 'desc' : 'asc'));
           const uniform = dirs.every((d) => d === dirs[0]);
           const allPresent = cursorVals.every((v) => v !== undefined && v !== null);
