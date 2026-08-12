@@ -12177,8 +12177,10 @@ function aggregateDailyStats(dailyDocs, dateStrings) {
 
 // Helper function to calculate analytics from raw orders (used for today/24h)
 function calculateAnalytics(orders, period) {
-  // Exclude cancelled/deleted/saved/refunded orders from analytics — only count valid orders
-  orders = orders.filter(o => !['cancelled', 'deleted', 'saved', 'refunded'].includes(o.status));
+  // Count only REALIZED orders — completed/paid/settled — so "today" analytics (revenue, orders,
+  // avg, breakdowns) match the Home/owner dashboard (which uses the same allowlist). An open
+  // 'confirmed'/'pending' KOT order is not revenue yet; a blocklist here wrongly inflated it.
+  orders = orders.filter(o => ['completed', 'paid', 'settled'].includes(String(o.status || '').toLowerCase()));
 
   if (orders.length === 0) {
     return {
