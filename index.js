@@ -1802,6 +1802,60 @@ app.use((req, res, next) => {
   next();
 });
 
+// ── SINGLE-TENANT GUARD (local-server app only) ──────────────────────────────────────────────────
+// The on-prem local server is bound to exactly ONE restaurant (the one it was provisioned for — the
+// sole row in the local `restaurants` table). This guard makes the local API serve/accept data ONLY
+// for that bound restaurant, so a DIFFERENT restaurant's session (e.g. a visiting owner logged in
+// while online) can never read this terminal's data or write its own into this local DB. Their
+// session is handled online-only by the frontend; if such a request ever reaches the local server,
+// it is refused here. No-op on the cloud (LOCAL_SERVER_MODE !== 'true'), so multi-tenant cloud is
+// unaffected. Provisioning/auth/health/public endpoints are exempt (they must work before, or to
+// establish, the binding).
+let _boundRestaurantId; // cached; the local DB is single-tenant so this never changes at runtime
+let _boundLookupAt = 0;
+async function getBoundRestaurantId() {
+  // Re-derive at most every 30s until known (covers the brief window right after provisioning).
+  if (_boundRestaurantId || (Date.now() - _boundLookupAt) < 30000) return _boundRestaurantId || null;
+  _boundLookupAt = Date.now();
+  try {
+    const { getPool } = require('./repos/pgClient');
+    const r = await getPool().query('SELECT id FROM restaurants ORDER BY created_at ASC NULLS FIRST LIMIT 1');
+    if (r.rows[0]) _boundRestaurantId = String(r.rows[0].id);
+  } catch (_) { /* not provisioned yet / DB not ready */ }
+  return _boundRestaurantId || null;
+}
+// The RELIABLE tenant signal is the caller's identity (JWT restaurantId), NOT the URL path — path
+// segments after /orders/, /tables/, /kot/ etc. are frequently an orderId/tableId, not a restaurant
+// id, so path-parsing would wrongly block legitimate single-entity ops. We check the token's
+// restaurantId, plus an EXPLICITLY-named restaurantId in the query/body (unambiguous).
+function _tokenRestaurantId(req) {
+  try {
+    const h = req.headers?.authorization || '';
+    const tok = h.startsWith('Bearer ') ? h.slice(7) : null;
+    if (!tok) return null;
+    const d = jwt.verify(tok, process.env.JWT_SECRET);
+    return d?.restaurantId ? String(d.restaurantId) : null;
+  } catch (_) { return null; } // invalid/expired token → let the route's own auth reject it
+}
+if (process.env.LOCAL_SERVER_MODE === 'true') {
+  const EXEMPT = /^\/(api\/(provision|auth|health|local-server|public)|health|$)/;
+  const mismatch = (res) => res.status(403).json({ error: 'tenant_mismatch', message: 'This terminal is set up for a different restaurant. That data is only available online.' });
+  app.use(async (req, res, next) => {
+    try {
+      if (req.method === 'OPTIONS' || EXEMPT.test(req.path)) return next();
+      const bound = await getBoundRestaurantId();
+      if (!bound) return next(); // not provisioned yet — nothing to protect
+      // 1) The caller's token must belong to the bound restaurant (main protection).
+      const tokRid = _tokenRestaurantId(req);
+      if (tokRid && tokRid !== bound) return mismatch(res);
+      // 2) An explicit ?restaurantId= / body.restaurantId for a different restaurant is also refused.
+      const explicit = req.query?.restaurantId || (req.body && typeof req.body === 'object' ? req.body.restaurantId : null);
+      if (explicit && String(explicit) !== bound) return mismatch(res);
+      return next();
+    } catch (e) { return next(); } // never hard-fail a request on a guard error
+  });
+}
+
 // ── Global rate limiter via Upstash Redis (protects against FE retry loops) ──
 // Uses Redis INCR + EXPIRE for a sliding window. Each IP gets 300 requests
 // per minute. Zero Firestore reads. Falls through silently if Redis is down.
@@ -40708,7 +40762,10 @@ app.get('/api/provision/status', async (req, res) => {
       const snap = await db.collection('restaurants').limit(1).get();
       provisioned = !snap.empty;
     } catch (_) {}
-    res.json({ configured, provisioned });
+    // boundRestaurantId: the restaurant this terminal is set up for (null until provisioned). The
+    // frontend uses it to decide local (bound) vs cloud-only (a different restaurant's owner).
+    const boundRestaurantId = await getBoundRestaurantId();
+    res.json({ configured, provisioned, boundRestaurantId });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -40721,8 +40778,20 @@ app.post('/api/provision', async (req, res) => {
     if (!token && !(phone && otp)) {
       return res.status(400).json({ error: 'Provide a cloud token, or phone + otp, to authorize provisioning.' });
     }
+    // Single-tenant binding: once this terminal is provisioned for restaurant A, it can only ever be
+    // re-provisioned (refreshed) for A — never a DIFFERENT restaurant, which would mix two shops'
+    // data in one local DB. A visiting owner of another restaurant is served online-only instead.
+    const bound = await getBoundRestaurantId();
+    if (bound && String(bound) !== String(restaurantId)) {
+      return res.status(409).json({
+        error: 'terminal_bound',
+        message: 'This terminal is already set up for a different restaurant. To switch, reset the terminal first.',
+        boundRestaurantId: bound,
+      });
+    }
     const { provisionFromCloud } = require('./services/provisioning');
     const summary = await provisionFromCloud({ cloudApiUrl, restaurantId, token, phone, otp });
+    _boundRestaurantId = String(restaurantId); _boundLookupAt = Date.now(); // bind immediately
     res.json({ success: true, ...summary });
   } catch (e) {
     res.status(500).json({ error: e.message });

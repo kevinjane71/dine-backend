@@ -122,8 +122,19 @@ const DOWN_TABLES = (process.env.CLOUD_SYNC_DOWN_TABLES ||
     'saved_carts', 'sub_restaurants',
   ].join(','))
   .split(',').map((s) => s.trim()).filter(Boolean);
-// One-restaurant device: DOWN pulls ONLY this restaurant's rows from the shared cloud DB.
-const SCOPE_RID = (process.env.SYNC_RESTAURANT_ID || '').trim() || null;
+// One-restaurant device: DOWN pulls ONLY this restaurant's rows from the shared cloud DB. Prefer an
+// explicit env override; otherwise derive it from the sole local restaurant row (the terminal is
+// bound to exactly one restaurant after provisioning). Derived lazily so it picks up the id the
+// moment provisioning writes the restaurant, without needing the env wired at launch.
+let SCOPE_RID = (process.env.SYNC_RESTAURANT_ID || '').trim() || null;
+async function resolveScopeRid() {
+  if (SCOPE_RID) return SCOPE_RID;
+  try {
+    const r = await localPool.query('SELECT id FROM restaurants ORDER BY created_at ASC NULLS FIRST LIMIT 1');
+    if (r.rows[0]) SCOPE_RID = String(r.rows[0].id);
+  } catch (_) {}
+  return SCOPE_RID;
+}
 
 function resolveMode() {
   let m = (process.env.SYNC_MODE || '').toLowerCase().trim();
@@ -529,13 +540,17 @@ async function runCycle() {
       try { await ensureTombstoneInfra(cloudPool); cloudInfraReady = true; }
       catch (e) { console.warn('☁️  cloud tombstone infra not ready:', e.message); }
     }
+    // Resolve the bound restaurant id (from env or the sole local restaurant row) so DOWN is scoped
+    // to THIS restaurant only — critical: the cloud holds every tenant, an unscoped DOWN would pull
+    // other restaurants' rows onto this terminal. If it can't be resolved yet, skip DOWN this cycle.
+    const scopeRid = await resolveScopeRid();
     for (const t of UP_TABLES) {
       const r = await replicate(localPool, cloudPool, t, `up:${t}`);
       if (r.synced) { summary.up += r.synced; if (ORDER_TABLES.has(t)) summary.ordersMoved += r.synced; }
       if (r.error || r.skipped) summary.tables.push(r);
     }
-    for (const t of DOWN_TABLES) {
-      const r = await replicate(cloudPool, localPool, t, `down:${t}`, SCOPE_RID);
+    for (const t of (scopeRid ? DOWN_TABLES : [])) {
+      const r = await replicate(cloudPool, localPool, t, `down:${t}`, scopeRid);
       if (r.synced) { summary.down += r.synced; if (ORDER_TABLES.has(t)) summary.ordersMoved += r.synced; }
       if (r.error || r.skipped) summary.tables.push(r);
     }
@@ -543,7 +558,7 @@ async function runCycle() {
     // UP (apply on cloud); this-restaurant's cloud deletes flow DOWN (apply locally, scoped).
     try {
       const tu = await replicateTombstones(localPool, cloudPool, 'up:__tombstones__', UP_TOMBSTONE);
-      const td = await replicateTombstones(cloudPool, localPool, 'down:__tombstones__', DOWN_TOMBSTONE, SCOPE_RID);
+      const td = scopeRid ? await replicateTombstones(cloudPool, localPool, 'down:__tombstones__', DOWN_TOMBSTONE, scopeRid) : { deleted: 0 };
       summary.deletesUp = tu.deleted; summary.deletesDown = td.deleted;
       if (tu.error) summary.tables.push(tu);
       if (td.error) summary.tables.push(td);
