@@ -317,9 +317,35 @@ function getEffectiveOrderRevenue(order) {
   return { amount: order.totalAmount || 0, amountWithTax: order.finalAmount || order.totalAmount || 0, dueAmount: 0 };
 }
 
+// Revenue is REALIZED money — an order counts only once it's completed/paid/settled. Same allowlist
+// the owner dashboard uses (see routes/ownerDashboard.js: "a blocklist wrongly counts open
+// 'confirmed'/'pending' orders"). Keeping this identical everywhere is what makes Order History /
+// analytics agree with the Home dashboard.
+const COUNTED_REVENUE_STATUSES = ['completed', 'paid', 'settled'];
+const isCountedRevenueStatus = (s) => COUNTED_REVENUE_STATUSES.includes(String(s || '').toLowerCase());
+
+// LOCAL app only: after any order-stats change, recompute the day's daily_stats from the raw orders
+// (delete + replay, realized-revenue filter above) so the stored aggregate always matches the
+// owner-dashboard definition — regardless of how the fast incremental path counted it. Debounced so
+// a burst of writes triggers one clean recompute. On the cloud this stays off (serverless); the
+// sync worker's onOrdersChanged already recomputes there.
+const _localStatsRecomputeTimers = new Map();
+const _statsRecomputing = new Set(); // restaurants whose recompute is in flight — don't re-trigger
+function scheduleLocalStatsRecompute(restaurantId) {
+  if (process.env.LOCAL_SERVER_MODE !== 'true' || !restaurantId) return;
+  if (_statsRecomputing.has(restaurantId)) return; // updateDailyStats calls from WITHIN a recompute
+  const prev = _localStatsRecomputeTimers.get(restaurantId);
+  if (prev) clearTimeout(prev);
+  _localStatsRecomputeTimers.set(restaurantId, setTimeout(() => {
+    _localStatsRecomputeTimers.delete(restaurantId);
+    Promise.resolve().then(() => recomputeDailyStatsFromOrders(restaurantId)).catch(() => {});
+  }, 1500));
+}
+
 // Pre-compute daily analytics stats on every order write (fire-and-forget)
 // Doc ID: {restaurantId}_{YYYY-MM-DD} in 'dailyStats' collection
 function updateDailyStats(restaurantId, order, operation, tzOffset, dayStartHour) {
+  scheduleLocalStatsRecompute(restaurantId); // local app: reconcile to realized-revenue shortly after
   try {
     const orderDate = order.createdAt?.toDate ? order.createdAt.toDate()
       : (order.createdAt instanceof Date ? order.createdAt : new Date(order.createdAt || Date.now()));
@@ -12231,8 +12257,10 @@ function aggregateDailyStats(dailyDocs, dateStrings) {
 
 // Helper function to calculate analytics from raw orders (used for today/24h)
 function calculateAnalytics(orders, period) {
-  // Exclude cancelled/deleted/saved/refunded orders from analytics — only count valid orders
-  orders = orders.filter(o => !['cancelled', 'deleted', 'saved', 'refunded'].includes(o.status));
+  // Count only REALIZED orders — completed/paid/settled — so "today" analytics (revenue, orders,
+  // avg, breakdowns) match the Home/owner dashboard. An open 'confirmed'/'pending' KOT order is not
+  // revenue yet; a blocklist here wrongly inflated it (Order History showed more than Home).
+  orders = orders.filter(o => isCountedRevenueStatus(o.status));
 
   if (orders.length === 0) {
     return {
@@ -40870,6 +40898,7 @@ if (process.env.LOCAL_SERVER_MODE === 'true') {
 let _statsFullRecomputeDone = false;
 async function recomputeDailyStatsFromOrders(restaurantId, { fullHistory = false } = {}) {
   if (!restaurantId) return;
+  _statsRecomputing.add(restaurantId); // suppress the debounced re-trigger for our own replay writes
   try {
     // Use the restaurant's own tz so day boundaries match how the orders were bucketed.
     let tzOffset = -330, dayStartHour = 0; // default: IST (-330 min), day starts midnight
@@ -40899,17 +40928,21 @@ async function recomputeDailyStatsFromOrders(restaurantId, { fullHistory = false
     for (const day of days) {
       await db.collection('dailyStats').doc(`${restaurantId}_${day}`).delete().catch(() => {});
     }
-    // Replay only orders that COUNT (exclude cancelled/deleted). Atomic increments → order-safe.
+    // Replay only orders that count as REALIZED revenue — completed/paid/settled — matching the
+    // owner-dashboard definition (an open 'confirmed'/'pending' KOT order is NOT revenue yet). This
+    // is the single source of truth that keeps Order History / analytics in step with the Home
+    // dashboard. Atomic increments → order-safe.
     let replayed = 0;
     for (const o of orders) {
-      const st = String(o.status || '').toLowerCase();
-      if (st === 'cancelled' || st === 'canceled' || o.deleted === true) continue;
+      if (!isCountedRevenueStatus(o.status)) continue;
       updateDailyStats(restaurantId, o, 'add', tzOffset, dayStartHour);
       replayed++;
     }
     console.log(`📊 daily_stats recomputed for ${restaurantId}: ${days.size} day(s), ${replayed} orders (${fullHistory ? 'full history' : 'recent'}).`);
   } catch (e) {
     console.warn('recomputeDailyStatsFromOrders error:', e.message);
+  } finally {
+    _statsRecomputing.delete(restaurantId);
   }
 }
 
