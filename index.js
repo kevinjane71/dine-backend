@@ -11695,16 +11695,35 @@ app.get('/api/orders/:restaurantId', authenticateToken, async (req, res) => {
 
       const orderedFastQuery = fastQuery.orderBy('createdAt', 'desc');
 
-      // Run paginated fetch and count in parallel
-      const [pageSnapshot, countSnapshot] = await Promise.all([
-        orderedFastQuery.offset(offset).limit(limitNum).get(),
-        fastQuery.count().get()
-      ]);
+      // ── Cached pagination count ──────────────────────────────────────────────
+      // The total count feeds pagination display only, so it tolerates brief staleness.
+      // Cache it separately under a short PLAIN TTL that SURVIVES the order-write version
+      // bumps — otherwise count() re-scanned the store's ENTIRE order history on every order
+      // write, and that cost grows unbounded as history grows (a busy store with 100k+ orders
+      // pays a full history count on every write-then-load). Page data itself stays fresh via
+      // the version cache above; only the "total pages" number can lag up to the TTL.
+      const _cntKey = `orders:cnt:${restaurantId}:` + require('crypto').createHash('md5')
+        .update(JSON.stringify({ status, date, startDate, endDate, todayOnly, orderType, paymentMethod, paymentStatus, waiterId, myOrdersOnly, floorIds, search, u: (req.user?.userId || req.user?.id || '') }))
+        .digest('hex').slice(0, 16);
+      const _cntCached = await kvGet(_cntKey);
+      const _haveCount = (typeof _cntCached === 'number');
 
       const orders = [];
-      pageSnapshot.forEach(doc => orders.push(formatOrder(doc)));
-
-      const totalOrders = countSnapshot.data().count;
+      let totalOrders;
+      if (_haveCount) {
+        // Count served from Redis → skip the full-history count() entirely.
+        const pageSnapshot = await orderedFastQuery.offset(offset).limit(limitNum).get();
+        pageSnapshot.forEach(doc => orders.push(formatOrder(doc)));
+        totalOrders = _cntCached;
+      } else {
+        const [pageSnapshot, countSnapshot] = await Promise.all([
+          orderedFastQuery.offset(offset).limit(limitNum).get(),
+          fastQuery.count().get()
+        ]);
+        pageSnapshot.forEach(doc => orders.push(formatOrder(doc)));
+        totalOrders = countSnapshot.data().count;
+        kvSet(_cntKey, totalOrders, 60).catch(() => {}); // 60s: count runs ≤1×/min/filter, not per write
+      }
       const totalPages = Math.ceil(totalOrders / limitNum);
 
       console.log(`📋 Order History (fast) - Found ${orders.length} orders (page ${pageNum}/${totalPages}, total: ${totalOrders})`);
