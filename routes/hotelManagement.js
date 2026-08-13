@@ -487,8 +487,9 @@ router.post('/hotel/checkout/:checkInId', authenticateToken, async (req, res) =>
     try {
       const restDoc = await db.collection('restaurants').doc(checkInData.restaurantId).get();
       const rd = restDoc.exists ? restDoc.data() : {};
-      roomTaxRate = Number(rd.roomTaxRate) || 0;
-      if (rd.roomTaxName) roomTaxName = rd.roomTaxName;
+      roomTaxRate = Number(rd.posSettings?.roomTaxRate ?? rd.roomTaxRate) || 0;
+      const _rtName = rd.posSettings?.roomTaxName ?? rd.roomTaxName;
+      if (_rtName) roomTaxName = _rtName;
     } catch (_) {}
     if (roomTaxRate > 0 && totalRoomCharges > 0) {
       roomTaxAmount = Math.round((totalRoomCharges * roomTaxRate) ) / 100;
@@ -894,8 +895,9 @@ router.get('/hotel/invoice/:checkInId', authenticateToken, async (req, res) => {
       try {
         const restDoc = await db.collection('restaurants').doc(data.restaurantId).get();
         const rd = restDoc.exists ? restDoc.data() : {};
-        roomTaxRate = Number(rd.roomTaxRate) || 0;
-        if (rd.roomTaxName) roomTaxName = rd.roomTaxName;
+        roomTaxRate = Number(rd.posSettings?.roomTaxRate ?? rd.roomTaxRate) || 0;
+        const _rtName = rd.posSettings?.roomTaxName ?? rd.roomTaxName;
+        if (_rtName) roomTaxName = _rtName;
       } catch (_) {}
       if (roomTaxRate > 0 && totalRoomCharges > 0) {
         roomTaxAmount = Math.round((totalRoomCharges * roomTaxRate)) / 100;
