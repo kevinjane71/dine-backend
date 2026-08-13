@@ -4583,6 +4583,102 @@ app.post('/api/auth/email/login', async (req, res) => {
   }
 });
 
+// ─── Forgot Password (self-service email reset) ───────────────────────────────
+// Security best-practices: (1) NEVER reveal whether an email exists (generic response);
+// (2) email a RANDOM token but store only its SHA-256 HASH; (3) 30-minute expiry;
+// (4) single-use (marked used + cleared on reset); (5) light per-email throttle.
+app.post('/api/auth/forgot-password', async (req, res) => {
+  const crypto = require('crypto');
+  const generic = { success: true, message: 'If an account with that email exists, a password reset link has been sent.' };
+  try {
+    const email = (req.body.email || '').toString().toLowerCase().trim();
+    if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+      return res.status(400).json({ success: false, error: 'Please enter a valid email address' });
+    }
+
+    const snap = await db.collection(collections.users).where('email', '==', email).limit(1).get();
+    if (snap.empty) return res.json(generic); // no enumeration
+
+    const userDoc = snap.docs[0];
+    const u = userDoc.data();
+    // Only email-password accounts can reset a password (Google/phone users have none).
+    if (!u.password) return res.json(generic);
+    // Throttle: if a link was requested in the last 60s, don't send another (still generic).
+    const lastReq = u.resetRequestedAt?.toDate ? u.resetRequestedAt.toDate().getTime() : (u.resetRequestedAt ? new Date(u.resetRequestedAt).getTime() : 0);
+    if (lastReq && (Date.now() - lastReq) < 60 * 1000) return res.json(generic);
+
+    const rawToken = crypto.randomBytes(32).toString('hex');
+    const tokenHash = crypto.createHash('sha256').update(rawToken).digest('hex');
+    await userDoc.ref.update({
+      resetTokenHash: tokenHash,
+      resetTokenExpiry: Date.now() + 30 * 60 * 1000, // 30 minutes
+      resetTokenUsed: false,
+      resetRequestedAt: new Date(),
+    });
+
+    const link = `${process.env.FRONTEND_URL || 'https://www.dineopen.com'}/reset-password?token=${rawToken}`;
+    try {
+      await emailService.sendEmail({
+        to: email,
+        subject: 'Reset your DineOpen password',
+        text: `We received a request to reset your DineOpen password.\n\nReset it here (this link expires in 30 minutes and can be used once):\n${link}\n\nIf you didn't request this, you can safely ignore this email — your password won't change.`,
+        html: `<!DOCTYPE html><html><body style="font-family:Arial,sans-serif;color:#333;max-width:520px;margin:0 auto;padding:20px">
+          <div style="text-align:center;margin-bottom:16px"><span style="font-size:22px;font-weight:700;color:#ef4444">🍽️ DineOpen</span></div>
+          <h2 style="color:#1f2937">Reset your password</h2>
+          <p>We received a request to reset your DineOpen password. Click the button below to set a new one:</p>
+          <p style="text-align:center;margin:24px 0"><a href="${link}" style="background:#ef4444;color:#fff;text-decoration:none;padding:12px 28px;border-radius:8px;font-weight:600;display:inline-block">Reset Password</a></p>
+          <p style="font-size:13px;color:#6b7280">This link <b>expires in 30 minutes</b> and can be used <b>only once</b>. If you didn't request this, ignore this email — your password won't change.</p>
+          <p style="font-size:12px;color:#9ca3af;word-break:break-all">Or paste this into your browser:<br>${link}</p>
+        </body></html>`,
+      });
+    } catch (mailErr) {
+      console.error('Reset email send failed:', mailErr.message);
+      // Still return generic — do not leak the failure/existence.
+    }
+    return res.json(generic);
+  } catch (error) {
+    console.error('Forgot-password error:', error);
+    return res.status(500).json({ success: false, error: 'Failed to process the request. Please try again.' });
+  }
+});
+
+// Reset password using the emailed token. Verifies hash + expiry + single-use, then sets the
+// new bcrypt password and invalidates the token. Errors are generic (no token/email leakage).
+app.post('/api/auth/reset-password', async (req, res) => {
+  const crypto = require('crypto');
+  try {
+    const token = (req.body.token || '').toString();
+    const newPassword = (req.body.newPassword || '').toString();
+    if (!token || !newPassword) return res.status(400).json({ success: false, error: 'Token and new password are required' });
+    if (newPassword.length < 6) return res.status(400).json({ success: false, error: 'Password must be at least 6 characters' });
+
+    const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
+    const snap = await db.collection(collections.users).where('resetTokenHash', '==', tokenHash).limit(1).get();
+    if (snap.empty) return res.status(400).json({ success: false, error: 'This reset link is invalid or has expired.' });
+
+    const userDoc = snap.docs[0];
+    const u = userDoc.data();
+    if (u.resetTokenUsed === true) return res.status(400).json({ success: false, error: 'This reset link has already been used.' });
+    if (!u.resetTokenExpiry || Date.now() > Number(u.resetTokenExpiry)) {
+      return res.status(400).json({ success: false, error: 'This reset link is invalid or has expired.' });
+    }
+
+    const hashed = await bcrypt.hash(newPassword, 10);
+    await userDoc.ref.update({
+      password: hashed,
+      resetTokenUsed: true,     // single-use
+      resetTokenHash: null,     // invalidate
+      resetTokenExpiry: null,
+      passwordChangedAt: new Date(),
+      updatedAt: new Date(),
+    });
+    return res.json({ success: true, message: 'Your password has been reset. You can now log in with your new password.' });
+  } catch (error) {
+    console.error('Reset-password error:', error);
+    return res.status(500).json({ success: false, error: 'Failed to reset the password. Please try again.' });
+  }
+});
+
 // Link email to existing phone-based user
 app.post('/api/user/link-email', authenticateToken, async (req, res) => {
   try {
