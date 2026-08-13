@@ -115,6 +115,10 @@ router.post('/hotel/checkin', authenticateToken, async (req, res) => {
       guestName: guestInfo.name,
       guestPhone: guestInfo.phone || null, // Phone is now optional
       guestEmail: guestInfo.email || null,
+      // Store ID-proof + GST on the check-in record too (not only the guest doc) — the invoice reads
+      // them from here, so without this the invoice's ID/GST blocks never rendered.
+      idProof: idProof || null,
+      gstInfo: gstInfo || null,
       roomNumber,
       checkInDate: new Date(checkInDate),
       checkOutDate: new Date(checkOutDate),
@@ -1533,6 +1537,17 @@ router.get('/hotel/calendar/summary', authenticateToken, async (req, res) => {
       });
     });
 
+    // Bookings store dates as strings, but CHECK-INS store them as Firestore Timestamps —
+    // new Date(Timestamp) yields "Invalid Date", so check-ins silently contributed 0 to occupancy.
+    // Parse both shapes (Timestamp {_seconds}/.toDate(), ISO string, Date) robustly.
+    const toDate = (v) => {
+      if (!v) return null;
+      if (typeof v.toDate === 'function') return v.toDate();
+      if (typeof v._seconds === 'number') return new Date(v._seconds * 1000);
+      const d = new Date(v);
+      return isNaN(d.getTime()) ? null : d;
+    };
+
     // Build daily summary
     const dailySummary = {};
 
@@ -1547,16 +1562,16 @@ router.get('/hotel/calendar/summary', authenticateToken, async (req, res) => {
 
       // Count bookings for this date
       const bookingsOnDate = bookings.filter(booking => {
-        const checkIn = new Date(booking.checkInDate);
-        const checkOut = new Date(booking.checkOutDate);
-        return checkIn <= currentDate && checkOut > currentDate;
+        const checkIn = toDate(booking.checkInDate);
+        const checkOut = toDate(booking.checkOutDate);
+        return checkIn && checkOut && checkIn <= currentDate && checkOut > currentDate;
       });
 
       // Count check-ins for this date
       const checkInsOnDate = checkIns.filter(checkIn => {
-        const ciDate = new Date(checkIn.checkInDate);
-        const coDate = new Date(checkIn.checkOutDate);
-        return ciDate <= currentDate && coDate > currentDate;
+        const ciDate = toDate(checkIn.checkInDate);
+        const coDate = toDate(checkIn.checkOutDate);
+        return ciDate && coDate && ciDate <= currentDate && coDate > currentDate;
       });
 
       const totalBookings = bookingsOnDate.length + checkInsOnDate.length;
