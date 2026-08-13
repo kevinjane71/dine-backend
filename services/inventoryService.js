@@ -259,6 +259,86 @@ class InventoryService {
   }
 
   /**
+   * COSTING (shared by the Menu-Engineering report and the Recipe Cost-Sheet export).
+   * Load recipes + inventory once for a restaurant and return lookup maps.
+   */
+  async loadCostingContext(restaurantId) {
+    const [recipesSnap, invSnap] = await Promise.all([
+      db.collection('recipes').where('restaurantId', '==', restaurantId).get(),
+      db.collection(collections.inventory).where('restaurantId', '==', restaurantId).get(),
+    ]);
+    const recipesList = recipesSnap.docs.map(d => ({ id: d.id, ...d.data() }));
+    const recipeMap = {};
+    recipesList.forEach(r => { recipeMap[r.id] = r; });
+    const inventoryItems = invSnap.docs.map(d => ({ id: d.id, ...d.data() }));
+    const invById = {};
+    const invByName = {};
+    inventoryItems.forEach(i => { invById[i.id] = i; invByName[(i.name || '').toLowerCase().trim()] = i; });
+    return { recipesList, recipeMap, inventoryItems, invById, invByName };
+  }
+
+  /**
+   * Cost of ONE serving of a recipe = Σ(ingredient converted-qty × inventory costPerUnit) ÷ servings.
+   * Mirrors the "cost per serving" the Recipes tab already shows, so all surfaces agree.
+   * Returns { totalCost, servings, costPerServing, lines[] } — `lines` powers the CSV/Excel export.
+   */
+  computeRecipeCost(recipe, ctx) {
+    const { recipeMap, invById, invByName } = ctx;
+    const flat = this.flattenIngredients(recipeMap, recipe.ingredients || []);
+    let total = 0;
+    const lines = [];
+    for (const ing of flat) {
+      let inv = ing.inventoryItemId ? invById[ing.inventoryItemId] : null;
+      if (!inv && ing.inventoryItemName) {
+        const t = ing.inventoryItemName.toLowerCase().trim();
+        inv = invByName[t] || Object.values(invById).find(i => {
+          const n = (i.name || '').toLowerCase().trim();
+          return n === t || n.includes(t) || t.includes(n);
+        });
+      }
+      const costPerUnit = inv ? (Number(inv.costPerUnit) || 0) : 0;
+      const conv = inv ? convertUnitsSafe(Number(ing.quantity) || 0, ing.unit, inv.unit) : { value: Number(ing.quantity) || 0, converted: false };
+      const matched = !!(inv && conv.converted);
+      const lineCost = matched ? costPerUnit * conv.value : 0;
+      if (matched) total += lineCost;
+      lines.push({
+        name: inv?.name || ing.inventoryItemName || ing.name || '',
+        quantity: Number(ing.quantity) || 0,
+        unit: ing.unit || '',
+        inventoryUnit: inv?.unit || '',
+        costPerUnit,
+        lineCost,
+        matched,
+      });
+    }
+    const servings = Number(recipe.servings) > 0 ? Number(recipe.servings) : 1;
+    return { totalCost: total, servings, costPerServing: total / servings, lines };
+  }
+
+  /**
+   * Unit cost of a menu item: recipe cost-per-serving FIRST, else the item's costPrice, else 0.
+   * `item` = { name, menuItemId?, costPrice? }. Returns { unitCost, source, recipe? }.
+   */
+  menuItemUnitCost(item, ctx) {
+    const { recipesList } = ctx;
+    let recipe = item.menuItemId ? recipesList.find(r => r.menuItemId === item.menuItemId) : null;
+    if (!recipe && item.name) {
+      const t = String(item.name).toLowerCase().replace(/\s*\(.*?\)\s*/g, '').trim();
+      recipe = recipesList.find(r => {
+        const n = (r.name || '').toLowerCase().trim();
+        return n === t || t.includes(n) || n.includes(t);
+      });
+    }
+    if (recipe) {
+      const c = this.computeRecipeCost(recipe, ctx);
+      if (c.costPerServing > 0) return { unitCost: c.costPerServing, source: 'recipe', recipe: c };
+    }
+    const cp = Number(item.costPrice);
+    if (Number.isFinite(cp) && cp > 0) return { unitCost: cp, source: 'costPrice' };
+    return { unitCost: 0, source: 'none' };
+  }
+
+  /**
    * Deducts inventory based on an order.
    * Triggered asynchronously after order placement.
    */

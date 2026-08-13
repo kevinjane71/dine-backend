@@ -12469,6 +12469,115 @@ app.get('/api/analytics/:restaurantId/cancelled-orders', authenticateToken, asyn
   }
 });
 
+// ── Menu Engineering — per-item sales vs recipe COST, margin, and Star/Dog class ──
+// Powers the "Product Cost & Margin" report. Cost per item = recipe cost-per-serving
+// (fallback: item costPrice) via inventoryService.menuItemUnitCost. Reads pre-computed
+// dailyStats (cheap); falls back to a raw-order scan only when the range has no dailyStats.
+app.get('/api/analytics/:restaurantId/menu-engineering', authenticateToken, async (req, res) => {
+  try {
+    const restaurantId = req.query.subRestaurantId || req.params.restaurantId;
+    const tzOffset = parseTZ(req);
+    const { startDate, endDate } = req.query;
+
+    const end = endDate ? new Date(endDate) : new Date();
+    const start = startDate ? new Date(startDate) : new Date(end.getTime() - 29 * 86400000);
+    const dateStrings = [];
+    for (let t = start.getTime(); t <= end.getTime() + 86400000; t += 86400000) {
+      const ds = dateStrInTZ(new Date(t), tzOffset);
+      if (!dateStrings.includes(ds)) dateStrings.push(ds);
+      if (dateStrings.length > 400) break; // ~13-month cap
+    }
+
+    // 1) Per-item qty + revenue from dailyStats itemCounts (fallback: raw orders).
+    const statsRefs = dateStrings.map(ds => db.collection('dailyStats').doc(`${restaurantId}_${ds}`));
+    const statsDocs = statsRefs.length ? await db.getAll(...statsRefs) : [];
+    const itemAgg = {}; // key -> { qty, revenue }
+    statsDocs.filter(d => d.exists).forEach(d => {
+      const ic = d.data().itemCounts || {};
+      for (const [k, v] of Object.entries(ic)) {
+        if (!itemAgg[k]) itemAgg[k] = { qty: 0, revenue: 0 };
+        itemAgg[k].qty += v.qty || 0;
+        itemAgg[k].revenue += v.revenue || 0;
+      }
+    });
+    let source = 'dailyStats';
+    if (Object.keys(itemAgg).length === 0) {
+      source = 'orders';
+      const snap = await db.collection(collections.orders)
+        .where('restaurantId', '==', restaurantId)
+        .where('createdAt', '>=', start).where('createdAt', '<=', new Date(end.getTime() + 86400000)).get();
+      snap.forEach(doc => {
+        const o = doc.data();
+        if ((o.status || '').toLowerCase() === 'cancelled') return;
+        (o.items || []).forEach(item => {
+          const baseName = item.name || item.itemName; if (!baseName) return;
+          const nm = item.selectedVariant?.name ? `${baseName} (${item.selectedVariant.name})` : baseName;
+          const k = nm.replace(/[.\/]/g, '_');
+          if (!itemAgg[k]) itemAgg[k] = { qty: 0, revenue: 0 };
+          itemAgg[k].qty += (item.quantity || 1);
+          itemAgg[k].revenue += (item.price || 0) * (item.quantity || 1);
+        });
+      });
+    }
+
+    // 2) Menu items → category + costPrice + id (recipe link). Key by a normalized name
+    //    (strip variant parens + Firestore-key-safe) so dailyStats keys line up.
+    const baseKey = (s) => String(s || '').replace(/\s*\(.*?\)\s*/g, ' ').replace(/[.\/]/g, '_').toLowerCase().replace(/\s+/g, ' ').trim();
+    const menuSnap = await db.collection(collections.menuItems).where('restaurantId', '==', restaurantId).get();
+    const menuMap = {};
+    menuSnap.forEach(d => { const m = d.data(); menuMap[baseKey(m.name)] = { realName: m.name, category: m.category || 'Uncategorized', id: d.id, costPrice: m.costPrice }; });
+
+    // 3) Costing context (recipes + inventory) once.
+    const ctx = await inventoryService.loadCostingContext(restaurantId);
+
+    // 4) Rows: cost = unitCost × qty; margin = revenue − cost.
+    const rows = Object.entries(itemAgg).map(([key, v]) => {
+      const menu = menuMap[baseKey(key)] || null;
+      const name = menu?.realName || key;
+      const category = menu?.category || 'Uncategorized';
+      const { unitCost } = inventoryService.menuItemUnitCost({ name, menuItemId: menu?.id, costPrice: menu?.costPrice }, ctx);
+      const qtySold = Math.round((v.qty || 0) * 100) / 100;
+      const revenue = Math.round((v.revenue || 0) * 100) / 100;
+      const totalCost = Math.round(unitCost * qtySold * 100) / 100;
+      const margin = Math.round((revenue - totalCost) * 100) / 100;
+      const marginPercent = revenue > 0 ? Math.round((margin / revenue) * 1000) / 10 : 0;
+      return { name, category, qtySold, revenue, totalCost, margin, marginPercent };
+    }).filter(r => r.qtySold > 0);
+
+    // 5) Classify vs average popularity & margin%.
+    const n = rows.length || 1;
+    const avgQty = rows.reduce((s, r) => s + r.qtySold, 0) / n;
+    const avgMarginPercent = rows.reduce((s, r) => s + r.marginPercent, 0) / n;
+    const summary = { stars: 0, plowHorses: 0, puzzles: 0, dogs: 0, totalItems: rows.length };
+    rows.forEach(r => {
+      const popular = r.qtySold >= avgQty;
+      const high = r.marginPercent >= avgMarginPercent;
+      r.classification = popular && high ? 'Star' : popular && !high ? 'Plow Horse' : !popular && high ? 'Puzzle' : 'Dog';
+      if (r.classification === 'Star') summary.stars++;
+      else if (r.classification === 'Plow Horse') summary.plowHorses++;
+      else if (r.classification === 'Puzzle') summary.puzzles++;
+      else summary.dogs++;
+    });
+
+    // 6) Category rollup.
+    const catMap = {};
+    rows.forEach(r => {
+      const c = catMap[r.category] || { category: r.category, revenue: 0, cost: 0, margin: 0, items: 0 };
+      c.revenue += r.revenue; c.cost += r.totalCost; c.margin += r.margin; c.items++;
+      catMap[r.category] = c;
+    });
+    const categorySummary = Object.values(catMap)
+      .map(c => ({ ...c, revenue: Math.round(c.revenue * 100) / 100, cost: Math.round(c.cost * 100) / 100, margin: Math.round(c.margin * 100) / 100 }))
+      .sort((a, b) => b.revenue - a.revenue);
+
+    rows.sort((a, b) => b.revenue - a.revenue);
+    res.json({ items: rows, summary, avgMarginPercent: Math.round(avgMarginPercent * 10) / 10, categorySummary, source });
+  } catch (error) {
+    console.error('Menu engineering error:', error);
+    res.status(500).json({ error: 'Failed to build menu engineering report' });
+  }
+});
+
 // Sales Summary — supports single date, period presets, and custom date ranges
 app.get('/api/analytics/:restaurantId/daily-summary', authenticateToken, async (req, res) => {
   try {
@@ -28716,6 +28825,40 @@ app.get('/api/recipes/:restaurantId', authenticateToken, async (req, res) => {
   } catch (error) {
     console.error('Get recipes error:', error);
     res.status(500).json({ error: 'Failed to fetch recipes' });
+  }
+});
+
+// Recipe Cost Sheet — every recipe with per-ingredient cost + total + cost-per-serving.
+// Powers the "Recipe Cost Sheet" CSV/Excel export. Uses the SAME inventoryService costing as
+// the Menu-Engineering report, so the numbers always agree with what the Recipes tab shows.
+app.get('/api/recipes/:restaurantId/cost-export', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+    const ctx = await inventoryService.loadCostingContext(restaurantId);
+    const recipes = ctx.recipesList.map(r => {
+      const c = inventoryService.computeRecipeCost(r, ctx);
+      return {
+        recipeId: r.id,
+        name: r.name || '',
+        category: r.category || '',
+        menuItemName: r.menuItemName || '',
+        servings: c.servings,
+        totalCost: Math.round(c.totalCost * 100) / 100,
+        costPerServing: Math.round(c.costPerServing * 100) / 100,
+        ingredients: c.lines.map(l => ({
+          name: l.name,
+          quantity: l.quantity,
+          unit: l.unit,
+          costPerUnit: Math.round((l.costPerUnit || 0) * 100) / 100,
+          lineCost: Math.round((l.lineCost || 0) * 100) / 100,
+          matched: l.matched,
+        })),
+      };
+    }).sort((a, b) => (a.name || '').localeCompare(b.name || ''));
+    res.json({ recipes, count: recipes.length });
+  } catch (error) {
+    console.error('Recipe cost export error:', error);
+    res.status(500).json({ error: 'Failed to build recipe cost export' });
   }
 });
 
