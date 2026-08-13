@@ -480,6 +480,22 @@ router.post('/hotel/checkout/:checkInId', authenticateToken, async (req, res) =>
     // 3. Calculate subtotal (room + OWED food)
     let subtotal = totalRoomCharges + totalFoodCharges;
 
+    // 3b. Optional ROOM TAX — owner-configured (roomTaxRate % + roomTaxName) on the restaurant. Applies
+    //     to the room charges only (food amounts are already tax-inclusive). No config → no tax line,
+    //     no behaviour change. Works for any market (owner sets the % and the label, e.g. GST/VAT).
+    let roomTaxRate = 0, roomTaxName = 'Room Tax', roomTaxAmount = 0;
+    try {
+      const restDoc = await db.collection('restaurants').doc(checkInData.restaurantId).get();
+      const rd = restDoc.exists ? restDoc.data() : {};
+      roomTaxRate = Number(rd.roomTaxRate) || 0;
+      if (rd.roomTaxName) roomTaxName = rd.roomTaxName;
+    } catch (_) {}
+    if (roomTaxRate > 0 && totalRoomCharges > 0) {
+      roomTaxAmount = Math.round((totalRoomCharges * roomTaxRate) ) / 100;
+      roomTaxAmount = Math.round(roomTaxAmount * 100) / 100;
+      subtotal += roomTaxAmount;
+    }
+
     // 4. Add additional charges if any
     let additionalChargesTotal = 0;
     if (additionalCharges && Array.isArray(additionalCharges)) {
@@ -510,6 +526,7 @@ router.post('/hotel/checkout/:checkInId', authenticateToken, async (req, res) =>
       totalRoomCharges, // Update with recalculated value
       totalFoodCharges, // OWED food only (excludes cancelled + already-paid)
       foodChargesAlreadyPaid, // food settled at the POS before checkout (for the invoice)
+      roomTaxRate, roomTaxName, roomTaxAmount, // optional owner-configured room tax
       totalCharges,
       discounts: discounts || [],
       discountAmount,
@@ -866,6 +883,27 @@ router.get('/hotel/invoice/:checkInId', authenticateToken, async (req, res) => {
     // 3. Calculate subtotal (room + OWED food)
     let subtotal = totalRoomCharges + totalFoodCharges;
 
+    // 3b. Optional ROOM TAX. AFTER checkout use the finalized stored amount; BEFORE, compute live from
+    //     the restaurant's roomTaxRate/roomTaxName. No config → 0, no line.
+    let roomTaxRate = 0, roomTaxName = 'Room Tax', roomTaxAmount = 0;
+    if (isCheckedOut) {
+      roomTaxRate = Number(data.roomTaxRate) || 0;
+      roomTaxName = data.roomTaxName || 'Room Tax';
+      roomTaxAmount = Number(data.roomTaxAmount) || 0;
+    } else {
+      try {
+        const restDoc = await db.collection('restaurants').doc(data.restaurantId).get();
+        const rd = restDoc.exists ? restDoc.data() : {};
+        roomTaxRate = Number(rd.roomTaxRate) || 0;
+        if (rd.roomTaxName) roomTaxName = rd.roomTaxName;
+      } catch (_) {}
+      if (roomTaxRate > 0 && totalRoomCharges > 0) {
+        roomTaxAmount = Math.round((totalRoomCharges * roomTaxRate)) / 100;
+        roomTaxAmount = Math.round(roomTaxAmount * 100) / 100;
+      }
+    }
+    subtotal += roomTaxAmount;
+
     // 4. Add additional charges if any
     const additionalCharges = data.additionalCharges || [];
     let additionalChargesTotal = 0;
@@ -905,6 +943,7 @@ router.get('/hotel/invoice/:checkInId', authenticateToken, async (req, res) => {
       additionalCharges: additionalCharges,
       discounts: discounts,
       subtotal: totalRoomCharges + totalFoodCharges + additionalChargesTotal,
+      roomTaxRate, roomTaxName, roomTaxAmount, // optional owner-configured room tax
       discountAmount: discountAmount,
       totalAmount: totalCharges, // Use recalculated value
       advancePayment: advancePayment,

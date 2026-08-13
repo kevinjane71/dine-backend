@@ -797,9 +797,30 @@ router.post('/booking/:bookingId/checkin', authenticateToken, async (req, res) =
       return res.status(400).json({ success: false, message: 'Booking is not confirmed' });
     }
 
+    // Create/record the guest in the directory too (walk-in check-in does this; booking→check-in
+    // didn't, so booking-origin guests were missing from the Guests list). Best-effort.
+    let guestId = null;
+    try {
+      const guestRef = await db.collection('hotel_guests').add({
+        restaurantId: bookingData.restaurantId,
+        name: bookingData.guestName || '',
+        phone: bookingData.guestPhone || null,
+        email: bookingData.guestEmail || null,
+        idProofType: idProof?.type || null,
+        idProofNumber: idProof?.number || null,
+        idProofImageUrl: idProof?.imageUrl || null,
+        gstNumber: gstInfo?.gstNumber || null,
+        gstCompanyName: gstInfo?.companyName || null,
+        source: 'booking',
+        createdAt: FieldValue.serverTimestamp(),
+      });
+      guestId = guestRef.id;
+    } catch (_) { /* directory write is non-critical — don't block check-in */ }
+
     // Create check-in
     const checkInData = {
       restaurantId: bookingData.restaurantId,
+      guestId,
       roomId: bookingData.roomId,
       roomNumber: bookingData.roomNumber,
       guestName: bookingData.guestName,
