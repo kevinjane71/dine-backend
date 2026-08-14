@@ -147,6 +147,23 @@ module.exports = function initEtimsRoutes(db, collections, authenticateToken, va
     } catch (e) { console.error('etims init-payload:', e); res.status(500).json({ error: 'Failed to prepare init' }); }
   });
 
+  // Connectivity probe — hand the desktop app a PURE-READ request (selectCodeList)
+  // so it can test "is the local VSCU reachable?" WITHOUT initialising the device
+  // or touching any sale. Only needs the VSCU URL configured.
+  router.get('/api/etims/:restaurantId/test-payload', authenticateToken, async (req, res) => {
+    try {
+      const r = await requireKenya(req, res); if (!r) return;
+      const cfg = r.data.etimsConfig || {};
+      if (!cfg.vscuUrl) return res.status(400).json({ error: 'Set the VSCU URL before testing the connection.' });
+      res.json({
+        success: true,
+        vscuUrl: cfg.vscuUrl,
+        path: '/code/selectCodeList',
+        body: { tin: String(cfg.tin || ''), bhfId: String(cfg.bhfId || '00'), lastReqDt: '20200101000000' },
+      });
+    } catch (e) { console.error('etims test-payload:', e); res.status(500).json({ error: 'Failed to prepare connection test' }); }
+  });
+
   // Store what the VSCU returned from selectInitInfo (device id, keys, counters).
   router.post('/api/etims/:restaurantId/init-result', authenticateToken, async (req, res) => {
     try {
