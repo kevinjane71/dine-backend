@@ -58,6 +58,52 @@ module.exports = function initEtimsRoutes(db, collections, authenticateToken, va
     // keys are never returned to the client
   });
 
+  // --- Diagnostics ----------------------------------------------------------
+  // Persist every VSCU touch-point (device init + sale fiscalisation) — success
+  // AND failure — to a queryable Firestore collection so a Kenya store's real KRA
+  // rejection reason can be diagnosed REMOTELY by restaurantId, without a site
+  // visit or asking a non-technical customer to read a log. Mirrors the print
+  // diagnostics pattern. Best-effort: a logging error can NEVER break fiscalisation.
+  const DIAG_COL = (collections && collections.etimsDiagnostics) || 'etimsDiagnostics';
+  const truncStr = (v, n = 2000) => {
+    try { const s = typeof v === 'string' ? v : JSON.stringify(v); return s.length > n ? s.slice(0, n) + '…[truncated]' : s; }
+    catch { return null; }
+  };
+  // Masked config context so a diagnostic row is self-explanatory (spot mis-config
+  // without a second lookup). Never logs the device signing keys.
+  const cfgCtx = (r) => {
+    const c = (r && r.data && r.data.etimsConfig) || {};
+    const d = c.device || {};
+    return { tin: c.tin, bhfId: c.bhfId, dvcSrlNo: c.dvcSrlNo, vscuUrl: c.vscuUrl, sdcId: d.sdcId, manual: d.manual };
+  };
+  const logDiag = async (restaurantId, rec = {}) => {
+    try {
+      const cfg = rec._cfg || {};
+      await db.collection(DIAG_COL).add({
+        restaurantId: String(restaurantId).slice(0, 128),
+        restaurantName: rec.restaurantName ? String(rec.restaurantName).slice(0, 160) : null,
+        phase: rec.phase || null,                       // init | prepare-sale | confirm-sale | relay | test | items
+        ok: typeof rec.ok === 'boolean' ? rec.ok : null,
+        orderId: rec.orderId ? String(rec.orderId).slice(0, 128) : null,
+        invcNo: (rec.invcNo != null && !isNaN(Number(rec.invcNo))) ? Number(rec.invcNo) : null,
+        resultCd: rec.resultCd != null ? String(rec.resultCd).slice(0, 32) : null,
+        resultMsg: rec.resultMsg ? String(rec.resultMsg).slice(0, 500) : null,
+        errorMessage: rec.errorMessage ? String(rec.errorMessage).slice(0, 500) : null,
+        tin: cfg.tin ? String(cfg.tin).slice(0, 20) : null,
+        bhfId: cfg.bhfId ? String(cfg.bhfId).slice(0, 8) : null,
+        dvcSrlNo: cfg.dvcSrlNo ? String(cfg.dvcSrlNo).slice(0, 60) : null,
+        vscuUrl: cfg.vscuUrl ? String(cfg.vscuUrl).slice(0, 200) : null,
+        sdcId: cfg.sdcId ? String(cfg.sdcId).slice(0, 40) : null,
+        manualDevice: cfg.manual === true ? true : (cfg.manual === false ? false : null),
+        source: rec.source || 'backend',                // backend | client
+        raw: rec.raw !== undefined ? truncStr(rec.raw) : null,
+        createdAt: new Date(),
+      });
+    } catch (err) {
+      console.error('[etims] diag log failed:', err.message);
+    }
+  };
+
   // --- Config ---------------------------------------------------------------
   router.get('/api/etims/:restaurantId/config', authenticateToken, async (req, res) => {
     try {
@@ -124,6 +170,7 @@ module.exports = function initEtimsRoutes(db, collections, authenticateToken, va
         if ((rc && String(rc) === '902') || /already/i.test(String(rm || ''))) {
           hint = `This device is already initialised on this PC (VSCU code ${rc || '902'}${rm ? ': ' + rm : ''}). KRA only returns the SDC ID + keys on the FIRST initialisation. Either re-register/reset the device on the eTIMS portal, or contact support to enter the existing SDC ID/MRC No manually.`;
         }
+        logDiag(req.params.restaurantId, { phase: 'init', ok: false, restaurantName: r.data.name, resultCd: rc, resultMsg: rm, errorMessage: hint, raw: body, _cfg: cfgCtx(r) });
         return res.status(400).json({ error: hint, resultCd: rc, resultMsg: rm });
       }
       const existing = r.data.etimsConfig || {};
@@ -139,6 +186,7 @@ module.exports = function initEtimsRoutes(db, collections, authenticateToken, va
         initialisedAt: new Date(),
       };
       await r.ref.update({ etimsConfig: { ...existing, enabled: true, device } });
+      logDiag(req.params.restaurantId, { phase: 'init', ok: true, restaurantName: r.data.name, resultCd: '000', _cfg: { ...cfgCtx(r), sdcId: device.sdcId } });
       res.json({ success: true, device: { sdcId: device.sdcId, mrcNo: device.mrcNo, lastInvcNo: device.lastInvcNo } });
     } catch (e) { console.error('etims init-result:', e); res.status(500).json({ error: 'Failed to store init result' }); }
   });
@@ -262,7 +310,16 @@ module.exports = function initEtimsRoutes(db, collections, authenticateToken, va
 
       const parsed = etims.parseSaleResult(vscuResponse);
       if (!parsed.rcptSign) {
-        return res.status(422).json({ error: 'VSCU did not return a receipt signature', detail: parsed.resultMsg || parsed.resultCd, parsed });
+        // The VSCU received the sale but refused to SIGN it — it returned an error
+        // code instead of a receipt signature. Log the real reason (lands in Vercel
+        // logs) AND put it in the error string, which the frontend shows verbatim,
+        // so the cashier sees WHY on screen. Mirrors the init-result logging.
+        const rc = parsed.resultCd || 'none';
+        const rm = parsed.resultMsg || null;
+        console.error('[etims] confirm-sale: VSCU returned no rcptSign. resultCd=%s resultMsg=%s raw=%j', rc, rm, vscuResponse);
+        const reason = rm ? `${rm} (code ${rc})` : `no receipt signature returned (code ${rc})`;
+        logDiag(restaurantId, { phase: 'confirm-sale', ok: false, restaurantName: r.data.name, orderId, invcNo: order.etims && order.etims.pendingInvcNo, resultCd: rc, resultMsg: rm, errorMessage: `VSCU rejected the sale: ${reason}`, raw: vscuResponse, _cfg: cfgCtx(r) });
+        return res.status(422).json({ error: `VSCU rejected the sale: ${reason}`, detail: rm || rc, resultCd: rc, resultMsg: rm, parsed });
       }
       // Use the invoice number RESERVED at prepare-sale (never the client's).
       const etimsRecord = {
@@ -280,8 +337,51 @@ module.exports = function initEtimsRoutes(db, collections, authenticateToken, va
       // counter was already advanced atomically at prepare-sale.
       await oRef.set({ etims: etimsRecord }, { merge: true });
       try { require('../utils/kvCache').invalidateOrdersCache(restaurantId); } catch (_) {}
+      logDiag(restaurantId, { phase: 'confirm-sale', ok: true, restaurantName: r.data.name, orderId, invcNo: etimsRecord.invcNo, resultCd: '000', _cfg: cfgCtx(r) });
       res.json({ success: true, etims: etimsRecord });
     } catch (e) { console.error('etims confirm-sale:', e); res.status(500).json({ error: 'Failed to confirm sale' }); }
+  });
+
+  // --- Diagnostics: client-reported events + recent-history read -------------
+  // The Electron relay call (renderer → VSCU) can fail BEFORE it ever reaches the
+  // backend (VSCU unreachable / offline / bad URL). The frontend reports those here
+  // so the failure is still captured server-side. Also accepts a client "test" ping.
+  router.post('/api/etims/:restaurantId/diagnostic', authenticateToken, async (req, res) => {
+    try {
+      const r = await requireKenya(req, res); if (!r) return;
+      const b = req.body || {};
+      await logDiag(req.params.restaurantId, {
+        phase: b.phase || 'relay',
+        ok: b.ok === true,
+        restaurantName: r.data.name,
+        orderId: b.orderId,
+        invcNo: b.invcNo,
+        resultCd: b.resultCd,
+        resultMsg: b.resultMsg,
+        errorMessage: b.errorMessage || b.error,
+        raw: b.raw,
+        source: 'client',
+        _cfg: cfgCtx(r),
+      });
+      res.json({ success: true });
+    } catch (e) { res.status(200).json({ success: false }); } // telemetry must never hard-fail
+  });
+
+  // Recent eTIMS diagnostics for THIS restaurant (newest first) — powers the admin
+  // "Recent eTIMS activity" panel and lets support see the real reason on the FE.
+  router.get('/api/etims/:restaurantId/diagnostics', authenticateToken, async (req, res) => {
+    try {
+      const r = await requireKenya(req, res); if (!r) return;
+      // where-only (no composite index needed); sort newest-first in memory.
+      const snap = await db.collection(DIAG_COL).where('restaurantId', '==', req.params.restaurantId).limit(300).get();
+      const toMs = (v) => { try { if (!v) return 0; if (v._seconds) return v._seconds * 1000; if (v.toDate) return v.toDate().getTime(); return new Date(v).getTime() || 0; } catch { return 0; } };
+      const items = snap.docs
+        .map(d => { const x = d.data(); return { id: d.id, phase: x.phase, ok: x.ok, orderId: x.orderId, invcNo: x.invcNo, resultCd: x.resultCd, resultMsg: x.resultMsg, errorMessage: x.errorMessage, source: x.source, createdAt: x.createdAt, _ms: toMs(x.createdAt) }; })
+        .sort((a, b) => b._ms - a._ms)
+        .slice(0, 25)
+        .map(({ _ms, ...rest }) => rest);
+      res.json({ success: true, items });
+    } catch (e) { console.error('etims diagnostics get:', e.message); res.status(500).json({ error: 'Failed to load diagnostics' }); }
   });
 
   return router;

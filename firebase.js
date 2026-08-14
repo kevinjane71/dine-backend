@@ -272,7 +272,9 @@ const collections = {
   bookings: 'bookings',
   bookingVenues: 'bookingVenues',
   // Print diagnostics telemetry (desktop app printer troubleshooting)
-  printDiagnostics: 'printDiagnostics'
+  printDiagnostics: 'printDiagnostics',
+  // Kenya KRA eTIMS/VSCU diagnostics (device init + sale fiscalisation troubleshooting)
+  etimsDiagnostics: 'etimsDiagnostics'
 };
 
 const admin = null; // We don't need the legacy admin object anymore
