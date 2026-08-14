@@ -7673,6 +7673,55 @@ Return JSON: {"items":[{"name":string,"category":string,"price":number,"descript
   }
 });
 
+// Desktop installer resolver — always redirect to the LATEST .exe/.dmg for a given
+// app + platform, straight from the correct GitHub release, so the download page never
+// needs manual link edits and the browser downloads directly (no GitHub page).
+//   app=online  → the cloud POS (normal Electron app; non "-server" tags)
+//   app=server  → the offline / local-server POS (tags with "-server", published as prereleases)
+//   platform=win → .exe    platform=mac → .dmg (prefers universal → arm64 → x64)
+app.get('/api/download/desktop', async (req, res) => {
+  try {
+    const appKind = String(req.query.app || 'online').toLowerCase();
+    const platform = String(req.query.platform || 'win').toLowerCase();
+    const REPO = process.env.DESKTOP_RELEASES_REPO || 'vivek7189/dine-fe2';
+    const headers = { 'User-Agent': 'dineopen', Accept: 'application/vnd.github+json' };
+    if (process.env.GITHUB_TOKEN) headers.Authorization = `Bearer ${process.env.GITHUB_TOKEN}`;
+
+    const resp = await fetch(`https://api.github.com/repos/${REPO}/releases?per_page=30`, { headers });
+    if (!resp.ok) return res.redirect(302, `https://github.com/${REPO}/releases`);
+    const releases = await resp.json();
+    if (!Array.isArray(releases)) return res.redirect(302, `https://github.com/${REPO}/releases`);
+
+    const isServerTag = (t) => /-server(?:\b|-)/i.test(t || '');
+    const pickAsset = (rel) => {
+      const assets = Array.isArray(rel.assets) ? rel.assets : [];
+      if (platform === 'mac') {
+        const dmgs = assets.filter((a) => (a.name || '').toLowerCase().endsWith('.dmg'));
+        return dmgs.find((a) => /universal/i.test(a.name)) || dmgs.find((a) => /arm64/i.test(a.name)) || dmgs.find((a) => /x64|intel/i.test(a.name)) || dmgs[0] || null;
+      }
+      return assets.find((a) => (a.name || '').toLowerCase().endsWith('.exe')) || null;
+    };
+
+    const candidates = releases
+      .filter((rel) => !rel.draft) // drafts can't be served publicly
+      .filter((rel) => (appKind === 'server' ? isServerTag(rel.tag_name) : !isServerTag(rel.tag_name)))
+      .sort((a, b) => new Date(b.published_at || b.created_at || 0) - new Date(a.published_at || a.created_at || 0));
+
+    for (const rel of candidates) {
+      const asset = pickAsset(rel);
+      if (asset && asset.browser_download_url) {
+        res.setHeader('Cache-Control', 'no-store');
+        return res.redirect(302, asset.browser_download_url);
+      }
+    }
+    // Nothing matched → send to the releases page as a graceful fallback.
+    return res.redirect(302, `https://github.com/${REPO}/releases`);
+  } catch (e) {
+    console.error('desktop download resolve error:', e.message);
+    return res.redirect(302, 'https://github.com/vivek7189/dine-fe2/releases');
+  }
+});
+
 // Demo Menu API - Fetch menu from demo account (phone: 9000000000) for new user preview
 app.get('/api/demo-menu', async (req, res) => {
   try {
