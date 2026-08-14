@@ -7595,6 +7595,84 @@ app.post('/api/restaurants/:restaurantId/seed-default', authenticateToken, async
   }
 });
 
+// AI LOCALIZED STARTER MENU — generate a believable, country + cuisine specific menu
+// (real local dishes, realistic LOCAL prices, short descriptions) so a restaurant in
+// ANY country gets a menu that feels made for THEM. Replaces the generic sample.
+// Uses the store's already-detected country/currency/cuisine — no guessing.
+app.post('/api/restaurants/:restaurantId/ai-starter-menu', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+    const { userId } = req.user;
+    const hasAccess = await validateRestaurantAccess(userId, restaurantId);
+    if (!hasAccess) return res.status(403).json({ error: 'Access denied' });
+
+    const restaurantDoc = await getCachedRestDoc(restaurantId);
+    if (!restaurantDoc.exists) return res.status(404).json({ error: 'Restaurant not found' });
+    const r = restaurantDoc.data();
+
+    const businessType = req.body?.businessType || r.businessType || 'restaurant';
+    const cs = r.currencySettings || {};
+    const countryCode = req.body?.countryCode || cs.countryCode || 'IN';
+    const currencyCode = cs.currencyCode || 'INR';
+    const currencySymbol = cs.currencySymbol || '';
+    const countryName = req.body?.countryName || countryCode;
+    const cuisine = (Array.isArray(r.cuisine) && r.cuisine.length ? r.cuisine.join(', ') : (req.body?.cuisine || '')) || 'local';
+    const typeLabel = { restaurant: 'restaurant', cafe: 'cafe', bar: 'bar', bakery: 'bakery', cloud_kitchen: 'cloud kitchen (delivery)', qsr: 'quick-service / fast food', ice_cream: 'ice cream parlour', hotel: 'hotel restaurant' }[businessType] || 'restaurant';
+
+    const sys = 'You are a menu consultant. Generate a realistic starter menu for a specific restaurant, using the LOCAL cuisine and LOCAL price range of the given country. Return STRICT JSON only.';
+    const userPrompt = `Country: ${countryName} (${countryCode}). Currency: ${currencyCode} (${currencySymbol}). Business: ${typeLabel}. Cuisine: ${cuisine}.
+Generate 16-20 popular, authentic items a real ${typeLabel} in ${countryName} would sell. Use LOCAL dish names and price them realistically in ${currencyCode} (plain integers, no currency symbol). Group into 3-6 sensible categories.
+Return JSON: {"items":[{"name":string,"category":string,"price":number,"description":string (max 12 words),"isVeg":boolean}]}. Prices MUST be realistic for ${countryName}. No alcohol unless the business is a bar.`;
+
+    const completion = await openai.chat.completions.create({
+      model: 'gpt-4o-mini',
+      messages: [{ role: 'system', content: sys }, { role: 'user', content: userPrompt }],
+      response_format: { type: 'json_object' },
+      max_tokens: 1500,
+      temperature: 0.7,
+    });
+    let parsed = {};
+    try { parsed = JSON.parse(completion.choices[0]?.message?.content || '{}'); } catch (_) { parsed = {}; }
+    const rawItems = Array.isArray(parsed.items) ? parsed.items : [];
+    if (rawItems.length === 0) return res.status(502).json({ error: 'AI could not generate a menu — please try again or use the sample menu.' });
+
+    const now = Date.now();
+    const menuItems = rawItems.slice(0, 24).map((it, index) => ({
+      id: `item_${now}_${Math.random().toString(36).substr(2, 9)}`,
+      name: String(it.name || 'Item').slice(0, 80),
+      description: String(it.description || '').slice(0, 140),
+      price: Math.max(0, Math.round(Number(it.price) || 0)),
+      category: String(it.category || 'Menu').slice(0, 40),
+      isVeg: it.isVeg === true,
+      spiceLevel: 'medium', allergens: [], image: null,
+      shortCode: String(index + 1), status: 'active', order: index,
+      isAvailable: true, stockQuantity: null, lowStockThreshold: 5, isStockManaged: false,
+      availableFrom: null, availableUntil: null, variants: [], customizations: [],
+      createdAt: new Date(), updatedAt: new Date(),
+    }));
+    const catNames = [...new Set(menuItems.map(i => i.category))];
+    const categories = catNames.map(name => ({ id: categoryNameToId(name), name, emoji: '🍽️', description: '', createdAt: new Date(), updatedAt: new Date() }));
+
+    await db.collection(collections.restaurants).doc(restaurantId).update({
+      'menu.items': menuItems,
+      'menu.categories': categories,
+      'menu.lastUpdated': new Date(),
+      hasDefaultMenu: false,
+      aiMenuGenerated: true,
+      updatedAt: new Date(),
+    });
+    invalidateRestaurantCache(restaurantId);
+    console.log(`✨ AI starter menu (${menuItems.length} items) for ${restaurantId} [${countryCode}/${businessType}]`);
+    res.json({ success: true, count: menuItems.length, items: menuItems.map(i => ({ name: i.name, price: i.price, category: i.category })) });
+  } catch (error) {
+    console.error('AI starter menu error:', error?.message);
+    if (error?.status === 429 || error?.code === 'rate_limit_exceeded') {
+      return res.status(503).json({ error: 'AI is busy — please try again in a moment.' });
+    }
+    res.status(500).json({ error: 'Failed to generate menu. Please try again or use the sample menu.' });
+  }
+});
+
 // Demo Menu API - Fetch menu from demo account (phone: 9000000000) for new user preview
 app.get('/api/demo-menu', async (req, res) => {
   try {
