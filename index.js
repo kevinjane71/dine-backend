@@ -7692,7 +7692,10 @@ app.get('/api/download/desktop', async (req, res) => {
     const releases = await resp.json();
     if (!Array.isArray(releases)) return res.redirect(302, `https://github.com/${REPO}/releases`);
 
-    const isServerTag = (t) => /-server(?:\b|-)/i.test(t || '');
+    // A server (local-server) release is any tag mentioning "server" — covers both the
+    // current `v<ver>-server` suffix AND older `server-v<ver>` prefix naming. Normal
+    // (online) app tags never contain "server" (e.g. v1.14.53 / v1.14.53-win).
+    const isServerTag = (t) => /server/i.test(t || '');
     const pickAsset = (rel) => {
       const assets = Array.isArray(rel.assets) ? rel.assets : [];
       if (platform === 'mac') {
