@@ -22686,6 +22686,14 @@ app.put('/api/admin/print-settings/:restaurantId', authenticateToken, async (req
       sanitizedSettings.printLanguage = ['en', 'ar', 'dual'].includes(printSettings.printLanguage)
         ? printSettings.printLanguage : 'en';
     }
+    // printTerminalId: the ONE desktop terminal designated to auto-print incoming KOT/Bill events
+    // (device UUID). Single value → only one terminal can be designated (mutual exclusion is free).
+    // null/'' clears it → every terminal auto-prints again (default). Admin/owner only (this PUT is
+    // already gated by checkFeaturePermission('admin','print')).
+    if (printSettings.printTerminalId !== undefined) {
+      sanitizedSettings.printTerminalId = printSettings.printTerminalId
+        ? String(printSettings.printTerminalId).slice(0, 64) : null;
+    }
 
     const restaurantDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
     if (!restaurantDoc.exists) {
