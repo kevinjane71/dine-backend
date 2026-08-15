@@ -7683,6 +7683,10 @@ app.get('/api/download/desktop', async (req, res) => {
   try {
     const appKind = String(req.query.app || 'online').toLowerCase();
     const platform = String(req.query.platform || 'win').toLowerCase();
+    // Optional: pin to a specific version (e.g. rollback to the previously-installed build).
+    // Accepts "1.14.52" or "v1.14.52"; matched against the semver embedded in each release tag.
+    const reqVersion = req.query.version ? String(req.query.version).replace(/^v/i, '').trim() : null;
+    const baseVersionOf = (tag) => { const m = String(tag || '').match(/(\d+\.\d+\.\d+)/); return m ? m[1] : ''; };
     const REPO = process.env.DESKTOP_RELEASES_REPO || 'vivek7189/dine-fe2';
     const headers = { 'User-Agent': 'dineopen', Accept: 'application/vnd.github+json' };
     if (process.env.GITHUB_TOKEN) headers.Authorization = `Bearer ${process.env.GITHUB_TOKEN}`;
@@ -7708,6 +7712,7 @@ app.get('/api/download/desktop', async (req, res) => {
     const candidates = releases
       .filter((rel) => !rel.draft) // drafts can't be served publicly
       .filter((rel) => (appKind === 'server' ? isServerTag(rel.tag_name) : !isServerTag(rel.tag_name)))
+      .filter((rel) => !reqVersion || baseVersionOf(rel.tag_name) === reqVersion) // pin to a version if asked
       .sort((a, b) => new Date(b.published_at || b.created_at || 0) - new Date(a.published_at || a.created_at || 0));
 
     for (const rel of candidates) {
@@ -18948,6 +18953,38 @@ app.patch('/api/floors/reorder/:restaurantId', authenticateToken, async (req, re
   } catch (error) {
     console.error('Reorder floors error:', error);
     res.status(500).json({ error: 'Failed to reorder floors' });
+  }
+});
+
+// Reorder tables WITHIN one floor (drag-drop). Persists a numeric `order` on each table so the
+// arrangement is identical for every device/user of the restaurant. Restricted to owner/admin/
+// cashier (product requirement) — deliberately role-based, independent of the tables feature flag
+// (cashier has tables:false by default but must still be able to rearrange). Additive: tables
+// without an `order` fall back to natural name sort on the client, so existing data is unaffected.
+app.patch('/api/tables/reorder/:restaurantId', authenticateToken, async (req, res) => {
+  try {
+    const role = String(req.user?.role || '').toLowerCase();
+    if (!['owner', 'admin', 'cashier'].includes(role)) {
+      return res.status(403).json({ error: 'Access denied. Only owner, admin or cashier can rearrange tables.' });
+    }
+    const { restaurantId } = req.params;
+    const { floorId, tableOrder } = req.body;
+    if (!floorId || !Array.isArray(tableOrder) || tableOrder.length === 0) {
+      return res.status(400).json({ error: 'floorId and a non-empty tableOrder array are required' });
+    }
+
+    const floorRef = db.collection('restaurants').doc(restaurantId).collection('floors').doc(floorId);
+    const batch = db.batch();
+    tableOrder.forEach((tableId, index) => {
+      if (!tableId) return;
+      batch.update(floorRef.collection('tables').doc(tableId), { order: index, updatedAt: new Date() });
+    });
+    await batch.commit();
+
+    res.json({ message: 'Table order updated successfully', saved: tableOrder.length });
+  } catch (error) {
+    console.error('Reorder tables error:', error);
+    res.status(500).json({ error: 'Failed to reorder tables' });
   }
 });
 
