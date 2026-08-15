@@ -35,12 +35,24 @@ router.post('/:staffId/reset-password', authenticateToken, requireOwnerRole, asy
       return res.status(404).json({ error: 'Staff member not found' });
     }
     const staffData = staffDoc.data();
-    const staffRoles = ['waiter', 'manager', 'employee', 'cashier', 'sales'];
-    if (!staffRoles.includes((staffData.role || '').toLowerCase())) {
+    // Any staff member can have their password reset — including CUSTOM roles. Only block the
+    // account owner and customers (a whitelist can never cover arbitrary custom role names).
+    const blockedRoles = ['owner', 'customer', 'super-admin', 'sub-admin'];
+    if (blockedRoles.includes((staffData.role || '').toLowerCase())) {
       return res.status(400).json({ error: 'Only staff members can have password reset' });
     }
-    if (!staffData.loginId) {
-      return res.status(400).json({ error: 'Staff has no login ID' });
+    // If the staff has no login ID (legacy / custom-role staff created without one), generate a
+    // unique 5-digit login ID now — resetting the password should also provision it, since they
+    // need it to log in. Matches the staff-create generation.
+    let loginId = staffData.loginId;
+    if (!loginId) {
+      let isUnique = false;
+      while (!isUnique) {
+        loginId = Math.floor(10000 + Math.random() * 90000).toString();
+        const inStaff = await db.collection(collections.staffUsers).where('loginId', '==', loginId).limit(1).get();
+        const inUsers = await db.collection(collections.users).where('loginId', '==', loginId).limit(1).get();
+        isUnique = inStaff.empty && inUsers.empty;
+      }
     }
 
     // Optional username: validate and check uniqueness (case-insensitive, exclude current user)
@@ -63,6 +75,7 @@ router.post('/:staffId/reset-password', authenticateToken, requireOwnerRole, asy
 
     const baseUpdate = {
       ...(usernameUpdate || {}),
+      ...(staffData.loginId ? {} : { loginId }), // persist the newly generated login ID
       updatedAt: new Date()
     };
 
@@ -88,7 +101,7 @@ router.post('/:staffId/reset-password', authenticateToken, requireOwnerRole, asy
       return res.json({
         success: true,
         message: 'Password set successfully. Staff can log in with the new password.',
-        loginId: staffData.loginId,
+        loginId: loginId,
         username: usernameUpdate ? usernameUpdate.username : (staffData.username || null)
       });
     }
@@ -103,7 +116,7 @@ router.post('/:staffId/reset-password', authenticateToken, requireOwnerRole, asy
     });
     await db.collection('staffCredentials').doc(staffId).set({
       staffId,
-      loginId: staffData.loginId,
+      loginId: loginId,
       temporaryPassword,
       createdAt: new Date(),
       expiresAt: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000)
@@ -113,7 +126,7 @@ router.post('/:staffId/reset-password', authenticateToken, requireOwnerRole, asy
     return res.json({
       success: true,
       message: 'Temporary password generated. Share with staff; they should change it in the app.',
-      loginId: staffData.loginId,
+      loginId: loginId,
       username: finalUsername,
       temporaryPassword
     });
