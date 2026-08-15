@@ -1528,6 +1528,9 @@ const invoiceRoutes = initializeInvoiceRoutes(db, collections);
 // Attendance Module
 const attendanceRoutes = require('./routes/attendance');
 
+// Corporate Meal Management Module (flag-gated: settings.features.corporateMeal)
+const corporateRoutes = require('./routes/corporate');
+
 // Delivery Management Module
 const deliveryRoutes = require('./routes/delivery');
 
@@ -21682,6 +21685,10 @@ app.use('/api/invoice', invoiceRoutes);
 
 // ==================== ATTENDANCE MODULE ====================
 app.use('/api/attendance', attendanceRoutes);
+
+// ==================== CORPORATE MEAL MANAGEMENT MODULE ====================
+// Flag-gated inside the router (settings.features.corporateMeal) — inert for all other restaurants.
+app.use('/api/corporate', corporateRoutes);
 
 // ==================== DELIVERY MANAGEMENT MODULE ====================
 app.use('/api/delivery', deliveryRoutes);
