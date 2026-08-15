@@ -11612,6 +11612,24 @@ app.get('/api/orders/single/:orderId', authenticateToken, async (req, res) => {
   }
 });
 
+// ── Order-status vocabulary (single source of truth) ─────────────────────────
+// A live/unsettled bill is created as 'confirmed' (or advanced to preparing/ready/
+// served) — it is NEVER literally 'pending'. So the order-history "Pending"/Open tab
+// must match the whole OPEN group, not the exact string 'pending' (that was the bug:
+// the tab always showed "No order"). Kept intentionally conservative — every other
+// filter token (completed/cancelled/refunded/saved/deleted) still matches exactly.
+const ORDER_OPEN_STATUSES = ['pending', 'confirmed', 'preparing', 'ready', 'served'];
+// Statuses that should appear under the "All" tab (excludes only hard-hidden
+// deleted/expired). Same as the legacy list plus the previously-missing 'served'.
+const ORDER_HISTORY_STATUSES = ['pending', 'confirmed', 'preparing', 'ready', 'served', 'completed', 'cancelled', 'saved'];
+// Map a UI filter token → the exact status values it should match.
+// length 1 → exact '==' match; length > 1 → 'in' match.
+function orderStatusFilterValues(status) {
+  if (!status || status === 'all') return ORDER_HISTORY_STATUSES;
+  if (status === 'pending' || status === 'open') return ORDER_OPEN_STATUSES;
+  return [status];
+}
+
 app.get('/api/orders/:restaurantId', authenticateToken, async (req, res) => {
   try {
     // Permission check: staff must have history/orders read access
@@ -11657,6 +11675,11 @@ app.get('/api/orders/:restaurantId', authenticateToken, async (req, res) => {
     };
 
     console.log(`🔍 Orders API - Restaurant: ${restaurantId}, Page: ${page}, Limit: ${limit}, Status: ${status || 'all'}, Search: ${search || 'none'}, Waiter: ${waiterId || 'all'}, TodayOnly: ${todayOnly}, PaymentMethod: ${paymentMethod || 'all'}`);
+
+    // Resolve the UI status token → status value(s) once, reused by both query paths.
+    // Single value → exact match; multiple → 'in' (fast path) or in-memory (search path).
+    const statusVals = orderStatusFilterValues(status);
+    const isStatusGroup = statusVals.length > 1;
 
     // Helper: format order data into the response shape (works for both PG and Firestore)
     const formatOrder = (doc) => {
@@ -11759,11 +11782,14 @@ app.get('/api/orders/:restaurantId', authenticateToken, async (req, res) => {
       let fastQuery = db.collection(collections.orders)
         .where('restaurantId', '==', restaurantId);
 
-      // Apply status filter — use 'in' to exclude deleted/expired at Firestore level
-      if (status && status !== 'all') {
-        fastQuery = fastQuery.where('status', '==', status);
+      // Apply status filter — expand group tokens: 'pending'/'open' → the whole OPEN set
+      // (so the Pending tab actually shows live bills), 'all' → every displayable status
+      // (now incl 'served'). One value → exact '=='; a group → 'in' (same index shape the
+      // 'all' query already uses, so no new Firestore composite index is needed).
+      if (statusVals.length === 1) {
+        fastQuery = fastQuery.where('status', '==', statusVals[0]);
       } else {
-        fastQuery = fastQuery.where('status', 'in', ['pending', 'confirmed', 'preparing', 'ready', 'completed', 'cancelled', 'saved']);
+        fastQuery = fastQuery.where('status', 'in', statusVals);
       }
 
       if (orderType && orderType !== 'all') {
@@ -11883,9 +11909,11 @@ app.get('/api/orders/:restaurantId', authenticateToken, async (req, res) => {
     let searchQuery = db.collection(collections.orders)
       .where('restaurantId', '==', restaurantId);
 
-    // Apply simple status filter (single equality, no 'in' — avoids composite index issues)
-    if (status && status !== 'all') {
-      searchQuery = searchQuery.where('status', '==', status);
+    // Apply simple status filter (single equality only — no 'in', avoids composite index
+    // issues on this multi-filter path). Group tokens (pending/open → open set) and 'all'
+    // are filtered in memory below instead.
+    if (status && status !== 'all' && !isStatusGroup) {
+      searchQuery = searchQuery.where('status', '==', statusVals[0]);
     }
 
     if (orderType && orderType !== 'all') {
@@ -11941,9 +11969,13 @@ app.get('/api/orders/:restaurantId', authenticateToken, async (req, res) => {
 
     console.log(`📋 Order History (search path) - Loaded ${allOrders.length} orders for in-memory filtering`);
 
-    // Exclude deleted and expired when status is 'all' or not set (same as original behavior)
+    // Status filtering for the search path (Firestore only applied exact single-value
+    // matches above). 'all' → everything except hard-hidden deleted/expired; a group
+    // token (pending/open → open set) → match the whole set here in memory.
     if (!status || status === 'all') {
       allOrders = allOrders.filter(o => o.status !== 'deleted' && o.status !== 'expired');
+    } else if (isStatusGroup) {
+      allOrders = allOrders.filter(o => statusVals.includes(o.status));
     }
 
     // Auto-expire saved orders older than 24 hours
