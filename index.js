@@ -13376,102 +13376,6 @@ app.post('/api/orders/merge', authenticateToken, async (req, res) => {
   }
 });
 
-// Apply DEFERRED customer stats when a KOT/confirmed order is completed (billed). KOT orders get a
-// customerId stamped at create with stats deferred to 0 — so on completion we must append the order
-// to the customer's orderHistory (exactly once) and recompute totalOrders/totalSpent. Keyed off the
-// linked customerId (fallback to phone lookup with format variations). Shared by BOTH completion
-// endpoints (PATCH /:orderId/status and PATCH /:orderId). Returns the resolved customerId. Never throws.
-async function applyDeferredCustomerStats(orderId, orderData, reqBody = {}) {
-  try {
-    const customerPhone = orderData.customerInfo?.phone || reqBody.customerInfo?.phone;
-    const customerName = orderData.customerInfo?.name || reqBody.customerInfo?.name;
-    if (!orderData.customerId && !(customerPhone && customerPhone !== 'null')) return orderData.customerId || null;
-    let customerId = orderData.customerId || null;
-    const orderFinalAmount = reqBody.finalAmount || orderData.finalAmount || orderData.totalAmount || 0;
-    const orderTotalAmount = reqBody.totalAmount || orderData.totalAmount || 0;
-    const histEntry = {
-      orderId,
-      orderNumber: orderData.orderNumber,
-      totalAmount: Math.round(orderTotalAmount * 100) / 100,
-      finalAmount: Math.round(orderFinalAmount * 100) / 100,
-      taxAmount: Math.round((reqBody.taxAmount || orderData.taxAmount || 0) * 100) / 100,
-      orderDate: new Date(),
-      tableNumber: orderData.tableNumber || null,
-      orderType: orderData.orderType,
-      paymentStatus: orderData.paymentStatus || 'paid',
-      // paidAmount = amount actually collected, so totalSpent doesn't over-count a due/partial order.
-      paidAmount: (orderData.paymentStatus === 'due' || orderData.paymentStatus === 'partial')
-        ? Math.round(Number(orderData.paidAmount || 0) * 100) / 100
-        : Math.round(orderFinalAmount * 100) / 100,
-      outstandingAmount: Math.round(Number(orderData.outstandingAmount || 0) * 100) / 100,
-    };
-    const normPhone = (p) => {
-      if (p === null || p === undefined || p === '') return null;
-      const d = String(p).replace(/\D/g, '');
-      if (d.length === 12 && d.startsWith('91')) return d.substring(2);
-      if (d.length === 11 && d.startsWith('0')) return d.substring(1);
-      return d;
-    };
-    // Find the customer — prefer the linked id, fall back to phone (with format variations).
-    let custDoc = null;
-    if (orderData.customerId) {
-      try { const c = await db.collection(collections.customers).doc(orderData.customerId).get(); if (c.exists) custDoc = c; } catch (_) {}
-    }
-    if (!custDoc && customerPhone && customerPhone !== 'null') {
-      const pq = await db.collection(collections.customers).where('restaurantId', '==', orderData.restaurantId).where('phone', '==', customerPhone).limit(1).get();
-      if (!pq.empty) custDoc = pq.docs[0];
-      else {
-        const np = normPhone(customerPhone);
-        if (np && np !== customerPhone) {
-          const npq = await db.collection(collections.customers).where('restaurantId', '==', orderData.restaurantId).where('phone', '==', np).limit(1).get();
-          if (!npq.empty) custDoc = npq.docs[0];
-        }
-        if (!custDoc) {
-          const variations = []; const digits = String(customerPhone).replace(/\D/g, '');
-          if (digits.length > 10) variations.push(digits.slice(-10));
-          if (digits.length === 10) { variations.push('91' + digits); variations.push('+91' + digits); }
-          for (const v of variations) {
-            if (v === customerPhone) continue;
-            const vq = await db.collection(collections.customers).where('restaurantId', '==', orderData.restaurantId).where('phone', '==', v).limit(1).get();
-            if (!vq.empty) { custDoc = vq.docs[0]; break; }
-          }
-        }
-      }
-    }
-    if (custDoc) {
-      customerId = custDoc.id;
-      const cd = custDoc.data();
-      // Append exactly once (guard against double-count on repeat completion / web direct-bill).
-      const already = (cd.orderHistory || []).some(o => o && o.orderId === orderId);
-      const nh = already ? (cd.orderHistory || []) : [...(cd.orderHistory || []), histEntry];
-      const upd = {
-        totalOrders: nh.length,
-        totalSpent: nh.reduce((s, o) => s + (o.paidAmount != null ? o.paidAmount : (o.finalAmount || o.totalAmount || 0)), 0),
-        lastOrderDate: new Date(), updatedAt: new Date(),
-      };
-      if (!already) upd.orderHistory = nh;
-      // Refresh a generic/blank name now that we have the real one (KOT default was 'Customer').
-      if (customerName && (!cd.name || cd.name === 'Customer')) upd.name = customerName;
-      await custDoc.ref.update(upd);
-    } else if (customerPhone && customerPhone !== 'null') {
-      const newRef = await db.collection(collections.customers).add({
-        name: customerName || 'Customer', phone: customerPhone, restaurantId: orderData.restaurantId,
-        orderHistory: [histEntry], totalOrders: 1, totalSpent: Math.round(orderFinalAmount * 100) / 100,
-        lastOrderDate: new Date(), createdAt: new Date(), updatedAt: new Date(),
-      });
-      customerId = newRef.id;
-    }
-    // Stamp the resolved customerId back on the order if it wasn't linked yet.
-    if (customerId && customerId !== orderData.customerId) {
-      try { await db.collection('orders').doc(orderId).update({ customerId }); } catch (_) {}
-    }
-    return customerId;
-  } catch (e) {
-    console.error('applyDeferredCustomerStats error:', e.message);
-    return orderData.customerId || null;
-  }
-}
-
 app.patch('/api/orders/:orderId/status', authenticateToken, async (req, res) => {
   try {
     const { orderId } = req.params;
@@ -13543,11 +13447,116 @@ app.patch('/api/orders/:orderId/status', authenticateToken, async (req, res) => 
     if (status === 'completed' && orderData.status !== 'completed') {
       console.log(`✅ Order ${orderId} marked as completed. Processing deferred updates...`);
 
-      // Apply the deferred customer stats (append to orderHistory + recompute totals) now that the
-      // order is completed. Shared helper — also covers the KOT/dine-app case where a customerId was
-      // stamped at create with stats deferred (previously skipped, leaving the customer at 0 orders).
-      let customerId = await applyDeferredCustomerStats(orderId, orderData, req.body);
+      let customerId = orderData.customerId;
 
+      // Create/update customer record if customer info exists but customerId not set yet
+      // (handles KOT→billing flow where customer wasn't linked during initial order creation)
+      const customerPhone = orderData.customerInfo?.phone || req.body.customerInfo?.phone;
+      const customerName = orderData.customerInfo?.name || req.body.customerInfo?.name;
+      if (customerPhone && customerPhone !== 'null' && !orderData.customerId) {
+        try {
+          const orderFinalAmount = req.body.finalAmount || orderData.finalAmount || orderData.totalAmount || 0;
+          const orderTotalAmount = req.body.totalAmount || orderData.totalAmount || 0;
+          const histEntry = {
+            orderId: orderId,
+            orderNumber: orderData.orderNumber,
+            totalAmount: Math.round(orderTotalAmount * 100) / 100,
+            finalAmount: Math.round(orderFinalAmount * 100) / 100,
+            taxAmount: Math.round((req.body.taxAmount || orderData.taxAmount || 0) * 100) / 100,
+            orderDate: new Date(),
+            tableNumber: orderData.tableNumber || null,
+            orderType: orderData.orderType,
+            // paidAmount = amount actually collected, so the totalSpent recompute
+            // doesn't over-count a due order linked to a customer at completion.
+            paymentStatus: orderData.paymentStatus || 'paid',
+            paidAmount: (orderData.paymentStatus === 'due' || orderData.paymentStatus === 'partial')
+              ? Math.round(Number(orderData.paidAmount || 0) * 100) / 100
+              : Math.round(orderFinalAmount * 100) / 100,
+            outstandingAmount: Math.round(Number(orderData.outstandingAmount || 0) * 100) / 100,
+          };
+          // Normalize phone helper
+          const normPhone = (p) => {
+            if (p === null || p === undefined || p === '') return null;
+            const d = String(p).replace(/\D/g, '');
+            if (d.length === 12 && d.startsWith('91')) return d.substring(2);
+            if (d.length === 11 && d.startsWith('0')) return d.substring(1);
+            return d.length === 10 ? d : d;
+          };
+          // Find existing customer
+          let custDoc = null;
+          const pq = await db.collection(collections.customers)
+            .where('restaurantId', '==', orderData.restaurantId)
+            .where('phone', '==', customerPhone)
+            .limit(1).get();
+          if (!pq.empty) {
+            custDoc = pq.docs[0];
+          } else {
+            // Try common phone format variations instead of scanning all customers
+            const np = normPhone(customerPhone);
+            if (np && np !== customerPhone) {
+              // Try normalized phone as direct query
+              const npq = await db.collection(collections.customers)
+                .where('restaurantId', '==', orderData.restaurantId)
+                .where('phone', '==', np)
+                .limit(1).get();
+              if (!npq.empty) {
+                custDoc = npq.docs[0];
+              }
+            }
+            // Try with/without country code prefix variations
+            if (!custDoc && customerPhone) {
+              const variations = [];
+              const digits = customerPhone.replace(/\D/g, '');
+              if (digits.length > 10) variations.push(digits.slice(-10)); // without country code
+              if (digits.length === 10) {
+                variations.push('91' + digits);   // with India code
+                variations.push('+91' + digits);  // with +91
+              }
+              for (const v of variations) {
+                if (v === customerPhone) continue; // skip already tried
+                const vq = await db.collection(collections.customers)
+                  .where('restaurantId', '==', orderData.restaurantId)
+                  .where('phone', '==', v)
+                  .limit(1).get();
+                if (!vq.empty) { custDoc = vq.docs[0]; break; }
+              }
+            }
+          }
+          if (custDoc) {
+            customerId = custDoc.id;
+            const cd = custDoc.data();
+            const nh = [...(cd.orderHistory || []), histEntry];
+            await custDoc.ref.update({
+              orderHistory: nh,
+              totalOrders: nh.length,
+              totalSpent: nh.reduce((s, o) => s + (o.paidAmount != null ? o.paidAmount : (o.finalAmount || o.totalAmount || 0)), 0),
+              lastOrderDate: new Date(),
+              updatedAt: new Date()
+            });
+          } else if (customerPhone) {
+            // Only create new customer when phone number is provided
+            const newRef = await db.collection(collections.customers).add({
+              name: customerName || 'Customer',
+              phone: customerPhone,
+              restaurantId: orderData.restaurantId,
+              orderHistory: [histEntry],
+              totalOrders: 1,
+              totalSpent: Math.round(orderFinalAmount * 100) / 100,
+              lastOrderDate: new Date(),
+              createdAt: new Date(),
+              updatedAt: new Date()
+            });
+            customerId = newRef.id;
+          } else {
+            console.log(`⏭️ Skipping customer creation on completion — no phone number provided`);
+          }
+          try { await db.collection('orders').doc(orderId).update({ customerId }); } catch (e) {}
+          console.log(`👤 Customer processed on completion: ${customerId}`);
+        } catch (custErr) {
+          console.error('Error creating/updating customer on completion:', custErr);
+        }
+      }
+      
       // Update Offer Usage for all applied offers
       const offersToUpdate = orderData.appliedOffers && orderData.appliedOffers.length > 0
         ? orderData.appliedOffers
@@ -15091,14 +15100,6 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
 
     console.log('🔄 Backend - Updating order:', orderId, 'with data:', updateData);
     await db.collection(collections.orders).doc(orderId).update(updateData);
-
-    // If this update just COMPLETED the order (the KOT→bill path the dine-app relies on — a waiter
-    // KOT order billed later on web/electron via updateOrder), apply the customer's DEFERRED stats:
-    // append to orderHistory + recompute totalOrders/totalSpent. Same shared helper as /status, so
-    // the customer's history updates regardless of which completion endpoint is used. Guarded/idempotent.
-    if (status === 'completed' && currentOrder.status !== 'completed') {
-      await applyDeferredCustomerStats(orderId, { ...currentOrder, ...updateData }, req.body);
-    }
 
     // Inventory adjustment: if items changed, compute delta and adjust stock
     if (items && updateData.items && currentOrder.items) {
