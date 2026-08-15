@@ -13443,13 +13443,16 @@ async function applyDeferredCustomerStats(orderId, orderData, reqBody = {}) {
       const cd = custDoc.data();
       // Append exactly once (guard against double-count on repeat completion / web direct-bill).
       const already = (cd.orderHistory || []).some(o => o && o.orderId === orderId);
-      const nh = already ? (cd.orderHistory || []) : [...(cd.orderHistory || []), histEntry];
-      const upd = {
-        totalOrders: nh.length,
-        totalSpent: nh.reduce((s, o) => s + (o.paidAmount != null ? o.paidAmount : (o.finalAmount || o.totalAmount || 0)), 0),
-        lastOrderDate: new Date(), updatedAt: new Date(),
-      };
-      if (!already) upd.orderHistory = nh;
+      const upd = { lastOrderDate: new Date(), updatedAt: new Date() };
+      if (!already) {
+        // INCREMENT the stored totals by exactly this order — never RECOMPUTE from the orderHistory
+        // array. A legacy customer whose array is incomplete vs their stored totals must not have
+        // their Total Orders / Total Spent reset or lowered here. Strictly additive.
+        const paid = histEntry.paidAmount != null ? histEntry.paidAmount : (histEntry.finalAmount || histEntry.totalAmount || 0);
+        upd.orderHistory = [...(cd.orderHistory || []), histEntry];
+        upd.totalOrders = (Number(cd.totalOrders) || 0) + 1;
+        upd.totalSpent = Math.round(((Number(cd.totalSpent) || 0) + paid) * 100) / 100;
+      }
       // Refresh a generic/blank name now that we have the real one (KOT default was 'Customer').
       if (customerName && (!cd.name || cd.name === 'Customer')) upd.name = customerName;
       await custDoc.ref.update(upd);
