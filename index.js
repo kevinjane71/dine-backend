@@ -22976,10 +22976,9 @@ app.put('/api/admin/print-settings/:restaurantId', authenticateToken, async (req
     const { restaurantId } = req.params;
     const { printSettings } = req.body;
 
-    // Check granular admin tab permission
-    if (!(await checkFeaturePermission(req, 'admin', 'print'))) {
-      return res.status(403).json({ error: 'Access denied to Print settings.' });
-    }
+    // Printer/print settings are operational — waiters/cashiers configure printers on their own
+    // terminal and enable remote/desktop print — so NO admin permission is required here, just a
+    // valid login (authenticateToken above). GET was already open to all staff.
 
     if (!printSettings || typeof printSettings !== 'object') {
       return res.status(400).json({ error: 'Invalid print settings' });
@@ -23180,6 +23179,63 @@ app.put('/api/admin/print-settings/:restaurantId', authenticateToken, async (req
 });
 
 // ============================================================================
+// Print Diagnostics — desktop terminals report each remote-print attempt here so we
+// can see, per-restaurant, EXACTLY what happened (event arrived → printer resolved →
+// method → success/error) without touching the customer's machine. Best-effort,
+// capped to the last 100 events; the POST never surfaces an error to the print path.
+// ============================================================================
+app.post('/api/print-diagnostics/:restaurantId', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+    const ev = (req.body && req.body.event) || req.body || {};
+    if (!restaurantId) return res.status(400).json({ error: 'restaurantId required' });
+    const s = (v, n) => (v == null ? null : String(v).slice(0, n));
+    const record = {
+      ts: Date.now(),
+      phase: s(ev.phase, 24) || 'unknown',      // received | printed | skipped
+      kind: s(ev.kind, 24),                      // kot | kot-request | billing
+      orderId: s(ev.orderId, 64),
+      stationId: s(ev.stationId, 64),
+      stationName: s(ev.stationName, 64),
+      multiStation: ev.multiStation === true,
+      stationCount: Number.isFinite(ev.stationCount) ? ev.stationCount : null,
+      terminalId: s(ev.terminalId, 64),
+      appVersion: s(ev.appVersion, 24),
+      method: s(ev.method, 24),                  // tcp | os-driver | pdf-fallback
+      configuredDeviceName: s(ev.configuredDeviceName, 96),
+      resolvedDeviceName: s(ev.resolvedDeviceName, 96),
+      deviceMatched: typeof ev.deviceMatched === 'boolean' ? ev.deviceMatched : null,
+      availablePrinters: Array.isArray(ev.availablePrinters) ? ev.availablePrinters.slice(0, 20).map(n => String(n).slice(0, 64)) : null,
+      reason: s(ev.reason, 160),                 // for skipped / failure context
+      success: typeof ev.success === 'boolean' ? ev.success : null,
+      error: s(ev.error, 300),
+    };
+    const ref = db.collection('printDiagnostics').doc(restaurantId);
+    const snap = await ref.get();
+    const events = (snap.exists && Array.isArray(snap.data().events)) ? snap.data().events : [];
+    events.push(record);
+    await ref.set({ restaurantId, events: events.slice(-100), updatedAt: new Date() }, { merge: true });
+    res.json({ success: true });
+  } catch (error) {
+    console.error('Print diagnostics POST error:', error.message);
+    res.status(200).json({ success: false }); // never break the printing path
+  }
+});
+
+// Read the collected print diagnostics for a restaurant (for support/debugging).
+app.get('/api/print-diagnostics/:restaurantId', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+    const snap = await db.collection('printDiagnostics').doc(restaurantId).get();
+    const events = (snap.exists && Array.isArray(snap.data().events)) ? snap.data().events : [];
+    res.json({ success: true, count: events.length, events });
+  } catch (error) {
+    console.error('Print diagnostics GET error:', error.message);
+    res.status(500).json({ error: 'Failed to read diagnostics' });
+  }
+});
+
+// ============================================================================
 // Print Station CRUD — Manage kitchen/bar/expo print stations
 // ============================================================================
 
@@ -23211,9 +23267,8 @@ app.get('/api/admin/print-stations/:restaurantId', authenticateToken, async (req
 // Save print stations for a restaurant (replace-all pattern)
 app.put('/api/admin/print-stations/:restaurantId', authenticateToken, async (req, res) => {
   try {
-    if (!(await checkFeaturePermission(req, 'admin', 'print'))) {
-      return res.status(403).json({ error: 'Access denied. Print settings permission required.' });
-    }
+    // Print-station config is operational (any logged-in staff can set up printers on their
+    // terminal) — no admin permission required, matching the print-settings endpoint.
     const { restaurantId } = req.params;
     const { printStations, kotPrintingMode } = req.body;
 
