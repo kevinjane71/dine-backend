@@ -221,12 +221,50 @@ async function getOrgOutlets(orgId) {
   return outlets;
 }
 
+/**
+ * Candidate outlet set for HQ REPORTS.
+ *
+ * A real organization (restaurant chain with warehouse / central-kitchen / indent, etc.)
+ * resolves outlets by `organizationId` — unchanged. But a plain multi-outlet owner who just
+ * added several restaurants under one login has NO organization document; forcing them to
+ * build an org just to see reports is wrong. In that case requireOrgAccess flags
+ * req.org._isSingleRestaurant and validates req.org.ownerId, so here we resolve outlets by
+ * `ownerId` — exactly the way the (working) owner-dashboard picker does. This makes HQ reports
+ * work for multi-outlet owners WITHOUT an organization, while leaving the chain/org path intact.
+ *
+ * Must run AFTER requireOrgAccess (uses req.org). Only the validated owner's own outlets are
+ * ever returned, so it cannot leak across owners.
+ */
+async function getReportOutlets(req) {
+  if (req.org && req.org._isSingleRestaurant && req.org.ownerId) {
+    const snapshot = await db.collection(collections.restaurants)
+      .where('ownerId', '==', req.org.ownerId)
+      .get();
+    const outlets = [];
+    snapshot.forEach(doc => {
+      const data = doc.data();
+      outlets.push({
+        id: doc.id,
+        name: data.name,
+        outletType: data.outletType || 'outlet',
+        outletCode: data.outletCode || null,
+        address: data.address || '',
+        status: data.status || 'active'
+      });
+    });
+    // Safety: if the ownerId query somehow returns nothing, fall back to the single-restaurant behaviour.
+    if (outlets.length > 0) return outlets;
+  }
+  return getOrgOutlets(req.org ? req.org.id : req.params.orgId);
+}
+
 module.exports = {
   requireOrgAccess,
   requireOrgFeature,
   requireOrgMember,
   isRestaurantInOrg,
   getOrgOutlets,
+  getReportOutlets,
   getOwnerId,
   getActorId
 };

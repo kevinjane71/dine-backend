@@ -2,7 +2,7 @@ const express = require('express');
 const router = express.Router();
 const { db, collections } = require('../firebase');
 const { authenticateToken } = require('../middleware/auth');
-const { getCachedRestDoc } = require('../utils/kvCache');
+const { getCachedRestDoc, invalidateRestaurantCache } = require('../utils/kvCache');
 
 // ============================================
 // SPACE BOOKING APIs
@@ -457,6 +457,7 @@ router.patch('/spaces/:spaceId/settings', authenticateToken, async (req, res) =>
       spaceSettings: updatedSettings,
       businessType: 'space'
     });
+    invalidateRestaurantCache(spaceId);
 
     res.json({ success: true, spaceSettings: updatedSettings });
   } catch (error) {

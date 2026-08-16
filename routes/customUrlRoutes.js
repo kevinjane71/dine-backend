@@ -2,6 +2,7 @@ const express = require('express');
 const router = express.Router();
 const { db, collections } = require('../firebase');
 const { authenticateToken } = require('../middleware/auth');
+const { invalidateRestaurantCache } = require('../utils/kvCache');
 
 // Reserved slugs that cannot be used by restaurants
 const RESERVED_SLUGS = [
@@ -127,6 +128,7 @@ router.patch('/restaurants/:restaurantId/slug', authenticateToken, async (req, r
         urlSlug: null,
         updatedAt: new Date()
       });
+      invalidateRestaurantCache(restaurantId);
       return res.json({ success: true, urlSlug: null });
     }
 
@@ -159,6 +161,7 @@ router.patch('/restaurants/:restaurantId/slug', authenticateToken, async (req, r
       urlSlug: normalizedSlug,
       updatedAt: new Date()
     });
+    invalidateRestaurantCache(restaurantId);
 
     res.json({ success: true, urlSlug: normalizedSlug });
   } catch (error) {

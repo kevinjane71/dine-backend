@@ -5,6 +5,10 @@
     {
       "path": "/api/cron/send-daily-reports",
       "schedule": "0 * * * *"
+    },
+    {
+      "path": "/api/whatsapp-ordering/agent/process-due",
+      "schedule": "*/10 * * * *"
     }
   ],
   "builds": [

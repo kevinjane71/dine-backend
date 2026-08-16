@@ -22,6 +22,24 @@ const oauth2Client = new OAuth2Client(
   OAUTH_REDIRECT_URI
 );
 
+// The OAuth redirect URI must (a) point at THIS backend and (b) be registered in the
+// Google Cloud OAuth client. Resolution order: explicit env → BACKEND_URL → derived from
+// the incoming request (so it works on whatever domain the backend is actually served,
+// instead of the hard-coded api.dineopen.com default which may not route here).
+function resolveRedirectUri(req) {
+  if (process.env.GOOGLE_OAUTH_REDIRECT_URI) return process.env.GOOGLE_OAUTH_REDIRECT_URI;
+  if (process.env.BACKEND_URL) return `${process.env.BACKEND_URL}/api/google-reviews/auth/callback`;
+  const proto = String(req.headers['x-forwarded-proto'] || req.protocol || 'https').split(',')[0].trim();
+  const host = req.headers['x-forwarded-host'] || req.get('host');
+  return `${proto}://${host}/api/google-reviews/auth/callback`;
+}
+
+// A per-request OAuth client bound to the correct redirect URI (needed for generateAuthUrl
+// + getToken; token refresh uses the module-level client which needs no redirect URI).
+function oauthClientFor(req) {
+  return new OAuth2Client(process.env.GOOGLE_CLIENT_ID, process.env.GOOGLE_CLIENT_SECRET, resolveRedirectUri(req));
+}
+
 // ---------------------------------------------------------------------------
 // Helper: Get a valid access token (refresh if expired)
 // ---------------------------------------------------------------------------
@@ -443,14 +461,15 @@ router.get('/auth/url/:restaurantId', authenticateToken, requireOwnerRole, async
       userId: req.user.uid || req.user.userId
     })).toString('base64');
 
-    const authUrl = oauth2Client.generateAuthUrl({
+    const authUrl = oauthClientFor(req).generateAuthUrl({
       access_type: 'offline',
       prompt: 'consent',
       scope: [GBP_SCOPE],
       state
     });
 
-    res.json({ success: true, authUrl });
+    // Return under both keys — the frontend reads `url`, older callers read `authUrl`.
+    res.json({ success: true, authUrl, url: authUrl });
   } catch (error) {
     console.error('Error generating Google OAuth URL:', error);
     res.status(500).json({ success: false, error: 'Failed to generate OAuth URL' });
@@ -486,8 +505,8 @@ router.get('/auth/callback', async (req, res) => {
       return res.redirect(`${FRONTEND_URL}/admin?tab=google-reviews&error=invalid_state`);
     }
 
-    // Exchange code for tokens
-    const { tokens } = await oauth2Client.getToken(code);
+    // Exchange code for tokens (redirect URI must match the one used to start the flow)
+    const { tokens } = await oauthClientFor(req).getToken(code);
 
     // Get connected email from userinfo
     let connectedEmail = '';
@@ -707,6 +726,8 @@ router.get('/reviews/:restaurantId', authenticateToken, async (req, res) => {
       if (!placesRes.ok) {
         const errorBody = await placesRes.text();
         console.error('Places API error:', placesRes.status, errorBody);
+        let hint = '';
+        try { hint = (JSON.parse(errorBody).error || {}).message || ''; } catch (_) { hint = errorBody.slice(0, 160); }
         return res.json({
           success: true,
           source: 'none',
@@ -714,7 +735,9 @@ router.get('/reviews/:restaurantId', authenticateToken, async (req, res) => {
           averageRating: null,
           totalReviewCount: 0,
           nextPageToken: null,
-          message: 'Failed to fetch reviews from Google Places API.'
+          message: 'Failed to fetch reviews from Google Places API.',
+          placesStatus: placesRes.status,
+          placesError: hint
         });
       }
 

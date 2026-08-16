@@ -153,6 +153,11 @@ router.post('/webhook', async (req, res) => {
     const match = await orderingService.findRestaurantByPhoneNumberId(phoneNumberId);
     if (!match) {
       console.warn(`No restaurant found for WhatsApp ordering phone number ID: ${phoneNumberId}`);
+      // AI sales/support agent for the DineOpen number (fully isolated — cannot affect the
+      // inbox flow above). onInbound() self-gates via isEnabled() (ON by default unless
+      // WA_AI_AGENT_ENABLED=false) and self-scopes to the DineOpen number, so just call it.
+      try { await require('./whatsappAgent').onInbound({ message, contact, phoneNumberId }); }
+      catch (agentErr) { console.error('[wa-agent] onInbound error (non-blocking):', agentErr.message); }
       return; // Ordering flow stops, but message is already logged above for inbox
     }
 
@@ -494,5 +499,27 @@ router.post('/test-message/:restaurantId', authenticateToken, async (req, res) =
     res.status(500).json({ success: false, error: error.message });
   }
 });
+
+// ── Cron: process due AI-agent replies (debounced) ───────────────────────────
+// Runs on the Vercel Cron in vercel.json (every 15 min) — Vercel calls it as a GET with
+// `Authorization: Bearer <CRON_SECRET>` (auto-injected because CRON_SECRET is set), same
+// as /api/cron/send-daily-reports. Also accepts POST + `x-cron-secret` (Cloud Scheduler)
+// or `?secret=`. Processes queued replies; no-op only when WA_AI_AGENT_ENABLED=false.
+const processDueHandler = async (req, res) => {
+  const bearer = (req.headers.authorization || '').replace(/^Bearer\s+/i, '');
+  const secret = bearer || req.headers['x-cron-secret'] || req.query.secret;
+  if (!process.env.CRON_SECRET || secret !== process.env.CRON_SECRET) {
+    return res.status(403).json({ error: 'forbidden' });
+  }
+  try {
+    const result = await require('./whatsappAgent').processDue();
+    res.json({ ok: true, ...result });
+  } catch (e) {
+    console.error('[wa-agent] process-due error:', e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+};
+router.get('/agent/process-due', processDueHandler);
+router.post('/agent/process-due', processDueHandler);
 
 module.exports = router;

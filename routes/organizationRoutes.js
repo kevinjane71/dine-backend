@@ -4,7 +4,7 @@ const { db, collections } = require('../firebase');
 const { authenticateToken, requireOwnerRole } = require('../middleware/auth');
 const { requireOrgAccess, getOwnerId, getOrgOutlets, requireOrgMember } = require('../middleware/orgAccess');
 const { pushTemplateToOutlets } = require('./centralMenuRoutes');
-const { getCachedRestDoc } = require('../utils/kvCache');
+const { getCachedRestDoc, invalidateRestaurantCache } = require('../utils/kvCache');
 
 
 // ============================================
@@ -224,6 +224,7 @@ router.post('/:orgId/outlets', authenticateToken, requireOwnerRole, requireOrgAc
       outletCode: outletCode?.trim() || null,
       updatedAt: new Date()
     });
+    invalidateRestaurantCache(restaurantId);
 
     // Update org outlets array
     const currentOutlets = req.org.outlets || [];
@@ -262,6 +263,7 @@ router.post('/:orgId/outlets', authenticateToken, requireOwnerRole, requireOrgAc
           await db.collection(collections.restaurants).doc(restaurantId).update({
             hasDefaultMenu: false,
           });
+          invalidateRestaurantCache(restaurantId);
         }
 
         menuAutoPushed = true;
@@ -313,6 +315,7 @@ router.delete('/:orgId/outlets/:restaurantId', authenticateToken, requireOwnerRo
       outletCode: null,
       updatedAt: new Date()
     });
+    invalidateRestaurantCache(restaurantId);
 
     // Remove from org outlets array
     const updatedOutlets = (req.org.outlets || []).filter(id => id !== restaurantId);
@@ -367,6 +370,7 @@ router.patch('/:orgId/outlets/:restaurantId/type', authenticateToken, requireOwn
     }
 
     await db.collection(collections.restaurants).doc(restaurantId).update(updateData);
+    invalidateRestaurantCache(restaurantId);
 
     res.json({
       success: true,

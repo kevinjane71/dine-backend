@@ -116,6 +116,10 @@ router.post('/hotel/checkin', authenticateToken, async (req, res) => {
       guestName: guestInfo.name,
       guestPhone: guestInfo.phone || null, // Phone is now optional
       guestEmail: guestInfo.email || null,
+      // Store ID-proof + GST on the check-in record too (not only the guest doc) — the invoice reads
+      // them from here, so without this the invoice's ID/GST blocks never rendered.
+      idProof: idProof || null,
+      gstInfo: gstInfo || null,
       roomNumber,
       checkInDate: new Date(checkInDate),
       checkOutDate: new Date(checkOutDate),
@@ -321,6 +325,17 @@ router.post('/hotel/link-order', authenticateToken, async (req, res) => {
 
     const checkInData = checkInDoc.data();
 
+    // Tenant scope: the order and the check-in must both belong to the caller's restaurant, so a
+    // manual link can't attach another restaurant's order or write to another hotel's folio.
+    if (req.user?.restaurantId) {
+      if (checkInData.restaurantId && checkInData.restaurantId !== req.user.restaurantId) {
+        return res.status(403).json({ success: false, error: 'This check-in belongs to a different restaurant.' });
+      }
+      if (orderData.restaurantId && orderData.restaurantId !== req.user.restaurantId) {
+        return res.status(403).json({ success: false, error: 'This order belongs to a different restaurant.' });
+      }
+    }
+
     // Add order to foodOrders array (with duplicate prevention)
     const foodOrders = checkInData.foodOrders || [];
 
@@ -348,9 +363,11 @@ router.post('/hotel/link-order', authenticateToken, async (req, res) => {
       orderNumber: orderData.orderNumber || null
     });
 
-    // Update totals
-    const totalFoodCharges = (checkInData.totalFoodCharges || 0) + orderAmount;
-    const totalCharges = checkInData.totalRoomCharges + totalFoodCharges;
+    // Update totals — increment by the SAME tax-inclusive amount we pushed into foodOrders[] above
+    // (was incrementing by the raw pre-tax orderAmount, so the live folio balance dropped the tax).
+    const linkedAmount = Math.round(finalOrderAmount * 100) / 100;
+    const totalFoodCharges = (checkInData.totalFoodCharges || 0) + linkedAmount;
+    const totalCharges = (checkInData.totalRoomCharges || 0) + totalFoodCharges;
     const balanceAmount = totalCharges - (checkInData.advancePayment || 0);
 
     // Update check-in with linked order
@@ -403,7 +420,9 @@ router.post('/hotel/checkout/:checkInId', authenticateToken, async (req, res) =>
       paymentMode,
       discounts,
       additionalCharges,
-      notes
+      notes,
+      foodOrdersStatus,          // [{ orderId, isPaid }] — cashier's paid/unpaid selection from the UI
+      roomTariff: bodyRoomTariff // cashier-corrected per-night tariff (optional)
     } = req.body;
 
     const checkInRef = db.collection(COLLECTIONS.checkIns).doc(checkInId);
@@ -418,6 +437,12 @@ router.post('/hotel/checkout/:checkInId', authenticateToken, async (req, res) =>
 
     const checkInData = checkInDoc.data();
 
+    // Tenant scope: this endpoint takes a raw checkInId — verify it belongs to the caller's
+    // restaurant so one hotel can't check out / read another's guest. (No-op for the owner.)
+    if (req.user?.restaurantId && checkInData.restaurantId && checkInData.restaurantId !== req.user.restaurantId) {
+      return res.status(403).json({ success: false, error: 'This check-in belongs to a different restaurant.' });
+    }
+
     if (checkInData.status === 'checked-out') {
       return res.status(400).json({
         success: false,
@@ -426,17 +451,54 @@ router.post('/hotel/checkout/:checkInId', authenticateToken, async (req, res) =>
     }
 
     // Recalculate totals from actual data (don't rely on stored values which might be 0)
-    // 1. Recalculate room charges
-    const roomTariff = checkInData.roomTariff || 0;
+    // 1. Recalculate room charges — honor a cashier-corrected tariff if the UI sent one, else stored.
+    const roomTariff = (bodyRoomTariff != null && !isNaN(Number(bodyRoomTariff)))
+      ? Number(bodyRoomTariff)
+      : (checkInData.roomTariff || 0);
     const stayDuration = checkInData.stayDuration || 1;
     const totalRoomCharges = roomTariff * stayDuration;
 
-    // 2. Recalculate food charges from foodOrders array
+    // 2. Food charges OWED at checkout = linked orders that are NOT cancelled and NOT already paid.
+    //    "Already paid" = the cashier's per-order toggle (foodOrdersStatus) OR the order's own
+    //    paymentStatus (food settled at the POS when the order was placed). This prevents the
+    //    double-charge where food paid at the POS was re-billed on the folio. Already-paid food is
+    //    tracked separately for the invoice, but excluded from the amount owed.
+    const paidByUi = {};
+    if (Array.isArray(foodOrdersStatus)) {
+      for (const s of foodOrdersStatus) if (s && s.orderId) paidByUi[s.orderId] = (s.isPaid === true);
+    }
     const foodOrders = checkInData.foodOrders || [];
-    const totalFoodCharges = foodOrders.reduce((sum, order) => sum + (order.amount || 0), 0);
+    let totalFoodCharges = 0;        // unpaid, non-cancelled → owed now
+    let foodChargesAlreadyPaid = 0;  // paid at POS / marked paid → shown on invoice, not owed
+    for (const o of foodOrders) {
+      const amt = o.amount || 0;
+      const cancelled = o.status === 'cancelled' || o.paymentStatus === 'cancelled';
+      if (cancelled) continue;
+      const alreadyPaid = paidByUi[o.orderId] === true
+        || o.paymentStatus === 'paid' || o.paymentStatus === 'completed';
+      if (alreadyPaid) { foodChargesAlreadyPaid += amt; continue; }
+      totalFoodCharges += amt;
+    }
 
-    // 3. Calculate subtotal (room + food)
+    // 3. Calculate subtotal (room + OWED food)
     let subtotal = totalRoomCharges + totalFoodCharges;
+
+    // 3b. Optional ROOM TAX — owner-configured (roomTaxRate % + roomTaxName) on the restaurant. Applies
+    //     to the room charges only (food amounts are already tax-inclusive). No config → no tax line,
+    //     no behaviour change. Works for any market (owner sets the % and the label, e.g. GST/VAT).
+    let roomTaxRate = 0, roomTaxName = 'Room Tax', roomTaxAmount = 0;
+    try {
+      const restDoc = await db.collection('restaurants').doc(checkInData.restaurantId).get();
+      const rd = restDoc.exists ? restDoc.data() : {};
+      roomTaxRate = Number(rd.posSettings?.roomTaxRate ?? rd.roomTaxRate) || 0;
+      const _rtName = rd.posSettings?.roomTaxName ?? rd.roomTaxName;
+      if (_rtName) roomTaxName = _rtName;
+    } catch (_) {}
+    if (roomTaxRate > 0 && totalRoomCharges > 0) {
+      roomTaxAmount = Math.round((totalRoomCharges * roomTaxRate) ) / 100;
+      roomTaxAmount = Math.round(roomTaxAmount * 100) / 100;
+      subtotal += roomTaxAmount;
+    }
 
     // 4. Add additional charges if any
     let additionalChargesTotal = 0;
@@ -464,8 +526,11 @@ router.post('/hotel/checkout/:checkInId', authenticateToken, async (req, res) =>
       actualCheckOutAt: FieldValue.serverTimestamp(),
       finalPayment: finalPayment || 0,
       finalPaymentMode: paymentMode || 'cash',
+      roomTariff, // persist the (possibly corrected) tariff so the invoice matches
       totalRoomCharges, // Update with recalculated value
-      totalFoodCharges, // Update with recalculated value
+      totalFoodCharges, // OWED food only (excludes cancelled + already-paid)
+      foodChargesAlreadyPaid, // food settled at the POS before checkout (for the invoice)
+      roomTaxRate, roomTaxName, roomTaxAmount, // optional owner-configured room tax
       totalCharges,
       discounts: discounts || [],
       discountAmount,
@@ -480,26 +545,31 @@ router.post('/hotel/checkout/:checkInId', authenticateToken, async (req, res) =>
 
     await checkInRef.update(checkoutData);
 
-    // If there are linked food orders, mark them as billed and checked-out
+    // Mark linked food orders as billed and checked-out (prevents re-linking to a future check-in).
+    // Orders already paid at the POS keep their existing payment — we only flip UNPAID orders to
+    // 'paid' (they were settled now, as part of the folio). Cancelled orders are left untouched.
     if (checkInData.foodOrders && checkInData.foodOrders.length > 0) {
       const batch = db.batch();
 
       for (const foodOrder of checkInData.foodOrders) {
+        const alreadyPaid = paidByUi[foodOrder.orderId] === true
+          || foodOrder.paymentStatus === 'paid' || foodOrder.paymentStatus === 'completed';
+        const cancelled = foodOrder.status === 'cancelled' || foodOrder.paymentStatus === 'cancelled';
         const orderRef = db.collection('orders').doc(foodOrder.orderId);
-        batch.update(orderRef, {
-          paymentStatus: 'paid',
-          paidAt: FieldValue.serverTimestamp(),
-          paidVia: 'hotel-checkout',
-          // IMPORTANT: Mark as checked-out to prevent re-linking to future check-ins
+        const upd = {
+          // Only settle it now if it wasn't already paid and isn't cancelled.
+          ...(!alreadyPaid && !cancelled ? { paymentStatus: 'paid', paidAt: FieldValue.serverTimestamp(), paidVia: 'hotel-checkout' } : {}),
+          // Always stamp checked-out so it can't re-link to a future check-in.
           hotelCheckoutId: checkInId,
           hotelCheckoutAt: FieldValue.serverTimestamp(),
           hotelBilledAndCheckedOut: true
-        });
+        };
+        batch.update(orderRef, upd);
       }
 
       await batch.commit();
       try { require('../utils/kvCache').invalidateOrdersCache(checkInData.restaurantId); } catch (_) {}
-      console.log(`✅ Marked ${checkInData.foodOrders.length} orders as billed and checked-out`);
+      console.log(`✅ Checkout ${checkInId}: stamped ${checkInData.foodOrders.length} linked orders (owed food ${totalFoodCharges}, already-paid ${foodChargesAlreadyPaid})`);
     }
 
     // Update room status to cleaning/available
@@ -781,18 +851,64 @@ router.get('/hotel/invoice/:checkInId', authenticateToken, async (req, res) => {
 
     const data = checkInDoc.data();
 
-    // Recalculate totals from actual data (don't rely on stored values which might be 0)
-    // 1. Recalculate room charges
-    const roomTariff = data.roomTariff || 0;
+    // Tenant scope: verify this check-in belongs to the caller's restaurant (protects guest PII).
+    if (req.user?.restaurantId && data.restaurantId && data.restaurantId !== req.user.restaurantId) {
+      return res.status(403).json({ success: false, error: 'This check-in belongs to a different restaurant.' });
+    }
+
+    const isCheckedOut = data.status === 'checked-out';
     const stayDuration = data.stayDuration || 1;
-    const totalRoomCharges = roomTariff * stayDuration;
 
-    // 2. Recalculate food charges from foodOrders array
+    // 1. Room charges — after checkout the stored value is the finalized (possibly corrected) one.
+    const totalRoomCharges = (isCheckedOut && data.totalRoomCharges != null)
+      ? data.totalRoomCharges
+      : (data.roomTariff || 0) * stayDuration;
+
+    // 2. Food charges. AFTER checkout, trust the finalized split stored at checkout — recomputing
+    //    live would be wrong because checkout flips every linked order to 'paid'. BEFORE checkout
+    //    (live preview), owed food = linked orders that are NOT cancelled and NOT already paid at the
+    //    POS; already-paid food is shown separately, never double-counted into the amount owed.
     const foodOrders = data.foodOrders || [];
-    const totalFoodCharges = foodOrders.reduce((sum, order) => sum + (order.amount || 0), 0);
+    let totalFoodCharges = 0;       // owed
+    let foodChargesAlreadyPaid = 0; // paid at POS (shown, not owed)
+    if (isCheckedOut) {
+      totalFoodCharges = data.totalFoodCharges || 0;
+      foodChargesAlreadyPaid = data.foodChargesAlreadyPaid || 0;
+    } else {
+      for (const o of foodOrders) {
+        const amt = o.amount || 0;
+        const cancelled = o.status === 'cancelled' || o.paymentStatus === 'cancelled';
+        if (cancelled) continue;
+        const alreadyPaid = o.paymentStatus === 'paid' || o.paymentStatus === 'completed';
+        if (alreadyPaid) { foodChargesAlreadyPaid += amt; continue; }
+        totalFoodCharges += amt;
+      }
+    }
 
-    // 3. Calculate subtotal (room + food)
+    // 3. Calculate subtotal (room + OWED food)
     let subtotal = totalRoomCharges + totalFoodCharges;
+
+    // 3b. Optional ROOM TAX. AFTER checkout use the finalized stored amount; BEFORE, compute live from
+    //     the restaurant's roomTaxRate/roomTaxName. No config → 0, no line.
+    let roomTaxRate = 0, roomTaxName = 'Room Tax', roomTaxAmount = 0;
+    if (isCheckedOut) {
+      roomTaxRate = Number(data.roomTaxRate) || 0;
+      roomTaxName = data.roomTaxName || 'Room Tax';
+      roomTaxAmount = Number(data.roomTaxAmount) || 0;
+    } else {
+      try {
+        const restDoc = await db.collection('restaurants').doc(data.restaurantId).get();
+        const rd = restDoc.exists ? restDoc.data() : {};
+        roomTaxRate = Number(rd.posSettings?.roomTaxRate ?? rd.roomTaxRate) || 0;
+        const _rtName = rd.posSettings?.roomTaxName ?? rd.roomTaxName;
+        if (_rtName) roomTaxName = _rtName;
+      } catch (_) {}
+      if (roomTaxRate > 0 && totalRoomCharges > 0) {
+        roomTaxAmount = Math.round((totalRoomCharges * roomTaxRate)) / 100;
+        roomTaxAmount = Math.round(roomTaxAmount * 100) / 100;
+      }
+    }
+    subtotal += roomTaxAmount;
 
     // 4. Add additional charges if any
     const additionalCharges = data.additionalCharges || [];
@@ -828,10 +944,12 @@ router.get('/hotel/invoice/:checkInId', authenticateToken, async (req, res) => {
       stayDuration: data.stayDuration,
       roomTariff: data.roomTariff,
       roomCharges: totalRoomCharges, // Use recalculated value
-      foodCharges: totalFoodCharges, // Use recalculated value
+      foodCharges: totalFoodCharges, // OWED food (excludes cancelled + already-paid)
+      foodChargesAlreadyPaid, // food already settled at the POS — shown for reference, not owed
       additionalCharges: additionalCharges,
       discounts: discounts,
       subtotal: totalRoomCharges + totalFoodCharges + additionalChargesTotal,
+      roomTaxRate, roomTaxName, roomTaxAmount, // optional owner-configured room tax
       discountAmount: discountAmount,
       totalAmount: totalCharges, // Use recalculated value
       advancePayment: advancePayment,
@@ -879,7 +997,17 @@ router.patch('/hotel/checkin/:checkInId', authenticateToken, async (req, res) =>
 
     updates.lastUpdated = FieldValue.serverTimestamp();
 
-    await db.collection(COLLECTIONS.checkIns).doc(checkInId).update(updates);
+    // Tenant scope: verify the check-in belongs to the caller's restaurant before updating.
+    const _ciRef = db.collection(COLLECTIONS.checkIns).doc(checkInId);
+    const _ciDoc = await _ciRef.get();
+    if (!_ciDoc.exists) {
+      return res.status(404).json({ success: false, error: 'Check-in not found' });
+    }
+    if (req.user?.restaurantId && _ciDoc.data().restaurantId && _ciDoc.data().restaurantId !== req.user.restaurantId) {
+      return res.status(403).json({ success: false, error: 'This check-in belongs to a different restaurant.' });
+    }
+
+    await _ciRef.update(updates);
 
 
     res.json({
@@ -1455,6 +1583,17 @@ router.get('/hotel/calendar/summary', authenticateToken, async (req, res) => {
       });
     });
 
+    // Bookings store dates as strings, but CHECK-INS store them as Firestore Timestamps —
+    // new Date(Timestamp) yields "Invalid Date", so check-ins silently contributed 0 to occupancy.
+    // Parse both shapes (Timestamp {_seconds}/.toDate(), ISO string, Date) robustly.
+    const toDate = (v) => {
+      if (!v) return null;
+      if (typeof v.toDate === 'function') return v.toDate();
+      if (typeof v._seconds === 'number') return new Date(v._seconds * 1000);
+      const d = new Date(v);
+      return isNaN(d.getTime()) ? null : d;
+    };
+
     // Build daily summary
     const dailySummary = {};
 
@@ -1469,16 +1608,16 @@ router.get('/hotel/calendar/summary', authenticateToken, async (req, res) => {
 
       // Count bookings for this date
       const bookingsOnDate = bookings.filter(booking => {
-        const checkIn = new Date(booking.checkInDate);
-        const checkOut = new Date(booking.checkOutDate);
-        return checkIn <= currentDate && checkOut > currentDate;
+        const checkIn = toDate(booking.checkInDate);
+        const checkOut = toDate(booking.checkOutDate);
+        return checkIn && checkOut && checkIn <= currentDate && checkOut > currentDate;
       });
 
       // Count check-ins for this date
       const checkInsOnDate = checkIns.filter(checkIn => {
-        const ciDate = new Date(checkIn.checkInDate);
-        const coDate = new Date(checkIn.checkOutDate);
-        return ciDate <= currentDate && coDate > currentDate;
+        const ciDate = toDate(checkIn.checkInDate);
+        const coDate = toDate(checkIn.checkOutDate);
+        return ciDate && coDate && ciDate <= currentDate && coDate > currentDate;
       });
 
       const totalBookings = bookingsOnDate.length + checkInsOnDate.length;

@@ -173,7 +173,17 @@ router.patch('/room/:roomId/status', authenticateToken, async (req, res) => {
       updateData.currentGuest = currentGuest;
     }
 
-    await db.collection('rooms').doc(roomId).update(updateData);
+    // Tenant scope: verify the room belongs to the caller's restaurant.
+    const roomRef = db.collection('rooms').doc(roomId);
+    const roomDoc = await roomRef.get();
+    if (!roomDoc.exists) {
+      return res.status(404).json({ success: false, message: 'Room not found' });
+    }
+    if (req.user?.restaurantId && roomDoc.data().restaurantId && roomDoc.data().restaurantId !== req.user.restaurantId) {
+      return res.status(403).json({ success: false, message: 'This room belongs to a different restaurant.' });
+    }
+
+    await roomRef.update(updateData);
 
     res.json({ success: true, message: 'Room status updated' });
   } catch (error) {
@@ -395,18 +405,34 @@ router.delete('/room/:roomId', authenticateToken, async (req, res) => {
   try {
     const { roomId } = req.params;
 
-    // Check if room has active check-in
-    const checkInSnapshot = await db.collection('hotel_checkins')
-      .where('roomId', '==', roomId)
-      .where('status', '==', 'checked-in')
-      .limit(1)
-      .get();
+    // Tenant scope: the room must belong to the caller's restaurant.
+    const roomRef = db.collection('rooms').doc(roomId);
+    const roomDoc = await roomRef.get();
+    if (!roomDoc.exists) {
+      return res.status(404).json({ success: false, message: 'Room not found' });
+    }
+    const roomData = roomDoc.data();
+    if (req.user?.restaurantId && roomData.restaurantId && roomData.restaurantId !== req.user.restaurantId) {
+      return res.status(403).json({ success: false, message: 'This room belongs to a different restaurant.' });
+    }
 
-    if (!checkInSnapshot.empty) {
+    // Block deletion if the room has an active check-in. Walk-in check-ins do NOT store a roomId
+    // (only booking-origin ones do), so we must ALSO match on the room NUMBER within this restaurant
+    // — otherwise a room occupied by a walk-in guest could be deleted out from under them.
+    const [byId, byNumber] = await Promise.all([
+      db.collection('hotel_checkins').where('roomId', '==', roomId).where('status', '==', 'checked-in').limit(1).get(),
+      (roomData.roomNumber || roomData.number)
+        ? db.collection('hotel_checkins')
+            .where('restaurantId', '==', roomData.restaurantId)
+            .where('roomNumber', '==', String(roomData.roomNumber || roomData.number))
+            .where('status', '==', 'checked-in').limit(1).get()
+        : Promise.resolve({ empty: true }),
+    ]);
+    if (!byId.empty || !byNumber.empty) {
       return res.status(400).json({ success: false, message: 'Cannot delete room with active check-in' });
     }
 
-    await db.collection('rooms').doc(roomId).delete();
+    await roomRef.delete();
 
     res.json({ success: true, message: 'Room deleted successfully' });
   } catch (error) {
@@ -681,6 +707,11 @@ router.patch('/booking/:bookingId/cancel', authenticateToken, async (req, res) =
 
     const bookingData = bookingDoc.data();
 
+    // Tenant scope: the booking must belong to the caller's restaurant.
+    if (req.user?.restaurantId && bookingData.restaurantId && bookingData.restaurantId !== req.user.restaurantId) {
+      return res.status(403).json({ success: false, message: 'This booking belongs to a different restaurant.' });
+    }
+
     // Don't allow canceling already cancelled or checked-in bookings
     if (bookingData.status === 'cancelled') {
       return res.status(400).json({ success: false, message: 'Booking is already cancelled' });
@@ -761,13 +792,39 @@ router.post('/booking/:bookingId/checkin', authenticateToken, async (req, res) =
 
     const bookingData = bookingDoc.data();
 
+    // Tenant scope: the booking must belong to the caller's restaurant.
+    if (req.user?.restaurantId && bookingData.restaurantId && bookingData.restaurantId !== req.user.restaurantId) {
+      return res.status(403).json({ success: false, message: 'This booking belongs to a different restaurant.' });
+    }
+
     if (bookingData.status !== 'confirmed') {
       return res.status(400).json({ success: false, message: 'Booking is not confirmed' });
     }
 
+    // Create/record the guest in the directory too (walk-in check-in does this; booking→check-in
+    // didn't, so booking-origin guests were missing from the Guests list). Best-effort.
+    let guestId = null;
+    try {
+      const guestRef = await db.collection('hotel_guests').add({
+        restaurantId: bookingData.restaurantId,
+        name: bookingData.guestName || '',
+        phone: bookingData.guestPhone || null,
+        email: bookingData.guestEmail || null,
+        idProofType: idProof?.type || null,
+        idProofNumber: idProof?.number || null,
+        idProofImageUrl: idProof?.imageUrl || null,
+        gstNumber: gstInfo?.gstNumber || null,
+        gstCompanyName: gstInfo?.companyName || null,
+        source: 'booking',
+        createdAt: FieldValue.serverTimestamp(),
+      });
+      guestId = guestRef.id;
+    } catch (_) { /* directory write is non-critical — don't block check-in */ }
+
     // Create check-in
     const checkInData = {
       restaurantId: bookingData.restaurantId,
+      guestId,
       roomId: bookingData.roomId,
       roomNumber: bookingData.roomNumber,
       guestName: bookingData.guestName,

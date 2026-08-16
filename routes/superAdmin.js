@@ -2692,6 +2692,48 @@ router.post('/whatsapp/mark-read', authenticateSuperAdmin, requireSuperAdmin, as
   }
 });
 
+// ── AI agent: draft approval queue (Step 2) ──────────────────────────────────
+// GET drafts waiting for approval (the AI drafted a reply to a general question).
+router.get('/whatsapp/agent/drafts', authenticateSuperAdmin, requireSuperAdmin, async (req, res) => {
+  try {
+    const drafts = await require('./whatsappAgent').listDrafts();
+    res.json({ success: true, drafts });
+  } catch (error) {
+    console.error('WhatsApp agent drafts error:', error);
+    res.status(500).json({ success: false, error: 'Failed to load drafts' });
+  }
+});
+
+// POST approve — send the (optionally edited) reply, then clear the draft.
+router.post('/whatsapp/agent/approve', authenticateSuperAdmin, requireSuperAdmin, async (req, res) => {
+  try {
+    const { phone, text } = req.body || {};
+    if (!phone) return res.status(400).json({ error: 'phone required' });
+    const by = req.admin?.username || req.admin?.email || 'super-admin';
+    const result = await require('./whatsappAgent').approveDraft(phone, text, by);
+    if (!result.ok) return res.status(400).json({ success: false, error: result.error });
+    res.json({ success: true, sent: result.sent });
+  } catch (error) {
+    console.error('WhatsApp agent approve error:', error);
+    res.status(500).json({ success: false, error: 'Failed to approve/send' });
+  }
+});
+
+// POST dismiss — drop the draft without sending.
+router.post('/whatsapp/agent/dismiss', authenticateSuperAdmin, requireSuperAdmin, async (req, res) => {
+  try {
+    const { phone } = req.body || {};
+    if (!phone) return res.status(400).json({ error: 'phone required' });
+    const by = req.admin?.username || req.admin?.email || 'super-admin';
+    const result = await require('./whatsappAgent').dismissDraft(phone, by);
+    if (!result.ok) return res.status(400).json({ success: false, error: result.error });
+    res.json({ success: true });
+  } catch (error) {
+    console.error('WhatsApp agent dismiss error:', error);
+    res.status(500).json({ success: false, error: 'Failed to dismiss' });
+  }
+});
+
 // GET /api/super-admin/whatsapp/media/:mediaId — proxy media download
 // Supports ?token= query param for <img src> usage where Authorization header isn't possible
 router.get('/whatsapp/media/:mediaId', (req, res, next) => {
