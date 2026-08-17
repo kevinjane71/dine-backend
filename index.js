@@ -13262,6 +13262,57 @@ app.get('/api/analytics/:restaurantId/daily-summary', authenticateToken, async (
 // List all currently OPEN (unsettled) orders for a restaurant — any date, with age. Powers the
 // "Open Orders" dashboard indicator + the resolution page (settle / cancel / delete). Bounded
 // lookback keeps reads small (open tabs are rare) and reuses the (restaurantId, createdAt) index.
+// GET /api/print-poll/:restaurantId — server-controlled KOT polling fallback.
+// The desktop calls this ONLY when this restaurant has kotPollingEnabled turned on (from
+// dine-admin). It returns recent still-confirmed orders so the desktop can print any KOT that a
+// silently-dropped realtime socket missed. Payload is intentionally tiny (ids + status + time) —
+// the desktop then fetches the full render for anything it actually needs to print, and dedups
+// against what it already printed. Also echoes the live config so the desktop has one source of
+// truth: if enabled flips to false here, the desktop stops polling on its next tick.
+app.get('/api/print-poll/:restaurantId', authenticateToken, async (req, res) => {
+  try {
+    const { restaurantId } = req.params;
+    const restaurant = await getCachedRestDoc(restaurantId);
+    const printSettings = restaurant.exists ? (restaurant.data().printSettings || {}) : {};
+    const enabled = printSettings.kotPollingEnabled === true;
+    const intervalSec = Math.max(8, Math.min(parseInt(printSettings.kotPollingIntervalSec) || 20, 120));
+
+    // Disabled → answer immediately, no order scan. The desktop stops its timer on this.
+    if (!enabled) {
+      return res.json({ success: true, enabled: false, intervalSec, orders: [] });
+    }
+
+    // Bounded lookback (default 5 min, cap 15). Mirror the realtime KOT trigger exactly: only
+    // 'confirmed' orders (the state the RTDB order-created→KOT path acts on). Orders already moved
+    // past confirmed were acted on by the kitchen, so we never re-surface them.
+    const sinceSec = Math.max(30, Math.min(parseInt(req.query.sinceSec) || 300, 900));
+    const since = new Date(Date.now() - sinceSec * 1000);
+
+    const snap = await db.collection(collections.orders)
+      .where('restaurantId', '==', restaurantId)
+      .where('createdAt', '>=', since)
+      .get();
+
+    const orders = [];
+    snap.docs.forEach(doc => {
+      const o = doc.data();
+      if (o.status !== 'confirmed') return;
+      const created = o.createdAt?.toDate ? o.createdAt.toDate() : new Date(o.createdAt);
+      orders.push({
+        id: doc.id,
+        status: o.status,
+        orderNumber: o.dailyOrderId || o.orderNumber || null,
+        createdAt: created.toISOString(),
+      });
+    });
+    orders.sort((a, b) => new Date(a.createdAt) - new Date(b.createdAt)); // oldest first
+    res.json({ success: true, enabled: true, intervalSec, orders });
+  } catch (error) {
+    console.error('print-poll error:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
 app.get('/api/orders/:restaurantId/open', authenticateToken, async (req, res) => {
   try {
     if (!(await checkFeaturePermission(req, 'orders', 'read'))) {
@@ -22155,7 +22206,11 @@ app.put('/api/admin/print-settings/:restaurantId', authenticateToken, async (req
       'autoPrintOnCompleteBilling',
       'autoPrintOnBillAndPrint',
       'showOrderStatusQR',
-      'imagePrintEnabled'
+      'imagePrintEnabled',
+      // Server-controlled KOT polling fallback (default OFF). When realtime (RTDB) silently
+      // drops on a terminal, this lets that restaurant's desktop poll for missed KOTs.
+      // Enabled per-restaurant from dine-admin; the desktop reads it live from printSettings.
+      'kotPollingEnabled'
     ];
 
     // Numeric fields
@@ -22188,6 +22243,12 @@ app.put('/api/admin/print-settings/:restaurantId', authenticateToken, async (req
       if (printSettings[field] !== undefined) {
         sanitizedSettings[field] = allowed.includes(printSettings[field]) ? printSettings[field] : allowed[1]; // default to 2nd value (medium)
       }
+    }
+    // kotPollingIntervalSec: how often the desktop polls for missed KOTs, in seconds.
+    // Clamped 8–120s so a mis-set value can't hammer the backend or lag hopelessly. Default 20.
+    if (printSettings.kotPollingIntervalSec !== undefined) {
+      const val = parseInt(printSettings.kotPollingIntervalSec);
+      sanitizedSettings.kotPollingIntervalSec = isNaN(val) ? 20 : Math.max(8, Math.min(val, 120));
     }
     // printContentWidth: numeric content width override in mm
     if (printSettings.printContentWidth !== undefined) {
