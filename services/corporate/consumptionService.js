@@ -3,7 +3,7 @@
 //  - postpaid_payroll (payMethod 'payroll') → accrue the copay (recorded, settled via payroll export)
 //  - 'cash' → recorded as collected at counter, no wallet touch
 // The employer subsidy is always recorded for billing regardless of payment model.
-const { db } = require('../../firebase');
+const { db, getFirestoreDb } = require('../../firebase');
 
 const CONS = 'mealConsumptions';
 const EMP = 'employees';
@@ -42,11 +42,17 @@ async function countToday(employeeId, periodId, todayStr) {
  * @returns {{ consumptionId:string, walletBalance:number }}
  */
 async function recordConsumption(p) {
-  const empRef = db.collection(EMP).doc(p.employeeId);
-  const consRef = db.collection(CONS).doc();
+  // The wallet debit + consumption write MUST be atomic. These corporate collections live in
+  // Firestore (on the PG branch they are Firestore-fallback), and the pgAdapter transaction can't
+  // lock Firestore refs — so run this on the RAW Firestore transaction (real optimistic locking +
+  // auto-retry), which is atomic on BOTH the Firestore and PG branches. Behaviour-identical on
+  // main (getFirestoreDb() === db there); on PG it restores the locking the wallet debit needs.
+  const fs = getFirestoreDb();
+  const empRef = fs.collection(EMP).doc(p.employeeId);
+  const consRef = fs.collection(CONS).doc();
   let walletBalance = null;
 
-  await db.runTransaction(async (tx) => {
+  await fs.runTransaction(async (tx) => {
     const snap = await tx.get(empRef);
     if (!snap.exists) throw new Error('Employee not found');
     const emp = snap.data();
