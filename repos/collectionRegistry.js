@@ -458,6 +458,7 @@ const REGISTRY = {
   'adminTasks':            { table: 'admin_tasks',           fieldMap: {}, toPgRow: genericPack, toFirestoreObj: genericUnpack, jsonbCols: GENERIC_JSONB },
   'sub_admins':            { table: 'sub_admins',            fieldMap: {}, toPgRow: genericPack, toFirestoreObj: genericUnpack, jsonbCols: GENERIC_JSONB },
   'waitlist':              { table: 'waitlist',              fieldMap: {}, toPgRow: genericPack, toFirestoreObj: genericUnpack, jsonbCols: GENERIC_JSONB },
+  'wa_agent_state':        { table: 'wa_agent_state',        fieldMap: {}, toPgRow: genericPack, toFirestoreObj: genericUnpack, jsonbCols: GENERIC_JSONB },
   'sadadTransactions':     { table: 'sadad_transactions',    fieldMap: {}, toPgRow: sadadPack,   toFirestoreObj: sadadUnpack,   jsonbCols: GENERIC_JSONB },
   'subRestaurants':        { table: 'sub_restaurants',       fieldMap: { status: 'status' }, toPgRow: subRestPack, toFirestoreObj: genericUnpack, jsonbCols: GENERIC_JSONB },
 

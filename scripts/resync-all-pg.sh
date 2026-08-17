@@ -12,13 +12,15 @@
 #   DATABASE_URL="postgresql://..." ./scripts/resync-all-pg.sh   # or pass it inline
 #
 # Run this RIGHT BEFORE the Cloud Run cutover so PG is current at go-live.
-set -uo pipefail
+set -o pipefail
 cd "$(dirname "$0")/.." || exit 1
 
 # Load .env.local if present (DATABASE_URL + Firebase creds) unless already set.
+# Errors suppressed: .env.local is a dotenv file (multiline keys, $ chars) that
+# isn't strictly shell-safe, but the vars we need parse fine before any bad line.
 if [ -z "${DATABASE_URL:-}" ] && [ -f .env.local ]; then
   echo "Loading .env.local ..."
-  set -a; . ./.env.local; set +a
+  set -a; . ./.env.local 2>/dev/null; set +a
 fi
 
 if [ -z "${DATABASE_URL:-}" ]; then
@@ -27,6 +29,9 @@ if [ -z "${DATABASE_URL:-}" ]; then
 fi
 
 # Backfill order — parents before dependents (FK safety).
+# NOTE: orders is intentionally EXCLUDED — it is already live + dual-writing on
+# PG (current). Re-run it separately only if needed:
+#   node scripts/backfill-orders-pg.js --upsert --since=2026-06-17
 SCRIPTS=(
   backfill-restaurants-pg.js
   backfill-auth-menu-pg.js
@@ -36,7 +41,6 @@ SCRIPTS=(
   backfill-inventory-pg.js
   backfill-floors-tables-pg.js
   backfill-daily-stats-pg.js
-  backfill-orders-pg.js
   backfill-payments-pg.js
   backfill-register-pg.js
   backfill-accounting-pg.js
@@ -46,6 +50,7 @@ SCRIPTS=(
   backfill-ai-automation-pg.js
   backfill-counters-pg.js
   backfill-system-misc-pg.js
+  backfill-generic-passthrough-pg.js
 )
 
 echo "==================================================================="
