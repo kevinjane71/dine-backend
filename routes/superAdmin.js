@@ -1830,7 +1830,18 @@ router.get('/restaurants/:restaurantId/settings', authenticateSuperAdmin, requir
       return res.status(404).json({ success: false, error: 'Restaurant not found' });
     }
     const data = restaurant.data();
-    res.json({ success: true, name: data.name || '', orderSettings: data.orderSettings || {}, superAdminDisabledPages: data.superAdminDisabledPages || [] });
+    const ps = data.printSettings || {};
+    res.json({
+      success: true,
+      name: data.name || '',
+      orderSettings: data.orderSettings || {},
+      superAdminDisabledPages: data.superAdminDisabledPages || [],
+      // KOT polling fallback config — surfaced so dine-admin can show/edit it per restaurant.
+      printPolling: {
+        kotPollingEnabled: ps.kotPollingEnabled === true,
+        kotPollingIntervalSec: Number.isFinite(ps.kotPollingIntervalSec) ? ps.kotPollingIntervalSec : 20,
+      },
+    });
   } catch (err) {
     console.error('Error fetching restaurant settings:', err);
     res.status(500).json({ success: false, error: err.message });
@@ -1842,7 +1853,7 @@ router.get('/restaurants/:restaurantId/settings', authenticateSuperAdmin, requir
 router.patch('/restaurants/:restaurantId/settings', authenticateSuperAdmin, requireSuperAdmin, async (req, res) => {
   try {
     const { restaurantId } = req.params;
-    const { orderSettings, superAdminDisabledPages } = req.body || {};
+    const { orderSettings, superAdminDisabledPages, printPolling } = req.body || {};
 
     if (!restaurantId) {
       return res.status(400).json({ success: false, error: 'restaurantId is required' });
@@ -1865,13 +1876,33 @@ router.patch('/restaurants/:restaurantId/settings', authenticateSuperAdmin, requ
       updateData.superAdminDisabledPages = superAdminDisabledPages;
     }
 
+    // KOT polling fallback — merge ONLY the two polling keys into printSettings (never touch the
+    // rest of the restaurant's print config). Interval is clamped 8–120s to match the backend.
+    if (printPolling && typeof printPolling === 'object') {
+      const existingPs = restaurant.data().printSettings || {};
+      const mergedPs = { ...existingPs };
+      if (printPolling.kotPollingEnabled !== undefined) {
+        mergedPs.kotPollingEnabled = Boolean(printPolling.kotPollingEnabled);
+      }
+      if (printPolling.kotPollingIntervalSec !== undefined) {
+        const val = parseInt(printPolling.kotPollingIntervalSec);
+        mergedPs.kotPollingIntervalSec = isNaN(val) ? 20 : Math.max(8, Math.min(val, 120));
+      }
+      updateData.printSettings = mergedPs;
+    }
+
     await restaurantRef.update(updateData);
     invalidateRestaurantCache(restaurantId);
 
+    const finalPs = updateData.printSettings || restaurant.data().printSettings || {};
     res.json({
       success: true,
       orderSettings: updateData.orderSettings || restaurant.data().orderSettings || {},
-      superAdminDisabledPages: updateData.superAdminDisabledPages ?? restaurant.data().superAdminDisabledPages ?? []
+      superAdminDisabledPages: updateData.superAdminDisabledPages ?? restaurant.data().superAdminDisabledPages ?? [],
+      printPolling: {
+        kotPollingEnabled: finalPs.kotPollingEnabled === true,
+        kotPollingIntervalSec: Number.isFinite(finalPs.kotPollingIntervalSec) ? finalPs.kotPollingIntervalSec : 20,
+      },
     });
   } catch (error) {
     console.error('Super admin update restaurant settings error:', error);
