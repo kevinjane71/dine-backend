@@ -1477,14 +1477,19 @@ router.get('/activity/logins', authenticateSuperAdmin, requireSuperAdmin, async 
 // POST /api/super-admin/orders/soft-delete
 // Body: { restaurantId: string, date: 'YYYY-MM-DD' | 'today' | 'yesterday' }
 //   OR: { restaurantId: string, startDate: 'YYYY-MM-DD', endDate: 'YYYY-MM-DD' }
+//   OR: { restaurantId: string, all: true }   ← soft-delete EVERY order for the restaurant
 // Soft-deletes (status='deleted') all orders for that restaurant in the date range (server local time).
+// `all: true` ignores dates entirely — used to wipe trial orders before go-live; it also catches
+// orders with a missing/null createdAt that a date-range query would silently skip.
 // Idempotent: orders already marked deleted are skipped.
 router.post('/orders/soft-delete', authenticateSuperAdmin, requireSuperAdmin, async (req, res) => {
   try {
-    const { restaurantId, date, startDate, endDate } = req.body || {};
+    const { restaurantId, date, startDate, endDate, all } = req.body || {};
     if (!restaurantId || typeof restaurantId !== 'string') {
       return res.status(400).json({ success: false, error: 'restaurantId is required' });
     }
+
+    const allMode = all === true;
 
     const parseDateStr = (str) => {
       const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(str);
@@ -1495,7 +1500,9 @@ router.post('/orders/soft-delete', authenticateSuperAdmin, requireSuperAdmin, as
 
     let dayStart, dayEnd;
 
-    if (startDate && endDate) {
+    if (allMode) {
+      // No date bounds — every order for the restaurant.
+    } else if (startDate && endDate) {
       // Date range mode
       if (typeof startDate !== 'string' || typeof endDate !== 'string') {
         return res.status(400).json({ success: false, error: 'startDate and endDate must be strings in YYYY-MM-DD format' });
@@ -1535,12 +1542,12 @@ router.post('/orders/soft-delete', authenticateSuperAdmin, requireSuperAdmin, as
     }
     const restaurantName = restDoc.data().name || restaurantId;
 
-    // Query orders for that restaurant on that day
-    const snapshot = await db.collection(collections.orders)
-      .where('restaurantId', '==', restaurantId)
-      .where('createdAt', '>=', dayStart)
-      .where('createdAt', '<', dayEnd)
-      .get();
+    // Query orders for that restaurant. In allMode, no date filter (also catches null createdAt).
+    let ordersQuery = db.collection(collections.orders).where('restaurantId', '==', restaurantId);
+    if (!allMode) {
+      ordersQuery = ordersQuery.where('createdAt', '>=', dayStart).where('createdAt', '<', dayEnd);
+    }
+    const snapshot = await ordersQuery.get();
 
     const { FieldValue } = require('firebase-admin/firestore');
     const adminUserId = req.admin?.id || req.admin?.email || 'super-admin';
@@ -1583,19 +1590,23 @@ router.post('/orders/soft-delete', authenticateSuperAdmin, requireSuperAdmin, as
     }
 
     const fmtDate = (d) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
-    const startStr = fmtDate(dayStart);
-    const endActual = new Date(dayEnd);
-    endActual.setDate(endActual.getDate() - 1);
-    const endStr = fmtDate(endActual);
-    const dateLabel = startStr === endStr ? startStr : `${startStr} to ${endStr}`;
+    let startStr = null, endStr = null, dateLabel;
+    if (allMode) {
+      dateLabel = 'ALL TIME';
+    } else {
+      startStr = fmtDate(dayStart);
+      const endActual = new Date(dayEnd);
+      endActual.setDate(endActual.getDate() - 1);
+      endStr = fmtDate(endActual);
+      dateLabel = startStr === endStr ? startStr : `${startStr} to ${endStr}`;
+    }
     console.log(`🗑️ Super admin soft-deleted ${deletedCount}/${totalOrders} orders for ${restaurantName} (${restaurantId}) on ${dateLabel}`);
 
     res.json({
       success: true,
       restaurantId,
       restaurantName,
-      date: startStr,
-      ...(startStr !== endStr && { endDate: endStr }),
+      ...(allMode ? { all: true } : { date: startStr, ...(startStr !== endStr && { endDate: endStr }) }),
       totalOrders,
       deletedCount,
       alreadyDeletedCount,
