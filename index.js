@@ -1258,16 +1258,13 @@ function resolveTablePricingRule(floorName, multiPricing) {
 // Server-authoritative fallback: applies even if the client didn't send a pricingRuleId.
 function resolveOrderTypePricingRule(orderType, restaurantData, multiPricing) {
   if (!multiPricing?.enabled || !orderType) return null;
-  const norm = (s) => (s || '').toLowerCase().trim();
+  // Normalize by lowercasing + stripping spaces/underscores/hyphens so "Take Away"/"take-away"/
+  // "take_away"/"takeaway" and any custom multi-word channel all match. No alias table needed.
+  const norm = (s) => (s || '').toLowerCase().replace(/[\s_-]+/g, '');
   const orderTypesList = Array.isArray(restaurantData?.posSettings?.orderTypes)
     ? restaurantData.posSettings.orderTypes : [];
   const otObj = orderTypesList.find((o) => o.id === orderType);
-  const aliases = {
-    takeaway: ['takeaway', 'take away', 'take-away'],
-    delivery: ['delivery'],
-    'dine-in': ['dine-in', 'dinein', 'dine in'],
-  };
-  const candidates = new Set([norm(orderType), norm(otObj?.label || orderType), ...((aliases[norm(orderType)]) || [])]);
+  const candidates = new Set([norm(orderType), norm(otObj?.label)].filter(Boolean));
   const rule = (multiPricing.rules || []).find((r) => r.isActive && candidates.has(norm(r.name)));
   return rule ? rule.id : null;
 }
