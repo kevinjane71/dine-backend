@@ -12867,6 +12867,101 @@ app.get('/api/analytics/:restaurantId/menu-engineering', authenticateToken, asyn
   }
 });
 
+// Hourly Sales Report — hourly breakdown for the /hourly-report page.
+// Returns { success, hourlyBreakdown: { "0".."23": { orders, revenue, topItems:[{name,qty}] } }, summary }.
+// Computed from raw orders bucketed by the LOCAL hour in the caller's timezone. dailyStats only
+// keeps a single hour_XX bucket (no per-hour revenue/items), so raw orders are used for accuracy.
+// tz param is an IANA name (e.g. "Asia/Kolkata") from the frontend, or a numeric offset fallback.
+app.get('/api/analytics/:restaurantId/hourly-sales', authenticateToken, async (req, res) => {
+  try {
+    if (!(await checkFeaturePermission(req, 'analytics', 'read'))) {
+      return res.status(403).json({ error: 'Access denied. You do not have permission to view analytics.' });
+    }
+    const { restaurantId } = req.params;
+    const targetId = req.query.subRestaurantId || restaurantId; // multi-outlet dropdown support
+
+    const rawTz = req.query.tz;
+    const tzName = (rawTz && /[A-Za-z]/.test(String(rawTz))) ? String(rawTz) : null;
+    const tzOffsetMin = tzName ? null : parseInt(rawTz); // getTimezoneOffset() style (IST = -330)
+
+    // Local calendar date (YYYY-MM-DD) + hour (0-23) of a Date, in the caller's timezone.
+    const localParts = (d) => {
+      if (tzName) {
+        try {
+          const p = new Intl.DateTimeFormat('en-CA', { timeZone: tzName, year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', hour12: false })
+            .formatToParts(d).reduce((a, x) => { a[x.type] = x.value; return a; }, {});
+          return { date: `${p.year}-${p.month}-${p.day}`, hour: (parseInt(p.hour) || 0) % 24 };
+        } catch (_) { /* fall through to offset math */ }
+      }
+      const off = Number.isFinite(tzOffsetMin) ? tzOffsetMin : 0;
+      const local = new Date(d.getTime() - off * 60000);
+      const date = `${local.getUTCFullYear()}-${String(local.getUTCMonth() + 1).padStart(2, '0')}-${String(local.getUTCDate()).padStart(2, '0')}`;
+      return { date, hour: local.getUTCHours() };
+    };
+
+    const todayStr = new Date().toISOString().split('T')[0];
+    const startDate = req.query.startDate || todayStr;
+    const endDate = req.query.endDate || todayStr;
+
+    // Query a 1-day-buffered UTC window, then keep only orders whose LOCAL date is in range.
+    const qStart = new Date(new Date(startDate + 'T00:00:00Z').getTime() - 86400000);
+    const qEnd = new Date(new Date(endDate + 'T23:59:59Z').getTime() + 86400000);
+
+    const VOID = new Set(['cancelled', 'deleted', 'refunded', 'saved', 'void']);
+    const snap = await db.collection(collections.orders)
+      .where('restaurantId', '==', targetId)
+      .where('createdAt', '>=', qStart)
+      .where('createdAt', '<=', qEnd)
+      .get();
+
+    const hb = {}; // hour -> { orders, revenue, items:{name:qty} }
+    for (let h = 0; h < 24; h++) hb[h] = { orders: 0, revenue: 0, items: {} };
+    let totalOrders = 0, totalRevenue = 0;
+
+    snap.forEach(doc => {
+      const o = doc.data();
+      if (VOID.has(o.status)) return;
+      const created = o.createdAt?.toDate ? o.createdAt.toDate() : new Date(o.createdAt);
+      const { date, hour } = localParts(created);
+      if (date < startDate || date > endDate) return; // outside requested local range
+      const amt = Number(o.finalAmount ?? o.totalAmount ?? 0) || 0;
+      hb[hour].orders += 1;
+      hb[hour].revenue += amt;
+      totalOrders += 1;
+      totalRevenue += amt;
+      if (Array.isArray(o.items)) {
+        for (const it of o.items) {
+          const nm = it.name || it.itemName;
+          if (!nm) continue;
+          hb[hour].items[nm] = (hb[hour].items[nm] || 0) + (Number(it.quantity) || 1);
+        }
+      }
+    });
+
+    const hourlyBreakdown = {};
+    for (let h = 0; h < 24; h++) {
+      const e = hb[h];
+      const topItems = Object.entries(e.items).sort((a, b) => b[1] - a[1]).slice(0, 3).map(([name, qty]) => ({ name, qty }));
+      hourlyBreakdown[h] = { orders: e.orders, revenue: Math.round(e.revenue * 100) / 100, topItems };
+    }
+
+    res.json({
+      success: true,
+      restaurantId: targetId,
+      dateRange: { start: startDate, end: endDate },
+      summary: {
+        totalOrders,
+        totalRevenue: Math.round(totalRevenue * 100) / 100,
+        avgOrderValue: totalOrders ? Math.round((totalRevenue / totalOrders) * 100) / 100 : 0,
+      },
+      hourlyBreakdown,
+    });
+  } catch (error) {
+    console.error('hourly-sales error:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
 // Sales Summary — supports single date, period presets, and custom date ranges
 app.get('/api/analytics/:restaurantId/daily-summary', authenticateToken, async (req, res) => {
   try {
