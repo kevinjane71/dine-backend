@@ -153,6 +153,11 @@ const notifyKOTPrintRequest = async (restaurantId, orderData) => {
     roomNumber: orderData.roomNumber || '',
     orderType: orderData.orderType || 'dine-in',
     itemsCount: orderData.items?.length || 0,
+    // Keep the exact station/revision payload in the durable event. A missed desktop may
+    // render this event minutes later, after the order document's transient isNew/isUpdated
+    // flags have been cleared by a subsequent order update.
+    items: Array.isArray(orderData.items) ? orderData.items : [],
+    removedItems: Array.isArray(orderData.removedItems) ? orderData.removedItems : [],
     createdAt: orderData.createdAt || new Date().toISOString(),
     isReprint: orderData.isReprint || false,
     // Order UPDATE → only the delta should print. The listener (useAutoPrint) reads this
