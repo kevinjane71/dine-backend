@@ -124,7 +124,7 @@ const bucket = lazyInit(() => {
   return storage.bucket(process.env.FIREBASE_STORAGE_BUCKET || 'dine-menu-uploads');
 });
 
-const { db, collections } = require('./firebase');
+const { db, collections, getRealtimeDb } = require('./firebase');
 const { FieldValue } = require('firebase-admin/firestore');
 const categoryTree = require('./utils/categoryTree');
 const performanceOptimizer = require('./middleware/performanceOptimizer');
@@ -14126,7 +14126,55 @@ app.get('/api/print-poll/:restaurantId', authenticateToken, async (req, res) => 
 
     // Disabled → answer immediately, no order scan. The desktop stops its timer on this.
     if (!enabled) {
-      return res.json({ success: true, enabled: false, intervalSec, orders: [] });
+      return res.json({ success: true, enabled: false, intervalSec, orders: [], events: [] });
+    }
+
+    // Revision-aware fallback for Electron terminals. The realtime KOT stream already contains
+    // exactly what must print (initial/update/reprint, station routing and a unique push key), so
+    // poll that stream instead of trying to reconstruct revisions from the order document.
+    //
+    // Using RTDB push keys as a cursor avoids local-clock skew and makes every update to the same
+    // order independently recoverable. The first request only returns events from a short server-
+    // clock bootstrap window, preventing historical KOTs from printing when polling is enabled.
+    // Existing desktop builds do not send includeEvents and continue through the legacy order
+    // response below unchanged.
+    if (req.query.includeEvents === 'true') {
+      const afterKey = typeof req.query.afterKey === 'string'
+        ? req.query.afterKey.trim().slice(0, 128)
+        : '';
+      const limit = 200;
+      const eventsRef = getRealtimeDb().ref(`events/${restaurantId}/kot`);
+      const query = afterKey
+        ? eventsRef.orderByKey().startAt(afterKey).limitToFirst(limit + 2)
+        : eventsRef.orderByKey().limitToLast(limit);
+      const snapshot = await query.once('value');
+      const serverTime = Date.now();
+      const bootstrapSince = serverTime - 15000;
+      const rows = [];
+      let cursor = afterKey || null;
+      snapshot.forEach(child => {
+        cursor = child.key || cursor;
+        if (afterKey && child.key === afterKey) return; // startAt is inclusive
+        const event = child.val() || {};
+        if (event.type !== 'kot-print-request') return;
+        if (!afterKey && Number(event.ts || 0) < bootstrapSince) return;
+        rows.push({ key: child.key, ...event });
+      });
+
+      const hasMore = afterKey && rows.length > limit;
+      const events = hasMore ? rows.slice(0, limit) : rows;
+      if (events.length > 0) cursor = events[events.length - 1].key;
+
+      return res.json({
+        success: true,
+        enabled: true,
+        intervalSec,
+        serverTime,
+        cursor,
+        hasMore: !!hasMore,
+        events,
+        orders: [],
+      });
     }
 
     // Bounded lookback (default 5 min, cap 15). Mirror the realtime KOT trigger exactly: only
