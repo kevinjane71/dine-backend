@@ -24435,24 +24435,54 @@ app.get('/api/kot/render/:restaurantId/:orderId', async (req, res) => {
     // Filter items by newOnly (incremental KOT) and/or print station
     const { stationId, newOnly } = req.query;
     const incremental = newOnly === 'true';
-    let items = orderData.items || [];
-    let removedItems = [];
+    const eventKey = typeof req.query.eventKey === 'string'
+      ? req.query.eventKey.trim().slice(0, 128)
+      : '';
+    let eventSnapshot = null;
+    if (eventKey) {
+      try {
+        const eventSnap = await getRealtimeDb().ref(`events/${restaurantId}/kot/${eventKey}`).once('value');
+        const eventData = eventSnap.val() || {};
+        if (eventData.type === 'kot-print-request' && eventData.orderId === orderId && Array.isArray(eventData.items)) {
+          eventSnapshot = eventData;
+        }
+      } catch (eventError) {
+        console.warn('KOT event snapshot unavailable; falling back to order document:', eventError.message);
+      }
+    }
+    let items = eventSnapshot ? eventSnapshot.items : (orderData.items || []);
+    let removedItems = eventSnapshot && Array.isArray(eventSnapshot.removedItems)
+      ? eventSnapshot.removedItems
+      : [];
 
     // Incremental KOT (order UPDATE): only the delta prints.
     //  - keep isNew / isUpdated items; for a quantity INCREASE print the delta qty (e.g. +1), not the full new qty
     //  - surface removedItems so the station prints a *** CANCELLED *** slip
     if (incremental) {
-      items = items
-        .filter(item => item.isNew === true || item.isUpdated === true)
-        .map(item => (item.isUpdated && Number(item.quantityDelta) > 0)
+      if (!eventSnapshot) {
+        items = items
+          .filter(item => item.isNew === true || item.isUpdated === true)
+          .map(item => (item.isUpdated && Number(item.quantityDelta) > 0)
+            ? { ...item, quantity: Number(item.quantityDelta) }
+            : item);
+        // stored removed items carry quantity:0 + previousQuantity — show the removed count on the CANCELLED slip
+        removedItems = (orderData.removedItems || []).map(i => ({
+          ...i,
+          isRemoved: true,
+          quantity: Number(i.previousQuantity) || Number(i.quantity) || 1,
+        }));
+      } else {
+        // Event snapshots already contain only the station/revision delta. Preserve them even
+        // after the order document has lost its temporary isNew/isUpdated markers.
+        items = items.map(item => (item.isUpdated && Number(item.quantityDelta) > 0)
           ? { ...item, quantity: Number(item.quantityDelta) }
           : item);
-      // stored removed items carry quantity:0 + previousQuantity — show the removed count on the CANCELLED slip
-      removedItems = (orderData.removedItems || []).map(i => ({
-        ...i,
-        isRemoved: true,
-        quantity: Number(i.previousQuantity) || Number(i.quantity) || 1,
-      }));
+        removedItems = removedItems.map(i => ({
+          ...i,
+          isRemoved: true,
+          quantity: Number(i.previousQuantity) || Number(i.quantity) || 1,
+        }));
+      }
     }
 
     // KOT Exclusion: filter out excluded items (ancestor-aware for tree menus)
