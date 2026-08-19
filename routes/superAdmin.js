@@ -160,6 +160,27 @@ router.get('/stats', authenticateSuperAdmin, requireSuperAdmin, async (req, res)
   }
 });
 
+// ─── GCP-native restaurants ─────────────────────────────────────────
+// Returns the restaurant IDs that physically exist in the GCP Postgres, so dine-admin can
+// tag which restaurants are truly "GCP-native" (data lives in Cloud SQL) vs merely routed.
+// Only meaningful on the GCP backend (DATABASE_URL set); elsewhere returns pg:false, [].
+let _gcpNativePool = null;
+router.get('/gcp-native-ids', authenticateSuperAdmin, requireSuperAdmin, async (req, res) => {
+  try {
+    if (!process.env.DATABASE_URL) return res.json({ pg: false, ids: [], count: 0 });
+    if (!_gcpNativePool) {
+      const { Pool } = require('pg');
+      _gcpNativePool = new Pool({ connectionString: process.env.DATABASE_URL, max: 2 });
+    }
+    const r = await _gcpNativePool.query('SELECT id FROM restaurants');
+    const ids = r.rows.map((x) => String(x.id));
+    res.json({ pg: true, ids, count: ids.length });
+  } catch (error) {
+    console.error('gcp-native-ids error:', error.message);
+    res.status(500).json({ pg: false, ids: [], count: 0, error: error.message });
+  }
+});
+
 // ─── Demo Requests (paginated, 50 default) ──────────────────────────
 router.get('/demo-requests', authenticateSuperAdmin, requireSuperAdmin, async (req, res) => {
   try {
