@@ -13,18 +13,41 @@
  * does nothing until a provisioned hub is wired up. Idempotent + retry-safe: a watermark only
  * advances once the cloud acknowledges, so a dropped connection just retries next cycle.
  */
+const fs = require('fs');
 const { Pool } = require('pg');
 const { selectSince, applyRecords, UP_TABLES, DOWN_TABLES } = require('./cloudSyncWorker');
 
 let pool = null;
 let timer = null;
 let running = false;
+let _rid = null; // resolved restaurant id (cached)
 
-const CLOUD = () => (process.env.CLOUD_API_URL || '').replace(/\/+$/, '');
-const TOKEN = () => process.env.SYNC_TOKEN;
-const RID = () => process.env.SYNC_RESTAURANT_ID;
+// The hub's sync credentials live in its config file (written at provisioning) so a freshly-issued
+// token is picked up WITHOUT restarting the backend. Env vars win if present (for tests).
+function syncConfig() {
+  try {
+    const p = process.env.SYNC_CONFIG_PATH;
+    if (p && fs.existsSync(p)) return JSON.parse(fs.readFileSync(p, 'utf8')) || {};
+  } catch (_) {}
+  return {};
+}
+const CLOUD = () => (process.env.CLOUD_API_URL || syncConfig().cloudApiUrl || '').replace(/\/+$/, '');
+const TOKEN = () => process.env.SYNC_TOKEN || syncConfig().syncToken || '';
 const INTERVAL = () => Number(process.env.API_SYNC_INTERVAL_MS) || 15000;
 const BATCH = 200;
+
+// The local DB is single-tenant (one restaurant), so the scope is simply that restaurant.
+async function RID() {
+  if (_rid) return _rid;
+  _rid = process.env.SYNC_RESTAURANT_ID || syncConfig().boundRestaurantId || null;
+  if (!_rid) {
+    try {
+      const r = await pool.query('SELECT id FROM restaurants ORDER BY created_at ASC NULLS FIRST LIMIT 1');
+      if (r.rows[0]) _rid = r.rows[0].id;
+    } catch (_) {}
+  }
+  return _rid;
+}
 
 async function getWatermark(key) {
   const r = await pool.query('SELECT last_updated_at FROM sync_watermark WHERE key = $1', [key]);
@@ -39,18 +62,20 @@ async function setWatermark(key, ts) {
 
 // UP: collect changed rows per table, push the batch, advance watermarks only on ack.
 async function pushUp() {
+  const rid = await RID();
+  if (!rid) return { pushed: 0 };
   const groups = {};
   const nexts = {};
   for (const table of UP_TABLES) {
     const wm = await getWatermark('apiup:' + table);
-    const { rows, next } = await selectSince(pool, table, wm, RID(), BATCH);
+    const { rows, next } = await selectSince(pool, table, wm, rid, BATCH);
     if (rows.length) { groups[table] = rows; nexts[table] = next; }
   }
   if (!Object.keys(groups).length) return { pushed: 0 };
   const res = await fetch(`${CLOUD()}/api/sync/push`, {
     method: 'POST',
     headers: { Authorization: `Bearer ${TOKEN()}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify({ restaurantId: RID(), records: groups }),
+    body: JSON.stringify({ restaurantId: rid, records: groups }),
   });
   if (!res.ok) throw new Error(`push HTTP ${res.status}`);
   for (const [t, ts] of Object.entries(nexts)) await setWatermark('apiup:' + t, ts);
@@ -59,6 +84,8 @@ async function pushUp() {
 
 // DOWN: pull cloud changes since the watermark and apply them locally (owner menu/price/config).
 async function pullDown() {
+  const rid = await RID();
+  if (!rid) return { applied: 0 };
   const since = await getWatermark('apidown:all');
   const res = await fetch(`${CLOUD()}/api/sync/pull?since=${encodeURIComponent(since)}`, {
     headers: { Authorization: `Bearer ${TOKEN()}` },
@@ -68,7 +95,7 @@ async function pullDown() {
   const rec = data.records || {};
   let applied = 0;
   for (const [table, rows] of Object.entries(rec)) {
-    const r = await applyRecords(pool, table, rows, { scopeRid: RID(), direction: 'down' });
+    const r = await applyRecords(pool, table, rows, { scopeRid: rid, direction: 'down' });
     applied += r.applied || 0;
   }
   if (data.next) await setWatermark('apidown:all', data.next);
@@ -77,6 +104,7 @@ async function pullDown() {
 
 async function cycle() {
   if (running) return;
+  if (!TOKEN()) return; // not provisioned for sync yet — quiet no-op until a token is written
   running = true;
   try {
     await pushUp();
@@ -90,15 +118,15 @@ async function cycle() {
 }
 
 function start() {
-  if (!CLOUD() || !TOKEN() || !RID()) {
-    console.log('[apiSync] not started (needs CLOUD_API_URL + SYNC_TOKEN + SYNC_RESTAURANT_ID).');
+  if (!CLOUD()) {
+    console.log('[apiSync] not started (no CLOUD_API_URL / cloudApiUrl).');
     return false;
   }
   if (timer) return true;
   pool = new Pool({ connectionString: process.env.DATABASE_URL, max: 3 });
   timer = setInterval(cycle, INTERVAL());
-  setTimeout(cycle, 3000); // first pass shortly after boot
-  console.log(`[apiSync] started — every ${INTERVAL()}ms → ${CLOUD()} (restaurant ${RID()})`);
+  setTimeout(cycle, 3000); // first pass shortly after boot; token/rid resolved lazily each cycle
+  console.log(`[apiSync] started — every ${INTERVAL()}ms → ${CLOUD()} (token+restaurant resolved from config)`);
   return true;
 }
 
