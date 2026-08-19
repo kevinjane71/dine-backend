@@ -85,6 +85,11 @@ router.post('/push', authenticateToken, express.json({ limit: '25mb' }), async (
       results.push(await applyRecords(p, table, rows, { scopeRid: rid, direction: 'up' }));
     }
     const applied = results.reduce((a, r) => a + (r.applied || 0), 0);
+    // Server-authoritative totals: if orders/payments were synced, recompute daily_stats from the
+    // now-synced order event log rather than trusting any pushed aggregate. Best-effort, async.
+    if ((groups.orders || groups.pos_payments || groups.pos_invoices) && req.app && req.app.locals && req.app.locals.recomputeDailyStats) {
+      Promise.resolve().then(() => req.app.locals.recomputeDailyStats(rid)).catch(() => {});
+    }
     res.json({ ok: true, applied, results });
   } catch (e) {
     console.error('[sync/push] error:', e.message);

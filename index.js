@@ -41674,6 +41674,9 @@ async function recomputeDailyStatsFromOrders(restaurantId, { fullHistory = false
     _statsRecomputing.delete(restaurantId);
   }
 }
+// Expose the server-authoritative recompute so the API-sync push endpoint can rebuild totals from
+// the just-synced orders (never trust a client's aggregate — recompute from the order event log).
+app.locals.recomputeDailyStats = recomputeDailyStatsFromOrders;
 
 try {
   require('./services/cloudSyncWorker').startCloudSync({
