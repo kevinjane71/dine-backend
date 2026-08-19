@@ -209,6 +209,23 @@ async function ensureIdempotentUpdatedAt() {
   }
 }
 
+// Same fix, but on ANY pool — used by the API-sync endpoints so cloud writes preserve the synced
+// timestamp too (otherwise the cloud trigger rewrites updated_at=now() and rows drift each cycle).
+async function makeUpdatedAtIdempotent(anyPool) {
+  try {
+    await anyPool.query(`
+      CREATE OR REPLACE FUNCTION update_updated_at_column() RETURNS trigger AS $$
+      BEGIN
+        IF NEW.updated_at IS NOT DISTINCT FROM OLD.updated_at THEN
+          NEW.updated_at := now();
+        END IF;
+        RETURN NEW;
+      END;
+      $$ LANGUAGE plpgsql`);
+    return true;
+  } catch (e) { return false; }
+}
+
 async function getWatermark(key) {
   const r = await localPool.query('SELECT last_updated_at FROM sync_watermark WHERE key = $1', [key]);
   return (r.rows[0] && r.rows[0].last_updated_at) || new Date(0);
@@ -733,5 +750,5 @@ async function selectSince(pool, table, sinceIso, scopeRid, limit = 500) {
 module.exports = {
   startCloudSync, stopCloudSync, runCycle, triggerSync, getSyncStatus, ensureTombstoneInfra,
   // API-based sync (dormant until wired):
-  applyRecords, selectSince, UP_TABLES, DOWN_TABLES,
+  applyRecords, selectSince, UP_TABLES, DOWN_TABLES, makeUpdatedAtIdempotent,
 };

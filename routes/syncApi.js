@@ -18,14 +18,19 @@ const router = express.Router();
 const { Pool } = require('pg');
 const jwt = require('jsonwebtoken');
 const { authenticateToken } = require('../middleware/auth');
-const { applyRecords, selectSince, DOWN_TABLES } = require('../services/cloudSyncWorker');
+const { applyRecords, selectSince, DOWN_TABLES, makeUpdatedAtIdempotent } = require('../services/cloudSyncWorker');
 
 // Dedicated small pool to this backend's own DB (Cloud SQL on GCP). Absent on Firestore-only
 // deployments → endpoints degrade gracefully to a 503 / empty pull.
 let _pool = null;
 function pool() {
   if (!process.env.DATABASE_URL) return null;
-  if (!_pool) _pool = new Pool({ connectionString: process.env.DATABASE_URL, max: 4, statement_timeout: 20000 });
+  if (!_pool) {
+    _pool = new Pool({ connectionString: process.env.DATABASE_URL, max: 4, statement_timeout: 20000 });
+    // Make the cloud updated_at trigger PRESERVE the synced timestamp (once) so a pushed row
+    // doesn't get rewritten to now() and drift on the next pull. Best-effort.
+    makeUpdatedAtIdempotent(_pool).catch(() => {});
+  }
   return _pool;
 }
 
