@@ -41536,8 +41536,11 @@ const server = app.listen(PORT, '0.0.0.0', async () => {
       } catch (e) {
         console.error('❌ Schema migration failed on boot:', e.message);
       }
+      // API-based cloud sync (hub → cloud). Self-guards: does nothing unless CLOUD_API_URL +
+      // SYNC_TOKEN + SYNC_RESTAURANT_ID are set (provisioned hub). Safe no-op otherwise.
+      try { require('./services/apiSyncWorker').start(); } catch (e) { console.warn('[apiSync] start skipped:', e.message); }
     }
-    
+
     // Clear localhost blocks for development
     try {
       await vercelSecurityMiddleware.clearLocalhostBlocks();
