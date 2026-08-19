@@ -41491,6 +41491,37 @@ app.post('/api/local-server/sync-now', authenticateToken, async (req, res) => {
   }
 });
 
+// Provision API-based cloud sync on THIS hub: exchange the caller's (owner) token for a
+// restaurant-scoped sync token from the cloud, and store it in the hub config so the sync worker
+// picks it up (no restart). The cloud validates the caller's access to the restaurant.
+app.post('/api/local-server/enable-sync', authenticateToken, async (req, res) => {
+  if (process.env.LOCAL_SERVER_MODE !== 'true') return res.status(400).json({ error: 'not a local server' });
+  const cloudUrl = (process.env.CLOUD_API_URL || '').replace(/\/+$/, '');
+  const cfgPath = process.env.SYNC_CONFIG_PATH;
+  const rid = req.body && req.body.restaurantId;
+  if (!cloudUrl || !cfgPath) return res.status(400).json({ error: 'sync not configured on this hub' });
+  if (!rid) return res.status(400).json({ error: 'restaurantId required' });
+  try {
+    const r = await fetch(`${cloudUrl}/api/sync/token`, {
+      method: 'POST',
+      headers: { 'Authorization': req.headers.authorization || '', 'Content-Type': 'application/json' },
+      body: JSON.stringify({ restaurantId: rid }),
+    });
+    if (!r.ok) return res.status(502).json({ error: `cloud refused sync token (${r.status})` });
+    const { token } = await r.json();
+    if (!token) return res.status(502).json({ error: 'no token from cloud' });
+    const fsm = require('fs');
+    let cfg = {}; try { cfg = JSON.parse(fsm.readFileSync(cfgPath, 'utf8')); } catch (_) {}
+    cfg.syncToken = token; cfg.boundRestaurantId = rid; cfg.cloudApiUrl = cloudUrl;
+    fsm.writeFileSync(cfgPath, JSON.stringify(cfg, null, 2));
+    // Kick a worker start in case it wasn't running yet.
+    try { require('./services/apiSyncWorker').start(); } catch (_) {}
+    res.json({ ok: true, restaurantId: rid });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // 404 handler - must be last (after all routes)
 app.use((req, res) => {
   res.status(404).json({
