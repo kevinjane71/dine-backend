@@ -16,6 +16,7 @@
 const express = require('express');
 const router = express.Router();
 const { Pool } = require('pg');
+const jwt = require('jsonwebtoken');
 const { authenticateToken } = require('../middleware/auth');
 const { applyRecords, selectSince, DOWN_TABLES } = require('../services/cloudSyncWorker');
 
@@ -31,6 +32,11 @@ function pool() {
 // The restaurant is supplied by the hub, but we NEVER trust it blindly: verify the authenticated
 // user actually owns or belongs to that restaurant before scoping any read/write to it.
 async function resolveScope(req, rid) {
+  // A dedicated sync token (issued by POST /api/sync/token) carries the restaurant grant directly,
+  // scoped to exactly one restaurant — no per-request access lookup needed.
+  if (req.user && req.user.syncRestaurantId) {
+    return (!rid || String(rid) === String(req.user.syncRestaurantId)) ? req.user.syncRestaurantId : null;
+  }
   if (!rid) return null;
   const userId = req.user && req.user.userId;
   if (!userId) return null;
@@ -45,6 +51,16 @@ async function resolveScope(req, rid) {
     return r.rowCount > 0 ? rid : null;
   } catch (_) { return null; }
 }
+
+// ─── Issue a long-lived, restaurant-scoped SYNC TOKEN for a hub ───────────────
+// Owner/staff of the restaurant only. The hub stores this and authenticates its sync worker with
+// it — far safer than a shared DB credential: it grants exactly one restaurant, nothing else.
+router.post('/token', authenticateToken, async (req, res) => {
+  const rid = await resolveScope(req, req.body && req.body.restaurantId);
+  if (!rid) return res.status(403).json({ error: 'no access to that restaurant' });
+  const token = jwt.sign({ syncRestaurantId: rid, role: 'sync' }, process.env.JWT_SECRET, { expiresIn: '365d' });
+  res.json({ token, restaurantId: rid });
+});
 
 // ─── UP: hub → cloud ──────────────────────────────────────────────────────────
 // body: { records: { "<table>": [ {id, updated_at, ...cols}, … ], … } }
