@@ -17226,6 +17226,9 @@ app.use('/api/print-installer', printInstallerRoutes);
 
 // Bulk menu upload (signed URL + async extraction)
 app.use('/api/menus', require('./routes/bulkMenuUpload'));
+// API-based offline sync (hub → cloud push / cloud → hub pull). Token-scoped, idempotent.
+// Endpoints exist but are only ever called by the hub's sync worker (not yet shipped).
+app.use('/api/sync', require('./routes/syncApi'));
 
 // Unified offline/online POS — device registry + event log (additive; needs sync tables).
 app.use('/api', require('./routes/offlineDevices'));
