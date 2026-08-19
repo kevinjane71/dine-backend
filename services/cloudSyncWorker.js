@@ -662,4 +662,76 @@ function stopCloudSync() {
   cloudInfraReady = false;
 }
 
-module.exports = { startCloudSync, stopCloudSync, runCycle, triggerSync, getSyncStatus, ensureTombstoneInfra };
+// ─────────────────────────────────────────────────────────────────────────────
+// API-BASED SYNC (secure transport) — apply a batch of records that arrived over an
+// authenticated HTTP endpoint, using the SAME idempotent / column-scoped / restaurant-scoped /
+// preserve-col guards as replicate(). The source is the request body, not a src Pool, so the
+// hub never needs the cloud DB credential. Dormant until wired to /api/sync/push + a hub worker.
+// ─────────────────────────────────────────────────────────────────────────────
+async function applyRecords(pool, table, records, { scopeRid = null, direction = 'up' } = {}) {
+  if (!Array.isArray(records) || !records.length) return { table, applied: 0, skipped: 0, failed: 0 };
+  const dstCols = await getColumns(pool, table);
+  const dstNames = new Set(dstCols.map((c) => c.column_name));
+  if (!dstNames.has('id') || !dstNames.has('updated_at')) return { table, applied: 0, skipped: records.length, failed: 0, reason: 'no id/updated_at' };
+  const typeOf = Object.fromEntries(dstCols.map((c) => [c.column_name, c.data_type]));
+  const pk = await getPk(pool, table);
+  const isDown = direction === 'down';
+  const scopeCol = table === 'restaurants' ? 'id' : 'restaurant_id';
+  const onlyCols = [
+    ...(SYNC_ONLY_COLS[table] || []),
+    ...(!isDown ? (UP_ONLY_COLS[table] || []) : []),
+    ...(isDown ? (DOWN_ONLY_COLS[table] || []) : []),
+  ].filter((c, i, a) => a.indexOf(c) === i && dstNames.has(c));
+
+  let applied = 0, skipped = 0, failed = 0;
+  for (const rec of records) {
+    try {
+      // Restaurant-scope guard — never let a record for a different restaurant through.
+      if (scopeRid && dstNames.has(scopeCol) && String(rec[scopeCol]) !== String(scopeRid)) { skipped++; continue; }
+      let names, sql;
+      if (onlyCols.length) {
+        const useCols = onlyCols.filter((c) => c in rec);
+        if (!useCols.length) { skipped++; continue; }
+        names = [...useCols, 'updated_at', ...pk];
+        const setClause = useCols.map((c, i) => `"${c}"=$${i + 1}`).join(', ');
+        const uaParam = useCols.length + 1;
+        const pkClause = pk.map((c, i) => `"${c}"=$${useCols.length + 2 + i}`).join(' AND ');
+        sql = `UPDATE "${table}" SET ${setClause}, "updated_at"=$${uaParam} WHERE ${pkClause} AND "${table}".updated_at < $${uaParam}`;
+      } else {
+        const preserveCols = isDown ? (DOWN_PRESERVE_COLS[table] || []) : [];
+        names = dstCols.map((c) => c.column_name).filter((c) => c in rec);
+        if (!names.includes('id') || !names.includes('updated_at')) { skipped++; continue; }
+        const setCols = names.filter((c) => !pk.includes(c) && !preserveCols.includes(c));
+        const ph = names.map((_, i) => `$${i + 1}`).join(',');
+        const conflictTgt = pk.map((c) => `"${c}"`).join(',');
+        const upd = setCols.length ? setCols.map((c) => `"${c}"=EXCLUDED."${c}"`).join(',') : `"${pk[0]}"=EXCLUDED."${pk[0]}"`;
+        const quotedIns = names.map((c) => `"${c}"`).join(',');
+        sql = `INSERT INTO "${table}" (${quotedIns}) VALUES (${ph}) ON CONFLICT (${conflictTgt}) DO UPDATE SET ${upd} WHERE "${table}".updated_at < EXCLUDED.updated_at`;
+      }
+      const vals = names.map((c) => coerce(rec[c], typeOf[c]));
+      const r = await pool.query(sql, vals);
+      if (r.rowCount > 0) applied++; else skipped++;
+    } catch (_) { failed++; }
+  }
+  return { table, applied, skipped, failed };
+}
+
+// Return rows of `table` changed since `sinceIso`, scoped to one restaurant (for DOWN pull).
+async function selectSince(pool, table, sinceIso, scopeRid, limit = 500) {
+  const cols = await getColumns(pool, table);
+  const names = new Set(cols.map((c) => c.column_name));
+  if (!names.has('updated_at')) return { rows: [], next: sinceIso };
+  const scopeCol = table === 'restaurants' ? 'id' : 'restaurant_id';
+  const scoped = scopeRid && names.has(scopeCol);
+  const where = scoped ? `updated_at > $1 AND "${scopeCol}" = $2` : `updated_at > $1`;
+  const params = scoped ? [sinceIso || new Date(0).toISOString(), scopeRid] : [sinceIso || new Date(0).toISOString()];
+  const r = await pool.query(`SELECT * FROM "${table}" WHERE ${where} ORDER BY updated_at ASC LIMIT ${Math.min(limit, 1000)}`, params);
+  const next = r.rows.length ? r.rows[r.rows.length - 1].updated_at : sinceIso;
+  return { rows: r.rows, next };
+}
+
+module.exports = {
+  startCloudSync, stopCloudSync, runCycle, triggerSync, getSyncStatus, ensureTombstoneInfra,
+  // API-based sync (dormant until wired):
+  applyRecords, selectSince, UP_TABLES, DOWN_TABLES,
+};
