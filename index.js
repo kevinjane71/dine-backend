@@ -1742,6 +1742,11 @@ if (process.env.LOCAL_SERVER_MODE === 'true') {
 // Running compression() in serverless adds CPU overhead without benefit.
 
 app.use(morgan(process.env.NODE_ENV === 'production' ? 'combined' : 'dev'));
+// Menu bulk-save can carry a very large extracted menu (many items + variants + channel prices).
+// Give just that route a higher body limit so big menus are never rejected by the default 10mb
+// cap. Mounted BEFORE the global parser so it wins for this path (body-parser skips a request
+// whose body is already parsed).
+app.use('/api/menus/bulk-save', bodyParser.json({ limit: '50mb' }));
 app.use(bodyParser.json({
   limit: '10mb',
   verify: (req, res, buf) => {
@@ -2830,16 +2835,25 @@ const extractMenuFromPDF = async (pdfUrl, businessType = 'restaurant') => {
   const buffer = await downloadFileBuffer(pdfUrl);
   const fileName = pdfUrl.split('/').pop().split('?')[0] || 'menu.pdf';
 
-  // Try 1: OpenAI native PDF (Files API + gpt-4o) — best, reads visual layout + text
+  // Try 1: PAGE-BY-PAGE (the robust engine). Split the PDF and send ONE page at a time to
+  // gpt-4o, then merge. A many-page menu never blows the model's context/output limits the
+  // way sending the whole document in a single call does. Same engine the async job uses.
   try {
-    const result = await extractMenuFromPDFViaFilesAPI(buffer, fileName);
+    const { extractPdfBufferPageByPage } = require('./services/menuExtractionService');
+    const result = await extractPdfBufferPageByPage(buffer, {
+      concurrency: 3,
+      maxRetries: 2,
+      onProgress: (p) => {
+        if (p.phase === 'start') console.log(`📄 Page-by-page extraction: ${p.totalPages} pages`);
+      },
+    });
     if (result.menuItems.length > 0) {
-      console.log(`✅ Files API path extracted ${result.menuItems.length} items`);
-      return result;
+      console.log(`✅ Page-by-page extracted ${result.menuItems.length} items from ${result.totalPages} pages`);
+      return { categories: result.categories, menuItems: result.menuItems };
     }
-    console.log('⚠️ Files API returned 0 items, trying text fallback...');
+    console.log('⚠️ Page-by-page returned 0 items, trying text fallback...');
   } catch (err) {
-    console.warn('⚠️ Files API path failed, falling back to pdf-parse:', err.message);
+    console.warn('⚠️ Page-by-page path failed, falling back to pdf-parse:', err.message);
   }
 
   // Try 2: Fallback — pdf-parse text extraction + GPT-4o

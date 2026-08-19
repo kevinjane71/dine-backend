@@ -9,7 +9,9 @@ let _openai = null;
 function getOpenAI() {
   if (!_openai) {
     const OpenAI = require('openai');
-    _openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+    // Bounded per-request timeout so a hung OpenAI call can never stall a worker forever.
+    // We do our own page-level retry/backoff, so keep the SDK's built-in retries at 0.
+    _openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY, timeout: 120000, maxRetries: 0 });
   }
   return _openai;
 }
@@ -114,21 +116,29 @@ async function extractPageWithRetry(pageBuffer, pageIndex, maxRetries) {
 
 // ─── PDF Page-by-Page Processing ───────────────────────────────────────────────
 
-async function processPDFPageByPage(pdfBuffer, jobId, restaurantId, fileName, options = {}) {
+/**
+ * Pure page-by-page PDF → menu extraction. Splits a PDF into single pages, sends each
+ * page to OpenAI independently (bounded concurrency + retry), and merges the results.
+ * No RTDB/Redis coupling — callers hook progress via the optional `onProgress` callback.
+ * This is the ONE extraction engine used by BOTH the async job path and the synchronous
+ * bulk-upload path, so heavy multi-page PDFs never blow the model's context window.
+ *
+ * @param {Buffer} pdfBuffer
+ * @param {object} options - { concurrency=3, maxRetries=2, onProgress? }
+ *   onProgress({ phase:'start'|'page-done'|'page-error', page, totalPages, itemsFound, error })
+ * @returns {Promise<{ categories:Array, menuItems:Array, totalPages:number }>}
+ */
+async function extractPdfBufferPageByPage(pdfBuffer, options = {}) {
   const concurrency = options.concurrency || 3;
-  const maxRetries = options.maxRetries || 2;
+  const maxRetries = options.maxRetries != null ? options.maxRetries : 2;
+  const onProgress = typeof options.onProgress === 'function' ? options.onProgress : null;
 
-  // Split PDF into pages
   const pdfDoc = await PDFDocument.load(pdfBuffer, { ignoreEncryption: true });
   const totalPages = pdfDoc.getPageCount();
-  console.log(`📄 PDF has ${totalPages} pages — processing with concurrency ${concurrency}`);
+  console.log(`📄 PDF has ${totalPages} pages — processing page-by-page (concurrency ${concurrency})`);
+  if (onProgress) await onProgress({ phase: 'start', totalPages });
 
-  // Notify start
-  await realtimeService.pushEvent(restaurantId, 'bulk-upload', 'bulk-upload-started', {
-    jobId, fileName, totalPages,
-  });
-
-  // Create single-page PDF buffers
+  // Create single-page PDF buffers.
   const pageBuffers = [];
   for (let i = 0; i < totalPages; i++) {
     const singleDoc = await PDFDocument.create();
@@ -137,26 +147,34 @@ async function processPDFPageByPage(pdfBuffer, jobId, restaurantId, fileName, op
     pageBuffers.push(await singleDoc.save());
   }
 
-  // Process pages with concurrency
   const pageResults = await processWithConcurrency(pageBuffers, concurrency, async (pageBuffer, pageIndex) => {
     console.log(`📖 Processing page ${pageIndex + 1}/${totalPages}...`);
     const result = await extractPageWithRetry(pageBuffer, pageIndex, maxRetries);
-
-    // Push progress to RTDB
-    if (result.error) {
-      await realtimeService.pushEvent(restaurantId, 'bulk-upload', 'bulk-upload-page-error', {
-        jobId, page: pageIndex + 1, totalPages, error: result.error,
-      });
-    } else {
-      await realtimeService.pushEvent(restaurantId, 'bulk-upload', 'bulk-upload-page-done', {
-        jobId, page: pageIndex + 1, totalPages, itemsFound: result.menuItems.length,
-      });
+    if (onProgress) {
+      await onProgress(result.error
+        ? { phase: 'page-error', page: pageIndex + 1, totalPages, error: result.error }
+        : { phase: 'page-done', page: pageIndex + 1, totalPages, itemsFound: result.menuItems.length });
     }
     return result;
   });
 
-  // Merge all page results
-  return mergePageResults(pageResults);
+  return { ...mergePageResults(pageResults), totalPages };
+}
+
+// Async-job wrapper: same engine, with RTDB progress events for the live upload UI.
+async function processPDFPageByPage(pdfBuffer, jobId, restaurantId, fileName, options = {}) {
+  return extractPdfBufferPageByPage(pdfBuffer, {
+    ...options,
+    onProgress: async (p) => {
+      if (p.phase === 'start') {
+        await realtimeService.pushEvent(restaurantId, 'bulk-upload', 'bulk-upload-started', { jobId, fileName, totalPages: p.totalPages });
+      } else if (p.phase === 'page-error') {
+        await realtimeService.pushEvent(restaurantId, 'bulk-upload', 'bulk-upload-page-error', { jobId, page: p.page, totalPages: p.totalPages, error: p.error });
+      } else {
+        await realtimeService.pushEvent(restaurantId, 'bulk-upload', 'bulk-upload-page-done', { jobId, page: p.page, totalPages: p.totalPages, itemsFound: p.itemsFound });
+      }
+    },
+  });
 }
 
 // ─── Non-PDF File Processing (delegates to existing extractors) ────────────────
@@ -360,4 +378,5 @@ async function processUploadedFile(bucket, gcsPath, jobId, restaurantId, busines
 
 module.exports = {
   processUploadedFile,
+  extractPdfBufferPageByPage,
 };
