@@ -6032,10 +6032,12 @@ app.get('/api/auth/pin/status', authenticateToken, async (req, res) => {
       return res.status(404).json({ error: 'User not found' });
     }
     const userData = userDoc.data();
+    // LOGIN PIN (log into the app without OTP) — stored separately from the Approval PIN
+    // (pinHash/pinEnabled, which unlocks the terminal + approves completed-order edits).
     res.json({
       success: true,
-      pinEnabled: userData.pinEnabled || false,
-      pinUpdatedAt: userData.pinUpdatedAt || null
+      pinEnabled: userData.loginPinEnabled || false,
+      pinUpdatedAt: userData.loginPinUpdatedAt || null
     });
   } catch (error) {
     console.error('PIN status error:', error);
@@ -6069,15 +6071,15 @@ app.post('/api/auth/pin/set', authenticateToken, async (req, res) => {
     if (userData.role !== 'owner') {
       return res.status(403).json({ error: 'PIN login is only available for restaurant owners' });
     }
-    if (userData.pinEnabled && userData.pinHash) {
+    if (userData.loginPinEnabled && userData.loginPinHash) {
       return res.status(400).json({ error: 'PIN already set. Use change PIN instead.' });
     }
 
-    const pinHash = await bcrypt.hash(pin, 10);
+    const loginPinHash = await bcrypt.hash(pin, 10);
     await db.collection(collections.users).doc(userId).update({
-      pinHash,
-      pinEnabled: true,
-      pinUpdatedAt: new Date(),
+      loginPinHash,
+      loginPinEnabled: true,
+      loginPinUpdatedAt: new Date(),
       pinAttempts: 0,
       pinLockedUntil: null
     });
@@ -6113,19 +6115,19 @@ app.post('/api/auth/pin/change', authenticateToken, async (req, res) => {
     if (userData.role !== 'owner') {
       return res.status(403).json({ error: 'PIN login is only available for restaurant owners' });
     }
-    if (!userData.pinHash || !userData.pinEnabled) {
+    if (!userData.loginPinHash || !userData.loginPinEnabled) {
       return res.status(400).json({ error: 'No PIN set. Use set PIN first.' });
     }
 
-    const isValid = await bcrypt.compare(currentPin, userData.pinHash);
+    const isValid = await bcrypt.compare(currentPin, userData.loginPinHash);
     if (!isValid) {
       return res.status(401).json({ error: 'Current PIN is incorrect' });
     }
 
-    const pinHash = await bcrypt.hash(newPin, 10);
+    const loginPinHash = await bcrypt.hash(newPin, 10);
     await db.collection(collections.users).doc(userId).update({
-      pinHash,
-      pinUpdatedAt: new Date(),
+      loginPinHash,
+      loginPinUpdatedAt: new Date(),
       pinAttempts: 0,
       pinLockedUntil: null
     });
@@ -6152,19 +6154,19 @@ app.post('/api/auth/pin/disable', authenticateToken, async (req, res) => {
       return res.status(404).json({ error: 'User not found' });
     }
     const userData = userDoc.data();
-    if (!userData.pinHash || !userData.pinEnabled) {
+    if (!userData.loginPinHash || !userData.loginPinEnabled) {
       return res.status(400).json({ error: 'PIN is not enabled' });
     }
 
-    const isValid = await bcrypt.compare(currentPin, userData.pinHash);
+    const isValid = await bcrypt.compare(currentPin, userData.loginPinHash);
     if (!isValid) {
       return res.status(401).json({ error: 'Current PIN is incorrect' });
     }
 
     await db.collection(collections.users).doc(userId).update({
-      pinEnabled: false,
-      pinHash: null,
-      pinUpdatedAt: new Date(),
+      loginPinEnabled: false,
+      loginPinHash: null,
+      loginPinUpdatedAt: new Date(),
       pinAttempts: 0,
       pinLockedUntil: null
     });
@@ -6241,8 +6243,13 @@ app.post('/api/auth/pin/login', async (req, res) => {
     const userData = userDoc.data();
     const userId = userDoc.id;
 
-    // Check PIN is enabled
-    if (!userData.pinEnabled || !userData.pinHash) {
+    // Verify against the LOGIN PIN if the owner has set one; otherwise fall back to the Approval PIN
+    // (pinHash) — existing owners whose single PIN pre-dates the login/approval split are never locked
+    // out, and once they set a distinct Login PIN only that is accepted for login (true separation).
+    const _useLoginPin = !!(userData.loginPinEnabled && userData.loginPinHash);
+    const _activeHash = _useLoginPin ? userData.loginPinHash : userData.pinHash;
+    const _activeEnabled = _useLoginPin ? userData.loginPinEnabled : userData.pinEnabled;
+    if (!_activeEnabled || !_activeHash) {
       return res.status(403).json({ error: 'PIN login is not enabled for this account. Please enable it from Settings.' });
     }
 
@@ -6257,8 +6264,8 @@ app.post('/api/auth/pin/login', async (req, res) => {
       await userDoc.ref.update({ pinAttempts: 0, pinLockedUntil: null });
     }
 
-    // Verify PIN
-    const isValid = await bcrypt.compare(pin, userData.pinHash);
+    // Verify PIN (against the resolved active hash — Login PIN or legacy Approval PIN)
+    const isValid = await bcrypt.compare(pin, _activeHash);
     if (!isValid) {
       const newAttempts = (userData.pinAttempts || 0) + 1;
       const updateData = { pinAttempts: newAttempts };
@@ -7194,7 +7201,15 @@ app.patch('/api/restaurants/:restaurantId', authenticateToken, async (req, res) 
     // POS settings (dashboard customization: button visibility, labels, payment methods, customer fields)
     if (req.body.posSettings !== undefined) {
       const existing = restaurant.data().posSettings || {};
-      updateData.posSettings = { ...existing, ...req.body.posSettings };
+      const incoming = { ...req.body.posSettings };
+      // Never store the completed-order-edit PIN in plaintext. When the client sends a new value,
+      // bcrypt-hash it into completedOrderEditPinHash and drop the plaintext (empty string disables).
+      if (Object.prototype.hasOwnProperty.call(incoming, 'completedOrderEditPin')) {
+        const raw = String(incoming.completedOrderEditPin || '').trim();
+        incoming.completedOrderEditPinHash = raw ? await bcrypt.hash(raw, 10) : null;
+        incoming.completedOrderEditPin = null; // clear any legacy plaintext
+      }
+      updateData.posSettings = { ...existing, ...incoming };
     }
 
     // ECR terminal settings (NAPS Qatar payment terminal integration)
@@ -21539,6 +21554,21 @@ app.post('/api/staff/:restaurantId/verify-pin', authenticateToken, async (req, r
   } catch (error) {
     console.error('verify-pin error:', error);
     res.status(500).json({ error: 'Failed to verify PIN' });
+  }
+});
+
+// Whether the CURRENT user has an APPROVAL PIN set (pinHash/pinEnabled) — powers the "Approval PIN
+// set ✓" indicator in settings. Distinct from /api/auth/pin/status, which reports the LOGIN PIN.
+// Registered BEFORE the :staffId route so "me" isn't matched as a staffId.
+app.get('/api/staff/me/pin/status', authenticateToken, async (req, res) => {
+  try {
+    const myId = req.user.userId || req.user.id;
+    const found = await findStaffDoc(myId);
+    const d = found && found.doc && found.doc.exists ? found.doc.data() : null;
+    res.json({ success: true, pinEnabled: !!(d && d.pinEnabled && d.pinHash), pinUpdatedAt: (d && d.pinUpdatedAt) || null });
+  } catch (error) {
+    console.error('approval-pin status error:', error.message);
+    res.status(500).json({ error: 'Failed to get PIN status' });
   }
 });
 
@@ -37499,9 +37529,15 @@ app.patch('/api/orders/:orderId/edit-completed-items', authenticateToken, async 
         return res.status(403).json({ error: 'PIN is required to edit completed orders', requirePin: true });
       }
       let pinOk = false;
-      // 1) The shared completed-edit PIN, if the owner configured one (simple mode — backward compatible).
-      const sharedPin = String(posSettings.completedOrderEditPin || '');
-      if (sharedPin && String(pinCode) === sharedPin) pinOk = true;
+      // 1) The shared completed-edit PIN, if the owner configured one (simple mode). Now stored
+      //    bcrypt-hashed (completedOrderEditPinHash); fall back to any legacy plaintext value.
+      const sharedHash = posSettings.completedOrderEditPinHash;
+      if (sharedHash) {
+        if (await bcrypt.compare(String(pinCode), sharedHash)) pinOk = true;
+      } else {
+        const legacyPlain = String(posSettings.completedOrderEditPin || '');
+        if (legacyPlain && String(pinCode) === legacyPlain) pinOk = true;
+      }
       // 2) Otherwise accept any AUTHORIZED APPROVER's personal terminal PIN (owner/admin/manager) —
       //    same bcrypt candidate check as /verify-pin. This is what a supervisor actually types (their
       //    "Set my PIN" PIN), which is stored hashed as pinHash and never equalled the shared secret.
