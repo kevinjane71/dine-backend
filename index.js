@@ -16022,6 +16022,36 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
       const feTotalDisc = parseFloat(req.body.totalDiscountAmount) || (feDiscount + feManual + feLoyalty);
       const feSubtotal = parseFloat(req.body.subtotal || req.body.totalAmount) || rawSubtotal;
       const feTaxAmt = req.body.taxBreakdown.reduce((s, t) => s + (t.amount || 0), 0);
+
+      // ── Sanity clamp (mirrors the POST /api/orders create override) ──
+      // The override may only refine, never REWRITE billing. The server-priced subtotal —
+      // sum of the re-priced item totals, which already include variant + customization/
+      // add-on prices — is authoritative. Reject the override entirely (keep the
+      // server-computed billing set above at "Calculate tax and finalAmount AFTER discounts")
+      // when the FE numbers are impossible, most importantly when the FE subtotal is far from
+      // the item-derived subtotal (e.g. a dropped add-on price on an item added in a later KOT
+      // round). Prevents the under/over-charge where line items sum to X but the total says Y.
+      const feCouponPre = parseFloat(req.body.couponDiscount) || 0;
+      const claimedDiscTotal = Math.max(feTotalDisc, feDiscount + feManual + feLoyalty) + feCouponPre;
+      const serverSubtotal = Array.isArray(updateData.items) && updateData.items.length
+        ? Math.round(updateData.items.reduce((s, i) => s + (typeof i.total === 'number' ? i.total : (Number(i.price) || 0) * (Number(i.quantity) || 1)), 0) * 100) / 100
+        : Math.round((rawSubtotal || 0) * 100) / 100;
+      const subtotalTolerance = Math.max(2, serverSubtotal * 0.01);
+      const feFinalPre = parseFloat(req.body.finalAmount) || 0;
+      const feRoundOff = Math.abs(parseFloat(req.body.roundOffAmount) || 0);
+      const finalFloor = (serverSubtotal - claimedDiscTotal) - feRoundOff - subtotalTolerance;
+      const overrideInvalid =
+        feDiscount < 0 || feManual < 0 || feLoyalty < 0 || feCouponPre < 0 || feTaxAmt < 0 ||
+        claimedDiscTotal > serverSubtotal + subtotalTolerance ||
+        Math.abs(feSubtotal - serverSubtotal) > subtotalTolerance ||
+        feFinalPre < 0 ||
+        feFinalPre < finalFloor;
+      if (overrideInvalid) {
+        updateData.billingClamped = true;
+        console.warn(`🚫 PATCH POS override REJECTED (server values kept) — order ${req.params.orderId}: ` +
+          `feSubtotal=₹${feSubtotal} vs server=₹${serverSubtotal}, claimedDisc=₹${claimedDiscTotal}, feFinal=₹${feFinalPre}`);
+      }
+      if (!overrideInvalid) {
       updateData.subtotal = Math.round(feSubtotal * 100) / 100;
       updateData.discountAmount = Math.round(feDiscount * 100) / 100;
       updateData.offerDiscount = Math.round(feDiscount * 100) / 100;
@@ -16039,6 +16069,7 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
       }
       updateData.finalAmount = Math.max(0, updateData.finalAmount);
       console.log(`📊 PATCH POS override: Using frontend billing values (Subtotal: ₹${updateData.subtotal}, Disc: ₹${updateData.totalDiscountAmount}, Tax: ₹${updateData.taxAmount}, Final: ₹${updateData.finalAmount})`);
+      }
     }
 
     // Billing audit: compare FE-sent values vs BE-resolved values
