@@ -4706,16 +4706,32 @@ app.post('/api/auth/reset-password', async (req, res) => {
   }
 });
 
-// Internal cross-backend auth mirror. The COUNTERPART backend (secret-authenticated) calls this to
-// keep a user's reset token / new password in sync in THIS backend's OWN store — so forgot/reset
-// works regardless of which backend (Firestore-web vs Postgres-app) handled the request. Writes to
-// `db` (Firestore on the web deploy, Postgres on the app deploy). Whitelisted fields only; the
-// shared MIRROR_SECRET is the sole trust boundary, so keep it strong and private.
+// Internal cross-backend auth mirror. The COUNTERPART backend calls this to keep a user's reset
+// token / new password in sync in THIS backend's OWN store — so forgot/reset works regardless of
+// which backend (Firestore-web vs Postgres-app) handled the request. Writes to `db` (Firestore on
+// the web deploy, Postgres on the app deploy). Whitelisted fields only.
+// AUTH: HMAC-SHA256 over (timestamp + fields) keyed by the shared MIRROR_SECRET — the secret is
+// never sent on the wire, the ±5-min timestamp window blocks replay, and the compare is constant-time.
 app.post('/api/auth/internal-mirror', async (req, res) => {
   try {
+    const crypto = require('crypto');
     const secret = process.env.MIRROR_SECRET;
-    if (!secret || req.headers['x-mirror-secret'] !== secret) return res.status(403).json({ error: 'forbidden' });
+    if (!secret) return res.status(403).json({ error: 'mirror not enabled' });
+    const ts = req.headers['x-mirror-ts'];
+    const sign = req.headers['x-mirror-sign'];
+    if (!ts || !sign) return res.status(401).json({ error: 'unauthorized' });
+    // Anti-replay: reject stale or future-dated requests (±5 minutes).
+    const skew = Math.abs(Date.now() - Number(ts));
+    if (!Number.isFinite(skew) || skew > 5 * 60 * 1000) return res.status(401).json({ error: 'stale request' });
     const b = req.body || {};
+    // Rebuild the exact signed string (same field order + null/undefined→'' rule as the sender).
+    const canonical = [ts, b.email, b.password, b.resetTokenHash, b.resetTokenExpiry, b.resetTokenUsed]
+      .map((v) => String(v ?? '')).join('|');
+    const expected = crypto.createHmac('sha256', secret).update(canonical).digest('hex');
+    const got = Buffer.from(String(sign));
+    const exp = Buffer.from(expected);
+    if (got.length !== exp.length || !crypto.timingSafeEqual(got, exp)) return res.status(401).json({ error: 'bad signature' });
+
     const email = (b.email || '').toString().toLowerCase().trim();
     if (!email) return res.status(400).json({ error: 'email required' });
     const snap = await db.collection(collections.users).where('email', '==', email).limit(1).get();
