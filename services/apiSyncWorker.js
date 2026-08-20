@@ -15,7 +15,8 @@
  */
 const fs = require('fs');
 const { Pool } = require('pg');
-const { selectSince, applyRecords, UP_TABLES, DOWN_TABLES } = require('./cloudSyncWorker');
+const { selectSince, applyRecords, UP_TABLES, DOWN_TABLES,
+  ensureTombstoneInfra, selectTombstonesSince, applyTombstones, UP_TOMBSTONE, DOWN_TOMBSTONE } = require('./cloudSyncWorker');
 
 let pool = null;
 let timer = null;
@@ -71,15 +72,20 @@ async function pushUp() {
     const { rows, next } = await selectSince(pool, table, wm, rid, BATCH);
     if (rows.length) { groups[table] = rows; nexts[table] = next; }
   }
-  if (!Object.keys(groups).length) return { pushed: 0 };
+  // Local deletes (structural/config only) captured by the tombstone trigger → flow UP so the cloud
+  // removes them too. Own restaurant scope; whitelisted to tables that sync up.
+  const tWm = await getWatermark('apiup:__tombstones__');
+  const { rows: tombstones, next: tNext } = await selectTombstonesSince(pool, tWm, rid, UP_TOMBSTONE, BATCH);
+  if (!Object.keys(groups).length && !tombstones.length) return { pushed: 0 };
   const res = await fetch(`${CLOUD()}/api/sync/push`, {
     method: 'POST',
     headers: { Authorization: `Bearer ${TOKEN()}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify({ restaurantId: rid, records: groups }),
+    body: JSON.stringify({ restaurantId: rid, records: groups, tombstones }),
   });
   if (!res.ok) throw new Error(`push HTTP ${res.status}`);
   for (const [t, ts] of Object.entries(nexts)) await setWatermark('apiup:' + t, ts);
-  return { pushed: Object.values(groups).reduce((a, r) => a + r.length, 0) };
+  if (tombstones.length) await setWatermark('apiup:__tombstones__', tNext);
+  return { pushed: Object.values(groups).reduce((a, r) => a + r.length, 0), deleted: tombstones.length };
 }
 
 // DOWN: pull cloud changes since the watermark and apply them locally (owner menu/price/config).
@@ -87,7 +93,8 @@ async function pullDown() {
   const rid = await RID();
   if (!rid) return { applied: 0 };
   const since = await getWatermark('apidown:all');
-  const res = await fetch(`${CLOUD()}/api/sync/pull?since=${encodeURIComponent(since)}`, {
+  const tsince = await getWatermark('apidown:__tombstones__');
+  const res = await fetch(`${CLOUD()}/api/sync/pull?since=${encodeURIComponent(since)}&tsince=${encodeURIComponent(tsince)}`, {
     headers: { Authorization: `Bearer ${TOKEN()}` },
   });
   if (!res.ok) throw new Error(`pull HTTP ${res.status}`);
@@ -99,7 +106,15 @@ async function pullDown() {
     applied += r.applied || 0;
   }
   if (data.next) await setWatermark('apidown:all', data.next);
-  return { applied };
+  // Delete propagation DOWN: apply the cloud's deletes locally (owner removed a table/offer/etc on
+  // the web). Scoped to this restaurant + whitelisted to DOWN_TOMBSTONE tables.
+  let deleted = 0;
+  if (Array.isArray(data.tombstones) && data.tombstones.length) {
+    const td = await applyTombstones(pool, data.tombstones, { scopeRid: rid, allowedTables: DOWN_TOMBSTONE });
+    deleted = td.deleted || 0;
+  }
+  if (data.tnext) await setWatermark('apidown:__tombstones__', data.tnext);
+  return { applied, deleted };
 }
 
 async function cycle() {
@@ -124,6 +139,10 @@ function start() {
   }
   if (timer) return true;
   pool = new Pool({ connectionString: process.env.DATABASE_URL, max: 3 });
+  // Ensure the tombstone table + AFTER DELETE triggers exist on the LOCAL DB so deletes made on this
+  // hub are captured and can flow UP. (The direct PG↔PG worker used to do this, but it's disabled in
+  // API-sync mode — so the API worker owns local capture now.) Idempotent, best-effort.
+  ensureTombstoneInfra(pool).catch((e) => console.warn('[apiSync] tombstone infra:', e.message));
   timer = setInterval(cycle, INTERVAL());
   setTimeout(cycle, 3000); // first pass shortly after boot; token/rid resolved lazily each cycle
   console.log(`[apiSync] started — every ${INTERVAL()}ms → ${CLOUD()} (token+restaurant resolved from config)`);

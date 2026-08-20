@@ -747,8 +747,64 @@ async function selectSince(pool, table, sinceIso, scopeRid, limit = 500) {
   return { rows: r.rows, next };
 }
 
+// ── API-based delete propagation (tombstones over /api/sync) ─────────────────────────────────────
+// The direct PG↔PG path replays deletes via replicateTombstones(src,dst,…) because it holds BOTH
+// connections. The API transport can't — the hub never touches the cloud DB — so we split that into
+// a READ side (selectTombstonesSince, like selectSince) and an APPLY side (applyTombstones, like
+// applyRecords). Same guarantees: session-flag so an applied delete doesn't re-tombstone (no
+// ping-pong), restaurant-scoped, and table names WHITELISTED against the fixed tombstone set.
+
+// Read deletes recorded since a watermark. scopeRid (used on the cloud for DOWN, and as the hub's
+// own rid on UP) limits to that restaurant's deletes (plus rid-less rows). Mirrors selectSince.
+async function selectTombstonesSince(pool, sinceIso, scopeRid, allowedTables, limit = 500) {
+  const allow = (allowedTables || []).filter(Boolean);
+  if (!allow.length) return { rows: [], next: sinceIso };
+  const since = sinceIso || new Date(0).toISOString();
+  const scoped = !!scopeRid;
+  const params = scoped ? [since, scopeRid, allow] : [since, allow];
+  const scopeSql = scoped ? ' AND (restaurant_id = $2 OR restaurant_id IS NULL)' : '';
+  const tblParam = scoped ? '$3' : '$2';
+  const r = await pool.query(
+    `SELECT seq, table_name, row_id, restaurant_id, deleted_at FROM sync_tombstones
+     WHERE deleted_at > $1${scopeSql} AND table_name = ANY(${tblParam}::text[])
+     ORDER BY deleted_at ASC LIMIT ${Math.min(limit, 1000)}`, params);
+  const next = r.rows.length ? r.rows[r.rows.length - 1].deleted_at : since;
+  return { rows: r.rows, next };
+}
+
+// Apply received tombstones as scoped DELETEs on `pool`. allowedTables is the ONLY source of table
+// identifiers that reach the SQL (the payload's table_name must be in it) → no injection. scopeRid
+// forces every delete to that restaurant → a hub can only ever delete its own rows. Mirrors applyRecords.
+async function applyTombstones(pool, tombstones, { scopeRid = null, allowedTables = [] } = {}) {
+  const allow = new Set((allowedTables || []).filter(Boolean));
+  let deleted = 0;
+  for (const tb of (tombstones || [])) {
+    if (!tb || !tb.table_name || tb.row_id == null) continue;
+    if (!allow.has(tb.table_name)) continue; // whitelist gate — identifier is now known-safe
+    const rowRid = tb.restaurant_id != null ? String(tb.restaurant_id) : null;
+    if (scopeRid && rowRid && rowRid !== String(scopeRid)) continue; // cross-tenant guard
+    const useRid = scopeRid || rowRid;
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      await client.query(`SET LOCAL dine.sync_replicating = 'on'`); // don't re-tombstone this delete
+      if (useRid && tb.table_name !== 'restaurants') {
+        await client.query(`DELETE FROM "${tb.table_name}" WHERE id = $1 AND restaurant_id = $2`, [tb.row_id, useRid]);
+      } else {
+        await client.query(`DELETE FROM "${tb.table_name}" WHERE id = $1`, [tb.row_id]);
+      }
+      await client.query('COMMIT');
+      deleted++;
+    } catch (e) { try { await client.query('ROLLBACK'); } catch (_) {} }
+    finally { client.release(); }
+  }
+  return { deleted };
+}
+
 module.exports = {
   startCloudSync, stopCloudSync, runCycle, triggerSync, getSyncStatus, ensureTombstoneInfra,
   // API-based sync (dormant until wired):
   applyRecords, selectSince, UP_TABLES, DOWN_TABLES, makeUpdatedAtIdempotent,
+  // API-based delete propagation:
+  selectTombstonesSince, applyTombstones, TOMBSTONE_TABLES, UP_TOMBSTONE, DOWN_TOMBSTONE,
 };

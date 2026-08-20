@@ -18,7 +18,8 @@ const router = express.Router();
 const { Pool } = require('pg');
 const jwt = require('jsonwebtoken');
 const { authenticateToken } = require('../middleware/auth');
-const { applyRecords, selectSince, DOWN_TABLES, makeUpdatedAtIdempotent } = require('../services/cloudSyncWorker');
+const { applyRecords, selectSince, DOWN_TABLES, makeUpdatedAtIdempotent,
+  ensureTombstoneInfra, applyTombstones, selectTombstonesSince, UP_TOMBSTONE, DOWN_TOMBSTONE } = require('../services/cloudSyncWorker');
 
 // Dedicated small pool to this backend's own DB (Cloud SQL on GCP). Absent on Firestore-only
 // deployments → endpoints degrade gracefully to a 503 / empty pull.
@@ -30,6 +31,9 @@ function pool() {
     // Make the cloud updated_at trigger PRESERVE the synced timestamp (once) so a pushed row
     // doesn't get rewritten to now() and drift on the next pull. Best-effort.
     makeUpdatedAtIdempotent(_pool).catch(() => {});
+    // Install the tombstone table + AFTER DELETE triggers on the CLOUD DB (once) so owner/web-side
+    // deletes are captured and can flow DOWN to hubs. Best-effort — pull degrades to no deletes.
+    ensureTombstoneInfra(_pool).catch(() => {});
   }
   return _pool;
 }
@@ -85,12 +89,21 @@ router.post('/push', authenticateToken, express.json({ limit: '25mb' }), async (
       results.push(await applyRecords(p, table, rows, { scopeRid: rid, direction: 'up' }));
     }
     const applied = results.reduce((a, r) => a + (r.applied || 0), 0);
+    // Delete propagation UP: replay the hub's local deletes as scoped DELETEs on the cloud. Scoped to
+    // the token's restaurant + whitelisted to UP_TOMBSTONE tables, so a hub can only delete its own
+    // structural/config rows (never orders/payments — those aren't in the tombstone set).
+    let deleted = 0;
+    const tombstones = (req.body && req.body.tombstones) || [];
+    if (Array.isArray(tombstones) && tombstones.length) {
+      const td = await applyTombstones(p, tombstones, { scopeRid: rid, allowedTables: UP_TOMBSTONE });
+      deleted = td.deleted || 0;
+    }
     // Server-authoritative totals: if orders/payments were synced, recompute daily_stats from the
     // now-synced order event log rather than trusting any pushed aggregate. Best-effort, async.
     if ((groups.orders || groups.pos_payments || groups.pos_invoices) && req.app && req.app.locals && req.app.locals.recomputeDailyStats) {
       Promise.resolve().then(() => req.app.locals.recomputeDailyStats(rid)).catch(() => {});
     }
-    res.json({ ok: true, applied, results });
+    res.json({ ok: true, applied, deleted, results });
   } catch (e) {
     console.error('[sync/push] error:', e.message);
     res.status(500).json({ error: e.message });
@@ -117,7 +130,11 @@ router.get('/pull', authenticateToken, async (req, res) => {
       if (rows.length) out[table] = rows;
       if (next && new Date(next) > new Date(maxNext)) maxNext = next;
     }
-    res.json({ records: out, next: maxNext });
+    // Delete propagation DOWN: return this restaurant's cloud-side deletes since ?tsince= so the hub
+    // can remove them locally. Scoped to rid + whitelisted to DOWN_TOMBSTONE tables.
+    const tsince = req.query.tsince || new Date(0).toISOString();
+    const { rows: tombstones, next: tnext } = await selectTombstonesSince(p, tsince, rid, DOWN_TOMBSTONE, 500);
+    res.json({ records: out, next: maxNext, tombstones, tnext });
   } catch (e) {
     console.error('[sync/pull] error:', e.message);
     res.status(500).json({ error: e.message });
