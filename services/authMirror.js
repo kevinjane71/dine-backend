@@ -1,32 +1,45 @@
 'use strict';
 
 /**
- * authMirror — keep password-reset writes consistent across BOTH backends, over HTTP.
+ * authMirror — keep password-reset writes consistent across BOTH backends, over a SIGNED HTTP call.
  *
  * The web runs on the Firestore backend and the app's online mode on the Postgres backend. A reset
  * token minted on one, or a password set on one, is otherwise invisible to the other. Rather than
- * give each backend a driver + credentials for the OTHER database (e.g. shipping a Postgres client
- * to the Vercel/Firestore deploy and opening Cloud SQL to it — unreliable + slow), each backend
- * simply calls the COUNTERPART backend's `/api/auth/internal-mirror` endpoint, which writes to ITS
- * OWN database. So the mirror needs nothing but an HTTP request.
+ * give each backend a driver + credentials for the OTHER database (shipping a Postgres client to the
+ * Vercel/Firestore deploy and opening Cloud SQL to it — unreliable + slow), each backend calls the
+ * COUNTERPART backend's `/api/auth/internal-mirror`, which writes to ITS OWN database.
  *
- * Config (per deploy): MIRROR_API_URL = the counterpart backend's base URL, MIRROR_SECRET = a shared
- * secret both backends hold. Dormant (no-op) if either is unset. Fully best-effort + time-bounded —
- * a mirror failure NEVER throws, so the primary forgot/reset flow is never broken or slowed beyond
- * the bounded timeout.
+ * Security: the request is authenticated with an HMAC-SHA256 signature over (timestamp + fields),
+ * keyed by a shared MIRROR_SECRET. The secret itself is NEVER transmitted; the timestamp makes a
+ * captured request unreplayable outside a ±5-minute window; the receiver compares in constant time.
+ *
+ * Config (per deploy): MIRROR_API_URL = counterpart base URL, MIRROR_SECRET = shared secret.
+ * Dormant (no-op) if either is unset. Fully best-effort + 5s-bounded — never throws or hangs the
+ * primary forgot/reset flow.
  */
+const crypto = require('crypto');
+
+// Deterministic string signed by BOTH sides — must be built identically here and in the endpoint.
+// `v ?? ''` collapses undefined AND null to '' so the JSON round-trip (which drops undefined and
+// keeps null) can't change the signed value.
+function canonical(ts, x) {
+  return [ts, x.email, x.password, x.resetTokenHash, x.resetTokenExpiry, x.resetTokenUsed]
+    .map((v) => String(v ?? '')).join('|');
+}
 
 async function post(fields) {
   const url = (process.env.MIRROR_API_URL || '').replace(/\/+$/, '');
   const secret = process.env.MIRROR_SECRET || '';
   if (!url || !secret) return; // counterpart not configured → dormant
+  const ts = String(Date.now());
+  const sign = crypto.createHmac('sha256', secret).update(canonical(ts, fields)).digest('hex');
   const ac = new AbortController();
   const timer = setTimeout(() => ac.abort(), 5000); // never hang the caller
   try {
     const r = await fetch(`${url}/api/auth/internal-mirror`, {
       method: 'POST',
       signal: ac.signal,
-      headers: { 'Content-Type': 'application/json', 'x-mirror-secret': secret },
+      headers: { 'Content-Type': 'application/json', 'x-mirror-ts': ts, 'x-mirror-sign': sign },
       body: JSON.stringify(fields),
     });
     if (!r.ok) console.warn('[authMirror] mirror HTTP', r.status);
