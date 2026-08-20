@@ -63,13 +63,20 @@ const pushEvent = async (restaurantId, category, eventType, data) => {
       ...data,
       ts: Date.now()
     }).catch((e) => { console.warn('📡 RTDB late push error:', e && e.message); });
-    // Bound the wait: offline, an RTDB write can neither resolve nor reject quickly.
-    // We already delivered over LAN above, so cap the cloud push (default 2s, tunable).
-    const rtdbTimeout = parseInt(process.env.RTDB_PUSH_TIMEOUT_MS, 10) || 2000;
-    await Promise.race([
-      push,
-      new Promise((resolve) => setTimeout(resolve, rtdbTimeout)),
-    ]);
+    // On the on-prem local server the LAN emit above ALREADY delivered to every terminal, and no
+    // one on-box listens to cloud RTDB. Awaiting the cloud push here (even capped at 2s) would add
+    // up to 2s of latency to EVERY order/bill/KOT when the internet is slow or down. So fire it
+    // and-forget in local-server mode — the event still reaches the cloud in the background when
+    // online, without ever blocking the till. Elsewhere (cloud deploy) keep the bounded await.
+    if (process.env.LOCAL_SERVER_MODE === 'true') {
+      // not awaited — request returns instantly; `push` already has its own .catch
+    } else {
+      const rtdbTimeout = parseInt(process.env.RTDB_PUSH_TIMEOUT_MS, 10) || 2000;
+      await Promise.race([
+        push,
+        new Promise((resolve) => setTimeout(resolve, rtdbTimeout)),
+      ]);
+    }
     console.log(`📡 RTDB: Event '${eventType}' pushed to events/${restaurantId}/${category}`);
   } catch (error) {
     console.error('📡 RTDB Error:', error.message);

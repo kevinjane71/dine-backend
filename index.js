@@ -41678,19 +41678,29 @@ async function recomputeDailyStatsFromOrders(restaurantId, { fullHistory = false
 // the just-synced orders (never trust a client's aggregate — recompute from the order event log).
 app.locals.recomputeDailyStats = recomputeDailyStatsFromOrders;
 
-try {
-  require('./services/cloudSyncWorker').startCloudSync({
-    // After order rows sync, rebuild the affected days' stats from the orders. First run does a
-    // full-history recompute (the initial pull brings in historical orders); after that, recent.
-    onOrdersChanged: async () => {
-      const rid = (process.env.SYNC_RESTAURANT_ID || '').trim();
-      if (!rid) return;
-      await recomputeDailyStatsFromOrders(rid, { fullHistory: !_statsFullRecomputeDone });
-      _statsFullRecomputeDone = true;
-    },
-  });
-} catch (e) {
-  console.warn('Cloud sync worker skipped:', e.message);
+// Pick ONE cloud transport. The local-server build syncs over the authenticated /api/sync/*
+// endpoints (apiSyncWorker) using a restaurant-scoped token — no DB credential on the till. When
+// that is active, the direct PG↔PG replicator (cloudSyncWorker, which needs CLOUD_DATABASE_URL =
+// multi-tenant master creds) must NOT also run: two transports double-write the same rows and put
+// master creds on-prem. So disable the direct worker whenever API sync is the transport.
+const _apiSyncIsTransport = process.env.LOCAL_SERVER_MODE === 'true' && !!(process.env.CLOUD_API_URL || '').trim();
+if (_apiSyncIsTransport) {
+  console.log('☁️  Cloud transport = API sync (token-scoped). Direct PG↔PG cloudSyncWorker disabled — no DB creds needed on this device.');
+} else {
+  try {
+    require('./services/cloudSyncWorker').startCloudSync({
+      // After order rows sync, rebuild the affected days' stats from the orders. First run does a
+      // full-history recompute (the initial pull brings in historical orders); after that, recent.
+      onOrdersChanged: async () => {
+        const rid = (process.env.SYNC_RESTAURANT_ID || '').trim();
+        if (!rid) return;
+        await recomputeDailyStatsFromOrders(rid, { fullHistory: !_statsFullRecomputeDone });
+        _statsFullRecomputeDone = true;
+      },
+    });
+  } catch (e) {
+    console.warn('Cloud sync worker skipped:', e.message);
+  }
 }
 
 // Handle server errors
@@ -42057,6 +42067,15 @@ server.on('error', (error) => {
   console.error('❌ Server error:', error);
   if (error.code === 'EADDRINUSE') {
     console.error(`Port ${PORT} is already in use`);
+    // In the local-server build the Electron parent forks this backend and watches /api/health,
+    // respawning on failure. If we merely log here, the process stays alive with NO listening
+    // socket → health never passes → the watchdog respawns us → we hit EADDRINUSE again forever.
+    // Exit non-zero so the parent's respawn (which first frees/rechecks the port) can recover,
+    // rather than looping. An orphaned listener from an unclean quit is the common trigger.
+    if (process.env.LOCAL_SERVER_MODE === 'true') {
+      console.error('Local-server mode: exiting so the app can reclaim the port and respawn cleanly.');
+      process.exit(1);
+    }
   }
 });
 
