@@ -37151,7 +37151,37 @@ app.patch('/api/orders/:orderId/edit-completed-items', authenticateToken, async 
       if (!pinCode) {
         return res.status(403).json({ error: 'PIN is required to edit completed orders', requirePin: true });
       }
-      if (String(pinCode) !== String(posSettings.completedOrderEditPin || '')) {
+      let pinOk = false;
+      // 1) The shared completed-edit PIN, if the owner configured one (simple mode — backward compatible).
+      const sharedPin = String(posSettings.completedOrderEditPin || '');
+      if (sharedPin && String(pinCode) === sharedPin) pinOk = true;
+      // 2) Otherwise accept any AUTHORIZED APPROVER's personal terminal PIN (owner/admin/manager) —
+      //    same bcrypt candidate check as /verify-pin. This is what a supervisor actually types (their
+      //    "Set my PIN" PIN), which is stored hashed as pinHash and never equalled the shared secret.
+      //    A waiter/cashier cannot self-approve (not in APPROVER_ROLES, and the owner is always allowed).
+      if (!pinOk) {
+        const APPROVER_ROLES = new Set(['owner', 'admin', 'manager']);
+        const ownerId = restaurantData.ownerId;
+        const candidates = [];
+        try {
+          const staffSnap = await db.collection(collections.staffUsers).where('restaurantId', '==', currentOrder.restaurantId).get();
+          staffSnap.docs.forEach(d => candidates.push({ id: d.id, ...d.data() }));
+        } catch (_) { /* staff lookup non-fatal */ }
+        if (ownerId) {
+          try {
+            const od = await db.collection(collections.users).doc(String(ownerId)).get();
+            if (od.exists) candidates.push({ id: od.id, ...od.data() });
+          } catch (_) { /* owner lookup non-fatal */ }
+        }
+        for (const c of candidates) {
+          if (c.pinEnabled === false || !c.pinHash) continue;
+          const isOwner = ownerId && String(c.id) === String(ownerId);
+          if (!isOwner && !APPROVER_ROLES.has(String(c.role || '').toLowerCase())) continue;
+          // eslint-disable-next-line no-await-in-loop
+          if (await bcrypt.compare(String(pinCode), c.pinHash)) { pinOk = true; break; }
+        }
+      }
+      if (!pinOk) {
         return res.status(403).json({ error: 'Invalid PIN', requirePin: true });
       }
     }
