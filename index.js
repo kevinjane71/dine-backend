@@ -16407,59 +16407,67 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
     const nonKitchenStatuses = ['completed', 'cancelled', 'deleted', 'saved'];
     if (items && items.length > 0 && !nonKitchenStatuses.includes(orderStatus) && !skipKOT && !isSeatOnlyItemsPatch) {
       try {
-        // Reset kotPrinted so pending-print API returns this order (polling mode)
-        await db.collection(collections.orders).doc(orderId).update({
-          kotPrinted: false
-        });
-
         const restaurantDoc = await getCachedRestDoc(currentOrder.restaurantId);
         const printSettings = restaurantDoc.exists ? (restaurantDoc.data().printSettings || {}) : {};
 
         {
-          console.log('🖨️ Order items updated, triggering KOT reprint for order:', orderId);
           const restaurantFullData = restaurantDoc.data();
-          const reprintItems = updateData.items || items;
+          const mergedForKot = updateData.items || items;
           const removedForKot = updateData.removedItems || [];
           // "Incremental" covers additions, quantity changes AND removals — so a
           // remove-only update still prints a delta (CANCELLED) rather than the whole order.
-          const hasChanges = reprintItems.some(i => i.isNew || i.isUpdated) || removedForKot.length > 0;
-          const stationSettings = { ...DEFAULT_PRINT_SETTINGS, ...(restaurantFullData.printSettings || {}) };
-          const stationGroups = splitOrderByPrintStation(reprintItems, restaurantFullData.printStations, restaurantFullData.categories, stationSettings);
-          // Also fire an event for any station whose ONLY change is a removal (its category has
-          // no remaining items, so it isn't in stationGroups). The render endpoint routes the
-          // removed items to the right station by category; here we just ensure the event fires.
-          const notifiedStationIds = new Set(stationGroups.map(g => g.stationId));
-          const dispatchGroups = [...stationGroups];
-          if (removedForKot.length > 0) {
-            const removedGroups = splitOrderByPrintStation(removedForKot, restaurantFullData.printStations, restaurantFullData.categories, stationSettings);
-            for (const g of removedGroups) {
-              if (!notifiedStationIds.has(g.stationId)) {
-                notifiedStationIds.add(g.stationId);
-                dispatchGroups.push({ stationId: g.stationId, stationName: g.stationName, items: [] });
+          const hasChanges = mergedForKot.some(i => i.isNew || i.isUpdated) || removedForKot.length > 0;
+          // DELTA ONLY: the KOT UPDATE must carry only the CHANGED lines — newly-added items and
+          // quantity changes (up AND down) — NEVER unchanged already-sent items. Previously the
+          // whole station slice was sent; on the remote (dine-app) path the render treats the event
+          // snapshot AS the delta and does not re-filter, so old items reprinted and the chef
+          // re-cooked them. This filter is IDENTICAL to the render's own no-snapshot fallback
+          // (isNew||isUpdated); markers are kept so the render maps an increase to the added qty and
+          // shows a decrease as a *** REDUCED *** slip — remote now behaves exactly like local.
+          const reprintItems = mergedForKot.filter(i => i.isNew === true || i.isUpdated === true);
+          // Nothing changed for the kitchen → fire NOTHING (prevents the spurious "+0 new" full reprint).
+          if (hasChanges) {
+            console.log('🖨️ Order items updated, KOT DELTA reprint for order:', orderId, '— new/updated:', reprintItems.length, 'removed:', removedForKot.length);
+            // Reset kotPrinted so the pending-print (polling) API re-surfaces this order
+            await db.collection(collections.orders).doc(orderId).update({ kotPrinted: false });
+            const stationSettings = { ...DEFAULT_PRINT_SETTINGS, ...(restaurantFullData.printSettings || {}) };
+            const stationGroups = splitOrderByPrintStation(reprintItems, restaurantFullData.printStations, restaurantFullData.categories, stationSettings);
+            // Also fire an event for any station whose ONLY change is a removal (its category has
+            // no remaining items, so it isn't in stationGroups). The render endpoint routes the
+            // removed items to the right station by category; here we just ensure the event fires.
+            const notifiedStationIds = new Set(stationGroups.map(g => g.stationId));
+            const dispatchGroups = [...stationGroups];
+            if (removedForKot.length > 0) {
+              const removedGroups = splitOrderByPrintStation(removedForKot, restaurantFullData.printStations, restaurantFullData.categories, stationSettings);
+              for (const g of removedGroups) {
+                if (!notifiedStationIds.has(g.stationId)) {
+                  notifiedStationIds.add(g.stationId);
+                  dispatchGroups.push({ stationId: g.stationId, stationName: g.stationName, items: [] });
+                }
               }
             }
-          }
-          for (const group of dispatchGroups) {
-            pusherPromises.push(
-              pusherService.notifyKOTPrintRequest(currentOrder.restaurantId, {
-                id: orderId,
-                dailyOrderId: currentOrder.dailyOrderId,
-                orderNumber: currentOrder.orderNumber,
-                tableNumber: tableNumber || currentOrder.tableNumber,
-                roomNumber: currentOrder.roomNumber,
-                items: group.items,
-                removedItems: removedForKot,
-                notes: currentOrder.notes,
-                specialInstructions: updateData.specialInstructions || currentOrder.specialInstructions,
-                staffInfo: currentOrder.staffInfo,
-                orderType: orderType || currentOrder.orderType,
-                createdAt: currentOrder.createdAt?.toDate?.()?.toISOString() || new Date().toISOString(),
-                isReprint: true,
-                isIncremental: hasChanges,
-                printStationId: group.stationId,
-                printStationName: group.stationName
-              }).catch(err => console.error('KOT reprint Pusher notification error (non-blocking):', err))
-            );
+            for (const group of dispatchGroups) {
+              pusherPromises.push(
+                pusherService.notifyKOTPrintRequest(currentOrder.restaurantId, {
+                  id: orderId,
+                  dailyOrderId: currentOrder.dailyOrderId,
+                  orderNumber: currentOrder.orderNumber,
+                  tableNumber: tableNumber || currentOrder.tableNumber,
+                  roomNumber: currentOrder.roomNumber,
+                  items: group.items,
+                  removedItems: removedForKot,
+                  notes: currentOrder.notes,
+                  specialInstructions: updateData.specialInstructions || currentOrder.specialInstructions,
+                  staffInfo: currentOrder.staffInfo,
+                  orderType: orderType || currentOrder.orderType,
+                  createdAt: currentOrder.createdAt?.toDate?.()?.toISOString() || new Date().toISOString(),
+                  isReprint: true,
+                  isIncremental: hasChanges,
+                  printStationId: group.stationId,
+                  printStationName: group.stationName
+                }).catch(err => console.error('KOT reprint Pusher notification error (non-blocking):', err))
+              );
+            }
           }
         }
       } catch (kotError) {
