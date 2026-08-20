@@ -7083,12 +7083,14 @@ app.patch('/api/restaurants/:restaurantId', authenticateToken, async (req, res) 
     if (req.body.posSettings !== undefined) {
       const existing = restaurant.data().posSettings || {};
       const incoming = { ...req.body.posSettings };
-      // Never store the completed-order-edit PIN in plaintext. When the client sends a new value,
-      // bcrypt-hash it into completedOrderEditPinHash and drop the plaintext (empty string disables).
+      // Never store the completed-order-edit PIN in plaintext. When the client sends a NEW value,
+      // bcrypt-hash it into completedOrderEditPinHash. An empty value means "no change" (so saving
+      // other settings never wipes the PIN) — the requirePinForCompletedOrderEdit toggle governs
+      // whether it's enforced. Always drop any plaintext so it's never persisted.
       if (Object.prototype.hasOwnProperty.call(incoming, 'completedOrderEditPin')) {
         const raw = String(incoming.completedOrderEditPin || '').trim();
-        incoming.completedOrderEditPinHash = raw ? await bcrypt.hash(raw, 10) : null;
-        incoming.completedOrderEditPin = null; // clear any legacy plaintext
+        if (raw) incoming.completedOrderEditPinHash = await bcrypt.hash(raw, 10);
+        incoming.completedOrderEditPin = null;
       }
       updateData.posSettings = { ...existing, ...incoming };
     }
