@@ -32975,10 +32975,15 @@ app.get('/api/books/:restaurantId/expenses', authenticateToken, async (req, res)
 
 app.post('/api/books/:restaurantId/expenses', authenticateToken, async (req, res) => {
   try {
-    // Only owner, admin, and manager can manage expenses
+    // Manage expenses if you can manage the Books for this outlet: an owner/admin/manager, OR any
+    // user granted Books (admin) access via pageAccess — consistent with VIEWING expenses, where the
+    // GET uses checkFeaturePermission(req, 'admin', 'read'). This fixes the delete/edit button showing
+    // but 403-ing on outlets where the user's role string isn't literally owner/admin/manager (e.g. a
+    // manager/co-manager granted Books access via permissions), so delete works across ALL outlets.
     const { role } = req.user;
-    if (role !== 'owner' && role !== 'admin' && role !== 'manager') {
-      return res.status(403).json({ error: 'Access denied. Only owners, admins, and managers can manage expenses.' });
+    const isManagerRole = role === 'owner' || role === 'admin' || role === 'manager';
+    if (!isManagerRole && !(await checkFeaturePermission(req, 'admin', 'read'))) {
+      return res.status(403).json({ error: 'Access denied. You do not have permission to manage expenses.' });
     }
 
     const { restaurantId } = req.params;
@@ -33015,10 +33020,15 @@ app.post('/api/books/:restaurantId/expenses', authenticateToken, async (req, res
 
 app.patch('/api/books/:restaurantId/expenses/:expenseId', authenticateToken, async (req, res) => {
   try {
-    // Only owner, admin, and manager can manage expenses
+    // Manage expenses if you can manage the Books for this outlet: an owner/admin/manager, OR any
+    // user granted Books (admin) access via pageAccess — consistent with VIEWING expenses, where the
+    // GET uses checkFeaturePermission(req, 'admin', 'read'). This fixes the delete/edit button showing
+    // but 403-ing on outlets where the user's role string isn't literally owner/admin/manager (e.g. a
+    // manager/co-manager granted Books access via permissions), so delete works across ALL outlets.
     const { role } = req.user;
-    if (role !== 'owner' && role !== 'admin' && role !== 'manager') {
-      return res.status(403).json({ error: 'Access denied. Only owners, admins, and managers can manage expenses.' });
+    const isManagerRole = role === 'owner' || role === 'admin' || role === 'manager';
+    if (!isManagerRole && !(await checkFeaturePermission(req, 'admin', 'read'))) {
+      return res.status(403).json({ error: 'Access denied. You do not have permission to manage expenses.' });
     }
 
     const { restaurantId, expenseId } = req.params;
@@ -33048,10 +33058,15 @@ app.patch('/api/books/:restaurantId/expenses/:expenseId', authenticateToken, asy
 
 app.delete('/api/books/:restaurantId/expenses/:expenseId', authenticateToken, async (req, res) => {
   try {
-    // Only owner, admin, and manager can manage expenses
+    // Manage expenses if you can manage the Books for this outlet: an owner/admin/manager, OR any
+    // user granted Books (admin) access via pageAccess — consistent with VIEWING expenses, where the
+    // GET uses checkFeaturePermission(req, 'admin', 'read'). This fixes the delete/edit button showing
+    // but 403-ing on outlets where the user's role string isn't literally owner/admin/manager (e.g. a
+    // manager/co-manager granted Books access via permissions), so delete works across ALL outlets.
     const { role } = req.user;
-    if (role !== 'owner' && role !== 'admin' && role !== 'manager') {
-      return res.status(403).json({ error: 'Access denied. Only owners, admins, and managers can manage expenses.' });
+    const isManagerRole = role === 'owner' || role === 'admin' || role === 'manager';
+    if (!isManagerRole && !(await checkFeaturePermission(req, 'admin', 'read'))) {
+      return res.status(403).json({ error: 'Access denied. You do not have permission to manage expenses.' });
     }
 
     const { restaurantId, expenseId } = req.params;
