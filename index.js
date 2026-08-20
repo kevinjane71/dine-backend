@@ -4775,6 +4775,35 @@ app.post('/api/auth/reset-password', async (req, res) => {
   }
 });
 
+// Internal cross-backend auth mirror. The COUNTERPART backend (secret-authenticated) calls this to
+// keep a user's reset token / new password in sync in THIS backend's OWN store — so forgot/reset
+// works regardless of which backend (Firestore-web vs Postgres-app) handled the request. Writes to
+// `db` (Firestore on the web deploy, Postgres on the app deploy). Whitelisted fields only; the
+// shared MIRROR_SECRET is the sole trust boundary, so keep it strong and private.
+app.post('/api/auth/internal-mirror', async (req, res) => {
+  try {
+    const secret = process.env.MIRROR_SECRET;
+    if (!secret || req.headers['x-mirror-secret'] !== secret) return res.status(403).json({ error: 'forbidden' });
+    const b = req.body || {};
+    const email = (b.email || '').toString().toLowerCase().trim();
+    if (!email) return res.status(400).json({ error: 'email required' });
+    const snap = await db.collection(collections.users).where('email', '==', email).limit(1).get();
+    if (snap.empty) return res.json({ ok: true, updated: 0 });
+    const fields = {};
+    for (const k of ['password', 'resetTokenHash', 'resetTokenExpiry', 'resetTokenUsed']) {
+      if (b[k] !== undefined) fields[k] = b[k];
+    }
+    if (Object.keys(fields).length) {
+      fields.updatedAt = new Date();
+      await snap.docs[0].ref.update(fields);
+    }
+    return res.json({ ok: true, updated: 1 });
+  } catch (error) {
+    console.error('internal-mirror error:', error.message);
+    return res.status(500).json({ error: 'mirror failed' });
+  }
+});
+
 // Link email to existing phone-based user
 app.post('/api/user/link-email', authenticateToken, async (req, res) => {
   try {
