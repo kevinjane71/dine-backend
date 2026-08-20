@@ -1289,6 +1289,23 @@ function resolveTablePricingRule(floorName, multiPricing) {
   return null;
 }
 
+// Resolve the active pricing rule from the order type by matching the order type's LABEL (or id,
+// with aliases for the built-ins) against a pricing rule's name. Mirrors the frontend so custom
+// order types (e.g. Talabat, Rafeeq, Snoonu, Keeta) drive their own tier — not just the built-ins.
+// Server-authoritative fallback: applies even if the client didn't send a pricingRuleId.
+function resolveOrderTypePricingRule(orderType, restaurantData, multiPricing) {
+  if (!multiPricing?.enabled || !orderType) return null;
+  // Normalize by lowercasing + stripping spaces/underscores/hyphens so "Take Away"/"take-away"/
+  // "take_away"/"takeaway" and any custom multi-word channel all match. No alias table needed.
+  const norm = (s) => (s || '').toLowerCase().replace(/[\s_-]+/g, '');
+  const orderTypesList = Array.isArray(restaurantData?.posSettings?.orderTypes)
+    ? restaurantData.posSettings.orderTypes : [];
+  const otObj = orderTypesList.find((o) => o.id === orderType);
+  const candidates = new Set([norm(orderType), norm(otObj?.label)].filter(Boolean));
+  const rule = (multiPricing.rules || []).find((r) => r.isActive && candidates.has(norm(r.name)));
+  return rule ? rule.id : null;
+}
+
 // Generate daily order ID (starts from 1 each day) — PG atomic upsert
 async function generateDailyOrderId(restaurantId) {
   try {
@@ -10212,6 +10229,12 @@ app.post('/api/orders', authenticateOrderCreate, async (req, res) => {
           activePricingRuleId = manualRule.id;
         }
       }
+      // Priority 3: Order type → rule name (covers custom channels e.g. Talabat/Rafeeq/Snoonu/Keeta).
+      // Server-authoritative fallback when the client didn't resolve/send a pricingRuleId.
+      if (!activePricingRuleId) {
+        const otRule = resolveOrderTypePricingRule(orderType, restaurantData, multiPricing);
+        if (otRule) activePricingRuleId = otRule;
+      }
     }
 
     for (const item of items) {
@@ -15103,6 +15126,11 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
         if (!activePricingRuleId && currentOrder.pricingRuleId) {
           const existingRule = (multiPricing.rules || []).find(r => r.id === currentOrder.pricingRuleId && r.isActive);
           if (existingRule) activePricingRuleId = existingRule.id;
+        }
+        // Generic: order type → rule name (covers custom channels e.g. Talabat/Rafeeq/Snoonu/Keeta).
+        if (!activePricingRuleId && orderType) {
+          const otRule = resolveOrderTypePricingRule(orderType, restaurantData, multiPricing);
+          if (otRule) activePricingRuleId = otRule;
         }
         if (!activePricingRuleId && orderType) {
           // Auto-resolve pricing rule by order type name (mirrors frontend logic)
