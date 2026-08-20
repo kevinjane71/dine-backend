@@ -12610,14 +12610,19 @@ function aggregateDailyStats(dailyDocs, dateStrings) {
 
 // Helper function to calculate analytics from raw orders (used for today/24h)
 function calculateAnalytics(orders, period) {
-  // Count only REALIZED orders — completed/paid/settled — so "today" analytics (revenue, orders,
-  // avg, breakdowns) match the Home/owner dashboard. An open 'confirmed'/'pending' KOT order is not
-  // revenue yet; a blocklist here wrongly inflated it (Order History showed more than Home).
-  orders = orders.filter(o => isCountedRevenueStatus(o.status));
+  // ORDERS count = every order PLACED (excluding cancelled/deleted/saved/refunded) so it matches the
+  // Order-History list total and rises the moment an order is placed. REVENUE and the money
+  // breakdowns below are computed only on REALIZED orders (completed/paid/settled) — an open
+  // 'confirmed'/'pending' KOT order counts toward the tally but is not revenue yet. This gives two
+  // distinct correct numbers: the ORDERS card (all placed) and the COMPLETED card (realized).
+  const placedOrders = orders.filter(o => !['cancelled', 'deleted', 'saved', 'refunded'].includes(o.status));
+  const totalOrdersPlaced = placedOrders.length;
+  orders = placedOrders.filter(o => isCountedRevenueStatus(o.status)); // realized set → revenue math below
+  const completedOrders = orders.length;
 
-  if (orders.length === 0) {
+  if (totalOrdersPlaced === 0) {
     return {
-      totalRevenue: 0, totalRevenueWithTax: 0, totalOrders: 0, avgOrderValue: 0, newCustomers: 0,
+      totalRevenue: 0, totalRevenueWithTax: 0, totalOrders: 0, completedOrders: 0, avgOrderValue: 0, newCustomers: 0,
       popularItems: [], revenueData: [], ordersByType: [], busyHours: [], paymentBreakdown: {}
     };
   }
@@ -12636,8 +12641,8 @@ function calculateAnalytics(orders, period) {
     const eff = getEffectiveOrderRevenue(order);
     return sum + eff.amountWithTax - refundAdj;
   }, 0);
-  const totalOrders = orders.length;
-  const avgOrderValue = totalOrders > 0 ? Math.round(totalRevenue / totalOrders) : 0;
+  const totalOrders = totalOrdersPlaced;                           // ORDERS card = all placed today
+  const avgOrderValue = completedOrders > 0 ? Math.round(totalRevenue / completedOrders) : 0; // avg over realized
 
   const customerIds = [...new Set(orders.map(order => order.customerId).filter(Boolean))];
   const newCustomers = customerIds.length;
@@ -12733,7 +12738,7 @@ function calculateAnalytics(orders, period) {
   });
 
   return {
-    totalRevenue, totalRevenueWithTax, totalOrders, avgOrderValue, newCustomers,
+    totalRevenue, totalRevenueWithTax, totalOrders, completedOrders, avgOrderValue, newCustomers,
     popularItems, revenueData, ordersByType: ordersByTypeArray, busyHours, paymentBreakdown,
     totalDueAmount: Math.round(totalDueAmount * 100) / 100, dueOrders
   };
