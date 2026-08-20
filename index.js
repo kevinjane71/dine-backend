@@ -4707,7 +4707,7 @@ app.post('/api/auth/forgot-password', async (req, res) => {
     });
     // Dual-store: mirror the token to the OTHER backend (Firestore⇄Postgres) so the emailed link
     // validates no matter which backend opens it (web=Firestore, app-online=Postgres). Best-effort.
-    try { await require('../services/authMirror').mirrorResetToken(email, { resetTokenHash: tokenHash, resetTokenExpiry }); } catch (_) {}
+    try { await require('./services/authMirror').mirrorResetToken(email, { resetTokenHash: tokenHash, resetTokenExpiry }); } catch (_) {}
 
     const link = `${process.env.FRONTEND_URL || 'https://www.dineopen.com'}/reset-password?token=${rawToken}`;
     try {
@@ -4767,7 +4767,7 @@ app.post('/api/auth/reset-password', async (req, res) => {
     });
     // Dual-store: mirror the new password (+ token invalidation) to the OTHER backend so the user
     // can log in on either web (Firestore) or the app's online mode (Postgres). Best-effort.
-    try { await require('../services/authMirror').mirrorNewPassword(u.email, hashed); } catch (_) {}
+    try { await require('./services/authMirror').mirrorNewPassword(u.email, hashed); } catch (_) {}
     return res.json({ success: true, message: 'Your password has been reset. You can now log in with your new password.' });
   } catch (error) {
     console.error('Reset-password error:', error);
