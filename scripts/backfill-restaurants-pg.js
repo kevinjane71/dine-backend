@@ -101,6 +101,9 @@ async function main() {
       const data = doc.data();
       const pgRow = toPgRow({ id: doc.id, ...data });
       if (!pgRow.id) pgRow.id = doc.id;
+      // Label as Firestore-origin (the app defaults new restaurants to 'native');
+      // the guard on DO UPDATE below then never overwrites a native row.
+      pgRow.origin = 'firestore';
 
       const cols = Object.keys(pgRow);
       const placeholders = cols.map((c, i) =>
@@ -112,7 +115,7 @@ async function main() {
 
       const result = await pool.query(
         `INSERT INTO restaurants (${cols.join(', ')}) VALUES (${placeholders})
-         ON CONFLICT (id) ${UPSERT ? 'DO UPDATE SET ' + cols.filter(c => c !== 'id').map(c => `${c} = EXCLUDED.${c}`).join(', ') : 'DO NOTHING'}`,
+         ON CONFLICT (id) ${UPSERT ? 'DO UPDATE SET ' + cols.filter(c => c !== 'id').map(c => `${c} = EXCLUDED.${c}`).join(', ') + " WHERE restaurants.origin IS DISTINCT FROM 'native'" : 'DO NOTHING'}`,
         values
       );
 

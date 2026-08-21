@@ -1,15 +1,14 @@
 // One-time, idempotent origin tagging for the PG (pg-full-migration) DB.
 //
 // Everything in PG today came from the Firestore sync, so we tag it all
-// origin='firestore' and default future inserts to 'firestore' — which keeps the
-// daily sync self-labeling correctly (the sync is the only writer today).
+// origin='firestore'. Future inserts DEFAULT to 'native' — because on the PG
+// backend the only app-path writer creates new (native) users; the sync writes via
+// direct SQL and stamps origin='firestore' EXPLICITLY (backfill-restaurants /
+// backfill-auth-menu). The sync also guards with `WHERE origin IS DISTINCT FROM
+// 'native'`, so a native row can never be overwritten or deleted by the sync.
 //
-// New users born on PG get stamped origin='native' EXPLICITLY by the signup flow
-// (built separately); the sync then guards with `WHERE origin <> 'native'`, so a
-// native row can never be overwritten or deleted by the sync.
-//
-// Why default 'firestore' (not 'native'): a 'native' default would mislabel newly
-// synced Firestore restaurants as native. Native is set explicitly on signup.
+// Net: app-created rows → native automatically (default); sync-created rows →
+// firestore (explicit). No signup-code change needed.
 //
 // Safe + reversible: only ADDs a column + a label (UPDATE origin IS NULL). Undo:
 // `ALTER TABLE <t> DROP COLUMN origin;`. Run on the VM (env.json bridged in) or with
@@ -32,10 +31,10 @@ const TABLES = ['restaurants', 'app_users'];
       await client.query(`ALTER TABLE ${t} ADD COLUMN IF NOT EXISTS origin text`);
       const untagged = (await client.query(`SELECT count(*)::int n FROM ${t} WHERE origin IS NULL`)).rows[0].n;
       const upd = await client.query(`UPDATE ${t} SET origin='firestore' WHERE origin IS NULL`);
-      await client.query(`ALTER TABLE ${t} ALTER COLUMN origin SET DEFAULT 'firestore'`);
+      await client.query(`ALTER TABLE ${t} ALTER COLUMN origin SET DEFAULT 'native'`);
       await client.query('COMMIT');
       const by = (await pool.query(`SELECT origin, count(*)::int n FROM ${t} GROUP BY origin ORDER BY n DESC`)).rows;
-      console.log(`\n${t}: tagged ${upd.rowCount} previously-untagged row(s) as 'firestore' (was ${untagged} NULL); default now 'firestore'`);
+      console.log(`\n${t}: tagged ${upd.rowCount} previously-untagged row(s) as 'firestore' (was ${untagged} NULL); default now 'native'`);
       for (const r of by) console.log(`  origin=${r.origin ?? 'NULL'}: ${r.n}`);
     } catch (e) {
       await client.query('ROLLBACK');

@@ -48,13 +48,13 @@ const BATCH_SIZE = 200;
 const COLLECTIONS = [
   { name: 'menus', table: 'menus', toPgRow: menuToPgRow, jsonbCols: MENU_JSONB_COLUMNS },
   { name: 'menuItems', table: 'menu_items', toPgRow: menuItemToPgRow, jsonbCols: MENU_ITEM_JSONB_COLUMNS },
-  { name: 'users', table: 'app_users', toPgRow: appUserToPgRow, jsonbCols: APP_USER_JSONB_COLUMNS },
+  { name: 'users', table: 'app_users', toPgRow: appUserToPgRow, jsonbCols: APP_USER_JSONB_COLUMNS, hasOrigin: true },
   { name: 'userRestaurants', table: 'user_restaurants', toPgRow: userRestaurantToPgRow, jsonbCols: USER_RESTAURANT_JSONB_COLUMNS },
   { name: 'staffCredentials', table: 'staff_credentials', toPgRow: staffCredentialToPgRow, jsonbCols: STAFF_CREDENTIAL_JSONB_COLUMNS },
   { name: 'dine_user_data', table: 'dine_user_data', toPgRow: dineUserDataToPgRow, jsonbCols: DINE_USER_DATA_JSONB_COLUMNS },
 ];
 
-async function backfillCollection({ name, table, toPgRow, jsonbCols }) {
+async function backfillCollection({ name, table, toPgRow, jsonbCols, hasOrigin }) {
   console.log(`\n── Backfilling ${name} → ${table} ──`);
 
   let totalDocs = 0;
@@ -76,6 +76,9 @@ async function backfillCollection({ name, table, toPgRow, jsonbCols }) {
         const data = doc.data();
         const pgRow = toPgRow({ id: doc.id, ...data });
         if (!pgRow.id) pgRow.id = doc.id;
+        // Label this synced row as Firestore-origin (the app defaults new rows to
+        // 'native'); the guard below then stops the sync from ever overwriting a native row.
+        if (hasOrigin) pgRow.origin = 'firestore';
 
         if (dryRun) {
           if (totalDocs <= 3) console.log(`  [dry-run] ${doc.id}:`, JSON.stringify(pgRow).slice(0, 200));
@@ -83,7 +86,7 @@ async function backfillCollection({ name, table, toPgRow, jsonbCols }) {
         }
 
         const qObj = upsertMode
-          ? buildUpsert(table, pgRow, jsonbCols)
+          ? buildUpsert(table, pgRow, jsonbCols, ['id'], hasOrigin ? { conflictWhere: `${table}.origin IS DISTINCT FROM 'native'` } : {})
           : buildInsert(table, pgRow, jsonbCols);
 
         await query(qObj.text, qObj.values);

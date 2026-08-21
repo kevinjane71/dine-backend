@@ -185,8 +185,11 @@ function buildUpsert(tableName, pgRow, jsonbColumns, conflictCols = ['id'], opts
     };
   }
 
+  // Optional guard on the DO UPDATE — e.g. protect native rows from the sync:
+  // opts.conflictWhere = "app_users.origin IS DISTINCT FROM 'native'"
+  const guard = opts.conflictWhere ? ` WHERE ${opts.conflictWhere}` : '';
   return {
-    text: `INSERT INTO ${tableName} (${cols.join(', ')}) VALUES (${placeholders.join(', ')}) ON CONFLICT (${conflictCols.join(', ')}) DO UPDATE SET ${updateClauses.join(', ')} RETURNING *`,
+    text: `INSERT INTO ${tableName} (${cols.join(', ')}) VALUES (${placeholders.join(', ')}) ON CONFLICT (${conflictCols.join(', ')}) DO UPDATE SET ${updateClauses.join(', ')}${guard} RETURNING *`,
     values,
   };
 }
