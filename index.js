@@ -36544,6 +36544,8 @@ app.get('/api/restaurants/:restaurantId/billing-settings', authenticateToken, as
       partialPaymentEnabled: existing.partialPaymentEnabled ?? false,
       compVoidEnabled: existing.compVoidEnabled ?? false,
       compVoidRequiresPin: existing.compVoidRequiresPin ?? true,
+      // Independent gate for the "Remove sent item?" void prompt — default OFF for everyone.
+      voidRemoveRequiresPin: existing.voidRemoveRequiresPin ?? false,
       managerPin: existing.managerPin || '',
       refundsEnabled: existing.refundsEnabled ?? false,
       refundsRequireApproval: existing.refundsRequireApproval ?? true,
@@ -36620,6 +36622,7 @@ app.put('/api/restaurants/:restaurantId/billing-settings', authenticateToken, as
       partialPaymentEnabled: settings.partialPaymentEnabled ?? false,
       compVoidEnabled: settings.compVoidEnabled ?? false,
       compVoidRequiresPin: settings.compVoidRequiresPin ?? true,
+      voidRemoveRequiresPin: settings.voidRemoveRequiresPin ?? false,
       managerPin: settings.managerPin || '',
       refundsEnabled: settings.refundsEnabled ?? false,
       refundsRequireApproval: settings.refundsRequireApproval ?? true,
