@@ -9771,7 +9771,7 @@ app.post('/api/public/orders/:restaurantId', vercelSecurityMiddleware.publicAPI,
     const orderHistoryEntry = {
       orderId: orderRef.id,
       orderNumber: orderNumber,
-      orderDate: new Date(),
+      orderDate: new Date().toISOString(),
       subtotal: Math.round(subtotal * 100) / 100,
       totalAmount: Math.round(preTaxTotal * 100) / 100,
       finalAmount: Math.round(finalTotal * 100) / 100,
@@ -11297,7 +11297,7 @@ app.post('/api/orders', authenticateOrderCreate, async (req, res) => {
         // order as ₹0 spent). Due/partial record the partial amount.
         paidAmount: req.body.partialPayAmount != null ? Math.round(Number(req.body.partialPayAmount) * 100) / 100 : Math.round(finalAmount * 100) / 100,
         paymentStatus: req.body.partialPayAmount != null ? (Number(req.body.partialPayAmount) === 0 ? 'due' : 'partial') : 'paid',
-        orderDate: new Date(),
+        orderDate: new Date().toISOString(),
         tableNumber: tableNumber || seatNumber || null,
         orderType: orderType,
         orderTypeLabel: orderType,
@@ -12489,8 +12489,16 @@ app.get('/api/analytics/:restaurantId', authenticateToken, async (req, res) => {
       const now = new Date();
       const todayDateStr = tzOffset !== undefined ? dateStrInTZ(now, tzOffset) : now.toISOString().split('T')[0];
 
-      // Try dailyStats first — 1 read instead of scanning all orders
+      // Try dailyStats first — 1 read instead of scanning all orders.
+      // (This read was accidentally stripped during the usePg-removal cleanup,
+      //  leaving todayData permanently null → every today/24h load raw-scanned
+      //  orders. Restored via the unified adapter; falls back to the raw scan
+      //  below if the doc is absent or the read errors.)
       let todayData = null;
+      try {
+        const todayDoc = await db.collection('dailyStats').doc(`${restaurantId}_${todayDateStr}`).get();
+        if (todayDoc.exists) todayData = todayDoc.data();
+      } catch (e) { /* fall through to raw-order scan */ }
       if (todayData && (todayData.totalOrders || 0) > 0) {
         console.log(`📊 Analytics (${period}): using dailyStats for ${todayDateStr}`);
         const analytics = aggregateDailyStats([todayData], [todayDateStr]);
@@ -13156,6 +13164,10 @@ app.get('/api/analytics/:restaurantId/daily-summary', authenticateToken, async (
 
       const dailyRefs = docIds.map(id => db.collection('dailyStats').doc(id));
       const dailyDocsSnaps = dailyRefs.length > 0 ? await db.getAll(...dailyRefs) : [];
+      // Expose the loaded snapshots to the category/payment aggregation below.
+      // (`docs` was left empty, so that aggregation never ran and every historical
+      //  daily-summary fell back to a full raw-order scan.)
+      docs = dailyDocsSnaps;
       const dailyDocsData = dailyDocsSnaps.map(d => d.exists ? d.data() : null);
       console.log(`📊 daily-summary: found ${dailyDocsData.filter(d => d).length}/${dailyDocsData.length} dailyStats docs`);
 
@@ -13228,10 +13240,16 @@ app.get('/api/analytics/:restaurantId/daily-summary', authenticateToken, async (
       // Backward compat: if dailyStats didn't have these fields (old data), fall back to raw orders
       if (Object.keys(categoryMap).length === 0 && Object.keys(paymentMap).length === 0) {
         console.log(`📊 daily-summary: dailyStats missing category/payment fields, falling back to raw orders`);
+        // Timezone-aware range so the category/payment window matches the tz-aware
+        // totals above (was server-local → shifted by the tz offset for IST/GST stores).
         const [sy, sm, sd] = dates[0].split('-').map(Number);
         const [ey, em, ed] = dates[dates.length - 1].split('-').map(Number);
-        const rangeStart = new Date(sy, sm - 1, sd, 0, 0, 0, 0);
-        const rangeEnd = new Date(ey, em - 1, ed, 23, 59, 59, 999);
+        const rangeStart = tzOffset !== undefined
+          ? dateBoundsInTZ(dates[0], tzOffset).start
+          : new Date(sy, sm - 1, sd, 0, 0, 0, 0);
+        const rangeEnd = tzOffset !== undefined
+          ? dateBoundsInTZ(dates[dates.length - 1], tzOffset).end
+          : new Date(ey, em - 1, ed, 23, 59, 59, 999);
         let catPayQuery = db.collection(collections.orders)
           .where('restaurantId', '==', restaurantId)
           .where('createdAt', '>=', rangeStart)
@@ -14465,7 +14483,7 @@ async function applyDeferredCustomerStats(orderId, orderData, reqBody = {}) {
       totalAmount: Math.round(orderTotalAmount * 100) / 100,
       finalAmount: Math.round(orderFinalAmount * 100) / 100,
       taxAmount: Math.round((reqBody.taxAmount || orderData.taxAmount || 0) * 100) / 100,
-      orderDate: new Date(),
+      orderDate: new Date().toISOString(),
       tableNumber: orderData.tableNumber || null,
       orderType: orderData.orderType,
       paymentStatus: orderData.paymentStatus || 'paid',
@@ -14663,7 +14681,7 @@ app.patch('/api/orders/:orderId/status', authenticateToken, async (req, res) => 
           const orderHistoryEntry = {
             orderId: orderId,
             orderNumber: orderData.orderNumber,
-            orderDate: new Date(), // Completion date
+            orderDate: new Date().toISOString(), // Completion date
             subtotal: orderData.subtotal || 0,
             totalAmount: orderData.totalAmount,
             finalAmount: orderData.finalAmount || orderData.totalAmount,
@@ -16323,7 +16341,7 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
                 totalAmount: updateData.totalAmount || currentOrder.totalAmount || 0,
                 finalAmount: Math.round(orderFinalAmount * 100) / 100,
                 taxAmount: updateData.taxAmount || currentOrder.taxAmount || 0,
-                orderDate: new Date(),
+                orderDate: new Date().toISOString(),
                 tableNumber: currentOrder.tableNumber || null,
                 orderType: currentOrder.orderType,
                 loyaltyPointsEarned: pointsEarned,

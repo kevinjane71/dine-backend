@@ -69,6 +69,19 @@ for s in "${SCRIPTS[@]}"; do
   fi
 done
 
+# Flush the pgAdapter Redis query cache so the running app sees the freshly
+# synced data immediately instead of serving stale cached reads until the TTL
+# (restaurants 180s, menus/offers/staff 120s, floors/tables 60s, inventory 30s).
+# Runs even on partial failure — any backfill that wrote rows needs this.
+echo ""
+echo ">>> Invalidating pgAdapter Redis cache ..."
+if node scripts/invalidate-pg-cache.js; then
+  echo "    ✓ cache invalidated"
+else
+  echo "    ⚠ cache invalidation FAILED — app may serve stale cached reads up to 180s."
+  echo "      Re-run: node scripts/invalidate-pg-cache.js"
+fi
+
 echo ""
 echo "==================================================================="
 if [ ${#FAILED[@]} -eq 0 ]; then

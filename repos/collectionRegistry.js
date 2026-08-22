@@ -411,6 +411,43 @@ const subRestPack = (obj) => {
   return out;
 };
 
+// Generic pack/unpack that PROMOTES a set of camelCase fields to real snake_case
+// columns (so they are queryable in WHERE/orderBy — extra_data fields are NOT),
+// packing everything else into extra_data JSONB. restaurantId is always promoted
+// (it is also the subcollection scope column). Returns { fieldMap, toPgRow,
+// toFirestoreObj, jsonbCols } to drop straight into a registry entry via spread.
+const _camelToSnake = (s) => s.replace(/[A-Z]/g, (m) => '_' + m.toLowerCase());
+const makePromote = (fields) => {
+  const pairs = Array.from(new Set(['restaurantId', ...fields])).map((f) => [f, _camelToSnake(f)]);
+  const fieldMap = {};
+  for (const [camel, snake] of pairs) fieldMap[camel] = snake;
+  const toPgRow = (obj) => {
+    const o = { ...(obj || {}) };
+    const out = {};
+    if (o.id !== undefined) out.id = o.id;
+    delete o.id;
+    for (const [camel, snake] of pairs) {
+      const v = o[camel] !== undefined ? o[camel] : o[snake];
+      if (v !== undefined) out[snake] = v;
+      delete o[camel];
+      delete o[snake];
+    }
+    out.extra_data = o; // everything not promoted
+    return out;
+  };
+  const toFirestoreObj = (row) => {
+    if (!row || typeof row !== 'object') return row;
+    const { extra_data, ...cols } = row;
+    const out = { ...(extra_data && typeof extra_data === 'object' ? extra_data : {}) };
+    for (const [camel, snake] of pairs) {
+      if (cols[snake] !== undefined && cols[snake] !== null && out[camel] === undefined) out[camel] = cols[snake];
+    }
+    if (cols.id !== undefined) out.id = cols.id;
+    return out;
+  };
+  return { fieldMap, toPgRow, toFirestoreObj, jsonbCols: GENERIC_JSONB };
+};
+
 // ═══════════════════════════════════════════════════════════════════════════
 // Registry — Firestore collection name → PG table config
 // ═══════════════════════════════════════════════════════════════════════════
@@ -461,6 +498,20 @@ const REGISTRY = {
   'wa_agent_state':        { table: 'wa_agent_state',        fieldMap: {}, toPgRow: genericPack, toFirestoreObj: genericUnpack, jsonbCols: GENERIC_JSONB },
   'sadadTransactions':     { table: 'sadad_transactions',    fieldMap: {}, toPgRow: sadadPack,   toFirestoreObj: sadadUnpack,   jsonbCols: GENERIC_JSONB },
   'subRestaurants':        { table: 'sub_restaurants',       fieldMap: { status: 'status' }, toPgRow: subRestPack, toFirestoreObj: genericUnpack, jsonbCols: GENERIC_JSONB },
+
+  // ── Corporate Meal (EverLoop) — B3 cutover mapping (were falling back to Firestore) ──
+  // Promoted fields = every field these routes filter on in .where(); rest → extra_data.
+  'corporateClients':      { table: 'corporate_clients',     ...makePromote([]) },
+  'corporateSites':        { table: 'corporate_sites',       ...makePromote(['clientId']) },
+  'employees':             { table: 'corporate_employees',   ...makePromote(['siteId', 'clientId', 'phone', 'qrToken']) },
+  'mealPeriods':           { table: 'meal_periods',          ...makePromote(['siteId']) },
+  'mealBookings':          { table: 'meal_bookings',         ...makePromote(['employeeId', 'siteId', 'periodId', 'date']) },
+  'mealConsumptions':      { table: 'meal_consumptions',     ...makePromote(['employeeId', 'siteId', 'date']) },
+
+  // ── FCM token subcollections — B2 cutover mapping (restaurants/{id}/fcmTokens|staffFcmTokens) ──
+  // Only the restaurantId scope is queried, so a plain generic (id, restaurant_id, extra_data) table suffices.
+  'fcmTokens':             { table: 'fcm_tokens',            fieldMap: {}, toPgRow: genericPack, toFirestoreObj: genericUnpack, jsonbCols: GENERIC_JSONB },
+  'staffFcmTokens':        { table: 'staff_fcm_tokens',      fieldMap: {}, toPgRow: genericPack, toFirestoreObj: genericUnpack, jsonbCols: GENERIC_JSONB },
 
   // ── cash registers & shifts ─────────────────────────────────────────────
   'cashRegisters':           { table: 'cash_registers',           fieldMap: REGISTER_FIELD_MAP,       toPgRow: registerToPgRow,       toFirestoreObj: registerToFirestoreObj,       jsonbCols: REGISTER_JSONB_COLUMNS },

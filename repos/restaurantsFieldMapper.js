@@ -54,6 +54,7 @@ const FIELD_MAP = {
 
   // Menu (embedded items + categories)
   menu:                        'menu',
+  categories:                  'categories',
 
   // JSONB complex settings
   operatingHours:              'operating_hours',
@@ -93,7 +94,7 @@ const JSONB_COLUMNS = new Set([
   'currency_settings', 'customer_app_settings', 'billing_settings',
   'billing_audit', 'booking_settings', 'feedback_settings',
   'bar_inventory_settings', 'discount_approval_settings', 'kot_settings',
-  'aggregator_config', 'menu', 'extra_data',
+  'aggregator_config', 'menu', 'categories', 'extra_data',
 ]);
 
 // Fields to skip entirely (too large / separate concern)

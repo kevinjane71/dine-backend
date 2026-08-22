@@ -680,7 +680,7 @@ class PgDocRef {
           const ensured = jsonbEnsured[pgCol] || (jsonbEnsured[pgCol] = new Set());
           for (let d = 1; d < jsonPath.length; d++) {
             const prefix = jsonPath.slice(0, d);
-            const pkey = prefix.join(' ');
+            const pkey = prefix.join(' ');
             // Only ensure each parent prefix once per statement — otherwise a later sibling
             // resets it from the raw column and wipes the earlier sibling's write.
             if (ensured.has(pkey)) continue;
