@@ -13178,10 +13178,18 @@ app.get('/api/analytics/:restaurantId/daily-summary', authenticateToken, async (
       // Backward compat: if dailyStats didn't have these fields (old data), fall back to raw orders
       if (Object.keys(categoryMap).length === 0 && Object.keys(paymentMap).length === 0) {
         console.log(`📊 daily-summary: dailyStats missing category/payment fields, falling back to raw orders`);
-        const [sy, sm, sd] = dates[0].split('-').map(Number);
-        const [ey, em, ed] = dates[dates.length - 1].split('-').map(Number);
-        const rangeStart = new Date(sy, sm - 1, sd, 0, 0, 0, 0);
-        const rangeEnd = new Date(ey, em - 1, ed, 23, 59, 59, 999);
+        // Timezone-aware range so the category/payment window matches the tz-aware
+        // totals (and the raw-orders fallback below). Server-local only when no tz.
+        let rangeStart, rangeEnd;
+        if (tzOffset !== undefined) {
+          rangeStart = dateBoundsInTZ(dates[0], tzOffset).start;
+          rangeEnd = dateBoundsInTZ(dates[dates.length - 1], tzOffset).end;
+        } else {
+          const [sy, sm, sd] = dates[0].split('-').map(Number);
+          const [ey, em, ed] = dates[dates.length - 1].split('-').map(Number);
+          rangeStart = new Date(sy, sm - 1, sd, 0, 0, 0, 0);
+          rangeEnd = new Date(ey, em - 1, ed, 23, 59, 59, 999);
+        }
         let catPayQuery = db.collection(collections.orders)
           .where('restaurantId', '==', restaurantId)
           .where('createdAt', '>=', rangeStart)
