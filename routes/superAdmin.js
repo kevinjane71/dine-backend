@@ -324,6 +324,7 @@ router.get('/users/lookup', authenticateSuperAdmin, requireSuperAdmin, async (re
       email: userData.email || '',
       phone: userData.phone || '',
       role: userData.role || '',
+      pgBackendUrl: userData.pgBackendUrl || null,
       createdAt: toISO(userData.createdAt),
     };
 
@@ -338,6 +339,7 @@ router.get('/users/lookup', authenticateSuperAdmin, requireSuperAdmin, async (re
         id: doc.id,
         name: d.name || '',
         subdomain: d.subdomain || '',
+        pgBackendUrl: d.pgBackendUrl || null,
         createdAt: toISO(d.createdAt),
       };
     });
@@ -1975,6 +1977,51 @@ router.patch('/restaurants/bulk-backend', authenticateSuperAdmin, requireSuperAd
   } catch (error) {
     console.error('Super admin bulk backend routing error:', error);
     res.status(500).json({ success: false, error: 'Failed to bulk update backend routing' });
+  }
+});
+
+// Per-MAIN-USER (owner) backend switch — the per-ACCOUNT toggle (not per-restaurant).
+// Stamps pgBackendUrl on the owner's user doc AND cascades it to EVERY restaurant they
+// own, so the owner's own phone login (via /api/auth/resolve-backend) and every staff of
+// those restaurants (via restaurant.pgBackendUrl in the staff-login response) all route to
+// the same backend. Pass pgBackendUrl = https URL for GCP, or null/'' to revert to Vercel.
+router.patch('/users/:userId/backend', authenticateSuperAdmin, requireSuperAdmin, async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const { pgBackendUrl } = req.body || {};
+    if (!userId) return res.status(400).json({ success: false, error: 'userId is required' });
+
+    const userRef = db.collection(collections.users).doc(userId);
+    const userSnap = await userRef.get();
+    if (!userSnap.exists) return res.status(404).json({ success: false, error: 'User not found' });
+
+    const urlValue = (pgBackendUrl && typeof pgBackendUrl === 'string' && pgBackendUrl.startsWith('https://'))
+      ? pgBackendUrl
+      : null;
+
+    // 1) Stamp the owner user doc — drives the pre-OTP resolver + is the account's source of truth.
+    await userRef.update({ pgBackendUrl: urlValue, updatedAt: new Date() });
+
+    // 2) Cascade to every restaurant this user owns (staff follow restaurant.pgBackendUrl).
+    const owned = await db.collection(collections.restaurants).where('ownerId', '==', userId).get();
+    const ids = owned.docs.map(d => d.id);
+    const BATCH_LIMIT = 500;
+    let updated = 0;
+    for (let i = 0; i < ids.length; i += BATCH_LIMIT) {
+      const chunk = ids.slice(i, i + BATCH_LIMIT);
+      const batch = db.batch();
+      for (const id of chunk) {
+        batch.update(db.collection(collections.restaurants).doc(id), { pgBackendUrl: urlValue, updatedAt: new Date() });
+      }
+      await batch.commit();
+      updated += chunk.length;
+    }
+
+    console.log(`Per-owner backend routing: user ${userId} + ${updated} restaurant(s) → ${urlValue || 'Vercel (default)'}`);
+    res.json({ success: true, userId, pgBackendUrl: urlValue, restaurantsUpdated: updated });
+  } catch (error) {
+    console.error('Super admin per-owner backend routing error:', error);
+    res.status(500).json({ success: false, error: 'Failed to update owner backend routing' });
   }
 });
 

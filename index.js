@@ -5800,6 +5800,30 @@ app.post('/api/auth/firebase/verify', async (req, res) => {
 });
 
 // Owner phone-based registration/login
+// Resolve which backend a phone (owner account) should log in through, BEFORE auth.
+// The dine-frontend calls this against the FIXED Vercel directory (which holds all
+// Firestore owners) so a browser already pinned to GCP still asks the right place.
+// Returns { backendUrl } = the owner's pgBackendUrl (set via the per-owner switch in
+// dine-admin), or null → default/Vercel. Unauthenticated + always 200 so a resolver
+// hiccup can never block login.
+app.get('/api/auth/resolve-backend', async (req, res) => {
+  try {
+    const raw = (req.query.phone || '').toString().trim();
+    if (!raw) return res.json({ backendUrl: null });
+    const noSpace = raw.replace(/\s+/g, '');
+    const variants = [...new Set([raw, noSpace, noSpace.startsWith('+') ? noSpace : '+' + noSpace])];
+    let backendUrl = null;
+    for (const p of variants) {
+      const snap = await db.collection(collections.users).where('phone', '==', p).limit(1).get();
+      if (!snap.empty) { backendUrl = snap.docs[0].data().pgBackendUrl || null; break; }
+    }
+    res.json({ backendUrl });
+  } catch (e) {
+    console.error('resolve-backend error:', e.message);
+    res.json({ backendUrl: null }); // never block login
+  }
+});
+
 app.post('/api/auth/phone/verify-otp', async (req, res) => {
   try {
     const { phone, otp, name } = req.body;
