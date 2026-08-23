@@ -1235,6 +1235,8 @@ router.get('/restaurants', authenticateSuperAdmin, requireSuperAdmin, async (req
         ownerId: d.ownerId || '',
         ownerName: owner.name || '',
         ownerEmail: owner.email || '',
+        ownerPhone: owner.phone || '',
+        ownerPgBackendUrl: owner.pgBackendUrl || null, // account-level backend (drives per-owner grouping)
         isOpen: d.isOpen ?? true,
         createdAt: toISO(d.createdAt),
         orders24h: stats.orders24h || 0,
