@@ -6465,14 +6465,18 @@ const DESKTOP_SESSIONS_COLLECTION = 'desktop_auth_sessions';
 // POST /api/auth/desktop/session — Browser stores auth result after successful login
 app.post('/api/auth/desktop/session', async (req, res) => {
   try {
-    const { sessionId, token, user } = req.body;
+    const { sessionId, token, user, backendUrl } = req.body;
     if (!sessionId || !token) {
       return res.status(400).json({ error: 'sessionId and token are required' });
     }
-    // Store in Firestore with 5-minute TTL
+    // Store in Firestore with 5-minute TTL. `backendUrl` is the backend the token was
+    // actually issued by (resolved per-user on the desktop-auth page): the desktop app
+    // must pin THIS backend after polling, or a GCP-native user gets a GCP token but
+    // routes to Vercel (split-brain). Optional/backward-compatible — old clients omit it.
     await db.collection(DESKTOP_SESSIONS_COLLECTION).doc(sessionId).set({
       token,
       user: user || null,
+      backendUrl: backendUrl || null,
       expiresAt: Date.now() + 5 * 60 * 1000,
       createdAt: new Date()
     });
@@ -6500,7 +6504,7 @@ app.get('/api/auth/desktop/session/:id', async (req, res) => {
     // Return the token and user, then delete the session (one-time use)
     await docRef.delete();
     console.log(`🖥️ Desktop auth session consumed: ${req.params.id}`);
-    res.json({ pending: false, token: session.token, user: session.user });
+    res.json({ pending: false, token: session.token, user: session.user, backendUrl: session.backendUrl || null });
   } catch (error) {
     console.error('Desktop session poll error:', error);
     res.status(500).json({ error: 'Failed to retrieve session' });
