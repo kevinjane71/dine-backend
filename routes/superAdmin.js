@@ -271,6 +271,7 @@ router.get('/users', authenticateSuperAdmin, requireSuperAdmin, async (req, res)
         emailVerified: data.emailVerified || false,
         phoneVerified: data.phoneVerified || false,
         adminNote: data.adminNote || '',
+        origin: data.origin || null, // 'native' = born-on-GCP; lets dine-admin tag/merge correctly
       };
     });
 

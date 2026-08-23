@@ -131,6 +131,7 @@ const APP_USER_FIELD_MAP = {
   language: 'language',
   defaultRestaurantId: 'default_restaurant_id',
   restaurantId: 'restaurant_id',
+  origin: 'origin', // 'native' = born-on-GCP, 'firestore' = synced mirror
   extra_data: 'extra_data',
   createdAt: 'created_at',
   updatedAt: 'updated_at',
