@@ -27136,8 +27136,8 @@ app.get('/api/inventory/:restaurantId', authenticateToken, async (req, res) => {
       
       // Apply status filter
       if (status && status !== 'all') {
-        if (status === 'low' && itemData.currentStock > itemData.minStock) return;
-        if (status === 'good' && itemData.currentStock <= itemData.minStock) return;
+        if (status === 'low' && !(itemData.minStock > 0 && itemData.currentStock <= itemData.minStock)) return;
+        if (status === 'good' && itemData.minStock > 0 && itemData.currentStock <= itemData.minStock) return;
         if (status === 'expired' && itemData.expiryDate && new Date(itemData.expiryDate) > new Date()) return;
       }
       
@@ -27152,7 +27152,7 @@ app.get('/api/inventory/:restaurantId', authenticateToken, async (req, res) => {
       }
       
       // Determine status
-      if (itemData.currentStock <= itemData.minStock) {
+      if (itemData.minStock > 0 && itemData.currentStock <= itemData.minStock) {
         itemData.status = 'low';
       } else if (itemData.expiryDate && new Date(itemData.expiryDate) < new Date()) {
         itemData.status = 'expired';
@@ -27295,7 +27295,7 @@ app.get('/api/inventory/:restaurantId/dashboard', authenticateToken, async (req,
         categories.add(itemData.category);
       }
 
-      if (itemData.currentStock <= itemData.minStock) {
+      if (itemData.minStock > 0 && itemData.currentStock <= itemData.minStock) {
         lowStockItems++;
       }
 
@@ -27868,9 +27868,9 @@ app.post('/api/inventory/:restaurantId', authenticateToken, async (req, res) => 
       calculatedExpiryDate = mfg.toISOString().split('T')[0];
     }
 
-    // Determine status based on stock levels
+    // Determine status based on stock levels (only "low" when a real threshold is set)
     let status = 'good';
-    if (currentStock <= minStock) {
+    if (minStock > 0 && currentStock <= minStock) {
       status = 'low';
     }
     if (calculatedExpiryDate && new Date(calculatedExpiryDate) < new Date()) {
