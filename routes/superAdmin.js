@@ -172,7 +172,9 @@ router.get('/gcp-native-ids', authenticateSuperAdmin, requireSuperAdmin, async (
       const { Pool } = require('pg');
       _gcpNativePool = new Pool({ connectionString: process.env.DATABASE_URL, max: 2 });
     }
-    const r = await _gcpNativePool.query('SELECT id FROM restaurants');
+    // Only TRULY native (born-on-GCP) restaurants — NOT the Firestore mirror. Otherwise, after
+    // a full resync every restaurant "exists in PG" and would be mislabeled GCP-native.
+    const r = await _gcpNativePool.query("SELECT id FROM restaurants WHERE origin = 'native'");
     const ids = r.rows.map((x) => String(x.id));
     res.json({ pg: true, ids, count: ids.length });
   } catch (error) {
