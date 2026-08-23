@@ -5807,20 +5807,39 @@ app.post('/api/auth/firebase/verify', async (req, res) => {
 // dine-admin), or null → default/Vercel. Unauthenticated + always 200 so a resolver
 // hiccup can never block login.
 app.get('/api/auth/resolve-backend', async (req, res) => {
+  // The GCP/Postgres backend new users are born on. Env-overridable.
+  const GCP_URL = process.env.PG_BACKEND_URL || 'https://34-93-129-104.sslip.io';
   try {
-    const raw = (req.query.phone || '').toString().trim();
-    if (!raw) return res.json({ backendUrl: null });
-    const noSpace = raw.replace(/\s+/g, '');
-    const variants = [...new Set([raw, noSpace, noSpace.startsWith('+') ? noSpace : '+' + noSpace])];
-    let backendUrl = null;
-    for (const p of variants) {
-      const snap = await db.collection(collections.users).where('phone', '==', p).limit(1).get();
-      if (!snap.empty) { backendUrl = snap.docs[0].data().pgBackendUrl || null; break; }
+    const phone = (req.query.phone || '').toString().trim();
+    const email = (req.query.email || '').toString().trim().toLowerCase();
+    if (!phone && !email) return res.json({ backendUrl: null, isNew: false });
+
+    // Look this identifier up in Firestore (the home of every EXISTING Vercel user).
+    let found = null;
+    if (phone) {
+      const noSpace = phone.replace(/\s+/g, '');
+      const variants = [...new Set([phone, noSpace, noSpace.startsWith('+') ? noSpace : '+' + noSpace])];
+      for (const p of variants) {
+        const snap = await db.collection(collections.users).where('phone', '==', p).limit(1).get();
+        if (!snap.empty) { found = snap.docs[0].data(); break; }
+      }
     }
-    res.json({ backendUrl });
+    if (!found && email) {
+      const snap = await db.collection(collections.users).where('email', '==', email).limit(1).get();
+      if (!snap.empty) found = snap.docs[0].data();
+    }
+
+    if (found) {
+      // EXISTING user → their assigned home (Vercel by default, or GCP if a super-admin toggled them).
+      return res.json({ backendUrl: found.pgBackendUrl || null, isNew: false });
+    }
+    // NOT on Vercel → a brand-new signup (or an already-native GCP user) → route to GCP (born-native).
+    return res.json({ backendUrl: GCP_URL, isNew: true });
   } catch (e) {
+    // Fail-safe: on ANY error, fall back to the Vercel default — never risk creating a
+    // duplicate account on GCP for someone who might already exist on Vercel.
     console.error('resolve-backend error:', e.message);
-    res.json({ backendUrl: null }); // never block login
+    res.json({ backendUrl: null, isNew: false });
   }
 });
 
