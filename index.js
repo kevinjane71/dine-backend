@@ -22423,8 +22423,19 @@ app.get('/api/cron/send-daily-reports', async (req, res) => {
       return res.status(401).json({ error: 'Unauthorized' });
     }
 
+    // ── TEMPORARY (Vercel↔GCP dual-run) — REMOVE once fully on GCP ─────────────
+    // During the parallel run this cron runs on BOTH backends. To avoid sending
+    // an owner two emails, each run is scoped by the OWNER's backend:
+    //   ?scope=vercel → only owners still on Vercel (pgBackendUrl null)   [Vercel cron]
+    //   ?scope=gcp    → only owners routed to GCP   (pgBackendUrl set)     [GCP Cloud Scheduler]
+    //   (no scope)    → everyone (original behaviour)
+    // ⚠️ ONCE EVERY CUSTOMER IS ON GCP: delete this block + the per-owner skip in
+    // the loop below + the Vercel cron, and let the GCP cron send for all owners.
+    const reportScope = (req.query.scope || '').toString();
+    // ──────────────────────────────────────────────────────────────────────────
+
     const currentUTCHour = new Date().getUTCHours();
-    console.log(`⏰ Cron: checking daily reports for UTC hour ${currentUTCHour}`);
+    console.log(`⏰ Cron: checking daily reports for UTC hour ${currentUTCHour}${reportScope ? ` (scope=${reportScope})` : ''}`);
 
     // Query owners using both new (activeReportHoursUTC) and legacy (reportTimeUTC) fields
     const [newPrefsSnap, legacyPrefsSnap] = await Promise.all([
@@ -22457,6 +22468,18 @@ app.get('/api/cron/send-daily-reports', async (req, res) => {
         const prefs = prefDoc.data();
         const recipients = prefs.reportEmails || (prefs.reportEmail ? [prefs.reportEmail] : []);
         if (recipients.length === 0) continue;
+
+        // TEMPORARY scope filter (see note at top) — skip owners not on this backend
+        // so Vercel + GCP don't both email the same owner. REMOVE after full GCP cutover.
+        if (reportScope === 'gcp' || reportScope === 'vercel') {
+          let ownerOnGcp = false;
+          try {
+            const uSnap = await db.collection(collections.users).doc(userId).get();
+            ownerOnGcp = !!(uSnap.exists && uSnap.data().pgBackendUrl);
+          } catch (_) { /* if we can't tell, default to the un-scoped side (Vercel) */ }
+          if (reportScope === 'gcp' && !ownerOnGcp) continue;   // GCP run: only GCP-routed owners
+          if (reportScope === 'vercel' && ownerOnGcp) continue; // Vercel run: only Vercel owners
+        }
 
         const frequency = prefs.reportFrequency || 'daily';
 

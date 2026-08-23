@@ -3,7 +3,7 @@
   "regions": ["bom1"],
   "crons": [
     {
-      "path": "/api/cron/send-daily-reports",
+      "path": "/api/cron/send-daily-reports?scope=vercel",
       "schedule": "0 * * * *"
     },
     {
