@@ -4868,7 +4868,7 @@ app.post('/api/user/link-email', authenticateToken, async (req, res) => {
 // Link phone to existing email-based user
 app.post('/api/user/link-phone', authenticateToken, async (req, res) => {
   try {
-    const { phone, otp } = req.body;
+    const { phone, otp, verifiedViaFirebase, firebaseUid } = req.body;
     const userId = req.user.userId;
 
     if (!phone) {
@@ -4899,29 +4899,53 @@ app.post('/api/user/link-phone', authenticateToken, async (req, res) => {
       });
     }
 
-    // If OTP provided, verify it using the same OTP verification as login
-    if (otp) {
-      // Check if this is a demo account
-      const isDemoAccount = isDummyPhone(normalizedPhone) && otp === '1234';
+    // Verify the number. Two paths, mirroring how the OTP was actually sent on the client:
+    //   • REAL numbers → Firebase verified the SMS OTP client-side (verifiedViaFirebase); the
+    //     6-digit code is a Firebase code and is NEVER in our otp_verification store, so we must
+    //     trust Firebase — but confirm SERVER-SIDE (getUser) that the verified phone matches, so a
+    //     client can't link an arbitrary number with a bare uid.
+    //   • DUMMY/test numbers → backend-generated OTP in otp_verification (existing behaviour).
+    // (Previously this endpoint ignored verifiedViaFirebase and always looked up otp_verification,
+    //  so linking a real number ALWAYS failed with "Invalid or expired OTP".)
+    if (otp || (verifiedViaFirebase && firebaseUid)) {
       let otpValid = false;
 
-      if (isDemoAccount) {
-        console.log('🎭 Demo account phone linking detected:', normalizedPhone);
-        otpValid = true;
-      } else {
-        // Regular OTP verification (same as login)
-        const otpQuery = await db.collection('otp_verification')
-          .where('phone', '==', normalizedPhone)
-          .where('otp', '==', otp)
-          .limit(1)
-          .get();
-
-        if (!otpQuery.empty) {
-          const otpData = otpQuery.docs[0].data();
-          if (new Date() <= otpData.otpExpiry.toDate()) {
+      if (verifiedViaFirebase && firebaseUid) {
+        try {
+          const fbAdmin = require('firebase-admin');
+          const fbUser = await fbAdmin.auth().getUser(firebaseUid);
+          // Compare digits-only so formatting differences (+, spaces) never cause a false mismatch.
+          const digitsOnly = (s) => String(s || '').replace(/[^\d]/g, '');
+          if (fbUser && fbUser.phoneNumber && digitsOnly(fbUser.phoneNumber) === digitsOnly(normalizedPhone)) {
             otpValid = true;
-            // Delete used OTP
-            await otpQuery.docs[0].ref.delete();
+          } else {
+            console.warn(`⚠️ link-phone Firebase phone mismatch: uid=${firebaseUid} fbPhone=${fbUser && fbUser.phoneNumber} requested=${normalizedPhone}`);
+            return res.status(400).json({ error: 'Phone verification mismatch. Please request a new OTP and try again.' });
+          }
+        } catch (e) {
+          console.error('❌ link-phone Firebase getUser failed:', e.message);
+          return res.status(400).json({ error: 'Could not confirm phone verification. Please try again.' });
+        }
+      } else {
+        // Backend OTP path (dummy/test numbers, or any number that bypassed Firebase)
+        const isDemoAccount = isDummyPhone(normalizedPhone) && otp === '1234';
+        if (isDemoAccount) {
+          console.log('🎭 Demo account phone linking detected:', normalizedPhone);
+          otpValid = true;
+        } else {
+          const otpQuery = await db.collection('otp_verification')
+            .where('phone', '==', normalizedPhone)
+            .where('otp', '==', otp)
+            .limit(1)
+            .get();
+
+          if (!otpQuery.empty) {
+            const otpData = otpQuery.docs[0].data();
+            if (otpData.otpExpiry && new Date() <= otpData.otpExpiry.toDate()) {
+              otpValid = true;
+              // Delete used OTP
+              await otpQuery.docs[0].ref.delete();
+            }
           }
         }
       }
