@@ -41898,6 +41898,16 @@ app.get('/api/local-server/sync-status', authenticateToken, async (req, res) => 
     res.status(500).json({ error: e.message });
   }
 });
+// API-sync worker status for the app's "Syncing…" indicator (Phase 1.4). No auth (loopback-only,
+// low sensitivity, mirrors /sync-progress) so the renderer can poll it cheaply. Never throws.
+app.get('/api/local-server/api-sync-status', async (req, res) => {
+  try {
+    const s = await require('./services/apiSyncWorker').getStatus();
+    res.json(s);
+  } catch (e) {
+    res.status(200).json({ enabled: false, running: false, pendingUp: 0, error: e.message });
+  }
+});
 app.post('/api/local-server/sync-now', authenticateToken, async (req, res) => {
   try {
     const result = await require('./services/cloudSyncWorker').triggerSync();

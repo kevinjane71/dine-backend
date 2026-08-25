@@ -22,6 +22,8 @@ let pool = null;
 let timer = null;
 let running = false;
 let _rid = null; // resolved restaurant id (cached)
+// Lightweight status for the UI "Syncing…" indicator (Phase 1.4). Never affects sync behavior.
+let stats = { lastCycleAt: null, lastPushed: 0, lastPulled: 0, lastError: null };
 
 // The hub's sync credentials live in its config file (written at provisioning) so a freshly-issued
 // token is picked up WITHOUT restarting the backend. Env vars win if present (for tests).
@@ -52,7 +54,12 @@ async function RID() {
 
 async function getWatermark(key) {
   const r = await pool.query('SELECT last_updated_at FROM sync_watermark WHERE key = $1', [key]);
-  return (r.rows[0] && r.rows[0].last_updated_at) || new Date(0).toISOString();
+  const v = r.rows[0] && r.rows[0].last_updated_at;
+  // ALWAYS return ISO. pg returns timestamptz as a JS Date; pullDown puts this in a URL query param
+  // where `${date}` → Date.toString() ("Wed Aug 19 2026 … GMT+0530 (India Standard Time)"), which
+  // Postgres on the cloud can't parse → "time zone gmt+0530 not recognized" → HTTP 500 on /sync/pull.
+  // ISO is safe for both the URL and local pg. (Fixes the DOWN sync silently failing.)
+  return v ? new Date(v).toISOString() : new Date(0).toISOString();
 }
 async function setWatermark(key, ts) {
   await pool.query(
@@ -122,14 +129,37 @@ async function cycle() {
   if (!TOKEN()) return; // not provisioned for sync yet — quiet no-op until a token is written
   running = true;
   try {
-    await pushUp();
-    await pullDown();
+    const up = await pushUp();
+    const down = await pullDown();
+    stats.lastCycleAt = new Date().toISOString();
+    stats.lastPushed = (up && up.pushed) || 0;
+    stats.lastPulled = (down && down.applied) || 0;
+    stats.lastError = null;
   } catch (e) {
     // Offline / transient — leave watermarks, retry next tick. Log quietly.
+    stats.lastError = e.message;
     if (!/HTTP (401|403)/.test(e.message)) console.warn('[apiSync] cycle:', e.message);
   } finally {
     running = false;
   }
+}
+
+// Lightweight status for the UI's "Syncing…" indicator. pendingUp = orders on THIS hub not yet
+// pushed to the cloud (the count that must drain on reconnect) — one indexed COUNT, best-effort.
+async function getStatus() {
+  const enabled = !!TOKEN();
+  let pendingUp = 0;
+  try {
+    if (enabled && pool) {
+      const rid = await RID();
+      if (rid) {
+        const wm = await getWatermark('apiup:orders');
+        const r = await pool.query('SELECT count(*)::int AS n FROM orders WHERE restaurant_id = $1 AND updated_at > $2', [rid, wm]);
+        pendingUp = (r.rows[0] && r.rows[0].n) || 0;
+      }
+    }
+  } catch (_) { /* best-effort — status must never throw */ }
+  return { enabled, running, pendingUp, lastCycleAt: stats.lastCycleAt, lastPushed: stats.lastPushed, lastPulled: stats.lastPulled, lastError: stats.lastError };
 }
 
 function start() {
@@ -153,4 +183,4 @@ function stop() {
   if (timer) { clearInterval(timer); timer = null; }
 }
 
-module.exports = { start, stop, cycle };
+module.exports = { start, stop, cycle, getStatus };
