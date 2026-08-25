@@ -701,6 +701,7 @@ async function applyRecords(pool, table, records, { scopeRid = null, direction =
   ].filter((c, i, a) => a.indexOf(c) === i && dstNames.has(c));
 
   let applied = 0, skipped = 0, failed = 0;
+  const failures = []; // {id, error} for records that threw — surfaced so the hub can dead-letter them.
   for (const rec of records) {
     try {
       // Restaurant-scope guard — never let a record for a different restaurant through.
@@ -728,9 +729,12 @@ async function applyRecords(pool, table, records, { scopeRid = null, direction =
       const vals = names.map((c) => coerce(rec[c], typeOf[c]));
       const r = await pool.query(sql, vals);
       if (r.rowCount > 0) applied++; else skipped++;
-    } catch (_) { failed++; }
+    } catch (e) {
+      failed++;
+      failures.push({ id: rec && rec.id, error: String((e && e.message) || e).slice(0, 300) });
+    }
   }
-  return { table, applied, skipped, failed };
+  return { table, applied, skipped, failed, ...(failures.length ? { failures } : {}) };
 }
 
 // Return rows of `table` changed since `sinceIso`, scoped to one restaurant (for DOWN pull).

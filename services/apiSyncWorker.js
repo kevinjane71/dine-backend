@@ -68,6 +68,79 @@ async function setWatermark(key, ts) {
     [key, ts]);
 }
 
+// ── Dead-letter (Phase 1.5) ───────────────────────────────────────────────────────────────────
+// Records the cloud REJECTED (validation error) are never silently lost: they land here, get a
+// bounded number of retries, and are surfaced in getStatus. The push watermark still advances past
+// them so a single bad row can never block the rest of the sync (no poison pill).
+const MAX_DL_ATTEMPTS = 6;
+async function ensureDeadLetterInfra(p) {
+  await p.query(`CREATE TABLE IF NOT EXISTS sync_deadletter (
+    table_name text NOT NULL,
+    row_id     text NOT NULL,
+    error      text,
+    attempts   int  NOT NULL DEFAULT 1,
+    first_seen timestamptz NOT NULL DEFAULT now(),
+    last_seen  timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (table_name, row_id)
+  )`);
+}
+// Record the cloud's per-table failures[] (from /api/sync/push results) into the dead-letter table.
+async function recordFailures(results) {
+  if (!Array.isArray(results)) return;
+  for (const r of results) {
+    if (!r || !Array.isArray(r.failures) || !r.failures.length) continue;
+    for (const f of r.failures) {
+      if (!f || f.id == null) continue;
+      await pool.query(
+        `INSERT INTO sync_deadletter (table_name, row_id, error) VALUES ($1,$2,$3)
+         ON CONFLICT (table_name, row_id) DO UPDATE SET attempts = sync_deadletter.attempts + 1,
+           error = EXCLUDED.error, last_seen = now()`,
+        [r.table, String(f.id), String(f.error || '').slice(0, 300)]
+      ).catch(() => {});
+    }
+  }
+}
+// Re-attempt dead-lettered rows (still within budget): re-read the current local row + re-push. Clears
+// the ones that now succeed, bumps attempts on the rest, and drops rows that were deleted locally.
+async function retryDeadLetter() {
+  if (!TOKEN()) return;
+  const rid = await RID();
+  if (!rid) return;
+  const upTables = new Set(UP_TABLES); // whitelist — never interpolate an arbitrary table name
+  const dl = await pool.query(
+    'SELECT table_name, row_id FROM sync_deadletter WHERE attempts < $1 ORDER BY last_seen ASC LIMIT 100', [MAX_DL_ATTEMPTS]);
+  if (!dl.rows.length) return;
+  const byTable = {};
+  for (const row of dl.rows) {
+    if (!upTables.has(row.table_name)) continue;
+    (byTable[row.table_name] = byTable[row.table_name] || []).push(row.row_id);
+  }
+  const groups = {};
+  for (const [table, ids] of Object.entries(byTable)) {
+    const q = await pool.query(`SELECT * FROM "${table}" WHERE id = ANY($1)`, [ids]);
+    if (q.rows.length) groups[table] = q.rows;
+    const present = new Set(q.rows.map((x) => String(x.id)));
+    const gone = ids.filter((id) => !present.has(String(id)));
+    if (gone.length) await pool.query('DELETE FROM sync_deadletter WHERE table_name=$1 AND row_id = ANY($2)', [table, gone]).catch(() => {});
+  }
+  if (!Object.keys(groups).length) return;
+  const res = await fetch(`${CLOUD()}/api/sync/push`, {
+    method: 'POST', headers: { Authorization: `Bearer ${TOKEN()}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ restaurantId: rid, records: groups, tombstones: [] }),
+  });
+  if (!res.ok) return; // transient → retry next cycle, attempts unchanged
+  const body = await res.json().catch(() => ({}));
+  const stillFailing = {};
+  for (const r of (body.results || [])) stillFailing[r.table] = new Set((r.failures || []).map((f) => String(f.id)));
+  for (const [table, ids] of Object.entries(byTable)) {
+    const failing = stillFailing[table] || new Set();
+    const cleared = ids.filter((id) => !failing.has(String(id)));
+    const bump = ids.filter((id) => failing.has(String(id)));
+    if (cleared.length) await pool.query('DELETE FROM sync_deadletter WHERE table_name=$1 AND row_id = ANY($2)', [table, cleared]).catch(() => {});
+    if (bump.length) await pool.query('UPDATE sync_deadletter SET attempts = attempts + 1, last_seen = now() WHERE table_name=$1 AND row_id = ANY($2)', [table, bump]).catch(() => {});
+  }
+}
+
 // UP: collect changed rows per table, push the batch, advance watermarks only on ack.
 async function pushUp() {
   const rid = await RID();
@@ -90,6 +163,8 @@ async function pushUp() {
     body: JSON.stringify({ restaurantId: rid, records: groups, tombstones }),
   });
   if (!res.ok) throw new Error(`push HTTP ${res.status}`);
+  const body = await res.json().catch(() => ({}));
+  await recordFailures(body.results); // Phase 1.5: quarantine any rows the cloud rejected (don't lose them)
   for (const [t, ts] of Object.entries(nexts)) await setWatermark('apiup:' + t, ts);
   if (tombstones.length) await setWatermark('apiup:__tombstones__', tNext);
   return { pushed: Object.values(groups).reduce((a, r) => a + r.length, 0), deleted: tombstones.length };
@@ -131,6 +206,7 @@ async function cycle() {
   try {
     const up = await pushUp();
     const down = await pullDown();
+    try { await retryDeadLetter(); } catch (_) { /* best-effort — never fail the cycle on retry */ }
     stats.lastCycleAt = new Date().toISOString();
     stats.lastPushed = (up && up.pushed) || 0;
     stats.lastPulled = (down && down.applied) || 0;
@@ -159,7 +235,11 @@ async function getStatus() {
       }
     }
   } catch (_) { /* best-effort — status must never throw */ }
-  return { enabled, running, pendingUp, lastCycleAt: stats.lastCycleAt, lastPushed: stats.lastPushed, lastPulled: stats.lastPulled, lastError: stats.lastError };
+  let deadLetter = 0;
+  try {
+    if (pool) { const d = await pool.query('SELECT count(*)::int AS n FROM sync_deadletter'); deadLetter = (d.rows[0] && d.rows[0].n) || 0; }
+  } catch (_) { /* table may not exist yet */ }
+  return { enabled, running, pendingUp, deadLetter, lastCycleAt: stats.lastCycleAt, lastPushed: stats.lastPushed, lastPulled: stats.lastPulled, lastError: stats.lastError };
 }
 
 function start() {
@@ -173,6 +253,7 @@ function start() {
   // hub are captured and can flow UP. (The direct PG↔PG worker used to do this, but it's disabled in
   // API-sync mode — so the API worker owns local capture now.) Idempotent, best-effort.
   ensureTombstoneInfra(pool).catch((e) => console.warn('[apiSync] tombstone infra:', e.message));
+  ensureDeadLetterInfra(pool).catch((e) => console.warn('[apiSync] deadletter infra:', e.message));
   timer = setInterval(cycle, INTERVAL());
   setTimeout(cycle, 3000); // first pass shortly after boot; token/rid resolved lazily each cycle
   console.log(`[apiSync] started — every ${INTERVAL()}ms → ${CLOUD()} (token+restaurant resolved from config)`);
