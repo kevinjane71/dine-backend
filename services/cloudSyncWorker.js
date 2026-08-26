@@ -732,7 +732,19 @@ async function applyRecords(pool, table, records, { scopeRid = null, direction =
         const conflictTgt = pk.map((c) => `"${c}"`).join(',');
         const upd = setCols.length ? setCols.map((c) => `"${c}"=EXCLUDED."${c}"`).join(',') : `"${pk[0]}"=EXCLUDED."${pk[0]}"`;
         const quotedIns = names.map((c) => `"${c}"`).join(',');
-        sql = `INSERT INTO "${table}" (${quotedIns}) VALUES (${ph}) ON CONFLICT (${conflictTgt}) DO UPDATE SET ${upd} WHERE "${table}".updated_at < EXCLUDED.updated_at`;
+        // Phase 3.2 — orders lifecycle-monotonic guard. The base policy is LWW by updated_at (the
+        // `updated_at < EXCLUDED.updated_at` below). For `orders` we add ONE exception: a sync update
+        // may never REGRESS an order that is already FINALIZED (completed/cancelled) on the receiving
+        // side back into a non-finalized (active/pending/open/…) state — regardless of timestamp. This
+        // stops a stale-but-newer-timestamp copy (clock skew, or a background touch on the other side
+        // bumping updated_at) from un-settling a paid bill or reviving a voided one. Symmetric: it
+        // protects the terminal on DOWN and the cloud on UP (incl. a second terminal pushing a stale
+        // open copy). Both-finalized edits (e.g. a later refund) still resolve LWW — only the specific
+        // finalized→non-finalized transition is blocked. Only added when the incoming row carries status.
+        const monotonic = (table === 'orders' && names.includes('status'))
+          ? ` AND NOT (LOWER(COALESCE("${table}".status,'')) IN ('completed','cancelled') AND LOWER(COALESCE(EXCLUDED.status,'')) NOT IN ('completed','cancelled'))`
+          : '';
+        sql = `INSERT INTO "${table}" (${quotedIns}) VALUES (${ph}) ON CONFLICT (${conflictTgt}) DO UPDATE SET ${upd} WHERE "${table}".updated_at < EXCLUDED.updated_at${monotonic}`;
       }
       const vals = names.map((c) => coerce(rec[c], typeOf[c]));
       const r = await pool.query(sql, vals);
