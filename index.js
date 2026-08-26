@@ -6836,6 +6836,8 @@ app.get('/api/restaurants', authenticateToken, async (req, res) => {
       for (const rDoc of rDocs) {
         if (rDoc.exists) {
           const rData = rDoc.data();
+          // Hide soft-deleted outlets
+          if (rData.isDeleted === true || rData.status === 'deleted') continue;
           // Only include if restaurant belongs to the admin's owner
           if (staffOwnerId && rData.ownerId && rData.ownerId !== staffOwnerId) continue;
           const { qrCode, menu, ...rest } = rData;
@@ -6907,6 +6909,8 @@ app.get('/api/restaurants', authenticateToken, async (req, res) => {
 
     snapshot.forEach(doc => {
       const restaurantData = doc.data();
+      // Hide soft-deleted outlets (reversible delete) from the owner's restaurant list/switcher.
+      if (restaurantData.isDeleted === true || restaurantData.status === 'deleted') return;
       // Remove qrCode (large base64 string) and menu (huge data) to reduce payload size
       // QR code can be generated on-demand via separate endpoint or client-side
       // Menu items are fetched separately via /api/menus/:restaurantId
@@ -7207,8 +7211,15 @@ app.delete('/api/restaurants/:restaurantId', authenticateToken, async (req, res)
       return res.status(403).json({ error: 'Access denied' });
     }
 
-    // TODO: Also delete associated staff, menus, orders etc.
-    await db.collection(collections.restaurants).doc(restaurantId).delete();
+    // Soft delete (reversible): mark it deleted instead of hard-removing the doc — a hard delete
+    // would orphan the restaurant's orders/menu/inventory/staff. Hidden from the owner's restaurant
+    // list + HQ dashboard (both filter isDeleted/status==='deleted'). Reverse by clearing the flags.
+    await db.collection(collections.restaurants).doc(restaurantId).update({
+      isDeleted: true,
+      status: 'deleted',
+      deletedAt: new Date(),
+      updatedAt: new Date(),
+    });
 
     res.json({ message: 'Restaurant deleted successfully' });
 
