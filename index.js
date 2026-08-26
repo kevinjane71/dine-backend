@@ -11139,6 +11139,28 @@ app.post('/api/orders', authenticateOrderCreate, async (req, res) => {
       }
     }
 
+    // ── Overcharge guard ──────────────────────────────────────────────────────
+    // finalAmount can NEVER exceed the discount-adjusted total. Mirrors the server's own
+    // finalAmount formula ((subtotal − discounts) + exclusiveTax + serviceCharge + tip + roundOff),
+    // so a correctly-billed order sits EXACTLY at this ceiling and the guard never fires on it —
+    // it only ever corrects an over-charge where a discount was stored on the order but not
+    // subtracted from finalAmount (e.g. a stale/inconsistent FE aggregate). Derives the discount
+    // from the individual fields actually stored (NOT totalDiscountAmount, which can itself be wrong).
+    try {
+      const gDisc = Math.round(((Number(orderData.manualDiscount) || 0) + (Number(orderData.offerDiscount) || Number(orderData.discountAmount) || 0) + (Number(orderData.loyaltyDiscount) || 0) + (Number(orderData.couponDiscount) || 0)) * 100) / 100;
+      if (gDisc > 0) {
+        const gExclTax = Array.isArray(orderData.taxBreakdown) ? orderData.taxBreakdown.filter(t => !t.inclusive).reduce((s, t) => s + (Number(t.amount) || 0), 0) : 0;
+        const gCeiling = Math.round((Math.max(0, subtotalForDiscount - gDisc) + gExclTax + (Number(orderData.serviceChargeAmount) || 0) + (Number(orderData.tipAmount) || 0) + (Number(orderData.roundOffAmount) || 0)) * 100) / 100;
+        if ((Number(orderData.finalAmount) || 0) > gCeiling + 0.5) {
+          console.warn(`🛡️ Overcharge guard (POST): finalAmount ₹${orderData.finalAmount} > discount-adjusted ceiling ₹${gCeiling} (disc ₹${gDisc}) for restaurant ${restaurantId} — correcting.`);
+          orderData.finalAmount = Math.max(0, gCeiling);
+          orderData.totalDiscountAmount = gDisc;
+          orderData.totalAmount = Math.round(Math.max(0, subtotalForDiscount - gDisc) * 100) / 100;
+          orderData.billingGuardApplied = true;
+        }
+      }
+    } catch (e) { console.error('Overcharge guard (POST) error:', e.message); }
+
     // Billing audit: compare FE-sent values vs BE-resolved values
     if (orderItems.length > 0) {
       const beResolvedSubtotal = orderItems.reduce((s, i) => s + ((i.price || 0) * (i.quantity || 1)), 0);
@@ -16117,6 +16139,33 @@ app.patch('/api/orders/:orderId', authenticateToken, async (req, res) => {
       console.log(`📊 PATCH POS override: Using frontend billing values (Subtotal: ₹${updateData.subtotal}, Disc: ₹${updateData.totalDiscountAmount}, Tax: ₹${updateData.taxAmount}, Final: ₹${updateData.finalAmount})`);
       }
     }
+
+    // ── Overcharge guard (mirror of POST) ─────────────────────────────────────
+    // Only when this PATCH actually writes finalAmount. finalAmount can never exceed the
+    // discount-adjusted total ((subtotal − discounts) + exclusiveTax + serviceCharge + tip +
+    // roundOff). Derives the discount from the effective individual fields (updateData else
+    // currentOrder). Correctly-billed edits sit exactly at the ceiling → never false-fires.
+    try {
+      if (updateData.finalAmount != null) {
+        const eff = (k) => (updateData[k] != null ? Number(updateData[k]) : Number(currentOrder[k])) || 0;
+        const gOffer = updateData.offerDiscount != null ? Number(updateData.offerDiscount)
+          : (updateData.discountAmount != null ? Number(updateData.discountAmount)
+          : (Number(currentOrder.offerDiscount) || Number(currentOrder.discountAmount) || 0));
+        const gDisc = Math.round((eff('manualDiscount') + (Number(gOffer) || 0) + eff('loyaltyDiscount') + eff('couponDiscount')) * 100) / 100;
+        if (gDisc > 0) {
+          const tb = Array.isArray(updateData.taxBreakdown) ? updateData.taxBreakdown : (Array.isArray(currentOrder.taxBreakdown) ? currentOrder.taxBreakdown : []);
+          const gExclTax = tb.filter(t => !t.inclusive).reduce((s, t) => s + (Number(t.amount) || 0), 0);
+          const gCeiling = Math.round((Math.max(0, rawSubtotal - gDisc) + gExclTax + eff('serviceChargeAmount') + eff('tipAmount') + eff('roundOffAmount')) * 100) / 100;
+          if (Number(updateData.finalAmount) > gCeiling + 0.5) {
+            console.warn(`🛡️ Overcharge guard (PATCH): finalAmount ₹${updateData.finalAmount} > discount-adjusted ceiling ₹${gCeiling} (disc ₹${gDisc}) order ${req.params.orderId} — correcting.`);
+            updateData.finalAmount = Math.max(0, gCeiling);
+            updateData.totalDiscountAmount = gDisc;
+            updateData.totalAmount = Math.round(Math.max(0, rawSubtotal - gDisc) * 100) / 100;
+            updateData.billingGuardApplied = true;
+          }
+        }
+      }
+    } catch (e) { console.error('Overcharge guard (PATCH) error:', e.message); }
 
     // Billing audit: compare FE-sent values vs BE-resolved values
     if (items && updateData.items) {
