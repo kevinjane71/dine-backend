@@ -23,7 +23,11 @@ let timer = null;
 let running = false;
 let _rid = null; // resolved restaurant id (cached)
 // Lightweight status for the UI "Syncing…" indicator (Phase 1.4). Never affects sync behavior.
-let stats = { lastCycleAt: null, lastPushed: 0, lastPulled: 0, lastError: null };
+let stats = { lastCycleAt: null, lastPushed: 0, lastPulled: 0, lastError: null, authExpired: false };
+// Phase 6 — a big offline backlog drains BATCH rows per push; loop up to this many pushes per cycle
+// so days-worth of orders catch up in a cycle or two instead of one-batch-per-timer-tick. Still one
+// HTTP round-trip per batch (sequential awaits) → catches up fast without hammering the cloud.
+const MAX_DRAIN_LOOPS = 25;
 
 // The hub's sync credentials live in its config file (written at provisioning) so a freshly-issued
 // token is picked up WITHOUT restarting the backend. Env vars win if present (for tests).
@@ -204,23 +208,56 @@ async function cycle() {
   if (!TOKEN()) return; // not provisioned for sync yet — quiet no-op until a token is written
   running = true;
   try {
-    const up = await pushUp();
+    // Phase 6 — drain a large backlog in one cycle (bounded): keep pushing while a full BATCH came
+    // back (⇒ probably more waiting). Watermarks advance per push, so this is safe to interrupt.
+    let up = await pushUp();
+    let pushed = (up && up.pushed) || 0;
+    let guard = 0;
+    while (((up && up.pushed) || 0) >= BATCH && guard++ < MAX_DRAIN_LOOPS) {
+      up = await pushUp();
+      pushed += (up && up.pushed) || 0;
+    }
     const down = await pullDown();
     try { await retryDeadLetter(); } catch (_) { /* best-effort — never fail the cycle on retry */ }
     // Phase 4.1 — after applying this cycle's changes, flag any item that reconciled below zero
     // (two writers sold the same units) so the manager sees an oversell instead of a silent negative.
     try { const rid = await RID(); if (rid) await require('./offlineSync/stockReconcile').flagNegativeStock(rid); } catch (_) { /* best-effort — never fail the cycle on the oversell sweep */ }
     stats.lastCycleAt = new Date().toISOString();
-    stats.lastPushed = (up && up.pushed) || 0;
+    stats.lastPushed = pushed;
     stats.lastPulled = (down && down.applied) || 0;
     stats.lastError = null;
+    stats.authExpired = false; // a clean cycle proves the token is still good
   } catch (e) {
     // Offline / transient — leave watermarks, retry next tick. Log quietly.
     stats.lastError = e.message;
-    if (!/HTTP (401|403)/.test(e.message)) console.warn('[apiSync] cycle:', e.message);
+    // Phase 6 — a 401/403 means the sync token is no longer accepted (revoked / secret rotated).
+    // Surface it (getStatus.authExpired) so the UI can prompt a re-connect instead of failing forever.
+    if (/HTTP (401|403)/.test(e.message)) stats.authExpired = true;
+    else console.warn('[apiSync] cycle:', e.message);
   } finally {
     running = false;
   }
+}
+
+// Phase 6 — disk-full guard. The terminal's embedded Postgres can't write when its data volume is
+// full (orders would fail). We proactively report free space on the PG data volume so the UI can warn
+// BEFORE it fills. Cached (20s) + best-effort — returns {} if statfs/SHOW is unavailable, never throws.
+let _pgDataDir = null;
+let _diskCache = { at: 0, val: {} };
+async function diskStatus() {
+  try {
+    const now = Date.now();
+    if (now - _diskCache.at < 20000) return _diskCache.val;
+    if (!_pgDataDir && pool) {
+      try { const r = await pool.query('SHOW data_directory'); _pgDataDir = r.rows[0] && r.rows[0].data_directory; } catch (_) {}
+    }
+    const dir = _pgDataDir || process.cwd();
+    const st = await fs.promises.statfs(dir);
+    const freeMb = Math.floor((Number(st.bavail) * Number(st.bsize)) / (1024 * 1024));
+    const val = { diskFreeMb: freeMb, diskLow: freeMb < 500, diskCritical: freeMb < 100 };
+    _diskCache = { at: now, val };
+    return val;
+  } catch (_) { return {}; }
 }
 
 // Lightweight status for the UI's "Syncing…" indicator. pendingUp = orders on THIS hub not yet
@@ -242,7 +279,8 @@ async function getStatus() {
   try {
     if (pool) { const d = await pool.query('SELECT count(*)::int AS n FROM sync_deadletter'); deadLetter = (d.rows[0] && d.rows[0].n) || 0; }
   } catch (_) { /* table may not exist yet */ }
-  return { enabled, running, pendingUp, deadLetter, lastCycleAt: stats.lastCycleAt, lastPushed: stats.lastPushed, lastPulled: stats.lastPulled, lastError: stats.lastError };
+  const disk = await diskStatus();
+  return { enabled, running, pendingUp, deadLetter, authExpired: !!stats.authExpired, ...disk, lastCycleAt: stats.lastCycleAt, lastPushed: stats.lastPushed, lastPulled: stats.lastPulled, lastError: stats.lastError };
 }
 
 function start() {
