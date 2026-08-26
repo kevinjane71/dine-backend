@@ -62,8 +62,11 @@ router.get('/admin/currency/:restaurantId', authenticateToken, async (req, res) 
 
     console.log(`💰 Getting currency settings for restaurant: ${restaurantId}, userId: ${userId}`);
 
-    // Verify user has access to this restaurant
-    const allowedRoles = ['owner', 'manager', 'admin', 'cashier'];
+    // Currency is a display setting the WHOLE restaurant shares — every POS-operating role must be
+    // able to READ it, or non-admin staff (waiter/kitchen/etc.) fall back to the ₹ default and see
+    // wrong prices. (Changing currency stays admin-only — see the PUT handler below.) Roles are
+    // stored lowercase; keep this list ≤10 for the Firestore `role IN` query.
+    const allowedRoles = ['owner', 'manager', 'admin', 'cashier', 'waiter', 'kitchen', 'delivery', 'staff', 'sub-admin'];
     const accessCheck = await verifyRestaurantAccess(userId, restaurantId, allowedRoles);
 
     if (!accessCheck.hasAccess) {
