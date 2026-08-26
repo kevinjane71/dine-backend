@@ -102,6 +102,10 @@ const DOWN_TABLES = (process.env.CLOUD_SYNC_DOWN_TABLES ||
   [
     'restaurants', 'orders', 'pos_payments', 'staff_users', 'floors', 'tables', 'rest_bookings',
     'bookings_v2', 'space_bookings', 'booking_venues',
+    // NOTE: the menu + prices already flow DOWN via the restaurants.menu JSONB column
+    // (SYNC_ONLY_COLS.restaurants=['menu']), so menu_items is intentionally NOT listed here — this
+    // deployment stores the active menu in restaurants.menu, and dual-syncing menu_items could cause
+    // two competing menu sources.
     'offers', 'recipes', 'suppliers', 'inventory', 'customers', 'coupons', 'customer_groups',
     // owner config that must reach the shop so offline payroll/leave/feedback/scheduling work:
     'payroll_config', 'leave_config', 'inventory_categories', 'restaurant_shift_settings', 'feedback_forms',
@@ -314,6 +318,10 @@ const DOWN_ONLY_COLS = {
     'tax_settings', 'pricing_settings', 'currency_settings', 'billing_settings', 'order_settings',
     'discount_approval_settings', 'booking_settings', 'feedback_settings', 'customer_app_settings',
     'aggregator_config',
+    // Owner-authoritative identity/currency the terminal must display consistently with the web
+    // (fixes a local terminal showing the wrong currency symbol vs the cloud). Non-existent columns
+    // are auto-filtered by dstNames.has(), so listing extras here is safe.
+    'currency_symbol', 'currency_code', 'country_code', 'timezone', 'business_type',
   ],
 };
 
