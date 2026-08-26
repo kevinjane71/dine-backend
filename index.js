@@ -7098,6 +7098,23 @@ app.patch('/api/restaurants/:restaurantId', authenticateToken, async (req, res) 
       }
     });
 
+    // Shared/single inventory: point this outlet's stock deduction at ANOTHER outlet you own.
+    // Empty → clear (use own stock). Validated same-owner (the deduction service re-checks too).
+    if (req.body.inventorySourceRestaurantId !== undefined) {
+      const srcId = req.body.inventorySourceRestaurantId;
+      if (!srcId) {
+        updateData.inventorySourceRestaurantId = null;
+      } else if (srcId === restaurantId) {
+        return res.status(400).json({ error: 'Inventory source cannot be the same outlet' });
+      } else {
+        const srcDoc = await getCachedRestDoc(srcId);
+        if (!srcDoc.exists || srcDoc.data().ownerId !== userId) {
+          return res.status(400).json({ error: 'Inventory source must be another outlet you own' });
+        }
+        updateData.inventorySourceRestaurantId = srcId;
+      }
+    }
+
     // Validate GSTIN format if provided (15 characters: 2 state code + 10 PAN + 1 entity + 1 Z + 1 checksum)
     if (req.body.gstin !== undefined && req.body.gstin !== '') {
       const gstinRegex = /^[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z]{1}[1-9A-Z]{1}Z[0-9A-Z]{1}$/;

@@ -374,9 +374,31 @@ class InventoryService {
       const batch = db.batch();
       let hasUpdates = false;
 
-      // 1. Load all inventory items for the restaurant for matching
+      // ── Shared / single inventory (per-outlet flag) ──────────────────────────────────────────
+      // An outlet (e.g. a small stall) can deduct from ANOTHER outlet's SINGLE stock by setting
+      // `inventorySourceRestaurantId` on itself (must belong to the SAME owner). Absent or invalid
+      // → it uses its OWN stock, exactly as before (zero behaviour change for every other
+      // restaurant). `stockRid` = the outlet whose inventory/recipes/menu we use; `restaurantId`
+      // stays the outlet where the sale happened and is recorded on each txn as `soldAtRestaurantId`.
+      const selfRestDoc = await db.collection(collections.restaurants).doc(restaurantId).get();
+      const selfRestData = selfRestDoc.exists ? selfRestDoc.data() : {};
+      let stockRid = restaurantId;
+      let restDataLoaded = selfRestData;
+      const srcId = selfRestData.inventorySourceRestaurantId;
+      if (srcId && srcId !== restaurantId) {
+        const srcDoc = await db.collection(collections.restaurants).doc(srcId).get();
+        if (srcDoc.exists && srcDoc.data().ownerId && srcDoc.data().ownerId === selfRestData.ownerId) {
+          stockRid = srcId;
+          restDataLoaded = srcDoc.data(); // source outlet's menu drives recipe/variant matching
+          console.log(`🔗 Shared inventory: order at ${restaurantId} deducts from ${stockRid}`);
+        } else {
+          console.warn(`⚠️ inventorySourceRestaurantId=${srcId} invalid (missing / different owner) — using own stock`);
+        }
+      }
+
+      // 1. Load all inventory items for the (stock) restaurant for matching
       const inventorySnapshot = await db.collection('inventory')
-        .where('restaurantId', '==', restaurantId)
+        .where('restaurantId', '==', stockRid)
         .get();
 
       const inventoryItems = [];
@@ -386,7 +408,7 @@ class InventoryService {
 
       // 1b. Load ALL recipes once for sub-recipe resolution (no extra queries per sub-recipe)
       const allRecipesSnap = await db.collection('recipes')
-        .where('restaurantId', '==', restaurantId)
+        .where('restaurantId', '==', stockRid)
         .get();
       const recipeMap = {};
       const recipesList = [];
@@ -396,10 +418,7 @@ class InventoryService {
         recipesList.push({ id: doc.id, ...data, ref: doc.ref });
       });
 
-      // 1c. Load the restaurant (menu items for variant multipliers + modifier
-      // inventory links; also reused for bar settings below).
-      const restDocLoaded = await db.collection(collections.restaurants).doc(restaurantId).get();
-      const restDataLoaded = restDocLoaded.exists ? restDocLoaded.data() : {};
+      // 1c. Menu items (variant multipliers + modifier inventory links) — from the stock outlet.
       const menuItemsMap = {};
       for (const m of (restDataLoaded.menu?.items || [])) menuItemsMap[m.id] = m;
 
@@ -447,7 +466,7 @@ class InventoryService {
           batch.update(modInv.ref, { currentStock: FieldValue.increment(-modDeduct), updatedAt: new Date() });
           const mCost = modInv.costPerUnit || 0;
           batch.set(db.collection('inventoryTransactions').doc(), {
-            restaurantId, inventoryItemId: modInv.id, inventoryItemName: modInv.name,
+            restaurantId: stockRid, soldAtRestaurantId: restaurantId, inventoryItemId: modInv.id, inventoryItemName: modInv.name,
             type: 'DEDUCTION', source: 'ORDER', referenceId, orderId: baseOrderId,
             quantityChange: -modDeduct, unit: modInv.unit, costPerUnit: mCost, totalCost: modDeduct * mCost,
             date: new Date(), notes: `Modifier "${cust.name}" on ${qtySold}x ${item.name}`
@@ -493,7 +512,7 @@ class InventoryService {
                 const unitCost = directInvItem.costPerUnit || 0;
                 const transactionRef = db.collection('inventoryTransactions').doc();
                 batch.set(transactionRef, {
-                  restaurantId, inventoryItemId: directInvItem.id, inventoryItemName: directInvItem.name,
+                  restaurantId: stockRid, soldAtRestaurantId: restaurantId, inventoryItemId: directInvItem.id, inventoryItemName: directInvItem.name,
                   type: 'DEDUCTION', source: 'ORDER', referenceId, orderId: baseOrderId,
                   quantityChange: -deductQty, unit: directInvItem.unit || 'pcs',
                   costPerUnit: unitCost, totalCost: deductQty * unitCost,
@@ -682,7 +701,8 @@ class InventoryService {
                 const unitCost = inventoryItem.costPerUnit || 0;
                 const transactionRef = db.collection('inventoryTransactions').doc();
                 const txData = {
-                    restaurantId,
+                    restaurantId: stockRid,
+                    soldAtRestaurantId: restaurantId,
                     inventoryItemId: inventoryItem.id,
                     inventoryItemName: inventoryItem.name,
                     type: 'DEDUCTION',
