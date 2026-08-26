@@ -61,10 +61,12 @@ router.get('/dashboard', authenticateToken, requireOwnerRole, async (req, res) =
     const restaurantIds = [];
 
     restaurantsSnap.forEach(doc => {
+      const d = doc.data();
+      if (d.isDeleted === true || d.status === 'deleted') return; // hide soft-deleted outlets from HQ rankings
       restaurantIds.push(doc.id);
       restaurants.push({
         id: doc.id,
-        ...doc.data()
+        ...d
       });
     });
 
