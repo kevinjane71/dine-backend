@@ -103,6 +103,11 @@ router.post('/push', authenticateToken, express.json({ limit: '25mb' }), async (
     if ((groups.orders || groups.pos_payments || groups.pos_invoices) && req.app && req.app.locals && req.app.locals.recomputeDailyStats) {
       Promise.resolve().then(() => req.app.locals.recomputeDailyStats(rid)).catch(() => {});
     }
+    // Phase 4.1 — if inventory/orders arrived, flag any item that reconciled below zero on the cloud
+    // so the owner sees the oversell on the web (never reverse the sale). Best-effort, async, additive.
+    if (groups.inventory || groups.orders) {
+      Promise.resolve().then(() => require('../services/offlineSync/stockReconcile').flagNegativeStock(rid)).catch(() => {});
+    }
     res.json({ ok: true, applied, deleted, results });
   } catch (e) {
     console.error('[sync/push] error:', e.message);

@@ -207,6 +207,9 @@ async function cycle() {
     const up = await pushUp();
     const down = await pullDown();
     try { await retryDeadLetter(); } catch (_) { /* best-effort — never fail the cycle on retry */ }
+    // Phase 4.1 — after applying this cycle's changes, flag any item that reconciled below zero
+    // (two writers sold the same units) so the manager sees an oversell instead of a silent negative.
+    try { const rid = await RID(); if (rid) await require('./offlineSync/stockReconcile').flagNegativeStock(rid); } catch (_) { /* best-effort — never fail the cycle on the oversell sweep */ }
     stats.lastCycleAt = new Date().toISOString();
     stats.lastPushed = (up && up.pushed) || 0;
     stats.lastPulled = (down && down.applied) || 0;
