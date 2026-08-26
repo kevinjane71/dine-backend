@@ -739,10 +739,18 @@ async function applyRecords(pool, table, records, { scopeRid = null, direction =
         // stops a stale-but-newer-timestamp copy (clock skew, or a background touch on the other side
         // bumping updated_at) from un-settling a paid bill or reviving a voided one. Symmetric: it
         // protects the terminal on DOWN and the cloud on UP (incl. a second terminal pushing a stale
-        // open copy). Both-finalized edits (e.g. a later refund) still resolve LWW — only the specific
-        // finalized→non-finalized transition is blocked. Only added when the incoming row carries status.
+        // open copy). Both-finalized edits (e.g. a later refund) still resolve LWW.
+        //   BUT a legitimate RESTORE (recall a cancelled order → cancelled goes back to pending/active)
+        //   is exactly this finalized→non-finalized shape. We let it through by requiring the incoming
+        //   row to carry a strictly-newer `restored_at` (a real restore stamps restored_at=now()); a
+        //   stale copy has null/older restored_at, so it is still blocked. Only the un-restore-looking,
+        //   NON-restore regression is stopped. Only added when the incoming row carries status.
+        const hasRestored = names.includes('restored_at');
         const monotonic = (table === 'orders' && names.includes('status'))
-          ? ` AND NOT (LOWER(COALESCE("${table}".status,'')) IN ('completed','cancelled') AND LOWER(COALESCE(EXCLUDED.status,'')) NOT IN ('completed','cancelled'))`
+          ? ` AND NOT (LOWER(COALESCE("${table}".status,'')) IN ('completed','cancelled')`
+            + ` AND LOWER(COALESCE(EXCLUDED.status,'')) NOT IN ('completed','cancelled')`
+            + (hasRestored ? ` AND COALESCE(EXCLUDED.restored_at, to_timestamp(0)) <= COALESCE("${table}".restored_at, to_timestamp(0))` : '')
+            + `)`
           : '';
         sql = `INSERT INTO "${table}" (${quotedIns}) VALUES (${ph}) ON CONFLICT (${conflictTgt}) DO UPDATE SET ${upd} WHERE "${table}".updated_at < EXCLUDED.updated_at${monotonic}`;
       }
