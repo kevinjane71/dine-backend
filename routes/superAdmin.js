@@ -1404,6 +1404,7 @@ router.get('/orders/summary', authenticateSuperAdmin, requireSuperAdmin, async (
     const period = req.query.period || 'today'; // 'today' | 'yesterday' | '7days'
     const dateStrings = getDateStringsForPeriod(period, parseTZ(req));
     const perRestLimit = parseLimit(req.query.limit);
+    const augment = !!process.env.SUPERADMIN_PG_URL;
 
     let snap;
     if (dateStrings.length === 1) {
@@ -1413,41 +1414,71 @@ router.get('/orders/summary', authenticateSuperAdmin, requireSuperAdmin, async (
     }
     const dailyStatsData = snap.docs.map(doc => doc.data());
 
-    let totalOrders = 0;
-    let totalRevenue = 0;
-    let totalRevenueWithTax = 0;
+    // Restaurants routed to GCP (pgBackendUrl set): their fresh per-day stats live in PG,
+    // so we take them from Postgres below and skip their (stale) Firestore copy here.
+    let migratedIds = new Set();
+    if (augment) {
+      try {
+        const ms = await db.collection(collections.restaurants).where('pgBackendUrl', '!=', null).get();
+        migratedIds = new Set(ms.docs.map(d => d.id));
+      } catch (e) { console.error('[orders-summary] migrated lookup failed:', e.message); }
+    }
+
     const statsMap = {};
-    const restaurantIds = new Set();
+    const pgNames = {};
+    const addStats = (rid, orders, revenue, revenueWithTax) => {
+      if (!statsMap[rid]) statsMap[rid] = { orders: 0, revenue: 0, revenueWithTax: 0 };
+      statsMap[rid].orders += orders;
+      statsMap[rid].revenue += revenue;
+      statsMap[rid].revenueWithTax += revenueWithTax;
+    };
 
-    dailyStatsData.forEach(data => {
-      const orders = data.totalOrders || 0;
-      const revenue = data.totalRevenue || 0;
-      const revenueWithTax = data.totalRevenueWithTax || data.totalRevenue || 0;
-
-      totalOrders += orders;
-      totalRevenue += revenue;
-      totalRevenueWithTax += revenueWithTax;
-
-      if (data.restaurantId) {
-        restaurantIds.add(data.restaurantId);
-        if (!statsMap[data.restaurantId]) {
-          statsMap[data.restaurantId] = { orders: 0, revenue: 0, revenueWithTax: 0 };
+    // ── GCP-native + migrated restaurants' per-day stats from Postgres (fail-safe) ──
+    let gcpOk = false;
+    const pool = getStatsPgPool();
+    if (pool) {
+      try {
+        const migratedArr = Array.from(migratedIds);
+        const rows = (await pool.query(
+          `SELECT restaurant_id,
+                  COALESCE(SUM(total_orders),0)::int AS orders,
+                  COALESCE(SUM(total_revenue),0)::float AS revenue,
+                  COALESCE(SUM(COALESCE(total_revenue_with_tax, total_revenue, 0)),0)::float AS revenue_wt
+             FROM daily_stats
+            WHERE date = ANY($1::text[])
+              AND ( restaurant_id = ANY($2::text[])
+                    OR restaurant_id IN (SELECT id FROM restaurants WHERE origin='native') )
+            GROUP BY restaurant_id`, [dateStrings, migratedArr])).rows;
+        rows.forEach(r => addStats(String(r.restaurant_id), r.orders, r.revenue, r.revenue_wt));
+        const ids = rows.map(r => String(r.restaurant_id));
+        if (ids.length) {
+          (await pool.query("SELECT id, name FROM restaurants WHERE id = ANY($1::text[])", [ids]))
+            .rows.forEach(x => { pgNames[String(x.id)] = x.name; });
         }
-        statsMap[data.restaurantId].orders += orders;
-        statsMap[data.restaurantId].revenue += revenue;
-        statsMap[data.restaurantId].revenueWithTax += revenueWithTax;
-      }
+        gcpOk = true;
+      } catch (e) { console.error('[orders-summary] PG augmentation failed, Firestore-only:', e.message); }
+    }
+
+    // Firestore: add every restaurant EXCEPT migrated ones (their fresh copy came from PG above).
+    dailyStatsData.forEach(data => {
+      if (!data.restaurantId) return;
+      if (gcpOk && migratedIds.has(data.restaurantId)) return; // avoid double-count
+      addStats(data.restaurantId, data.totalOrders || 0, data.totalRevenue || 0, data.totalRevenueWithTax || data.totalRevenue || 0);
     });
 
-    // Batch fetch restaurant names with getAll() — single round-trip
-    const nameMap = await batchGetDocs(collections.restaurants, [...restaurantIds]);
+    // Totals recomputed from the merged map so they always match the per-restaurant rows.
+    let totalOrders = 0, totalRevenue = 0, totalRevenueWithTax = 0;
+    Object.values(statsMap).forEach(s => { totalOrders += s.orders; totalRevenue += s.revenue; totalRevenueWithTax += s.revenueWithTax; });
 
-    // Build sorted per-restaurant list
-    let perRestaurant = Object.entries(statsMap).map(([restaurantId, stats]) => ({
+    // Names: Firestore first, PG fallback for born-on-GCP restaurants (not in Firestore).
+    const allIds = Object.keys(statsMap);
+    const nameMap = await batchGetDocs(collections.restaurants, allIds);
+
+    let perRestaurant = allIds.map(restaurantId => ({
       restaurantId,
-      restaurantName: nameMap[restaurantId]?.name || 'Unknown',
-      orders: stats.orders,
-      revenue: Math.round(stats.revenueWithTax * 100) / 100,
+      restaurantName: nameMap[restaurantId]?.name || pgNames[restaurantId] || 'Unknown',
+      orders: statsMap[restaurantId].orders,
+      revenue: Math.round(statsMap[restaurantId].revenueWithTax * 100) / 100,
     }));
     perRestaurant.sort((a, b) => b.revenue - a.revenue);
 
@@ -1565,6 +1596,54 @@ router.get('/activity/logins', authenticateSuperAdmin, requireSuperAdmin, async 
       lastLoginPlatform: u.lastLoginPlatform || null,
       restaurants: restaurantMap[u.id] || [],
     }));
+
+    // ── GCP-native logins from Postgres (fail-safe no-op if SUPERADMIN_PG_URL unset) ──
+    // Native users are born on GCP and don't exist in Firestore, so add them here — with
+    // their own restaurants pulled from PG. Deduped by userId for safety.
+    if (process.env.SUPERADMIN_PG_URL) {
+      const pool = getStatsPgPool();
+      if (pool) {
+        try {
+          const nu = (await pool.query(
+            `SELECT id, name, email, phone, role, provider, last_login, last_login_platform
+               FROM app_users
+              WHERE origin='native' AND last_login >= $1 AND last_login <= $2
+              ORDER BY last_login DESC LIMIT 200`,
+            [startDate.toISOString(), endDate.toISOString()])).rows;
+
+          const ownerIds = nu.filter(u => u.role === 'owner').map(u => String(u.id));
+          const restByOwner = {};
+          if (ownerIds.length) {
+            (await pool.query("SELECT id, name, owner_id FROM restaurants WHERE owner_id = ANY($1::text[])", [ownerIds]))
+              .rows.forEach(r => {
+                const o = String(r.owner_id);
+                if (!restByOwner[o]) restByOwner[o] = [];
+                restByOwner[o].push({ id: String(r.id), name: r.name || 'Unnamed' });
+              });
+          }
+
+          const seen = new Set(logins.map(l => l.userId));
+          for (const u of nu) {
+            const uid = String(u.id);
+            if (seen.has(uid)) continue;
+            logins.push({
+              userId: uid,
+              name: u.name || '',
+              email: u.email || '',
+              phone: u.phone || '',
+              role: u.role || '',
+              provider: u.provider || '',
+              lastLogin: u.last_login ? new Date(u.last_login).toISOString() : null,
+              lastLoginPlatform: u.last_login_platform || null,
+              restaurants: restByOwner[uid] || [],
+            });
+          }
+          logins.sort((a, b) => String(b.lastLogin || '').localeCompare(String(a.lastLogin || '')));
+        } catch (e) {
+          console.error('[activity-logins] PG augmentation failed, Firestore-only:', e.message);
+        }
+      }
+    }
 
     res.json({
       success: true,
