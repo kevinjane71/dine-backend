@@ -368,6 +368,17 @@ module.exports = function initEtimsRoutes(db, collections, authenticateToken, va
         vsdcRcptPbctDate: parsed.vsdcRcptPbctDate,
         fiscalisedAt: new Date(),
       };
+      // Pre-render the KRA verification QR and STORE it on the order so it prints on EVERY
+      // path — the sale-time auto-print AND later reprints (the FE renders order.etims.qrDataUrl
+      // when present; the live path in kenyaFiscalReceipt.js only builds it if it's still absent).
+      // Byte-identical content to the FE's buildQrContent (tin+bhfId+rcptSign). Best-effort only:
+      // a QR failure must NEVER block fiscalisation, so it's fully wrapped and non-fatal.
+      try {
+        const cfg = (r.data && r.data.etimsConfig) || {};
+        const qrContent = 'https://etims.kra.go.ke/common/link/etims/receipt/indexEtimsReceiptData?Data='
+          + encodeURIComponent(`${cfg.tin || ''}${cfg.bhfId || '00'}${etimsRecord.rcptSign || ''}`);
+        etimsRecord.qrDataUrl = await require('qrcode').toDataURL(qrContent, { width: 150, margin: 1 });
+      } catch (qrErr) { console.error('[etims] confirm-sale: QR render skipped (non-fatal):', qrErr && qrErr.message); }
       // Full-object UPDATE (order exists; a merge-set upserts and its INSERT branch would need
       // restaurant_id (NOT NULL) on PG). No dot-path — Firestore + pgAdapter safe. The device
       // counter was already advanced atomically at prepare-sale.
