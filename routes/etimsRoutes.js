@@ -299,7 +299,13 @@ module.exports = function initEtimsRoutes(db, collections, authenticateToken, va
           return { invcNo, order, rData };
         });
       } catch (e) {
-        if (e && e.code) return res.status(e.code).json({ error: e.message, status: e.status });
+        // Only our own intentional { code: <http status> } errors map to a status here. A DB/PG
+        // error carries a NON-numeric code (e.g. '25P02') — res.status() would throw on it and mask
+        // the real error, so let those fall through to the outer 500 handler.
+        const httpCode = Number(e && e.code);
+        if (Number.isInteger(httpCode) && httpCode >= 400 && httpCode <= 599) {
+          return res.status(httpCode).json({ error: e.message, status: e.status });
+        }
         throw e;
       }
 
