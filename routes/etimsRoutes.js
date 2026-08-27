@@ -305,6 +305,11 @@ module.exports = function initEtimsRoutes(db, collections, authenticateToken, va
 
       if (reserved.alreadyFiscalised) return res.json({ success: true, alreadyFiscalised: true, etims: reserved.etims });
       const cfg = reserved.rData.etimsConfig || {};
+      // Log the attempt START (invoice reserved). This is what was missing: a fiscalisation that dies
+      // at the VSCU/confirm step used to leave order.etims={pendingInvcNo} with NO diagnostic. Now every
+      // attempt is traceable — pair a 'prepare-sale' with (or WITHOUT) a later 'confirm-sale' to see
+      // exactly where it stopped. Best-effort; never blocks the sale.
+      logDiag(restaurantId, { phase: 'prepare-sale', ok: true, restaurantName: r.data.name, orderId, invcNo: reserved.invcNo, _cfg: cfgCtx(r) });
       const { payload } = etims.buildSaveSalesPayload(reserved.order, reserved.rData, reserved.invcNo);
       res.json({ success: true, vscuUrl: cfg.vscuUrl, path: '/trnsSales/saveSales', body: payload });
     } catch (e) { console.error('etims prepare-sale:', e); res.status(500).json({ error: 'Failed to prepare sale' }); }
