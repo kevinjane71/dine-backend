@@ -220,6 +220,7 @@ const FIELD_MAP = {
   updatedAt: 'updated_at',
   completedAt: 'completed_at',
   expiredAt: 'expired_at',
+  etims: 'etims',                 // Kenya KRA eTIMS fiscal data (pendingInvcNo / rcptSign / sdcId …)
 };
 
 // Reverse map: snake_case → camelCase
@@ -241,7 +242,7 @@ const JSONB_COLUMNS = new Set([
   'kot_printed_stations', 'delivery_info', 'delivery_address',
   'pre_edit_snapshot', 'void_items', 'removed_items', 'edit_history',
   'price_discrepancies', 'restoration_history', 'bill_reprint_history', 'extra_data',
-  'update_history', 'offer_ids', 'billing_audit', 'comp_items',
+  'update_history', 'offer_ids', 'billing_audit', 'comp_items', 'etims',
 ]);
 
 /**
