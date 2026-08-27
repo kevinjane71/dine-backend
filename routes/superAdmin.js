@@ -105,6 +105,27 @@ router.post('/login', async (req, res) => {
   }
 });
 
+// ─── Cross-DB stats augmentation ─────────────────────────────────────
+// This (Vercel) backend reads Firestore. New signups are now born on the GCP/Postgres
+// backend and stored with origin='native'. To show correct PLATFORM totals WITHOUT
+// double-counting the Firestore-mirror rows that also live in PG (from restaurant syncs),
+// we add ONLY origin='native' PG rows to the Firestore counts.
+//
+// Uses a SEPARATE read-only connection string (SUPERADMIN_PG_URL) — deliberately NOT
+// DATABASE_URL — so this backend never flips into "PG mode". If the env is absent (or PG
+// is unreachable) the endpoint behaves EXACTLY as before: Firestore-only, no throw.
+let _statsPgPool = null;
+function getStatsPgPool() {
+  const url = process.env.SUPERADMIN_PG_URL;
+  if (!url) return null;
+  if (!_statsPgPool) {
+    const { Pool } = require('pg');
+    _statsPgPool = new Pool({ connectionString: url, max: 2, idleTimeoutMillis: 10000, ssl: { rejectUnauthorized: false } });
+    _statsPgPool.on('error', (e) => console.error('[stats-pg] pool error:', e.message));
+  }
+  return _statsPgPool;
+}
+
 // ─── Platform Stats ──────────────────────────────────────────────────
 // Uses count() aggregation queries to avoid fetching full documents
 router.get('/stats', authenticateSuperAdmin, requireSuperAdmin, async (req, res) => {
@@ -112,6 +133,8 @@ router.get('/stats', authenticateSuperAdmin, requireSuperAdmin, async (req, res)
     const { start: todayStart } = getTodayBounds();
     const sevenDaysAgo = new Date(todayStart);
     sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 7);
+    const todayStr = getTodayString(parseTZ(req));
+    const augment = !!process.env.SUPERADMIN_PG_URL;
 
     const [
       usersCount,
@@ -126,32 +149,95 @@ router.get('/stats', authenticateSuperAdmin, requireSuperAdmin, async (req, res)
       // Use count() instead of fetching full user docs
       db.collection(collections.users).where('lastLogin', '>=', todayStart).count().get(),
       db.collection(collections.users).where('createdAt', '>=', sevenDaysAgo).count().get(),
-      // dailyStats: PG primary, Firestore fallback
+      // dailyStats: PG primary, Firestore fallback — returns an array of data objects
       (async () => {
-        const todayStr = getTodayString(parseTZ(req));
         const snap = await db.collection('dailyStats').where('date', '==', todayStr).get();
         return snap.docs.map(doc => doc.data());
       })(),
       db.collection('demoRequests').count().get(),
     ]);
 
+    // Restaurants routed to GCP (pgBackendUrl set): their LIVE today-stats are written to
+    // Postgres now, so their Firestore dailyStats copy is stale. We take their numbers from
+    // PG below and skip the Firestore copy here to avoid counting them twice.
+    let migratedIds = new Set();
+    if (augment) {
+      try {
+        const migratedSnap = await db.collection(collections.restaurants).where('pgBackendUrl', '!=', null).get();
+        migratedIds = new Set(migratedSnap.docs.map(d => d.id));
+      } catch (e) {
+        console.error('[stats-pg] migrated-ids lookup failed:', e.message);
+      }
+    }
+
+    // ── GCP-native augmentation (fail-safe: any error → Firestore-only numbers) ──
+    let gcpOk = false;
+    let gNativeUsers = 0, gNativeRests = 0, gNewUsers7d = 0, gActiveToday = 0, gOrders = 0, gRevenue = 0;
+    const pool = getStatsPgPool();
+    if (pool) {
+      try {
+        const migratedArr = Array.from(migratedIds);
+        const [nu, nr, n7, na, od] = await Promise.all([
+          pool.query("SELECT count(*)::int c FROM app_users WHERE origin='native'"),
+          pool.query("SELECT count(*)::int c FROM restaurants WHERE origin='native'"),
+          pool.query("SELECT count(*)::int c FROM app_users WHERE origin='native' AND created_at >= $1", [sevenDaysAgo.toISOString()]),
+          pool.query("SELECT count(*)::int c FROM app_users WHERE origin='native' AND last_login >= $1", [todayStart.toISOString()]),
+          // Today's orders/revenue for every GCP-LIVE restaurant (born-native OR migrated).
+          pool.query(
+            `SELECT COALESCE(SUM(total_orders),0)::int AS orders,
+                    COALESCE(SUM(COALESCE(total_revenue_with_tax, total_revenue, 0)),0)::float AS revenue
+               FROM daily_stats
+              WHERE date = $1
+                AND ( restaurant_id = ANY($2::text[])
+                      OR restaurant_id IN (SELECT id FROM restaurants WHERE origin='native') )`,
+            [todayStr, migratedArr]),
+        ]);
+        gNativeUsers = nu.rows[0].c;
+        gNativeRests = nr.rows[0].c;
+        gNewUsers7d = n7.rows[0].c;
+        gActiveToday = na.rows[0].c;
+        gOrders = od.rows[0].orders;
+        gRevenue = od.rows[0].revenue || 0;
+        gcpOk = true;
+      } catch (e) {
+        console.error('[stats-pg] augmentation failed, returning Firestore-only:', e.message);
+      }
+    }
+
     let ordersToday = 0;
     let revenueToday = 0;
     dailyStatsToday.forEach(data => {
+      // Only skip the (stale) Firestore copy of a migrated restaurant when we actually got its
+      // fresh PG number — otherwise keep the value rather than dropping it entirely.
+      if (gcpOk && migratedIds.has(data.restaurantId)) return;
       ordersToday += data.totalOrders || 0;
       revenueToday += data.totalRevenueWithTax || data.totalRevenue || 0;
     });
+    ordersToday += gOrders;
+    revenueToday += gRevenue;
 
     res.json({
       success: true,
       stats: {
-        totalUsers: usersCount.data().count,
-        totalRestaurants: restaurantsCount.data().count,
-        activeUsersToday: activeUsersTodayCount.data().count,
-        newUsersThisWeek: newUsersWeekCount.data().count,
+        totalUsers: usersCount.data().count + gNativeUsers,
+        totalRestaurants: restaurantsCount.data().count + gNativeRests,
+        activeUsersToday: activeUsersTodayCount.data().count + gActiveToday,
+        newUsersThisWeek: newUsersWeekCount.data().count + gNewUsers7d,
         totalDemoRequests: demoRequestsCount.data().count,
         ordersToday,
         revenueToday: Math.round(revenueToday * 100) / 100,
+        // Transparency: where the numbers came from (null gcpNative = augmentation off/failed).
+        _breakdown: {
+          firestore: {
+            totalUsers: usersCount.data().count,
+            totalRestaurants: restaurantsCount.data().count,
+          },
+          gcpNative: gcpOk ? {
+            users: gNativeUsers, restaurants: gNativeRests,
+            newUsers7d: gNewUsers7d, activeToday: gActiveToday,
+            ordersToday: gOrders, revenueToday: Math.round(gRevenue * 100) / 100,
+          } : null,
+        },
       }
     });
   } catch (error) {
