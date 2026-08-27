@@ -1764,6 +1764,12 @@ app.use(morgan(process.env.NODE_ENV === 'production' ? 'combined' : 'dev'));
 // cap. Mounted BEFORE the global parser so it wins for this path (body-parser skips a request
 // whose body is already parsed).
 app.use('/api/menus/bulk-save', bodyParser.json({ limit: '50mb' }));
+
+// Per-restaurant reverse proxy (Vercel → GCP) — disabled unless ENABLE_PG_PROXY=true.
+// When on, it needs the exact request bytes to forward migrated restaurants' traffic
+// verbatim, so we stash the raw buffer here (zero overhead / not stored when disabled).
+const PG_PROXY_ENABLED = process.env.ENABLE_PG_PROXY === 'true';
+
 app.use(bodyParser.json({
   limit: '10mb',
   verify: (req, res, buf) => {
@@ -1771,9 +1777,16 @@ app.use(bodyParser.json({
     if (req.url && (req.url.includes('/webhook') || req.url.includes('/webhooks'))) {
       req.rawBody = buf.toString();
     }
+    if (PG_PROXY_ENABLED) req._rawBodyBuf = buf; // byte-exact forward source for pg-proxy
   }
 }));
-app.use(bodyParser.urlencoded({ extended: true, limit: '10mb' }));
+app.use(bodyParser.urlencoded({
+  extended: true,
+  limit: '10mb',
+  verify: (req, res, buf) => {
+    if (PG_PROXY_ENABLED) req._rawBodyBuf = buf;
+  }
+}));
 
 // Performance optimization middleware (must be early in the chain)
 app.use(performanceOptimizer);
@@ -1783,6 +1796,14 @@ app.use((req, res, next) => {
   res.setHeader('X-Request-ID', req.id);
   next();
 });
+
+// ── Per-restaurant backend proxy (migration bridge) ──────────────────────────
+// For restaurants flagged onto GCP (pgBackendUrl set via dine-admin), transparently
+// forward their traffic to GCP so live sessions route correctly WITHOUT re-login.
+// No-op unless ENABLE_PG_PROXY=true — see middleware/pgBackendProxy.js for safety notes.
+const pgBackendProxy = require('./middleware/pgBackendProxy');
+pgBackendProxy.init(db, collections);
+app.use(pgBackendProxy.middleware);
 
 // Global rate limiter ready but disabled — enable after testing order rate limit
 // app.use('/api', async (req, res, next) => {
