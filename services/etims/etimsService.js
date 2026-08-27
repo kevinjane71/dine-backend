@@ -153,20 +153,21 @@ function buildSaveSalesPayload(order, restaurantData, overrideInvcNo) {
     return {
       itemSeq: i + 1,
       itemCd: String(it.pluCode || it.shortCode || it.menuItemId || it.id || `ITEM${i + 1}`).slice(0, 20),
-      itemClsCd: String(it.kraItemClassCode || cfg.defaultItemClassCode || '5059690800'), // CONFIRM §4.17 (UNSPSC)
+      itemClsCd: String(it.kraItemClassCode || cfg.defaultItemClassCode || '42294957'), // §4.17 (UNSPSC) — 42294957 is the KRA-accepted default (matches a proven live sale)
       itemNm: String(it.name || 'Item').slice(0, 200),
       bcd: it.barcode ? String(it.barcode) : null,
-      pkgUnitCd: 'NT',            // CONFIRM §4.5 (packaging unit)
-      pkg: 1,
-      qtyUnitCd: 'U',             // CONFIRM §4.6 (unit of quantity — 'U' = each)
+      pkgUnitCd: 'CTN',           // §4.5 packaging unit — 'CTN' is a KRA-accepted code (a proven live sale used it; 'NT' was rejected by the sandbox VSCU)
+      pkg: 0,                      // packaging qty — proven live sale used 0
+      qtyUnitCd: 'U',             // §4.6 (unit of quantity — 'U' = each)
       qty,
       prc: round2(unitPrice),
       splyAmt: lineGross,
       dcRt: 0,
       dcAmt: 0,
+      isrccNm: null, isrcRt: null, isrcAmt: null, // insurance (pharmacy) — sent as null on a normal sale
       taxTyCd: bandLetter,
       taxblAmt: round2(taxbl),
-      totTaxAmt: round2(tax),
+      taxAmt: round2(tax),        // KRA item field is `taxAmt` (the proven-working payload uses this, NOT totTaxAmt)
       totAmt: lineTotal,
     };
   });
@@ -181,8 +182,10 @@ function buildSaveSalesPayload(order, restaurantData, overrideInvcNo) {
     invcNo,
     trdInvcNo: String(order.orderNumber || order.id || invcNo).slice(0, 50),
     orgInvcNo: 0,                 // 0 for an original sale (non-credit-note)
-    custTin: order.customerTin ? String(order.customerTin) : null,
-    custNm: custName ? String(custName).slice(0, 60) : null,
+    // KRA requires a buyer PIN + name; for a walk-in sale use the KRA generic-customer
+    // defaults (custTin 'A000000000D' / custNm 'CASH') — a null here is rejected by the VSCU.
+    custTin: order.customerTin ? String(order.customerTin) : 'A000000000D',
+    custNm: custName ? String(custName).slice(0, 60) : 'CASH',
     salesTyCd: 'N',              // §4.8 — send only 'N'
     rcptTyCd: 'S',               // §4.9 — 'S' = Sale
     pmtTyCd: paymentTypeCode(order.paymentMethod),  // §4.10
@@ -201,11 +204,17 @@ function buildSaveSalesPayload(order, restaurantData, overrideInvcNo) {
     totTaxAmt: round2(totTaxAmt),
     totAmt: round2(totAmt),
     prchrAcptcYn: 'N',
-    remark: null,
+    remark: '',
+    // Registrant/modifier — KRA expects these at the TOP LEVEL too (not only inside receipt).
+    // A null/absent value is rejected; use the staff, falling back to a safe non-empty code.
+    regrId: String(order.createdBy || order.staffId || 'POS').slice(0, 20) || 'POS',
+    regrNm: String(order.createdByName || order.staffName || 'POS').slice(0, 60) || 'POS',
+    modrId: String(order.createdBy || order.staffId || 'POS').slice(0, 20) || 'POS',
+    modrNm: String(order.createdByName || order.staffName || 'POS').slice(0, 60) || 'POS',
 
     // Receipt sub-object
     receipt: {
-      custTin: order.customerTin ? String(order.customerTin) : null,
+      custTin: order.customerTin ? String(order.customerTin) : 'A000000000D',
       custMblNo: custPhone ? String(custPhone).slice(0, 20) : null,
       rptNo: invcNo,
       trdeNm: String(restaurantData.name || '').slice(0, 60),
@@ -243,12 +252,12 @@ function buildSaveItemsPayloads(menuItems, restaurantData) {
         tin: String(cfg.tin || ''),
         bhfId: String(cfg.bhfId || '00'),
         itemCd: String(it.pluCode || it.shortCode || it.menuItemId || it.id || '').slice(0, 20),
-        itemClsCd: String(it.kraItemClassCode || cfg.defaultItemClassCode || '5059690800'), // CONFIRM §4.17
-        itemTyCd: '2',              // CONFIRM §4 — '2' = finished/service item (typical for F&B)
+        itemClsCd: String(it.kraItemClassCode || cfg.defaultItemClassCode || '42294957'), // §4.17 — KRA-accepted default (matches saveSales)
+        itemTyCd: '2',              // §4 — '2' = finished/service item (typical for F&B)
         itemNm: String(it.name || 'Item').slice(0, 200),
         itemStdNm: String(it.name || '').slice(0, 200),
         orgnNatCd: 'KE',            // country of origin
-        pkgUnitCd: 'NT',            // CONFIRM §4.5
+        pkgUnitCd: 'CTN',           // §4.5 packaging unit — KRA-accepted code (keep in step with saveSales)
         qtyUnitCd: 'U',             // CONFIRM §4.6 — 'U' = each
         taxTyCd: band,              // A–E
         bcd: it.barcode ? String(it.barcode) : null,
