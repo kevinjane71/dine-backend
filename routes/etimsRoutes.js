@@ -46,6 +46,7 @@ module.exports = function initEtimsRoutes(db, collections, authenticateToken, va
 
   const maskConfig = (cfg = {}) => ({
     enabled: !!cfg.enabled,
+    askPerBill: !!cfg.askPerBill,
     tin: cfg.tin || '',
     bhfId: cfg.bhfId || '00',
     dvcSrlNo: cfg.dvcSrlNo || '',
@@ -120,6 +121,7 @@ module.exports = function initEtimsRoutes(db, collections, authenticateToken, va
       const next = {
         ...existing,
         enabled: b.enabled != null ? !!b.enabled : (existing.enabled || false),
+        askPerBill: b.askPerBill != null ? !!b.askPerBill : (existing.askPerBill || false),
         tin: (b.tin != null ? String(b.tin) : existing.tin || '').trim(),
         bhfId: (b.bhfId != null ? String(b.bhfId) : existing.bhfId || '00').trim(),
         dvcSrlNo: (b.dvcSrlNo != null ? String(b.dvcSrlNo) : existing.dvcSrlNo || '').trim(),
