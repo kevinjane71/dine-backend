@@ -66,12 +66,17 @@ const round2 = (n) => Math.round((Number(n) || 0) * 100) / 100;
 // Date formatting (KRA wants local time, no separators).
 // ---------------------------------------------------------------------------
 function fmt(date, withTime) {
-  const d = date instanceof Date ? date : new Date(date);
-  if (isNaN(d.getTime())) return withTime ? '' : '';
+  const base = date instanceof Date ? date : new Date(date);
+  if (isNaN(base.getTime())) return '';
+  // eTIMS is Kenya-only → stamp the KRA timestamp in East Africa Time (UTC+3, no DST), independent of
+  // where the code runs. The cloud backend runs in UTC (Vercel) / other zones, so using the server's
+  // local clock would send a cfmDt hours off the Kenya VSCU's clock and risk rejection. Shift to EAT,
+  // then read the UTC fields of the shifted instant to get the Kenya wall-clock.
+  const d = new Date(base.getTime() + 3 * 3600 * 1000);
   const p = (n) => String(n).padStart(2, '0');
-  const ymd = `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}`;
+  const ymd = `${d.getUTCFullYear()}${p(d.getUTCMonth() + 1)}${p(d.getUTCDate())}`;
   if (!withTime) return ymd;
-  return `${ymd}${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`;
+  return `${ymd}${p(d.getUTCHours())}${p(d.getUTCMinutes())}${p(d.getUTCSeconds())}`;
 }
 
 // Payment method (§4.10 — CONFIRM). Map our methods to KRA codes.
