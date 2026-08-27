@@ -277,29 +277,33 @@ module.exports = function initEtimsRoutes(db, collections, authenticateToken, va
       // dot-path updates). A re-prepare reuses the same reserved number.
       let reserved;
       try {
-        reserved = await db.runTransaction(async (tx) => {
-          const rSnap = await tx.get(r.ref);
-          const rData = rSnap.data() || {};
-          const cfg = rData.etimsConfig || {};
-          const device = cfg.device || {};
-          const oRef = db.collection('orders').doc(orderId);
-          const oSnap = await tx.get(oRef);
-          if (!oSnap.exists) { const e = new Error('Order not found'); e.code = 404; throw e; }
-          const order = { id: oSnap.id, ...oSnap.data() };
-          if (order.restaurantId !== restaurantId) { const e = new Error('Order does not belong to this restaurant.'); e.code = 403; throw e; }
-          if (order.status !== 'completed' && order.status !== 'paid') { const e = new Error('Order is not a completed sale yet.'); e.code = 409; e.status = order.status; throw e; }
-          if (!Array.isArray(order.items) || order.items.length === 0) { const e = new Error('Order has no items to fiscalise.'); e.code = 422; throw e; }
-          if (order.etims && order.etims.rcptSign) return { alreadyFiscalised: true, etims: order.etims };
+        // NOT a runTransaction: the pgAdapter wraps each write in a SAVEPOINT off a shared counter,
+        // and two writes to different collections in one tx break the savepoint chain
+        // ("savepoint ... does not exist"). eTIMS is single-till, so reserve sequentially instead.
+        // The invoice-number bump is thus best-effort under concurrency; a duplicate invcNo would be
+        // VSCU-rejected + logged (not silently wrong), and one till never races itself.
+        const rSnap = await r.ref.get();
+        const rData = rSnap.data() || {};
+        const cfg = rData.etimsConfig || {};
+        const device = cfg.device || {};
+        const oRef = db.collection('orders').doc(orderId);
+        const oSnap = await oRef.get();
+        if (!oSnap.exists) { const e = new Error('Order not found'); e.code = 404; throw e; }
+        const order = { id: oSnap.id, ...oSnap.data() };
+        if (order.restaurantId !== restaurantId) { const e = new Error('Order does not belong to this restaurant.'); e.code = 403; throw e; }
+        if (order.status !== 'completed' && order.status !== 'paid') { const e = new Error('Order is not a completed sale yet.'); e.code = 409; e.status = order.status; throw e; }
+        if (!Array.isArray(order.items) || order.items.length === 0) { const e = new Error('Order has no items to fiscalise.'); e.code = 422; throw e; }
+        if (order.etims && order.etims.rcptSign) {
+          reserved = { alreadyFiscalised: true, etims: order.etims };
+        } else {
           let invcNo = order.etims && order.etims.pendingInvcNo;
           if (!invcNo) {
             invcNo = (Number(device.lastInvcNo) || 0) + 1;
-            tx.update(r.ref, { etimsConfig: { ...cfg, device: { ...device, lastInvcNo: invcNo } } });
-            // UPDATE (order already exists) — a merge-set does an upsert whose INSERT branch needs
-            // restaurant_id (NOT NULL) which this partial payload lacks, aborting the PG transaction.
-            tx.update(oRef, { etims: { pendingInvcNo: invcNo, preparedAt: new Date() } });
+            await r.ref.update({ etimsConfig: { ...cfg, device: { ...device, lastInvcNo: invcNo } } });
+            await oRef.update({ etims: { pendingInvcNo: invcNo, preparedAt: new Date() } });
           }
-          return { invcNo, order, rData };
-        });
+          reserved = { invcNo, order, rData };
+        }
       } catch (e) {
         // Only our own intentional { code: <http status> } errors map to a status here. A DB/PG
         // error carries a NON-numeric code (e.g. '25P02') — res.status() would throw on it and mask
