@@ -177,7 +177,15 @@ function buildSaveSalesPayload(order, restaurantData, overrideInvcNo) {
     };
   });
 
-  const now = order.completedAt ? new Date(order.completedAt) : new Date();
+  // Robustly resolve the sale time: completedAt may be a Firestore Timestamp ({toDate}), a Date, an
+  // ISO string, or a {_seconds} blob — and new Date(<Timestamp>) is Invalid (→ empty cfmDt → VSCU
+  // rejects "cfmDt bad"). Fall back to now() if it can't be parsed.
+  let now = new Date();
+  const ca = order.completedAt || order.createdAt;
+  if (ca) {
+    const d = ca.toDate ? ca.toDate() : (ca._seconds != null ? new Date(ca._seconds * 1000) : new Date(ca));
+    if (d && !isNaN(d.getTime())) now = d;
+  }
   const custPhone = (order.customerInfo && (order.customerInfo.phone || order.customerInfo.mobile)) || order.customerMobile || '';
   const custName = (order.customerInfo && order.customerInfo.name) || order.customerName || '';
 
