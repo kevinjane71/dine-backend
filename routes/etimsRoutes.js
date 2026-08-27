@@ -294,7 +294,9 @@ module.exports = function initEtimsRoutes(db, collections, authenticateToken, va
           if (!invcNo) {
             invcNo = (Number(device.lastInvcNo) || 0) + 1;
             tx.update(r.ref, { etimsConfig: { ...cfg, device: { ...device, lastInvcNo: invcNo } } });
-            tx.set(oRef, { etims: { pendingInvcNo: invcNo, preparedAt: new Date() } }, { merge: true });
+            // UPDATE (order already exists) — a merge-set does an upsert whose INSERT branch needs
+            // restaurant_id (NOT NULL) which this partial payload lacks, aborting the PG transaction.
+            tx.update(oRef, { etims: { pendingInvcNo: invcNo, preparedAt: new Date() } });
           }
           return { invcNo, order, rData };
         });
@@ -362,9 +364,10 @@ module.exports = function initEtimsRoutes(db, collections, authenticateToken, va
         vsdcRcptPbctDate: parsed.vsdcRcptPbctDate,
         fiscalisedAt: new Date(),
       };
-      // Full-object merge (no dot-path — Firestore + pgAdapter safe). The device
+      // Full-object UPDATE (order exists; a merge-set upserts and its INSERT branch would need
+      // restaurant_id (NOT NULL) on PG). No dot-path — Firestore + pgAdapter safe. The device
       // counter was already advanced atomically at prepare-sale.
-      await oRef.set({ etims: etimsRecord }, { merge: true });
+      await oRef.update({ etims: etimsRecord });
       try { require('../utils/kvCache').invalidateOrdersCache(restaurantId); } catch (_) {}
       logDiag(restaurantId, { phase: 'confirm-sale', ok: true, restaurantName: r.data.name, orderId, invcNo: etimsRecord.invcNo, resultCd: '000', _cfg: cfgCtx(r) });
       res.json({ success: true, etims: etimsRecord });
