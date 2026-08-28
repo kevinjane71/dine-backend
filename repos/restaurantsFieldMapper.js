@@ -76,6 +76,7 @@ const FIELD_MAP = {
   kotSettings:                 'kot_settings',
   aggregatorConfig:            'aggregator_config',
   etimsConfig:                 'etims_config',
+  superAdminDisabledPages:     'super_admin_disabled_pages',
 
   // Timestamps
   createdAt:                   'created_at',
@@ -95,7 +96,8 @@ const JSONB_COLUMNS = new Set([
   'currency_settings', 'customer_app_settings', 'billing_settings',
   'billing_audit', 'booking_settings', 'feedback_settings',
   'bar_inventory_settings', 'discount_approval_settings', 'kot_settings',
-  'aggregator_config', 'etims_config', 'menu', 'categories', 'extra_data',
+  'aggregator_config', 'etims_config', 'super_admin_disabled_pages',
+  'menu', 'categories', 'extra_data',
 ]);
 
 // Fields to skip entirely (too large / separate concern)
