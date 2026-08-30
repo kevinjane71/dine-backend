@@ -39182,8 +39182,10 @@ app.patch('/api/categories/:restaurantId/:categoryId', authenticateToken, async 
       return res.status(404).json({ error: 'Category not found' });
     }
 
-    // Validate parentId if provided
-    if (parentId !== undefined && parentId !== null && !categories.find(cat => cat.id === parentId)) {
+    // Validate parentId ONLY when a real parent was given. An empty string / null / undefined
+    // means "top-level" (no parent) — the same rule the create endpoint uses. Without this,
+    // renaming a top-level category (which sends parentId:'') wrongly failed as "Parent not found".
+    if (parentId && !categories.find(cat => cat.id === parentId)) {
       return res.status(400).json({ error: 'Parent category not found' });
     }
 
