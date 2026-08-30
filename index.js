@@ -22905,6 +22905,12 @@ app.use('/api/ai', aiInsightsRoutes);
 // restaurant.posSettings.scheduleOrderLeadTimeMinutes (default 30). Idempotent: the
 // scheduledFired flag guards against double-firing if the cron overlaps.
 const fireScheduledOrders = async () => {
+  // OFF BY DEFAULT. The entire scheduled auto-fire feature is dormant unless explicitly enabled
+  // with SCHEDULED_AUTOFIRE_ENABLED=true. It's fully built but disabled — enable it manually only
+  // when you want scheduled orders to auto-fire / auto-print the KOT at their time.
+  if (process.env.SCHEDULED_AUTOFIRE_ENABLED !== 'true') {
+    return { disabled: true, fired: 0, skipped: 0, checked: 0 };
+  }
   const now = new Date();
   const WINDOW_MS = 6 * 60 * 60 * 1000; // look-ahead window for candidates (covers any lead time)
   const cutoff = new Date(now.getTime() + WINDOW_MS);
