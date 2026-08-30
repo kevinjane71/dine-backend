@@ -9,6 +9,10 @@
     {
       "path": "/api/whatsapp-ordering/agent/process-due",
       "schedule": "*/10 * * * *"
+    },
+    {
+      "path": "/api/cron/fire-scheduled-orders",
+      "schedule": "* * * * *"
     }
   ],
   "builds": [

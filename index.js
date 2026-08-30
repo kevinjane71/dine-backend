@@ -22896,6 +22896,108 @@ app.get('/api/utils/image-to-base64', authenticateToken, async (req, res) => {
 app.use('/api/ai', aiInsightsRoutes);
 
 // ==================== CRON JOBS ====================
+
+// ─── Auto-fire scheduled orders ──────────────────────────────────────────────
+// Cron (every minute). A scheduled order (isScheduled=true, scheduledFor set) "fires" at
+// scheduledFor − leadTime: it becomes a live/confirmed order (scheduledFired=true), the kitchen
+// receives it via the SAME realtime path as a brand-new order (order-created + per-station
+// kot-print-request → KDS + auto-print), and staff are alerted. leadTime =
+// restaurant.posSettings.scheduleOrderLeadTimeMinutes (default 30). Idempotent: the
+// scheduledFired flag guards against double-firing if the cron overlaps.
+const fireScheduledOrders = async () => {
+  const now = new Date();
+  const WINDOW_MS = 6 * 60 * 60 * 1000; // look-ahead window for candidates (covers any lead time)
+  const cutoff = new Date(now.getTime() + WINDOW_MS);
+  let candidates;
+  try {
+    candidates = await db.collection(collections.orders)
+      .where('isScheduled', '==', true)
+      .where('scheduledFor', '<=', cutoff)
+      .limit(500)
+      .get();
+  } catch (e) {
+    // Missing composite index or query error — never throw from the cron.
+    console.error('[fire-scheduled] candidate query failed:', e.message);
+    return { fired: 0, skipped: 0, checked: 0, error: e.message };
+  }
+  let fired = 0, skipped = 0;
+  const restCache = {};
+  for (const doc of candidates.docs) {
+    try {
+      const o = doc.data();
+      if (o.scheduledFired) { skipped++; continue; }                          // already fired
+      if (['cancelled', 'deleted', 'completed'].includes(o.status)) { skipped++; continue; }
+      const sf = o.scheduledFor;
+      const sfMs = sf?._seconds != null ? sf._seconds * 1000
+        : (typeof sf?.toDate === 'function' ? sf.toDate().getTime() : new Date(sf).getTime());
+      if (!sfMs || isNaN(sfMs)) { skipped++; continue; }
+      if (!restCache[o.restaurantId]) {
+        const rd = await getCachedRestDoc(o.restaurantId);
+        restCache[o.restaurantId] = rd.exists ? rd.data() : {};
+      }
+      const restaurantData = restCache[o.restaurantId];
+      const ps = restaurantData.posSettings || {};
+      const leadMin = Number.isFinite(Number(ps.scheduleOrderLeadTimeMinutes)) ? Number(ps.scheduleOrderLeadTimeMinutes) : 30;
+      if (sfMs - leadMin * 60000 > now.getTime()) { skipped++; continue; }    // not yet in the fire window
+
+      // ── FIRE ──
+      const orderId = doc.id;
+      const newStatus = (o.status === 'pending' || o.status === 'scheduled' || !o.status) ? 'confirmed' : o.status;
+      await db.collection(collections.orders).doc(orderId).update({
+        scheduledFired: true, firedAt: now, status: newStatus, updatedAt: now,
+      });
+      // Live-list + KDS (same event a new order emits)
+      pusherService.notifyOrderCreated(o.restaurantId, {
+        id: orderId, orderNumber: o.orderNumber, dailyOrderId: o.dailyOrderId, status: newStatus,
+        totalAmount: o.finalAmount || o.totalAmount, tableNumber: o.tableNumber, chairNumber: o.chairNumber || null,
+        orderType: o.orderType, orderSource: o.orderSource || 'scheduled',
+      }).catch(err => console.error('[fire-scheduled] notifyOrderCreated:', err.message));
+      // Auto-print KOT — split by print station exactly like a new order
+      const printSettings = restaurantData.printSettings || {};
+      const stationGroups = splitOrderByPrintStation(o.items || [], restaurantData.printStations, restaurantData.categories, { ...DEFAULT_PRINT_SETTINGS, ...printSettings });
+      for (const group of stationGroups) {
+        pusherService.notifyKOTPrintRequest(o.restaurantId, {
+          id: orderId, dailyOrderId: o.dailyOrderId, orderNumber: o.orderNumber,
+          tableNumber: o.tableNumber, roomNumber: o.roomNumber, chairNumber: o.chairNumber || null,
+          items: group.items, notes: o.notes, orderType: o.orderType,
+          printStationId: group.stationId || null, printStationName: group.stationName || null,
+          createdAt: new Date().toISOString(),
+        }).catch(err => console.error('[fire-scheduled] notifyKOTPrintRequest:', err.message));
+      }
+      fired++;
+    } catch (e) {
+      console.error('[fire-scheduled] order fire failed:', e.message);
+      skipped++;
+    }
+  }
+  return { fired, skipped, checked: candidates.size };
+};
+
+app.get('/api/cron/fire-scheduled-orders', async (req, res) => {
+  try {
+    if (req.headers.authorization !== `Bearer ${process.env.CRON_SECRET}`) {
+      return res.status(401).json({ error: 'Unauthorized' });
+    }
+    const result = await fireScheduledOrders();
+    res.json({ success: true, at: new Date().toISOString(), ...result });
+  } catch (error) {
+    console.error('fire-scheduled-orders error:', error);
+    res.status(500).json({ error: 'Failed to fire scheduled orders' });
+  }
+});
+
+// Persistent-server internal cron: fire scheduled orders every 60s. Runs ONLY where
+// ENABLE_INTERNAL_CRON=true (the always-on GCP VM) — NOT on Vercel/Cloud Run serverless, where
+// setInterval doesn't persist (there, vercel.json cron hits /api/cron/fire-scheduled-orders).
+if (process.env.ENABLE_INTERNAL_CRON === 'true') {
+  setInterval(() => {
+    fireScheduledOrders()
+      .then(r => { if (r && r.fired) console.log(`[fire-scheduled] fired ${r.fired}, skipped ${r.skipped}`); })
+      .catch(e => console.error('[fire-scheduled] interval error:', e.message));
+  }, 60 * 1000);
+  console.log('⏰ Internal cron enabled: fire-scheduled-orders every 60s');
+}
+
 // Vercel Cron — runs hourly, sends daily reports to owners at their preferred time
 app.get('/api/cron/send-daily-reports', async (req, res) => {
   try {
