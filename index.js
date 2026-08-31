@@ -12690,7 +12690,7 @@ app.get('/api/analytics/:restaurantId', authenticateToken, async (req, res) => {
 function aggregateDailyStats(dailyDocs, dateStrings) {
   if (dailyDocs.length === 0) {
     return {
-      totalRevenue: 0, totalRevenueWithTax: 0, totalOrders: 0, avgOrderValue: 0, newCustomers: 0,
+      totalRevenue: 0, totalRevenueWithTax: 0, totalOrders: 0, completedOrders: 0, avgOrderValue: 0, newCustomers: 0,
       popularItems: [], revenueData: [], ordersByType: [], busyHours: [], paymentBreakdown: {}
     };
   }
@@ -12743,13 +12743,21 @@ function aggregateDailyStats(dailyDocs, dateStrings) {
       }
     }
 
-    // Payment method breakdown (flat fields like paymentMethod_cash, paymentMethod_due)
+    // Payment method breakdown — handle BOTH nested (pgAdapter) and flat dotted (Firestore) shapes.
     for (const [key, val] of Object.entries(doc)) {
-      if (key.startsWith('paymentMethod_') && typeof val === 'object') {
-        const method = key.replace('paymentMethod_', '');
+      if (!key.startsWith('paymentMethod_')) continue;
+      const rest = key.slice('paymentMethod_'.length);
+      if (val && typeof val === 'object') {
+        if (!paymentBreakdown[rest]) paymentBreakdown[rest] = { transactions: 0, amount: 0 };
+        paymentBreakdown[rest].transactions += (val.transactions || 0);
+        paymentBreakdown[rest].amount += (val.amount || 0);
+      } else if (rest.includes('.')) {
+        const dot = rest.lastIndexOf('.');
+        const method = rest.slice(0, dot);
+        const field = rest.slice(dot + 1);
         if (!paymentBreakdown[method]) paymentBreakdown[method] = { transactions: 0, amount: 0 };
-        paymentBreakdown[method].transactions += (val.transactions || 0);
-        paymentBreakdown[method].amount += (val.amount || 0);
+        if (field === 'transactions') paymentBreakdown[method].transactions += (Number(val) || 0);
+        else if (field === 'amount') paymentBreakdown[method].amount += (Number(val) || 0);
       }
     }
 
@@ -12796,7 +12804,9 @@ function aggregateDailyStats(dailyDocs, dateStrings) {
     .slice(0, 6);
 
   return {
-    totalRevenue, totalRevenueWithTax, totalOrders, avgOrderValue,
+    totalRevenue, totalRevenueWithTax, totalOrders,
+    completedOrders: totalOrders,
+    avgOrderValue,
     newCustomers: allCustomerIds.size,
     popularItems, revenueData,
     ordersByType: ordersByTypeArray,
